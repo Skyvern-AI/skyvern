@@ -20,13 +20,15 @@ from skyvern.cli.core.js_dispatch import (
     deadline_ended_the_call,
     raise_if_cancelled,
     record_unreported_timeout,
+    under_action_deadline,
 )
 from skyvern.cli.core.page_read import DEFAULT_MAX_CHARS, MAX_CURSOR_CHARS, CursorError, read_page
-from skyvern.exceptions import SkyvernPageAnalysisTimeout
+from skyvern.exceptions import ActionDeadlineExceeded, SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._common import DIRECT_TARGET_DESCRIPTION, BrowserContext, ErrorCode, make_error, make_result
-from ._element_state import DEFAULT_ACTION_TIMEOUT_MS
+from ._element_state import DEFAULT_ACTION_TIMEOUT_MS, action_deadline_error
+from ._read_retry import retry_read_on_page_change
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
 
 # Query param keys whose values are redacted from captured URLs.
@@ -228,6 +230,10 @@ async def _capture_body(response: Any, request_id: int, state: Any) -> None:
 
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     """Create console/network/dialog/pageerror handlers bound to a specific page."""
+    from skyvern.cli.core.session_manager import is_stateless_http_mode
+
+    # Stateless HTTP mode disables every body reader, so a fetch there only blocks the hosting (API) event loop.
+    capture_bodies = not is_stateless_http_mode()
 
     def _on_console(msg: Any) -> None:
         try:
@@ -295,7 +301,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                 return
             state.network_requests.append(network_event)
 
-            if _should_capture_body(content_type, content_length):
+            if capture_bodies and _should_capture_body(content_type, content_length):
                 try:
                     task = asyncio.create_task(_capture_body(response, request_id, state))
                     state._pending_tasks.add(task)
@@ -1011,7 +1017,10 @@ async def skyvern_get_html(
         return make_result("skyvern_get_html", ok=False, error=no_browser_error(exc))
 
     try:
-        html = await do_get_html(page, selector, outer=outer)
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            html = await retry_read_on_page_change(
+                "skyvern_get_html", page, lambda: do_get_html(page, selector, outer=outer)
+            )
         return make_result(
             "skyvern_get_html",
             browser_context=ctx,
@@ -1021,6 +1030,13 @@ async def skyvern_get_html(
                 "outer": outer,
                 "length": len(html),
             },
+        )
+    except ActionDeadlineExceeded as exc:
+        return make_result(
+            "skyvern_get_html",
+            ok=False,
+            browser_context=ctx,
+            error=action_deadline_error(exc, mutating=False),
         )
     except Exception as e:
         return make_result(

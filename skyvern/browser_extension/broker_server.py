@@ -106,7 +106,7 @@ MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
 TAB_REQUEST_EXACT_TIMEOUT_TOLERANCE_SECONDS = 0.25
 _LEASED_OPS = frozenset(
-    {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "tabs.activate", "tabs.remove"}
+    {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "dom.fill", "tabs.activate", "tabs.remove"}
 )
 _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"

@@ -1,4 +1,5 @@
 import { useCallback, useMemo } from "react";
+import posthog from "posthog-js";
 import {
   useLocation,
   useNavigate,
@@ -23,6 +24,7 @@ import {
   useStudioShellContext,
   useStudioWorkflowDeletedAt,
 } from "./StudioShellContext";
+import { useWorkflowPermanentId } from "../WorkflowPermanentIdContext";
 
 type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   selectedBlockLabel?: string | null;
@@ -31,6 +33,7 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
 export function useStudioPanes() {
   const location = useLocation();
   const navigate = useNavigate();
+  const workflowPermanentId = useWorkflowPermanentId();
   const studioRunId = useStudioRunId();
   const {
     isStudio,
@@ -40,7 +43,7 @@ export function useStudioPanes() {
     preserveNextEntry,
   } = useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-  const { restoreExpandedPane } = useStudioShellContext();
+  const { organizationId, restoreExpandedPane } = useStudioShellContext();
   const panes = useMemo(() => {
     const resolved = isStudio
       ? [...currentPanes]
@@ -58,11 +61,27 @@ export function useStudioPanes() {
 
   const applyPanes = useCallback(
     (
-      compute: (current: StudioPaneId[]) => StudioPaneId[],
+      compute: (
+        current: StudioPaneId[],
+        slots: readonly StudioPaneId[],
+      ) => StudioPaneId[],
       options?: ApplyPanesOptions,
     ) => {
       restoreExpandedPane?.();
-      updatePanes(compute);
+      updatePanes((current, slots) => {
+        const next = compute(current, slots);
+        if (
+          !workflowDeleted &&
+          !current.includes("copilot") &&
+          next.includes("copilot")
+        ) {
+          posthog.capture("copilot.pane.opened", {
+            org_id: organizationId,
+            workflow_permanent_id: workflowPermanentId,
+          });
+        }
+        return next;
+      });
       if (
         !options ||
         (!("state" in options) && options.selectedBlockLabel === undefined)
@@ -92,6 +111,9 @@ export function useStudioPanes() {
     [
       restoreExpandedPane,
       updatePanes,
+      workflowDeleted,
+      organizationId,
+      workflowPermanentId,
       location.search,
       location.pathname,
       location.hash,
@@ -101,12 +123,13 @@ export function useStudioPanes() {
   );
 
   const togglePane = useCallback(
-    (id: StudioPaneId) => applyPanes((current) => togglePaneIn(current, id)),
+    (id: StudioPaneId) =>
+      applyPanes((current, slots) => togglePaneIn(current, id, slots)),
     [applyPanes],
   );
   const openPane = useCallback(
     (id: StudioPaneId, options?: ApplyPanesOptions) =>
-      applyPanes((current) => withPaneOpen(current, id), options),
+      applyPanes((current, slots) => withPaneOpen(current, id, slots), options),
     [applyPanes],
   );
   const closePane = useCallback(

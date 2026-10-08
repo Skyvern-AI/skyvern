@@ -32,6 +32,7 @@ class TwilioClient:
         api_key_secret: str | None = None,
         auth_token: str | None = None,
     ) -> None:
+        """Create a client for an account or subaccount."""
         self.account_sid = account_sid
         self._username: str
         self._password: str | None
@@ -41,6 +42,55 @@ class TwilioClient:
         else:
             self._username = account_sid
             self._password = auth_token
+
+    async def create_subaccount(self, friendly_name: str) -> dict[str, Any]:
+        url = f"{TWILIO_API_BASE}/{_TWILIO_API_VERSION}/Accounts.json"
+        async with self._new_http_client() as client:
+            return await self._request_json(
+                client,
+                "POST",
+                url,
+                data={"FriendlyName": friendly_name},
+            )
+
+    async def list_subaccounts(self, friendly_name: str) -> list[dict[str, Any]]:
+        url = f"{TWILIO_API_BASE}/{_TWILIO_API_VERSION}/Accounts.json"
+        async with self._new_http_client() as client:
+            payload = await self._request_json(
+                client,
+                "GET",
+                url,
+                params={"FriendlyName": friendly_name, "Status": "active", "PageSize": "20"},
+            )
+        accounts = payload.get("accounts", [])
+        if not isinstance(accounts, list) or not all(isinstance(account, dict) for account in accounts):
+            raise TwilioApiError(200, "Twilio API returned an invalid account list")
+        return accounts
+
+    async def get_subaccount(self, account_sid: str) -> dict[str, Any]:
+        url = f"{TWILIO_API_BASE}/{_TWILIO_API_VERSION}/Accounts/{account_sid}.json"
+        async with self._new_http_client() as client:
+            return await self._request_json(client, "GET", url)
+
+    async def search_available_numbers(
+        self,
+        country_code: str = "US",
+        area_code: str | None = None,
+        contains: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        url = self._account_api_url(f"AvailablePhoneNumbers/{country_code}/Local.json")
+        params = {"SmsEnabled": "true", "PageSize": str(limit)}
+        if area_code is not None:
+            params["AreaCode"] = area_code
+        if contains is not None:
+            params["Contains"] = contains
+        async with self._new_http_client() as client:
+            payload = await self._request_json(client, "GET", url, params=params)
+        phone_numbers = payload.get("available_phone_numbers", [])
+        if not isinstance(phone_numbers, list) or not all(isinstance(number, dict) for number in phone_numbers):
+            raise TwilioApiError(200, "Twilio API returned an invalid available phone number list")
+        return phone_numbers
 
     def _new_http_client(self) -> httpx.AsyncClient:
         if self._password is None:
@@ -112,6 +162,31 @@ class TwilioClient:
                 params = None
 
         return phone_numbers
+
+    async def purchase_number(
+        self,
+        phone_number: str,
+        sms_url: str,
+        sms_method: str = "POST",
+    ) -> dict[str, Any]:
+        url = self._account_api_url("IncomingPhoneNumbers.json")
+        async with self._new_http_client() as client:
+            return await self._request_json(
+                client,
+                "POST",
+                url,
+                data={"PhoneNumber": phone_number, "SmsUrl": sms_url, "SmsMethod": sms_method},
+            )
+
+    async def release_number(self, phone_number_sid: str) -> None:
+        url = self._account_api_url(f"IncomingPhoneNumbers/{phone_number_sid}.json")
+        async with self._new_http_client() as client:
+            try:
+                response = await client.request("DELETE", url)
+            except httpx.HTTPError as exc:
+                raise TwilioApiError(0, "Twilio API request failed") from exc
+        if response.status_code != 204:
+            raise TwilioApiError(response.status_code, _error_message(response))
 
     async def get_incoming_phone_number(self, number_sid: str) -> dict[str, Any]:
         if not is_twilio_phone_number_sid(number_sid):

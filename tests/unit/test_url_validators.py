@@ -1,10 +1,17 @@
 import socket
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import BaseModel
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException, UnresolvableHost
+from skyvern.exceptions import (
+    BlockedHost,
+    InvalidUrl,
+    SkyvernHTTPException,
+    UnresolvableHost,
+)
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
@@ -14,13 +21,79 @@ from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.utils.url_validators import (
     encode_url,
     is_blocked_host,
+    prepend_scheme_and_validate_url,
     redact_url_for_display,
     redact_url_query,
+    redacted_url_origin,
+    signed_url_ttl_remaining_seconds,
     validate_fetch_url,
     validate_redirect_url,
     validate_url,
     validate_webhook_url,
 )
+
+
+@pytest.mark.parametrize(
+    "validator,field_name",
+    [
+        (prepend_scheme_and_validate_url, "url"),
+        (validate_url, "url"),
+        (validate_webhook_url, "webhook_url"),
+        (validate_fetch_url, "url"),
+    ],
+)
+@pytest.mark.parametrize(
+    "url,failure_class",
+    [
+        ("htps://private-sentinel.example.test/otp?signature=synthetic-secret", "unsupported scheme"),
+        ("https://[private-sentinel/otp?signature=synthetic-secret", "malformed"),
+        ("https://private-sentinel.example.test:invalid/otp?signature=synthetic-secret", "malformed"),
+    ],
+)
+def test_url_validation_errors_withhold_values(
+    validator: Callable[[str], str | None], field_name: str, url: str, failure_class: str
+) -> None:
+    with pytest.raises(SkyvernHTTPException) as error:
+        validator(url)
+    message = str(error.value)
+    assert field_name in message
+    assert failure_class in message
+    assert error.value.status_code == 400
+    for private_value in (url, "private-sentinel", "synthetic-secret"):
+        assert private_value not in message
+
+
+@pytest.mark.parametrize("exception", [InvalidUrl, BlockedHost, UnresolvableHost])
+def test_url_exception_messages_withhold_values(exception: type[SkyvernHTTPException]) -> None:
+    error = exception("private-sentinel")
+    assert "private-sentinel" not in str(error)
+    assert "url" in str(error)
+
+
+@pytest.mark.parametrize("field_name", ["webhook_url", "webhook_callback_url"])
+def test_webhook_blocked_host_error_withholds_host(field_name: str) -> None:
+    with pytest.raises(BlockedHost) as error:
+        validate_webhook_url("https://private-sentinel.internal/hook?signature=synthetic-secret", field_name=field_name)
+    assert field_name in str(error.value)
+    assert "blocked host" in str(error.value)
+    assert "private-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize("field_name", ["webhook_url", "totp_url"])
+@pytest.mark.parametrize("model", [TaskRunRequest, WorkflowRunRequest])
+def test_public_run_callback_error_names_field_without_value(field_name: str, model: type[BaseModel]) -> None:
+    with pytest.raises(SkyvernHTTPException) as error:
+        model.model_validate(
+            {
+                "prompt": "Continue",
+                "workflow_id": "wpid_test",
+                field_name: "htps://private-sentinel.example.test/?signature=synthetic-secret",
+            }
+        )
+    assert field_name in str(error.value)
+    assert "unsupported scheme" in str(error.value)
+    assert "private-sentinel" not in str(error.value)
+    assert "synthetic-secret" not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -36,6 +109,55 @@ from skyvern.utils.url_validators import (
 )
 def test_redact_url_query(url: str, expected: str) -> None:
     assert redact_url_query(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_ttl", "expected_origin"),
+    [
+        (
+            "https://storage.example/object?X-Amz-Date=20240101T000000Z&X-Amz-Expires=120&X-Amz-Signature=secret",
+            90.0,
+            "https://storage.example",
+        ),
+        (
+            "https://storage.example:8443/object?X-Goog-Date=20240101T000000Z&X-Goog-Expires=45&X-Goog-Signature=secret",
+            15.0,
+            "https://storage.example:8443",
+        ),
+        (
+            "https://storage.example/object?Expires=1704067320&Signature=secret&AWSAccessKeyId=key",
+            90.0,
+            "https://storage.example",
+        ),
+        (
+            "https://storage.example/object?Expires=1704067200&Signature=secret&Key-Pair-Id=key",
+            -30.0,
+            "https://storage.example",
+        ),
+        (
+            "https://storage.example/object?Expires=not-numeric&Signature=secret",
+            None,
+            "https://storage.example",
+        ),
+        (
+            "https://storage.example/object?Expires=999999999999999999999999&Signature=secret",
+            None,
+            "https://storage.example",
+        ),
+        ("https://storage.example/object", None, "https://storage.example"),
+        ("not a url", None, "<redacted>"),
+    ],
+)
+def test_signed_download_url_ttl_and_origin_are_redacted(
+    url: str, expected_ttl: float | None, expected_origin: str
+) -> None:
+    now = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(seconds=30)
+
+    assert signed_url_ttl_remaining_seconds(url, now) == expected_ttl
+    origin = redacted_url_origin(url)
+    assert origin == expected_origin
+    assert "?" not in origin
+    assert "secret" not in origin
 
 
 def test_encode_url_basic():

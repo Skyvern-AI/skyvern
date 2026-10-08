@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern import exceptions as skyvern_exceptions
+from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS, SKYVERN_DIR
 from skyvern.exceptions import ScrapingFailed
 from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
     CLASSIFIER_VERSION,
     FAILURE_ATTRIBUTION_SCHEMA_VERSION,
+    PROXY_TRANSPORT_FAILED_REASON_CODE,
+    WORKER_CONTAINER_RESTARTED_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
 )
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError as ProviderLLMError
 from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
@@ -91,6 +99,14 @@ class LLMProviderError(Exception):
 
 
 class RateLimitExceeded(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    pass
+
+
+class ThrottlingException(Exception):
     pass
 
 
@@ -240,6 +256,215 @@ def test_broad_blocked_and_forbidden_do_not_match_antibot() -> None:
             assert "ANTI_BOT_DETECTION" not in [r["category"] for r in result], reason
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(
+            "navigation block terminated. Reason: The site returned Cloudflare Error 1015 (HTTP 429: temporarily "
+            "rate limited/banned) when accessing the update URL, so the form could not be submitted.",
+            id="cloudflare-1015",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: Page indicates 403 error or rate limit; cannot proceed with opt-out.",
+            id="model-hedged-403-or-rate-limit",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: The site says this page was requested too many times.",
+            id="requested-too-many-times",
+        ),
+        pytest.param("The site returned a 403 Forbidden page; the form cannot be reached.", id="forbidden-page"),
+        pytest.param(
+            "for_loop block failed. failure reason: Page indicates 403 error or rate limit; cannot proceed.",
+            id="site-page-in-loop",
+        ),
+        pytest.param(
+            "goto_url block terminated. Reason: The page shows HTTP 429 Too Many Requests.", id="goto-url-page"
+        ),
+        pytest.param(
+            "task block failed. failure reason: The website displayed 'Too many requests, please try again later' "
+            "(HTTP 429) and blocked further navigation.",
+            id="task-site-429-page",
+        ),
+        pytest.param(
+            "navigation block failed. failure reason: The page returned 403 Forbidden after submitting the form.",
+            id="navigation-site-403-page",
+        ),
+        pytest.param(
+            "task block failed. failure reason: Failed to send the form: the site shows HTTP 429 Too Many Requests",
+            id="task-reason-opening-with-failed-to-send",
+        ),
+        pytest.param(
+            "Failed to send the form: the site shows HTTP 429 Too Many Requests", id="raw-task-reason-failed-to-send"
+        ),
+        pytest.param(
+            "workflow_trigger block failed. failure reason: navigation block terminated. Reason: The page shows "
+            "HTTP 429 Too Many Requests.",
+            id="site-page-in-child-workflow",
+        ),
+    ],
+)
+def test_site_throttle_or_block_page_is_antibot_not_llm_error(reason: str) -> None:
+    categories = _classify(reason)
+
+    assert categories[0]["category"] == "ANTI_BOT_DETECTION"
+    assert "LLM_ERROR" not in [category["category"] for category in categories]
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "unattributed"
+
+
+def test_words_that_merely_end_in_rate_are_not_a_site_throttle() -> None:
+    assert classify_from_failure_reason("The corporate limit field is required but empty") is None
+
+
+@pytest.mark.parametrize(
+    ("reason", "exception"),
+    [
+        pytest.param(
+            "navigation block failed. failure reason: "
+            + str(ProviderLLMError("GEMINI_2_5_FLASH", cause=RateLimitError("Rate limit reached for the model"))),
+            None,
+            id="provider-error-text",
+        ),
+        pytest.param(
+            "The task failed due to LLM service errors. This is typically caused by rate limiting, service outages, "
+            "or resource exhaustion from the LLM provider.",
+            None,
+            id="max-steps-llm-summary",
+        ),
+        pytest.param("navigation block failed. failure reason: HTTP 429", RateLimitError("429"), id="exception-object"),
+        pytest.param(
+            "text_prompt block failed. failure reason: "
+            + str(ProviderLLMError("GPT_5", cause=RateLimitError("Rate limit reached for the model"))),
+            None,
+            id="provider-error-in-non-browser-block",
+        ),
+    ],
+)
+def test_llm_rate_limit_is_still_llm_error(reason: str, exception: Exception | None) -> None:
+    categories = _classify(reason, exception, fallback_to_unknown=True)
+    names = [category["category"] for category in categories]
+
+    assert names[0] == "LLM_ERROR"
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "WEBSITE_ERROR" not in names
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "llm"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param("Google Sheets rate limit on write: quota exceeded", id="sheets-raw"),
+        pytest.param(
+            "google_sheets_write block failed. failure reason: Google Sheets rate limit on write: quota exceeded",
+            id="sheets-workflow-level",
+        ),
+        pytest.param("HTTP request failed: 429 Too Many Requests from the target API", id="http-request-raw"),
+        pytest.param(
+            "send_email block failed. failure reason: 429 Too Many Requests from the mail API", id="email-workflow"
+        ),
+        pytest.param(
+            "for_loop block failed. failure reason: Google Sheets rate limit on write: quota exceeded",
+            id="sheets-in-loop",
+        ),
+        pytest.param(
+            "conditional block terminated. Reason: for_loop block failed. failure reason: "
+            "Google Sheets rate limit on read: quota exceeded",
+            id="sheets-in-loop-in-conditional",
+        ),
+        pytest.param(
+            "while_loop block failed. failure reason: Failed to send human interaction email: 429 Too Many Requests",
+            id="human-interaction-email-in-loop",
+        ),
+        pytest.param(
+            "Failed to send human interaction email: 429 Too Many Requests from the mail API",
+            id="human-interaction-email-raw",
+        ),
+        pytest.param(
+            "file_download block failed. failure reason: Failed to send downloaded file(s) to s3: 429 Too Many Requests",
+            id="file-download-storage-throttle",
+        ),
+        pytest.param(
+            "file_download block failed. failure reason: Failed to download file from Google Drive: "
+            '<HttpError 429 when requesting https://www.googleapis.com/drive/v3/files/abc?alt=media returned "User '
+            'rate limit exceeded.">',
+            id="drive-api-in-browser-block",
+        ),
+        pytest.param(
+            "google_sheets_read block failed. failure reason: Google Sheets read failed: 429 Too Many Requests: "
+            "rate limit exceeded",
+            id="sheets-read-429",
+        ),
+        pytest.param(
+            "http_request block failed. failure reason: HTTP request failed: 429 Too Many Requests",
+            id="http-request-block-429",
+        ),
+        pytest.param(
+            "http_request block failed. failure reason: HTTP 403: {'detail': 'User rate limit exceeded.'}",
+            id="http-request-block-api-quota",
+        ),
+        pytest.param(
+            "Failed to initialize workflow run context. failure reason: "
+            + str(skyvern_exceptions.OnePasswordRateLimitError("Too many requests")),
+            id="vault-throttle-at-run-start",
+        ),
+    ],
+)
+def test_integration_or_api_throttle_is_website_error(reason: str) -> None:
+    categories = _classify(reason, fallback_to_unknown=True)
+    names = [category["category"] for category in categories]
+
+    assert names[0] == "WEBSITE_ERROR"
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "LLM_ERROR" not in names
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "non_infra"
+
+
+def test_llm_provider_throttle_is_neither_bot_protection_nor_a_website_error() -> None:
+    reason = "navigation block failed. failure reason: " + str(
+        ProviderLLMError("BEDROCK_SONNET", cause=ThrottlingException("Too many requests, please wait"))
+    )
+
+    names = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "ANTI_BOT_DETECTION" not in names
+    assert "WEBSITE_ERROR" not in names
+
+
+# A pageless failure's text says nothing about a site, and "http_request block" itself contains "request block".
+# A failure from a block that drives the page keeps today's keyword label.
+@pytest.mark.parametrize(
+    ("reason", "is_antibot"),
+    [
+        pytest.param("http_request block failed. failure reason: HTTP 404: Not Found", False, id="http-request-404"),
+        pytest.param(
+            "for_loop block failed. failure reason: http_request block failed. failure reason: HTTP 401: Unauthorized",
+            False,
+            id="http-request-in-loop",
+        ),
+        pytest.param(
+            "send_email block failed. failure reason: File access denied: path must not be empty",
+            False,
+            id="send-email-file-access-denied",
+        ),
+        pytest.param("code block failed. failure reason: CAPTCHA could not be solved.", True, id="code-block-captcha"),
+        pytest.param(
+            "task block failed. failure reason: Failed to send the form because a captcha appeared",
+            True,
+            id="task-reason-starting-like-an-integration",
+        ),
+        pytest.param(
+            "workflow_trigger block failed. failure reason: navigation block terminated. Reason: A Cloudflare "
+            "challenge blocked the page.",
+            True,
+            id="child-workflow-captcha",
+        ),
+    ],
+)
+def test_antibot_keywords_skip_only_pageless_failures(reason: str, is_antibot: bool) -> None:
+    names = _categories_for(reason, fallback_to_unknown=True)
+
+    assert ("ANTI_BOT_DETECTION" in names) is is_antibot
+
+
 def test_multiple_categories_are_sorted_by_confidence_descending() -> None:
     result = _classify("Reached the max steps because captcha kept appearing")
 
@@ -328,6 +553,24 @@ def test_secure_codeblock_runner_unavailable_carries_a_reason_code() -> None:
     assert infra[0]["reason_code"] == "secure_codeblock_runner_unavailable"
 
 
+def test_worker_restart_is_attributed_from_the_typed_cause_not_from_reason_text() -> None:
+    """Only the typed cause the restart recovery raises names a worker loss; a reason that merely
+    quotes worker-restart wording (page text, user code) must not be pinned on the worker."""
+    reason = "Workflow run failed: the worker running this run was restarted before the run finished."
+    result = classify_from_failure_reason(
+        reason, exception_name=WORKER_CONTAINER_RESTARTED_REASON_CODE, fallback_to_unknown=True
+    )
+
+    assert result is not None
+    assert [entry["category"] for entry in result] == ["INFRASTRUCTURE_ERROR"]
+    attribution = derive_failure_attribution(result)
+    assert attribution["primary_infra_component"] == "worker"
+    assert attribution["reason_code"] == WORKER_CONTAINER_RESTARTED_REASON_CODE
+
+    quoted = _classify("Element text: 'the worker running it was restarted'", fallback_to_unknown=True)
+    assert WORKER_CONTAINER_RESTARTED_REASON_CODE not in [entry.get("reason_code") for entry in quoted]
+
+
 def test_ordinary_user_code_failure_is_not_infrastructure() -> None:
     # A block that reached the sandbox and raised is a user-code fault, not a deploy fault.
     reason = "code block failed. failure reason: CodeBlock failed while running user code."
@@ -389,6 +632,122 @@ def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None
     categories = _categories_for(reason, fallback_to_unknown=True)
 
     assert "INFRASTRUCTURE_ERROR" not in categories
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(
+            "navigation block failed. failure reason: Max retries per step (3) exceeded. Possible failure reasons: "
+            "The user's attempts failed because the website returned a '502 Bad Gateway' error.",
+            id="max-retries-summary-502",
+        ),
+        pytest.param(
+            "navigation block terminated. Reason: Page shows 502 Bad Gateway error; cannot proceed with request.",
+            id="terminate-bad-gateway",
+        ),
+        pytest.param("http_request block failed. failure reason: HTTP 500: ", id="http-request-block-500"),
+    ],
+)
+def test_a_server_error_is_website_error_only_when_the_model_says_so(reason: str) -> None:
+    categories = classify_from_failure_reason(reason, fallback_to_unknown=True) or []
+
+    assert "WEBSITE_ERROR" not in [category["category"] for category in categories]
+
+
+PROMPTS_DIR = SKYVERN_DIR / "forge" / "prompts" / "skyvern"
+
+
+def test_every_prompt_that_asks_the_model_for_a_category_offers_website_error() -> None:
+    category_lists = {
+        template.name: re.search(r'"failure_categories": array //.*?Categories: (.*)', template.read_text())
+        for template in PROMPTS_DIR.glob("*.j2")
+    }
+    category_lists = {name: match.group(1) for name, match in category_lists.items() if match}
+
+    assert len(category_lists) >= 5
+    for name, listed in category_lists.items():
+        offered = set(re.findall(r"\b([A-Z][A-Z_]+[A-Z]) \(", listed))
+        assert "WEBSITE_ERROR" in offered, name
+        assert offered <= {category.value for category in FailureCategory}, name
+
+
+def _driver_nav_failure(code: str, url: str = "https://example.test/login") -> skyvern_exceptions.FailedToNavigateToUrl:
+    return skyvern_exceptions.FailedToNavigateToUrl(
+        url=url,
+        error_message=f'Page.goto: {code} at {url}\nCall log:\n  - navigating to "{url}", waiting until "load"\n',
+        nav_error_code=code,
+    )
+
+
+def _workflow_failure_reason(error: Exception) -> str:
+    return f"login block failed. failure reason: {skyvern_exceptions.get_user_facing_exception_message(error)}"
+
+
+def _classified_on_both_paths(error: Exception) -> list[list[dict]]:
+    """The workflow-run path classifies the flattened sentence; the task path also has the exception."""
+    return [
+        _classify(_workflow_failure_reason(error), fallback_to_unknown=True),
+        _classify(str(error), error, fallback_to_unknown=True),
+    ]
+
+
+@pytest.mark.parametrize("code", PROXY_TRANSPORT_NAV_ERRORS)
+def test_a_proxy_transport_navigation_failure_is_a_proxy_error(code: str) -> None:
+    evidence = []
+    for categories in _classified_on_both_paths(_driver_nav_failure(code)):
+        doc = derive_failure_attribution(categories)
+        assert doc["failure_category"] == "PROXY_ERROR"
+        assert doc["primary_infra_component"] == "proxy"
+        assert doc["reason_code"] == PROXY_TRANSPORT_FAILED_REASON_CODE
+        assert "NAVIGATION_FAILURE" not in [category["category"] for category in categories]
+        evidence.append(doc["evidence_source"])
+    # The flattened sentence is scanned text; only the exception carries the driver's typed code.
+    assert evidence == ["keyword_match", "code_level"]
+
+
+def test_a_transport_code_outside_the_driver_message_is_not_a_proxy_error() -> None:
+    model_written_reason = (
+        "The target page displayed net::ERR_TUNNEL_CONNECTION_FAILED, so the goal cannot be completed."
+    )
+
+    categories = _categories_for(model_written_reason, None, fallback_to_unknown=True)
+
+    assert "PROXY_ERROR" not in categories
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            skyvern_exceptions.UnresolvableNavigationHost(
+                url="https://gone.example.test/",
+                host="gone.example.test",
+                error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://gone.example.test/",
+            ),
+            id="target_with_no_dns_record_borrows_the_tunnel_code",
+        ),
+        pytest.param(_driver_nav_failure("net::ERR_CERT_AUTHORITY_INVALID"), id="site_certificate_chain"),
+        pytest.param(_driver_nav_failure("net::ERR_NAME_NOT_RESOLVED"), id="site_dns"),
+        pytest.param(_driver_nav_failure("net::ERR_CONNECTION_REFUSED"), id="site_refused_the_connection"),
+    ],
+)
+def test_a_site_side_navigation_failure_stays_a_navigation_failure(error: Exception) -> None:
+    for categories in _classified_on_both_paths(error):
+        doc = derive_failure_attribution(categories)
+        assert doc["failure_category"] == "NAVIGATION_FAILURE"
+        assert doc["primary_infra_component"] == "unattributed"
+
+
+def test_a_proxy_code_quoted_in_the_url_is_not_a_proxy_error() -> None:
+    error = _driver_nav_failure(
+        "net::ERR_CERT_DATE_INVALID", url="https://example.test/?next=net::ERR_TUNNEL_CONNECTION_FAILED"
+    )
+
+    for classified in _classified_on_both_paths(error):
+        categories = [category["category"] for category in classified]
+        assert categories[0] == "NAVIGATION_FAILURE"
+        assert "PROXY_ERROR" not in categories
 
 
 @pytest.mark.asyncio
@@ -601,6 +960,20 @@ def test_derive_element_not_found_maps_to_non_infra() -> None:
     assert derive_failure_attribution(fc)["primary_infra_component"] == "non_infra"
 
 
+def test_derive_a_model_written_website_error_is_non_infra_not_worker() -> None:
+    fc = [
+        {
+            "category": "WEBSITE_ERROR",
+            "confidence_float": 1.0,
+            "reasoning": "The site's server returned 502 Bad Gateway.",
+        },
+        {"category": "NAVIGATION_FAILURE", "confidence_float": 0.8, "reasoning": "The page did not load."},
+    ]
+    document = derive_failure_attribution(fc)
+    assert document["failure_category"] == "WEBSITE_ERROR"
+    assert document["primary_infra_component"] == "non_infra"
+
+
 def test_derive_none_input_is_explicit_unattributed_document() -> None:
     doc = derive_failure_attribution(None)
     assert doc["primary_infra_component"] == "unattributed"
@@ -638,6 +1011,31 @@ def test_derive_uses_highest_confidence_primary_first() -> None:
 def test_derive_end_to_end_from_real_classifier_output() -> None:
     fc = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
     assert derive_failure_attribution(fc)["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.parametrize(
+    "browser_loss",
+    [
+        pytest.param(skyvern_exceptions.MissingBrowserStatePage(), id="page-missing"),
+        pytest.param(
+            skyvern_exceptions.ScreenshotTargetClosed("Target page, context or browser has been closed"),
+            id="target-closed",
+        ),
+    ],
+)
+def test_an_unsolved_captcha_outranks_the_browser_loss_that_ended_the_run(browser_loss: Exception) -> None:
+    categories = classify_from_failure_reason(
+        skyvern_exceptions.get_user_facing_exception_message(browser_loss),
+        exception=browser_loss,
+        fallback_to_unknown=True,
+        unsolved_captcha_exception="CaptchaNotSolvedInTime",
+    )
+
+    assert categories is not None
+    assert categories[0]["category"] == "ANTI_BOT_DETECTION"
+    assert categories[0]["evidence_source"] == "exception_type"
+    assert "BROWSER_ERROR" in [category["category"] for category in categories]
+    assert derive_failure_attribution(categories)["primary_infra_component"] != "browser"
 
 
 def test_derive_parameter_binding_error_maps_to_worker() -> None:
@@ -919,16 +1317,26 @@ def test_derive_is_never_raises_by_construction_for_pathological_primary() -> No
 def test_browser_lease_producer_reason_codes_round_trip_through_attribution() -> None:
     # Drift guard: the real producer's emitted reason codes must survive derivation. If a new
     # browser-lease code is added without updating the shared allowlist, this fails.
-    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout
+    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionExpired, BrowserSessionStartupTimeout
     from skyvern.forge.sdk.workflow.service import _browser_lease_failure_category
 
-    for exc in (
-        BrowserSessionClosed(browser_session_id="pbs_x"),
-        BrowserSessionStartupTimeout(browser_session_id="pbs_x"),
+    started_at = datetime(2026, 9, 28, 13, 1, tzinfo=UTC)
+    ended_at = started_at + timedelta(minutes=240)
+    workflow_run = SimpleNamespace(created_at=ended_at + timedelta(hours=6))
+    expired = BrowserSessionExpired(
+        "pbs_x", started_at=started_at, ended_at=ended_at, timeout_minutes=240, created_by="api"
+    )
+    for exc, component in (
+        (BrowserSessionClosed(browser_session_id="pbs_x"), "browser"),
+        (BrowserSessionStartupTimeout(browser_session_id="pbs_x"), "browser"),
+        (expired, "non_infra"),
     ):
-        fc = _browser_lease_failure_category(exc)
+        fc = _browser_lease_failure_category(exc, workflow_run)
         assert fc is not None
         doc = derive_failure_attribution(fc)
         assert doc["reason_code"] == fc[0]["reason_code"]
         assert doc["evidence_source"] == "reason_code"
-        assert doc["primary_infra_component"] == "browser"
+        assert doc["primary_infra_component"] == component
+    assert derive_failure_attribution(_browser_lease_failure_category(expired, workflow_run))["failure_category"] == (
+        FailureCategory.BROWSER_SESSION_EXPIRED
+    )

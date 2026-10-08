@@ -1,5 +1,7 @@
 import type { BrowserPaneViewIntent } from "@/store/useStudioBrowserStore";
 
+import type { RunVisuals } from "./useRunVisuals";
+
 export type BrowserPaneView = "live" | "recording" | "screenshots";
 
 type ResolveBrowserPaneViewArgs = {
@@ -21,6 +23,11 @@ type ResolveBrowserPaneViewArgs = {
   runInDebugSession: boolean;
   running: boolean;
   hasRecording: boolean;
+  // Whether the header offers the Recording / Screenshots pill for this run.
+  recordingAvailable: boolean;
+  screenshotsAvailable: boolean;
+  // Live without a debug session is an open-ended "warming up" spinner.
+  hasDebugSession: boolean;
   failed: boolean;
 };
 
@@ -32,6 +39,21 @@ type ResolveLiveSurfaceArgs = {
   runInDebugSession: boolean;
   hasRunId: boolean;
 };
+
+// A pill is offered only once there is something behind it, running or not:
+// recordings land at finalize, screenshots as the run takes each action.
+export function resolveReplayAvailability(
+  visuals: Pick<
+    RunVisuals,
+    "recordingUrls" | "recordingArchived" | "hasScreenshots"
+  >,
+): { recordingAvailable: boolean; screenshotsAvailable: boolean } {
+  return {
+    recordingAvailable:
+      visuals.recordingUrls.length > 0 || visuals.recordingArchived,
+    screenshotsAvailable: visuals.hasScreenshots,
+  };
+}
 
 /**
  * What the Live view shows: the shared debug-session singleton, or the
@@ -53,8 +75,8 @@ export function resolveLiveSurface({
  * live while running, replay (recording/screenshots) on step-select or once the
  * inspected run finishes; system focus holds Live only while running or when
  * the run executed in the debug session. Without a run named in the URL (edit
- * context) the pane is live from the first frame — a booting debug session
- * shows its connecting state, never a flash of the latest run's replay.
+ * context) the pane is always live: replays only exist for an open run, so a
+ * stored pill intent or a latest-run step pin never surfaces one there.
  */
 export function resolveBrowserPaneView({
   intent,
@@ -66,25 +88,31 @@ export function resolveBrowserPaneView({
   runInDebugSession,
   running,
   hasRecording,
+  recordingAvailable,
+  screenshotsAvailable,
+  hasDebugSession,
   failed,
 }: ResolveBrowserPaneViewArgs): BrowserPaneView {
   // An active recording outranks everything, stored replay intents included:
   // the recorder is driving the live browser and must see it immediately.
-  if (recording) {
+  // With no run open there is nothing to replay (the header hides the pills).
+  if (recording || !inspectingRun) {
     return "live";
   }
-  if (intent === "live") {
+  // A finished run's Live view is the debug browser; without one it would be an
+  // endless "warming up", so a stored Live intent falls through to the replays.
+  if (intent === "live" && (running || hasDebugSession)) {
     return "live";
   }
-  // A pinned replay intent always presents its surface; when the run has no
-  // recording/screenshots (yet), the pane body renders the empty state.
-  if (intent === "recording") {
+  // A pinned replay intent presents its surface only while its pill is offered;
+  // a finished run with nothing to replay there falls through to the default.
+  if (intent === "recording" && recordingAvailable) {
     return "recording";
   }
-  if (intent === "screenshots") {
+  if (intent === "screenshots" && screenshotsAvailable) {
     return "screenshots";
   }
-  if (scrubbing) {
+  if (scrubbing && screenshotsAvailable) {
     return "screenshots";
   }
   // System focus keeps Live only while the run is still on that browser; a
@@ -98,10 +126,15 @@ export function resolveBrowserPaneView({
   if (running) {
     return "live";
   }
-  if (inspectingRun) {
-    return hasRecording && !failed ? "recording" : "screenshots";
+  if (hasRecording && !failed) {
+    return "recording";
   }
-  // Edit context: the live debug surface immediately (its boot shows the
-  // connecting state); the latest run's replays stay one pill-click away.
-  return "live";
+  if (screenshotsAvailable) {
+    return "screenshots";
+  }
+  if (recordingAvailable) {
+    return "recording";
+  }
+  // Nothing to replay: the debug browser if one exists, else the empty state.
+  return hasDebugSession ? "live" : "screenshots";
 }

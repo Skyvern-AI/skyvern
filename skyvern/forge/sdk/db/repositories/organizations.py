@@ -7,6 +7,7 @@ from typing import Literal, overload
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -264,7 +265,25 @@ class OrganizationsRepository(BaseRepository):
                 organization.default_secondary_llm_key = default_secondary_llm_key
             await session.commit()
             await session.refresh(organization)
+            remember_organization_created_at(organization.organization_id, organization.created_at)
             return Organization.model_validate(organization)
+
+    @db_operation("has_valid_org_auth_token")
+    async def has_valid_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> bool:
+        """Check token existence without decrypting its secret payload."""
+        async with self.Session() as session:
+            token_id = await session.scalar(
+                select(OrganizationAuthTokenModel.id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .filter_by(valid=True)
+                .limit(1)
+            )
+            return token_id is not None
 
     @overload
     async def get_valid_org_auth_token(
@@ -578,10 +597,10 @@ class OrganizationsRepository(BaseRepository):
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-    ) -> None:
-        """Invalidate all existing tokens of a specific type for an organization."""
+    ) -> int:
+        """Invalidate all existing tokens of a specific type for an organization; returns how many were valid."""
         async with self.Session() as session:
-            await session.execute(
+            result = await session.execute(
                 update(OrganizationAuthTokenModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(token_type=token_type)
@@ -589,6 +608,7 @@ class OrganizationsRepository(BaseRepository):
                 .values(valid=False)
             )
             await session.commit()
+            return result.rowcount
 
     @db_operation("invalidate_org_auth_token")
     async def invalidate_org_auth_token(

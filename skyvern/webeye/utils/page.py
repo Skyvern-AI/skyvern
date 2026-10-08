@@ -25,6 +25,7 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     ElementTreeBuildFailed,
     FailedToTakeScreenshot,
     ScreenshotTargetClosed,
@@ -36,11 +37,17 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.browser_runtime_events import (
+    BrowserRuntimeLogContext,
+    ScreenshotFailureOutcome,
+    log_screenshot_failure,
+)
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
 
@@ -1027,6 +1034,20 @@ async def _page_screenshot_helper(
                 pass
 
 
+async def _bounded_page_screenshot(
+    page: Page,
+    file_path: str | None,
+    full_page: bool,
+    timeout: float,
+    animations: Literal["allow", "disabled"],
+) -> bytes:
+    # The driver's own screenshot timeout has been seen not to fire for hours on an unresponsive page. The
+    # action deadline also re-cancels a driver that swallows the first cancellation and rejects a late image.
+    async with under_action_deadline(budget_ms=int(timeout)):
+        screenshot = await page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+    return screenshot
+
+
 async def _control_screenshot(
     page: Page,
     file_path: str | None,
@@ -1036,14 +1057,11 @@ async def _control_screenshot(
 ) -> bytes:
     """Current-main behavior: Playwright-first, raw-CDP rescue on timeout for the eligible path."""
     try:
-        return await page.screenshot(
-            path=file_path,
-            timeout=timeout,
-            full_page=full_page,
-            animations="disabled",
-        )
+        return await _bounded_page_screenshot(page, file_path, full_page, timeout, animations="disabled")
     except Exception as timeout_error:
-        if not is_engine_timeout(timeout_error, engine_selection):
+        # A driver that left its own timeout unanswered would leave the rescue and the retry, which go
+        # through it too, unanswered as well.
+        if isinstance(timeout_error, ActionDeadlineExceeded) or not is_engine_timeout(timeout_error, engine_selection):
             raise
         if page.is_closed():
             raise
@@ -1073,12 +1091,7 @@ async def _control_screenshot(
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
         )
-        return await page.screenshot(
-            path=file_path,
-            timeout=timeout,
-            full_page=full_page,
-            animations="allow",
-        )
+        return await _bounded_page_screenshot(page, file_path, full_page, timeout, animations="allow")
 
 
 _monotonic = time.monotonic  # test seam: monkeypatch page_module._monotonic, never the time module
@@ -1108,7 +1121,9 @@ async def _cdp_first_screenshot(
     time consumes the caller budget before the fallback's remaining ms are computed; it is deliberately
     not clipped to the remaining budget because cleanup ownership must complete. Worst case the
     caller-visible tail exceeds the deadline by at most the detach bound, and if detach spends the
-    remaining budget the fallback is truthfully skipped."""
+    remaining budget the fallback is truthfully skipped. A fallback whose driver never answers its own
+    timeout ends at the action deadline, which adds ``ACTION_DEADLINE_HEADROOM_MS`` to that tail, plus one
+    re-cancel interval for each cancellation the driver swallows."""
     deadline = _monotonic() + max(timeout, 0.0) / 1000.0
     rescued = await _cdp_rescue_screenshot(
         page=page,
@@ -1147,16 +1162,11 @@ async def _cdp_first_screenshot(
         )
     started = time.time()
     try:
-        screenshot = await page.screenshot(
-            path=file_path,
-            timeout=remaining_ms,
-            full_page=False,
-            animations="disabled",
-        )
+        screenshot = await _bounded_page_screenshot(page, file_path, False, remaining_ms, animations="disabled")
     except Exception as exc:
         if page.is_closed() or _is_screenshot_target_closed(exc, engine_selection):
             outcome = ScreenshotOutcome.TARGET_CLOSED
-        elif is_engine_timeout(exc, engine_selection):
+        elif isinstance(exc, ActionDeadlineExceeded) or is_engine_timeout(exc, engine_selection):
             outcome = ScreenshotOutcome.TIMEOUT
         else:
             outcome = ScreenshotOutcome.ERROR
@@ -1260,12 +1270,12 @@ async def _current_viewpoint_screenshot_helper(
         skyvern_context.record_browser_success()
         return screenshot
     except Exception as e:
-        # ScreenshotTargetClosed / _ScreenshotDeadlineExceeded are our own canonical signals, not driver
-        # errors, so a pinned engine's is_engine_error rejects them; exempt them here so they reach the
-        # established terminal mapper (target_closed / timeout) instead of being re-raised untelemetered.
+        # ScreenshotTargetClosed / _ScreenshotDeadlineExceeded / ActionDeadlineExceeded are our own canonical
+        # signals, not driver errors, so a pinned engine's is_engine_error rejects them; exempt them here so they
+        # reach the established terminal mapper (target_closed / timeout) instead of being re-raised untelemetered.
         if (
             engine_selection is not None
-            and not isinstance(e, (_ScreenshotDeadlineExceeded, ScreenshotTargetClosed))
+            and not isinstance(e, (_ScreenshotDeadlineExceeded, ActionDeadlineExceeded, ScreenshotTargetClosed))
             and not _is_engine_error(e, engine_selection)
         ):
             raise
@@ -1287,7 +1297,9 @@ async def _current_viewpoint_screenshot_helper(
                 ),
             )
             raise ScreenshotTargetClosed(error_message=str(e)) from e
-        if isinstance(e, _ScreenshotDeadlineExceeded) or is_engine_timeout(e, engine_selection):
+        if isinstance(e, (_ScreenshotDeadlineExceeded, ActionDeadlineExceeded)) or is_engine_timeout(
+            e, engine_selection
+        ):
             skyvern_context.record_browser_timeout(BrowserOperation.SCREENSHOT)
             LOG.warning(
                 "Screenshot timeout",
@@ -1506,6 +1518,7 @@ async def _scrolling_screenshots_helper(
     max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
     engine_selection: BrowserEngineSelection | None = None,
+    partial_frames: list[tuple[bytes, int]] | None = None,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
     skyvern_page = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
@@ -1547,6 +1560,8 @@ async def _scrolling_screenshots_helper(
             )
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
+            if partial_frames is not None:
+                partial_frames.append((screenshot, int(scroll_y_px)))
             scroll_y_px_old = scroll_y_px
             LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
             scroll_y_px = await skyvern_page.scroll_to_next_page(
@@ -1635,6 +1650,51 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
             merged_img.close()
 
     return merged_img
+
+
+def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -> bytes:
+    images: list[Image.Image] = []
+    merged_img: Image.Image | None = None
+    buffer: BytesIO | None = None
+    try:
+        for screenshot in screenshots:
+            with Image.open(BytesIO(screenshot)) as img:
+                img.load()
+                images.append(img)
+
+        merged_img = _merge_images_by_position(images, positions)
+
+        buffer = BytesIO()
+        merged_img.save(buffer, format="PNG")
+        buffer.seek(0)
+        return buffer.read()
+    finally:
+        # The decoded images, stitched image, and PNG buffer land in reference cycles that
+        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
+        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
+        _close_screenshot_stitch_resources(images, merged_img, buffer)
+        if len(images) > 1:
+            gc.collect()
+
+
+def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:
+    positions = [position for _, position in partial_frames]
+    try:
+        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames], positions)
+    except Exception:
+        LOG.warning(
+            "Failed to stitch the viewports captured before the scrolling screenshot timed out",
+            frame_count=len(positions),
+            exc_info=True,
+        )
+        return None
+    LOG.warning(
+        "Scrolling screenshot timed out; keeping the viewports captured so far",
+        incomplete_reason="capture_timeout",
+        frame_count=len(positions),
+        scroll_positions=positions,
+    )
+    return png
 
 
 def _close_screenshot_stitch_resources(
@@ -2086,6 +2146,19 @@ def pop_destination_facts(nodes: object) -> dict[str, dict]:
     return facts
 
 
+@dataclasses.dataclass(frozen=True)
+class ElementScrollMetrics:
+    scroll_top: float
+    client_height: float
+    scroll_height: float
+
+    @property
+    def at_bottom(self) -> bool:
+        # Fractional device-pixel ratios leave scroll_top + client_height a sub-pixel short of
+        # scroll_height even when the container is really scrolled all the way down.
+        return self.scroll_top + self.client_height >= self.scroll_height - 1
+
+
 class SkyvernFrame:
     engine_selection: BrowserEngineSelection | None = None
 
@@ -2505,10 +2578,62 @@ class SkyvernFrame:
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
         scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         engine_selection: BrowserEngineSelection | None = None,
+        runtime_context: BrowserRuntimeLogContext | None = None,
+        keep_partial_on_timeout: bool = False,
     ) -> bytes:
         """``timeout`` is milliseconds and is one deadline for frame setup, capture, fallback and the scroll restore.
-        Expiry raises TimeoutError; helper cleanup (CDP detach drain, cursor re-show) is separately bounded and may
-        overshoot by that bound."""
+        Expiry raises TimeoutError, unless ``keep_partial_on_timeout`` is set and at least one viewport was captured:
+        those viewports are then stitched and returned (not written to ``file_path``). Helper cleanup (CDP detach
+        drain, cursor re-show) is separately bounded and may overshoot by that bound. ``runtime_context`` is the
+        owning browser's, for its runtime dimensions only."""
+        context = BrowserRuntimeLogContext.current()
+        started = _monotonic()
+        partial_frames: list[tuple[bytes, int]] | None = [] if keep_partial_on_timeout else None
+        try:
+            return await SkyvernFrame._take_scrolling_screenshot(
+                page=page,
+                file_path=file_path,
+                timeout=timeout,
+                mode=mode,
+                scrolling_number=scrolling_number,
+                engine_selection=engine_selection,
+                partial_frames=partial_frames,
+            )
+        except Exception as exc:
+            # Observe only the terminal request, after local timeout conversion and all fallbacks;
+            # caller-owned cancellation bypasses this handler, and telemetry cannot replace the error.
+            with contextlib.suppress(Exception):
+                outcome: ScreenshotFailureOutcome = "other_error"
+                failure = exc.__cause__ if isinstance(exc, FailedToTakeScreenshot) and exc.__cause__ else exc
+                if isinstance(exc, ScreenshotTargetClosed) or _is_screenshot_target_closed(failure, engine_selection):
+                    outcome = "target_closed"
+                elif isinstance(
+                    failure, (TimeoutError, _ScreenshotDeadlineExceeded, ActionDeadlineExceeded)
+                ) or is_engine_timeout(failure, engine_selection):
+                    outcome = "timeout"
+                log_screenshot_failure(
+                    LOG,
+                    context=context.with_browser_dimensions_of(runtime_context),
+                    outcome=outcome,
+                    timeout_ms=timeout,
+                    elapsed_ms=(_monotonic() - started) * 1000,
+                )
+            if partial_frames and isinstance(exc, TimeoutError):
+                partial = _stitch_partial_frames(partial_frames)
+                if partial is not None:
+                    return partial
+            raise
+
+    @staticmethod
+    async def _take_scrolling_screenshot(
+        page: Page,
+        file_path: str | None,
+        timeout: float,
+        mode: ScreenshotMode,
+        scrolling_number: int,
+        engine_selection: BrowserEngineSelection | None,
+        partial_frames: list[tuple[bytes, int]] | None = None,
+    ) -> bytes:
         if scrolling_number <= 0:
             return await _current_viewpoint_screenshot_helper(
                 page=page,
@@ -2534,8 +2659,9 @@ class SkyvernFrame:
         skyvern_frame: SkyvernFrame | None = None
         x: int | None = None
         y: int | None = None
+        capture_timeout = asyncio.timeout_at(deadline)
         try:
-            async with asyncio.timeout_at(deadline):
+            async with capture_timeout:
                 skyvern_frame = await SkyvernFrame.create_instance(frame=page, engine_selection=engine_selection)
                 try:
                     x, y = await skyvern_frame.get_scroll_x_y()
@@ -2544,41 +2670,20 @@ class SkyvernFrame:
                         mode=mode,
                         max_number=scrolling_number,
                         engine_selection=engine_selection,
+                        partial_frames=partial_frames,
                     )
-                    images: list[Image.Image] = []
-                    merged_img: Image.Image | None = None
-                    buffer: BytesIO | None = None
-                    try:
-                        for screenshot in screenshots:
-                            with Image.open(BytesIO(screenshot)) as img:
-                                img.load()
-                                images.append(img)
+                    img_data = _stitch_screenshots_to_png(screenshots, positions)
+                    if file_path is not None:
+                        with open(file_path, "wb") as f:
+                            f.write(img_data)
 
-                        merged_img = _merge_images_by_position(images, positions)
-
-                        buffer = BytesIO()
-                        merged_img.save(buffer, format="PNG")
-                        buffer.seek(0)
-
-                        img_data = buffer.read()
-                        if file_path is not None:
-                            with open(file_path, "wb") as f:
-                                f.write(img_data)
-
-                        end_time = time.time()
-                        LOG.debug(
-                            "Full page screenshot taking time",
-                            screenshot_time=end_time - start_time,
-                            file_path=file_path,
-                        )
-                        return img_data
-                    finally:
-                        # The decoded images, stitched image, and PNG buffer land in reference cycles that
-                        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
-                        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
-                        _close_screenshot_stitch_resources(images, merged_img, buffer)
-                        if len(images) > 1:
-                            gc.collect()
+                    end_time = time.time()
+                    LOG.debug(
+                        "Full page screenshot taking time",
+                        screenshot_time=end_time - start_time,
+                        file_path=file_path,
+                    )
+                    return img_data
                 except ScreenshotTargetClosed:
                     # The fallback below captures the same page, so a closed target can only fail there too.
                     x = None
@@ -2598,6 +2703,11 @@ class SkyvernFrame:
                         full_page=True,
                         engine_selection=engine_selection,
                     )
+        except TimeoutError:
+            # Only this capture's own deadline may keep the captured viewports.
+            if partial_frames is not None and not capture_timeout.expired():
+                partial_frames.clear()
+            raise
         finally:
             if skyvern_frame is not None and x is not None and y is not None:
                 # Courtesy restore of the pre-screenshot scroll position, kept outside the deadline block so a
@@ -2728,6 +2838,24 @@ class SkyvernFrame:
         return await self.evaluate(
             frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
         )
+
+    async def get_element_scroll_metrics(self, element: ElementHandle) -> ElementScrollMetrics:
+        js_script = "(element) => [element.scrollTop, element.clientHeight, element.scrollHeight]"
+        scroll_top, client_height, scroll_height = await self.evaluate(
+            frame=self.frame, engine_selection=self.engine_selection, expression=js_script, arg=element
+        )
+        return ElementScrollMetrics(
+            scroll_top=scroll_top,
+            client_height=client_height,
+            scroll_height=scroll_height,
+        )
+
+    async def safe_get_element_scroll_metrics(self, element: ElementHandle) -> ElementScrollMetrics | None:
+        try:
+            return await self.get_element_scroll_metrics(element)
+        except Exception:
+            LOG.warning("Failed to read the element scroll metrics, ignore it", exc_info=True)
+            return None
 
     async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
         js_script = with_dom_utils(

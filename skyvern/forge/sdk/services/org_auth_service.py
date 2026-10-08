@@ -17,9 +17,11 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.request_logging import set_request_organization
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
+from skyvern.forge.sdk.services.request_principal import resolve_request_principal
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
@@ -177,6 +179,7 @@ async def get_current_org(
             app.DATABASE,
             user_agent=user_agent,
             fern_language=x_fern_language,
+            authorization=authorization,
         )
     elif authorization:
         organization = await authenticate_helper(
@@ -200,18 +203,20 @@ def apply_request_org_context(organization: Organization) -> None:
     short-circuits the per-helper context-setting — still leaves a consistent
     request-scoped identity for downstream routes and for request logging.
     """
-    age_bucket = skyvern_context.ORG_AGE_BUCKET_UNKNOWN
+    org_age = None
     try:
-        age_bucket = skyvern_context.compute_org_age_bucket(organization.created_at)
+        org_age = skyvern_context.compute_org_age(organization.created_at)
+        # An authenticated org may come from an auth cache rather than a fresh row load.
+        remember_organization_created_at(organization.organization_id, organization.created_at)
         ctx = skyvern_context.current()
         if ctx:
             ctx.organization_id = organization.organization_id
             ctx.organization_name = organization.organization_name
-            ctx.org_age_bucket = age_bucket
+            ctx.org_age = org_age
     except Exception:
         pass
     # The request-logging middleware sits outside skyvern_context, so it needs its own stamp.
-    set_request_organization(organization.organization_id, organization.organization_name, age_bucket)
+    set_request_organization(organization.organization_id, organization.organization_name, org_age)
     if not settings.OTEL_ENABLED:
         return
     try:
@@ -276,6 +281,11 @@ async def _get_current_org_for_token_types(
         fern_language=fern_language,
     )
     apply_request_org_context(validation.organization)
+    await resolve_request_principal(
+        validation.organization.organization_id,
+        api_key_type=_api_key_type(_decode_token_before_cache(x_api_key)),
+        bearer_token=_extract_bearer_token(authorization),
+    )
     return validation.organization
 
 
@@ -346,13 +356,15 @@ async def get_current_org_with_authentication(
     )
 
 
-def _extract_bearer_token(authorization: str) -> str | None:
+def _extract_bearer_token(authorization: str | None) -> str | None:
     """Return the bearer token, or None for any other scheme.
 
     Self-hosted deployments commonly gate the UI origin with HTTP basic auth, so the browser
     attaches ``Authorization: Basic ...`` to same-origin API calls too. Treating that as a
     Skyvern token rejects the request with an auth-method error that hides the real cause.
     """
+    if not authorization:
+        return None
     scheme, separator, token = authorization.partition(" ")
     if not separator or scheme.lower() != "bearer":
         return None
@@ -361,6 +373,15 @@ def _extract_bearer_token(authorization: str) -> str | None:
 
 
 async def authenticate_helper(
+    authorization: str,
+    attribution_header: str | None = None,
+) -> Organization:
+    organization = await _authenticate_bearer_organization(authorization, attribution_header)
+    await resolve_request_principal(organization.organization_id, bearer_token=_extract_bearer_token(authorization))
+    return organization
+
+
+async def _authenticate_bearer_organization(
     authorization: str,
     attribution_header: str | None = None,
 ) -> Organization:
@@ -405,6 +426,7 @@ async def get_current_user_id(
             app.DATABASE,
             user_agent=user_agent,
             fern_language=x_fern_language,
+            authorization=authorization,
         )
         if organization:
             return f"{organization.organization_id}_user"
@@ -438,6 +460,7 @@ async def get_current_user_id_or_none(
                 app.DATABASE,
                 user_agent=user_agent,
                 fern_language=x_fern_language,
+                authorization=authorization,
             )
             is_member = await app.AGENT_FUNCTION.validate_user_organization_membership(
                 user_id=user_id,
@@ -724,12 +747,18 @@ def _claims_ui_session(payload: dict[str, object] | None) -> bool:
     return payload is not None and payload.get("token_type") == OrganizationAuthTokenType.ui_session.value
 
 
+def _api_key_type(payload: dict[str, object] | None) -> OrganizationAuthTokenType:
+    # Safe once the key has authenticated: a ui_session row is only accepted with this signed claim.
+    return OrganizationAuthTokenType.ui_session if _claims_ui_session(payload) else OrganizationAuthTokenType.api
+
+
 async def get_current_org_cached(
     x_api_key: str,
     db: AgentDB,
     *,
     user_agent: str | None = None,
     fern_language: str | None = None,
+    authorization: str | None = None,
 ) -> Organization:
     payload = _decode_token_before_cache(x_api_key)
     _validate_token_expiry_before_cache(payload)
@@ -750,6 +779,11 @@ async def get_current_org_cached(
             fern_language=fern_language,
         )
     apply_request_org_context(organization)
+    await resolve_request_principal(
+        organization.organization_id,
+        api_key_type=_api_key_type(payload),
+        bearer_token=_extract_bearer_token(authorization),
+    )
     return organization
 
 
@@ -791,6 +825,7 @@ async def get_current_caller_context(
             app.DATABASE,
             user_agent=user_agent,
             fern_language=x_fern_language,
+            authorization=authorization,
         )
         apply_request_org_context(organization)
         # x-user-agent is spoofable and is NOT an access-control check —
@@ -815,9 +850,11 @@ async def get_current_caller_context(
         # concurrently so JWT validation cost is paid in parallel, not serially.
         user_id, organization = await asyncio.gather(
             authenticate_user_helper(authorization),
-            authenticate_helper(authorization),
+            _authenticate_bearer_organization(authorization),
         )
         apply_request_org_context(organization)
+        # Resolved here, not in the gathered task: a context write there would not reach this task.
+        await resolve_request_principal(organization.organization_id, bearer_token=_extract_bearer_token(authorization))
         return CallerContext(
             organization=organization,
             caller_id=user_id,

@@ -1,6 +1,7 @@
 import abc
 import ast
 import functools
+import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass, field
@@ -8,10 +9,13 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from pydantic import (
     BaseModel,
     Field,
     StrictInt,
+    StringConstraints,
     TypeAdapter,
     ValidationError,
     field_serializer,
@@ -32,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
@@ -88,6 +93,11 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
         if llm_key and llm_key not in reverse_mapping:
             reverse_mapping[llm_key] = model_name
     return reverse_mapping
+
+
+ENGINE_PINNED_DESCRIPTION = (
+    "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
 
 
 class _LLMSelectionBlock(Protocol):
@@ -514,6 +524,7 @@ class BlockType(StrEnum):
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
     DATA_EXPORT = "data_export"
+    TERMINATE = "terminate"
 
 
 class AIFallbackMode(StrEnum):
@@ -556,6 +567,8 @@ class BlockResult:
     # False when retry/continuation cannot change the outcome, such as invalid
     # CodeBlock source that fails before execution.
     can_continue_after_failure: bool = True
+    # A failed CodeBlock's failing tab showed a sign-in form. Kept off the output so templates never see it.
+    sign_in_form_visible: bool = False
 
 
 class FileType(StrEnum):
@@ -836,7 +849,8 @@ class TaskBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | str | None = None
@@ -1089,6 +1103,22 @@ class CodeBlockYAML(BlockYAML):
         default=None,
         description="Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored",
     )
+    data_schema: dict[str, Any] | list | str | None = Field(
+        default=None,
+        description="JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing",
+    )
+    user_owned_goal: bool | None = Field(
+        default=None,
+        description="True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    goal_needs_regeneration: bool | None = Field(
+        default=None,
+        description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    code_edited_by_hand: bool | None = Field(
+        default=None,
+        description="True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -1229,7 +1259,8 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -1244,7 +1275,8 @@ class ActionBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     selector: str | None = None
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
@@ -1267,7 +1299,8 @@ class NavigationBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1292,7 +1325,8 @@ class ExtractionBlockYAML(BlockYAML):
     data_extraction_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1312,7 +1346,8 @@ class LoginBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -1357,6 +1392,40 @@ class DataExportBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class TerminateBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.TERMINATE] = BlockType.TERMINATE  # type: ignore
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
+        description="Why the run ends here; supports Jinja templating."
+    )
+    error_code: str | None = Field(
+        default=None,
+        description=(
+            "Optional error code added to the run's error codes; supports Jinja templating. "
+            "A literal code must be at most 128 characters. The rendered code must be at most 128 characters "
+            "and may contain only ASCII letters, digits, underscores, periods, colons, and hyphens."
+        ),
+    )
+
+    @field_validator("error_code", mode="before")
+    @classmethod
+    def normalize_error_code(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if re.search(r"\{[{%#]", value):
+            if _contains_unicode_category_c(value):
+                raise ValueError("error code keys must not contain Unicode category-C characters")
+            return value
+        if unusable := error_code_key_error(value):
+            raise ValueError(unusable)
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError(
+                "literal error codes may contain only ASCII letters, digits, underscores, periods, colons, and hyphens"
+            )
+        return value
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -1385,7 +1454,8 @@ class FileDownloadBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1444,8 +1514,21 @@ class WebSearchBlockYAML(BlockYAML):
     query: str = Field(min_length=1)
     provider: Literal["auto", "google", "exa"] = "auto"
     num_results: int = Field(default=10, ge=1, le=100, strict=True)
-    no_results_error_code: str | None = Field(default=None, min_length=1, max_length=100)
-    no_match_error_code: str | None = Field(default=None, min_length=1, max_length=100)
+    no_results_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    no_match_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    error_code_mapping: dict[str, str] | None = None
     prompt: str | None = None
     json_schema: dict[str, Any] | None = None
     parameter_keys: list[str] | None = None
@@ -1458,6 +1541,25 @@ class WebSearchBlockYAML(BlockYAML):
     def validate_no_match_error_code_prompt(self) -> "WebSearchBlockYAML":
         _validate_no_match_error_code_prompt(self.no_match_error_code, self.prompt)
         return self
+
+    @field_validator("json_schema")
+    @classmethod
+    def validate_search_schema(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        def contains_template(item: Any) -> bool:
+            if isinstance(item, str):
+                return "{{" in item or "{%" in item
+            if isinstance(item, dict):
+                return any(contains_template(key) or contains_template(val) for key, val in item.items())
+            if isinstance(item, list):
+                return any(contains_template(val) for val in item)
+            return False
+
+        if value is not None and not contains_template(value):
+            try:
+                Draft202012Validator.check_schema(value)
+            except SchemaError as exc:
+                raise ValueError(f"The Data Schema is not a valid JSON Schema: {exc.message.rstrip('.')}.") from exc
+        return value
 
 
 class HttpRequestBlockYAML(BlockYAML):
@@ -1614,6 +1716,7 @@ BLOCK_YAML_SUBCLASSES = (
     | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
     | DataExportBlockYAML
+    | TerminateBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
@@ -1706,6 +1809,16 @@ class WorkflowDefinitionYAML(BaseModel):
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates. Omit to keep the previous "
+        "version's settings; set to null to clear them.",
+    )
+
+    @field_validator("browser_settings")
+    @classmethod
+    def validate_browser_settings(cls, value: BrowserSettings | None) -> BrowserSettings | None:
+        return require_known_timezone(value)
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
@@ -1744,10 +1857,28 @@ class WorkflowCreateYAMLRequest(BaseModel):
         description="Durable browser recording to attach to the workflow version created by this save.",
     )
     description: str | None = None
-    proxy_location: ProxyLocation | GeoTarget | dict | None = None
-    webhook_callback_url: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
+    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
+    webhook_callback_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_verification_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
     persist_browser_session: bool = False
     reuse_browser_session: bool = False
     mask_secrets: bool | None = Field(
@@ -1763,8 +1894,20 @@ class WorkflowCreateYAMLRequest(BaseModel):
     is_saved_task: bool = False
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
-    extra_http_headers: dict[str, str] | None = None
-    cdp_connect_headers: dict[str, str] | None = None
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map. Values, including ***, are literal."
+        ),
+    )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map; each masked *** entry keeps the stored value for that key."
+        ),
+    )
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
     browser_type: str | None = Field(
@@ -1776,9 +1919,8 @@ class WorkflowCreateYAMLRequest(BaseModel):
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
-    # None = inherit from the existing workflow on update (mirrors code_version);
-    # treated as False on first create. Prevents older clients that omit the field
-    # from silently disabling self-healing on save.
+    # Kept for compatibility and has no runtime effect; None keeps the stored value on update
+    # and is treated as False on first create.
     enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False

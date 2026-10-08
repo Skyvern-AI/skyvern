@@ -1,6 +1,8 @@
 import json
+import os
 import socket
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urljoin
 
@@ -1000,3 +1002,76 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         assert result.success is True
         assert sent["data"] == {"password": "hunter2-secret"}
+
+
+class TestHttpRequestBlockLocalFileScope:
+    """A local `files` path may only name this run's downloads or this organization's local artifacts."""
+
+    @pytest.fixture
+    def local_tree(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+        downloads = tmp_path / "downloads"
+        artifacts = tmp_path / "artifacts"
+        monkeypatch.setattr(block_module.settings, "DOWNLOAD_PATH", str(downloads))
+        monkeypatch.setattr(block_module.settings, "ARTIFACT_STORAGE_PATH", str(artifacts))
+        env = block_module.settings.ENV
+        paths = {
+            "run_file": downloads / "wr-1" / "report.pdf",
+            "other_run_file": downloads / "wr-other" / "report.pdf",
+            "org_artifact": artifacts / env / "o_1" / "workflow_runs" / "shot.png",
+            "other_org_artifact": artifacts / env / "o_other" / "workflow_runs" / "shot.png",
+            "outside": tmp_path / "outside.txt",
+        }
+        for path in paths.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        symlink = downloads / "wr-1" / "escape.pdf"
+        symlink.symlink_to(paths["outside"])
+        resolved = {name: str(path) for name, path in paths.items()}
+        resolved["symlink_escape"] = str(symlink)
+        resolved["dotdot_escape"] = str(downloads / "wr-1" / ".." / "wr-other" / "report.pdf")
+        return resolved
+
+    async def _execute_with_file(
+        self, monkeypatch: pytest.MonkeyPatch, file_value: str
+    ) -> tuple[object, dict[str, object]]:
+        block = _http_block(url="https://api.example.com/upload", files={"doc": file_value})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(
+            HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: _make_context()
+        )
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1", organization_id="o_1")
+        return result, sent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "as_uri"),
+        [("run_file", False), ("run_file", True), ("org_artifact", False)],
+    )
+    async def test_file_inside_run_or_org_scope_is_sent(
+        self, local_tree: dict[str, str], monkeypatch: pytest.MonkeyPatch, name: str, as_uri: bool
+    ) -> None:
+        path = local_tree[name]
+        result, sent = await self._execute_with_file(monkeypatch, Path(path).as_uri() if as_uri else path)
+
+        assert result.success is True
+        assert sent["files"] == {"doc": os.path.realpath(path)}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name", ["other_run_file", "other_org_artifact", "outside", "symlink_escape", "dotdot_escape"]
+    )
+    async def test_file_outside_run_or_org_scope_is_refused(
+        self, local_tree: dict[str, str], monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        result, sent = await self._execute_with_file(monkeypatch, local_tree[name])
+
+        assert result.success is False
+        assert "No permission to access local file" in (result.failure_reason or "")
+        assert sent == {}

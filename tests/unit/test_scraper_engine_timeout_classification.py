@@ -19,6 +19,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.exceptions import NoElementFound, ScrapingFailed, ScrapingFailedBlankPage, SkyvernPageAnalysisTimeout
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -50,7 +51,11 @@ def _selection(name: str, error_type: type[BaseException], timeout_type: type[Ba
 
 
 def _browser_state(selection: BrowserEngineSelection | None) -> SimpleNamespace:
-    return SimpleNamespace(engine_selection=selection, get_working_page=AsyncMock(return_value=None))
+    return SimpleNamespace(
+        engine_selection=selection,
+        get_working_page=AsyncMock(return_value=None),
+        runtime_event_context=BrowserRuntimeLogContext(),
+    )
 
 
 async def _run_scrape_and_capture(browser_state: SimpleNamespace, error: BaseException) -> ScrapingFailed:
@@ -89,6 +94,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
             engine_selection=None,
             get_working_page=AsyncMock(return_value=None),
             must_get_working_page=AsyncMock(return_value=page),
+            runtime_event_context=BrowserRuntimeLogContext(browser_runtime="vendor", browser_vendor="vendor-a"),
         )
         cleanup_element_tree = AsyncMock()
         scrape_exclude = AsyncMock()
@@ -168,6 +174,9 @@ class TestScrapeWebsiteEmptyTreeRecovery:
         assert rig.scrape_web_unsafe.await_args_list == [call(**rig.unsafe_kwargs)] * 3
         rig.page.goto.assert_awaited_once_with("https://example.test/path", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         assert rig.sleep.await_args_list == [call(3), call(3)]
+        # The terminal line is a rendering-failure numerator; it must split by the browser's runtime.
+        terminal = rig.log.warning.call_args.kwargs
+        assert (terminal["browser_runtime"], terminal["browser_vendor"]) == ("vendor", "vendor-a")
 
     @pytest.mark.asyncio
     async def test_blank_page_failure_bypasses_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:

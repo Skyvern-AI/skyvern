@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.api.files import RUN_TEMP_NAMESPACE, get_run_temp_dir
+from skyvern.forge.sdk.api.files import RUN_TEMP_NAMESPACE, get_run_temp_dir, make_run_temp_directory
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 
 
 def test_run_temp_dir_is_namespaced_and_created(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -54,6 +56,24 @@ def test_run_temp_dir_refuses_symlinked_ancestors_out_of_temp(tmp_path: Path, mo
     assert not (outside / "wr_1").exists()
 
 
+def test_run_temp_directory_falls_back_when_the_run_folder_is_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A browser profile must still get a directory when its run folder cannot be made, never one outside TEMP_PATH.
+    temp = tmp_path / "temp"
+    outside = tmp_path / "outside"
+    (temp / RUN_TEMP_NAMESPACE).mkdir(parents=True)
+    outside.mkdir()
+    (temp / RUN_TEMP_NAMESPACE / "o_1").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(temp))
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", run_id="wr_1")):
+        profile_dir = Path(make_run_temp_directory(prefix="skyvern_browser_"))
+
+    assert profile_dir.parent == temp
+    assert list(outside.iterdir()) == []
+
+
 def test_temp_path_tenant_allowlist() -> None:
     """New per-run temp MUST go through ``get_run_temp_dir``; direct TEMP_PATH tenants are frozen.
 
@@ -88,10 +108,8 @@ def test_temp_path_tenant_allowlist() -> None:
         "skyvern/utils/files.py",
         # Session-scoped recording staging; reaped by unlink-after-sync at session close.
         "cloud/webeye/vendor_recording.py",
-        # Browser profile / user-data staging on launch lanes (single-run pods wipe TEMP_PATH).
-        "skyvern/webeye/browser_factory.py",
+        # Browser profile staging outside a run context (single-run pods wipe TEMP_PATH).
         "skyvern/forge/sdk/routes/browser_profiles.py",
-        "cloud/webeye/profile_cache.py",
         "cloud/browser_profile/banking.py",
     }
     allowed = {entry for entry in allowed if entry.split("/", 1)[0] in present_roots}

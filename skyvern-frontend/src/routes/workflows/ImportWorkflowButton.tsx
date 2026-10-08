@@ -16,6 +16,7 @@ import {
   ArchiveEntry,
   expandFileToWorkflowYamls,
   extractTitleFromYaml,
+  stripLegacyEngineFromYaml,
   unzipArchive,
 } from "./importWorkflowYaml";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -165,10 +166,22 @@ function ImportWorkflowButton({
     if (files.length === 0) {
       return;
     }
+    const stripped = files.map((f) => ({
+      ...f,
+      ...stripLegacyEngineFromYaml(f.yaml),
+    }));
     const results = await Promise.all(
-      files.map((f) => createWorkflowFromYaml(f.yaml, f.title ?? f.fileName)),
+      stripped.map((f) =>
+        createWorkflowFromYaml(f.yaml, f.title ?? f.fileName),
+      ),
     );
     const successCount = results.filter(Boolean).length;
+    // One toast shows at a time, so the reset notice rides on the success toast.
+    const resetNotice = stripped.some(
+      (f, i) => f.strippedLegacyEngines && results[i],
+    )
+      ? " Legacy engine settings were reset to Default."
+      : "";
     if (successCount > 0) {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
@@ -179,9 +192,10 @@ function ImportWorkflowButton({
             ? "Agent imported"
             : `${successCount} agents imported`,
         description:
-          successCount === files.length
-            ? "Successfully imported all agents"
-            : `${successCount} of ${files.length} agents imported successfully`,
+          (successCount === files.length
+            ? "Successfully imported all agents."
+            : `${successCount} of ${files.length} agents imported successfully.`) +
+          resetNotice,
       });
     }
   };

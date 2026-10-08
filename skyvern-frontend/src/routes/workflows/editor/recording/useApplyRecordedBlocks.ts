@@ -4,7 +4,14 @@ import { useEffect, useRef } from "react";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  reconcileYamlDraftAfterGraphChange,
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { AppNode } from "../nodes";
+import { resolveAppendInsertionPoint } from "../workspaceAuthoringActions";
 import { applyRecordedBlocksToGraph } from "./applyRecordedBlocksToGraph";
 
 type UseApplyRecordedBlocksArgs = {
@@ -20,6 +27,7 @@ function useApplyRecordedBlocks({
   edges,
   doLayout,
 }: UseApplyRecordedBlocksArgs) {
+  const recordedOwner = useRecordedBlocksStore((state) => state.owner);
   const recordedBlocks = useRecordedBlocksStore((state) => state.blocks);
   const recordedParameters = useRecordedBlocksStore(
     (state) => state.parameters,
@@ -34,14 +42,22 @@ function useApplyRecordedBlocks({
     (state) => state.clearRecordedBlocks,
   );
   const parameters = useWorkflowParametersStore((state) => state.parameters);
+  const isLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
 
   const appliedSignatureRef = useRef<string | null>(null);
   const awaitingClearRef = useRef(false);
 
   useEffect(() => {
-    if (!enabled) {
+    const current = useWorkflowYamlEditorStore.getState();
+    if (
+      !enabled ||
+      isLocked ||
+      current.commitInProgress ||
+      current.copilotAcceptance
+    ) {
       return;
     }
+    if (!recordedOwner?.active || recordedOwner !== current.editorOwner) return;
     if (!recordedBlocks?.length || !recordedInsertionPoint) {
       return;
     }
@@ -62,6 +78,17 @@ function useApplyRecordedBlocks({
       return;
     }
 
+    // A remounted workflow has new canvas IDs. Its upload can still append,
+    // but must not create edges pointing to the disposed canvas.
+    const insertionPoint =
+      (!recordedInsertionPoint.previous && !recordedInsertionPoint.next) ||
+      [
+        recordedInsertionPoint.previous,
+        recordedInsertionPoint.next,
+        recordedInsertionPoint.parent,
+      ].some((id) => id && !nodes.some((node) => node.id === id))
+        ? resolveAppendInsertionPoint(nodes, edges)
+        : recordedInsertionPoint;
     const {
       nodes: mergedNodes,
       edges: mergedEdges,
@@ -70,11 +97,13 @@ function useApplyRecordedBlocks({
       nodes,
       edges,
       recordedBlocks,
-      recordedInsertionPoint,
+      recordedInsertionPoint: insertionPoint,
       recordedParameters,
       existingParameters: parameters,
     });
 
+    useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+    reconcileYamlDraftAfterGraphChange();
     useWorkflowHasChangesStore.getState().setHasChanges(true);
     doLayout(mergedNodes, mergedEdges);
 
@@ -93,7 +122,9 @@ function useApplyRecordedBlocks({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     enabled,
+    isLocked,
     recordedBlocks,
+    recordedOwner,
     recordedInsertionPoint,
     applicationNonce,
     doLayout,
@@ -113,8 +144,11 @@ function useApplyRecordedBlocks({
   // the user navigates away right after a commit), the blocks must not survive
   // to be applied to whichever workflow canvas mounts next.
   useEffect(() => {
+    const owner = useWorkflowYamlEditorStore.getState().editorOwner;
     return () => {
-      useRecordedBlocksStore.getState().clearRecordedBlocks();
+      const recorded = useRecordedBlocksStore.getState();
+      if (!recorded.owner || recorded.owner === owner)
+        recorded.clearRecordedBlocks();
     };
   }, []);
 }

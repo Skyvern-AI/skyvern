@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import time
 import typing as t
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -15,6 +16,9 @@ from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
+    PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
+    PREWARM_DISPATCHED_RUNNABLE_TYPE,
+    PREWARM_PENDING_RUNNABLE_TYPE,
     DebugLoginBlockCompatibility,
     DebugSession,
     DebugSessionPrewarmRequest,
@@ -30,12 +34,10 @@ from skyvern.forge.sdk.workflow.service import (
     DEBUG_SESSION_PROFILE_REASON_DIFFERENT,
     DEBUG_SESSION_PROFILE_REASON_NO_PROFILE,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
-PREWARM_BOUND_WORKFLOW_PERMANENT_ID = "debug-session-prewarm"
-PREWARM_PENDING_RUNNABLE_TYPE = "debug_session_prewarm_pending"
-PREWARM_DISPATCHED_RUNNABLE_TYPE = "debug_session_prewarm_dispatched"
 BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
 
 
@@ -187,6 +189,8 @@ async def _claim_compatible_prewarm(
         debug_session_id=claimed.debug_session_id,
         browser_session_id=claimed.browser_session_id,
         workflow_permanent_id=workflow_permanent_id,
+        # The browser was created as editor_prewarm; from this claim on it serves the editor.
+        session_kind=BrowserSessionKind.editor,
     )
     return claimed
 
@@ -265,6 +269,8 @@ async def prewarm_debug_session(
             runnable_type=PREWARM_PENDING_RUNNABLE_TYPE,
             wait_for_startup=False,
             needs_live_view=True,
+            created_by=current_user_id,
+            session_kind=BrowserSessionKind.editor_prewarm,
         )
     except IntegrityError:
         return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -436,7 +442,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     if claimed_prewarm:
         return debug_session
 
-    LOG.info(
+    LOG.debug(
         "Existing debug session found",
         debug_session_id=debug_session.debug_session_id,
         browser_session_id=debug_session.browser_session_id,
@@ -549,7 +555,7 @@ async def new_debug_session(
     )
 
     if completed_debug_sessions and settings.ENV != "local":
-        closeable_browser_sessions: list[PersistentBrowserSession] = []
+        closeable_browser_sessions: list[tuple[PersistentBrowserSession, str]] = []
 
         for debug_session in completed_debug_sessions:
             try:
@@ -561,7 +567,7 @@ async def new_debug_session(
                 browser_session = None
 
             if browser_session and browser_session.completed_at is None:
-                closeable_browser_sessions.append(browser_session)
+                closeable_browser_sessions.append((browser_session, debug_session.debug_session_id))
 
         LOG.info(
             f"Closing browser {len(closeable_browser_sessions)} browser session(s)",
@@ -572,17 +578,21 @@ async def new_debug_session(
 
         def handle_close_browser_session_error(
             browser_session_id: str,
+            debug_session_id: str,
             organization_id: str,
             task: asyncio.Task,
         ) -> None:
             if task.exception():
                 LOG.error(
-                    f"Failed to close session: {task.exception()}",
+                    "Failed to close browser session for debug session",
                     browser_session_id=browser_session_id,
+                    debug_session_id=debug_session_id,
                     organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    error=str(task.exception()),
                 )
 
-        for browser_session in closeable_browser_sessions:
+        for browser_session, debug_session_id in closeable_browser_sessions:
             LOG.info(
                 "Closing existing browser session for debug session",
                 browser_session_id=browser_session.persistent_browser_session_id,
@@ -603,6 +613,7 @@ async def new_debug_session(
                 partial(
                     handle_close_browser_session_error,
                     browser_session.persistent_browser_session_id,
+                    debug_session_id,
                     current_org.organization_id,
                 )
             )
@@ -623,12 +634,30 @@ async def new_debug_session(
     )
     proxy_location = runtime_proxy_location(workflow.proxy_location)
 
-    new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+    browser_start_started_at = time.monotonic()
+    try:
+        new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=current_org.organization_id,
+            timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+            proxy_location=proxy_location,
+            wait_for_startup=settings.ENV != "local",
+            needs_live_view=True,
+            created_by=current_user_id,
+            session_kind=BrowserSessionKind.editor,
+        )
+    except Exception:
+        LOG.exception(
+            "Debug session browser startup failed",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        raise
+    LOG.info(
+        "Debug session browser ready",
         organization_id=current_org.organization_id,
-        timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=proxy_location,
-        wait_for_startup=settings.ENV != "local",
-        needs_live_view=True,
+        workflow_permanent_id=workflow_permanent_id,
+        browser_session_id=new_browser_session.persistent_browser_session_id,
+        duration_seconds=time.monotonic() - browser_start_started_at,
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(

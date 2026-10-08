@@ -2,10 +2,10 @@ import {
   DiscordLogoIcon,
   ExternalLinkIcon,
   GitHubLogoIcon,
-  PlusCircledIcon,
   ReaderIcon,
   StarIcon,
 } from "@radix-ui/react-icons";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import {
@@ -17,7 +17,7 @@ import { cn } from "@/util/utils";
 
 type Props = {
   collapsed: boolean;
-  addCreditsHref?: string;
+  billingLink?: { href: string; label: string; icon: ReactNode };
 };
 
 const links = [
@@ -45,7 +45,7 @@ const links = [
   },
 ];
 
-function SidebarResourceLinks({ collapsed, addCreditsHref }: Props) {
+function SidebarResourceLinks({ collapsed, billingLink }: Props) {
   const { data: starCount } = useGithubStarCount();
 
   return (
@@ -64,10 +64,10 @@ function SidebarResourceLinks({ collapsed, addCreditsHref }: Props) {
           "flex-col": !collapsed,
         })}
       >
-        {addCreditsHref ? (
+        {billingLink ? (
           <Link
-            to={addCreditsHref}
-            title={collapsed ? "Add credits" : undefined}
+            to={billingLink.href}
+            title={collapsed ? billingLink.label : undefined}
             className={cn(
               "group flex h-7 items-center rounded-md border border-green-500/30 bg-green-500/10 text-[13px] font-medium leading-5 text-green-700 antialiased shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] transition-colors duration-100 hover:bg-green-500/15 hover:text-green-800 dark:border-green-400/35 dark:bg-green-400/10 dark:text-green-300 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-green-400/20 dark:hover:text-green-200",
               {
@@ -77,10 +77,12 @@ function SidebarResourceLinks({ collapsed, addCreditsHref }: Props) {
             )}
           >
             <span className="flex size-4 shrink-0 items-center justify-center text-green-700 transition-colors duration-100 group-hover:text-green-800 dark:text-green-300 dark:group-hover:text-green-200">
-              <PlusCircledIcon className="size-4" />
+              {billingLink.icon}
             </span>
             {!collapsed ? (
-              <span className="min-w-0 flex-1 truncate">Add credits</span>
+              <span className="min-w-0 flex-1 truncate">
+                {billingLink.label}
+              </span>
             ) : null}
           </Link>
         ) : null}

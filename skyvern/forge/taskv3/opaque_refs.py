@@ -238,7 +238,7 @@ class OpaqueUrlRefs:
 
         return _URL_IN_TEXT_RE.sub(_mint, text)
 
-    def mask(self, text: str) -> str:
+    def mask(self, text: str, *, cut: bool = False) -> str:
         """Replace every occurrence of a known payload signed-URL in ``text`` with its opaque token —
         the inverse of resolve(). Masking is by PROVENANCE, not URL shape: only a URL we minted from
         the payload is rewritten, so a live-page URL the model must reason about is never touched, even
@@ -248,7 +248,7 @@ class OpaqueUrlRefs:
         Shares one implementation with the model-facing boundary (SkyvernContext.hide_from_model), so
         the pre-truncation surfaces (observe/get_html) and the universal tool-result boundary can never
         diverge."""
-        return mask_opaque_urls_in_text(text, self.refs)
+        return mask_opaque_urls_in_text(text, self.refs, cut=cut)
 
     def resolve_deep(self, value: Any) -> Any:
         if isinstance(value, str):

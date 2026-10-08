@@ -131,14 +131,14 @@ function ScrollableActionList({
             )}
             {action.summary?.outcome && (
               <div className="break-words text-xs text-slate-400">
-                <span className="text-slate-500">Outcome: </span>
+                <span className="text-slate-500">Result: </span>
                 {action.summary.outcome}
               </div>
             )}
             {action.type === ActionTypes.InputText && (
               <>
                 <Separator />
-                <div className="text-xs text-slate-400">
+                <div className="max-h-24 overflow-y-auto break-words text-xs text-slate-400">
                   Input: {action.input}
                 </div>
               </>

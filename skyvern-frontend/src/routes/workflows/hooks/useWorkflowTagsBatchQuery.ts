@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { useQuery } from "@tanstack/react-query";
 import {
   normalizeWorkflowTags,
@@ -18,11 +19,12 @@ function useWorkflowTagsBatchQuery(
   { enabled = true }: { enabled?: boolean } = {},
 ) {
   const credentialGetter = useCredentialGetter();
+  const taggingEnabled = useWorkflowTaggingEnabled();
   const sortedIds = [...workflowPermanentIds].sort();
 
   return useQuery({
     queryKey: ["workflow-tags", "batch", sortedIds],
-    enabled: enabled && sortedIds.length > 0,
+    enabled: enabled && taggingEnabled && sortedIds.length > 0,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const chunks: Array<Array<string>> = [];

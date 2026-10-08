@@ -15,6 +15,7 @@ from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
+from skyvern.webeye import action_deadline
 
 
 def _make_mock_page(url: str = "https://example.com", title: str = "Example", *, closed: bool = False) -> MagicMock:
@@ -220,12 +221,42 @@ async def test_tab_list_answers_within_its_bound_when_a_page_title_hangs(monkeyp
     _patch_get_page(monkeypatch, hanging, ctx)
     _patch_session(monkeypatch, _make_session_state(browser))
     monkeypatch.setattr(mcp_tabs, "TAB_TITLE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 50)
 
     result = await asyncio.wait_for(mcp_tabs.skyvern_tab_list(), timeout=5)
 
     assert result["ok"] is True
     assert result["data"]["tabs"][0]["title"] == ""
     assert result["data"]["tabs"][0]["url"] == "https://slow.com"
+
+
+@pytest.mark.asyncio
+async def test_tab_list_spends_one_title_budget_across_all_tabs(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _never_returns() -> str:
+        await asyncio.sleep(3600)
+        return "Slow"
+
+    pages = [_make_mock_page(f"https://slow{i}.com", "Slow") for i in range(3)]
+    for page in pages:
+        page.title = _never_returns
+    browser = _make_mock_browser(*pages)
+
+    ctx = BrowserContext(mode="local")
+    _patch_get_page(monkeypatch, pages[0], ctx)
+    _patch_session(monkeypatch, _make_session_state(browser))
+    monkeypatch.setattr(mcp_tabs, "TAB_TITLE_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(mcp_tabs, "DEFAULT_ACTION_TIMEOUT_MS", 200)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 50)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_tabs.skyvern_tab_list()
+    elapsed = loop.time() - started
+
+    assert result["ok"] is True
+    assert [tab["title"] for tab in result["data"]["tabs"]] == ["", "", ""]
+    assert [tab["url"] for tab in result["data"]["tabs"]] == [f"https://slow{i}.com" for i in range(3)]
+    assert elapsed < 2.0
 
 
 @pytest.mark.asyncio

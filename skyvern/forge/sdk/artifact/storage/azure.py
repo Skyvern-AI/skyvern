@@ -346,7 +346,7 @@ class AzureStorage(BaseStorage):
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        # Artifact-first when keyring is configured — see s3.py for rationale.
+        # Artifact-first when the keyring is configured. Unlike S3, Azure still lists blobs when there are no rows.
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
                 artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
@@ -363,7 +363,7 @@ class AzureStorage(BaseStorage):
                 )
                 artifacts = []
             # Filter out in-progress partials — user-facing listing must only
-            # show completed downloads. Mirrors s3.py.
+            # show completed downloads.
             artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
             if artifacts:
                 return await _file_infos_from_download_artifacts(artifacts)
@@ -434,9 +434,9 @@ class AzureStorage(BaseStorage):
     ) -> list[FileInfo]:
         """Get recording files for a browser session.
 
-        Artifact-first when the keyring is configured — see s3.py for the
-        rationale. Falls back to direct Azure LIST + SAS URLs for legacy
-        sessions and OSS-default deployments.
+        Artifact-first when the keyring is configured. Unlike S3, falls back to
+        direct Azure LIST + SAS URLs when there are no rows, as well as when the
+        lookup raises or the keyring is unset (OSS default).
         """
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
@@ -666,10 +666,8 @@ class AzureStorage(BaseStorage):
     async def get_downloaded_files(
         self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
     ) -> list[FileInfo]:
-        # Artifact-first — see s3.py::get_downloaded_files for rationale. When
-        # the keyring isn't configured (OSS default) or no artifact rows exist
-        # (legacy run pre-SKY-8861) we fall back to the legacy listing path so
-        # downloaded files remain reachable.
+        # Artifact-first when the keyring is configured. Unlike S3, Azure lists blobs when the keyring is unset or
+        # the run has no artifact rows, so files saved before rows existed stay reachable.
         download_artifacts: list[Artifact] | None = None
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             download_artifacts = await self._list_download_artifacts_safe(

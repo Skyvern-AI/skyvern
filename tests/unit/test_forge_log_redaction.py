@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import enum
 import io
@@ -13,8 +14,8 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from decimal import Decimal
 from logging.handlers import BufferingHandler
-from types import MappingProxyType
-from unittest.mock import AsyncMock
+from types import MappingProxyType, ModuleType
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
@@ -31,14 +32,21 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
-from skyvern.forge.sdk import log_artifacts
+from skyvern.forge.sdk import forge_log, log_artifacts
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    clear_session_scrub_values,
+    register_secret_scrub_value,
+    scrub_secrets_from_text,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import (
     CODEBLOCK_LOG_REDACTED,
+    _generated_log_value,
     _GeneratedLogValue,
     add_filename_section,
     add_log_context,
@@ -165,12 +173,38 @@ def test_proxy_field_families_render_by_semantics() -> None:
 @pytest.fixture(autouse=True)
 def _isolate_session_scrub_registry() -> Iterator[None]:
     secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_CHAT_IDS.clear()
     yield
     secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_CHAT_IDS.clear()
 
 
 def _register_credential(value: str) -> None:
     secret_scrub._SESSION_SCRUB_VALUES.setdefault("pbs_1", []).append(value)
+
+
+def _copilot_turn(browser_session_id: str = "pbs_1") -> AgentContext:
+    return AgentContext(
+        organization_id="o_1",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        workflow_yaml="",
+        browser_session_id=browser_session_id,
+        stream=MagicMock(),
+    )
+
+
+def _register_in_copilot_turn(*values: str) -> SkyvernContext:
+    """Register values the way a Copilot tool does, inside its own request; returns that request."""
+    request = SkyvernContext(request_id="req_copilot", copilot_session_id="wcc_1")
+    with skyvern_context.scoped(request):
+        for value in values:
+            register_secret_scrub_value(_copilot_turn(), value)
+    return request
+
+
+def _request_log_line() -> dict[str, object]:
+    return {"event": "request", "path": "/v1/credentials", "status_code": 401, "duration_seconds": 0.0123, "attempt": 1}
 
 
 def test_redacts_url_encoded_bearer_token() -> None:
@@ -272,6 +306,105 @@ def test_redacts_a_credential_inside_a_tuple_value() -> None:
     out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
 
     assert out["pair"] == ("user", REDACTED_SECRET_PLACEHOLDER)
+
+
+def test_a_short_value_from_another_session_leaves_unrelated_request_lines_alone() -> None:
+    _register_in_copilot_turn("1")
+    line = _request_log_line()
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated", browser_session_id="pbs_2")):
+        out = redact_registered_secrets(None, "info", dict(line))  # type: ignore[arg-type]
+
+    assert out == line
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "registering_request",
+        "registering_request_after_close",
+        "same_browser_session",
+        "same_chat",
+        "reader",
+        "reader_after_context_replaced",
+    ],
+)
+def test_a_short_value_is_still_scrubbed_on_its_own_sessions_lines(scope: str) -> None:
+    request = _register_in_copilot_turn("1")
+    if scope == "registering_request_after_close":
+        clear_session_scrub_values("pbs_1")
+    line_context = {
+        "registering_request": request,
+        "registering_request_after_close": request,
+        "same_browser_session": SkyvernContext(request_id="req_run", browser_session_id="pbs_1"),
+        "same_chat": SkyvernContext(request_id="req_next_turn", copilot_session_id="wcc_1"),
+        "reader": SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"),
+        "reader_after_context_replaced": SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"),
+    }[scope]
+
+    with skyvern_context.scoped(line_context):
+        if scope.startswith("reader"):
+            # Another chat's turn on the same browser scrubs a readback with the session's values.
+            scrub_secrets_from_text(_copilot_turn(), "readback")
+        if scope == "reader":
+            clear_session_scrub_values("pbs_1")
+        if scope == "reader_after_context_replaced":
+            # prepare_workflow swaps in a context that keeps only the request's chat id.
+            skyvern_context.replace(SkyvernContext(request_id="req_other_chat", copilot_session_id="wcc_2"))
+        out = redact_registered_secrets(None, "info", _request_log_line())  # type: ignore[arg-type]
+
+    assert out["path"] == f"/v{REDACTED_SECRET_PLACEHOLDER}/credentials"
+    assert out["attempt"] == REDACTED_SECRET_PLACEHOLDER
+    assert out["status_code"] == 401
+
+
+def test_a_value_from_another_session_applies_from_four_characters() -> None:
+    _register_in_copilot_turn(_FAKE_CREDENTIAL, "q7x", "z9k4", "48392017")
+    event = {"event": f"login failed for {_FAKE_CREDENTIAL}", "codes": "aq7xb xz9k4x", "code": 48392017}
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_unrelated")):
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["event"] == f"login failed for {REDACTED_SECRET_PLACEHOLDER}"
+    assert out["codes"] == f"aq7xb x{REDACTED_SECRET_PLACEHOLDER}x"
+    assert out["code"] == REDACTED_SECRET_PLACEHOLDER
+
+
+@pytest.mark.parametrize("request_context", [None, SkyvernContext(request_id="req_unrelated")])
+def test_a_short_value_from_another_session_is_still_scrubbed_as_a_whole_token(
+    request_context: SkyvernContext | None,
+) -> None:
+    _register_in_copilot_turn("123", "401", "1", "10", "45", "#7")
+    masked = REDACTED_SECRET_PLACEHOLDER
+    scrubbed = {
+        '{"value":"123","cvv": 123,"status":"401"}': f'{{"value":"{masked}","cvv": {masked},"status":"{masked}"}}',
+        "%22123%22": f"%22{masked}%22",
+        "line\\n123": f"line\\n{masked}",
+        "\\u0022123\\u0022": f"\\u0022{masked}\\u0022",
+        "code=x#7": f"code=x{masked}",
+    }
+    kept = ["a123", "0.123", "123.45", "10.0.0.1", "/v1/credentials", "block_1", "2026-10-04T00:45:48.123Z"]
+    event = {"event": "api.raw_request", "scrubbed": list(scrubbed), "kept": kept, "status_code": 401}
+
+    with skyvern_context.scoped(request_context) if request_context else contextlib.nullcontext():
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["scrubbed"] == list(scrubbed.values())
+    assert out["kept"] == kept
+    assert out["status_code"] == 401
+
+
+def test_a_copilot_value_replaces_only_its_own_number_and_a_run_secret_any_number_containing_it() -> None:
+    _register_in_copilot_turn("483920")
+    copilot_numbers = [483920, 483920.0, Decimal("483920"), 1483920, 4839201, 0.48392, 48392, 401]
+    run_numbers = [15551234567, 0.5551234567, Decimal("5551234567.25")]
+    event = {"event": "numbers", "copilot": copilot_numbers, "run": run_numbers}
+
+    with skyvern_context.scoped(SkyvernContext(request_id="req_run", runtime_secret_values={"5551234567"})):
+        out = redact_registered_secrets(None, "info", event)  # type: ignore[arg-type]
+
+    assert out["copilot"] == [REDACTED_SECRET_PLACEHOLDER] * 3 + copilot_numbers[3:]
+    assert out["run"] == [REDACTED_SECRET_PLACEHOLDER] * 3
 
 
 @pytest.fixture
@@ -526,6 +659,68 @@ def test_registered_secrets_protect_output_and_log_artifacts_after_teardown(
         assert record["details"] == {"detail": REDACTED_SECRET_PLACEHOLDER}
 
 
+def test_registered_processor_preserves_only_failure_attribution_subtree_keys() -> None:
+    context = SkyvernContext()
+    for secret in (
+        "failure",
+        "attribution",
+        "failure_attribution",
+        "classifier",
+        "proxy",
+        "2",
+        "event",
+        "msg",
+        "level",
+    ):
+        context.register_secret_value(secret)
+    attribution = {
+        "failure_category": "failure",
+        "primary_infra_component": "proxy",
+        "classifier_version": 2,
+        "failure_attribution": [{"attribution": ["proxy", {"failure_category": "failure"}]}],
+    }
+    event = {
+        "event": "event",
+        "msg": "msg",
+        "level": "level",
+        "failure_attribution": attribution,
+        "caller": copy.deepcopy(attribution),
+    }
+    original = copy.deepcopy(event)
+    logger = logging.getLogger(__name__)
+
+    with skyvern_context.scoped(context):
+        out = redact_registered_secrets(logger, "info", event)
+        body, exported = redact_registered_log_payload(copy.deepcopy(attribution), event)
+
+    assert out["failure_attribution"] == {
+        "failure_category": REDACTED_SECRET_PLACEHOLDER,
+        "primary_infra_component": REDACTED_SECRET_PLACEHOLDER,
+        "classifier_version": REDACTED_SECRET_PLACEHOLDER,
+        "failure_attribution": [
+            {"attribution": [REDACTED_SECRET_PLACEHOLDER, {"failure_category": REDACTED_SECRET_PLACEHOLDER}]}
+        ],
+    }
+    scrubbed_caller = {
+        f"{REDACTED_SECRET_PLACEHOLDER}_category": REDACTED_SECRET_PLACEHOLDER,
+        "primary_infra_component": REDACTED_SECRET_PLACEHOLDER,
+        f"{REDACTED_SECRET_PLACEHOLDER}_version": REDACTED_SECRET_PLACEHOLDER,
+        REDACTED_SECRET_PLACEHOLDER: [
+            {
+                REDACTED_SECRET_PLACEHOLDER: [
+                    REDACTED_SECRET_PLACEHOLDER,
+                    {f"{REDACTED_SECRET_PLACEHOLDER}_category": REDACTED_SECRET_PLACEHOLDER},
+                ]
+            }
+        ],
+    }
+    assert out["caller"] == scrubbed_caller
+    assert exported == out
+    assert exported["event"] == exported["msg"] == exported["level"] == REDACTED_SECRET_PLACEHOLDER
+    assert body == scrubbed_caller
+    assert event == original
+
+
 def test_registered_processor_copies_keys_containers_and_preserves_unmatched_scalars() -> None:
     context = SkyvernContext()
     for value in ("q7", "587", "483920", "synthetic-long-value", "synthetic-long"):
@@ -601,6 +796,93 @@ def test_export_payload_scrubs_copied_provenance_and_preserves_sliced_generated_
     assert result["forged_[REDACTED_SECRET]"] == "tsk_[REDACTED_SECRET]"
     assert "123" not in json.dumps(result["payload"])
     assert attributes == original and message.startswith("caller 123")
+
+
+@pytest.mark.parametrize("value", [128, 0.128])
+def test_numeric_provenance_survives_copies_only_at_its_source_field(value: int | float) -> None:
+    generated = _generated_log_value("usage", value)
+    with pytest.raises(AttributeError):
+        generated.field = "copied"
+    with pytest.raises(AttributeError):
+        delattr(generated, "field")
+    attributes = {"usage": copy.deepcopy(generated), "copied": generated, "payload": {"usage": generated}}
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"12"})):
+        first = redact_registered_secrets(logging.getLogger(), "info", attributes)
+        _, exported = redact_registered_log_payload("diagnostic", first)
+    assert exported["usage"] == value and type(exported["usage"]) is type(value)
+    assert exported["copied"] == REDACTED_SECRET_PLACEHOLDER
+    assert exported["payload"]["usage"] == REDACTED_SECRET_PLACEHOLDER
+    assert json.loads(json.dumps(exported))["usage"] == value
+    assert attributes["copied"] == value
+
+
+def test_generated_string_subclasses_cannot_bypass_caller_text_scrubbing() -> None:
+    class CallerValue(_GeneratedLogValue):
+        pass
+
+    credential = "fake-registered-credential"
+    value = CallerValue("diagnostic", ((credential, False),))
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={credential})):
+        _, exported = redact_registered_log_payload("diagnostic", {"diagnostic": value})
+    assert exported["diagnostic"] == REDACTED_SECRET_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "from skyvern.forge.sdk.forge_log import _generated_log_value\n",
+        "from skyvern.forge.sdk import forge_log\nforge_log._generated_log_value('diagnostic', 'fake-credential')\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogInt\n",
+        "from skyvern.forge.sdk.forge_log import _GeneratedLogValue\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_copilot_model_usage\n",
+        "from skyvern.forge.sdk.api.llm.copilot_model_usage import _emit_direct_copilot_model_usage\n",
+        "from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id\n",
+        "from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope\n",
+        "from skyvern.forge.sdk.api.llm.config_registry import _register_builtin_config\n",
+        "from skyvern.forge.sdk.forge_log import _model_log_value\n",
+    ],
+)
+def test_uploaded_scripts_reject_direct_private_log_provenance_access(code: str) -> None:
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
+
+    with pytest.raises(InsecureCodeDetected):
+        is_safe_script_code(code)
+    assert not hasattr(forge_log, "generated_log_value")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "marker.parts = (('fake-registered-credential', True),)",
+        "marker.field = 'diagnostic'",
+        "del marker.parts",
+        "del marker.field",
+    ],
+)
+def test_validated_script_cannot_mutate_registered_model_provenance(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry, _register_builtin_config
+    from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
+    from skyvern.schemas.llm import LLMConfig
+
+    monkeypatch.setattr(LLMConfigRegistry, "_configs", {})
+    _register_builtin_config("TEST_IMMUTABLE", LLMConfig("gpt-5.6-terra", [], False, False))
+    code = (
+        "from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry\n"
+        "marker = LLMConfigRegistry.get_config('TEST_IMMUTABLE').model_name\n"
+        f"{mutation}\n"
+    )
+    is_safe_script_code(code)
+    with pytest.raises(AttributeError):
+        exec(code, {})
+    marker = LLMConfigRegistry.get_config("TEST_IMMUTABLE").model_name
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5.6", "fake-registered-credential"})):
+        _, values = redact_registered_log_payload("diagnostic", {"model_name": marker, "copied": marker})
+    assert values["model_name"] == "gpt-5.6-terra"
+    assert values["copied"] == f"gpt-{REDACTED_SECRET_PLACEHOLDER}-terra"
+    assert "fake-registered-credential" not in repr(values)
 
 
 @pytest.mark.asyncio
@@ -752,6 +1034,8 @@ async def test_generated_metadata_survives_short_secrets_and_actual_artifact_sel
 def test_plain_metadata_names_and_copied_generated_values_are_still_caller_data(
     monkeypatch: pytest.MonkeyPatch, registered_log_stream: io.StringIO, with_context: bool
 ) -> None:
+    # Provenance, not the cross-session floor, is under test: let these short values apply anywhere.
+    monkeypatch.setattr(secret_scrub, "MIN_CROSS_SESSION_LOG_REDACTION_LENGTH", 1)
     _register_credential("123")
     _register_credential("id")
     context = SkyvernContext(workflow_run_id="wr_123", task_id="tsk_123") if with_context else None
@@ -1434,7 +1718,10 @@ def test_codeblock_fail_closed_redaction_emits_blanked_records_with_identity(
     registered_log_stream: io.StringIO,
 ) -> None:
     context_identity = {"workflow_run_id": "wr_575775527211416595", "request_id": "req_16595", "run_id": "run_16595"}
-    with skyvern_context.scoped(SkyvernContext(**context_identity)), codeblock_parameter_log_redaction(lambda _: ""):
+    with (
+        skyvern_context.scoped(SkyvernContext(**context_identity)),
+        codeblock_parameter_log_redaction(lambda _: "", {}),
+    ):
         structlog.get_logger("skyvern.forge.sdk.forge_log").warning(
             f"native {_CODEBLOCK_PARAMETER_VALUE}",
             payload=_CODEBLOCK_PARAMETER_VALUE,
@@ -1482,7 +1769,7 @@ def test_codeblock_fail_closed_redaction_emits_blanked_records_with_identity(
 
 @pytest.mark.parametrize("registered_log_stream", [True], indirect=True)
 def test_codeblock_redaction_never_rewrites_field_names(registered_log_stream: io.StringIO) -> None:
-    with codeblock_parameter_log_redaction(_substring_redactor):
+    with codeblock_parameter_log_redaction(_substring_redactor, {}):
         structlog.get_logger("skyvern.test.codeblock_native").warning(
             "native",
             workflow_run_id="wr_575775527211416595",
@@ -1511,7 +1798,7 @@ def test_codeblock_redaction_redacts_caller_built_field_names(monkeypatch: pytes
     (handler,) = _buffered_logger(monkeypatch, "skyvern.test.codeblock_dynamic_key", 1)
     logger = logging.getLogger("skyvern.test.codeblock_dynamic_key")
 
-    with codeblock_parameter_log_redaction(_substring_redactor):
+    with codeblock_parameter_log_redaction(_substring_redactor, {}):
         logger.handle(
             logger.makeRecord(
                 logger.name, logging.INFO, __file__, 1, "x", (), None, extra={dynamic_key: 1, "workflow_run_id": "wr_1"}
@@ -1558,7 +1845,7 @@ def test_codeblock_redaction_keeps_level_record_metadata(monkeypatch: pytest.Mon
     handlers = _buffered_logger(monkeypatch, "skyvern.test.codeblock_levelno", 2)
     logger = logging.getLogger("skyvern.test.codeblock_levelno")
 
-    with codeblock_parameter_log_redaction(_exact_value_redactor(parameter)):
+    with codeblock_parameter_log_redaction(_exact_value_redactor(parameter), {}):
         logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 20, "hello", (), None))
 
     for handler in handlers:
@@ -1573,7 +1860,7 @@ def test_codeblock_fail_closed_keeps_enum_level_comparable(monkeypatch: pytest.M
     handlers = _buffered_logger(monkeypatch, "skyvern.test.codeblock_enum_level", 2)
     logger = logging.getLogger("skyvern.test.codeblock_enum_level")
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(logger.makeRecord(logger.name, level, __file__, 20, "hello", (), None))
 
     for handler in handlers:
@@ -1588,7 +1875,7 @@ def test_codeblock_fail_closed_blanks_runtime_chosen_names(monkeypatch: pytest.M
     names = (secret, f"skyvern.{secret}", platform_name)
     handlers = {name: _buffered_logger(monkeypatch, name, 1)[0] for name in names}
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         for name in handlers:
             record = logging.getLogger(name).makeRecord(name, logging.INFO, __file__, 1, "x", (), None)
             record.threadName = secret
@@ -1611,7 +1898,7 @@ def test_codeblock_fail_closed_blanks_caller_ids_without_platform_shape(monkeypa
     logger = logging.getLogger("skyvern.test.fail_closed_ids")
     ids = {"workflow_run_block_id": secret, "workflow_run_id": "wr_575775527211416595"}
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 1, "x", (), None, extra=ids))
         event = redact_codeblock_parameters(None, "info", {"event": "x", **ids})  # type: ignore[arg-type]
 
@@ -1621,7 +1908,7 @@ def test_codeblock_fail_closed_blanks_caller_ids_without_platform_shape(monkeypa
 
 
 def test_codeblock_fail_closed_processor_keeps_only_id_shaped_identity() -> None:
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         out = redact_codeblock_parameters(
             None,  # type: ignore[arg-type]
             "info",
@@ -1675,7 +1962,7 @@ def test_codeblock_fail_closed_stdlib_record_keeps_only_id_shaped_identity(
         record.funcName = "f" * 3000
         record.lineno = _CallerInt(1)
 
-    with codeblock_parameter_log_redaction(lambda _: ""):
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
         logger.handle(record)
 
     (emitted,) = handler.buffer
@@ -1689,3 +1976,174 @@ def test_codeblock_fail_closed_stdlib_record_keeps_only_id_shaped_identity(
     assert fields["browser_session_id"] == CODEBLOCK_LOG_REDACTED
     assert fields["organization_name"] == CODEBLOCK_LOG_REDACTED
     assert fields["workflow_run_id"] == "wr_575775527211416595"
+
+
+@pytest.mark.parametrize("path", ["processor", "record"])
+def test_codeblock_fail_closed_judges_generated_fields_by_their_plain_value(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    timestamp = "2026-09-24T18:37:51.123456Z"
+    generated = {
+        key: _GeneratedLogValue(key, ((value, True),))
+        for key, value in (
+            ("level", "info"),
+            ("timestamp", timestamp),
+            ("version", "1.0 dev"),
+            ("entrypoint", "test_worker"),
+            ("codeblock_execution_path", "secure_runner"),
+        )
+    }
+    (handler,) = _buffered_logger(monkeypatch, "skyvern.test.fail_closed_generated", 1)
+    logger = logging.getLogger("skyvern.test.fail_closed_generated")
+
+    with codeblock_parameter_log_redaction(lambda _: "", {}):
+        if path == "record":
+            logger.handle(logger.makeRecord(logger.name, logging.INFO, __file__, 1, "x", (), None, extra=generated))
+            fields = handler.buffer[0].__dict__
+        else:
+            fields = redact_codeblock_parameters(None, "info", {"event": "x", **generated})  # type: ignore[arg-type]
+
+    assert (fields["level"], fields["timestamp"], fields["version"]) == ("info", timestamp, CODEBLOCK_LOG_REDACTED)
+    assert "entrypoint" not in fields
+    assert "codeblock_execution_path" not in fields
+
+
+_OVERLAPPING_CODEBLOCKS = (
+    ("5", "wr_100000000000000051", "wrb_100000000000000052", "wrb_100000000000000053", "o_100000000000000054"),
+    ("20", "wr_100000000000000201", "wrb_100000000000000202", "wrb_100000000000000203", "o_100000000000000204"),
+    ("n", "wr_100000000000000301", "wrb_100000000000000302", "wrb_100000000000000303", "o_100000000000000304"),
+)
+
+
+def _redacted(text: str, parameter: str) -> str:
+    return text.replace(parameter, CODEBLOCK_LOG_REDACTED)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_codeblock_scopes_keep_platform_ids_and_timestamp(
+    registered_log_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    version = "f90b65e0dd882620c675fe847960527aae225273"
+    monkeypatch.setattr(forge_log, "__version__", version)
+    monkeypatch.setattr(forge_log, "_entrypoint", "test_worker_5")
+    monkeypatch.setattr(settings, "ENV", "production-us5")
+    for name in ("skyvern.test.runner_workflow", "skyvern.test.runner_grpc"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    barrier = asyncio.Barrier(len(_OVERLAPPING_CODEBLOCKS))
+
+    async def run_block(parameter: str, run_id: str, block_id: str, nested_block_id: str, org_id: str) -> None:
+        platform_ids = {"workflow_run_id": run_id, "workflow_run_block_id": block_id, "organization_id": org_id}
+        context = SkyvernContext(
+            workflow_run_id=run_id,
+            organization_id=org_id,
+            codeblock_execution_path="secure_runner",
+            # Equal to the "20" block's parameter: only its platform provenance keeps it an unredacted number.
+            org_age=20,
+        )
+        with (
+            skyvern_context.scoped(context),
+            codeblock_parameter_log_redaction(_exact_value_redactor(parameter), platform_ids),
+        ):
+            await barrier.wait()
+            structlog.get_logger("skyvern.test.runner_workflow").info(
+                "Test runner completed successfully",
+                workflow_run_id=run_id,
+                workflow_run_block_id=block_id,
+                detail=f"results={parameter}",
+            )
+            logging.getLogger("skyvern.test.runner_grpc").warning(
+                "Test runner first message results=%s", parameter, extra={"detail": f"results={parameter}"}
+            )
+            with (
+                skyvern_context.scoped(SkyvernContext()),
+                codeblock_parameter_log_redaction(
+                    _exact_value_redactor(parameter), {"workflow_run_block_id": nested_block_id}
+                ),
+            ):
+                structlog.get_logger("skyvern.test.runner_workflow").info(
+                    "Nested test block finished", workflow_run_id=run_id, workflow_run_block_id=nested_block_id
+                )
+            await barrier.wait()
+
+    await asyncio.gather(*(run_block(*block) for block in _OVERLAPPING_CODEBLOCKS))
+
+    records = [json.loads(line) for line in registered_log_stream.getvalue().splitlines()]
+    assert len(records) == 3 * len(_OVERLAPPING_CODEBLOCKS)
+    for parameter, run_id, block_id, nested_block_id, org_id in _OVERLAPPING_CODEBLOCKS:
+        native, stdlib, nested = (record for record in records if record["workflow_run_id"] == run_id)
+        suffix = f" | organization_id={org_id}, workflow_run_id={run_id}"
+        assert native["msg"] == _redacted("Test runner completed successfully", parameter) + suffix
+        assert stdlib["msg"] == _redacted(f"Test runner first message results={parameter}", parameter) + suffix
+        assert nested["msg"] == _redacted("Nested test block finished", parameter) + f" | workflow_run_id={run_id}"
+        assert native["workflow_run_block_id"] == block_id
+        assert nested["workflow_run_block_id"] == nested_block_id
+        assert (native["func_name"], native["filename"]) == ("run_block", "test_forge_log_redaction.py")
+        for record in (native, stdlib):
+            assert record["organization_id"] == org_id
+            assert record["detail"] == f"results={CODEBLOCK_LOG_REDACTED}"
+            assert (record["codeblock_execution_path"], record["org_age"]) == ("secure_runner", 20)
+            assert type(record["org_age"]) is int
+        for record, level in ((native, "info"), (stdlib, "warning"), (nested, "info")):
+            assert datetime.fromisoformat(record["timestamp"]).tzinfo is not None
+            assert (record["version"], record["env"]) == (version, "production-us5")
+            assert record["level"] == level
+            assert record["logger"].startswith("skyvern.test.runner_")
+        assert native["entrypoint"] == nested["entrypoint"] == "test_worker_5"
+
+
+@pytest.mark.parametrize("context_org_age", [20, None], ids=["different-age", "no-age"])
+def test_codeblock_redaction_does_not_trust_an_org_age_the_context_does_not_own(context_org_age: int | None) -> None:
+    # Only the context's own age is platform-authored; any other org_age a block logs is redacted like caller data.
+    with (
+        skyvern_context.scoped(SkyvernContext(org_age=context_org_age)),
+        codeblock_parameter_log_redaction(_exact_value_redactor("7"), {}),
+    ):
+        event = redact_codeblock_parameters(None, "info", {"event": "x", "org_age": 7})  # type: ignore[arg-type]
+
+    assert event["org_age"] == CODEBLOCK_LOG_REDACTED
+
+
+def test_codeblock_redaction_scrubs_ids_and_msg_text_the_scope_does_not_own() -> None:
+    foreign_block_id = "wrb_555555555555555555"
+    msg = _GeneratedLogValue("msg", (("count 5", False), (" | workflow_run_id=wr_100000000000000051", True)))
+    with codeblock_parameter_log_redaction(
+        _exact_value_redactor("5"), {"workflow_run_block_id": "wrb_100000000000000052"}
+    ):
+        event = redact_codeblock_parameters(
+            None,  # type: ignore[arg-type]
+            "info",
+            {
+                "msg": msg,
+                "structlog_event": _GeneratedLogValue("structlog_event", msg.parts),
+                "workflow_run_block_id": foreign_block_id,
+            },
+        )
+
+    assert event["workflow_run_block_id"] == foreign_block_id.replace("5", CODEBLOCK_LOG_REDACTED)
+    assert event["msg"] == f"count {CODEBLOCK_LOG_REDACTED} | workflow_run_id=wr_100000000000000051"
+    assert event["structlog_event"] == event["msg"]
+
+
+def test_codeblock_redaction_keeps_block_id_the_context_owns() -> None:
+    block_id = "wrb_555555555555555555"
+    with (
+        skyvern_context.scoped(SkyvernContext(workflow_run_block_id=block_id)),
+        codeblock_parameter_log_redaction(_exact_value_redactor("5"), {"workflow_run_id": "wr_100000000000000051"}),
+    ):
+        event = redact_codeblock_parameters(None, "info", {"event": "x", "workflow_run_block_id": block_id})  # type: ignore[arg-type]
+
+    assert event["workflow_run_block_id"] == block_id
+
+
+def test_codeblock_redaction_keeps_module_logger_name(
+    registered_log_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "skyvern.test.runner_grpc"
+    monkeypatch.setitem(sys.modules, name, ModuleType(name))
+
+    with codeblock_parameter_log_redaction(_exact_value_redactor("grpc"), {}):
+        logging.getLogger(name).warning("Test runner first message grpc")
+
+    (record,) = (json.loads(line) for line in registered_log_stream.getvalue().splitlines())
+    assert record["logger"] == name
+    assert record["msg"] == f"Test runner first message {CODEBLOCK_LOG_REDACTED}"

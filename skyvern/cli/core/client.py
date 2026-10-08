@@ -5,17 +5,23 @@ import os
 from collections import OrderedDict
 from contextvars import ContextVar, Token
 from threading import RLock
+from typing import Any
 
 import httpx
 import structlog
 
 from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, is_cli_runtime
-from skyvern.client import SkyvernEnvironment
+from skyvern.client import RunSdkActionResponse, SkyvernEnvironment
+from skyvern.client.core.request_options import RequestOptions
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.library.skyvern import Skyvern
 
 from .api_key_hash import hash_api_key_for_cache
+
+# Fern applies a per-call timeout to the whole request (connect, read, write and pool), so only run_sdk_action gets it.
+# 115 s bounds one call below the 120 s ALB idle timeout; a tool that makes several calls can still run longer.
+LOOPBACK_SDK_ACTION_TIMEOUT_SECONDS = 115
 
 _skyvern_instance: ContextVar[Skyvern | None] = ContextVar("skyvern_instance", default=None)
 _api_key_override: ContextVar[str | None] = ContextVar("skyvern_api_key_override", default=None)
@@ -62,10 +68,20 @@ def _resolve_self_base_url() -> str:
     return f"http://127.0.0.1:{settings.PORT}"
 
 
+class _LoopbackSkyvern(Skyvern):
+    async def run_sdk_action(
+        self, *, request_options: RequestOptions | None = None, **kwargs: Any
+    ) -> RunSdkActionResponse:
+        options: RequestOptions = {"timeout_in_seconds": LOOPBACK_SDK_ACTION_TIMEOUT_SECONDS, **(request_options or {})}
+        return await super().run_sdk_action(request_options=options, **kwargs)
+
+
 def _build_cloud_client(api_key: str) -> Skyvern:
     from .session_manager import is_stateless_http_mode  # noqa: PLC0415 — circular import
 
+    client_class: type[Skyvern] = Skyvern
     if is_stateless_http_mode():
+        client_class = _LoopbackSkyvern
         base_url: str | None = _resolve_self_base_url()
     else:
         # Guard is CLI-scoped on purpose: prod temporal workers run with SKYVERN_BASE_URL
@@ -77,7 +93,7 @@ def _build_cloud_client(api_key: str) -> Skyvern:
     # Generated SDK methods send "x-user-agent": None when no per-call user_agent is given,
     # clobbering constructor-level headers in the merge; httpx client-level defaults survive
     # because None-valued headers are stripped before the request is sent (SKY-13333).
-    return Skyvern(
+    return client_class(
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
         base_url=base_url,

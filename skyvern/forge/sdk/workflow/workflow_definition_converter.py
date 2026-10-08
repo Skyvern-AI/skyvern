@@ -88,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
+from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
@@ -350,6 +351,11 @@ def convert_workflow_definition(
         retry_policy=workflow_definition_yaml.retry_policy,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
         completion_contract=workflow_definition_yaml.completion_contract,
+        **(
+            {"browser_settings": workflow_definition_yaml.browser_settings}
+            if "browser_settings" in workflow_definition_yaml.model_fields_set
+            else {}
+        ),
     )
 
     LOG.info(
@@ -424,6 +430,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=task_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             data_extraction_goal=block_yaml.data_extraction_goal,
@@ -544,6 +551,10 @@ def block_yaml_to_block(
             error_code_mapping=block_yaml.error_code_mapping,
             prompt=block_yaml.prompt,
             steps=[CodeBlockStep(**step) for step in derive_code_block_steps(block_yaml.code)] or None,
+            data_schema=block_yaml.data_schema,
+            user_owned_goal=block_yaml.user_owned_goal,
+            goal_needs_regeneration=block_yaml.goal_needs_regeneration,
+            code_edited_by_hand=block_yaml.code_edited_by_hand,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(
@@ -687,6 +698,7 @@ def block_yaml_to_block(
             **base_kwargs,
             task_type=TaskType.validation,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=validation_block_parameters,
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
@@ -707,6 +719,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             task_type=TaskType.action,
             parameters=action_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
@@ -732,6 +745,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=navigation_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -776,6 +790,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=extraction_block_parameters,
             data_extraction_goal=block_yaml.data_extraction_goal,
             data_schema=block_yaml.data_schema,
@@ -803,6 +818,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=login_block_parameters,
             navigation_goal=login_navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -840,6 +856,9 @@ def block_yaml_to_block(
             parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
+    elif block_yaml.block_type == BlockType.TERMINATE:
+        return TerminateBlock(**base_kwargs, reason=block_yaml.reason, error_code=block_yaml.error_code)
+
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)
         return FileDownloadBlock(
@@ -869,6 +888,7 @@ def block_yaml_to_block(
             url=block_yaml.url,
             title=block_yaml.title,
             engine=block_yaml.engine,
+            engine_pinned=block_yaml.engine_pinned,
             parameters=file_download_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
             error_code_mapping=block_yaml.error_code_mapping,
@@ -899,6 +919,7 @@ def block_yaml_to_block(
             query=block_yaml.query,
             provider=block_yaml.provider,
             num_results=block_yaml.num_results,
+            error_code_mapping=block_yaml.error_code_mapping,
             no_results_error_code=block_yaml.no_results_error_code,
             no_match_error_code=block_yaml.no_match_error_code,
             prompt=block_yaml.prompt,

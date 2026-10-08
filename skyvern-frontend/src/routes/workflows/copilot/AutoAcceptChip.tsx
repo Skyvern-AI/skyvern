@@ -3,9 +3,17 @@ import { useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useLogging } from "@/hooks/useLogging";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
 
 type Props = {
   chatId: string;
+  organizationId?: string | null;
+  captureProductEvent?: (
+    event: string,
+    properties: Record<string, unknown>,
+  ) => void;
   waitForAccept: (chatId: string) => Promise<void>;
   // This chat's Turn off is already running, including one started before this chip mounted.
   pendingFromChat: boolean;
@@ -15,12 +23,16 @@ type Props = {
 
 export function AutoAcceptChip({
   chatId,
+  organizationId,
+  captureProductEvent,
   waitForAccept,
   pendingFromChat,
   onPendingChange,
   onTurnedOff,
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const logging = useLogging();
+  const workflowPermanentId = useWorkflowPermanentId();
   const [pending, setPending] = useState(false);
   const busy = pending || pendingFromChat;
 
@@ -36,12 +48,35 @@ export function AutoAcceptChip({
       await client.post("/workflow/copilot/disable-auto-accept", {
         workflow_copilot_chat_id: chatId,
       });
+      captureProductEvent?.("copilot.auto_accept.toggled", {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        enabled: false,
+      });
       onTurnedOff(chatId);
     } catch (error) {
       console.error("Failed to turn off auto-accept:", error);
+      const waitingForAccept =
+        error instanceof Error &&
+        error.message === "Wait for the Copilot change to finish";
+      if (!waitingForAccept) {
+        const fields = getCopilotFailureLogFields(error);
+        const status = fields.http_status;
+        const clientError =
+          typeof status === "number" && status >= 400 && status < 500;
+        logging[clientError ? "warn" : "error"]("Copilot request failed", {
+          operation: "proposal_sync",
+          workflow_permanent_id: workflowPermanentId,
+          chat_id: chatId,
+          ...fields,
+        });
+      }
       toast({
         title: "Auto-accept is still on",
-        description: "Could not turn it off. Please try again.",
+        description:
+          waitingForAccept && error instanceof Error
+            ? error.message
+            : "Could not turn it off. Please try again.",
         variant: "destructive",
       });
     } finally {

@@ -18,20 +18,14 @@ const response = (
 describe("shouldAutoApplyWorkflowResponse", () => {
   it("auto-applies only what the backend says it applied", () => {
     expect(
-      shouldAutoApplyWorkflowResponse(
-        response({ workflow_applied: true }),
-        false,
-      ),
+      shouldAutoApplyWorkflowResponse(response({ workflow_applied: true })),
     ).toBe(true);
   });
 
   it("keeps a verified fix pending when the backend did not apply it", () => {
     // The server owns this: Turn off can commit there before the browser sees its request resolve.
     expect(
-      shouldAutoApplyWorkflowResponse(
-        response({ workflow_applied: false }),
-        false,
-      ),
+      shouldAutoApplyWorkflowResponse(response({ workflow_applied: false })),
     ).toBe(false);
   });
 
@@ -44,7 +38,6 @@ describe("shouldAutoApplyWorkflowResponse", () => {
         frame as unknown as Parameters<
           typeof shouldAutoApplyWorkflowResponse
         >[0],
-        false,
       ),
     ).toBe(false);
   });
@@ -53,10 +46,7 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     "forces explicit review for %s proposals",
     (proposal_disposition) => {
       expect(
-        shouldAutoApplyWorkflowResponse(
-          response({ proposal_disposition }),
-          false,
-        ),
+        shouldAutoApplyWorkflowResponse(response({ proposal_disposition })),
       ).toBe(false);
     },
   );
@@ -65,15 +55,22 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     expect(
       shouldAutoApplyWorkflowResponse(
         response({ proposal_disposition: "no_proposal" }),
-        false,
       ),
     ).toBe(false);
   });
 
-  it("does not auto-apply cancelled turns", () => {
+  it("honors a server commit over cancellation metadata", () => {
     expect(
-      shouldAutoApplyWorkflowResponse(response({ cancelled: true }), false),
-    ).toBe(false);
-    expect(shouldAutoApplyWorkflowResponse(response(), true)).toBe(false);
+      shouldAutoApplyWorkflowResponse(
+        response({ workflow_applied: true, cancelled: true }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not auto-apply cancelled turns", () => {
+    expect(shouldAutoApplyWorkflowResponse(response({ cancelled: true }))).toBe(
+      false,
+    );
+    expect(shouldAutoApplyWorkflowResponse(response())).toBe(false);
   });
 });

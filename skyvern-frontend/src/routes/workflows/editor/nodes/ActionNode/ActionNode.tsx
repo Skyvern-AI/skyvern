@@ -59,7 +59,6 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader

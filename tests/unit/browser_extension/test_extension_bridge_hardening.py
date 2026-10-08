@@ -7,6 +7,73 @@ from pathlib import Path
 
 import pytest
 
+_WINDOW_GROUP_FAKES = """
+function installWindowGroupFakes(chrome, tabs, updates) {
+  const state = {
+    types: new Map(), lookupFailures: new Set(), enumerationFailure: false,
+    ungroupFails: false, ungroupNoop: false, groupCalls: [], alarms: [],
+    attached: [], alarmListeners: [], focusedWindowId: 99,
+    groupLookupFailures: new Set(), groupTitles: new Map(), pendingAlarms: new Map(), now: 0,
+  };
+  const allTypes = ["normal", "popup", "panel", "app", "devtools"];
+  chrome.windows = {
+    ...chrome.windows,
+    async get(id, options) {
+      assert.deepEqual(options.windowTypes, allTypes);
+      if (state.lookupFailures.has(id)) throw new Error("window lookup failed");
+      return { id, type: state.types.get(id) ?? "normal" };
+    },
+    async getAll(options) {
+      assert.equal(options.populate, true);
+      assert.deepEqual(options.windowTypes, allTypes);
+      if (state.enumerationFailure) throw new Error("window enumeration failed");
+      return [...new Set([...tabs.values()].map((tab) => tab.windowId))].map((id) => ({
+        id, type: state.types.get(id) ?? "normal",
+        tabs: [...tabs.values()].filter((tab) => tab.windowId === id).map((tab) => ({ ...tab })),
+      }));
+    },
+  };
+  chrome.tabs.onAttached = { addListener(fn) { state.attached.push(fn); } };
+  const getGroup = chrome.tabGroups.get;
+  chrome.tabGroups.get = async (id) => {
+    if (state.groupLookupFailures.has(id)) throw new Error("group lookup failed");
+    const group = await getGroup(id);
+    return { ...group, title: state.groupTitles.get(id) ?? group.title };
+  };
+  chrome.alarms = {
+    ...chrome.alarms,
+    onAlarm: { addListener(fn) { state.alarmListeners.push(fn); } },
+    async get(name) { return state.pendingAlarms.get(name); },
+    async create(name, options) {
+      state.alarms.push({ name, options });
+      state.pendingAlarms.set(name, { name, scheduledTime: state.now + options.delayInMinutes * 60_000 });
+    },
+  };
+  state.fireAlarm = (name) => {
+    const alarm = state.pendingAlarms.get(name);
+    assert(alarm, "no pending alarm");
+    state.pendingAlarms.delete(name);
+    state.alarmListeners.forEach((fn) => fn(alarm));
+  };
+  chrome.tabs.group = async (options) => {
+    state.groupCalls.push(structuredClone(options));
+    const windowId = options.createProperties?.windowId ??
+      (options.groupId === undefined ? state.focusedWindowId : tabs.get(options.tabIds[0]).windowId);
+    if ((state.types.get(windowId) ?? "normal") !== "normal") throw new Error("cannot group this window");
+    for (const id of options.tabIds) Object.assign(tabs.get(id), { windowId, groupId: options.groupId ?? 700 });
+    return options.groupId ?? 700;
+  };
+  chrome.tabs.ungroup = async (ids) => {
+    if (state.ungroupFails) throw new Error("ungroup failed");
+    if (!state.ungroupNoop) for (const id of ids) {
+      tabs.get(id).groupId = -1;
+      updates.forEach((fn) => fn(id, { groupId: -1 }));
+    }
+  };
+  return state;
+}
+"""
+
 
 @pytest.mark.parametrize("revocation", ["target_closed", "canceled_by_user", "unshared", "restricted_url"])
 def test_created_tab_survives_scope_revocation_and_reset(revocation: str) -> None:
@@ -22,25 +89,21 @@ const stored = {{}};
 const events = [];
 const removed = [];
 let nextId = 1;
+const updates = [];
 const listener = {{ addListener() {{}} }};
 globalThis.chrome = {{
   tabs: {{
-    onCreated: listener, onRemoved: listener, onUpdated: listener,
+    onCreated: listener, onRemoved: listener,
+    onUpdated: {{ addListener(fn) {{ updates.push(fn); }} }},
     async create({{ url }}) {{
-      const tab = {{ id: nextId++, windowId: 1, groupId: -1, url }};
+      const tab = {{ id: nextId++, windowId: 1, groupId: -1, url, status: "complete" }};
       tabs.set(tab.id, tab);
+      updates.forEach((fn) => fn(tab.id, {{ status: "complete" }}));
       return {{ ...tab }};
     }},
     async get(tabId) {{
       assert(tabs.has(tabId));
       return {{ ...tabs.get(tabId) }};
-    }},
-    async group({{ tabIds }}) {{
-      for (const tabId of tabIds) tabs.get(tabId).groupId = 700;
-      return 700;
-    }},
-    async ungroup(tabIds) {{
-      for (const tabId of tabIds) tabs.get(tabId).groupId = -1;
     }},
     async remove(tabId) {{ removed.push(tabId); tabs.delete(tabId); }},
   }},
@@ -56,6 +119,8 @@ globalThis.chrome = {{
   }} }},
   debugger: {{ onEvent: listener, onDetach: listener }},
 }};
+{_WINDOW_GROUP_FAKES}
+installWindowGroupFakes(chrome, tabs, updates);
 const {{ TabScope }} = await import({json.dumps((extension_dir / "tab_scope.js").as_uri())});
 const {{ DebuggerRouter }} = await import({json.dumps((extension_dir / "debugger_router.js").as_uri())});
 const scope = new TabScope({{ sendEvent: (event, params) => events.push({{ event, params }}) }});
@@ -405,142 +470,46 @@ def test_dom_evaluate_contract() -> None:
     dom_uri = (extension_dir / "dom_router.js").as_uri()
     protocol_uri = (extension_dir / "protocol.js").as_uri()
     script = f"""
-const scriptCalls = [];
-globalThis.chrome = {{
-  userScripts: {{
-    async execute({{ target, world, injectImmediately, js }}) {{
-      scriptCalls.push({{ target, world, injectImmediately, js }});
-      try {{
-        return [{{ result: await globalThis.eval(js[0].code) }}];
-      }} catch (error) {{
-        return [{{ error: String(error?.message ?? error) }}];
-      }}
-    }},
-  }},
-}};
-
+import assert from "node:assert/strict";
 const {{ evaluateDom }} = await import({json.dumps(dom_uri)});
-const {{ ERROR_CODES, ProtocolError }} = await import({json.dumps(protocol_uri)});
-
-let leaseChecks = 0;
-let controllableChecks = 0;
-let controllableUrl = "https://example.test/";
-const lease = {{ assertCurrent() {{ leaseChecks += 1; }} }};
-const tabScope = {{
-  async runTabOperation(tabId, operation) {{
-    if (tabId !== 7) throw new Error(`unexpected tab ID: ${{tabId}}`);
-    return operation(lease);
+const {{ ProtocolError, ERROR_CODES }} = await import({json.dumps(protocol_uri)});
+let chromeAccesses = 0;
+let argumentAccesses = 0;
+globalThis.callerSourceRan = false;
+Object.defineProperty(globalThis, "chrome", {{
+  get() {{
+    chromeAccesses += 1;
+    throw new Error("DOM evaluation must not access Chrome");
   }},
-  async assertControllableLocked(tabId, currentLease) {{
-    if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
-    controllableChecks += 1;
-    return {{ id: tabId, groupId: 700, url: controllableUrl }};
-  }},
-}};
-
-const evaluated = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "({{ answer: 6 * 7 }})",
 }});
-if (
-  evaluated.result?.answer !== 42 ||
-  scriptCalls.length !== 1 ||
-  scriptCalls[0].target?.tabId !== 7 ||
-  scriptCalls[0].world !== "MAIN" ||
-  scriptCalls[0].injectImmediately !== true ||
-  scriptCalls[0].js?.[0]?.code !== "({{ answer: 6 * 7 }})" ||
-  controllableChecks !== 2 ||
-  leaseChecks !== 1
-) {{
-  throw new Error(`DOM evaluation contract failed: ${{JSON.stringify({{
-    evaluated,
-    scriptCalls,
-    controllableChecks,
-    leaseChecks,
-  }})}}`);
+const unreadable = new Proxy({{}}, {{
+  get() {{
+    argumentAccesses += 1;
+    throw new Error("DOM evaluation must not read its arguments");
+  }},
+  ownKeys() {{
+    argumentAccesses += 1;
+    throw new Error("DOM evaluation must not enumerate its arguments");
+  }},
+}});
+for (const args of [
+  {{ tabId: 7, expression: "globalThis.callerSourceRan = true" }},
+  unreadable,
+  undefined,
+]) {{
+  await assert.rejects(evaluateDom(unreadable, args), (error) => {{
+    assert(error instanceof ProtocolError);
+    assert.equal(error.code, ERROR_CODES.OP_NOT_ALLOWED);
+    assert.equal(error.message,
+      "Direct JavaScript evaluation is unavailable in extension mode. " +
+      "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. " +
+      "Use skyvern_click or skyvern_type to interact.");
+    return true;
+  }});
 }}
-
-for (const [expression, expected] of [["false", false], ["0", 0], ["null", null]]) {{
-  const response = await evaluateDom(tabScope, {{ tabId: 7, expression }});
-  if (!Object.is(response.result, expected)) {{
-    throw new Error(`DOM evaluation changed a falsy result: ${{expression}}`);
-  }}
-}}
-const thrownEvaluationError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "(() => {{ throw new Error('page failure'); }})()",
-}}).then(() => null, (error) => error);
-if (
-  thrownEvaluationError?.code !== ERROR_CODES.CDP_ERROR ||
-  !thrownEvaluationError.message.includes("page failure")
-) {{
-  throw new Error(`thrown page evaluation was not structured: ${{thrownEvaluationError?.message}}`);
-}}
-
-const invalidError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-  extra: true,
-}}).then(() => null, (error) => error);
-if (invalidError?.code !== ERROR_CODES.OP_NOT_ALLOWED) {{
-  throw new Error(`invalid DOM arguments did not fail closed: ${{invalidError?.code}}`);
-}}
-
-const callsBeforeBlank = scriptCalls.length;
-controllableUrl = "about:blank";
-const blankError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (
-  blankError?.code !== ERROR_CODES.RESTRICTED_URL ||
-  scriptCalls.length !== callsBeforeBlank
-) {{
-  throw new Error(`about:blank reached MAIN evaluation: ${{blankError?.code}}`);
-}}
-controllableUrl = "https://example.test/";
-
-chrome.userScripts.execute = async () => {{ throw new Error("injection blocked"); }};
-const injectionError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (injectionError?.code !== ERROR_CODES.CDP_ERROR) {{
-  throw new Error(`failed injection was not structured: ${{injectionError?.code}}`);
-}}
-
-let revalidationChecks = 0;
-let failedInjectionCalls = 0;
-chrome.userScripts.execute = async () => {{
-  failedInjectionCalls += 1;
-  throw new Error("navigation interrupted injection");
-}};
-tabScope.assertControllableLocked = async (tabId, currentLease) => {{
-  if (tabId !== 7 || currentLease !== lease) throw new Error("scope check lost the tab lease");
-  revalidationChecks += 1;
-  if (revalidationChecks === 2) {{
-    throw new ProtocolError(
-      ERROR_CODES.RESTRICTED_URL,
-      "Chrome does not allow controlling this URL.",
-    );
-  }}
-  return {{ id: tabId, groupId: 700, url: "https://example.test/" }};
-}};
-const revokedError = await evaluateDom(tabScope, {{
-  tabId: 7,
-  expression: "1 + 1",
-}}).then(() => null, (error) => error);
-if (
-  revokedError?.code !== ERROR_CODES.RESTRICTED_URL ||
-  revalidationChecks !== 2 ||
-  failedInjectionCalls !== 1
-) {{
-  throw new Error(`failed injection hid scope revocation: ${{JSON.stringify({{
-    code: revokedError?.code,
-    revalidationChecks,
-    failedInjectionCalls,
-  }})}}`);
-}}
+assert.equal(chromeAccesses, 0);
+assert.equal(argumentAccesses, 0);
+assert.equal(globalThis.callerSourceRan, false);
 """
 
     result = subprocess.run(
@@ -565,6 +534,7 @@ def test_extension_reset_and_debugger_lifecycle_contract() -> None:
     protocol_uri = (extension_dir / "protocol.js").as_uri()
     tab_scope_uri = (extension_dir / "tab_scope.js").as_uri()
     script = f"""
+import assert from "node:assert/strict";
 const listeners = {{ created: [], removed: [], updated: [], debuggerEvent: [], debuggerDetach: [] }};
 const tabs = new Map();
 const sessionState = {{}};
@@ -577,7 +547,10 @@ globalThis.chrome = {{
     onCreated: {{ addListener(listener) {{ listeners.created.push(listener); }} }},
     onRemoved: {{ addListener(listener) {{ listeners.removed.push(listener); }} }},
     onUpdated: {{ addListener(listener) {{ listeners.updated.push(listener); }} }},
-    create() {{ return new Promise((resolve) => {{ createTab = resolve; }}); }},
+    create({{ url }}) {{
+      if (sessionState.pendingTabCreation?.url !== url) throw new Error("creation marker was not durable before Chrome invocation");
+      return new Promise((resolve) => {{ createTab = resolve; }});
+    }},
     async get(tabId) {{
       const tab = tabs.get(tabId);
       if (!tab) throw new Error("missing tab");
@@ -588,17 +561,6 @@ globalThis.chrome = {{
         .filter((tab) => !values.active || tab.active === true)
         .filter((tab) => !values.lastFocusedWindow || tab.windowId === lastFocusedWindowId)
         .map((tab) => ({{ ...tab }}));
-    }},
-    async group({{ tabIds }}) {{
-      const tab = tabs.get(tabIds[0]);
-      if (tab) tab.groupId = 700;
-      return 700;
-    }},
-    async ungroup(tabIds) {{
-      for (const tabId of tabIds) {{
-        const tab = tabs.get(tabId);
-        if (tab) tab.groupId = -1;
-      }}
     }},
     async remove(tabId) {{ tabs.delete(tabId); }},
     async update(tabId, values) {{ Object.assign(tabs.get(tabId), values); }},
@@ -626,6 +588,8 @@ globalThis.chrome = {{
 }};
 globalThis.WebSocket = {{ OPEN: 1, CONNECTING: 0, CLOSING: 2 }};
 
+{_WINDOW_GROUP_FAKES}
+installWindowGroupFakes(chrome, tabs, listeners.updated);
 const {{ BridgeConnection }} = await import({json.dumps(bridge_uri)});
 const {{ DebuggerRouter }} = await import({json.dumps(debugger_uri)});
 const {{ ERROR_CODES }} = await import({json.dumps(protocol_uri)});
@@ -944,180 +908,381 @@ scope.scopedTabIds.delete(28);
 scope.scopedGroupIds.delete(28);
 tabs.delete(28);
 
-// Closing a just-created tab must cancel its create operation after Chrome returns the tab id.
-const originalAddToScopeLocked = scope.addToScopeLocked.bind(scope);
-let addToScopeStarted = false;
-let releaseAddToScope;
-scope.addToScopeLocked = async (tab, lease) => {{
-  addToScopeStarted = true;
-  await new Promise((resolve) => {{ releaseAddToScope = resolve; }});
-  return originalAddToScopeLocked(tab, lease);
+// Creation completion is required even when the URL already matches.
+const emit = (id, change) => {{
+  if (tabs.has(id)) Object.assign(tabs.get(id), change);
+  listeners.updated.forEach((fn) => fn(id, change));
 }};
-createTab = undefined;
-const interruptedCreate = scope.create({{ url: "https://created.example" }}).then(
-  () => null,
-  (error) => error,
-);
-await waitUntil(() => typeof createTab === "function");
-const createdTab = {{ id: 22, windowId: 2, groupId: -1, url: "https://created.example" }};
-tabs.set(22, createdTab);
-createTab({{ ...createdTab }});
-await waitUntil(() => addToScopeStarted && scope.tabOperationLeases.has(22));
-tabs.delete(22);
-listeners.removed.forEach((listener) => listener(22));
-const interruptedCreateError = await settleWithin(interruptedCreate);
-if (interruptedCreateError?.code !== ERROR_CODES.TAB_NOT_FOUND) {{
-  throw new Error(`closed created tab did not invalidate create: ${{interruptedCreateError?.code}}`);
-}}
-releaseAddToScope();
-scope.addToScopeLocked = originalAddToScopeLocked;
-await waitUntil(() => !scope.tabOperationLeases.has(22));
-
-const prepareCreate = async (tabId, url = "about:blank") => {{
+const added = (id) => scopeEvents.filter((e) => e.event === "scope.tabAdded" && e.params.tabId === id);
+const prepareCreate = async (tabId, url = "about:blank", complete = true) => {{
   createTab = undefined;
-  const createOutcome = scope.create(url === "about:blank" ? {{}} : {{ url }}).then(
-    () => null,
-    (error) => error,
-  );
+  const outcome = scope.create({{ url }}).then(() => null, (error) => error);
   await waitUntil(() => typeof createTab === "function");
-  const createdTab = {{ id: tabId, windowId: 2, groupId: -1, url }};
-  tabs.set(tabId, createdTab);
-  createTab({{ ...createdTab }});
-  return {{ outcome: createOutcome }};
+  tabs.set(tabId, {{ id: tabId, windowId: 2, groupId: -1, url, status: "loading" }});
+  createTab({{ ...tabs.get(tabId) }});
+  if (complete) emit(tabId, {{ status: "complete" }});
+  return {{ outcome }};
 }};
+scope.operationTimeoutMs = 5000;
+// Before identification: URL events and completion must be buffered by tab id.
+for (const [id, url, observed, code] of [
+  [39, "https://early.example", "https://redirect.example", "COMMAND_TIMEOUT"],
+  [40, "https://early.example", "https://early.example/", null],
+  [41, "about:blank", "about:blank", null],
+]) {{
+  createTab = undefined;
+  const outcome = scope.create({{ url }}).then(() => null, (e) => e);
+  await waitUntil(() => typeof createTab === "function");
+  tabs.set(id, {{ id, windowId: 2, groupId: -1, url: observed, status: "loading" }});
+  emit(id, {{ url: observed, status: "complete" }});
+  createTab({{ ...tabs.get(id) }});
+  assert.equal((await settleWithin(outcome))?.code ?? null, code);
+  assert.equal(added(id).length, code ? 0 : 1);
+  if (!code) await scope.remove({{ tabId: id }});
+}}
+// URL rewrites during identification, including a combined group update, fail closed.
+for (const [id, change] of [
+  [42, {{ url: "https://redirect.example" }}],
+  [43, {{ url: "about:blank", groupId: 701 }}],
+  [44, {{ url: "chrome://settings" }}],
+]) {{
+  const {{ outcome }} = await prepareCreate(id, "about:blank", false);
+  await waitUntil(() => scope.activeCreation?.tabId === id);
+  emit(id, change);
+  assert.equal((await settleWithin(outcome)).code, "COMMAND_TIMEOUT");
+  assert.equal(added(id).length, 0);
+  assert(!tabs.has(id));
+}}
+// A conflicting pending URL or failed final snapshot is rejected even after complete.
+for (const [id, finalFailure] of [[45, false], [46, true]]) {{
+  const originalGet = chrome.tabs.get;
+  let gets = 0;
+  chrome.tabs.get = async (tabId) => {{
+    const tab = await originalGet(tabId);
+    if (tabId === id && (++gets >= (finalFailure ? 2 : 1))) tab.pendingUrl = "https://conflict.example";
+    return tab;
+  }};
+  const {{ outcome }} = await prepareCreate(id);
+  assert.equal((await settleWithin(outcome)).code, "COMMAND_TIMEOUT");
+  chrome.tabs.get = originalGet;
+  assert(!tabs.has(id));
+  assert.equal(added(id).length, 0);
+}}
+// Removal and explicit unshare before the commit cancel creation.
+for (const [id, action] of [[47, "remove"], [48, "unshare"], [49, "reset"]]) {{
+  const {{ outcome }} = await prepareCreate(id, "about:blank", false);
+  await waitUntil(() => scope.activeCreation?.tabId === id);
+  if (action === "remove") {{
+    tabs.delete(id);
+    listeners.removed.forEach((fn) => fn(id));
+  }} else if (action === "unshare") {{
+    await scope.unshareTab(id).catch(() => undefined);
+  }} else {{
+    await scope.prepareForReset();
+    assert.equal(scope.activeCreation, null);
+    await scope.reset();
+    scope.finishReset();
+  }}
+  const error = await settleWithin(outcome);
+  assert.equal(error.code, action === "remove" ? "TAB_NOT_FOUND" : "COMMAND_TIMEOUT");
+  if (action === "remove") assert.equal(error.message, "The created tab closed during creation.");
+  assert.equal(added(id).length, 0);
+  assert(!tabs.has(id));
+}}
+// A closed final snapshot reports the same contract even if onRemoved is delayed.
+const originalGetForMissing = chrome.tabs.get;
+chrome.tabs.get = async (id) => {{
+  if (id === 73) {{ tabs.delete(id); throw new Error("missing tab"); }}
+  return originalGetForMissing(id);
+}};
+const {{ outcome: missingSnapshot }} = await prepareCreate(73);
+assert.equal((await settleWithin(missingSnapshot)).message, "The created tab closed during creation.");
+chrome.tabs.get = originalGetForMissing;
+assert.equal(added(73).length, 0);
 
-// A redirect before tabs.create resolves is accepted by the publication re-read.
+// Chrome 153's measured empty-url create reply remains hidden through loading.
 createTab = undefined;
-const earlyRedirectCreate = scope.create({{ url: "https://created-early.example" }}).then(
-  () => null,
-  (error) => error,
-);
+const measured = scope.create({{ url: "https://measured.example" }}).then(() => null, (e) => e);
 await waitUntil(() => typeof createTab === "function");
-const earlyRedirectTab = {{
-  id: 39,
-  windowId: 2,
-  groupId: -1,
-  url: "https://created-early.example",
-}};
-tabs.set(39, earlyRedirectTab);
-tabs.get(39).url = "https://created-early-redirected.example";
-listeners.updated.forEach((listener) =>
-  listener(39, {{ url: "https://created-early-redirected.example" }}),
-);
-createTab({{ ...earlyRedirectTab }});
-const earlyRedirectCreateOutcome = await settleWithin(earlyRedirectCreate);
-const earlyRedirectCreateEvents = scopeEvents.filter(
-  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 39,
-);
-if (
-  earlyRedirectCreateOutcome !== null ||
-  earlyRedirectCreateEvents.length !== 1 ||
-  earlyRedirectCreateEvents[0].params.origin !== "created" ||
-  earlyRedirectCreateEvents[0].params.url !==
-    "https://created-early-redirected.example"
-) {{
-  throw new Error(`early redirect create was not published: ${{JSON.stringify({{
-    outcome: earlyRedirectCreateOutcome?.code ?? earlyRedirectCreateOutcome,
-    events: earlyRedirectCreateEvents,
-  }})}}`);
-}}
-tabs.delete(39);
-listeners.removed.forEach((listener) => listener(39));
-await waitUntil(() => !scope.scopedTabIds.has(39) && !scope.createdTabIds.has(39));
+tabs.set(61, {{ id: 61, windowId: 2, groupId: -1, url: "", pendingUrl: "https://measured.example", status: "loading" }});
+createTab({{ ...tabs.get(61) }});
+await waitUntil(() => scope.activeCreation?.tabId === 61);
+assert(!scope.isScoped(61));
+assert(!(await scope.list()).tabs.some((tab) => tab.tabId === 61));
+await assert.rejects(scope.assertScoped(61), {{ code: "TAB_NOT_SCOPED" }});
+emit(61, {{ status: "loading", url: "https://measured.example/" }});
+await delay(1);
+assert.equal(added(61).length, 0);
+tabs.get(61).pendingUrl = "";
+emit(61, {{ status: "complete" }});
+assert.equal(await settleWithin(measured), null);
+await scope.remove({{ tabId: 61 }});
 
-// A created tab may redirect after the requested URL event and before publication.
-const originalTabsGetForRedirect = chrome.tabs.get;
-let redirectEventsSent = false;
-chrome.tabs.get = async (tabId) => {{
-  await originalTabsGetForRedirect(tabId);
-  if (tabId === 30 && !redirectEventsSent) {{
-    redirectEventsSent = true;
-    tabs.get(30).url = "https://created.example";
-    listeners.updated.forEach((listener) =>
-      listener(30, {{ url: "https://created.example" }}),
-    );
-    tabs.get(30).url = "https://created-redirected.example";
-    listeners.updated.forEach((listener) =>
-      listener(30, {{ url: "https://created-redirected.example" }}),
-    );
+// A second creation waits on the stable queue and consumes only its own early events.
+const {{ outcome: firstQueued }} = await prepareCreate(62, "about:blank", false);
+const firstResolver = createTab;
+const secondQueued = scope.create({{}}).then(() => null, (e) => e);
+await delay(1);
+assert.equal(createTab, firstResolver);
+emit(62, {{ status: "complete" }});
+assert.equal(await settleWithin(firstQueued), null);
+await waitUntil(() => createTab !== firstResolver);
+tabs.set(63, {{ id: 63, windowId: 2, groupId: -1, url: "about:blank", status: "complete" }});
+emit(63, {{ status: "complete" }});
+createTab({{ ...tabs.get(63) }});
+assert.equal(await settleWithin(secondQueued), null);
+await scope.remove({{ tabId: 62 }});
+await scope.remove({{ tabId: 63 }});
+
+// URL changes and unshare while grouping/persisting are still pre-commit failures.
+for (const [id, action] of [[64, "url"], [65, "unshare"], [66, "group"]]) {{
+  const originalSet = chrome.storage.session.set;
+  let injected = false;
+  chrome.storage.session.set = async (values) => {{
+    if (values.scopedTabGroupIds?.[id] === 700 && !injected) {{
+      injected = true;
+      assert(!scope.isScoped(id));
+      assert.equal(added(id).length, 0);
+      if (action === "unshare") await scope.unshareTab(id).catch(() => undefined);
+      else emit(id, action === "url" ? {{ url: "https://rewrite.example" }} : {{ groupId: -1 }});
+    }}
+    return originalSet(values);
+  }};
+  const {{ outcome }} = await prepareCreate(id);
+  assert.equal((await settleWithin(outcome)).code, "COMMAND_TIMEOUT");
+  chrome.storage.session.set = originalSet;
+  assert(injected && !tabs.has(id) && added(id).length === 0);
+}}
+
+// No completion event: the creation's own 3 s deadline, not the operation deadline.
+const {{ outcome: neverComplete }} = await prepareCreate(50, "about:blank", false);
+assert.equal((await settleWithin(neverComplete, 3500)).message,
+  "The created tab did not settle on the requested URL.");
+assert(!tabs.has(50));
+
+// Share, group admission and popup inheritance wait outside queues while unidentified.
+// The identified creation is refused; unrelated tabs proceed, including a popup.
+tabs.set(51, {{ id: 51, windowId: 2, groupId: 700, url: "https://opener.example" }});
+scope.scopedTabIds.add(51);
+scope.scopedGroupIds.set(51, 700);
+createTab = undefined;
+const fenced = scope.create({{}}).then(() => null, (e) => e);
+await waitUntil(() => typeof createTab === "function");
+for (const id of [52, 53, 54, 55]) {{
+  tabs.set(id, {{ id, windowId: 2, groupId: id === 54 ? 700 : -1,
+    url: "about:blank", status: "loading", openerTabId: 51 }});
+}}
+const pendingShare = scope.shareTab(52).then(() => null, (e) => e);
+const otherShare = scope.shareTab(53);
+const otherGroup = scope.handleTabUpdated(54, {{ groupId: 700 }});
+const otherPopup = scope.handleTabCreated(tabs.get(55));
+const ownGroup = scope.handleTabUpdated(52, {{ groupId: 700 }});
+const ownPopup = scope.handleTabCreated(tabs.get(52));
+await delay(2);
+for (const id of [52, 53, 54, 55]) {{
+  assert(!scope.isScoped(id));
+  assert(!scope.tabOperations.has(id));
+}}
+createTab({{ ...tabs.get(52) }});
+assert.equal((await pendingShare).message, "The requested tab is still being created.");
+await Promise.all([otherShare, otherGroup, otherPopup, ownGroup, ownPopup]);
+assert(!scope.isScoped(52));
+for (const id of [53, 54, 55]) assert(scope.isScoped(id));
+await assert.rejects(scope.shareTab(52), {{ message: "The requested tab is still being created." }});
+await scope.handleTabCreated(tabs.get(52));
+await scope.handleTabUpdated(52, {{ groupId: 700 }});
+assert(!scope.isScoped(52));
+emit(52, {{ status: "complete" }});
+assert.equal(await settleWithin(fenced), null);
+assert(scope.isScoped(52));
+assert(!scope.expectedGroupTransitions.has(52));
+for (const id of [51, 52, 53, 54, 55]) {{
+  await scope.unshareTab(id);
+  tabs.delete(id);
+}}
+
+// If creation starts during an admission await, retry outside every tab queue.
+for (const [id, kind] of [[67, "share"], [68, "group"], [69, "popup"]]) {{
+  tabs.set(70, {{ id: 70, windowId: 2, groupId: 700, url: "https://opener.example" }});
+  scope.scopedTabIds.add(70);
+  scope.scopedGroupIds.set(70, 700);
+  tabs.set(id, {{ id, windowId: 2, groupId: kind === "group" ? 700 : -1,
+    url: "about:blank", openerTabId: 70 }});
+  const originalGet = chrome.tabs.get;
+  const originalSet = chrome.storage.session.set;
+  let releaseAdmission;
+  let delayed = false;
+  if (kind === "popup") {{
+    chrome.storage.session.set = async (values) => {{
+      if (values.createdTabIds?.includes(id) && !delayed) {{
+        delayed = true;
+        await new Promise((resolve) => {{ releaseAdmission = resolve; }});
+      }}
+      return originalSet(values);
+    }};
+  }} else {{
+    chrome.tabs.get = async (tabId) => {{
+      const tab = await originalGet(tabId);
+      if (tabId === id && !delayed) {{
+        delayed = true;
+        await new Promise((resolve) => {{ releaseAdmission = resolve; }});
+      }}
+      return tab;
+    }};
   }}
-  return {{ ...tabs.get(tabId) }};
-}};
-const {{ outcome: matchingCreate }} = await prepareCreate(30, "https://created.example");
-const matchingCreateOutcome = await settleWithin(matchingCreate);
-chrome.tabs.get = originalTabsGetForRedirect;
-const matchingCreateEvents = scopeEvents.filter(
-  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 30,
-);
-if (
-  matchingCreateOutcome !== null ||
-  matchingCreateEvents.length !== 1 ||
-  matchingCreateEvents[0].params.origin !== "created" ||
-  matchingCreateEvents[0].params.url !== "https://created-redirected.example"
-) {{
-  throw new Error(`redirected create was not published as the final URL: ${{JSON.stringify({{
-    outcome: matchingCreateOutcome?.code ?? matchingCreateOutcome,
-    events: matchingCreateEvents,
-  }})}}`);
+  const admission = kind === "share" ? scope.shareTab(id)
+    : kind === "group" ? scope.handleTabUpdated(id, {{ groupId: 700 }})
+    : scope.handleTabCreated(tabs.get(id));
+  await waitUntil(() => typeof releaseAdmission === "function");
+  createTab = undefined;
+  const creation = scope.create({{}}).then(() => null, (e) => e);
+  await waitUntil(() => typeof createTab === "function");
+  releaseAdmission();
+  await waitUntil(() => !scope.tabOperations.has(id) && !scope.tabOperations.has(70));
+  assert(!scope.isScoped(id));
+  tabs.set(71, {{ id: 71, windowId: 2, groupId: -1, url: "about:blank", status: "complete" }});
+  emit(71, {{ status: "complete" }});
+  createTab({{ ...tabs.get(71) }});
+  await admission;
+  assert(scope.isScoped(id));
+  assert.equal(await settleWithin(creation), null);
+  chrome.tabs.get = originalGet;
+  chrome.storage.session.set = originalSet;
+  await scope.remove({{ tabId: 71 }});
+  for (const tabId of [id, 70]) {{ await scope.unshareTab(tabId); tabs.delete(tabId); }}
 }}
 
-// A created tab whose only URL event is a non-restricted redirect publishes the redirect.
-let committedCreateEventSent = false;
-chrome.tabs.get = async (tabId) => {{
-  const tab = await originalTabsGetForRedirect(tabId);
-  if (tabId === 31 && !committedCreateEventSent) {{
-    committedCreateEventSent = true;
-    tabs.get(31).url = "https://created-redirected.example";
-    listeners.updated.forEach((listener) =>
-      listener(31, {{ url: "https://created-redirected.example" }}),
-    );
-    return {{ ...tabs.get(tabId) }};
-  }}
-  return tab;
-}};
-const {{ outcome: committedCreate }} = await prepareCreate(31, "https://created-requested.example");
-const committedCreateOutcome = await settleWithin(committedCreate);
-chrome.tabs.get = originalTabsGetForRedirect;
-const committedCreateEvents = scopeEvents.filter(
-  (entry) => entry.event === "scope.tabAdded" && entry.params?.tabId === 31,
-);
-if (
-  committedCreateOutcome !== null ||
-  committedCreateEvents.length !== 1 ||
-  committedCreateEvents[0].params.origin !== "created" ||
-  committedCreateEvents[0].params.url !== "https://created-redirected.example"
-) {{
-  throw new Error(`committed redirect create was not published as the final URL: ${{JSON.stringify({{
-    outcome: committedCreateOutcome?.code ?? committedCreateOutcome,
-    events: committedCreateEvents,
-  }})}}`);
-}}
+// Deferred admissions belong to the reset generation in which they arrived.
+createTab = undefined;
+const resetUnidentified = scope.create({{}}).then(() => null, (e) => e);
+await waitUntil(() => typeof createTab === "function");
+const resetResolver = createTab;
+tabs.set(72, {{ id: 72, windowId: 2, groupId: 700, url: "about:blank" }});
+const resetShare = scope.shareTab(72).then(() => null, (e) => e);
+const resetGroup = scope.handleTabUpdated(72, {{ groupId: 700 }});
+await delay(1);
+await scope.prepareForReset();
+await scope.reset();
+scope.finishReset();
+assert.equal((await settleWithin(resetShare)).code, "COMMAND_TIMEOUT");
+await resetGroup;
+assert(!scope.isScoped(72));
+assert.equal((await resetUnidentified).code, "COMMAND_TIMEOUT");
+resetResolver({{ ...tabs.get(72) }});
+await waitUntil(() => !tabs.has(72));
 
-// A restricted URL observed by the pre-publication re-read fails closed.
-const {{ outcome: restrictedCreate }} = await prepareCreate(32, "https://created-restricted.example");
-tabs.get(32).url = "chrome://settings";
-const restrictedCreateError = await settleWithin(restrictedCreate);
-if (
-  restrictedCreateError?.code !== ERROR_CODES.RESTRICTED_URL ||
-  tabs.has(32)
-) {{
-  throw new Error(`restricted create did not fail closed: ${{restrictedCreateError?.code}}`);
-}}
+// Restart before tabs.create answers must retain the unidentified admission fence.
+createTab = undefined;
+const interruptedCreation = scope.create({{ url: "https://requested.example" }}).catch((e) => e);
+await waitUntil(() => typeof createTab === "function");
+const interruptedLease = scope.activeCreation.lease;
+const durableBeforeCallback = structuredClone(sessionState);
+clearTimeout(scope.activeCreation.timer);
+const recoveryListenerCounts = Object.fromEntries(["created", "removed", "updated"].map((key) => [key, listeners[key].length]));
+tabs.set(73, {{ id: 73, windowId: 2, groupId: 700, url: "https://wrong.example", status: "complete" }});
+const recoveredEvents = [];
+const recoveredScope = new TabScope({{ sendEvent: (...args) => recoveredEvents.push(args) }});
+await recoveredScope.initialize();
+await recoveredScope.handleTabUpdated(73, {{ groupId: 700 }});
+assert(!recoveredScope.isScoped(73), "restart admitted an unresolved creation at the wrong URL");
+await assert.rejects(recoveredScope.shareTab(73), {{ code: "COMMAND_TIMEOUT" }});
+assert.deepEqual(recoveredEvents, []);
+assert.equal(durableBeforeCallback.pendingTabCreation.url, "https://requested.example");
+assert(durableBeforeCallback.pendingTabCreation.deadlineMs > Date.now());
+// Once its deadline passes, the recovered fence drops without acquiring ownership.
+const realNow = Date.now;
+Date.now = () => durableBeforeCallback.pendingTabCreation.deadlineMs + 1;
+await recoveredScope.shareTab(73);
+await recoveredScope.unshareTab(73);
+Date.now = realNow;
+assert.equal(sessionState.pendingTabCreation, null);
+// An already-expired marker also releases admissions during initialization.
+sessionState.pendingTabCreation = {{ ...durableBeforeCallback.pendingTabCreation, deadlineMs: Date.now() - 1 }};
+const expiredScope = new TabScope({{ sendEvent: () => undefined }});
+await expiredScope.initialize();
+await expiredScope.shareTab(73);
+await expiredScope.unshareTab(73);
+assert(tabs.has(73), "recovery must not acquire ownership of an unidentified tab");
+// End the simulated old worker only after checking its durable crash snapshot.
+interruptedLease.cancel(new Error("simulated worker stopped"));
+await interruptedCreation;
+tabs.delete(73);
+for (const [key, count] of Object.entries(recoveryListenerCounts)) listeners[key].length = count;
 
-// The creation grant is revoked at operation end and cannot spare a later URL event.
+// Failed cleanup stays owned and quarantined across worker restart, then reset closes it.
+const originalRemoveForCreation = chrome.tabs.remove;
+chrome.tabs.remove = async (id) => {{ if (id === 56) throw new Error("close denied"); return originalRemoveForCreation(id); }};
+const {{ outcome: failedClose }} = await prepareCreate(56, "about:blank", false);
+await waitUntil(() => scope.activeCreation?.tabId === 56);
+emit(56, {{ url: "https://wrong.example" }});
+assert.equal((await settleWithin(failedClose)).message, "The created tab could not be closed.");
+assert(scope.createdTabIds.has(56) && scope.quarantinedTabIds.has(56));
+const restart = new TabScope({{ sendEvent: () => undefined }});
+await restart.initialize();
+await assert.rejects(restart.shareTab(56), {{ code: "COMMAND_TIMEOUT" }});
+tabs.get(56).groupId = 700;
+await restart.handleTabUpdated(56, {{ groupId: 700 }});
+assert(!restart.isScoped(56));
+chrome.tabs.remove = originalRemoveForCreation;
+await restart.prepareForReset();
+await restart.reset();
+restart.finishReset();
+assert(!tabs.has(56));
+scope.createdTabIds.delete(56);
+scope.quarantinedTabIds.delete(56);
+
+// A times out unresolved; reset; B starts; A's late result cannot fence or close B.
+scope.operationTimeoutMs = 20;
+createTab = undefined;
+const orphan = scope.create({{}}).then(() => null, (e) => e);
+await waitUntil(() => typeof createTab === "function");
+const resolveOrphan = createTab;
+assert.equal((await settleWithin(orphan)).code, "COMMAND_TIMEOUT");
+assert.equal(scope.activeCreation, null);
+await scope.prepareForReset();
+await scope.reset();
+scope.finishReset();
+scope.operationTimeoutMs = 5000;
+const {{ outcome: nextCreation }} = await prepareCreate(57, "about:blank", false);
+await waitUntil(() => scope.activeCreation?.tabId === 57);
+tabs.set(58, {{ id: 58, windowId: 2, groupId: -1, url: "about:blank" }});
+resolveOrphan({{ ...tabs.get(58) }});
+await waitUntil(() => !tabs.has(58) && !scope.creationCleanups.has(58));
+assert.equal(scope.activeCreation.tabId, 57);
+emit(57, {{ status: "complete" }});
+assert.equal(await settleWithin(nextCreation), null);
+await scope.remove({{ tabId: 57 }});
+
+// Another path already scoped the late result: ownership is handed back, never closed.
+scope.operationTimeoutMs = 20;
+createTab = undefined;
+const superseded = scope.create({{}}).then(() => null, (e) => e);
+await waitUntil(() => typeof createTab === "function");
+const resolveSuperseded = createTab;
+await settleWithin(superseded);
+tabs.set(59, {{ id: 59, windowId: 2, groupId: 700, url: "about:blank" }});
+await scope.shareTab(59);
+await scope.unshareTab(59);
+resolveSuperseded({{ ...tabs.get(59) }});
+await delay(2);
+assert(tabs.has(59), "late creation cleanup closed a handed-back tab");
+assert(!scope.isScoped(59) && !scope.createdTabIds.has(59) && !scope.isQuarantined(59));
+tabs.delete(59);
+
+// Normal explicit-URL creation; an identical URL replay after commit still cancels.
+scope.operationTimeoutMs = 5000;
+const {{ outcome: successfulCreate }} = await prepareCreate(30, "https://created.example");
+assert.equal(await settleWithin(successfulCreate), null);
 let replayOperationStarted = false;
 const replayOperation = scope.runTabOperation(30, async () => {{
   replayOperationStarted = true;
   return new Promise(() => undefined);
 }}).then(() => null, (error) => error);
 await waitUntil(() => replayOperationStarted);
-listeners.updated.forEach((listener) =>
-  listener(30, {{ url: "https://created-redirected.example" }}),
-);
-const replayError = await settleWithin(replayOperation);
-if (replayError?.code !== ERROR_CODES.COMMAND_TIMEOUT) {{
-  throw new Error(`creation URL grant survived publication: ${{replayError?.code}}`);
-}}
+emit(30, {{ url: "https://created.example" }});
+assert.equal((await settleWithin(replayOperation)).message,
+  "The page changed while the extension operation was running.");
+scope.operationTimeoutMs = 20;
 
 // Page.navigate remains available after publication and consumes its own grant.
 const creationRouter = new DebuggerRouter({{
@@ -1291,6 +1456,7 @@ chrome.tabs.remove = (tabId) => {{
 
 // Reset must invalidate an in-flight create before ACK and the late Chrome result
 // must never scope a tab into the new epoch.
+createTab = undefined;
 const createOutcome = scope.create({{ url: "https://old-client.example" }}).then(
   () => null,
   (error) => error,
@@ -1522,6 +1688,65 @@ if (
   }})}}`);
 }}
 tabs.delete(35);
+
+// Queued debugger leases report before-start; invoked commands report running.
+for (const method of ["Runtime.evaluate", "Input.dispatchMouseEvent"]) {{
+  markAttached(60, "https://before.example");
+  let finishLate;
+  let invocations = 0;
+  chrome.debugger.sendCommand = () => {{
+    invocations += 1;
+    return new Promise((resolve) => {{ finishLate = resolve; }});
+  }};
+  const running = router.send({{ tabId: 60, method, params: {{}} }}).then(() => null, (e) => e);
+  await waitUntil(() => typeof finishLate === "function");
+  const queued = router.send({{ tabId: 60, method: "Input.dispatchMouseEvent" }}).then(() => null, (e) => e);
+  emit(60, {{ url: "https://changed.example" }});
+  assert.equal((await settleWithin(running)).message, "The page changed while the extension operation was running.");
+  assert.equal((await settleWithin(queued)).message, "The page changed before the extension operation started.");
+  assert.equal(invocations, 1);
+  finishLate({{ stale: true }});
+  await delay(1);
+  assert(router.attachedTabs.has(60) && scope.isScoped(60));
+  chrome.debugger.sendCommand = async () => ({{ fresh: true }});
+  assert.deepEqual((await router.send({{ tabId: 60, method: "Page.getFrameTree" }})).result, {{ fresh: true }});
+  await scope.unshareTab(60);
+  tabs.delete(60);
+}}
+
+// Exempt commands retain their per-tab order and Chrome results across URL events.
+for (const restricted of [false, true]) {{
+  markAttached(60, "https://before.example");
+  const calls = [];
+  let finishEnable;
+  chrome.debugger.sendCommand = (_target, method) => {{
+    calls.push(method);
+    return method === "Page.enable"
+      ? new Promise((resolve) => {{ finishEnable = resolve; }})
+      : Promise.resolve({{ method, fromChrome: true }});
+  }};
+  const enable = router.send({{ tabId: 60, method: "Page.enable" }}).catch((e) => e);
+  await waitUntil(() => finishEnable);
+  const tree = router.send({{ tabId: 60, method: "Page.getFrameTree" }}).catch((e) => e);
+  const bootstrap = router.send({{ tabId: 60, method: "Runtime.evaluate", params: {{
+    expression: "(() => {{\\n const module = {{}};\\n return new (module.exports.UtilityScript())(globalThis, false);\\n }})();",
+    contextId: 1,
+  }} }}).catch((e) => e);
+  emit(60, {{ url: restricted ? "chrome://settings" : "https://changed.example" }});
+  finishEnable({{ enabledByChrome: true }});
+  if (restricted) {{
+    for (const result of await Promise.all([enable, tree, bootstrap])) assert.equal(result.code, "RESTRICTED_URL");
+    assert.deepEqual(calls, ["Page.enable"]);
+    await waitUntil(() => !scope.isScoped(60));
+  }} else {{
+    assert.deepEqual((await enable).result, {{ enabledByChrome: true }});
+    assert.deepEqual((await tree).result, {{ method: "Page.getFrameTree", fromChrome: true }});
+    assert.deepEqual((await bootstrap).result, {{ method: "Runtime.evaluate", fromChrome: true }});
+    assert.deepEqual(calls, ["Page.enable", "Page.getFrameTree", "Runtime.evaluate"]);
+    await scope.unshareTab(60);
+  }}
+  tabs.delete(60);
+}}
 
 // A non-navigation operation is cancelled by a URL event, but cancellation does not detach the debugger.
 markAttached(37, "https://before.example");
@@ -1761,4 +1986,523 @@ await waitUntil(() => !router.attachedTabs.has(21) && !router.attachStates.has(2
         timeout=10,
     )
 
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "child_popup",
+        "adopt_late_attach",
+        "adopt_unmatched_attach",
+        "adopt_move_rejected",
+        "adopt_group_failure",
+        "adopt_identification_retry",
+        "adopt_identification_retry_reset",
+        "adopt_renamed_opener_group",
+        "child_panel",
+        "child_app",
+        "child_devtools",
+        "child_normal",
+        "startup_match",
+        "startup_unscoped",
+        "startup_ungroup_failure",
+        "startup_ungroup_noop",
+        "startup_enumeration_failure",
+        "startup_group_lookup_failure",
+        "startup_attached",
+        "startup_attached_unowned",
+        "restore_groupless",
+        "normal_groupless",
+        "popup_positive",
+        "lookup_failure",
+        "attached",
+        "regroup_scoped",
+        "regroup_unscoped",
+        "regroup_lookup_failure",
+        "create_popup",
+        "group_race",
+        "admission_validation_race",
+    ],
+)
+def test_popup_window_scope_contract(case: str) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension scope test")
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    script = f"""
+import assert from "node:assert/strict";
+const tabs = new Map();
+const stored = {{}};
+const events = [];
+const removed = [];
+const updates = [];
+const commands = [];
+const moves = [];
+const activations = [];
+let moveHook = null;
+const listener = {{ addListener() {{}} }};
+globalThis.chrome = {{
+  tabs: {{
+    onCreated: listener, onRemoved: listener,
+    onUpdated: {{ addListener(fn) {{ updates.push(fn); }} }},
+    async get(id) {{ if (!tabs.has(id)) throw new Error("missing tab"); return {{ ...tabs.get(id) }}; }},
+    async query() {{ return [...tabs.values()]; }},
+    async move(id, options) {{
+      moves.push({{ id, ...options }});
+      if (caseName === "adopt_move_rejected") throw new Error("move rejected");
+      Object.assign(tabs.get(id), {{ windowId: options.windowId, groupId: -1, active: false }});
+      delete tabs.get(id).openerTabId;
+      if (moveHook) await moveHook();
+      if (caseName !== "adopt_late_attach") {{
+        state.attached.forEach((fn) => fn(id, {{ newWindowId: options.windowId }}));
+      }}
+      return {{ ...tabs.get(id) }};
+    }},
+    async update(id, options) {{
+      activations.push({{ id, ...options }});
+      assert(events.some((entry) => entry.event === "tabs.created" && entry.params.tabId === id));
+      Object.assign(tabs.get(id), options);
+      return {{ ...tabs.get(id) }};
+    }},
+    async remove(id) {{ removed.push(id); tabs.delete(id); }},
+    async create({{ url }}) {{
+      const tab = {{ id: 3, windowId: 2, groupId: -1, url, status: "complete" }};
+      tabs.set(tab.id, tab);
+      updates.forEach((fn) => fn(tab.id, {{ status: "complete" }}));
+      return {{ ...tab }};
+    }},
+  }},
+  tabGroups: {{
+    async query() {{ return []; }},
+    async get(id) {{ return {{ id, windowId: 1, title: "Skyvern Controlled" }}; }},
+    async update() {{}},
+  }},
+  storage: {{ session: {{
+    async get(defaults) {{ return {{ ...defaults, ...stored }}; }},
+    async set(values) {{ Object.assign(stored, structuredClone(values)); }},
+    async remove(keys) {{ for (const key of keys) delete stored[key]; }},
+  }} }},
+  debugger: {{
+    onEvent: listener, onDetach: listener,
+    async attach() {{}}, async detach() {{}},
+    async sendCommand(target, method) {{ commands.push({{ target, method }}); return {{}}; }},
+  }},
+}};
+{_WINDOW_GROUP_FAKES}
+const state = installWindowGroupFakes(chrome, tabs, updates);
+state.types.set(2, "popup");
+const {{ TabScope }} = await import({json.dumps((extension_dir / "tab_scope.js").as_uri())});
+const {{ DebuggerRouter }} = await import({json.dumps((extension_dir / "debugger_router.js").as_uri())});
+const caseName = {json.dumps(case)};
+const tab = {{ id: 2, windowId: 2, groupId: -1, url: "https://popup.example.test" }};
+tabs.set(2, tab);
+const scope = new TabScope({{ sendEvent: (event, params) => events.push({{ event, params }}) }});
+const waitUntil = async (predicate) => {{
+  for (let i = 0; i < 100; i++) {{
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }}
+  assert.fail("event did not settle");
+}};
+if (caseName.startsWith("startup_attached")) {{
+  state.types.set(2, "normal");
+  tab.groupId = 700;
+  stored.scopedTabIds = [2];
+  stored.scopedTabGroupIds = {{ 2: 700 }};
+  stored.createdTabIds = caseName === "startup_attached" ? [2] : [];
+  let releaseStorage;
+  chrome.storage.session.get = () => new Promise((resolve) => {{ releaseStorage = resolve; }});
+  const initializing = scope.initialize();
+  tab.windowId = 3;
+  state.attached.forEach((fn) => fn(2, {{ newWindowId: 3 }}));
+  releaseStorage(structuredClone(stored));
+  await initializing;
+  await waitUntil(() => events.some((entry) => entry.event === "scope.tabRemoved" && entry.params.reason === "unshared"));
+  assert(!scope.isScoped(2));
+  assert(!scope.createdTabIds.has(2));
+  assert(!stored.scopedTabIds.includes(2));
+  assert(!stored.createdTabIds.includes(2));
+  await assert.rejects(scope.assertControllableLocked(2), {{ code: "TAB_NOT_SCOPED" }});
+}} else if (caseName.startsWith("startup_") || caseName === "restore_groupless") {{
+  tab.groupId = caseName === "restore_groupless" ? -1 : 700;
+  const unscoped = ["startup_unscoped", "startup_group_lookup_failure"].includes(caseName);
+  stored.scopedTabIds = unscoped ? [] : [2];
+  stored.createdTabIds = unscoped ? [] : [2];
+  stored.scopedTabGroupIds = {{ 2: tab.groupId }};
+  // A failed lookup on another restored tab must not abort initialization.
+  tabs.set(4, {{ id: 4, windowId: 4, groupId: 700, url: "https://missing.example.test" }});
+  stored.scopedTabIds.push(4);
+  stored.scopedTabGroupIds[4] = 700;
+  state.lookupFailures.add(4);
+  state.ungroupFails = caseName === "startup_ungroup_failure";
+  state.ungroupNoop = caseName === "startup_ungroup_noop";
+  state.enumerationFailure = caseName === "startup_enumeration_failure";
+  if (caseName === "startup_group_lookup_failure") {{
+    state.groupLookupFailures.add(700);
+    state.groupTitles.set(702, "Other group");
+    tabs.set(5, {{ ...tab, id: 5, groupId: 702 }});
+  }}
+  await scope.initialize();
+  await scope.ready;
+  assert(!scope.isScoped(4));
+  if (state.ungroupFails || state.ungroupNoop || state.groupLookupFailures.size) {{
+    assert.equal(tab.groupId, 700);
+    assert(!scope.isScoped(2));
+    assert(!scope.createdTabIds.has(2));
+    assert.equal(scope.scopedGroupIds.get(2), undefined);
+    assert.equal(stored.scopedTabGroupIds[2], undefined);
+    assert(!(await scope.helloTabs()).some((item) => item.tabId === 2));
+    assert(!(await scope.list()).tabs.some((item) => item.tabId === 2));
+    assert.deepEqual(state.alarms.at(-1), {{ name: "skyvern-popup-group-sweep", options: {{ delayInMinutes: 0.5 }} }});
+    const deadline = state.pendingAlarms.get("skyvern-popup-group-sweep").scheduledTime;
+    state.now += 10_000;
+    await scope.sweepPopupGroups();
+    assert.equal(state.pendingAlarms.get("skyvern-popup-group-sweep").scheduledTime, deadline);
+    state.ungroupFails = false;
+    state.ungroupNoop = false;
+    state.groupLookupFailures.clear();
+    state.fireAlarm("skyvern-popup-group-sweep");
+    await waitUntil(() => tab.groupId === -1 && scope.activeOperationCount === 0);
+    assert(!scope.isScoped(2));
+    assert(!scope.createdTabIds.has(2));
+    assert.equal(scope.scopedGroupIds.get(2), undefined);
+    if (caseName === "startup_group_lookup_failure") assert.equal(tabs.get(5).groupId, 702);
+  }} else if (state.enumerationFailure) {{
+    assert(state.alarms.some((alarm) => alarm.name === "skyvern-popup-group-sweep"));
+  }} else {{
+    assert.equal(tab.groupId, -1);
+    const keepsScope = caseName === "restore_groupless";
+    assert.equal(scope.isScoped(2), keepsScope);
+    assert.equal(scope.createdTabIds.has(2), keepsScope);
+    assert.equal(scope.scopedGroupIds.get(2), keepsScope ? -1 : undefined);
+  }}
+}} else {{
+  await scope.initialize();
+  if (caseName.startsWith("child_")) {{
+    const type = caseName.slice(6);
+    state.types.set(2, type);
+    tabs.set(1, {{ id: 1, windowId: 1, groupId: 700, url: "https://opener.example.test" }});
+    scope.scopedTabIds.add(1);
+    scope.scopedGroupIds.set(1, 700);
+    tab.openerTabId = 1;
+    // The event snapshot is stale. Grouping must use the live destination.
+    await scope.handleTabCreated({{ ...tab, windowId: 1 }});
+    assert(scope.isScoped(2));
+    assert((await scope.list()).tabs.some((item) => item.tabId === 2));
+    assert.equal(tab.windowId, type === "popup" ? 1 : 2);
+    assert.equal(tab.groupId, ["normal", "popup"].includes(type) ? 700 : -1);
+    assert.equal(state.groupCalls.length, ["normal", "popup"].includes(type) ? 1 : 0);
+    if (type === "popup") {{
+      assert.deepEqual(moves, [{{ id: 2, windowId: 1, index: -1 }}]);
+      assert.equal(state.groupCalls[0].groupId, 700);
+      assert.equal(scope.pendingAdoptions.size, 0);
+      assert.deepEqual(events.find((entry) => entry.event === "tabs.created").params,
+        {{ tabId: 2, openerTabId: 1, url: tab.url }});
+    }}
+    if (type === "normal") assert.equal(state.groupCalls[0].createProperties.windowId, 2);
+    const router = new DebuggerRouter({{ tabScope: scope, sendEvent() {{}}, onAttachedChange() {{}} }});
+    await router.attach({{ tabId: 2 }});
+    await router.send({{ tabId: 2, method: "Runtime.evaluate", params: {{ expression: "1" }} }});
+    assert(commands.some((command) => command.target.tabId === 2 && command.method === "Runtime.evaluate"));
+  }} else if (caseName.startsWith("adopt_")) {{
+    tabs.set(1, {{ id: 1, windowId: 1, groupId: 701,
+      active: caseName === "adopt_late_attach",
+      url: "https://opener.example.test" }});
+    scope.scopedTabIds.add(1);
+    scope.scopedGroupIds.set(1, 701);
+    tab.openerTabId = 1;
+    chrome.tabGroups.query = async () => [
+      {{ id: 700, windowId: 1, title: "Skyvern Controlled" }},
+      {{ id: 701, windowId: 1, title: "Skyvern Controlled" }},
+    ];
+    if (caseName === "adopt_unmatched_attach") {{
+      moveHook = async () => {{
+        state.attached.forEach((fn) => fn(2, {{ newWindowId: 3 }}));
+      }};
+    }}
+    if (caseName === "adopt_group_failure") {{
+      chrome.tabs.group = async () => {{ throw new Error("group failed"); }};
+    }}
+    if (caseName === "adopt_renamed_opener_group") {{
+      state.groupTitles.set(701, "Personal tabs");
+    }}
+    let identify;
+    let retryCount = 0;
+    const identificationRetry = caseName.startsWith("adopt_identification_retry");
+    if (identificationRetry) {{
+      const persist = scope.persistScope.bind(scope);
+      scope.persistScope = async (...args) => {{
+        await persist(...args);
+        if (scope.createdTabIds.has(2) && retryCount++ === 0) {{
+          assert.equal(tab.windowId, 1);
+          scope.activeCreation = {{ tabId: null,
+            identified: new Promise((resolve) => {{ identify = resolve; }}) }};
+        }}
+      }};
+    }}
+    const admission = scope.handleTabCreated({{ ...tab }});
+    if (identificationRetry) {{
+      await waitUntil(() => identify && scope.activeOperationCount === 0);
+      assert(scope.createdTabIds.has(2));
+      assert(stored.createdTabIds.includes(2));
+      if (caseName === "adopt_identification_retry_reset") {{
+        await scope.prepareForReset();
+        await scope.reset();
+        scope.finishReset();
+        assert.deepEqual(removed, [2]);
+        assert(!tabs.has(2), "reset must close the adopted child during the retry wait");
+        assert(!scope.createdTabIds.has(2));
+        assert(!stored.createdTabIds.includes(2));
+      }}
+      scope.activeCreation = null;
+      identify();
+    }}
+    if (caseName === "adopt_identification_retry_reset") {{
+      await admission;
+      assert.equal(scope.pendingAdoptions.size, 0);
+      assert(!scope.isScoped(2));
+      assert(!events.some((entry) => entry.event === "tabs.created"));
+    }} else if (caseName === "adopt_renamed_opener_group") {{
+      await admission;
+      assert.deepEqual(moves, []);
+      assert.equal(tab.windowId, 2);
+      assert.equal(tab.groupId, -1);
+      assert(!scope.isScoped(2));
+      assert.equal(scope.pendingAdoptions.size, 0);
+    }} else if (["adopt_unmatched_attach", "adopt_group_failure"].includes(caseName)) {{
+      await assert.rejects(admission);
+      assert.deepEqual(removed, [2]);
+      assert(!scope.isScoped(2));
+      assert(!events.some((entry) => entry.event === "tabs.created"));
+      await scope.handleTabRemoved(2);
+      assert.equal(scope.pendingAdoptions.size, 0);
+    }} else {{
+      await admission;
+      assert(scope.isScoped(2));
+      assert(scope.createdTabIds.has(2));
+      assert.equal(events.find((entry) => entry.event === "tabs.created").params.openerTabId, 1);
+      if (caseName === "adopt_move_rejected") {{
+        assert.equal(tab.windowId, 2);
+        assert.equal(tab.groupId, -1);
+        assert.equal(scope.pendingAdoptions.size, 0);
+      }} else {{
+        assert.equal(tab.windowId, 1);
+        assert.equal(tab.groupId, 701);
+        assert.equal(scope.scopedGroupIds.get(2), 701);
+        if (caseName === "adopt_late_attach") {{
+          assert.equal(scope.pendingAdoptions.get(2).admissionDone, true);
+          state.attached.forEach((fn) => fn(2, {{ newWindowId: 1 }}));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          assert(scope.isScoped(2));
+          assert.equal(scope.pendingAdoptions.size, 0);
+          assert(!events.some((entry) => entry.event === "scope.tabRemoved"));
+        }}
+        const active = caseName === "adopt_late_attach";
+        assert.deepEqual(activations, active ? [{{ id: 2, active: true }}] : []);
+        assert.equal(tab.active, active);
+      }}
+    }}
+  }} else if (caseName === "create_popup") {{
+    await assert.rejects(scope.create({{ url: "https://created.example.test" }}));
+    assert.deepEqual(removed, [3]);
+    assert.equal(state.groupCalls.length, 0);
+    assert.equal(events.filter((entry) => entry.event === "scope.tabAdded" || entry.event === "tabs.created").length, 0);
+  }} else if (caseName === "group_race") {{
+    state.types.set(2, "normal");
+    state.types.set(3, "normal");
+    const group = chrome.tabs.group;
+    chrome.tabs.group = async (options) => {{
+      const id = await group(options);
+      tab.windowId = 3;
+      state.attached.forEach((fn) => fn(2, {{ newWindowId: 3 }}));
+      return id;
+    }};
+    await assert.rejects(scope.shareTab(2), {{ code: "TAB_NOT_SCOPED" }});
+    await waitUntil(() => scope.activeOperationCount === 0);
+    assert.equal(tab.windowId, 3);
+    assert.equal(tab.groupId, -1);
+    assert(!scope.isScoped(2));
+    assert.equal(state.pendingAlarms.size, 0);
+  }} else if (caseName === "admission_validation_race") {{
+    state.types.set(2, "normal");
+    state.types.set(3, "normal");
+    const get = chrome.tabs.get;
+    let moved = false;
+    chrome.tabs.get = async (id) => {{
+      // The group record is written after groupTabLocked's own tab validation.
+      if (id === 2 && !moved && scope.scopedGroupIds.get(2) === 700) {{
+        moved = true;
+        tab.windowId = 3;
+        state.attached.forEach((fn) => fn(2, {{ newWindowId: 3 }}));
+      }}
+      return get(id);
+    }};
+    await assert.rejects(scope.shareTab(2), {{ code: "TAB_NOT_SCOPED" }});
+    await waitUntil(() => scope.activeOperationCount === 0);
+    assert(moved);
+    assert.equal(tab.groupId, -1);
+    assert(!scope.isScoped(2));
+    assert.equal(scope.scopedGroupIds.get(2), undefined);
+    assert.equal(state.pendingAlarms.size, 0);
+  }} else {{
+    if (caseName !== "regroup_unscoped") {{
+      scope.scopedTabIds.add(2);
+      scope.scopedGroupIds.set(2, -1);
+    }}
+    if (caseName === "regroup_lookup_failure") {{
+      tab.groupId = 700;
+      state.groupLookupFailures.add(700);
+      await scope.handleTabUpdated(2, {{ groupId: 700 }});
+      assert(!scope.isScoped(2));
+      assert.equal(scope.scopedGroupIds.get(2), undefined);
+      assert.equal(tab.groupId, 700);
+      assert(state.pendingAlarms.has("skyvern-popup-group-sweep"));
+      state.groupLookupFailures.clear();
+      state.fireAlarm("skyvern-popup-group-sweep");
+      await waitUntil(() => scope.activeOperationCount === 0 && tab.groupId === -1);
+      assert(!scope.isScoped(2));
+    }} else if (caseName.startsWith("regroup_")) {{
+      for (const ungroupFails of [false, true]) {{
+        if (caseName === "regroup_scoped") {{
+          scope.scopedTabIds.add(2);
+          scope.scopedGroupIds.set(2, -1);
+          scope.createdTabIds.add(2);
+        }}
+        tab.groupId = 700;
+        state.ungroupFails = ungroupFails;
+        updates.forEach((fn) => fn(2, {{ groupId: 700 }}));
+        await waitUntil(() => !scope.isScoped(2) && (ungroupFails ? state.pendingAlarms.size > 0 : tab.groupId === -1));
+        assert(!scope.createdTabIds.has(2));
+        assert.equal(scope.scopedGroupIds.get(2), undefined);
+        if (ungroupFails) {{
+          state.ungroupFails = false;
+          state.fireAlarm("skyvern-popup-group-sweep");
+        }}
+        await waitUntil(() => tab.groupId === -1 && scope.activeOperationCount === 0);
+      }}
+    }} else if (caseName === "attached") {{
+      let lease;
+      const running = scope.runTabOperation(2, async (value) => {{ lease = value; await value.invalidated; }});
+      const rejected = assert.rejects(running, {{ code: "TAB_NOT_SCOPED" }});
+      await waitUntil(() => lease !== undefined);
+      tab.windowId = 1;
+      state.attached.forEach((fn) => fn(2, {{ newWindowId: 1 }}));
+      await rejected;
+      await waitUntil(() => events.some((entry) => entry.event === "scope.tabRemoved" && entry.params.reason === "unshared"));
+      assert(!scope.isScoped(2));
+    }} else {{
+      if (caseName === "normal_groupless") state.types.set(2, "normal");
+      if (caseName === "popup_positive") {{ tab.groupId = 700; scope.scopedGroupIds.set(2, 700); }}
+      if (caseName === "lookup_failure") state.lookupFailures.add(2);
+      await assert.rejects(scope.assertControllableLocked(2), {{ code: "TAB_NOT_SCOPED" }});
+      assert(!scope.isScoped(2));
+      assert.equal(tab.groupId, -1);
+    }}
+  }}
+}}
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_scope_observer_commit_and_synchronous_removal_contract() -> None:
+    """Scope observers must see committed membership before events or asynchronous removal cleanup."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the extension scope test")
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    script = f"""
+import assert from "node:assert/strict";
+const tabs = new Map([
+  [1, {{ id: 1, windowId: 1, groupId: 700, url: "https://one.example.test" }}],
+  [2, {{ id: 2, windowId: 1, groupId: -1, url: "https://two.example.test" }}],
+]);
+const stored = {{ scopedTabIds: [1], scopedTabGroupIds: {{ 1: 700 }} }};
+const changes = [];
+const updates = [];
+const listener = {{ addListener() {{}} }};
+globalThis.chrome = {{
+  tabs: {{
+    onCreated: listener, onRemoved: listener,
+    onUpdated: {{ addListener(fn) {{ updates.push(fn); }} }},
+    async get(id) {{ if (!tabs.has(id)) throw new Error("missing"); return {{ ...tabs.get(id) }}; }},
+    async remove(id) {{ tabs.delete(id); }},
+    async create({{ url }}) {{
+      const tab = {{ id: 3, windowId: 1, groupId: -1, url, status: "complete" }};
+      tabs.set(3, tab);
+      updates.forEach((fn) => fn(3, {{ status: "complete" }}));
+      return {{ ...tab }};
+    }},
+  }},
+  tabGroups: {{
+    async query() {{ return []; }},
+    async get(id) {{ return {{ id, title: "Skyvern Controlled" }}; }},
+    async update() {{}},
+  }},
+  storage: {{ session: {{
+    async get(defaults) {{ return {{ ...defaults, ...stored }}; }},
+    async set(values) {{ Object.assign(stored, structuredClone(values)); }},
+    async remove(keys) {{ for (const key of keys) delete stored[key]; }},
+  }} }},
+}};
+{_WINDOW_GROUP_FAKES}
+installWindowGroupFakes(chrome, tabs, updates);
+const {{ TabScope }} = await import({json.dumps((extension_dir / "tab_scope.js").as_uri())});
+const scope = new TabScope({{
+  onScopeChange(id, scoped) {{
+    changes.push([id, scoped]);
+    assert.equal(scope.isScoped(id), scoped);
+    throw new Error("observer failure is ignored");
+  }},
+  sendEvent(event, params) {{
+    if (["scope.tabAdded", "tabs.created"].includes(event)) {{
+      assert.deepEqual(changes.at(-1), [params.tabId, true]);
+    }}
+  }},
+}});
+await scope.initialize();
+assert.deepEqual(changes, [[1, true]]);
+await scope.shareTab(2);
+assert.deepEqual(changes.at(-1), [2, true]);
+let releaseDetach;
+scope.setDebuggerRouter({{
+  detachIfAttachedLocked(id) {{
+    assert.deepEqual(changes.at(-1), [id, false]);
+    return new Promise((resolve) => {{ releaseDetach = resolve; }});
+  }},
+}});
+const removing = scope.removeFromScopeLocked(2, "unshared", true);
+assert.deepEqual(changes.at(-1), [2, false]);
+assert(!scope.isScoped(2));
+releaseDetach();
+await removing;
+scope.setDebuggerRouter(null);
+await scope.create({{ url: "https://three.example.test" }});
+assert.deepEqual(changes.at(-1), [3, true]);
+tabs.set(4, {{ id: 4, windowId: 1, groupId: 700, url: "https://four.example.test" }});
+await scope.handleTabUpdated(4, {{ groupId: 700 }});
+assert.deepEqual(changes.at(-1), [4, true]);
+tabs.set(5, {{ id: 5, windowId: 1, groupId: -1, openerTabId: 1, url: "https://five.example.test" }});
+await scope.handleTabCreated({{ ...tabs.get(5) }});
+assert.deepEqual(changes.at(-1), [5, true]);
+const group = chrome.tabs.group;
+chrome.tabs.group = async () => {{ throw new Error("grouping failed"); }};
+await assert.rejects(scope.shareTab(2));
+assert.deepEqual(changes.at(-1), [2, false]);
+chrome.tabs.group = group;
+const ids = [...scope.scopedTabIds];
+const beforeReset = changes.length;
+await scope.prepareForReset();
+const resetting = scope.reset();
+assert.deepEqual(changes.slice(beforeReset), ids.map((id) => [id, false]));
+assert.equal(scope.scopedTabIds.size, 0);
+await resetting;
+scope.finishReset();
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False, timeout=10
+    )
     assert result.returncode == 0, result.stderr

@@ -1,5 +1,6 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
+  CodeBlockDataSchema,
   CodeBlockStep,
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
@@ -21,6 +22,7 @@ export type WorkflowCreateYAMLRequest = {
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
   model?: WorkflowModel | null;
+  totp_identifier?: string | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
@@ -32,9 +34,10 @@ export type WorkflowCreateYAMLRequest = {
   run_with?: string | null;
   browser_type?: string | null;
   cache_key?: string | null;
-  ai_fallback?: boolean;
-  enable_self_healing?: boolean;
+  ai_fallback?: boolean | null;
+  enable_self_healing?: boolean | null;
   adaptive_caching?: boolean;
+  generate_script_on_terminal?: boolean;
   code_version?: number | null;
   mask_secrets?: boolean | null;
   run_sequentially?: boolean;
@@ -166,6 +169,7 @@ export type BlockYAML =
   | ExtractionBlockYAML
   | LoginBlockYAML
   | WaitBlockYAML
+  | TerminateBlockYAML
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
@@ -209,6 +213,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type Taskv2BlockYAML = BlockYAMLBase & {
@@ -228,6 +233,7 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type HumanInteractionBlockYAML = BlockYAMLBase & {
@@ -267,6 +273,7 @@ export type ActionBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type NavigationBlockYAML = BlockYAMLBase & {
@@ -286,6 +293,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   model: WorkflowModel | null;
   include_action_history_in_verification: boolean;
 };
@@ -301,6 +309,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   export_enabled?: boolean;
   export_data_schema?: Record<string, unknown> | null;
   export_file_name?: string | null;
@@ -323,11 +332,18 @@ export type LoginBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type WaitBlockYAML = BlockYAMLBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type TerminateBlockYAML = BlockYAMLBase & {
+  block_type: "terminate";
+  reason: string;
+  error_code: string | null;
 };
 
 export type FileDownloadBlockYAML = BlockYAMLBase & {
@@ -366,6 +382,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   disable_cache: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   download_timeout?: number | null;
 };
 
@@ -376,6 +393,10 @@ export type CodeBlockYAML = BlockYAMLBase & {
   error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
+  data_schema?: CodeBlockDataSchema;
+  user_owned_goal?: boolean | null;
+  goal_needs_regeneration?: boolean | null;
+  code_edited_by_hand?: boolean | null;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {
@@ -502,6 +523,7 @@ export type WebSearchBlockYAML = BlockYAMLBase & {
   provider: "auto" | "google" | "exa";
   num_results: number;
   prompt: string | null;
+  error_code_mapping: Record<string, string> | null;
   no_results_error_code: string | null;
   no_match_error_code: string | null;
   json_schema: Record<string, unknown> | null;

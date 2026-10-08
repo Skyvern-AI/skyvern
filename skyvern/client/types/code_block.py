@@ -6,6 +6,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel, update_forward_refs
+from .code_block_data_schema import CodeBlockDataSchema
 from .code_block_parameters_item import CodeBlockParametersItem
 from .code_block_step import CodeBlockStep
 from .output_parameter import OutputParameter
@@ -32,6 +33,10 @@ class CodeBlock(UniversalBaseModel):
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStep]] = None
+    data_schema: typing.Optional[CodeBlockDataSchema] = pydantic.Field(default=None)
+    """
+    JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

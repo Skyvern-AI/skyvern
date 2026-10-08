@@ -13,6 +13,8 @@ import axios from "axios";
 import { HomeTelemetry, type AgentCreationAttempt } from "@/util/homeTelemetry";
 
 type CreateWorkflowInput = WorkflowCreateYAMLRequest & {
+  // Becomes ?via=, which marks the studio entry as a create (StudioPaneDefaults);
+  // without it the new agent opens with the Edit panes.
   _via?: string;
   _agentCreationAttempt?: AgentCreationAttempt;
 };

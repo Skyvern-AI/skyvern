@@ -50,8 +50,13 @@ class WebhookDeliveryStatus(StrEnum):
 
     delivered = "delivered"
     exhausted_customer_config = "exhausted_customer_config"
-    exhausted_platform = "exhausted_platform"  # Reserved until internal failures have structured attribution.
+    exhausted_platform = "exhausted_platform"
     exhausted_unattributed = "exhausted_unattributed"
+
+
+_ATTRIBUTED_EXHAUSTED_STATUSES = frozenset(
+    {WebhookDeliveryStatus.exhausted_customer_config, WebhookDeliveryStatus.exhausted_platform}
+)
 
 
 def resolve_webhook_delivery_projection(
@@ -62,7 +67,7 @@ def resolve_webhook_delivery_projection(
 
     ``delivered`` is the highest terminal state and is never downgraded; a later successful
     replay may upgrade an exhausted result to ``delivered``; an exhausted classification may
-    refine an earlier exhausted one.
+    refine an earlier exhausted one, but an unattributed one never replaces an attribution.
     """
     if current is None:
         return incoming
@@ -70,4 +75,6 @@ def resolve_webhook_delivery_projection(
         return WebhookDeliveryStatus.delivered
     if incoming == WebhookDeliveryStatus.delivered:
         return WebhookDeliveryStatus.delivered
+    if incoming == WebhookDeliveryStatus.exhausted_unattributed and current in _ATTRIBUTED_EXHAUSTED_STATUSES:
+        return WebhookDeliveryStatus(current)
     return incoming

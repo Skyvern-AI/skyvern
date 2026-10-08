@@ -7,8 +7,7 @@ export type WebSearchNodeData = NodeBaseData & {
   provider: "auto" | "google" | "exa";
   numResults: number;
   prompt: string;
-  noResultsErrorCode: string;
-  noMatchErrorCode: string;
+  errorCodeMapping: string;
   jsonSchema: string;
   parameterKeys: Array<string>;
 };
@@ -25,8 +24,7 @@ export const webSearchNodeDefaultData: WebSearchNodeData = {
   provider: "auto",
   numResults: 10,
   prompt: "",
-  noResultsErrorCode: "",
-  noMatchErrorCode: "",
+  errorCodeMapping: "null",
   jsonSchema: "null",
   parameterKeys: [],
 };

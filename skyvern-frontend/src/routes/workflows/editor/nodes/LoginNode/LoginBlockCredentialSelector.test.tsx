@@ -18,6 +18,10 @@ import CloudContext from "@/store/CloudContext";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import { WorkflowScopeContext } from "../../WorkflowScopeContext";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
 import type { WorkflowStartNodeData } from "../StartNode/types";
 
@@ -105,6 +109,13 @@ afterAll(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+  useWorkflowHasChangesStore.setState(
+    useWorkflowHasChangesStore.getInitialState(),
+  );
   mocks.credentialDetail.data = undefined;
   mocks.credentialDetail.error = null;
   mocks.credentialDetail.isError = false;
@@ -151,6 +162,10 @@ function startNode(
       withWorkflowSettings: true,
       webhookCallbackUrl: "",
       proxyLocation: "RESIDENTIAL",
+      totpVerificationUrl: null,
+      totpIdentifier: null,
+      adaptiveCaching: false,
+      generateScriptOnTerminal: false,
       persistBrowserSession: false,
       reuseBrowserSession: false,
       pinSavedSessionIp: false,
@@ -166,7 +181,6 @@ function startNode(
       codeVersion: null,
       scriptCacheKey: null,
       aiFallback: true,
-      enableSelfHealing: false,
       maskSecrets: false,
       runSequentially: true,
       sequentialKey: null,
@@ -510,6 +524,92 @@ describe("LoginBlockCredentialSelector browser session reuse", () => {
       ],
     });
   });
+
+  it.each([
+    { label: "Disable parallel runs", setting: "runSequentially" as const },
+    {
+      label: "Reuse browser sessions",
+      setting: "reuseBrowserSession" as const,
+    },
+  ])(
+    "updates $label without recording an untracked proposal",
+    ({ label, setting }) => {
+      mocks.nodes = [
+        startNode({ runSequentially: setting === "reuseBrowserSession" }),
+      ];
+      useWorkflowYamlEditorStore.setState({
+        editorOwner: { workflowPermanentId: "wpid_test", active: true },
+      });
+      renderInCloud(
+        <LoginBlockCredentialSelector
+          nodeId="login-node"
+          value="credentials"
+        />,
+      );
+      const toggle = screen
+        .getByText(label)
+        .parentElement!.parentElement!.querySelector('button[role="switch"]')!;
+      fireEvent.click(toggle);
+      expect(mocks.nodes[0]!.data[setting]).toBe(true);
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(useWorkflowTitleStore.getState().copilotMetadataEdits).toEqual({});
+    },
+  );
+
+  it.each(
+    [
+      { label: "Disable parallel runs", setting: "runSequentially" as const },
+      {
+        label: "Reuse browser sessions",
+        setting: "reuseBrowserSession" as const,
+      },
+    ].flatMap((toggle) =>
+      ["YAML transaction lock", "read-only scope"].map((guard) => ({
+        ...toggle,
+        guard,
+      })),
+    ),
+  )(
+    "refuses $label under a $guard without marking dirty",
+    ({ label, setting, guard }) => {
+      mocks.nodes = [
+        startNode({ runSequentially: setting === "reuseBrowserSession" }),
+      ];
+      useWorkflowYamlEditorStore.setState({
+        editorOwner: { workflowPermanentId: "wpid_test", active: true },
+        commitInProgress: guard === "YAML transaction lock",
+      });
+      useWorkflowTitleStore.setState({
+        copilotMetadataEdits: {
+          wpid_test: { proposal: "proposal-1", edits: {} },
+        },
+      });
+      renderInCloud(
+        <WorkflowScopeContext.Provider
+          value={{
+            workflowId: "wf_test",
+            readOnly: guard === "read-only scope",
+          }}
+        >
+          <LoginBlockCredentialSelector
+            nodeId="login-node"
+            value="credentials"
+          />
+        </WorkflowScopeContext.Provider>,
+      );
+      const toggle = screen
+        .getByText(label)
+        .parentElement!.parentElement!.querySelector('button[role="switch"]')!;
+      fireEvent.click(toggle);
+      expect(mocks.updateNodeData).not.toHaveBeenCalled();
+      expect(mocks.nodes[0]!.data[setting]).toBe(false);
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+      expect(
+        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_test
+          ?.graphEdited,
+      ).toBeUndefined();
+    },
+  );
 
   it("applies enable state before disabling and keeps persistence sticky", () => {
     mocks.nodes = [

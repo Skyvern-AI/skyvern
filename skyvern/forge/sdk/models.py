@@ -45,14 +45,6 @@ class SpeculativeLLMMetadata(BaseModel):
     llm_response_json: str | None = None
     parsed_response_json: str | None = None
     rendered_response_json: str | None = None
-    llm_key: str | None = None
-    model: str | None = None
-    duration_seconds: float | None = None
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cached_tokens: int | None = None
-    llm_cost: float | None = None
 
 
 class Step(BaseModel):

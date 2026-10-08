@@ -64,6 +64,7 @@ function SendEmailEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInput
+          name="recipients"
           nodeId={blockId}
           onChange={(value) => update({ recipients: value })}
           value={recipients}
@@ -75,6 +76,7 @@ function SendEmailEditorBody({
       <div className="space-y-2">
         <Label className="text-xs text-tertiary-foreground">Subject</Label>
         <WorkflowBlockInput
+          name="subject"
           nodeId={blockId}
           onChange={(value) => update({ subject: value })}
           value={subject}
@@ -92,6 +94,7 @@ function SendEmailEditorBody({
           />
         </div>
         <WorkflowBlockInputTextarea
+          name="body"
           aiImprove={AI_IMPROVE_CONFIGS.sendEmail.body}
           nodeId={blockId}
           onChange={(value) => update({ body: value })}
@@ -109,6 +112,7 @@ function SendEmailEditorBody({
           <HelpTooltip content={helpTooltips["sendEmail"]["fileAttachments"]} />
         </div>
         <WorkflowBlockInput
+          name="fileAttachments"
           nodeId={blockId}
           value={fileAttachments}
           onChange={(value) => update({ fileAttachments: value })}
@@ -133,6 +137,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="The From address for the email. When using a custom SMTP server below, set this to an address that server is allowed to send as." />
                 </div>
                 <WorkflowBlockInput
+                  name="sender"
                   nodeId={blockId}
                   onChange={(value) => update({ sender: value })}
                   value={sender}
@@ -156,6 +161,7 @@ function SendEmailEditorBody({
                   SMTP Host
                 </Label>
                 <WorkflowBlockInput
+                  name="customSmtpHost"
                   nodeId={blockId}
                   onChange={(value) => update({ customSmtpHost: value })}
                   value={customSmtpHost ?? ""}
@@ -171,6 +177,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="Numeric only. Defaults to 587 if left blank." />
                 </div>
                 <WorkflowBlockInput
+                  name="customSmtpPort"
                   nodeId={blockId}
                   onChange={(value) =>
                     update({ customSmtpPort: value.replace(/[^0-9]/g, "") })
@@ -192,6 +199,7 @@ function SendEmailEditorBody({
                   SMTP Username
                 </Label>
                 <WorkflowBlockInput
+                  name="customSmtpUsername"
                   nodeId={blockId}
                   onChange={(value) => update({ customSmtpUsername: value })}
                   value={customSmtpUsername ?? ""}
@@ -207,6 +215,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="Encrypted at rest on Skyvern Cloud and on self-hosted deployments with encryption keys configured; stored as-is otherwise. For Gmail, use an App Password. You can also reference a secret parameter." />
                 </div>
                 <WorkflowBlockInput
+                  name="customSmtpPassword"
                   nodeId={blockId}
                   type="password"
                   onChange={(value) => update({ customSmtpPassword: value })}

@@ -3477,7 +3477,11 @@ async def test_scheduled_run_whose_initializer_fails_is_recovered_after_a_restar
 ) -> None:
     fire_time = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
     schedule = SimpleNamespace(
-        workflow_schedule_id="wfs_test", workflow_permanent_id="wpid_test", organization_id="org_test", parameters={}
+        workflow_schedule_id="wfs_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        parameters={},
+        is_one_time=False,
     )
     workflow_run_id = schedule_service_module.build_scheduled_workflow_run_id(schedule.workflow_schedule_id, fire_time)
     async with sqlite_db.Session() as session:
@@ -4353,8 +4357,19 @@ async def test_in_process_retry_reacquires_serialized_lane(
         waiting.set()
         await release.wait()
 
+    admission_timeout: asyncio.Timeout | None = None
+
+    def timeout(seconds: float | None) -> asyncio.Timeout:
+        nonlocal admission_timeout
+        if outcome == "timeout" and seconds == 0.05:
+            # Arm the real cancellation only after the occupied lane is observed;
+            # database latency must not decide whether this ordering test passes.
+            admission_timeout = asyncio.timeout(None)
+            return admission_timeout
+        return asyncio.timeout(seconds)
+
     monkeypatch.setattr(svc, "execute_workflow", execute)
-    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep))
+    monkeypatch.setattr(service_module, "asyncio", ScopedAsyncio(sleep=sleep, timeout=timeout))
     clearance_query = sqlite_db.workflow_runs.get_blocking_sequential_workflow_run
     query_failed = False
 
@@ -4422,6 +4437,9 @@ async def test_in_process_retry_reacquires_serialized_lane(
             release.set()
         elif outcome == "task_cancel":
             task.cancel()
+        elif outcome == "timeout":
+            assert admission_timeout is not None
+            admission_timeout.reschedule(asyncio.get_running_loop().time())
 
         if outcome == "task_cancel":
             with pytest.raises(asyncio.CancelledError):

@@ -172,6 +172,7 @@ async def stream(
             organization_id=organization_id,
         )
     except Exception:
+        vnc_channel.live_stream.end_first("stream_error")
         LOG.exception(
             "An exception occurred in the vnc loop.",
             task_id=task_id,
@@ -186,3 +187,4 @@ async def stream(
             organization_id=organization_id,
         )
         await vnc_channel.close(reason="vnc-closed")
+        await vnc_channel.live_stream.finish()

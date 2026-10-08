@@ -1,3 +1,4 @@
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
@@ -61,6 +62,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   extraction: "extraction",
   login: "login",
   wait: "wait",
+  terminate: "terminate",
   fileDownload: "file_download",
   pdfParser: "pdf_parser",
   taskv2: "task_v2",
@@ -226,7 +228,10 @@ function EditableBlockTitle({
     <EditableNodeTitle
       value={label}
       editable
-      onChange={handleLabelChange}
+      onChange={(value) => {
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        handleLabelChange(value);
+      }}
       titleClassName="text-sm font-medium text-foreground"
       inputClassName="text-sm font-medium text-foreground"
     />

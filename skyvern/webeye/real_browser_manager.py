@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import structlog
 
@@ -24,6 +25,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.streaming.registries import (
     complete_stream_teardown,
@@ -32,7 +34,13 @@ from skyvern.forge.sdk.streaming.registries import (
     stream_ref_active,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.schemas.browser_settings import BrowserSettingsSource, requested_timezone_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, read_browser_type
+from skyvern.webeye.browser_acquisition_sample import (
+    FALLBACK_TARGET_CLASSICAL_ENGINE,
+    browser_acquisition_scope,
+    note_fallback_target,
+)
 from skyvern.webeye.browser_artifacts import DownloadBinding, RecordingPrefixSnapshot, VideoArtifact
 from skyvern.webeye.browser_engine import (
     BrowserEngineBootstrapError,
@@ -42,6 +50,18 @@ from skyvern.webeye.browser_engine import (
 )
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
 from skyvern.webeye.browser_manager import BrowserCleanupResult, BrowserManager
+from skyvern.webeye.browser_runtime_events import (
+    AcquireMode,
+    BrowserRuntimeLogContext,
+    browser_runtime_log_context,
+    log_browser_acquisition_failure,
+    with_acquired_browser_runtime,
+)
+from skyvern.webeye.browser_settings_receipts import (
+    is_final_receipt,
+    measure_timezone_receipt,
+    record_session_timezone_receipt,
+)
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_frame_publisher import (
     CDPFramePublisher,
@@ -66,6 +86,10 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserType
 
 LOG = structlog.get_logger()
+
+
+class _BrowserStateGenerationKwargs(TypedDict, total=False):
+    expected_runnable_generation_id: str
 
 
 def to_persistent_session_browser_type(browser_type_value: str | None) -> PersistentBrowserType | None:
@@ -179,6 +203,7 @@ async def _inherited_browser_transport_alive(browser_state: BrowserState) -> boo
     context = browser_state.browser_context
     if context is None:
         return False
+    driver = browser_state.pw
     try:
         async with asyncio.timeout(_INHERITED_BROWSER_LIVENESS_PROBE_TIMEOUT_SECONDS):
             await context.cookies()
@@ -186,12 +211,14 @@ async def _inherited_browser_transport_alive(browser_state: BrowserState) -> boo
         # Process-control signals are never a browser-liveness verdict — propagate untouched.
         raise
     except (asyncio.TimeoutError, TimeoutError):
+        browser_state.record_connection_probe_failure(context, driver, timed_out=True)
         LOG.info("Inherited browser liveness probe timed out; treating browser as disconnected")
         return False
     except Exception as exc:
         # Only a genuinely closed transport counts as disconnected; anything else is an unexpected
         # programming error that must not be silently swallowed into a fresh-browser fallback.
         if _is_closed_transport_error(exc):
+            browser_state.record_connection_probe_failure(context, driver)
             LOG.info(
                 "Inherited browser liveness probe hit a closed transport; treating browser as disconnected",
                 error=str(exc),
@@ -266,11 +293,24 @@ async def _on_browser_state_acquired(
     workflow_run_id: str | None,
     parent_workflow_run_id: str | None = None,
     live_run_ids: Iterable[str] = (),
+    *,
+    task_id: str | None = None,
+    browser_session_id: str | None = None,
+    acquire: bool = True,
 ) -> BrowserState:
     browser_context = browser_state.browser_context
     if browser_context is not None:
         _retain_run_dialog_answers(browser_state, workflow_run_id, parent_workflow_run_id, live_run_ids)
         await app.AGENT_FUNCTION.on_browser_context_acquired(browser_context, workflow_run_id)
+    if acquire:
+        browser_state.bind_runtime_event_context(
+            BrowserRuntimeLogContext.for_run(
+                workflow_run_id=workflow_run_id,
+                task_id=task_id,
+                browser_session_id=browser_session_id,
+            )
+        )
+        browser_state.record_browser_acquisition("reuse")
     return browser_state
 
 
@@ -281,6 +321,51 @@ def _merge_proxy_session_headers(
     if not proxy_session_id:
         return extra_http_headers
     return app.AGENT_FUNCTION.merge_proxy_session_extra_http_headers(extra_http_headers, proxy_session_id)
+
+
+def _session_created_for_run(session: PersistentBrowserSession, workflow_run: WorkflowRun) -> bool:
+    if session.created_for_workflow_run_id == workflow_run.workflow_run_id:
+        return True
+    # A run requesting a timezone resolves a timezone-partitioned reuse key, so a session bound to that key was
+    # launched for this workflow version's settings.
+    return (
+        workflow_run.reuse_bound_key is not None
+        and session.bound_workflow_permanent_id == workflow_run.workflow_permanent_id
+        and session.bound_key == workflow_run.reuse_bound_key
+    )
+
+
+async def _record_run_timezone_receipt(
+    workflow_run: WorkflowRun,
+    browser_state: BrowserState,
+    *,
+    browser_session_id: str | None,
+    inherited: bool,
+    session: PersistentBrowserSession | None = None,
+) -> None:
+    """Parent, caller-supplied, and address-dialed browsers are existing sessions whose request went unapplied."""
+    requested = requested_timezone_id(workflow_run.browser_settings)
+    if requested is None or is_final_receipt(workflow_run.browser_settings_receipt):
+        return
+    try:
+        created_for_run = not inherited and not workflow_run.browser_address
+        if created_for_run and browser_session_id:
+            if session is None:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                    browser_session_id, workflow_run.organization_id
+                )
+            created_for_run = session is not None and _session_created_for_run(session, workflow_run)
+        source = BrowserSettingsSource.workflow_version if created_for_run else BrowserSettingsSource.existing_session
+        receipt = await measure_timezone_receipt(await browser_state.get_working_page(), requested, source)
+        await app.DATABASE.workflow_runs.record_workflow_run_browser_settings_receipt(
+            workflow_run.workflow_run_id, workflow_run.organization_id, receipt
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to record the workflow run timezone receipt",
+            workflow_run_id=workflow_run.workflow_run_id,
+            exc_info=True,
+        )
 
 
 def _resolve_stream_key(*, workflow_run_id: str | None, task_id: str | None) -> str | None:
@@ -679,131 +764,166 @@ class RealBrowserManager(BrowserManager):
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
         user_browser_type: str | None = None,
+        runtime_event_context: BrowserRuntimeLogContext | None = None,
+        profile_read_only: bool = False,
+        timezone_id: str | None = None,
     ) -> BrowserState:
-        # Fail closed before any driver/browser launch: a recognized engine selection can only be
-        # honored where the cloud dynamic-browser creator is registered (cloud dynamic lane, or a
-        # cloud fixed-worker whose compliance wrapper reroutes there). On OSS/self-host that creator
-        # is absent, so the base factory would launch settings.BROWSER_TYPE and silently ignore the
-        # selection — refuse instead. Null/unrecognized selections keep the existing legacy behavior.
-        if (
-            to_persistent_session_browser_type(user_browser_type) is not None
-            and not runtime_supports_browser_type_selection()
-        ):
-            raise SelectedBrowserTypeUnsupportedError(str(user_browser_type))
-
-        run_key = engine_run_key or canonical_run_key(
-            workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
+        requested_at_monotonic = time.monotonic()
+        acquisition_context = runtime_event_context or BrowserRuntimeLogContext.for_run(
+            workflow_run_id=engine_workflow_run_id or workflow_run_id,
+            task_id=task_id,
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
         )
-        engine_selection = await self.get_or_resolve_engine_selection(
-            run_key=run_key,
-            context=BrowserEngineContext(
-                organization_id=organization_id,
-                # Engine-flag identity only: a caller that pins under workflow_run_id while keeping it out
-                # of browser-context creation (task-first, for download-dir scoping) passes it via
-                # engine_workflow_run_id, so the flag's distinct_id AND its workflow_run_id property both
-                # match the pinned run. The browser context below still uses the raw workflow_run_id.
-                workflow_run_id=engine_workflow_run_id or workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                task_id=task_id,
-                script_id=script_id,
-                browser_source=settings.BROWSER_TYPE,
+        # Truthiness, not `is not None`: the creators treat an empty address as absent and launch a browser.
+        acquire_mode: AcquireMode = "attach" if browser_address else "create"
+        # Own the first-try sample OUTSIDE the failure-emit context so it is still open when the
+        # canonical acquire_result event is emitted, and so it spans the engine boot-fallback retry
+        # below — a boot fallback must count as one acquisition that was not a first-try success.
+        with (
+            browser_acquisition_scope(acquire_mode),
+            log_browser_acquisition_failure(
+                LOG, lambda: with_acquired_browser_runtime(acquisition_context), acquire_mode
             ),
-        )
-        context = skyvern_context.current()
+        ):
+            # Fail closed before any driver/browser launch: a recognized engine selection can only be
+            # honored where the cloud dynamic-browser creator is registered (cloud dynamic lane, or a
+            # cloud fixed-worker whose compliance wrapper reroutes there). On OSS/self-host that creator
+            # is absent, so the base factory would launch settings.BROWSER_TYPE and silently ignore the
+            # selection — refuse instead. Null/unrecognized selections keep the existing legacy behavior.
+            if (
+                to_persistent_session_browser_type(user_browser_type) is not None
+                and not runtime_supports_browser_type_selection()
+            ):
+                raise SelectedBrowserTypeUnsupportedError(str(user_browser_type))
 
-        async def _start(selection: BrowserEngineSelection) -> BrowserState:
-            LOG.info(
-                "Creating browser state",
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                browser_source=settings.BROWSER_TYPE,
-                **selection.attribution(),
+            run_key = engine_run_key or canonical_run_key(
+                workflow_run_id=workflow_run_id, task_id=task_id, script_id=script_id
             )
-            try:
-                pw = await selection.start_driver()
-            except Exception as start_error:
-                # Mark a fallback-eligible driver-start failure so the boundary can degrade once; a
-                # no-fallback selection (and CancelledError, a BaseException) propagates unchanged.
-                if selection.boot_fallback_selection is None:
-                    raise
-                raise BrowserEngineBootstrapError(f"{selection.name} driver failed to start") from start_error
-            try:
-                (
-                    browser_context,
-                    browser_artifacts,
-                    browser_cleanup,
-                ) = await BrowserContextFactory.create_browser_context(
-                    pw,
-                    proxy_location=proxy_location,
-                    url=url,
+            engine_selection = await self.get_or_resolve_engine_selection(
+                run_key=run_key,
+                context=BrowserEngineContext(
+                    organization_id=organization_id,
+                    # Engine-flag identity only: a caller that pins under workflow_run_id while keeping it out
+                    # of browser-context creation (task-first, for download-dir scoping) passes it via
+                    # engine_workflow_run_id, so the flag's distinct_id AND its workflow_run_id property both
+                    # match the pinned run. The browser context below still uses the raw workflow_run_id.
+                    workflow_run_id=engine_workflow_run_id or workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    task_id=task_id,
+                    script_id=script_id,
+                    browser_source=settings.BROWSER_TYPE,
+                ),
+            )
+            context = skyvern_context.current()
+
+            async def _start(selection: BrowserEngineSelection) -> BrowserState:
+                nonlocal acquisition_context
+                acquisition_context = replace(acquisition_context, browser_engine=selection.name)
+                LOG.info(
+                    "Creating browser state",
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    extra_http_headers=extra_http_headers,
-                    cdp_connect_headers=cdp_connect_headers,
-                    browser_address=browser_address,
-                    cdp_port=cdp_port,
-                    browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
-                    browser_profile_id=browser_profile_id,
-                    browser_session_id=browser_session_id,
-                    user_browser_type=user_browser_type,
-                    engine_selection=selection,
-                    _reconcile_persistent_init_scripts=browser_session_id is not None,
+                    browser_source=settings.BROWSER_TYPE,
+                    **selection.attribution(),
                 )
-            except BaseException:
-                # start() launched the local Node driver; stop it (time-bounded) so a failed context
-                # creation doesn't leak it, and never let a stop() error/timeout mask the original.
                 try:
-                    async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
-                        await pw.stop()
-                except Exception:
-                    LOG.warning(
-                        "Failed to stop Playwright driver after browser-context creation failure",
+                    pw = await selection.start_driver()
+                except Exception as start_error:
+                    # Mark a fallback-eligible driver-start failure so the boundary can degrade once; a
+                    # no-fallback selection (and CancelledError, a BaseException) propagates unchanged.
+                    if selection.boot_fallback_selection is None:
+                        raise
+                    raise BrowserEngineBootstrapError(f"{selection.name} driver failed to start") from start_error
+                try:
+                    (
+                        browser_context,
+                        browser_artifacts,
+                        browser_cleanup,
+                    ) = await BrowserContextFactory.create_browser_context(
+                        pw,
+                        proxy_location=proxy_location,
+                        url=url,
                         task_id=task_id,
                         workflow_run_id=workflow_run_id,
-                        exc_info=True,
+                        workflow_permanent_id=workflow_permanent_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        extra_http_headers=extra_http_headers,
+                        cdp_connect_headers=cdp_connect_headers,
+                        browser_address=browser_address,
+                        cdp_port=cdp_port,
+                        browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
+                        browser_profile_id=browser_profile_id,
+                        profile_read_only=profile_read_only,
+                        browser_session_id=browser_session_id,
+                        user_browser_type=user_browser_type,
+                        engine_selection=selection,
+                        _reconcile_persistent_init_scripts=browser_session_id is not None,
+                        **({"timezone_id": timezone_id} if timezone_id is not None else {}),
                     )
-                raise
-            state = RealBrowserState(
-                pw=pw,
-                browser_context=browser_context,
-                page=None,
-                browser_artifacts=browser_artifacts,
-                browser_cleanup=browser_cleanup,
-                release_driver_on_close=browser_address is not None,
-                engine_selection=selection,
-                browser_context_route_policy_url=url,
-            )
-            # The proxy this context was actually built with. A reader naming the hop that failed
-            # cannot recover it from anywhere else once the context exists.
-            state.built_with_proxy_location = proxy_location
-            return state
+                except BaseException:
+                    # start() launched the local Node driver; stop it (time-bounded) so a failed context
+                    # creation doesn't leak it, and never let a stop() error/timeout mask the original.
+                    try:
+                        async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                            await pw.stop()
+                    except Exception:
+                        LOG.warning(
+                            "Failed to stop Playwright driver after browser-context creation failure",
+                            task_id=task_id,
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
+                    raise
+                acquisition_context = with_acquired_browser_runtime(acquisition_context)
+                state = RealBrowserState(
+                    pw=pw,
+                    browser_context=browser_context,
+                    page=None,
+                    browser_artifacts=browser_artifacts,
+                    browser_cleanup=browser_cleanup,
+                    release_driver_on_close=browser_address is not None,
+                    engine_selection=selection,
+                    browser_context_route_policy_url=url,
+                    runtime_event_context=acquisition_context,
+                )
+                # The proxy this context was actually built with. A reader naming the hop that failed
+                # cannot recover it from anywhere else once the context exists.
+                state.built_with_proxy_location = proxy_location
+                state.profile_read_only = profile_read_only
+                state.timezone_id = timezone_id
+                # The pre-dispatch address heuristic is passed as-is; the canonical event resolves it
+                # to the mode a vendor branch recorded at dispatch time (a create that ignores a
+                # fallback browser_address), covering both this success and the failure path uniformly.
+                state.record_browser_acquisition(acquire_mode, requested_at_monotonic)
+                return state
 
-        # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
-        # classical boot fallback before any usable context; the classical has none, so it then propagates.
-        boot_fallback = engine_selection.boot_fallback_selection
-        try:
-            state = await _start(engine_selection)
-        except BrowserEngineBootstrapError:
-            if boot_fallback is None:
-                raise
-            LOG.warning(
-                "Browser engine boot failed before a usable context; falling back once to its classical engine",
-                failed_engine=engine_selection.name,
-                fallback_engine=boot_fallback.name,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                exc_info=True,
-            )
-            self._repin_engine_selection(run_key, boot_fallback)
-            return await _start(boot_fallback)
-        if boot_fallback is not None:
-            # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run
-            # recreation reuses the effective engine and can no longer fall back.
-            self._repin_engine_selection(run_key, replace(engine_selection, boot_fallback_selection=None))
-        return state
+            # At most two attempts: a fallback-eligible (Rustwright) selection degrades EXACTLY ONCE to its
+            # classical boot fallback before any usable context; the classical has none, so it then propagates.
+            boot_fallback = engine_selection.boot_fallback_selection
+            try:
+                state = await _start(engine_selection)
+            except BrowserEngineBootstrapError:
+                if boot_fallback is None:
+                    raise
+                LOG.warning(
+                    "Browser engine boot failed before a usable context; falling back once to its classical engine",
+                    failed_engine=engine_selection.name,
+                    fallback_engine=boot_fallback.name,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                # An application-level retry across engines: the eventual success is not a first-try one.
+                note_fallback_target(FALLBACK_TARGET_CLASSICAL_ENGINE)
+                self._repin_engine_selection(run_key, boot_fallback)
+                return await _start(boot_fallback)
+            if boot_fallback is not None:
+                # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run
+                # recreation reuses the effective engine and can no longer fall back.
+                self._repin_engine_selection(run_key, replace(engine_selection, boot_fallback_selection=None))
+            return state
 
     def evict_page(self, page_id: str) -> None:
         self.pages.pop(page_id, None)
@@ -844,7 +964,11 @@ class RealBrowserManager(BrowserManager):
                 browser_state = None
             else:
                 return await _on_browser_state_acquired(
-                    browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                    browser_state,
+                    task.workflow_run_id,
+                    live_run_ids=self._live_run_ids_sharing(browser_state),
+                    task_id=task.task_id,
+                    browser_session_id=browser_session_id,
                 )
 
         if browser_session_id:
@@ -882,21 +1006,31 @@ class RealBrowserManager(BrowserManager):
                     "Getting browser state for task from persistent sessions manager",
                     browser_session_id=browser_session_id,
                 )
-                get_state_kwargs = {
-                    "organization_id": task.organization_id,
-                    "expected_runnable_id": expected_runnable_id,
-                    "download_run_id": download_run_id,
-                    "task_id": task.task_id,
-                    "workflow_run_id": None,
-                    "url": task.url,
-                    "workflow_permanent_id": task.workflow_permanent_id,
-                }
+                generation_kwargs: _BrowserStateGenerationKwargs = {}
                 if expected_runnable_generation_id is not None:
-                    get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
-                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                    browser_session_id,
-                    **get_state_kwargs,
-                )
+                    generation_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
+                # The task path intentionally omits workflow_run_id from PBS download scoping.
+                # Preserve its authoritative Run identity for logs without changing those arguments.
+                with browser_runtime_log_context(
+                    BrowserRuntimeLogContext.for_run(
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        browser_session_id=browser_session_id,
+                        organization_id=task.organization_id,
+                    )
+                ):
+                    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                        browser_session_id,
+                        organization_id=task.organization_id,
+                        acquire=True,
+                        expected_runnable_id=expected_runnable_id,
+                        download_run_id=download_run_id,
+                        task_id=task.task_id,
+                        workflow_run_id=None,
+                        url=task.url,
+                        workflow_permanent_id=task.workflow_permanent_id,
+                        **generation_kwargs,
+                    )
                 if browser_state is None:
                     LOG.warning(
                         "Browser state not found in persistent sessions manager",
@@ -932,12 +1066,14 @@ class RealBrowserManager(BrowserManager):
         extra_http_headers = task.extra_http_headers
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
+            session_timezone_id: str | None = None
             if browser_session_id and task.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
                 if session:
                     if session.proxy_location is not None:
                         proxy_location = session.proxy_location
                     extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
+                    session_timezone_id = requested_timezone_id(session.browser_settings)
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=task.url,
@@ -954,6 +1090,7 @@ class RealBrowserManager(BrowserManager):
                 cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
                 browser_session_id=browser_session_id,
+                timezone_id=session_timezone_id,
             )
 
             if browser_session_id:
@@ -986,8 +1123,26 @@ class RealBrowserManager(BrowserManager):
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
+        # A workflow block running a task on a browser session acquires here, never through
+        # get_or_create_for_workflow_run, so this is where that run's receipt is recorded.
+        if browser_session_id and task.workflow_run_id and task.organization_id:
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    task.workflow_run_id, organization_id=task.organization_id
+                )
+            except Exception:
+                workflow_run = None
+                LOG.warning("Could not load the workflow run for its timezone receipt", exc_info=True)
+            if workflow_run is not None:
+                await _record_run_timezone_receipt(
+                    workflow_run, browser_state, browser_session_id=browser_session_id, inherited=False
+                )
         return await _on_browser_state_acquired(
-            browser_state, task.workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+            browser_state,
+            task.workflow_run_id,
+            live_run_ids=self._live_run_ids_sharing(browser_state),
+            task_id=task.task_id,
+            browser_session_id=browser_session_id,
         )
 
     async def get_or_create_for_workflow_run(
@@ -1004,6 +1159,16 @@ class RealBrowserManager(BrowserManager):
         workflow_run_id = workflow_run.workflow_run_id
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
+
+        context = skyvern_context.current()
+        # A synthetic run never begins the session; only an explicit runnable can acquire it.
+        owner_fallback_id = None if context is not None and context.workflow_run_is_synthetic else workflow_run_id
+        expected_runnable_id = (
+            browser_session_runnable_id
+            or (context.browser_session_runnable_id if context else None)
+            or owner_fallback_id
+        )
+        acquire = not browser_session_id or expected_runnable_id is not None
 
         # Check own cache entry first so navigate_to_url is only called on the first step.
         # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
@@ -1022,7 +1187,12 @@ class RealBrowserManager(BrowserManager):
             else:
                 LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
                 return await _on_browser_state_acquired(
-                    browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+                    browser_state,
+                    workflow_run_id,
+                    parent_workflow_run_id,
+                    self._live_run_ids_sharing(browser_state),
+                    browser_session_id=browser_session_id,
+                    acquire=acquire,
                 )
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
@@ -1077,11 +1247,15 @@ class RealBrowserManager(BrowserManager):
                         workflow_run_id=workflow_run_id,
                         organization_id=workflow_run.organization_id,
                     )
+                    await _record_run_timezone_receipt(
+                        workflow_run, browser_state, browser_session_id=None, inherited=True
+                    )
                     return await _on_browser_state_acquired(
                         browser_state,
                         workflow_run_id,
                         parent_workflow_run_id,
                         self._live_run_ids_sharing(browser_state),
+                        browser_session_id=browser_session_id,
                     )
                 # The inherited state is genuinely torn down (disconnected and page-less).
                 # Drop the stale entry and fall through to create a fresh browser for this run.
@@ -1096,17 +1270,6 @@ class RealBrowserManager(BrowserManager):
                 browser_state = None
 
         if browser_session_id:
-            context = skyvern_context.current()
-            # A synthetic run (minted per-action by run_sdk_action) never begins the session, so
-            # presenting it as the expected owner can only ever fail the ownership guard (SKY-13518).
-            owner_fallback_id = (
-                None if context is not None and context.workflow_run_is_synthetic else workflow_run.workflow_run_id
-            )
-            expected_runnable_id = (
-                browser_session_runnable_id
-                or (context.browser_session_runnable_id if context else None)
-                or owner_fallback_id
-            )
             expected_runnable_generation_id = browser_session_runnable_generation_id or (
                 context.browser_session_runnable_generation_id if context else None
             )
@@ -1118,23 +1281,21 @@ class RealBrowserManager(BrowserManager):
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
+            generation_kwargs: _BrowserStateGenerationKwargs = {}
+            if expected_runnable_generation_id is not None:
+                generation_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
             async with self.acquiring_session_runnable(expected_runnable_id):
                 browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                     browser_session_id,
-                    **{
-                        "organization_id": workflow_run.organization_id,
-                        "expected_runnable_id": expected_runnable_id,
-                        "download_run_id": download_run_id,
-                        "task_id": None,
-                        "workflow_run_id": workflow_run.workflow_run_id,
-                        "url": url,
-                        "workflow_permanent_id": workflow_run.workflow_permanent_id,
-                        **(
-                            {"expected_runnable_generation_id": expected_runnable_generation_id}
-                            if expected_runnable_generation_id is not None
-                            else {}
-                        ),
-                    },
+                    organization_id=workflow_run.organization_id,
+                    acquire=expected_runnable_id is not None,
+                    expected_runnable_id=expected_runnable_id,
+                    download_run_id=download_run_id,
+                    task_id=None,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    url=url,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    **generation_kwargs,
                 )
                 if browser_state is not None:
                     LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
@@ -1191,22 +1352,15 @@ class RealBrowserManager(BrowserManager):
                             )
                             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                                 browser_session_id,
-                                **{
-                                    "organization_id": workflow_run.organization_id,
-                                    "expected_runnable_id": expected_runnable_id,
-                                    "download_run_id": download_run_id,
-                                    "task_id": None,
-                                    "workflow_run_id": workflow_run.workflow_run_id,
-                                    "url": url,
-                                    "workflow_permanent_id": workflow_run.workflow_permanent_id,
-                                    **(
-                                        {
-                                            "expected_runnable_generation_id": expected_runnable_generation_id,
-                                        }
-                                        if expected_runnable_generation_id is not None
-                                        else {}
-                                    ),
-                                },
+                                organization_id=workflow_run.organization_id,
+                                acquire=expected_runnable_id is not None,
+                                expected_runnable_id=expected_runnable_id,
+                                download_run_id=download_run_id,
+                                task_id=None,
+                                workflow_run_id=workflow_run.workflow_run_id,
+                                url=url,
+                                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                                **generation_kwargs,
                             )
                             if browser_state is None:
                                 raise
@@ -1248,12 +1402,19 @@ class RealBrowserManager(BrowserManager):
 
         proxy_location = workflow_run.proxy_location
         extra_http_headers = workflow_run.extra_http_headers
+        launched_session: PersistentBrowserSession | None = None
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
                 sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_profile_id=browser_profile_id or "none",
+            )
+            # A session's browser launches with the session's own settings; a caller-supplied address is never changed.
+            launch_timezone_id = (
+                None
+                if browser_session_id or workflow_run.browser_address
+                else requested_timezone_id(workflow_run.browser_settings)
             )
             if browser_session_id and workflow_run.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
@@ -1263,6 +1424,8 @@ class RealBrowserManager(BrowserManager):
                     if session.proxy_location is not None:
                         proxy_location = session.proxy_location
                     extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
+                    launch_timezone_id = requested_timezone_id(session.browser_settings)
+                    launched_session = session
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
@@ -1275,6 +1438,7 @@ class RealBrowserManager(BrowserManager):
                 browser_profile_id=browser_profile_id,
                 browser_session_id=browser_session_id,
                 user_browser_type=read_browser_type(workflow_run),
+                timezone_id=launch_timezone_id,
             )
 
             if browser_session_id:
@@ -1309,13 +1473,27 @@ class RealBrowserManager(BrowserManager):
             browser_profile_id=browser_profile_id,
             browser_session_id=browser_session_id,
         )
+        if launched_session is not None and requested_timezone_id(launched_session.browser_settings) is not None:
+            await record_session_timezone_receipt(launched_session, await browser_state.get_working_page())
+        await _record_run_timezone_receipt(
+            workflow_run,
+            browser_state,
+            browser_session_id=browser_session_id,
+            inherited=False,
+            session=launched_session,
+        )
         await self._start_frame_publisher(
             browser_state=browser_state,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
         )
         return await _on_browser_state_acquired(
-            browser_state, workflow_run_id, parent_workflow_run_id, self._live_run_ids_sharing(browser_state)
+            browser_state,
+            workflow_run_id,
+            parent_workflow_run_id,
+            self._live_run_ids_sharing(browser_state),
+            browser_session_id=browser_session_id,
+            acquire=acquire,
         )
 
     def get_for_workflow_run(
@@ -1531,6 +1709,7 @@ class RealBrowserManager(BrowserManager):
         await self._drop_engine_owner(task_id)
         browser_state_to_close = self.pages.pop(task_id, None)
         if browser_state_to_close:
+            browser_state_to_close.mark_run_released()
             # Stop tracing before closing the browser if tracing is enabled
             if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
                 trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{task_id}.zip"
@@ -1665,8 +1844,10 @@ class RealBrowserManager(BrowserManager):
                     sampling=True,
                     workflow_run_id=workflow_run_id,
                 )
-            elif browser_state_to_close.browser_context:
-                clear_context_run_dialog_policies(browser_state_to_close.browser_context)
+            else:
+                browser_state_to_close.mark_run_released()
+                if browser_state_to_close.browser_context:
+                    clear_context_run_dialog_policies(browser_state_to_close.browser_context)
 
             # Stop tracing before closing the browser if tracing is enabled.
             # Skip when the browser is shared — Playwright supports only one active
@@ -1753,6 +1934,8 @@ class RealBrowserManager(BrowserManager):
             # contributes its (task-id-owned) recorder to the effective-close sweep set.
             shared = self._shared_with_another_workflow_run(task_id, task_browser_state)
             effective_close = close_browser_on_completion and not shared
+            if not shared:
+                task_browser_state.mark_run_released()
             if effective_close:
                 sweep_owner_ids.add(task_id)
             if task_browser_state is browser_state_to_close and finalization_attempted:
@@ -1861,7 +2044,11 @@ class RealBrowserManager(BrowserManager):
         browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
             return await _on_browser_state_acquired(
-                browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+                browser_state,
+                workflow_run_id,
+                live_run_ids=self._live_run_ids_sharing(browser_state),
+                task_id=context.task_id if context else None,
+                browser_session_id=browser_session_id,
             )
 
         if browser_session_id:
@@ -1888,22 +2075,20 @@ class RealBrowserManager(BrowserManager):
                     "Getting browser state for script",
                     browser_session_id=browser_session_id,
                 )
+                generation_kwargs: _BrowserStateGenerationKwargs = {}
+                if expected_runnable_generation_id is not None:
+                    generation_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
                 browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                     browser_session_id,
-                    **{
-                        "organization_id": organization_id,
-                        "expected_runnable_id": script_id,
-                        "download_run_id": download_run_id,
-                        "task_id": context.task_id if context else None,
-                        "workflow_run_id": workflow_run_id,
-                        "url": None,
-                        "workflow_permanent_id": context.workflow_permanent_id if context else None,
-                        **(
-                            {"expected_runnable_generation_id": expected_runnable_generation_id}
-                            if expected_runnable_generation_id is not None
-                            else {}
-                        ),
-                    },
+                    organization_id=organization_id,
+                    acquire=True,
+                    expected_runnable_id=script_id,
+                    download_run_id=download_run_id,
+                    task_id=context.task_id if context else None,
+                    workflow_run_id=workflow_run_id,
+                    url=None,
+                    workflow_permanent_id=context.workflow_permanent_id if context else None,
+                    **generation_kwargs,
                 )
                 if browser_state is None:
                     # Fail closed: a cold/evicted session has no reusable state. Silently creating a local
@@ -1945,7 +2130,11 @@ class RealBrowserManager(BrowserManager):
         )
 
         return await _on_browser_state_acquired(
-            browser_state, workflow_run_id, live_run_ids=self._live_run_ids_sharing(browser_state)
+            browser_state,
+            workflow_run_id,
+            live_run_ids=self._live_run_ids_sharing(browser_state),
+            task_id=context.task_id if context else None,
+            browser_session_id=browser_session_id,
         )
 
     async def cleanup_for_script(
@@ -1985,6 +2174,7 @@ class RealBrowserManager(BrowserManager):
             effective_close = close_browser_on_completion and not browser_session_id
             browser_state_to_close = self.pages.pop(script_id, None)
             if browser_state_to_close:
+                browser_state_to_close.mark_run_released()
                 if browser_state_to_close.browser_context and browser_state_to_close.browser_artifacts.traces_dir:
                     trace_path = f"{browser_state_to_close.browser_artifacts.traces_dir}/{script_id}.zip"
                     try:

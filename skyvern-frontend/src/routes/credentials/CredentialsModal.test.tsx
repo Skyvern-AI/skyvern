@@ -1304,6 +1304,22 @@ describe("CredentialsModal copilot-context tested_url default", () => {
     expect(onCredentialCreated).toHaveBeenCalledWith("cred-z", "credentials");
   }, 10_000);
 
+  it("saves when Enter is pressed in the password field", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-e", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsernameAndPassword();
+    fireEvent.keyDown(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { key: "Enter" },
+    );
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith("cred-e", "credentials"),
+    );
+  }, 10_000);
+
   it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
     postMock.mockResolvedValueOnce({
       data: { credential_id: "cred-y", name: "credentials" },

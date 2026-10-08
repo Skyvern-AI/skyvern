@@ -52,6 +52,9 @@ from skyvern.webeye.actions.handler import (
     handle_download_file_action,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess, StaleActionAbort
+from skyvern.webeye.browser_factory import (
+    mark_download_cancelled_by_skyvern,
+)
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
@@ -1932,11 +1935,13 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES", 1),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=settle,
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
+            capture_logs() as logs,
         ):
             results = await asyncio.wait_for(
                 ActionHandler.handle_action(
@@ -1953,9 +1958,17 @@ async def test_handle_action_crdownload_signal_enters_completion_before_reportin
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
     assert "report.pdf.crdownload" not in results[-1].downloaded_files
+    completion_log = next(entry for entry in logs if entry["event"] == "Large browser download completed")
+    assert completion_log["bytes_downloaded"] == len(b"in progress")
+    assert completion_log["transfer_elapsed_s"] >= 0
+    assert completion_log["url_origin"] == "unknown"
+    assert "bytes" not in completion_log
+    assert "duration_s" not in completion_log
 
 
-async def _run_aborted_download() -> list:
+async def _run_aborted_download(
+    *, cancelled_by_skyvern: bool = False, observe_partial: bool = True
+) -> tuple[list, dict]:
     # The browser deletes the partial file when it aborts a transfer, so the settle sees the same
     # empty directory a completed download leaves behind.
     now = datetime.now(UTC)
@@ -1970,16 +1983,24 @@ async def _run_aborted_download() -> list:
     with tempfile.TemporaryDirectory() as temp_dir:
         partial_path = Path(temp_dir) / "bundle.zip.crdownload"
         aborted_download = _download(path=partial_path, failure="canceled")
-        aborted_download.url = "https://example.com/bundle.zip"
+        aborted_download.url = "https://example.com/bundle.zip?signature=secret"
+        if not observe_partial:
+            aborted_download.failure = AsyncMock(side_effect=[None, "canceled"])
+        if cancelled_by_skyvern:
+            mark_download_cancelled_by_skyvern(aborted_download)
 
         async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
-            partial_path.write_bytes(b"in progress")
+            if observe_partial:
+                partial_path.write_bytes(b"x")
             capture = next(call_.args[1] for call_ in page.on.call_args_list if call_.args[0] == "download")
             capture(aborted_download)
             return [ActionSuccess()]
 
         async def abort_download(**kwargs: object) -> None:
-            partial_path.unlink()
+            if observe_partial:
+                partial_path.write_bytes(b"x" * 4096)
+                await asyncio.sleep(0)
+                partial_path.unlink()
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
@@ -1990,11 +2011,13 @@ async def _run_aborted_download() -> list:
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS", 0),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(side_effect=abort_download),
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
+            capture_logs() as logs,
         ):
             results = await asyncio.wait_for(
                 ActionHandler.handle_action(
@@ -2006,7 +2029,12 @@ async def _run_aborted_download() -> list:
                 ),
                 timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
-    return results
+    abort_log = next(
+        entry
+        for entry in logs
+        if entry["event"] == "Browser aborted the download after it was credited; no file was saved"
+    )
+    return results, abort_log
 
 
 @pytest.mark.asyncio
@@ -2014,13 +2042,38 @@ async def test_handle_action_aborted_download_is_reported_as_failure_not_success
     # The browser deletes the partial file when it aborts a transfer, so the settle sees the same
     # empty directory a completed download leaves behind. Reporting success here tells the agent the
     # file arrived, and it retries the already-consumed link instead of regenerating it.
-    results = await _run_aborted_download()
+    results, abort_log = await _run_aborted_download()
 
     assert results[-1].success is False
     assert results[-1].download_triggered is True
     assert not results[-1].downloaded_files
     assert "canceled" in (results[-1].exception_message or "")
     assert results[-1].download_failure_status is None
+    assert abort_log["last_observed_bytes"] == 4096
+    assert abort_log["cancel_origin"] == "unknown"
+    assert abort_log["url_origin"] == "https://example.com"
+    await asyncio.sleep(0)
+    pending_progress_samplers = [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done() and getattr(getattr(task.get_coro(), "cr_code", None), "co_name", None) == "_sample"
+    ]
+    assert not pending_progress_samplers
+
+
+@pytest.mark.asyncio
+async def test_handle_action_aborted_download_reports_skyvern_timeout_cancel_origin() -> None:
+    _, abort_log = await _run_aborted_download(cancelled_by_skyvern=True)
+
+    assert abort_log["last_observed_bytes"] == 4096
+    assert abort_log["cancel_origin"] == "skyvern_timeout"
+
+
+@pytest.mark.asyncio
+async def test_handle_action_aborted_download_without_partial_reports_no_observed_bytes() -> None:
+    _, abort_log = await _run_aborted_download(observe_partial=False)
+
+    assert abort_log["last_observed_bytes"] is None
 
 
 @pytest.mark.asyncio
@@ -2029,7 +2082,7 @@ async def test_aborted_download_stamps_observed_failure_status() -> None:
     # it, so no artifact is saved. An admitted xhr/fetch request observed a server 500; the aborted
     # ActionFailure must carry that status as evidence rather than dropping it.
     with _forced_observed_failure_status(500):
-        results = await _run_aborted_download()
+        results, _ = await _run_aborted_download()
 
     assert results[-1].success is False
     assert results[-1].download_triggered is True

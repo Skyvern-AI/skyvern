@@ -22,10 +22,11 @@ from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import NavigationBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import script_service
 from skyvern.services.script_service import _handle_script_termination
@@ -206,6 +207,7 @@ async def test_cached_creation_and_termination_persist_contract(
     assert (created.organization_id, created.workflow_run_id, created.attempt_number) == ("o_cached", "wr_cached", 3)
     existing_error = {"error_code": "existing", "reasoning": "Earlier condition", "confidence_float": 0.5}
     await tasks.update_task(task_id, organization_id="o_cached", errors=[existing_error])
+    await observer.update_workflow_run_block(block_id, organization_id="o_cached", error_codes=["existing"])
     error = UserDefinedError(error_code="unavailable", reasoning="Requested item unavailable", confidence_float=0.9)
     run_context = RunContext(parameters={}, page=Mock())
     run_context.actions_and_results.append((TerminateAction(errors=[error]), []))
@@ -230,3 +232,34 @@ async def test_cached_creation_and_termination_persist_contract(
     block = await observer.get_workflow_run_block(block_id, organization_id="o_cached")
     assert block.status == BlockStatus.terminated
     assert block.attempt_number == 3
+    assert block.error_codes == ["existing"]
+    # The cached path writes the same outcome record the engine writes for an agent-run block.
+    assert workflow_context.get_block_outcome("target") == BlockOutcome(
+        status=BlockStatus.terminated, error_codes=["unavailable"], failure_reason="Requested item unavailable"
+    )
+    errors = _merge_workflow_run_errors(
+        finalized.errors,
+        [(block_id, block.error_codes or [], block.failure_reason, block.output, block.block_type.value)],
+    )
+    assert [error["error_code"] for error in errors].count("unavailable") == 1
+
+    # The agent executor still persists its block result's error codes.
+    agent_block = await observer.create_workflow_run_block(
+        workflow_run_id="wr_cached",
+        organization_id="o_cached",
+        label="agent_control",
+        block_type=BlockType.NAVIGATION,
+        attempt_number=3,
+    )
+    await target.build_block_result(
+        success=False,
+        failure_reason=None,
+        status=BlockStatus.failed,
+        workflow_run_block_id=agent_block.workflow_run_block_id,
+        organization_id="o_cached",
+        error_codes=["agent_control_error"],
+    )
+    persisted_agent_block = await observer.get_workflow_run_block(
+        agent_block.workflow_run_block_id, organization_id="o_cached"
+    )
+    assert persisted_agent_block.error_codes == ["agent_control_error"]

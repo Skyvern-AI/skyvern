@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError
 from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
+    BrowserSessionNotFound,
     FailedToSendWebhook,
     ScreenshotTargetClosed,
     TaskTerminationError,
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.task_v2 import (
     TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL,
     TaskV2,
@@ -61,7 +63,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunStatus,
+    workflow_definition_sha256,
+)
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
     ProxyLocationInput,
@@ -338,10 +346,22 @@ async def initialize_task_v2(
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    created_by: str | None = None,
 ) -> TaskV2:
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
         user_url = await asyncio.to_thread(validate_fetch_url, user_url)
+    if browser_session_id:
+        # The workflow run created below refuses this too, but only after the task and its workflow exist.
+        browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            session_id=browser_session_id,
+            organization_id=organization.organization_id,
+        )
+        if not browser_session:
+            raise BrowserSessionNotFound(browser_session_id=browser_session_id)
+        unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+        if unusable is not None:
+            raise unusable
 
     task_v2 = await app.DATABASE.observer.create_task_v2(
         prompt=user_prompt,
@@ -400,6 +420,7 @@ async def initialize_task_v2(
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
@@ -581,8 +602,9 @@ async def run_task_v2(
         organization_name=organization.organization_name,
         org_default_llm_key=organization.default_llm_key,
         org_default_secondary_llm_key=organization.default_secondary_llm_key,
-        org_age_bucket=(parent_context.org_age_bucket if parent_context else None)
-        or skyvern_context.compute_org_age_bucket(organization.created_at),
+        org_age=parent_context.org_age
+        if parent_context and parent_context.org_age is not None
+        else skyvern_context.compute_org_age(organization.created_at),
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -806,9 +828,11 @@ async def run_task_v2_helper(
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
+    )
     await _set_up_workflow_context(workflow, workflow_run_id, organization)
 
     user_prompt = task_v2.prompt
@@ -1226,8 +1250,10 @@ async def run_task_v2_helper(
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
+            extra_http_headers=workflow.extra_http_headers or {},
+            cdp_connect_headers=workflow.cdp_connect_headers or {},
         )
-        LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
+        LOG.info("Creating workflow from request", workflow_permanent_id=workflow.workflow_permanent_id)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
             request=workflow_create_request,
@@ -1663,6 +1689,7 @@ async def _generate_loop_task(
         data_schema=_generate_data_extraction_schema_for_loop(loop_values_key),
         output_parameter=loop_value_extraction_output_parameter,
     )
+    extraction_block_for_loop.mark_internal_evaluation()
 
     extraction_block_result = await extraction_block_for_loop.execute_safe(
         workflow_run_id=workflow_run_id,
@@ -2059,7 +2086,7 @@ async def _generate_compute_task(
     label = f"compute_{generate_random_string()}"
     # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
     # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
-    # fabricated one would arm runtime self-heal on a data-only block.
+    # fabricated one would arm the AI fallback on a data-only block.
     code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -2549,7 +2576,9 @@ async def _get_navigate_complete_output(
     if not task_id:
         return None
     try:
-        actions = await app.DATABASE.tasks.get_task_actions(task_id=task_id, organization_id=organization_id)
+        # Hydrated: `output` is a base Action field with no ActionModel column, so the base read
+        # would resolve it to None and make this function's documented fallback dead.
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id=task_id, organization_id=organization_id)
     except Exception:
         LOG.warning(
             "Failed to load navigate task actions; skipping terminal-output recovery",

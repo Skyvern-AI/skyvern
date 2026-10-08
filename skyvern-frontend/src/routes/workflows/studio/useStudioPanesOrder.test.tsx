@@ -43,7 +43,8 @@ function renderWithPanes(search: string, order: StudioPaneId[]) {
 }
 
 function CopilotVisitProbe() {
-  const { panes, togglePane, openPane } = useStudioPanes();
+  const { panes, togglePane, openPane, closePane, setPanesOrder } =
+    useStudioPanes();
   const location = useLocation();
   const navigate = useNavigate();
   const address = `${location.pathname}${location.search}${location.hash}`;
@@ -58,6 +59,11 @@ function CopilotVisitProbe() {
       <button onClick={() => togglePane("browser")}>toggle-browser</button>
       <button onClick={() => togglePane("editor")}>toggle-editor</button>
       <button onClick={() => openPane("browser")}>open-browser</button>
+      <button onClick={() => closePane("copilot")}>close-copilot</button>
+      <button onClick={() => openPane("copilot")}>open-copilot</button>
+      <button onClick={() => setPanesOrder(["copilot", "browser"])}>
+        drag-copilot-first
+      </button>
       <button
         onClick={() =>
           openPane("copilot", {
@@ -70,7 +76,7 @@ function CopilotVisitProbe() {
       <button
         onClick={() =>
           navigate(
-            "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof",
+            "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof",
           )
         }
       >
@@ -78,7 +84,9 @@ function CopilotVisitProbe() {
       </button>
       <button
         onClick={() =>
-          navigate("/studio?via=blank&panes=copilot,editor,browser#proof")
+          navigate(
+            "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+          )
         }
       >
         return-to-studio
@@ -127,9 +135,9 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
 
   test("reapplies shared entry panes when navigating between Studio and runs", () => {
     const studioAddress =
-      "/studio?via=blank&panes=copilot,editor,browser#proof";
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof";
     const runAddress =
-      "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof";
+      "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof";
     renderCopilotVisit(studioAddress);
 
     expect(screen.getByTestId("panes").textContent).toBe(
@@ -145,12 +153,12 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
     );
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
-    // Reopening appends Copilot during this visit.
+    // The run entry starts its own slot memory, so Copilot reopens in place.
     fireEvent.click(screen.getByText("toggle-copilot"));
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
     fireEvent.click(screen.getByText("toggle-copilot"));
     expect(screen.getByTestId("panes").textContent).toBe(
-      "editor,browser,copilot",
+      "copilot,editor,browser",
     );
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
@@ -168,7 +176,7 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
   });
 
   test("keeps route-state handoffs while preserving pathname, search, and hash", () => {
-    const address = "/studio?via=blank&panes=editor,browser#proof";
+    const address = "/studio?cache-key-value=x&panes=editor,browser#proof";
     renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("open-copilot-with-state"));
@@ -190,14 +198,16 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
   });
 
   test("preserves the incoming URL through multiple pane toggles", () => {
-    renderCopilotVisit("/studio?via=blank&panes=copilot,editor,browser#proof");
+    renderCopilotVisit(
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+    );
 
     fireEvent.click(screen.getByText("toggle-copilot"));
     fireEvent.click(screen.getByText("toggle-browser"));
 
     expect(screen.getByTestId("panes").textContent).toBe("editor");
     expect(screen.getByTestId("address").textContent).toBe(
-      "/studio?via=blank&panes=copilot,editor,browser#proof",
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
     );
   });
 
@@ -212,17 +222,39 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
     );
   });
 
-  test("appends Copilot after reopening", () => {
-    const address = "/studio?via=blank&panes=editor,copilot,browser#proof";
+  test("reopens Copilot in the slot it was closed from", () => {
+    const address =
+      "/studio?cache-key-value=x&panes=editor,copilot,browser#proof";
     renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("toggle-copilot"));
     fireEvent.click(screen.getByText("toggle-copilot"));
 
     expect(screen.getByTestId("panes").textContent).toBe(
-      "editor,browser,copilot",
+      "editor,copilot,browser",
     );
     expect(screen.getByTestId("address").textContent).toBe(address);
+  });
+
+  test("reopens a dragged pane where the drag left it, not at the end", () => {
+    renderCopilotVisit("/studio?panes=browser,copilot");
+
+    fireEvent.click(screen.getByText("drag-copilot-first"));
+    fireEvent.click(screen.getByText("close-copilot"));
+    expect(screen.getByTestId("panes").textContent).toBe("browser");
+    fireEvent.click(screen.getByText("open-copilot"));
+
+    expect(screen.getByTestId("panes").textContent).toBe("copilot,browser");
+  });
+
+  test("appends a pane that has not been open during this visit", () => {
+    renderCopilotVisit("/studio?panes=copilot,browser");
+
+    fireEvent.click(screen.getByText("toggle-editor"));
+
+    expect(screen.getByTestId("panes").textContent).toBe(
+      "copilot,browser,editor",
+    );
   });
 });
 
@@ -309,7 +341,7 @@ function renderAtRunRoute(entry: string) {
 describe("useStudioPanes under the short run URL", () => {
   test("/runs/{wr} opens the run layout from the path, not the edit default", () => {
     renderAtRunRoute("/runs/wr_1");
-    expect(screen.getByTestId("panes").textContent).toBe("browser,overview");
+    expect(screen.getByTestId("panes").textContent).toBe("overview,browser");
   });
 
   test("an explicit ?panes= still wins under the short run URL", () => {

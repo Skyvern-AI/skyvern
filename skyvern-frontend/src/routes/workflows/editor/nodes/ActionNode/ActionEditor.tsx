@@ -18,7 +18,11 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
-import { helpTooltips, placeholders } from "../../helpContent";
+import {
+  firstBrowserBlockUrlPlaceholder,
+  helpTooltips,
+  placeholders,
+} from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
@@ -29,10 +33,16 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { errorMappingExampleValue } from "../types";
 import { type AppNode } from "..";
 import { ActionNode, ActionNodeData } from "./types";
+import { cn } from "@/util/utils";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 
@@ -71,6 +81,10 @@ function ActionEditorBody({
   const update = useUpdate<ActionNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
+  const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
+    ? firstBrowserBlockUrlPlaceholder
+    : placeholders["action"]["url"];
+  const urlError = useBlockUrlError(blockId);
   const outputParameterKeys = getAvailableOutputParameterKeys(
     nodes,
     edges,
@@ -99,12 +113,23 @@ function ActionEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInputTextarea
+          name="url"
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
           value={data.url}
-          placeholder={placeholders["action"]["url"]}
-          className="nopan text-xs"
+          placeholder={urlPlaceholder}
+          aria-invalid={urlError !== null}
+          aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+          className={cn(
+            "nopan text-xs",
+            urlError !== null && "border-destructive",
+          )}
         />
+        {urlError ? (
+          <p id={blockUrlErrorId(blockId)} className="text-xs text-destructive">
+            {urlError}
+          </p>
+        ) : null}
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
@@ -114,6 +139,7 @@ function ActionEditorBody({
           <HelpTooltip content={navigationGoalTooltip} />
         </div>
         <WorkflowBlockInputTextarea
+          name="navigationGoal"
           aiImprove={AI_IMPROVE_CONFIGS.action.navigationGoal}
           nodeId={blockId}
           onChange={(value) => update({ navigationGoal: value })}
@@ -194,6 +220,7 @@ function ActionEditorBody({
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}
@@ -263,6 +290,7 @@ function ActionEditorBody({
                   <HelpTooltip content={helpTooltips["action"]["fileSuffix"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="downloadSuffix"
                   nodeId={blockId}
                   type="text"
                   placeholder={placeholders["action"]["downloadSuffix"]}
@@ -282,6 +310,7 @@ function ActionEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -308,6 +337,7 @@ function ActionEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

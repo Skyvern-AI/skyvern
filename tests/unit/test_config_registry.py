@@ -3,13 +3,126 @@ import runpy
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import structlog
 
 from skyvern.forge.sdk.api.llm import config_registry
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, _build_litellm_router
+from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _emit_copilot_model_usage
+from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.forge_log import _model_log_value, redact_registered_log_payload
 from skyvern.schemas import llm as llm_schemas
+from tests.unit.forge_log_capture import capture_runtime_logs
+
+
+def test_only_builtin_model_registration_establishes_log_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})
+    config = llm_schemas.LLMConfig("gpt-5.6-terra", [], False, False)
+    config_registry._register_builtin_config("BUILTIN", config)
+    config_registry.LLMConfigRegistry.register_config("CUSTOM", config)
+    builtin = config_registry.LLMConfigRegistry.get_config("BUILTIN")
+    custom = config_registry.LLMConfigRegistry.get_config("CUSTOM")
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5.6"})):
+        _, values = redact_registered_log_payload(
+            "diagnostic",
+            {
+                "model": _model_log_value("model", builtin.model_name),
+                "custom": _model_log_value("custom", custom.model_name),
+            },
+        )
+    assert values["model"] == "gpt-5.6-terra"
+    assert values["custom"] == f"gpt-{REDACTED_SECRET_PLACEHOLDER}-terra"
+    assert type(config.model_name) is str
+
+
+@pytest.mark.parametrize("builtin", [True, False])
+def test_real_router_serving_group_retains_only_its_configuration_provenance(
+    monkeypatch: pytest.MonkeyPatch, builtin: bool
+) -> None:
+    monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})
+    group = "gpt-4-1-mini-fallback"
+    config = llm_schemas.LLMRouterConfig(
+        model_name=group,
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        main_model_group=group,
+        model_list=[
+            llm_schemas.LLMRouterModelConfig(
+                model_name=group,
+                litellm_params={"model": "openai/gpt-4.1-mini", "api_key": "synthetic-test-key"},
+                model_info={"id": "test-registered-deployment"},
+            )
+        ],
+    )
+    register = (
+        config_registry._register_builtin_config if builtin else config_registry.LLMConfigRegistry.register_config
+    )
+    register("TEST_ROUTER", config)
+    resolved = config_registry.LLMConfigRegistry.get_config("TEST_ROUTER")
+    assert isinstance(resolved, llm_schemas.LLMRouterConfig)
+    router = _build_litellm_router(resolved)
+    response = SimpleNamespace(_hidden_params={"model_id": "test-registered-deployment"}, model=group)
+    served = LLMAPIHandlerFactory._served_model_group(router, response)
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"1"})):
+        _, values = redact_registered_log_payload(
+            "diagnostic",
+            {"served_model_group": _model_log_value("served_model_group", served), "response_model": response.model},
+        )
+    redacted = f"gpt-4-{REDACTED_SECRET_PLACEHOLDER}-mini-fallback"
+    assert values["served_model_group"] == (group if builtin else redacted)
+    assert values["response_model"] == redacted
+
+
+@pytest.mark.parametrize("builtin", [True, False])
+def test_copilot_router_provider_model_retains_only_its_source_provenance(
+    monkeypatch: pytest.MonkeyPatch, builtin: bool
+) -> None:
+    monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})
+    provider_model = "vertex_ai/gemini-2.5-flash"
+    credential = "synthetic-test-key"
+    parameters = {"model": provider_model, "api_key": credential}
+    config = llm_schemas.LLMRouterConfig(
+        model_name="router-group",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        main_model_group="router-group",
+        model_list=[llm_schemas.LLMRouterModelConfig("router-group", parameters)],
+    )
+    register = (
+        config_registry._register_builtin_config if builtin else config_registry.LLMConfigRegistry.register_config
+    )
+    register("TEST_ROUTER", config)
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5", credential})):
+        model_name, run_config, _, _ = resolve_model_config(None, llm_key_override="TEST_ROUTER")
+        model = run_config.model_provider.get_model(model_name)
+        with capture_runtime_logs() as events:
+            _emit_copilot_model_usage(
+                CopilotModelUsageEvent(
+                    request_model=model.model,
+                    response_model=provider_model,
+                    input_tokens=15,
+                    cost=0.25,
+                ),
+                logger=structlog.get_logger("skyvern.test.router_provider_provenance"),
+            )
+            structlog.get_logger().info("Caller parameters", payload=parameters)
+    records = json.loads(json.dumps(events))
+    usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
+    redacted = f"vertex_ai/gemini-2.{REDACTED_SECRET_PLACEHOLDER}-flash"
+    assert usage["gen_ai.request.model"] == (provider_model if builtin else redacted)
+    assert usage["gen_ai.response.model"] == redacted
+    assert usage["gen_ai.usage.input_tokens"] == 15 and type(usage["gen_ai.usage.input_tokens"]) is int
+    assert usage["operation.cost"] == 0.25 and type(usage["operation.cost"]) is float
+    assert credential not in json.dumps(records)
+    assert type(parameters["model"]) is str
 
 
 def test_xai_grok_4_5_cost_override_uses_separate_output_cap(monkeypatch: pytest.MonkeyPatch) -> None:

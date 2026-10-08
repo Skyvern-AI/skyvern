@@ -165,7 +165,7 @@ class TestGenerateComputeTask:
                 task_history=GATHERED,
             )
         # A non-null prompt is what makes the editor render the code-first node. It stays
-        # empty: a fabricated goal would arm runtime self-heal on a data-only block.
+        # empty: a fabricated goal would arm the AI fallback on a data-only block.
         assert block_yaml_list[0].prompt == ""
         assert block.prompt == ""
 

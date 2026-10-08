@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import structlog
 from fastapi import Depends, HTTPException, Query, status
+from fastapi.exceptions import RequestValidationError
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.core.permissions.schedule_limit_checker import ScheduleLimitCheckerFactory
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.agent_db import ScheduleLimitExceededError
@@ -14,6 +16,7 @@ from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_schedules import (
     DeleteScheduleResponse,
+    OneTimeDispatchStatus,
     OrganizationScheduleListResponse,
     WorkflowSchedule,
     WorkflowScheduleListResponse,
@@ -23,14 +26,28 @@ from skyvern.forge.sdk.schemas.workflow_schedules import (
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.schedules import (
+    NEXT_RUNS_COUNT,
     calculate_next_runs,
+    default_first_fire_at,
     validate_cron_expression,
     validate_timezone_name,
 )
 
 LOG = structlog.get_logger()
-DEFAULT_NEXT_RUNS_COUNT = 5
 SCHEDULE_SYNC_ERROR_DETAIL = "Failed to sync schedule with scheduling service"
+# Leaves time for the row write and the scheduler create to land before the requested first tick.
+MIN_FIRST_FIRE_LEAD = timedelta(seconds=60)
+_AUDITED_SCHEDULE_FIELDS = {
+    "cron_expression",
+    "description",
+    "enabled",
+    "first_fire_at",
+    "interval_seconds",
+    "name",
+    "parameters",
+    "run_at",
+    "timezone",
+}
 
 
 def _require_schedules_enabled() -> None:
@@ -76,9 +93,17 @@ async def _get_schedule_or_404(
 
 def _next_runs(
     schedule: WorkflowSchedule,
-    count: int = DEFAULT_NEXT_RUNS_COUNT,
+    count: int = NEXT_RUNS_COUNT,
 ) -> list[datetime]:
-    return calculate_next_runs(schedule.cron_expression, schedule.timezone, count)
+    if schedule.run_at is not None:
+        return [schedule.run_at] if schedule.dispatch_status == OneTimeDispatchStatus.pending else []
+    return calculate_next_runs(
+        schedule.cron_expression,
+        schedule.timezone,
+        count,
+        interval_seconds=schedule.interval_seconds,
+        first_fire_at=schedule.first_fire_at,
+    )
 
 
 def _strip_none_parameters(params: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -89,12 +114,58 @@ def _strip_none_parameters(params: dict[str, Any] | None) -> dict[str, Any] | No
     return stripped or None
 
 
-def _validate_request(cron_expression: str, timezone: str) -> None:
+def _validate_request(body: WorkflowScheduleUpsertRequest) -> None:
     try:
-        validate_cron_expression(cron_expression)
-        validate_timezone_name(timezone)
+        if body.cron_expression is not None:
+            validate_cron_expression(body.cron_expression)
+        validate_timezone_name(body.timezone)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _resolve_first_fire_at(body: WorkflowScheduleUpsertRequest, existing: WorkflowSchedule | None) -> datetime | None:
+    if body.interval_seconds is None:
+        return None
+    # Clients that fetch-merge-put echo the stored anchor back, so an unchanged anchor is kept even once it is past.
+    if (
+        existing is not None
+        and existing.first_fire_at is not None
+        and body.first_fire_at in (None, existing.first_fire_at)
+    ):
+        return existing.first_fire_at
+    if body.first_fire_at is None:
+        return default_first_fire_at(body.interval_seconds)
+    return _require_future(body.first_fire_at, "first_fire_at")
+
+
+def _require_future(value: datetime, field: str) -> datetime:
+    if value < datetime.now(UTC) + MIN_FIRST_FIRE_LEAD:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("body", field),
+                    "msg": f"{field} must be at least 60 seconds in the future",
+                    "input": value.isoformat(),
+                }
+            ]
+        )
+    return value
+
+
+def _resolve_run_at(body: WorkflowScheduleUpsertRequest, existing: WorkflowSchedule | None) -> datetime | None:
+    if body.run_at is None:
+        return None
+    if existing is not None and body.run_at == existing.run_at:
+        return existing.run_at
+    return _require_future(body.run_at, "run_at")
+
+
+def _one_time_conflict(workflow_schedule_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"Schedule {workflow_schedule_id} already fired or was canceled, so it can no longer change",
+    )
 
 
 async def _set_schedule_enabled(
@@ -114,6 +185,11 @@ async def _set_schedule_enabled(
         raise HTTPException(
             status_code=404,
             detail=f"Schedule {workflow_schedule_id} not found",
+        )
+    if existing.is_one_time:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A one-time schedule cannot be paused or resumed; cancel it, or update run_at to move it",
         )
 
     backend_schedule_id = existing.backend_schedule_id or app.AGENT_FUNCTION.build_workflow_schedule_id(
@@ -169,6 +245,15 @@ async def _set_schedule_enabled(
                 )
             raise _schedule_sync_error() from e
 
+    if previous_enabled != enabled:
+        await record_request_audit_event(
+            organization.organization_id,
+            "workflow_schedule.update",
+            "workflow_schedule",
+            workflow_schedule_id,
+            changed_fields=("enabled",),
+            related_resource_ids=(workflow_permanent_id,),
+        )
     LOG.info(
         "Workflow schedule enabled state updated",
         organization_id=organization.organization_id,
@@ -236,8 +321,9 @@ async def list_organization_schedules(
     operation_id="schedules_create",
     summary="Create a schedule for an agent",
     description=(
-        "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. "
-        "Returns the stored schedule and its next upcoming run times."
+        "Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed "
+        "set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A "
+        "one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times."
     ),
 )
 async def create_workflow_schedule(
@@ -246,7 +332,9 @@ async def create_workflow_schedule(
     organization: Organization = Depends(org_auth_service.get_current_org),
     _: None = Depends(_require_schedules_enabled),
 ) -> WorkflowScheduleResponse:
-    _validate_request(body.cron_expression, body.timezone)
+    _validate_request(body)
+    first_fire_at = _resolve_first_fire_at(body, existing=None)
+    run_at = _resolve_run_at(body, existing=None)
     workflow = await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
     await app.WORKFLOW_SERVICE.validate_schedule_parameters(
         workflow=workflow,
@@ -271,6 +359,9 @@ async def create_workflow_schedule(
             parameters=stored_parameters,
             name=body.name,
             description=body.description,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
+            run_at=run_at,
         )
     except ScheduleLimitExceededError as e:
         LOG.info(
@@ -337,6 +428,9 @@ async def create_workflow_schedule(
             enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
+            run_at=run_at,
         )
     except Exception as e:
         LOG.exception(
@@ -360,12 +454,21 @@ async def create_workflow_schedule(
             )
         raise _schedule_sync_error() from e
 
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.create",
+        "workflow_schedule",
+        schedule.workflow_schedule_id,
+        related_resource_ids=(workflow.workflow_permanent_id,),
+    )
     LOG.info(
         "Workflow schedule created",
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=schedule.workflow_schedule_id,
         cron_expression=body.cron_expression,
+        interval_seconds=body.interval_seconds,
+        run_at=run_at,
         enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
@@ -401,7 +504,7 @@ async def list_workflow_schedules(
     operation_id="schedules_get",
     summary="Get an agent schedule by id",
     description=(
-        "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, "
+        "Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, "
         "parameters, enabled state, and next upcoming run times."
     ),
 )
@@ -432,7 +535,8 @@ async def get_workflow_schedule(
     operation_id="schedules_update",
     summary="Update an agent schedule",
     description=(
-        "Replace a schedule's cron expression, timezone, run parameters, and enabled state. "
+        "Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled "
+        "state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. "
         "Returns the updated schedule and its next upcoming run times."
     ),
 )
@@ -454,7 +558,17 @@ async def update_workflow_schedule(
             detail=f"Schedule {workflow_schedule_id} not found",
         )
 
-    _validate_request(body.cron_expression, body.timezone)
+    if existing.is_one_time != (body.run_at is not None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A schedule cannot switch between one-time and recurring; create a new schedule instead",
+        )
+    if existing.is_one_time and existing.dispatch_status != OneTimeDispatchStatus.pending:
+        raise _one_time_conflict(workflow_schedule_id)
+
+    _validate_request(body)
+    first_fire_at = _resolve_first_fire_at(body, existing=existing)
+    run_at = _resolve_run_at(body, existing=existing)
     await app.WORKFLOW_SERVICE.validate_schedule_parameters(
         workflow=workflow,
         organization=organization,
@@ -479,6 +593,9 @@ async def update_workflow_schedule(
         raise _schedule_sync_error()
 
     old_cron = existing.cron_expression
+    old_interval_seconds = existing.interval_seconds
+    old_first_fire_at = existing.first_fire_at
+    old_run_at = existing.run_at
     old_timezone = existing.timezone
     old_enabled = existing.enabled
     old_parameters = existing.parameters
@@ -494,7 +611,7 @@ async def update_workflow_schedule(
     # Pass _UNSET (not existing.enabled) when omitted so this write can't clobber
     # a concurrent pause/resume that lands between the read above and this write.
     enabled_explicit = "enabled" in body.model_fields_set and body.enabled is not None
-    enabled_for_write = body.enabled if enabled_explicit else _UNSET
+    enabled_for_write = body.enabled if enabled_explicit and body.enabled is not None else _UNSET
 
     schedule = await app.DATABASE.schedules.update_workflow_schedule(
         workflow_schedule_id=workflow_schedule_id,
@@ -506,8 +623,13 @@ async def update_workflow_schedule(
         backend_schedule_id=backend_schedule_id,
         name=body.name,
         description=body.description,
+        interval_seconds=body.interval_seconds,
+        first_fire_at=first_fire_at,
+        run_at=run_at,
     )
     if not schedule:
+        if existing.is_one_time:
+            raise _one_time_conflict(workflow_schedule_id)
         raise HTTPException(
             status_code=404,
             detail=f"Schedule {workflow_schedule_id} not found",
@@ -528,6 +650,9 @@ async def update_workflow_schedule(
             enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
+            interval_seconds=body.interval_seconds,
+            first_fire_at=first_fire_at,
+            run_at=run_at,
         )
     except Exception as e:
         LOG.exception(
@@ -547,6 +672,9 @@ async def update_workflow_schedule(
                 backend_schedule_id=backend_schedule_id,
                 name=old_name,
                 description=old_description,
+                interval_seconds=old_interval_seconds,
+                first_fire_at=old_first_fire_at,
+                run_at=old_run_at,
             )
         except Exception as rollback_err:
             LOG.exception(
@@ -558,15 +686,94 @@ async def update_workflow_schedule(
             )
         raise _schedule_sync_error() from e
 
+    before = existing.model_dump(include=_AUDITED_SCHEDULE_FIELDS)
+    after = schedule.model_dump(include=_AUDITED_SCHEDULE_FIELDS)
+    changed_fields = tuple(sorted(name for name in after if before[name] != after[name]))
+    if changed_fields:
+        await record_request_audit_event(
+            organization.organization_id,
+            "workflow_schedule.update",
+            "workflow_schedule",
+            workflow_schedule_id,
+            changed_fields=changed_fields,
+            related_resource_ids=(workflow_permanent_id,),
+        )
     LOG.info(
         "Workflow schedule updated",
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=workflow_schedule_id,
         cron_expression=body.cron_expression,
+        interval_seconds=body.interval_seconds,
+        run_at=run_at,
         enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
+
+
+@legacy_base_router.post(
+    "/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel",
+    response_model=WorkflowScheduleResponse,
+    tags=["Schedules"],
+    operation_id="schedules_cancel",
+    summary="Cancel a one-time agent schedule",
+    description=(
+        "Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status "
+        "canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule."
+    ),
+)
+async def cancel_workflow_schedule(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    _: None = Depends(_require_schedules_enabled),
+) -> WorkflowScheduleResponse:
+    await _ensure_workflow_exists(workflow_permanent_id, organization.organization_id)
+    existing = await _get_schedule_or_404(workflow_schedule_id, organization.organization_id)
+    if existing.workflow_permanent_id != workflow_permanent_id:
+        raise HTTPException(status_code=404, detail=f"Schedule {workflow_schedule_id} not found")
+    if not existing.is_one_time:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only a one-time schedule can be canceled; disable or delete a recurring schedule instead",
+        )
+
+    schedule = await app.DATABASE.schedules.cancel_one_time_schedule(
+        workflow_schedule_id=workflow_schedule_id,
+        organization_id=organization.organization_id,
+    )
+    if schedule is None:
+        raise _one_time_conflict(workflow_schedule_id)
+
+    # The pending-only claim already refuses a canceled row, so a leftover backend schedule can never start a run.
+    if existing.backend_schedule_id:
+        try:
+            await app.AGENT_FUNCTION.delete_workflow_schedule(existing.backend_schedule_id)
+        except Exception:
+            LOG.exception(
+                "Failed to delete canceled one-time schedule on execution backend",
+                workflow_schedule_id=workflow_schedule_id,
+                backend_schedule_id=existing.backend_schedule_id,
+            )
+
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.cancel",
+        "workflow_schedule",
+        workflow_schedule_id,
+        related_resource_ids=(workflow_permanent_id,),
+    )
+    LOG.info(
+        "One-time workflow schedule canceled",
+        organization_id=organization.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_schedule_id=workflow_schedule_id,
+    )
+    return WorkflowScheduleResponse(schedule=schedule, next_runs=[])
 
 
 @legacy_base_router.post(
@@ -684,6 +891,13 @@ async def delete_workflow_schedule_route(
                 )
             raise _schedule_sync_error() from e
 
+    await record_request_audit_event(
+        organization.organization_id,
+        "workflow_schedule.delete",
+        "workflow_schedule",
+        workflow_schedule_id,
+        related_resource_ids=(workflow_permanent_id,),
+    )
     LOG.info(
         "Workflow schedule deleted",
         organization_id=organization.organization_id,

@@ -13,7 +13,7 @@ from skyvern.exceptions import (
     SkyvernHTTPException,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.files import uploaded_file_id_for_local_uri, validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
@@ -75,17 +75,19 @@ def _release_sdk_action_context(workflow_run_id: str) -> bool:
 async def run_sdk_action(
     action_request: RunSdkActionRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> RunSdkActionResponse:
     """Execute a single SDK action with the specified parameters."""
     # The whole action runs on this process's event loop, so the cap is taken before any database
     # write or page work: an organization over its cap costs a rejected request, not a started one.
     async with app.RATE_LIMITER.limit_sdk_action_concurrency(organization.organization_id):
-        return await _run_sdk_action(action_request, organization)
+        return await _run_sdk_action(action_request, organization, created_by=user_id)
 
 
 async def _run_sdk_action(
     action_request: RunSdkActionRequest,
     organization: Organization,
+    created_by: str | None = None,
 ) -> RunSdkActionResponse:
     LOG.info(
         "Running SDK action",
@@ -136,6 +138,7 @@ async def _run_sdk_action(
             organization=organization,
             version=None,
             trigger_type=WorkflowRunTriggerType.api,
+            created_by=created_by,
         )
         task_type = TaskType.synthetic_sdk_action
 
@@ -202,8 +205,9 @@ async def _run_sdk_action(
             SkyvernContext(
                 request_id=context.request_id,
                 organization_id=task.organization_id,
-                org_age_bucket=context.org_age_bucket
-                or skyvern_context.compute_org_age_bucket(organization.created_at),
+                org_age=context.org_age
+                if context.org_age is not None
+                else skyvern_context.compute_org_age(organization.created_at),
                 task_id=task.task_id,
                 step_id=step.step_id,
                 browser_session_id=browser_session_id,
@@ -246,7 +250,12 @@ async def _run_sdk_action(
                     timeout=action.timeout,
                 )
             elif action.type == "ai_upload_file":
-                if action.file_url and not validate_download_url(action.file_url, organization_id=organization_id):
+                # The id only clears this gate; the original URI travels on because the upload handler
+                # matches it against the task payload, and download_file maps it to the id again.
+                gate_url = action.file_url
+                if gate_url:
+                    gate_url = await uploaded_file_id_for_local_uri(gate_url, organization_id) or gate_url
+                if gate_url and not validate_download_url(gate_url, organization_id=organization_id):
                     raise HTTPException(status_code=400, detail="Unsupported file url")
                 result = await page_ai.ai_upload_file(
                     selector=action.selector,

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     Block,
     ForLoopBlock,
     JinjaBranchCriteria,
+    LoopBlockExecutedResult,
     PromptBranchCriteria,
     TaskBlock,
     WhileLoopBlock,
@@ -227,6 +228,43 @@ class TestWhileLoopNestedLabelValidation:
 # ---------------------------------------------------------------------------
 # 3) Execution: top-of-loop semantics
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_type", [ForLoopBlock, WhileLoopBlock])
+async def test_a_loop_stopped_by_a_child_on_a_sign_in_form_carries_that_fact(loop_type: type[Block]) -> None:
+    inner = TaskBlock(label="inner_task", output_parameter=_make_output_param("inner_task"))
+    failed_child = BlockResult(
+        success=False, output_parameter=inner.output_parameter, status=BlockStatus.failed, sign_in_form_visible=True
+    )
+    executed = LoopBlockExecutedResult(outputs_with_loop_values=[[]], block_outputs=[failed_child], last_block=inner)
+    if loop_type is ForLoopBlock:
+        loop: Block = ForLoopBlock(label="my_for", output_parameter=_make_output_param("my_for"), loop_blocks=[inner])
+        run_loop_body = patch.object(ForLoopBlock, "execute_loop_helper", AsyncMock(return_value=executed))
+    else:
+        loop = _make_while_loop()
+        run_loop_body = patch.object(WhileLoopBlock, "_execute_while_loop_helper", AsyncMock(return_value=executed))
+
+    async def build_block_result(
+        self: Block, *, success: bool, failure_reason: str | None, status: BlockStatus, **kwargs: object
+    ) -> BlockResult:
+        return BlockResult(
+            success=success, failure_reason=failure_reason, output_parameter=self.output_parameter, status=status
+        )
+
+    with (
+        run_loop_body,
+        patch.object(Block, "build_block_result", build_block_result),
+        patch.object(Block, "record_output_parameter_value", AsyncMock()),
+        patch.object(Block, "get_workflow_run_context", return_value=FakeWorkflowRunContext(values={})),
+        patch.object(ForLoopBlock, "get_loop_over_parameter_values", AsyncMock(return_value=[1])),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        result = await loop.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_loop")
+
+    assert result.success is False
+    assert result.sign_in_form_visible is True
 
 
 class TestExecuteTopOfLoopSemantics:

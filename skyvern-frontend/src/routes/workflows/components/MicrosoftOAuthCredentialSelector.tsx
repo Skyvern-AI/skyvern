@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   CustomSelectItem,
   Select,
@@ -16,6 +16,7 @@ import {
   useMicrosoftOAuthCredentials,
 } from "@/hooks/useMicrosoftOAuthCredentials";
 import { MICROSOFT_MAIL_REQUIRED_SCOPES } from "@/util/microsoftScopes";
+import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
 import { PlusIcon } from "@radix-ui/react-icons";
 
 type Props = {
@@ -44,9 +45,6 @@ function MicrosoftOAuthCredentialSelector({
     hasMicrosoftOAuthCredentialScopes(credential, requiredScopes),
   );
 
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-
   const isTemplateValue = value.includes("{{") || value.includes("{%");
   const useAdvanced = showAdvanced || isTemplateValue;
 
@@ -55,18 +53,16 @@ function MicrosoftOAuthCredentialSelector({
   const firstValidId = getDefaultMicrosoftOAuthCredentialId(credentials);
   const needsAutoFill = !value;
 
-  useEffect(() => {
-    if (
-      isLoading ||
-      isFetching ||
-      !hasCredentials ||
-      !needsAutoFill ||
-      !firstValidId
-    ) {
-      return;
-    }
-    onChangeRef.current(firstValidId);
-  }, [isLoading, isFetching, hasCredentials, needsAutoFill, firstValidId]);
+  useOAuthCredentialAutoFill({
+    nodeId,
+    field: "credentialId:microsoft",
+    value,
+    firstValidId,
+    needsAutoFill,
+    isLoading,
+    isFetching,
+    onChange,
+  });
 
   const handlePickerValueChange = (selected: string) => {
     if (selected === ADVANCED_OPTION) {
@@ -99,6 +95,7 @@ function MicrosoftOAuthCredentialSelector({
       {useAdvanced ? (
         <>
           <WorkflowBlockInputTextarea
+            name="credentialId:microsoft"
             nodeId={nodeId}
             value={value}
             onChange={onChange}

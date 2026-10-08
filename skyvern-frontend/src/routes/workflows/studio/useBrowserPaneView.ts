@@ -12,6 +12,7 @@ import {
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import {
   resolveBrowserPaneView,
+  resolveReplayAvailability,
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
@@ -35,6 +36,9 @@ type BrowserPaneViewState = {
   // What the Live view shows: the shared debug-session singleton, or the
   // inspected run's own per-run stream (running outside the debug session).
   liveSurface: "debug" | "run";
+  recordingAvailable: boolean;
+  screenshotsAvailable: boolean;
+  liveAvailable: boolean;
 };
 
 /**
@@ -123,6 +127,9 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     visuals.workflowRun.browser_session_id === debugBrowserSessionId;
   const blockRunInDebugSession = searchParams.has("bl") && runInDebugSession;
 
+  const { recordingAvailable, screenshotsAvailable } =
+    resolveReplayAvailability(visuals);
+
   const view = resolveBrowserPaneView({
     intent,
     recording: isRecording,
@@ -133,6 +140,11 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     runInDebugSession,
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
+    recordingAvailable,
+    // Until it is known whether screenshots exist, route as if they do, so the
+    // view doesn't flip away and back; the pill itself waits for the answer.
+    screenshotsAvailable: screenshotsAvailable || visuals.screenshotsPending,
+    hasDebugSession: debugBrowserSessionId != null,
     failed: visuals.failed,
   });
 
@@ -152,5 +164,8 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     debugBrowserSessionId,
     runInDebugSession,
     liveSurface,
+    recordingAvailable,
+    screenshotsAvailable,
+    liveAvailable: visuals.running || debugBrowserSessionId != null,
   };
 }

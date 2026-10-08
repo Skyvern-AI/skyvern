@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useEffect } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+
+import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 
 let transport: string | undefined = "cdp";
 
@@ -10,13 +13,32 @@ vi.mock("@/hooks/useRuntimeConfig", () => ({
 }));
 
 vi.mock("@/components/BrowserStream", () => ({
-  BrowserStream: ({ onClose }: { onClose: () => void }) => (
-    <button data-testid="vnc-stream" onClick={onClose} />
+  BrowserStream: ({
+    onClose,
+    onStreamStateChange,
+  }: {
+    onClose: () => void;
+    onStreamStateChange?: StreamStateChangeHandler;
+  }) => (
+    <button
+      data-testid="vnc-stream"
+      data-reports-state={onStreamStateChange ? "yes" : "no"}
+      onClick={onClose}
+    />
   ),
 }));
 
 vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
-  BrowserSessionStream: () => <div data-testid="session-stream" />,
+  BrowserSessionStream: ({
+    onStreamStateChange,
+  }: {
+    onStreamStateChange?: StreamStateChangeHandler;
+  }) => {
+    useEffect(() => {
+      onStreamStateChange?.("live", "pbs_1");
+    }, [onStreamStateChange]);
+    return <div data-testid="session-stream" />;
+  },
 }));
 
 vi.mock("../../workflowRun/WorkflowRunStream", () => ({
@@ -51,6 +73,26 @@ describe("RunLiveStream", () => {
       />,
     );
     expect(screen.queryByTestId("vnc-stream")).not.toBeNull();
+  });
+
+  test("hands stream state to the CDP fallback once VNC closes", () => {
+    transport = "vnc";
+    const onStreamStateChange = vi.fn();
+    render(
+      <RunLiveStream
+        workflowRunId="wr_1"
+        browserSessionId="pbs_1"
+        interactive={false}
+        onStreamStateChange={onStreamStateChange}
+      />,
+    );
+    expect(
+      screen.getByTestId("vnc-stream").getAttribute("data-reports-state"),
+    ).toBe("yes");
+    fireEvent.click(screen.getByTestId("vnc-stream"));
+
+    expect(screen.queryByTestId("session-stream")).not.toBeNull();
+    expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_1");
   });
 
   test("streams the per-run key when the run has no browser session", () => {

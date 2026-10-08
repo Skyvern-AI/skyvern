@@ -2047,6 +2047,7 @@ async def test_non_cached_script_download_threads_destination_into_single_block_
         organization_id="organization-id",
         browser_session_id="browser-session-id",
         context=SimpleNamespace(parent_workflow_run_block_id="parent-block-id"),
+        workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[])),
     )
 
     with (

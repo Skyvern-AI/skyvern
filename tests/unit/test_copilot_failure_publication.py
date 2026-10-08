@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -398,11 +399,15 @@ async def test_cancel_capture_joins_owned_task_before_preserving_caller_cancella
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
     recorder = SimpleNamespace(
-        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
     )
     healed = BlockResult(
         success=True,
@@ -417,7 +422,6 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", AsyncMock(return_value=b"frame"))
     monkeypatch.setattr(block_module.app.DATABASE.observer, "update_workflow_run_block", update_block)
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=healed))
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -425,6 +429,7 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
 
     result = await block._resolve_failure_with_heal(
+        authored_code=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -453,6 +458,7 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("_sample", range(5))
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_outer_deadline_during_staging_still_publishes_the_healable_failure(
     monkeypatch: pytest.MonkeyPatch, _sample: int
 ) -> None:
@@ -462,7 +468,10 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
     block = _block()
     context = _context()
     recorder = SimpleNamespace(
-        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
     )
     staging_entered = asyncio.Event()
     published: list[str] = []
@@ -487,7 +496,6 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
     heal = AsyncMock()
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", cancelled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -497,6 +505,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
     task = asyncio.create_task(
         block._resolve_failure_with_heal(
+            authored_code=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=build_failure_result,
@@ -531,6 +540,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("_sample", range(5))
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     monkeypatch: pytest.MonkeyPatch, _sample: int
 ) -> None:
@@ -540,7 +550,10 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     block = _block()
     context = _context()
     recorder = SimpleNamespace(
-        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
     )
     heal_reached = asyncio.Event()
 
@@ -559,7 +572,6 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
     monkeypatch.setattr(block_module.settings, "BROWSER_SCREENSHOT_TIMEOUT_MS", 10)
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", stalled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -568,6 +580,7 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
     result = await asyncio.wait_for(
         block._resolve_failure_with_heal(
+            authored_code=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=AsyncMock(),
@@ -591,11 +604,15 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
     recorder = SimpleNamespace(
-        recording_page=SimpleNamespace(failure_nav_error_code=lambda _exception: None), finalize=AsyncMock()
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
     )
     failed = BlockResult(
         success=False,
@@ -618,13 +635,13 @@ async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatc
         ),
     )
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=failed))
     monkeypatch.setattr(block, "_failure_output_with_downloads", AsyncMock(return_value=None))
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
 
     result = await block._resolve_failure_with_heal(
+        authored_code=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -1406,7 +1423,9 @@ async def test_capture_settlement_failure_uses_protected_block_failure_path(monk
     monkeypatch.setattr(CodeBlock, "_invalidate_stale_output_on_failure", AsyncMock())
     monkeypatch.setattr(CodeBlock, "build_block_result", build_result)
 
-    result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
+    # structlog's unconfigured default renderer cannot format the failure log's list-valued `stack`.
+    with capture_logs():
+        result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
 
     assert result.failure_reason == "CodeBlock execution failed."
     assert build_result.await_args.kwargs["workflow_run_block_id"] == "wrb_successor"

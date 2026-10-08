@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
-from skyvern.exceptions import SkyvernHTTPException
+from skyvern.exceptions import SkyvernHTTPException, WorkflowHasNoBlocks
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService, _workflow_save_fingerprint
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
@@ -39,6 +43,14 @@ def test_workflow_pydantic_defaults_to_none() -> None:
 def test_workflow_pydantic_accepts_browser_profile_id() -> None:
     workflow = _make_workflow(browser_profile_id="bp_abc123")
     assert workflow.browser_profile_id == "bp_abc123"
+
+
+def test_default_workflow_deep_copies_and_pickles() -> None:
+    # Copilot block runs deep-copy the stored workflow, so every field default must be copyable.
+    workflow = _make_workflow()
+    assert copy.deepcopy(workflow) == workflow
+    assert workflow.model_copy(deep=True) == workflow
+    assert pickle.loads(pickle.dumps(workflow)) == workflow
 
 
 def test_workflow_create_yaml_request_defaults_to_none() -> None:
@@ -345,9 +357,10 @@ async def test_recording_save_retry_returns_the_original_workflow_without_side_e
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     create_workflow = service.create_workflow
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits
@@ -426,9 +439,10 @@ async def test_concurrent_recording_save_retry_removes_the_redundant_version() -
             organization=cast(Any, SimpleNamespace(organization_id="org_1")),
             request=request,
             workflow_permanent_id="wpid_test",
+            return_write_result=True,
         )
 
-    assert result is original_workflow
+    assert result == (original_workflow, ())
     delete_workflow = service.delete_workflow_by_id
     maybe_delete_cached_code = service.maybe_delete_cached_code
     refresh_schedules = service._refresh_workflow_schedule_runtime_limits
@@ -572,14 +586,46 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         backend_schedule_id="temporal_1",
         workflow_schedule_id="wfs_1",
         cron_expression="0 */6 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
+        run_at=None,
+        dispatch_status=None,
         timezone="UTC",
         enabled=True,
         parameters={"url": "https://example.com"},
     )
+    interval_schedule_with_backend = SimpleNamespace(
+        backend_schedule_id="temporal_2",
+        workflow_schedule_id="wfs_2",
+        cron_expression=None,
+        interval_seconds=18000,
+        first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        run_at=None,
+        dispatch_status=None,
+        timezone="America/New_York",
+        enabled=False,
+        parameters=None,
+    )
+    pending_one_time = SimpleNamespace(
+        backend_schedule_id="temporal_3",
+        workflow_schedule_id="wfs_3",
+        cron_expression=None,
+        interval_seconds=None,
+        first_fire_at=None,
+        run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
+        dispatch_status="pending",
+        timezone="America/Los_Angeles",
+        enabled=True,
+        parameters=None,
+    )
+    fired_one_time = SimpleNamespace(**{**vars(pending_one_time), "workflow_schedule_id": "wfs_4"})
+    fired_one_time.dispatch_status = "fired"
     schedule_without_backend = SimpleNamespace(
         backend_schedule_id=None,
         workflow_schedule_id="wfs_local",
         cron_expression="0 */12 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
         timezone="UTC",
         enabled=False,
         parameters=None,
@@ -588,7 +634,13 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
-            return_value=[schedule_with_backend, schedule_without_backend]
+            return_value=[
+                schedule_with_backend,
+                interval_schedule_with_backend,
+                pending_one_time,
+                fired_one_time,
+                schedule_without_backend,
+            ]
         )
         mock_app.AGENT_FUNCTION.upsert_workflow_schedule = AsyncMock()
 
@@ -602,17 +654,50 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         workflow_permanent_id="wpid_test",
         organization_id="org_1",
     )
-    mock_app.AGENT_FUNCTION.upsert_workflow_schedule.assert_awaited_once_with(
-        backend_schedule_id="temporal_1",
-        organization_id="org_1",
-        workflow_permanent_id="wpid_test",
-        workflow_schedule_id="wfs_1",
-        cron_expression="0 */6 * * *",
-        timezone="UTC",
-        enabled=True,
-        parameters={"url": "https://example.com"},
-        max_elapsed_time_minutes=360,
-    )
+    assert mock_app.AGENT_FUNCTION.upsert_workflow_schedule.await_args_list == [
+        call(
+            backend_schedule_id="temporal_1",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_1",
+            cron_expression="0 */6 * * *",
+            timezone="UTC",
+            enabled=True,
+            parameters={"url": "https://example.com"},
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+            run_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_2",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_2",
+            cron_expression=None,
+            timezone="America/New_York",
+            enabled=False,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=18000,
+            first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+            run_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_3",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_3",
+            cron_expression=None,
+            timezone="America/Los_Angeles",
+            enabled=True,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+            run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
+        ),
+    ]
 
 
 def _make_workflow_update_service(
@@ -625,7 +710,11 @@ def _make_workflow_update_service(
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
         version=2,
+        proxy_location=None,
+        totp_identifier=None,
+        totp_verification_url=None,
         cdp_connect_headers=None,
+        extra_http_headers=None,
         workflow_permanent_id="wpid_test",
         folder_id=None,
         code_version=None,
@@ -855,3 +944,49 @@ async def test_setup_workflow_run_without_credentials_writes_no_sequential_crede
 
         update_mock = mock_app.DATABASE.workflow_runs.update_workflow_run
         assert all("sequential_credential_id" not in call.kwargs for call in update_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_rejects_empty_workflow_before_creating_run() -> None:
+    service, organization, _ = _make_setup_service(_make_workflow_stub(browser_profile_id=None))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        with pytest.raises(WorkflowHasNoBlocks) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data={}),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+                reject_empty_workflow=True,
+            )
+
+    assert exc_info.value.status_code == 400
+    cast(AsyncMock, service.create_workflow_run).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_empty_loop_block_when_rejecting_empty_workflows() -> None:
+    workflow_stub = _make_workflow_stub(browser_profile_id=None)
+    output_parameter = OutputParameter(
+        key="loop_output",
+        output_parameter_id="op_test",
+        workflow_id="wf_test",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    empty_loop = ForLoopBlock(label="loop", output_parameter=output_parameter, loop_blocks=[])
+    workflow_stub.workflow_definition = SimpleNamespace(parameters=[], blocks=[empty_loop])
+    service, organization, _ = _make_setup_service(workflow_stub)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            reject_empty_workflow=True,
+        )
+
+    cast(AsyncMock, service.create_workflow_run).assert_awaited_once()

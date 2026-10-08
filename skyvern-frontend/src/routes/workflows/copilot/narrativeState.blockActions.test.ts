@@ -41,6 +41,8 @@ const recordedAction = (
   summary: null,
   durationMs: 200,
   failed: false,
+  codeLine: null,
+  response: null,
   ...overrides,
 });
 

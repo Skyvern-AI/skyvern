@@ -1,14 +1,25 @@
 import {
+  canonicalRecoveriesByWorkflow,
+  WorkflowCopilotChat,
+} from "./WorkflowCopilotChat";
+import { toast } from "@/components/ui/use-toast";
+import type { EditorStateSnapshot } from "../editor/editorStateSnapshot";
+import type { ComponentProps } from "react";
+import {
   act,
   cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import type {
   QuestionInteraction,
@@ -16,12 +27,14 @@ import type {
 } from "./workflowCopilotTypes";
 
 type HistoryData = {
+  request_turn_id?: string | null;
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   workflow_copilot_chat_id: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
+  proposed_workflow_metadata?: Record<string, unknown> | null;
   auto_accept: boolean;
 };
 
@@ -42,6 +55,8 @@ const {
   historyRejects,
   historyParams,
   workflowGets,
+  workflowGet,
+  workflowResponse,
   hasLocalChanges,
   historySignals,
   boolFlags,
@@ -65,6 +80,10 @@ const {
     historyQueue: [] as Array<(resp: { data: HistoryData }) => void>,
     historyRejects: [] as Array<(reason?: unknown) => void>,
     workflowGets: [] as string[],
+    workflowGet: vi.fn(),
+    workflowResponse: {
+      current: { workflow_id: "wf_recovered", workflow_permanent_id: "wpid_1" },
+    },
     hasLocalChanges: { current: false },
     historyParams: [] as Array<Record<string, unknown> | undefined>,
     historySignals: [] as Array<AbortSignal | undefined>,
@@ -95,7 +114,7 @@ vi.mock("@/api/AxiosClient", () => ({
         }
         if (path.startsWith("/workflows/")) {
           workflowGets.push(path);
-          return Promise.resolve({ data: { workflow_permanent_id: "wpid_1" } });
+          return workflowGet();
         }
         return Promise.resolve({ data: [] });
       },
@@ -131,28 +150,29 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 
 vi.mock("@/store/WorkflowHasChangesStore", () => {
-  const useWorkflowHasChangesStore = () => ({
-    getSaveData: () => ({
-      title: "Test WF",
-      workflow: {
-        workflow_id: "wf_1",
-        workflow_permanent_id: "wpid_1",
-        description: "",
-        totp_verification_url: null,
-        is_saved_task: false,
-        status: "published",
-      },
-      settings: {},
-      parameters: [],
-      blocks: [],
-      workflowDefinitionVersion: 1,
-    }),
+  const getSaveData = () => ({
+    title: "Test WF",
+    workflow: {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+      description: "",
+      totp_verification_url: null,
+      is_saved_task: false,
+      status: "published",
+    },
+    settings: { proxyLocation: null },
+    parameters: [],
+    blocks: [],
+    workflowDefinitionVersion: 1,
   });
-  // The real store is a zustand store; the recovery re-read reads hasChanges
-  // off getState() so it never overwrites unsaved local edits.
+  const useWorkflowHasChangesStore = () => ({ getSaveData });
+  // Ordinary history recovery reads hasChanges from the zustand store so it
+  // preserves unsaved edits when no persisted outcome needs reconciliation.
   useWorkflowHasChangesStore.getState = () => ({
     hasChanges: hasLocalChanges.current,
     setSaveBlockedReason: () => {},
+    setHasChanges: () => {},
+    getSaveData,
   });
   return { useWorkflowHasChangesStore };
 });
@@ -193,7 +213,6 @@ vi.mock("./WorkflowCopilotHistory", () => ({
 }));
 
 import capturedHistory from "./recoveryPoll.chatHistory.fixture.json";
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
 
@@ -246,6 +265,18 @@ function chatUi(props: {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   portalTarget?: HTMLElement | null;
+  captureEditorState?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["captureEditorState"];
+  restoreEditorState?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["restoreEditorState"];
+  onWorkflowUpdate?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["onWorkflowUpdate"];
+  onReviewWorkflow?: NonNullable<
+    ComponentProps<typeof WorkflowCopilotChat>
+  >["onReviewWorkflow"];
 }) {
   return (
     <FeatureFlagContext.Provider value={(name) => boolFlags.current[name]}>
@@ -254,6 +285,10 @@ function chatUi(props: {
         portalTarget={props.portalTarget}
         requiresLiveBrowser={props.requiresLiveBrowser}
         isLiveBrowserReady={props.isLiveBrowserReady}
+        onWorkflowUpdate={props.onWorkflowUpdate}
+        onReviewWorkflow={props.onReviewWorkflow}
+        captureEditorState={props.captureEditorState}
+        restoreEditorState={props.restoreEditorState}
       />
     </FeatureFlagContext.Provider>
   );
@@ -295,6 +330,10 @@ async function submit(value: string): Promise<void> {
 }
 
 beforeEach(() => {
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  sessionStorage.clear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
@@ -305,6 +344,15 @@ beforeEach(() => {
   historyRejects.length = 0;
   historyParams.length = 0;
   workflowGets.length = 0;
+  workflowGet
+    .mockReset()
+    .mockImplementation(() =>
+      Promise.resolve({ data: workflowResponse.current }),
+    );
+  workflowResponse.current = {
+    workflow_id: "wf_recovered",
+    workflow_permanent_id: "wpid_1",
+  };
   hasLocalChanges.current = false;
   boolFlags.current = {};
   routeWpid.current = "wpid_1";
@@ -314,6 +362,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
   portalTargets.splice(0).forEach((el) => el.remove());
 });
 
@@ -343,6 +392,7 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
     expect(cancelPost).not.toHaveBeenCalledWith(
       "/workflow/copilot/apply-proposed-workflow",
       expect.anything(),
+      { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
 
     await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
@@ -465,7 +515,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         await screen.findByRole("button", { name: /Auto-accepting/ }),
       );
     });
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     // A second chat's Turn off starts while the first one is still in flight.
     await act(async () => {
@@ -487,7 +539,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
     await flushHistory(pendingChat("chat-1"));
 
     expect(heldDisables).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
@@ -539,7 +593,9 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
       fireEvent.click(chip);
     });
     expect(heldDisables).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "Always accept" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "More accept options" }),
+    ).toBeNull();
 
     await act(async () => {
       heldDisables[0]!({});
@@ -549,10 +605,12 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         screen.queryByRole("button", { name: /Auto-accepting/ }),
       ).toBeNull(),
     );
-    expect(screen.getByRole("button", { name: "Always accept" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "More accept options" }),
+    ).toBeTruthy();
   });
 
-  it("does not clear the new chat's pending review when the old chat's Accept lands late", async () => {
+  it("loads another chat's proposal after the outstanding Accept settles", async () => {
     const pendingChat = (chatId: string) =>
       historyData({
         workflow_copilot_chat_id: chatId,
@@ -580,19 +638,24 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
       fireEvent.click(screen.getByText("mock-select-history-chat"));
       await Promise.resolve();
     });
-    await flushHistory(pendingChat("chat_other"));
+    expect(historyQueue).toHaveLength(0);
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
 
     await act(async () => {
       finishApply({ data: { workflow_id: "wf_chat-1" } });
     });
+    // The Accept reads auto_accept back from its own chat row.
+    await flushHistory(pendingChat("chat-1"));
 
-    // chat_other's proposal is untouched on the server, so its gate must survive.
+    await act(async () =>
+      fireEvent.click(screen.getByText("mock-select-history-chat")),
+    );
+    await flushHistory(pendingChat("chat_other"));
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
     expect(screen.getByText("Proposed changes")).toBeTruthy();
   });
 
-  it("reconciles the accepted chat's row even when the user switched away", async () => {
+  it("reconciles the accepted chat after refusing a history switch", async () => {
     const pendingChat = (chatId: string) =>
       historyData({
         workflow_copilot_chat_id: chatId,
@@ -604,12 +667,6 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
         },
         chat_history: [aiHistoryMessage(null, "Here is a draft.")],
       });
-    // CHANGED BY THE #17099 MERGE. This asserted that a failed atomic apply fell back to a
-    // CLIENT-SIDE apply which cleared the accepted chat's row itself, addressed to that chat
-    // rather than the one on screen. Slice 1 removes the fallback - a failed apply now opens the
-    // review gate instead - so the clear is gone. The concern is not: the work an Accept triggers
-    // after it fails must still be addressed to the chat the Accept BEGAN on, never the chat the
-    // user has since switched to. On this path that work is the reconciling READ of the row.
     let failApply: (reason: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
       path === "/workflow/copilot/apply-proposed-workflow"
@@ -626,15 +683,13 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
       fireEvent.click(screen.getByText("mock-select-history-chat"));
       await Promise.resolve();
     });
-    await flushHistory(pendingChat("chat_other"));
+    expect(historyQueue).toHaveLength(0);
 
     const readsBeforeFailure = historyParams.length;
     await act(async () => {
-      failApply({ response: { status: 500 } });
+      failApply({ response: { status: 422 } });
       await Promise.resolve();
     });
-
-    // The reconcile reads the ACCEPTED chat's row, not the one now on screen.
     await waitFor(() =>
       expect(
         historyParams
@@ -642,19 +697,59 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
           .map((params) => params?.workflow_copilot_chat_id),
       ).toContain("chat-1"),
     );
-    // The chat now on screen keeps its own pending review.
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  // RETIRED BY THE #17099 MERGE, WITH THE GUARD IT PROTECTED. This asserted that a 404 on the
-  // fallback clear must not retry against whatever chat is now on screen. Slice 1 removes the
-  // accept-path clears, leaving clearProposedWorkflow with one caller that names no chat - so
-  // there is no named-chat clear left to retry, and clearProposedWorkflow's forChatId parameter
-  // and its `status === 404 && !forChatId` guard are removed here too. Unlike the three tests
-  // rewritten alongside it, the concern does not survive the mechanism: the mechanism was the
-  // only way to reach it. Restoring both is a git revert if a later slice names a chat again.
+  it("never clears a different chat through a failed Accept fallback", async () => {
+    const pendingChat = (chatId: string) =>
+      historyData({
+        workflow_copilot_chat_id: chatId,
+        auto_accept: false,
+        proposed_workflow: {
+          workflow_id: `wf_${chatId}`,
+          title: "Pending draft",
+          _copilot_unvalidated: true,
+        },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      });
+    let failApply: (reason: unknown) => void = () => {};
+    const clearBodies: Array<Record<string, unknown>> = [];
+    cancelPost.mockImplementation(
+      (path: string, body: Record<string, unknown>) => {
+        if (path === "/workflow/copilot/apply-proposed-workflow") {
+          return new Promise((_resolve, reject) => (failApply = reject));
+        }
+        if (path === "/workflow/copilot/clear-proposed-workflow") {
+          clearBodies.push(body);
+          return Promise.reject({ response: { status: 404 } });
+        }
+        return Promise.resolve({});
+      },
+    );
+    await renderChat();
+    await flushHistory(pendingChat("chat-1"));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Accept" }));
+    });
 
-  it("does not hold one chat's Turn off behind an Accept still running in another chat", async () => {
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    expect(historyQueue).toHaveLength(0);
+
+    await act(async () => {
+      failApply({ response: { status: 422 } });
+      await Promise.resolve();
+    });
+    await flushHistory(pendingChat("chat-1"));
+    expect(clearBodies).toEqual([]);
+    expect(
+      screen.getByRole("button", { name: "Accept" }).matches(":disabled"),
+    ).toBe(true);
+  });
+
+  it("blocks navigation to another chat's Turn off during Accept", async () => {
     await renderChat();
     await flushHistory(
       historyData({
@@ -680,29 +775,15 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
       fireEvent.click(screen.getByText("mock-select-history-chat"));
       await Promise.resolve();
     });
-    await flushHistory(
-      historyData({
-        workflow_copilot_chat_id: "chat_other",
-        auto_accept: true,
-      }),
-    );
-    await act(async () => {
-      fireEvent.click(
-        await screen.findByRole("button", { name: /Auto-accepting/ }),
-      );
-    });
-
-    await waitFor(() =>
-      expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/disable-auto-accept",
-        { workflow_copilot_chat_id: "chat_other" },
+    expect(historyQueue).toHaveLength(0);
+    expect(
+      cancelPost.mock.calls.some(
+        ([path]) => path === "/workflow/copilot/disable-auto-accept",
       ),
-    );
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("button", { name: /Auto-accepting/ }),
-      ).toBeNull(),
-    );
+    ).toBe(false);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
   });
 
   it("does not let a late post-Accept read of the old chat overwrite the chat the user switched to", async () => {
@@ -751,47 +832,26 @@ describe("WorkflowCopilotChat — auto-accept Turn off across a chat switch", ()
   });
 });
 
-// Item 2 (SKY-12384): a live_browser prompt queued before the initial history
-// load must keep one owner — footer while the bubble exists, else the chip.
-describe("WorkflowCopilotChat — queued prompt survives initial history load (item 2)", () => {
-  it("keeps the queued status + Cancel visible after the history load lands", async () => {
+describe("WorkflowCopilotChat — startup and live-browser queue", () => {
+  it("holds sending until startup settles, then keeps queued status and Cancel visible", async () => {
     boolFlags.current = {};
     await renderChat({ requiresLiveBrowser: true, isLiveBrowserReady: false });
-
-    // Queue while the initial history GET is still pending (isLoadingHistory).
-    // The bubble owns the footer here.
     await submit("log into the portal");
-    await waitFor(() =>
-      expect(
-        screen.getByText("Prompt queued. Waiting for live browser..."),
-      ).toBeTruthy(),
-    );
-    expect(
-      screen.getByRole("button", { name: "Edit queued message" }),
-    ).toBeTruthy();
-
-    // History resolves and replaces messages, dropping the queued bubble — the
-    // composer chip must pick up the status/Cancel (old code shows neither).
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
+    expect(postStreaming).not.toHaveBeenCalled();
     await flushHistory(
       historyData({ chat_history: [aiHistoryMessage(null, "Earlier chat.")] }),
     );
-
-    expect(
-      screen.getByText("Prompt queued. Waiting for live browser..."),
-    ).toBeTruthy();
-    const cancel = screen.getByRole("button", {
-      name: "Edit queued message",
-    });
-
-    await act(async () => {
-      fireEvent.click(cancel);
-    });
-
-    await waitFor(() =>
-      expect(
-        screen.queryByText("Prompt queued. Waiting for live browser..."),
-      ).toBeNull(),
+    await submit("log into the portal");
+    expect(screen.getByTestId("copilot-queued-message").textContent).toContain(
+      "log into the portal",
     );
+    await act(async () =>
+      fireEvent.click(
+        screen.getByRole("button", { name: "Edit queued message" }),
+      ),
+    );
+    expect(screen.queryByTestId("copilot-queued-message")).toBeNull();
   });
 });
 
@@ -824,14 +884,22 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
   // The server's own clock, deliberately far behind the client's: correlation
   // must not depend on comparing it to Date.now().
-  function recoveredHistory(): HistoryData {
+  function recoveredHistory(
+    createdAt = "2025-01-01T00:00:00",
+    terminalReason?: string,
+  ): HistoryData {
     return historyWithRow({
       ...capturedAiRow,
-      created_at: "2025-01-01T00:00:00",
+      created_at: createdAt,
+      turn_outcome: {
+        ...capturedAiRow.turn_outcome,
+        terminal_reason:
+          terminalReason ?? capturedAiRow.turn_outcome!.terminal_reason,
+      },
     });
   }
 
-  function interruptedHistory(): HistoryData {
+  function interruptedHistory(final = false): HistoryData {
     return historyWithRow({
       sender: "ai",
       content: interruptedText,
@@ -841,6 +909,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
         response_kind: "recover",
         terminal_reason: "interrupted",
         copilot_turn_id: turnId,
+        ...(final ? { interrupted_row_final: true } : {}),
       },
     });
   }
@@ -878,14 +947,36 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
   async function startTurn(
     chatId: string | null = "chat-1",
+    props: Parameters<typeof chatUi>[0] = {},
   ): Promise<ReturnType<typeof render>> {
-    const handle = await renderChat();
-    await flushHistory(historyData({ workflow_copilot_chat_id: chatId }));
+    const handle = await renderChat(props);
+    await flushHistory(
+      historyData({ workflow_copilot_chat_id: chatId, auto_accept: true }),
+    );
     await submit("build me a flow");
     await waitFor(() => expect(streamCalls.length).toBe(1));
     await emitTurnStart();
     vi.useFakeTimers();
     return handle;
+  }
+
+  async function startBackgroundRecovery(): Promise<void> {
+    await renderChat();
+    await waitFor(() => expect(historyQueue.length).toBeGreaterThan(0));
+    vi.useFakeTimers();
+    await resolveNextHistory(
+      historyData({
+        chat_history: [
+          {
+            sender: "product",
+            content:
+              "Refine the recording (1 actions) into a reusable workflow.",
+            turn_id: turnId,
+            created_at: "2025-01-01T00:00:00",
+          },
+        ],
+      }),
+    );
   }
 
   async function advance(ms: number): Promise<void> {
@@ -993,6 +1084,43 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(renderedText()).toContain(capturedAiText);
   });
 
+  it("keeps a comparison open when a recovery read assigns the open chat its id", async () => {
+    vi.mocked(toast).mockClear();
+    const onReviewWorkflow = vi.fn();
+    const pendingDraft = { workflow_id: "wf_p", _copilot_unvalidated: true };
+    await renderChat({ onReviewWorkflow });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: null,
+        proposed_workflow: pendingDraft,
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Review" }));
+    });
+    const [, settle] = onReviewWorkflow.mock.calls[0]!;
+    await submit("tweak it");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    await advance(2_000);
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      proposed_workflow: pendingDraft,
+    });
+
+    await act(async () => {
+      await settle("reject");
+    });
+    expect(toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringContaining("The chat changed"),
+      }),
+    );
+  });
+
   it("can answer a recovered first question whose chat id never arrived", async () => {
     await startTurn(null);
     await closeStreamWithoutTerminal();
@@ -1048,7 +1176,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(renderedText()).toContain(capturedAiText);
   });
 
-  it("keeps reading past the reconcile threshold and lets the real reply supersede the interrupted row", async () => {
+  it("reads past the reconcile threshold and waits for the interrupted row to be superseded", async () => {
     await startTurn();
     await closeStreamWithoutTerminal();
 
@@ -1064,10 +1192,13 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     await advance(30_000);
     await resolveNextHistory(interruptedHistory());
     expect(renderedText()).toContain(interruptedText);
-
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
     await advance(30_000);
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).toContain(capturedAiText);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
   it("reads on its own timer only, and stops once the budget elapses", async () => {
@@ -1108,15 +1239,14 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
   });
 
   it("keeps an earlier turn's recovery alive across a later send", async () => {
-    await startTurn();
-    await closeStreamWithoutTerminal();
+    await startBackgroundRecovery();
 
     await submit("another one");
-    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+    for (let i = 0; i < 20 && streamCalls.length < 1; i += 1) {
       await advance(10);
     }
-    expect(streamCalls.length).toBe(2);
-    await emitTerminalResponse(1);
+    expect(streamCalls.length).toBe(1);
+    await emitTerminalResponse();
 
     await advance(2_000);
     await resolveNextHistory(recoveredHistory());
@@ -1161,25 +1291,86 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(historyQueue.length).toBe(0);
   });
 
-  it("does not re-read history when the user stopped the turn", async () => {
-    await startTurn();
-    await act(async () => {
-      fireEvent.keyDown(document, { key: "Escape" });
-      await Promise.resolve();
-    });
+  it.each(["resolved", "failed-post", "safety-timer"])(
+    "retains recovery after an unconfirmed Stop (%s)",
+    async (outcome) => {
+      hasLocalChanges.current = true;
+      const apply = vi.fn();
+      await startTurn("chat-1", { onWorkflowUpdate: apply });
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      if (outcome === "failed-post")
+        cancelPost.mockRejectedValueOnce(new Error("offline"));
+      await act(async () => {
+        fireEvent.keyDown(document, { key: "Escape" });
+        await Promise.resolve();
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        expect.anything(),
+        expect.objectContaining({
+          timeout: 15_000,
+          signal: expect.any(AbortSignal),
+        }),
+      );
+      if (outcome === "safety-timer") await advance(15_000);
+      await act(async () => streamCalls[0]!.resolve());
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      await advance(2_000);
+      expect(historyQueue).toHaveLength(1);
+      await resolveNextHistory(recoveredHistory());
+      expect(workflowGets).toContain("/workflows/wpid_1");
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        workflowResponse.current,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    },
+  );
+
+  it("releases a confirmed Stop after terminal history confirms cancellation", async () => {
+    workflowResponse.current = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+    };
+    const apply = vi.fn();
+    await startTurn("chat-1", { onWorkflowUpdate: apply });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    await act(async () => fireEvent.keyDown(document, { key: "Escape" }));
     expect(cancelPost).toHaveBeenCalledWith(
       "/workflow/copilot/cancel",
       expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
     );
-    await closeStreamWithoutTerminal();
-
+    await act(async () => streamCalls[0]!.resolve());
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    await advance(2_000);
+    await resolveNextHistory(
+      historyWithRow({
+        ...capturedAiRow,
+        content: "Cancelled.",
+        turn_outcome: {
+          ...capturedAiRow.turn_outcome,
+          terminal_reason: "cancelled",
+        },
+      }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(apply).not.toHaveBeenCalled();
     await advance(30_000);
-    expect(historyQueue.length).toBe(0);
+    expect(historyQueue).toHaveLength(0);
   });
 
-  it("does not re-read history for a stream that never announced a turn", async () => {
-    // Without a turn id there is nothing to correlate a row against, so the
-    // poll must not arm at all rather than match on position.
+  it("correlates an unannounced turn by request before releasing its reservation", async () => {
     await renderChat();
     await flushHistory(historyData());
     await submit("build me a flow");
@@ -1187,19 +1378,29 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     vi.useFakeTimers();
     await closeStreamWithoutTerminal();
 
-    await advance(30_000);
-    expect(historyQueue.length).toBe(0);
+    await advance(2_000);
+    expect(historyParams[historyParams.length - 1]).toEqual(
+      expect.objectContaining({ request_cancel_token: expect.any(String) }),
+    );
+    await resolveNextHistory(recoveredHistory());
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await advance(3_000);
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      request_turn_id: turnId,
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
-  it("gives up and shows the plain failure once reads keep failing", async () => {
+  it("retains the reservation through read failures and after the budget expires", async () => {
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
       "Copilot is checking whether this turn finished",
     );
 
-    // The usual cause of a severed stream is a client that lost the network, so
-    // every recovery read fails too; it must not hold the notice for 25 minutes.
     for (let i = 0; i < 3; i += 1) {
       await advance(30_000);
       expect(historyQueue.length).toBeGreaterThan(0);
@@ -1212,14 +1413,29 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     }
 
     await advance(120_000);
-    expect(historyQueue.length).toBe(0);
-    expect(renderedText()).not.toContain(
+    expect(historyQueue.length).toBe(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(renderedText()).toContain(
       "Copilot is checking whether this turn finished",
     );
-    expect(renderedText()).toContain("Sorry, I encountered an error");
+    historyQueue.shift();
+    const inFlight = historySignals[historySignals.length - 1];
+    await advance(1_500_000);
+    expect(inFlight?.aborted).toBe(true);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(historyQueue.length).toBe(1);
+    expect(historySignals[historySignals.length - 1]?.aborted).toBe(true);
+    expect(renderedText()).toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
   });
 
-  it("does not re-read history for a turn whose chat the user left mid-stream", async () => {
+  it("reconciles a reserved turn after the user leaves its chat mid-stream", async () => {
     await startTurn();
     await act(async () => {
       fireEvent.click(screen.getByText("mock-select-history-chat"));
@@ -1234,8 +1450,14 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     });
     await closeStreamWithoutTerminal();
 
-    await advance(30_000);
-    expect(historyQueue.length).toBe(0);
+    await advance(2_000);
+    expect(historyQueue).toHaveLength(1);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+    });
+    await resolveNextHistory(recoveredHistory());
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(renderedText()).not.toContain(capturedAiText);
   });
 
   it("stops the poll when the route moves to another workflow", async () => {
@@ -1298,7 +1520,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(renderedText()).toContain(capturedAiText);
   });
 
-  it("does not arm when a chat switch lands during the connected-account refresh", async () => {
+  it("keeps reserved recovery when a chat switch lands during the connected-account refresh", async () => {
     await renderChat();
     await flushHistory(
       historyData({
@@ -1332,9 +1554,6 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     vi.useFakeTimers();
     await closeStreamWithoutTerminal();
 
-    // The refresh forgives its own single generation bump. Here the user also
-    // leaves for another chat while it is still awaiting, so the turn belongs
-    // to a chat that is no longer on screen and must not arm.
     await act(async () => {
       fireEvent.click(screen.getByText("mock-select-history-chat"));
       await Promise.resolve();
@@ -1348,18 +1567,32 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
       });
     }
 
-    await advance(30_000);
-    expect(historyQueue.length).toBe(0);
+    await advance(2_000);
+    expect(historyQueue).toHaveLength(1);
+    await resolveNextHistory(recoveredHistory());
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(renderedText()).not.toContain(capturedAiText);
   });
 
-  it("recovers a reply the server persisted with no turn outcome", async () => {
+  it("renders an untagged reply but keeps the reservation until terminal confirmation", async () => {
     await startTurn();
     await closeStreamWithoutTerminal();
 
     await advance(2_000);
     await resolveNextHistory(untaggedHistory());
     expect(renderedText()).toContain(capturedAiText);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(workflowGets).toHaveLength(1);
 
+    await advance(3_000);
+    await resolveNextHistory(
+      recoveredHistory(new Date(Date.now() + 60_000).toISOString()),
+    );
+    expect(renderedText()).toContain(capturedAiText);
+    expect(workflowGets).toHaveLength(2);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
     await advance(30_000);
     expect(historyQueue.length).toBe(0);
   });
@@ -1402,7 +1635,11 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
       await Promise.resolve();
     });
     await advance(30_000);
-    expect(historyQueue.length).toBe(0);
+    expect(historyQueue.length).toBe(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
   });
 
   it("stays on the chat it first resolved when polling by workflow id", async () => {
@@ -1429,8 +1666,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
   });
 
   it("does not apply history fetched before a send that came and went", async () => {
-    await startTurn();
-    await closeStreamWithoutTerminal();
+    await startBackgroundRecovery();
 
     await advance(2_000);
     expect(historyQueue.length).toBe(1);
@@ -1439,12 +1675,12 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     // A whole send begins and ends while that read is outstanding, so the
     // in-flight flag is false at both ends of it.
     await submit("another one");
-    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+    for (let i = 0; i < 20 && streamCalls.length < 1; i += 1) {
       await advance(10);
     }
-    expect(streamCalls.length).toBe(2);
+    expect(streamCalls.length).toBe(1);
     await act(async () => {
-      streamCalls[1]!.resolve();
+      streamCalls[0]!.resolve();
       await Promise.resolve();
     });
 
@@ -1459,7 +1695,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(historyQueue.length).toBeGreaterThan(0);
   });
 
-  it("drops the refreshing notice when the budget runs out", async () => {
+  it("replaces the refreshing notice with required reconciliation when the budget runs out", async () => {
     await startTurn();
     await closeStreamWithoutTerminal();
     expect(renderedText()).toContain(
@@ -1478,12 +1714,16 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(renderedText()).not.toContain(
       "Copilot is checking whether this turn finished",
     );
-    expect(renderedText()).toContain("Sorry, I encountered an error");
+    expect(renderedText()).toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
   });
 
   it("stops watching for a supersede well short of the budget", async () => {
-    await startTurn();
-    await closeStreamWithoutTerminal();
+    await startBackgroundRecovery();
 
     // A turn cancelled by a worker drain writes this row and never finishes, so
     // waiting out the budget would have every open chat polling through a
@@ -1522,10 +1762,33 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(workflowGets.some((url) => url === "/workflows/wpid_1")).toBe(true);
   });
 
-  it("leaves the workflow alone when the editor has unsaved edits", async () => {
+  it("confirms uncertain persistence despite unsaved edits", async () => {
     hasLocalChanges.current = true;
     await startTurn();
     await closeStreamWithoutTerminal();
+
+    // A failed transport must check whether the server persisted a new version.
+    expect(workflowGets).toEqual(["/workflows/wpid_1"]);
+
+    await advance(2_000);
+    await resolveNextHistory(
+      recoveredHistory("2025-01-01T00:00:00", "completed"),
+    );
+    expect(renderedText()).toContain(capturedAiText);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(workflowGets).toEqual(["/workflows/wpid_1", "/workflows/wpid_1"]);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("confirms uncertain persistence for a normally finished turn, whose terminal_reason is null", async () => {
+    hasLocalChanges.current = true;
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    expect(workflowGets).toEqual(["/workflows/wpid_1"]);
 
     await advance(2_000);
     await resolveNextHistory(recoveredHistory());
@@ -1534,24 +1797,8 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     await act(async () => {
       await Promise.resolve();
     });
-    // Losing edits the user can see is worse than the stale graph being fixed.
-    expect(workflowGets).toEqual([]);
-  });
-
-  it("re-arming the same turn replaces its ladder instead of adding one", async () => {
-    await startTurn();
-    await closeStreamWithoutTerminal();
-
-    await submit("another one");
-    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
-      await advance(10);
-    }
-    expect(streamCalls.length).toBe(2);
-    await emitTurnStart(1);
-    await closeStreamWithoutTerminal(1);
-
-    await advance(2_500);
-    expect(historyQueue.length).toBe(1);
+    expect(workflowGets).toEqual(["/workflows/wpid_1", "/workflows/wpid_1"]);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
   it("keeps this chat's run-lifecycle lines when the recovered row lands", async () => {
@@ -1604,6 +1851,1045 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     expect(screen.getByText("Other chat reply.")).toBeTruthy();
     expect(renderedText()).not.toContain(capturedAiText);
   });
+
+  it("blocks a later send until the earlier turn's recovery finishes", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await submit("another one");
+    expect(streamCalls.length).toBe(1);
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+
+    await submit("another one");
+    for (let i = 0; i < 20 && streamCalls.length < 2; i += 1) {
+      await advance(10);
+    }
+    expect(streamCalls.length).toBe(2);
+    await emitTerminalResponse(1);
+  });
+
+  it("restores a stopped turn only after terminal history and a canonical re-read", async () => {
+    const snapshot: EditorStateSnapshot = {
+      workflowPermanentId: "wpid_1",
+      nodes: [],
+      edges: [],
+      parameters: [],
+      title: "Unsaved title",
+      titleHasBeenGenerated: false,
+      description: "Unsaved description",
+      hasChanges: true,
+      saveGeneration: 0,
+    };
+    const restore = vi.fn().mockReturnValue("restored");
+    const canonical = { workflow_id: "wf_1", workflow_permanent_id: "wpid_1" };
+    workflowGet.mockResolvedValue({ data: canonical });
+    await startTurn("chat-1", {
+      captureEditorState: () => snapshot,
+      restoreEditorState: restore,
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: canonical,
+      });
+      fireEvent.keyDown(document, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+      expect.objectContaining({
+        timeout: 15_000,
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    await closeStreamWithoutTerminal();
+    expect(workflowGets).toHaveLength(1);
+    expect(restore).not.toHaveBeenCalled();
+
+    await advance(2_000);
+    await resolveNextHistory(historyData());
+    expect(restore).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+
+    let resolveCanonical!: (value: unknown) => void;
+    workflowGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCanonical = resolve;
+        }),
+    );
+    await advance(3_000);
+    const terminalHistory = recoveredHistory();
+    (
+      terminalHistory.chat_history[1] as { turn_outcome: unknown }
+    ).turn_outcome = {
+      copilot_turn_id: turnId,
+      terminal_reason: "user_cancelled",
+    };
+    await resolveNextHistory(terminalHistory);
+    expect(workflowGets).toHaveLength(2);
+    expect(restore).not.toHaveBeenCalled();
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+
+    await act(async () => resolveCanonical({ data: canonical }));
+    expect(restore).toHaveBeenCalledExactlyOnceWith(snapshot);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+
+    await advance(1_500_000);
+    expect(historyQueue.length).toBe(0);
+    expect(workflowGets).toHaveLength(2);
+  });
+
+  it.each(["advanced", "unchanged", "timed-out"] as const)(
+    "recovery Reject waits for the finalizer before resolving the %s canonical read",
+    async (outcome) => {
+      const snapshot: EditorStateSnapshot = {
+        workflowPermanentId: "wpid_1",
+        nodes: [],
+        edges: [],
+        parameters: [],
+        title: "Unsaved title",
+        titleHasBeenGenerated: false,
+        description: "Unsaved description",
+        hasChanges: true,
+        saveGeneration: 0,
+      };
+      const canonical = {
+        workflow_id: "wf_1",
+        workflow_permanent_id: "wpid_1",
+        workflow_definition: { blocks: [], parameters: [] },
+      };
+      const committed = { ...canonical, workflow_id: "wf_committed" };
+      const restore = vi.fn().mockReturnValue("restored");
+      const update = vi.fn();
+      workflowGet.mockResolvedValue({ data: canonical });
+      await renderChat({
+        captureEditorState: () => snapshot,
+        restoreEditorState: restore,
+        onWorkflowUpdate: update,
+      });
+      await flushHistory(historyData({ auto_accept: true }));
+      await submit("build me a flow");
+      await waitFor(() => expect(streamCalls).toHaveLength(1));
+      await emitTurnStart();
+      vi.useFakeTimers();
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "workflow_draft",
+          block_labels: [],
+          workflow: canonical,
+        });
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: turnId,
+          error: "The stream ended while saving the workflow.",
+        });
+        streamCalls[0]!.resolve();
+      });
+      expect(workflowGets).toHaveLength(1);
+      expect(restore).not.toHaveBeenCalled();
+      update.mockClear();
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      expect(reservation).not.toBeNull();
+
+      let resolveCancel!: (value: unknown) => void;
+      cancelPost.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCancel = resolve;
+          }),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      });
+      expect(restore).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token: (
+            postStreaming.mock.calls[0]![1] as { cancel_token: string }
+          ).cancel_token,
+          workflow_copilot_chat_id: "chat-1",
+          source: "stop_button",
+        },
+        { timeout: 5_000 },
+      );
+      expect(renderedText()).toContain("Cancelling the Copilot turn");
+      expect(
+        (screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Retry",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false);
+
+      await advance(2_000);
+      await resolveNextHistory(historyData({ auto_accept: true }));
+      expect(restore).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      await act(async () => resolveCancel({}));
+
+      let resolveCanonical!: (value: unknown) => void;
+      workflowGet.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCanonical = resolve;
+          }),
+      );
+      await advance(3_000);
+      await resolveNextHistory(recoveredHistory());
+      expect(workflowGets).toHaveLength(2);
+      expect(restore).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      if (outcome === "timed-out") {
+        await advance(5_000);
+        expect(restore).not.toHaveBeenCalled();
+        expect(update).not.toHaveBeenCalled();
+        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+          reservation,
+        );
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        await act(async () => resolveCanonical({ data: committed }));
+        expect(update).not.toHaveBeenCalled();
+        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+          reservation,
+        );
+        return;
+      }
+      await act(async () =>
+        resolveCanonical({
+          data: outcome === "advanced" ? committed : canonical,
+        }),
+      );
+      if (outcome === "advanced") {
+        expect(restore).not.toHaveBeenCalled();
+        expect(update).toHaveBeenCalledExactlyOnceWith(
+          committed,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      } else {
+        expect(restore).toHaveBeenCalledExactlyOnceWith(snapshot);
+        expect(update).not.toHaveBeenCalled();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      await advance(30_000);
+      expect(historyQueue).toHaveLength(0);
+      expect(workflowGets).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    ["unchanged", "credential"],
+    ["advanced", "credential"],
+    ["unchanged", "question"],
+    ["advanced", "question"],
+  ] as const)(
+    "Reject before turn_start retains recovery until the %s canonical outcome settles after a %s lookup",
+    async (outcome, lookup) => {
+      const snapshot: EditorStateSnapshot = {
+        workflowPermanentId: "wpid_1",
+        nodes: [],
+        edges: [],
+        parameters: [],
+        title: "Unsaved title",
+        titleHasBeenGenerated: false,
+        description: "Unsaved description",
+        hasChanges: true,
+        saveGeneration: 0,
+      };
+      const canonical = {
+        workflow_id: "wf_1",
+        workflow_permanent_id: "wpid_1",
+        workflow_definition: { blocks: [], parameters: [] },
+      };
+      const committed = { ...canonical, workflow_id: "wf_committed" };
+      const restore = vi.fn().mockReturnValue("restored");
+      const update = vi.fn();
+      workflowGet.mockResolvedValue({ data: canonical });
+      await renderChat({
+        captureEditorState: () => snapshot,
+        restoreEditorState: restore,
+        onWorkflowUpdate: update,
+      });
+      await flushHistory(historyData());
+      await submit("build me a flow");
+      await waitFor(() => expect(streamCalls).toHaveLength(1));
+      vi.useFakeTimers();
+      await closeStreamWithoutTerminal();
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      expect(reservation).not.toBeNull();
+      const requestId = (
+        postStreaming.mock.calls[0]![1] as { cancel_token: string }
+      ).cancel_token;
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      });
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token: requestId,
+          workflow_copilot_chat_id: "chat-1",
+          source: "stop_button",
+        },
+        { timeout: 5_000 },
+      );
+      expect(restore).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(renderedText()).toContain("Cancelling the Copilot turn");
+
+      await advance(2_000);
+      await resolveNextHistory(otherTurnHistory());
+      expect(restore).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      await advance(5_000);
+      await resolveNextHistory(
+        historyData(
+          lookup === "question"
+            ? {
+                request_turn_id: turnId,
+                pending_question_cancel_token: requestId,
+                question_interactions: [
+                  {
+                    interaction_id: "question-1",
+                    turn_id: turnId,
+                    tool_call_id: "tool-1",
+                    parts: [
+                      {
+                        part_id: "part-1",
+                        prompt: "Choose the input",
+                        choices: [],
+                      },
+                    ],
+                    status: "pending",
+                    response: null,
+                    created_at: new Date().toISOString(),
+                    resolved_at: null,
+                  },
+                ],
+              }
+            : {
+                request_turn_id: turnId,
+                pending_credential_requests: [
+                  {
+                    type: "credential_required",
+                    turn_id: turnId,
+                    workflow_copilot_chat_id: "chat-1",
+                    resume_token: "resume-token",
+                    reason: "workflow_credential_inputs_unbound",
+                    message: "",
+                    login_page_urls: ["https://example.com/login"],
+                    credential_refs: [],
+                    timeout_seconds: 300,
+                    expires_at: new Date(Date.now() + 300_000).toISOString(),
+                    timestamp: new Date().toISOString(),
+                  },
+                ],
+              },
+        ),
+      );
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      let resolveCanonical!: (value: unknown) => void;
+      workflowGet.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCanonical = resolve;
+          }),
+      );
+      await advance(10_000);
+      expect(historyQueue).toHaveLength(lookup === "question" ? 3 : 1);
+      await resolveNextHistory(recoveredHistory());
+      if (lookup === "question") {
+        await resolveNextHistory(recoveredHistory());
+        await resolveNextHistory(recoveredHistory());
+      }
+      expect(resolveCanonical).toBeTypeOf("function");
+      expect(restore).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+
+      await act(async () =>
+        resolveCanonical({
+          data: outcome === "advanced" ? committed : canonical,
+        }),
+      );
+      if (outcome === "advanced") {
+        expect(restore).not.toHaveBeenCalled();
+        expect(update).toHaveBeenCalledExactlyOnceWith(
+          committed,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+      } else {
+        expect(restore).toHaveBeenCalledExactlyOnceWith(snapshot);
+        expect(update).not.toHaveBeenCalled();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+      await advance(1_500_000);
+      expect(historyQueue).toHaveLength(0);
+    },
+  );
+
+  it("logs a 422 cancellation status and request id while retaining the recovery toast", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await startTurn();
+      await closeStreamWithoutTerminal();
+      log.mockClear();
+      vi.mocked(toast).mockClear();
+      cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      });
+      expect(log).toHaveBeenCalledWith(
+        "Failed to cancel the recovering Copilot turn:",
+        {
+          status: 422,
+          requestId: (
+            postStreaming.mock.calls[0]![1] as { cancel_token: string }
+          ).cancel_token,
+        },
+      );
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Could not cancel the Copilot turn",
+          description: "Copilot will keep checking for saved changes.",
+        }),
+      );
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      await advance(2_000);
+      await resolveNextHistory(recoveredHistory());
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("joins a late turn lookup to the original request recovery after remount", async () => {
+    const canonical = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+      workflow_definition: { blocks: [], parameters: [] },
+    };
+    workflowGet.mockResolvedValue({ data: canonical });
+    const view = await renderChat();
+    await flushHistory(historyData({ workflow_copilot_chat_id: null }));
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    const requestId = (
+      postStreaming.mock.calls[0]![1] as { cancel_token: string }
+    ).cancel_token;
+    view.unmount();
+    const update = vi.fn();
+    await act(async () => {
+      render(chatUi({ onWorkflowUpdate: update }));
+    });
+    const paused = historyData({
+      request_turn_id: turnId,
+      pending_credential_requests: [
+        {
+          type: "credential_required",
+          turn_id: turnId,
+          workflow_copilot_chat_id: "chat-1",
+          resume_token: "resume-token",
+          reason: "workflow_credential_inputs_unbound",
+          message: "",
+          login_page_urls: ["https://example.com/login"],
+          credential_refs: [],
+          timeout_seconds: 300,
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    });
+    await resolveNextHistory({ ...paused, request_turn_id: null });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      {
+        cancel_token: requestId,
+        workflow_copilot_chat_id: null,
+        source: "stop_button",
+      },
+      { timeout: 5_000 },
+    );
+    expect(historyQueue).toHaveLength(1);
+    expect(historyParams[historyParams.length - 1]).toMatchObject({
+      workflow_copilot_chat_id: "chat-1",
+      request_cancel_token: requestId,
+    });
+    await resolveNextHistory(paused);
+    const committed = { ...canonical, workflow_id: "wf_committed" };
+    workflowGet.mockResolvedValue({ data: committed });
+    await advance(2_000);
+    expect(historyQueue).toHaveLength(1);
+    await resolveNextHistory({
+      ...recoveredHistory(),
+      request_turn_id: turnId,
+    });
+    expect(update).toHaveBeenCalledExactlyOnceWith(
+      committed,
+      expect.objectContaining({ persisted: true, applied: true }),
+    );
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await advance(1_500_000);
+    expect(historyQueue).toHaveLength(0);
+  });
+
+  async function recoverStagedTurn(
+    remount: "mid-stream" | "after the drop" | "none",
+    options: { terminalReason?: string; errorFrame?: boolean } = {},
+  ): Promise<ReturnType<typeof vi.fn>> {
+    const snapshot: EditorStateSnapshot = {
+      workflowPermanentId: "wpid_1",
+      nodes: [],
+      edges: [],
+      parameters: [],
+      title: "Submitted title",
+      titleHasBeenGenerated: false,
+      description: "",
+      hasChanges: false,
+      saveGeneration: 0,
+    };
+    const restore = vi.fn().mockReturnValue("restored");
+    const props = {
+      captureEditorState: () => snapshot,
+      restoreEditorState: restore,
+    };
+    workflowResponse.current = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+    };
+    const staged = {
+      workflow_id: "wf_proposed",
+      workflow_permanent_id: "wpid_1",
+      workflow_definition: { blocks: [], parameters: [] },
+    };
+    const view = await renderChat(props);
+    await flushHistory(historyData());
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await emitTurnStart();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "workflow_draft",
+        block_labels: [],
+        workflow: staged,
+      });
+      if (options.errorFrame) {
+        streamCalls[0]!.onMessage({
+          type: "error",
+          turn_id: turnId,
+          error: "The stream ended while saving the workflow.",
+        });
+        streamCalls[0]!.resolve();
+      }
+      await Promise.resolve();
+    });
+    vi.useFakeTimers();
+    if (remount !== "mid-stream" && !options.errorFrame)
+      await closeStreamWithoutTerminal();
+    if (remount !== "none") {
+      view.unmount();
+      await act(async () => {
+        render(chatUi(props));
+      });
+      await resolveNextHistory({
+        ...historyData(),
+        chat_history: capturedHistory.chat_history.slice(0, -1),
+      });
+    }
+    await advance(2_000);
+    await resolveNextHistory({
+      ...recoveredHistory(undefined, options.terminalReason),
+      request_turn_id: turnId,
+      proposed_workflow: staged,
+      proposed_workflow_metadata: {
+        owner_turn_id: turnId,
+        revision: 1,
+        canonical_fingerprint: "canonical-1",
+        disposition: "review_untested",
+        workflow_run_id: null,
+      },
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    return restore;
+  }
+
+  it.each([
+    ["mid-stream", null],
+    ["after the drop", null],
+    ["none", null],
+    ["none", "verified_goal_satisfied"],
+    ["mid-stream", "verified_goal_satisfied"],
+    ["none", "timeout"],
+    ["mid-stream", "timeout"],
+    ["none", "turn_halt:browser_session_lost"],
+    ["mid-stream", "turn_halt:browser_session_lost"],
+  ] as const)(
+    "keeps a recovered turn's staged proposal and canvas (remount: %s, terminal_reason: %s)",
+    async (remount, terminalReason) => {
+      const restore = await recoverStagedTurn(remount, {
+        terminalReason: terminalReason ?? undefined,
+      });
+
+      expect(restore).not.toHaveBeenCalled();
+      const accept = screen.getByRole("button", { name: "Accept" });
+      expect(accept.hasAttribute("disabled")).toBe(false);
+    },
+  );
+
+  it.each(["cancelled", "copilot_recoverable_failure", "user_cancelled"])(
+    "still rolls back a turn recovered after a remount whose terminal_reason is %s",
+    async (terminalReason) => {
+      const restore = await recoverStagedTurn("mid-stream", { terminalReason });
+
+      expect(restore).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("still rolls back a staged turn whose error frame arrived before the pane remounted", async () => {
+    const restore = await recoverStagedTurn("mid-stream", { errorFrame: true });
+
+    expect(restore).toHaveBeenCalledOnce();
+  });
+
+  it("keeps Reject reserved when a pre-cancellation canonical read returns before the turn is identified", async () => {
+    const canonical = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+      workflow_definition: { blocks: [], parameters: [] },
+    };
+    let resolveCanonical!: (value: unknown) => void;
+    workflowGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveCanonical = resolve;
+        }),
+    );
+    const update = vi.fn();
+    const restore = vi.fn().mockReturnValue("restored");
+    await renderChat({ onWorkflowUpdate: update, restoreEditorState: restore });
+    await flushHistory(historyData());
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    });
+    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+    expect(reservation).not.toBeNull();
+    await act(async () =>
+      resolveCanonical({ data: { ...canonical, workflow_id: "wf_advanced" } }),
+    );
+    expect(update).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    await advance(1_500_000);
+    expect(renderedText()).toContain("Cancelling the Copilot turn");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+      reservation,
+    );
+    const reads = historyParams.length;
+    await advance(30_000);
+    expect(historyParams).toHaveLength(reads);
+  });
+
+  it("correlates an unannounced stream before applying its terminal history", async () => {
+    await renderChat();
+    await flushHistory(historyData());
+    await submit("build me a flow");
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it("keeps uncertain recovery reserved through read failures and timeout", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    expect(renderedText()).toContain(
+      "Copilot is checking whether this turn finished",
+    );
+
+    for (let i = 0; i < 3; i += 1) {
+      await advance(30_000);
+      expect(historyQueue.length).toBeGreaterThan(0);
+      historyQueue.shift();
+      const failRead = historyRejects.shift()!;
+      await act(async () => {
+        failRead(new Error("offline"));
+        await Promise.resolve();
+      });
+    }
+
+    await advance(120_000);
+    expect(historyQueue.length).toBe(1);
+    expect(renderedText()).toContain(
+      "Copilot is checking whether this turn finished",
+    );
+    await advance(1_500_000);
+    expect(historySignals[historySignals.length - 1]?.aborted).toBe(true);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    await submit("another one");
+    expect(streamCalls.length).toBe(1);
+  });
+
+  it("continues the reserved history read after leaving the chat", async () => {
+    await startTurn();
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    const switchLoad = historyQueue.shift()!;
+    await act(async () => {
+      switchLoad({
+        data: historyData({ workflow_copilot_chat_id: "chat_other" }),
+      });
+      await Promise.resolve();
+    });
+    await closeStreamWithoutTerminal();
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+  });
+
+  it.each([false, true])(
+    "arms the poll after the connected-account refresh (terminal before refresh=%s)",
+    async (terminalBeforeRefresh) => {
+      await renderChat();
+      await flushHistory(
+        historyData({
+          chat_history: [
+            {
+              sender: "ai",
+              content: "Which account should I use?",
+              created_at: "2026-07-15T00:00:00Z",
+              narrative_payload: narrativePayload({ turnId: "turn-choice" }),
+              turn_outcome: {
+                response_kind: "clarify",
+                connected_account_choices: [
+                  {
+                    connection_id: "conn_12345678",
+                    name: "Work account",
+                    state: "active",
+                    email_address: "work@example.com",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /Work account/ }));
+      });
+      await waitFor(() => expect(streamCalls.length).toBe(1));
+      await emitTurnStart();
+      vi.useFakeTimers();
+      await closeStreamWithoutTerminal();
+
+      const refresh = historyQueue.shift()!;
+      if (terminalBeforeRefresh) {
+        await advance(2_000);
+        await resolveNextHistory(recoveredHistory());
+        expect(renderedText()).not.toContain(capturedAiText);
+      }
+      await act(async () =>
+        refresh({ data: historyData({ chat_history: [] }) }),
+      );
+
+      await advance(3_000);
+      await resolveNextHistory(recoveredHistory());
+      expect(renderedText()).toContain(capturedAiText);
+    },
+  );
+
+  it("keeps the original recovery poll when a chat switch lands during the connected-account refresh", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Which account should I use?",
+            created_at: "2026-07-15T00:00:00Z",
+            narrative_payload: narrativePayload({ turnId: "turn-choice" }),
+            turn_outcome: {
+              response_kind: "clarify",
+              connected_account_choices: [
+                {
+                  connection_id: "conn_12345678",
+                  name: "Work account",
+                  state: "active",
+                  email_address: "work@example.com",
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Work account/ }));
+    });
+    await waitFor(() => expect(streamCalls.length).toBe(1));
+    await emitTurnStart();
+    vi.useFakeTimers();
+    await closeStreamWithoutTerminal();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("mock-select-history-chat"));
+      await Promise.resolve();
+    });
+    while (historyQueue.length > 0) {
+      await act(async () => {
+        historyQueue.shift()!({
+          data: historyData({ workflow_copilot_chat_id: "chat_other" }),
+        });
+        await Promise.resolve();
+      });
+    }
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(1);
+    expect(historyParams[historyParams.length - 1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+    });
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).not.toContain(capturedAiText);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("refuses another send while the recovery history read is outstanding", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await advance(2_000);
+    expect(historyQueue.length).toBe(1);
+    const staleRead = historyQueue.shift()!;
+
+    await submit("another one");
+    expect(streamCalls.length).toBe(1);
+
+    await act(async () => {
+      staleRead({ data: recoveredHistory() });
+      await Promise.resolve();
+    });
+    expect(renderedText()).toContain(capturedAiText);
+    await submit("another one");
+    expect(streamCalls.length).toBe(2);
+    await emitTerminalResponse(1);
+    expect(renderedText()).toContain("another one");
+
+    await advance(30_000);
+    expect(historyQueue.length).toBe(0);
+  });
+
+  it("drops the refreshing notice when the budget runs out", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    expect(renderedText()).toContain(
+      "Copilot is checking whether this turn finished",
+    );
+
+    for (let i = 0; i < 64; i += 1) {
+      await advance(30_000);
+      if (historyQueue.length === 0) {
+        break;
+      }
+      await resolveNextHistory(historyData({ chat_history: [] }));
+    }
+
+    // Recovery has stopped, so a notice saying it is still refreshing is stale.
+    expect(renderedText()).not.toContain(
+      "Copilot is checking whether this turn finished",
+    );
+    expect(renderedText()).toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+  });
+
+  it("stops uncertain supersede reads but keeps Retry and Reject reserved", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    // A turn cancelled by a worker drain writes this row and never finishes, so
+    // waiting out the budget would have every open chat polling through a
+    // deploy.
+    await advance(2_000);
+    await resolveNextHistory(interruptedHistory());
+    expect(renderedText()).toContain(interruptedText);
+
+    let reads = 0;
+    for (let i = 0; i < 30; i += 1) {
+      await advance(30_000);
+      if (historyQueue.length === 0) {
+        break;
+      }
+      await resolveNextHistory(interruptedHistory());
+      reads += 1;
+    }
+    expect(reads).toBe(30);
+    expect(historyQueue.length).toBe(0);
+    expect(workflowGets).toHaveLength(1);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    await submit("another one");
+    expect(streamCalls).toHaveLength(1);
+    await advance(1_500_000);
+    while (historyQueue.length) await resolveNextHistory(interruptedHistory());
+    expect(historyQueue).toHaveLength(0);
+
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    await advance(2_000);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+    expect(workflowGets).toHaveLength(3);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await advance(30_000);
+    expect(historyQueue).toHaveLength(0);
+  });
+
+  it("releases the save hold on the first read of an interrupted row the server marked final", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+    const readsBeforeRow = workflowGets.length;
+
+    await advance(2_000);
+    await resolveNextHistory(interruptedHistory(true));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(renderedText()).toContain(interruptedText);
+    expect(renderedText()).not.toContain(
+      "Could not confirm whether Copilot saved changes",
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(workflowGets.length).toBeGreaterThan(readsBeforeRow);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  it("rechecks canonical after the terminal row despite unsaved edits", async () => {
+    hasLocalChanges.current = true;
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    // A failed transport must check whether the server persisted a new version.
+    expect(workflowGets).toEqual(["/workflows/wpid_1"]);
+
+    await advance(2_000);
+    expect(workflowGets).toHaveLength(1);
+    await resolveNextHistory(recoveredHistory());
+    expect(renderedText()).toContain(capturedAiText);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(workflowGets).toEqual(["/workflows/wpid_1", "/workflows/wpid_1"]);
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    await advance(30_000);
+    expect(workflowGets).toHaveLength(2);
+    expect(historyQueue).toHaveLength(0);
+  });
+
+  it("retrying the same request keeps one recovery ladder", async () => {
+    await startTurn();
+    await closeStreamWithoutTerminal();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    });
+
+    await advance(2_500);
+    expect(historyQueue.length).toBe(1);
+  });
 });
 
 describe("WorkflowCopilotChat — question transport", () => {
@@ -1650,7 +2936,7 @@ describe("WorkflowCopilotChat — question transport", () => {
         response: { text: "why do you need this?" },
       },
     });
-    const composer = screen.getByPlaceholderText("Answer Copilot…");
+    const composer = screen.getByRole("textbox", { name: "Your response" });
     fireEvent.change(composer, { target: { value: "why do you need this?" } });
     await act(async () => {
       fireEvent.keyDown(composer, { key: "Enter" });
@@ -1663,7 +2949,753 @@ describe("WorkflowCopilotChat — question transport", () => {
     expect(cancelPost.mock.calls[0]?.[1]).toEqual({
       workflow_copilot_chat_id: "chat-1",
       interaction_id: "interaction",
-      text: "why do you need this?",
+      answers: [{ part_id: "part", text: "why do you need this?" }],
     });
+  });
+
+  it("docks the pending question on the composer and sends its choice with the composer text", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+              {
+                part_id: "state",
+                prompt: "Which state was the LLC formed in?",
+                choices: [],
+              },
+            ],
+          },
+        ],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    expect(tray.nextElementSibling).toBe(
+      screen.getByRole("group", { name: "Copilot message composer" }),
+    );
+    expect(useCopilotHeaderStore.getState().attention).toBe("question");
+
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        interaction_id: "interaction",
+        turn_id: "turn-ask",
+        tool_call_id: "call",
+        status: "resolved",
+        parts: [],
+        response: null,
+      },
+    });
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    const composer = screen.getByRole("textbox", { name: "Your response" });
+    fireEvent.change(composer, { target: { value: "Single member" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(
+      within(tray).getByText("Which state was the LLC formed in?"),
+    ).toBeTruthy();
+    expect((composer as HTMLTextAreaElement).value).toBe("");
+    fireEvent.change(composer, { target: { value: "Delaware" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+    await waitFor(() => expect(cancelPost).toHaveBeenCalled());
+    expect(cancelPost.mock.calls[0]?.[1]).toEqual({
+      workflow_copilot_chat_id: "chat-1",
+      interaction_id: "interaction",
+      answers: [
+        { part_id: "structure", choice_id: "llc", text: "Single member" },
+        { part_id: "state", text: "Delaware" },
+      ],
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    expect(useCopilotHeaderStore.getState().attention).toBeNull();
+  });
+
+  it("waits for an answer before the composer sends, and locks Cancel while it posts", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "pending",
+            response: null,
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: null,
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+            ],
+          },
+        ],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    expect(
+      screen
+        .getByRole("button", {
+          name: "Send disabled — answer or skip the question",
+        })
+        .matches(":disabled"),
+    ).toBe(true);
+
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    expect(
+      screen.getByRole("button", { name: "Send answer" }).matches(":disabled"),
+    ).toBe(false);
+
+    expect(
+      within(tray)
+        .getByRole("button", { name: "Cancel question" })
+        .matches(":disabled"),
+    ).toBe(false);
+    cancelPost.mockImplementationOnce(() => new Promise(() => {}));
+    await act(async () => {
+      fireEvent.click(within(tray).getByRole("button", { name: "Send" }));
+    });
+    expect(
+      within(tray)
+        .getByRole("button", { name: "Cancel question" })
+        .matches(":disabled"),
+    ).toBe(true);
+  });
+
+  it("gives the prompt being written back once its question is answered", async () => {
+    const question = {
+      interaction_id: "interaction",
+      turn_id: "turn-ask",
+      tool_call_id: "call",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "structure",
+          prompt: "Which legal structure is applying?",
+          choices: [{ choice_id: "llc", text: "LLC" }],
+        },
+      ],
+    };
+    await renderChat();
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "pending" }],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    fireEvent.click(within(tray).getByRole("button", { name: "LLC" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Your response" }), {
+      target: { value: "Single member" },
+    });
+    cancelPost.mockResolvedValueOnce({
+      data: {
+        ...question,
+        status: "resolved",
+        response: {
+          answers: [
+            { part_id: "structure", choice_id: "llc", text: "Single member" },
+          ],
+        },
+      },
+    });
+    await act(async () => {
+      fireEvent.click(within(tray).getByRole("button", { name: "Send" }));
+    });
+
+    await waitFor(() => expect(textarea().value).toBe("Also add a retry"));
+    expect(cancelPost.mock.calls[0]?.[1]).toMatchObject({
+      answers: [
+        { part_id: "structure", choice_id: "llc", text: "Single member" },
+      ],
+    });
+  });
+
+  it("parks the prompt being written while a question is answered, and drops the answer on cancel", async () => {
+    const question = {
+      interaction_id: "interaction",
+      turn_id: "turn-ask",
+      tool_call_id: "call",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [
+        {
+          part_id: "state",
+          prompt: "Which state was the LLC formed in?",
+          choices: [],
+        },
+      ],
+    };
+    await renderChat();
+    fireEvent.change(textarea(), { target: { value: "Also add a retry" } });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "pending" }],
+        pending_question_cancel_token: "cancel",
+      }),
+    );
+    const tray = await screen.findByRole("group", { name: "Question parts" });
+    const answer = screen.getByRole("textbox", { name: "Your response" });
+    expect((answer as HTMLTextAreaElement).value).toBe("");
+    fireEvent.change(answer, { target: { value: "Delaware" } });
+    cancelPost.mockResolvedValueOnce({ data: {} });
+    await act(async () => {
+      fireEvent.click(
+        within(tray).getByRole("button", { name: "Cancel question" }),
+      );
+    });
+    await flushHistory(
+      historyData({
+        question_interactions: [{ ...question, status: "cancelled" }],
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("group", { name: "Question parts" }),
+      ).toBeNull(),
+    );
+    expect(textarea().value).toBe("Also add a retry");
+  });
+
+  it("shows an answered question before the reply that used it", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [
+          {
+            interaction_id: "interaction",
+            turn_id: "turn-ask",
+            tool_call_id: "call",
+            status: "resolved",
+            response: {
+              answers: [{ part_id: "structure", choice_id: "llc" }],
+            },
+            created_at: "2026-09-04T00:00:00Z",
+            resolved_at: "2026-09-04T00:01:00Z",
+            parts: [
+              {
+                part_id: "structure",
+                prompt: "Which legal structure is applying?",
+                choices: [{ choice_id: "llc", text: "LLC" }],
+              },
+            ],
+          },
+        ],
+        chat_history: [
+          {
+            sender: "user",
+            content: "Ask me before building",
+            created_at: "2026-09-04T00:00:00Z",
+          },
+          {
+            sender: "ai",
+            content: "Got it, an LLC.",
+            created_at: "2026-09-04T00:02:00Z",
+            turn_outcome: { copilot_turn_id: "turn-ask" },
+            narrative_payload: {
+              turnId: "turn-ask",
+              terminal: "response",
+              responseKind: "answer",
+              terminalMessage: "Got it, an LLC.",
+            },
+          },
+        ],
+      }),
+    );
+    const receipt = await screen.findByText("You answered 1 question");
+    const reply = screen.getByTestId("copilot-terminal-prose");
+    expect(reply.textContent).toContain("Got it, an LLC.");
+    expect(
+      receipt.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("clears loading after recovery Reject confirms the answered question was cancelled", async () => {
+    const interaction: QuestionInteraction = {
+      interaction_id: "interaction",
+      turn_id: "turn-ask",
+      tool_call_id: "call",
+      status: "pending",
+      response: null,
+      created_at: "2026-09-04T00:00:00Z",
+      resolved_at: null,
+      parts: [{ part_id: "part", prompt: "Which store?", choices: [] }],
+    };
+    await renderChat();
+    await flushHistory(
+      historyData({
+        question_interactions: [interaction],
+        pending_question_cancel_token: "cancel-question",
+      }),
+    );
+    let resolveAnswer!: (value: unknown) => void;
+    let resolveCancel!: (value: unknown) => void;
+    cancelPost
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveAnswer = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveCancel = resolve;
+          }),
+      );
+    const composer = screen.getByRole("textbox", { name: "Your response" });
+    fireEvent.change(composer, { target: { value: "The test store" } });
+    await act(async () => fireEvent.keyDown(composer, { key: "Enter" }));
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+    );
+    expect(cancelPost.mock.calls.map(([path]) => path)).toEqual([
+      "/workflow/copilot/question-response",
+      "/workflow/copilot/cancel",
+    ]);
+    await act(async () =>
+      resolveAnswer({
+        data: {
+          ...interaction,
+          status: "resolved",
+          response: { text: "The test store" },
+        },
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+    await act(async () => resolveCancel({}));
+    await flushHistory(
+      historyData({
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Cancelled",
+            created_at: new Date().toISOString(),
+            turn_outcome: {
+              copilot_turn_id: "turn-ask",
+              terminal_reason: "cancelled",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+    await submit("build after cancellation");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+  });
+});
+
+// A recording-refinement turn arms a recovery poll that holds no reservation, so the review gate
+// stays usable and an Accept can run while one of its reads is in flight.
+describe("WorkflowCopilotChat — history reads across an Accept", () => {
+  afterEach(() => {
+    useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+  });
+  const refinementRow = {
+    sender: "product",
+    content: "Refine the recording (1 actions) into a reusable workflow.",
+    turn_id: "turn-r",
+    created_at: "2025-01-01T00:00:00",
+  };
+  const draftRow = aiHistoryMessage(
+    narrativePayload({
+      turnId: "turn-p",
+      proposalDisposition: "review_untested",
+      draft: { blockCount: 1, blockLabels: ["open_example"], summary: null },
+      terminalMessage: "Here is a draft.",
+      narrativeSummary: "Here is a draft.",
+    }),
+    "Here is a draft.",
+  );
+  const refinedRow = (proposalDisposition: string) => ({
+    sender: "ai",
+    content: "Refined the recording.",
+    created_at: "2025-01-01T00:00:01",
+    narrative_payload: narrativePayload({
+      turnId: "turn-r",
+      proposalDisposition,
+      draft:
+        proposalDisposition === "no_proposal"
+          ? null
+          : { blockCount: 1, blockLabels: ["refined"], summary: null },
+    }),
+    turn_outcome: { copilot_turn_id: "turn-r", terminal_reason: null },
+  });
+  const metadata = (ownerTurnId: string, disposition = "review_untested") => ({
+    owner_turn_id: ownerTurnId,
+    revision: 1,
+    canonical_fingerprint: "canonical-1",
+    disposition,
+    workflow_run_id: null,
+  });
+  const proposal = (workflowId: string) => ({
+    workflow_id: workflowId,
+    workflow_permanent_id: "wpid_1",
+    title: workflowId,
+    _copilot_unvalidated: true,
+  });
+  const acceptButtons = () =>
+    screen.queryAllByRole("button", { name: "Accept" });
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  function takeRead(): (resp: { data: HistoryData }) => void {
+    expect(historyQueue.length).toBe(1);
+    historyRejects.shift();
+    return historyQueue.shift()!;
+  }
+
+  async function hydrateWithRefinementPoll(
+    proposalMetadata: Record<string, unknown> | null,
+  ): Promise<void> {
+    // After a successful Accept the saved workflow is the one the editor shows.
+    workflowResponse.current = {
+      workflow_id: "wf_1",
+      workflow_permanent_id: "wpid_1",
+    };
+    await renderChat({ onWorkflowUpdate: vi.fn() });
+    await waitFor(() => expect(historyQueue.length).toBeGreaterThan(0));
+    vi.useFakeTimers();
+    const mountRead = takeRead();
+    await act(async () => {
+      mountRead({
+        data: historyData({
+          chat_history: [draftRow, refinementRow],
+          proposed_workflow: proposal("wf_p"),
+          proposed_workflow_metadata: proposalMetadata,
+        }),
+      });
+      await Promise.resolve();
+    });
+    expect(acceptButtons()).toHaveLength(1);
+  }
+
+  // Without metadata the Accept records no owner turn, so the accepted-turn merge cannot
+  // recognise the old proposal in a read taken before the write.
+  it.each([
+    ["with metadata", metadata("turn-p")],
+    ["without metadata", null],
+  ])(
+    "does not restore an accepted proposal from a poll read in flight when the Accept returned (%s)",
+    async (_label, proposalMetadata) => {
+      await hydrateWithRefinementPoll(proposalMetadata);
+      await advance(2_000);
+      const readBeforeWrite = takeRead();
+      cancelPost.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflow/copilot/apply-proposed-workflow"
+            ? { data: proposal("wf_saved") }
+            : {},
+        ),
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
+        "/workflow/copilot/apply-proposed-workflow",
+      );
+      expect(acceptButtons()).toHaveLength(0);
+      // The Accept reads auto_accept back; that read touches no proposal state.
+      const autoAcceptRead = takeRead();
+      await act(async () => {
+        autoAcceptRead({
+          data: historyData({
+            chat_history: [draftRow, refinementRow],
+            proposed_workflow: proposal("wf_p"),
+            proposed_workflow_metadata: proposalMetadata,
+          }),
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(acceptButtons()).toHaveLength(0);
+
+      await act(async () => {
+        readBeforeWrite({
+          data: {
+            ...historyData({
+              chat_history: [
+                draftRow,
+                refinementRow,
+                refinedRow("no_proposal"),
+              ],
+              proposed_workflow: proposal("wf_p"),
+              proposed_workflow_metadata: proposalMetadata && {
+                ...proposalMetadata,
+                disposition: "accepting",
+              },
+            }),
+            // The server reports a claim only through a proposal's metadata.
+            proposed_claim_expires_in_seconds: proposalMetadata ? 30 : null,
+          } as HistoryData,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(acceptButtons()).toHaveLength(0);
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(useWorkflowYamlEditorStore.getState().pendingAccepts).toEqual({});
+
+      // The discarded read is replaced by one taken after the write, which the poll applies.
+      await advance(30_000);
+      const readAfterWrite = takeRead();
+      await act(async () => {
+        readAfterWrite({
+          data: historyData({
+            chat_history: [draftRow, refinementRow, refinedRow("no_proposal")],
+          }),
+        });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(document.body.textContent).toContain("All set.");
+      expect(acceptButtons()).toHaveLength(0);
+    },
+  );
+
+  async function acceptWhileNewerProposalStages(
+    acceptedMetadata: Record<string, unknown> | null,
+    stagedMetadata: Record<string, unknown>,
+  ): Promise<void> {
+    await hydrateWithRefinementPoll(acceptedMetadata);
+    let finishApply: (value: unknown) => void = () => {};
+    cancelPost.mockImplementation((path: string) =>
+      path === "/workflow/copilot/apply-proposed-workflow"
+        ? new Promise((resolve) => (finishApply = resolve))
+        : Promise.resolve({}),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await advance(2_000);
+    const refinementLanded = takeRead();
+    await act(async () => {
+      refinementLanded({
+        data: historyData({
+          chat_history: [
+            draftRow,
+            refinementRow,
+            refinedRow("review_untested"),
+          ],
+          proposed_workflow: proposal("wf_r"),
+          proposed_workflow_metadata: stagedMetadata,
+        }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      finishApply({ data: proposal("wf_saved") });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  }
+
+  // Without a token the accepted proposal is identified by the turn its diff card names. A token
+  // still tells two proposals apart when another client is already accepting the newer one.
+  it.each([
+    ["with a token", metadata("turn-p"), "chat-1:turn-p:1", "review_untested"],
+    ["without a token", null, "chat-1:legacy", "review_untested"],
+    [
+      "with a token, the newer one already accepting",
+      metadata("turn-p"),
+      "chat-1:turn-p:1",
+      "accepting",
+    ],
+  ])(
+    "keeps a newer proposal staged while an Accept of a proposal %s was in flight",
+    async (_label, acceptedMetadata, acceptedTag, stagedDisposition) => {
+      useWorkflowTitleStore.setState({
+        copilotMetadataEdits: {
+          wpid_1: {
+            proposal: acceptedTag,
+            edits: { title: "Renamed for the first proposal" },
+          },
+        },
+      });
+      await acceptWhileNewerProposalStages(
+        acceptedMetadata,
+        metadata("turn-r", stagedDisposition),
+      );
+
+      expect(
+        within(document.getElementById("copilot-gate-turn-r")!).getByRole(
+          "button",
+          { name: "Accept" },
+        ),
+      ).toBeTruthy();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      // Edits made under the accepted proposal must not ride along to the one kept.
+      expect(
+        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_1,
+      ).toEqual({ proposal: "chat-1:turn-r:1", edits: {} });
+    },
+  );
+
+  // A turn that ends without a draft re-reads the chat row for the bypassed proposal and frees the
+  // gate before that read returns.
+  it("does not restore a tokenless proposal from a resync read that outlived its Accept", async () => {
+    await renderChat({ onWorkflowUpdate: vi.fn() });
+    await flushHistory(
+      historyData({
+        chat_history: [draftRow],
+        proposed_workflow: proposal("wf_p"),
+      }),
+    );
+    expect(acceptButtons()).toHaveLength(1);
+    await submit("what does this block do?");
+    await waitFor(() => expect(streamCalls).toHaveLength(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "It opens the example page.",
+        updated_workflow: null,
+        response_time: "2026-08-16T02:02:13Z",
+        proposal_disposition: "no_proposal",
+      });
+      streamCalls[0]!.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(historyQueue.length).toBe(1));
+    const resyncBeforeWrite = takeRead();
+    cancelPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflow/copilot/apply-proposed-workflow"
+          ? { data: proposal("wf_saved") }
+          : {},
+      ),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    });
+    await waitFor(() => expect(acceptButtons()).toHaveLength(0));
+
+    await act(async () => {
+      resyncBeforeWrite({
+        data: historyData({
+          chat_history: [draftRow],
+          proposed_workflow: proposal("wf_p"),
+        }),
+      });
+    });
+
+    expect(acceptButtons()).toHaveLength(0);
+  });
+
+  // Graph edits send a successful Accept through the saved-workflow conflict, which settles later.
+  it("keeps a newer proposal when a tokenless Accept settles through the saved-workflow conflict", async () => {
+    useWorkflowTitleStore.setState({
+      copilotMetadataEdits: {
+        wpid_1: { proposal: "chat-1:legacy", edits: {}, graphEdited: true },
+      },
+    });
+    await acceptWhileNewerProposalStages(null, metadata("turn-r"));
+    await advance(0);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Keep my edits" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(
+      within(document.getElementById("copilot-gate-turn-r")!).getByRole(
+        "button",
+        { name: "Accept" },
+      ),
+    ).toBeTruthy();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+  });
+
+  // A tokenless proposal is given a fresh owner when its Accept claims it, so a read taken during
+  // that Accept shows the accepted proposal under a turn the client never saw.
+  it("clears the accepted proposal when a read shows it claimed under a new owner", async () => {
+    await acceptWhileNewerProposalStages(
+      null,
+      metadata("owner-assigned-at-accept", "accepting"),
+    );
+
+    expect(acceptButtons()).toHaveLength(0);
+  });
+});
+
+describe("WorkflowCopilotChat — first chat selection", () => {
+  it("discards a read that outlived a first selection from a chat with no id", async () => {
+    await renderChat();
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: null,
+        proposed_workflow: { workflow_id: "wf_p", _copilot_unvalidated: true },
+        chat_history: [aiHistoryMessage(null, "Here is a draft.")],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    });
+    await waitFor(() => expect(historyQueue).toHaveLength(1));
+    const resolveLatest = historyQueue.shift()!;
+    historyRejects.shift();
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "mock-select-history-chat" }),
+      );
+    });
+    await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
+    await act(async () => {
+      resolveLatest({
+        data: historyData({ workflow_copilot_chat_id: "chat-1" }),
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
+      ).toBe(false),
+    );
+    await submit("next");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(
+      (
+        postStreaming.mock.calls[0]![1] as {
+          workflow_copilot_chat_id?: string | null;
+        }
+      ).workflow_copilot_chat_id,
+    ).toBe("chat_other");
   });
 });

@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
+from skyvern.exceptions import (
+    BrowserSessionDegraded,
+    MissingBrowserStatePage,
+    ScreenshotTargetClosed,
+    get_user_facing_exception_message,
+)
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.block import _should_skip_retry_on_anti_bot_detection
 
@@ -105,3 +114,65 @@ class TestFallbackFromReason:
             failure_reason="Access denied after login - user does not have permission",
         )
         assert _should_skip_retry_on_anti_bot_detection(task) is False
+
+
+# Each decision was recorded from the classifier before site rate-limit and 403 wording was labeled anti-bot and
+# before integration throttles were labeled website errors. Those labels are bookkeeping: a failure that kept its
+# retries then must keep them now, and one that skipped them must still skip them.
+@pytest.mark.parametrize(
+    ("reason", "skips_retry"),
+    [
+        pytest.param(
+            "Failed to send the form because a captcha appeared", True, id="captcha-reason-worded-like-integration"
+        ),
+        pytest.param("HTTP request failed: 429 Too Many Requests", False, id="http-request-throttle"),
+        pytest.param(
+            "The site returned Cloudflare Error 1015 (HTTP 429: temporarily rate limited/banned).",
+            True,
+            id="cloudflare-keyword-with-429",
+        ),
+        pytest.param("Page indicates 403 error or rate limit; cannot proceed.", False, id="hedged-403-or-rate-limit"),
+        pytest.param("The site says this page was requested too many times.", False, id="requested-too-many-times"),
+        pytest.param("The site returned a 403 Forbidden page.", False, id="forbidden-page"),
+        pytest.param("Google Sheets rate limit on write: quota exceeded", False, id="sheets-quota"),
+        pytest.param("Page blocked by captcha challenge", True, id="captcha"),
+        pytest.param("Access denied: rate limit exceeded", True, id="access-denied-with-rate-limit"),
+    ],
+)
+def test_site_throttle_labeling_does_not_change_the_retry_decision(reason: str, skips_retry: bool) -> None:
+    from_reason = _make_failed_task(failure_reason=reason)
+    from_persisted = _make_failed_task(failure_category=classify_from_failure_reason(reason, fallback_to_unknown=True))
+
+    assert _should_skip_retry_on_anti_bot_detection(from_reason) is skips_retry
+    assert _should_skip_retry_on_anti_bot_detection(from_persisted) is skips_retry
+
+
+_BROWSER_LOSSES = [
+    pytest.param(MissingBrowserStatePage(), id="page-missing"),
+    pytest.param(ScreenshotTargetClosed("Target page, context or browser has been closed"), id="target-closed"),
+    pytest.param(BrowserSessionDegraded(3, "screenshot"), id="browser-degraded"),
+]
+
+
+@pytest.mark.parametrize("browser_loss", _BROWSER_LOSSES)
+@pytest.mark.parametrize(
+    "reason_suffix",
+    [
+        pytest.param("", id="exception-message-only"),
+        pytest.param(" A captcha challenge was still on the page.", id="reason-also-names-a-captcha"),
+    ],
+)
+def test_the_unsolved_captcha_relabel_leaves_the_retry_decision_unchanged(
+    browser_loss: Exception, reason_suffix: str
+) -> None:
+    """Categorization is output-only: relabeling a browser loss as anti-bot must not stop a block retry."""
+    reason = get_user_facing_exception_message(browser_loss) + reason_suffix
+    before = classify_from_failure_reason(reason, exception=browser_loss, fallback_to_unknown=True)
+    after = classify_from_failure_reason(
+        reason, exception=browser_loss, fallback_to_unknown=True, unsolved_captcha_exception="CaptchaNotSolvedInTime"
+    )
+
+    assert after is not None and after[0]["category"] == "ANTI_BOT_DETECTION"
+    assert _should_skip_retry_on_anti_bot_detection(
+        _make_failed_task(failure_reason=reason, failure_category=after)
+    ) is _should_skip_retry_on_anti_bot_detection(_make_failed_task(failure_reason=reason, failure_category=before))

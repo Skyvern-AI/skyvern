@@ -67,6 +67,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithW
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
+import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
 import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
@@ -77,6 +78,7 @@ import {
   collectTimelineSearchTargets,
   filterTimelineToAttempt,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   flattenTimelineChronologically,
   parseActiveIterationParam,
   type TimelineSearchTarget,
@@ -107,6 +109,7 @@ import {
 } from "./RunOutputsSection";
 import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
@@ -693,50 +696,6 @@ export function RunView({
     timelineIsPlaceholder,
   ]);
 
-  // A run that had already succeeded when it was opened lands on its Outputs;
-  // a failed one keeps the timeline, where its failure section and Fix/Retry live.
-  // Explicit choices win here for the same reason they do for the pin above:
-  // a deep link names what to show, and switching the pane hides it.
-  const outputsLandingDecidedForRunRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (
-      !workflowRunId ||
-      outputsLandingDecidedForRunRef.current === workflowRunId ||
-      !workflowRun ||
-      runIsPlaceholder ||
-      timelineIsPlaceholder
-    ) {
-      return;
-    }
-    outputsLandingDecidedForRunRef.current = workflowRunId;
-    if (!finalized || outcome !== "success") {
-      return;
-    }
-    const landingSearchParams = new URLSearchParams(
-      window.location.search || searchParamsRef.current.toString(),
-    );
-    if (
-      landingSearchParams.has("view") ||
-      hasExplicitSelection(landingSearchParams)
-    ) {
-      return;
-    }
-    if (
-      runHasOutputs(workflowRun) &&
-      useRunPaneViewStore.getState().view === "timeline"
-    ) {
-      setPaneView("outputs");
-    }
-  }, [
-    workflowRunId,
-    workflowRun,
-    finalized,
-    outcome,
-    runIsPlaceholder,
-    timelineIsPlaceholder,
-    setPaneView,
-  ]);
-
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
   // the live edge — the same resolution the Browser pane applies in useRunVisuals.
   const selectedId =
@@ -987,12 +946,20 @@ export function RunView({
   const jumpToFailedBlock = failedBlock
     ? () => selectTimelineBlock(failedBlock)
     : undefined;
+  const awaitingHumanInteraction = currentTimeline
+    ? findAwaitingHumanInteractionBlock(currentTimeline)
+    : null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 overflow-hidden p-2">
       <WorkflowRunVerificationCodeForm
         workflowRunId={workflowRun.workflow_run_id}
       />
+      {awaitingHumanInteraction ? (
+        <WorkflowRunHumanInteraction
+          workflowRunBlock={awaitingHumanInteraction}
+        />
+      ) : null}
       {embedded ? null : (
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
           <RunTagsEditor workflowRunId={workflowRun.workflow_run_id} />
@@ -1045,6 +1012,16 @@ export function RunView({
               />
             }
           />
+          {!statusUnavailable &&
+          !runIsPlaceholder &&
+          !canceled &&
+          runIsLogicallyFinal(workflowRun) ? (
+            <RunFeedback
+              targetType="workflow_run"
+              targetId={workflowRun.workflow_run_id}
+              variant={failed ? "report" : "thumbs"}
+            />
+          ) : null}
           {failed || runIsRetryWaiting(workflowRun) ? (
             <RunFailureLine
               workflowRun={workflowRun}

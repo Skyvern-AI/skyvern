@@ -20,9 +20,26 @@ import {
 
 import "./capabilityExamples.css";
 
+const SAMPLE_RESUME_PATH = "/sample-resume.pdf";
+
+// Used when attachments can't reach the agent; an external URL is reachable from any
+// execution browser, unlike the UI's own origin in self-hosted or protected deploys.
+const SAMPLE_RESUME_PUBLIC_URL =
+  "https://writing.colostate.edu/guides/documents/resume/functionalSample.pdf";
+
+const JOB_APPLICATION_PROMPT =
+  "Go to https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply and fill out the job application using the attached resume. Upload the resume to the resume field, and fill every other field with information from the resume. Leave a field blank if the resume doesn't cover it; don't make anything up. For voluntary self-identification questions (gender, race, veteran, disability), choose \"Decline to self-identify\" or the closest option. Do not click Submit. Stop once the form is filled and list the fields you completed.";
+
 type Capability = "forms" | "extract" | "login" | "monitor" | "schedule";
 
-type Example = { id: string; label: string; prompt: string; icon: ReactNode };
+type Example = {
+  id: string;
+  label: string;
+  prompt: string;
+  icon: ReactNode;
+  // Public path of a file to attach alongside the prompt.
+  attachment?: string;
+};
 
 type Group = {
   capability: Capability;
@@ -79,8 +96,8 @@ const GROUPS: ReadonlyArray<Group> = [
         id: "forms.apply_for_job",
         label: "Apply for a job",
         icon: <EnvelopeClosedIcon />,
-        prompt:
-          "Go to https://jobs.lever.co/leverdemo-8, find the first Solutions Engineer role in Toronto, and apply with the attached resume. Fill in the name and email, submit, and confirm the application went through.",
+        prompt: JOB_APPLICATION_PROMPT,
+        attachment: SAMPLE_RESUME_PATH,
       },
       {
         id: "forms.get_quote",
@@ -280,12 +297,13 @@ type Selection = {
   capability: Capability;
   label: string;
   prompt: string;
+  attachment?: string;
 };
 
 type Props = {
   disabled?: boolean;
   onSelect: (selection: Selection) => void;
-  onPreview?: (selection: Omit<Selection, "prompt">) => void;
+  onPreview?: (selection: Omit<Selection, "prompt" | "attachment">) => void;
 };
 
 function CapabilityExamples({ disabled = false, onSelect, onPreview }: Props) {
@@ -328,6 +346,7 @@ function CapabilityExamples({ disabled = false, onSelect, onPreview }: Props) {
                             capability: group.capability,
                             label: example.label,
                             prompt: example.prompt,
+                            attachment: example.attachment,
                           })
                         }
                         className="flex h-12 w-full items-center gap-2.5 rounded-[10px] border border-transparent bg-slate-elevation2 pl-4 pr-5 text-left text-sm text-foreground transition-colors hover:border-border hover:bg-slate-elevation3 disabled:pointer-events-none disabled:opacity-50 [&>svg]:size-[22px] [&>svg]:shrink-0"
@@ -357,4 +376,9 @@ function CapabilityExamples({ disabled = false, onSelect, onPreview }: Props) {
   );
 }
 
-export { CapabilityExamples };
+export {
+  CapabilityExamples,
+  JOB_APPLICATION_PROMPT,
+  SAMPLE_RESUME_PATH,
+  SAMPLE_RESUME_PUBLIC_URL,
+};

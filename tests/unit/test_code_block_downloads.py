@@ -11,6 +11,7 @@ Covers the three acceptance behaviors:
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import structlog
 from playwright.async_api import Download
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.exceptions import (
     DownloadFileMaxWaitingTime,
@@ -32,10 +34,12 @@ from skyvern.exceptions import (
     IllegitCompleteScriptTermination,
     ScriptTerminationException,
 )
+from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.files import classify_download_visibility, observe_download_dir
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage import s3 as s3_module
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -63,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.services import uploaded_file_service
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit.conftest import SESSION_DOWNLOAD_BYTES, make_claimed_download_mock, registered_download_row
@@ -2123,6 +2128,7 @@ def test_none_valued_registration_fields_are_schema_not_claims() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2146,7 +2152,6 @@ async def test_successful_self_heal_binds_the_download_that_preceded_the_raise(
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(
@@ -2298,6 +2303,7 @@ async def test_cancel_during_registration_does_not_book_the_block_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -2318,7 +2324,6 @@ async def test_failed_self_heal_still_binds_the_download_that_preceded_the_raise
         "execute_user_function_with_timeout",
         AsyncMock(side_effect=_raise_after_download(_isolated_download_path, Exception("Download is starting"))),
     )
-    monkeypatch.setattr(CodeBlock, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", lambda self, e, page, engine_selection: True)
 
     healed = BlockResult(
@@ -3374,7 +3379,6 @@ async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytes
 async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], False)))
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=True))
     listing = AsyncMock(return_value=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
 
@@ -3398,7 +3402,6 @@ async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
         "list_artifacts_for_run_by_type",
         AsyncMock(side_effect=RuntimeError("database unavailable")),
     )
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
     with _capture_empty_read_logs() as logs:
@@ -3565,18 +3568,15 @@ async def test_failed_row_lookup_still_lists_instead_of_reporting_no_downloads(
 ) -> None:
     """A DB blip must not be answered with an empty download list.
 
-    The cutover skip exists to avoid listing when a run provably has no rows; a lookup that
-    failed proves nothing, so the legitimate case has to keep its route through the listing.
+    Rows are trusted only when the lookup succeeds; a lookup that failed proves nothing, so the
+    read keeps its route through the listing.
     """
     listed = [FileInfo(url="https://example.test/real")]
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], True)))
-    skip = AsyncMock(return_value=True)
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", skip)
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=listed))
 
     assert await storage.get_downloaded_files("o_1", "wr_blip") == listed
-    skip.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3593,3 +3593,53 @@ async def test_downloads_empty_read_reports_every_empty_read_for_a_run(monkeypat
         await storage.get_downloaded_files("o_1", "wr_repeat")
 
     assert len(_empty_read_rows(repeated)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_local_storage_upload_uri_reaches_the_code_as_a_readable_run_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """The run form submits a local upload's file:// URI; its uploaded_files row, not the path, authorizes it."""
+    storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    upload_uri, _ = await storage.save_legacy_file(
+        organization_id="o_1", filename="file_1_inputs.csv", fileObj=io.BytesIO(b"a,b\n1,2\n")
+    )
+    artifact = tmp_path / "artifacts" / settings.ENV / "o_1" / "workflow_runs" / "wr_0" / "har.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"session cookies")
+    rows = {("o_1", upload_uri): SimpleNamespace(file_id="file_1")}
+
+    async def by_uri(storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return rows.get((organization_id, storage_uri))
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=by_uri)),
+    )
+    monkeypatch.setattr(uploaded_file_service, "resolve_file_reference", AsyncMock(return_value=upload_uri))
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
+    _wire_block_runtime(monkeypatch, values={"inputs": upload_uri})
+    block = CodeBlock(
+        label="code_read",
+        code="resolved = inputs",
+        output_parameter=_output_parameter("code_out"),
+        parameters=[_file_url_parameter("inputs")],
+    )
+
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    with open(result.output_parameter_value["resolved"], "rb") as f:
+        assert f.read() == b"a,b\n1,2\n"
+
+    for refused_uri, organization_id in ((f"file://{artifact}", "o_1"), (upload_uri, "o_2")):
+        refused = await block._materialize_file_parameter_path(
+            refused_uri,
+            parameter_key="other",
+            materialized_file_paths={},
+            workflow_run_id="wr_1",
+            organization_id=organization_id,
+        )
+        assert isinstance(refused, AuthorizedFileMaterializationFailure)

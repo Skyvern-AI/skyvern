@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
@@ -9,10 +15,23 @@ import {
   type RecordingDraftStep,
 } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import {
+  createYamlCommitOwner,
+  registerEditorOwner,
+  unregisterEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import type { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 
 import { RecordingPanel } from "./RecordingPanel";
 
 const mutateMock = vi.fn();
+const recordingMutation = vi.hoisted(() => ({
+  isPending: false,
+  onSuccess: undefined as Parameters<
+    typeof useProcessRecordingMutation
+  >[0]["onSuccess"],
+}));
 const modalState = vi.hoisted(() => ({
   overrideType: null as string | null,
   defaultTestUrl: null as string | null,
@@ -21,11 +40,16 @@ const modalState = vi.hoisted(() => ({
 }));
 
 vi.mock("@/routes/browserSessions/hooks/useProcessRecordingMutation", () => ({
-  useProcessRecordingMutation: () => ({
-    isPending: false,
-    isError: false,
-    mutate: mutateMock,
-  }),
+  useProcessRecordingMutation: (
+    options: Parameters<typeof useProcessRecordingMutation>[0],
+  ) => {
+    recordingMutation.onSuccess = options.onSuccess;
+    return {
+      isPending: recordingMutation.isPending,
+      isError: false,
+      mutate: mutateMock,
+    };
+  },
 }));
 
 vi.mock("@/routes/credentials/CredentialsModal", () => ({
@@ -63,6 +87,22 @@ vi.mock("@/routes/credentials/CredentialsModal", () => ({
 const initialRecording = useRecordingStore.getState();
 const initialPanel = useWorkflowPanelStore.getState();
 const initialRecordedBlocks = useRecordedBlocksStore.getState();
+const suggestionHosts: HTMLElement[] = [];
+
+function renderWithSuggestionHost() {
+  const suggestionHost = document.createElement("div");
+  document.body.appendChild(suggestionHost);
+  suggestionHosts.push(suggestionHost);
+  return {
+    suggestionHost,
+    ...render(
+      <RecordingPanel
+        browserSessionId="pbs_123"
+        suggestionPortalTarget={suggestionHost}
+      />,
+    ),
+  };
+}
 
 function inputDraft(
   id: string,
@@ -90,7 +130,13 @@ function inputDraft(
 describe("RecordingPanel", () => {
   beforeEach(() => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
+    HTMLElement.prototype.scrollTo = vi.fn();
     mutateMock.mockReset();
+    recordingMutation.isPending = false;
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    registerEditorOwner(createYamlCommitOwner("wpid-1"));
     modalState.overrideType = null;
     modalState.defaultTestUrl = null;
     modalState.defaultTotpType = null;
@@ -117,49 +163,79 @@ describe("RecordingPanel", () => {
 
   afterEach(() => {
     cleanup();
+    suggestionHosts.splice(0).forEach((host) => host.remove());
   });
 
-  it("explains what Record Task captures and what Skyvern creates", () => {
-    render(<RecordingPanel browserSessionId="pbs_123" />);
-
-    expect(screen.getByText("Recording task")).toBeTruthy();
-    expect(
-      screen.getByText(
-        "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps.",
-      ),
-    ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+  it("does not change another owner's committing flag after an old request settles", () => {
+    const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
+    recordingMutation.isPending = true;
+    const { rerender } = render(<RecordingPanel browserSessionId="pbs-1" />);
+    act(() => {
+      unregisterEditorOwner(owner);
+      registerEditorOwner(createYamlCommitOwner("wpid-2"));
+      useRecordingStore.setState({ isCommitting: true, isRecording: true });
+    });
+    const recording = useRecordingStore.getState();
+    recordingMutation.isPending = false;
+    rerender(<RecordingPanel browserSessionId="pbs-2" />);
+    expect(useRecordingStore.getState()).toBe(recording);
   });
 
-  it("keeps Done disabled and never calls process_recording while the browser session id has not resolved", () => {
+  it.each([true, false])(
+    "publishes recording blocks only for a live owner: %s",
+    (live) => {
+      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
+      render(<RecordingPanel browserSessionId="pbs-1" />);
+      act(() => {
+        useRecordingStore.setState({ isRecording: true });
+        if (!live) {
+          unregisterEditorOwner(owner);
+          registerEditorOwner(createYamlCommitOwner("wpid-2"));
+        }
+      });
+      act(() =>
+        recordingMutation.onSuccess?.(
+          { recordingId: "br-1", blocks: [], parameters: [] },
+          owner,
+        ),
+      );
+      expect(useRecordedBlocksStore.getState().owner).toBe(live ? owner : null);
+      expect(useRecordingStore.getState().isRecording).toBe(!live);
+    },
+  );
+
+  it("keeps Stop disabled and never calls process_recording while the browser session id has not resolved", () => {
     render(<RecordingPanel browserSessionId={null} />);
 
-    const doneButton = screen.getByRole("button", {
-      name: /done/i,
+    const stopButton = screen.getByRole("button", {
+      name: /stop recording/i,
     }) as HTMLButtonElement;
-    expect(doneButton.disabled).toBe(true);
+    expect(stopButton.disabled).toBe(true);
 
-    fireEvent.click(doneButton);
+    fireEvent.click(stopButton);
 
     expect(mutateMock).not.toHaveBeenCalled();
   });
 
-  it("enables Done and processes the recording once the browser session id resolves", () => {
+  it("enables Stop and automatically processes once the browser session id resolves", () => {
     const { rerender } = render(<RecordingPanel browserSessionId={null} />);
 
     expect(
-      (screen.getByRole("button", { name: /done/i }) as HTMLButtonElement)
-        .disabled,
+      (
+        screen.getByRole("button", {
+          name: /stop recording/i,
+        }) as HTMLButtonElement
+      ).disabled,
     ).toBe(true);
 
     rerender(<RecordingPanel browserSessionId="pbs_123" />);
 
-    const doneButton = screen.getByRole("button", {
-      name: /done/i,
+    const stopButton = screen.getByRole("button", {
+      name: /stop recording/i,
     }) as HTMLButtonElement;
-    expect(doneButton.disabled).toBe(false);
+    expect(stopButton.disabled).toBe(false);
 
-    fireEvent.click(doneButton);
+    fireEvent.click(stopButton);
 
     expect(mutateMock).toHaveBeenCalledTimes(1);
   });
@@ -175,7 +251,7 @@ describe("RecordingPanel", () => {
         <RecordingPanel browserSessionId="pbs_123" />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: /done/i }));
+      fireEvent.click(screen.getByRole("button", { name: /stop recording/i }));
 
       // The debug session's browser_session_id blips to null while the
       // finalize timeout is pending.
@@ -194,7 +270,35 @@ describe("RecordingPanel", () => {
     }
   });
 
-  it("shows add and dismiss on a password draft, not on an email draft", () => {
+  it("processes once when the same controller moves between chat and full-pane during finishing", () => {
+    vi.useFakeTimers();
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    try {
+      useRecordingStore.setState({ sessionRevision: 1 });
+      const { rerender } = render(
+        <RecordingPanel browserSessionId="pbs_123" />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /stop recording/i }));
+      rerender(
+        <RecordingPanel
+          browserSessionId="pbs_123"
+          expanded
+          portalTarget={portalTarget}
+        />,
+      );
+      rerender(<RecordingPanel browserSessionId="pbs_123" />);
+      vi.advanceTimersByTime(5000);
+
+      expect(mutateMock).toHaveBeenCalledTimes(1);
+    } finally {
+      portalTarget.remove();
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a password suggestion in the outer chat host, not the recording action feed", () => {
     useRecordingStore.setState({
       draftSteps: [
         inputDraft("email", { title: "Fill email" }),
@@ -205,17 +309,25 @@ describe("RecordingPanel", () => {
       ],
     });
 
-    render(<RecordingPanel browserSessionId="pbs_123" />);
+    const { suggestionHost } = renderWithSuggestionHost();
 
     expect(screen.getByText("Fill password")).toBeTruthy();
     expect(screen.getByText("Fill email")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /add password/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^dismiss$/i })).toBeTruthy();
+    const addPassword = screen.getByRole("button", { name: /add password/i });
+    expect(suggestionHost.contains(addPassword)).toBe(true);
+    expect(
+      screen.getByTestId("recording-action-feed").contains(addPassword),
+    ).toBe(false);
+    expect(screen.getByRole("button", { name: /^skip$/i })).toBeTruthy();
   });
 
-  it("hides the credential prompt after dismiss", () => {
+  it("shows one suggestion per credential on a site and skip hides it", () => {
     useRecordingStore.setState({
       draftSteps: [
+        inputDraft("pw-focus", {
+          credential_kind: "password",
+          title: "Focus password",
+        }),
         inputDraft("pw", {
           credential_kind: "password",
           title: "Fill password",
@@ -223,8 +335,11 @@ describe("RecordingPanel", () => {
       ],
     });
 
-    render(<RecordingPanel browserSessionId="pbs_123" />);
-    fireEvent.click(screen.getByRole("button", { name: /^dismiss$/i }));
+    renderWithSuggestionHost();
+    expect(
+      screen.getAllByRole("button", { name: /add password/i }),
+    ).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /^skip$/i }));
 
     expect(screen.queryByRole("button", { name: /add password/i })).toBeNull();
     expect(screen.getByText("Fill password")).toBeTruthy();
@@ -242,7 +357,7 @@ describe("RecordingPanel", () => {
       sessionRevision: 1,
     });
 
-    render(<RecordingPanel browserSessionId="pbs_123" />);
+    renderWithSuggestionHost();
     fireEvent.click(screen.getByRole("button", { name: /add password/i }));
 
     expect(modalState.overrideType).toBe("password");
@@ -303,7 +418,7 @@ describe("RecordingPanel", () => {
         ],
       });
 
-      render(<RecordingPanel browserSessionId="pbs_123" />);
+      renderWithSuggestionHost();
       fireEvent.click(screen.getByRole("button", { name: button }));
 
       expect(modalState.overrideType).toBe(overrideType);

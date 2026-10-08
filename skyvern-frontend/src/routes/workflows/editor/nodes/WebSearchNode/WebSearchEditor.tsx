@@ -3,6 +3,7 @@ import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
+import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,7 +21,7 @@ import { helpTooltips } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
-import { dataSchemaExampleValue } from "../types";
+import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
 import type { WebSearchNode, WebSearchNodeData } from "./types";
 
 function WebSearchEditor({ blockId }: { blockId: string }) {
@@ -56,6 +57,7 @@ function WebSearchEditorBody({
         <Label className="text-xs text-tertiary-foreground">Search Query</Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
+          name="query"
           value={data.query}
           onChange={(query) => update({ query })}
           placeholder="site:example.com search terms"
@@ -123,87 +125,66 @@ function WebSearchEditorBody({
         </Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
+          name="prompt"
           value={data.prompt}
-          onChange={(prompt) =>
-            update(
-              prompt.trim() ? { prompt } : { prompt, noMatchErrorCode: "" },
-            )
-          }
+          onChange={(prompt) => update({ prompt })}
           placeholder="What would you like to do with the search results?"
           className="nopan text-xs"
         />
         <p className="text-xs text-tertiary-foreground">
-          Leave blank to return search results without AI processing. A prompt
-          uses only the returned results and does not read linked pages.
+          Leave Prompt and Data Schema blank to return search results without AI
+          processing. A prompt uses only the returned results and does not read
+          linked pages.
         </p>
       </div>
-      {data.prompt.trim() && (
-        <>
-          <ModelSelector
-            className="nopan w-full text-xs"
-            value={data.model}
-            onChange={(model) => update({ model })}
-          />
-          <WorkflowDataSchemaInputGroup
-            exampleValue={dataSchemaExampleValue}
-            value={data.jsonSchema}
-            onChange={(jsonSchema) => update({ jsonSchema })}
-            suggestionContext={{ current_schema: data.jsonSchema }}
-          />
-        </>
-      )}
+      <ModelSelector
+        className="nopan w-full text-xs"
+        value={data.model}
+        onChange={(model) => update({ model })}
+      />
+      <WorkflowDataSchemaInputGroup
+        deferKey={JSON.stringify([blockId, "jsonSchema"])}
+        exampleValue={dataSchemaExampleValue}
+        value={data.jsonSchema}
+        onChange={(jsonSchema) => update({ jsonSchema })}
+        suggestionContext={{ current_schema: data.jsonSchema }}
+      />
+      <p className="text-xs text-tertiary-foreground">
+        The answer is stored at {`{{ ${data.label}_output.prompt_output }}`}.
+      </p>
       <div className="space-y-4">
-        <Label className="text-xs text-tertiary-foreground">Outcomes</Label>
         <div className="space-y-2">
-          <Label
-            htmlFor={`${blockId}-no-results-error-code`}
-            className="text-xs text-tertiary-foreground"
-          >
-            No Results Error Code
-          </Label>
-          <Input
-            data-testid="web-search-no-results-error-code"
-            id={`${blockId}-no-results-error-code`}
-            value={data.noResultsErrorCode}
-            maxLength={100}
-            disabled={!data.editable}
-            onChange={(event) =>
-              update({ noResultsErrorCode: event.target.value })
-            }
-            placeholder="NO_SEARCH_RESULTS"
-            className="nopan text-xs"
-          />
-          <p className="text-xs text-tertiary-foreground">
-            Leave blank to complete the block with zero results. A code
-            terminates the run with that error code.
-          </p>
-        </div>
-        {data.prompt.trim() && (
-          <div className="space-y-2">
-            <Label
-              htmlFor={`${blockId}-no-match-error-code`}
-              className="text-xs text-tertiary-foreground"
-            >
-              No Match Error Code
-            </Label>
-            <Input
-              data-testid="web-search-no-match-error-code"
-              id={`${blockId}-no-match-error-code`}
-              value={data.noMatchErrorCode}
-              maxLength={100}
-              disabled={!data.editable}
-              onChange={(event) =>
-                update({ noMatchErrorCode: event.target.value })
-              }
-              placeholder="NO_MATCHING_RESULT"
-              className="nopan text-xs"
-            />
-            <p className="text-xs text-tertiary-foreground">
-              Leave blank to complete the block when no result matches the
-              Prompt. A code terminates the run with that error code.
-            </p>
+          <div className="flex items-center justify-between">
+            <div className="flex gap-2">
+              <Label className="text-xs font-normal text-tertiary-foreground">
+                Error Messages
+              </Label>
+              <HelpTooltip content={helpTooltips.webSearch.errorCodeMapping} />
+            </div>
+            <div className="w-52">
+              <Switch
+                checked={data.errorCodeMapping !== "null"}
+                onCheckedChange={(checked) => {
+                  if (!data.editable) return;
+                  update({
+                    errorCodeMapping: checked
+                      ? JSON.stringify(errorMappingExampleValue, null, 2)
+                      : "null",
+                  });
+                }}
+              />
+            </div>
           </div>
-        )}
+          {data.errorCodeMapping !== "null" && (
+            <ErrorCodeMappingEditor
+              deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
+              label={data.label}
+              value={data.errorCodeMapping}
+              onChange={(value) => update({ errorCodeMapping: value })}
+              readOnly={!data.editable}
+            />
+          )}
+        </div>
         <div className="flex-1 space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-tertiary-foreground">

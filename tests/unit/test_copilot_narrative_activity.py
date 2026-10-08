@@ -141,30 +141,33 @@ def test_record_activity_routes_to_design_when_no_block_running() -> None:
     assert state.block_activity == {}
 
 
-def test_record_activity_routes_to_running_block() -> None:
+def test_unknown_tool_result_stays_in_design_with_a_block_running() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(
         build_tool_result_activity("run_blocks_and_collect_debug", "ran", True, 1, "c2", timestamp=_TS)
     )
-    assert [e["id"] for e in state.block_activity["step_1"]] == ["tr-c2"]
-    assert state.design_activity == []
+    assert state.block_activity == {}
+    assert [e["id"] for e in state.design_activity] == ["tr-c2"]
 
 
 def test_record_activity_drops_denylisted_entries() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(build_tool_call_activity("get_run_results", 0, "c1", timestamp=_TS))
     state.record_activity(build_tool_call_activity("update_workflow", 1, "c2", timestamp=_TS))
-    assert [e["id"] for e in state.block_activity["step_1"]] == ["tc-c2"]
+    assert [e["id"] for e in state.block_activity["wrb_step_1"]] == ["tc-c2"]
 
 
 def test_record_activity_caps_keep_most_recent() -> None:
     state = NarratorState()
     state.running_block_label = "b"
+    state.running_block_id = "wrb_b"
     for i in range(MAX_BLOCK_ACTIVITY_ENTRIES + 10):
         state.record_activity(build_tool_call_activity("t", i, f"c{i}", timestamp=_TS))
-    bucket = state.block_activity["b"]
+    bucket = state.block_activity["wrb_b"]
     assert len(bucket) == MAX_BLOCK_ACTIVITY_ENTRIES
     assert bucket[0]["iteration"] == 10
     assert bucket[-1]["iteration"] == MAX_BLOCK_ACTIVITY_ENTRIES + 9
@@ -177,14 +180,12 @@ def test_record_activity_caps_keep_most_recent() -> None:
 
 
 def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
-    # A run tool's call is recorded before the run it triggers flips
-    # running_block_label; its result must rejoin the call's bucket so the FE
-    # folds the pair instead of stranding the call row "calling…".
     state = NarratorState()
     state.record_activity(build_tool_call_activity("update_and_run_blocks", 0, "c1", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c1"]
 
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(
         build_tool_result_activity("update_and_run_blocks", "Workflow updated", True, 1, "c1", timestamp=_TS)
     )
@@ -193,17 +194,17 @@ def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
     assert state.block_activity == {}
 
 
-def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
-    # The pin is scoped to run tools; other tools keep live running_block_label routing.
+def test_record_activity_non_run_tool_result_keeps_the_original_call_bucket() -> None:
     state = NarratorState()
     state.record_activity(build_tool_call_activity("evaluate", 0, "c9", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c9"]
 
     state.running_block_label = "step_2"
+    state.running_block_id = "wrb_step_2"
     state.record_activity(build_tool_result_activity("evaluate", "Inspecting page", True, 1, "c9", timestamp=_TS))
 
-    assert [e["id"] for e in state.block_activity["step_2"]] == ["tr-c9"]
-    assert [e["id"] for e in state.design_activity] == ["tc-c9"]
+    assert state.block_activity == {}
+    assert [e["id"] for e in state.design_activity] == ["tc-c9", "tr-c9"]
 
 
 def test_tool_activity_display_label_covers_discovery_tools() -> None:
@@ -241,13 +242,16 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
         build_narration_activity("Planning the build", 0, datetime(2026, 1, 1, tzinfo=timezone.utc))
     ]
     state.block_activity = {
-        "step_1": [
+        "wrb_1": [
             build_tool_result_activity("run_blocks_and_collect_debug", "ran step_1", True, 1, "c1", timestamp=_TS)
         ]
     }
+    state.work_plan = {"toolCallId": "p1", "items": ["Open the admin page"]}
     ctx.narrator_state = state
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
+
+    assert payload["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page"]}
 
     assert payload["designActivity"] == [
         {
@@ -363,7 +367,7 @@ def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() 
 
     state = NarratorState()
     state.block_activity = {
-        "step_1": [build_tool_result_activity("edit_block", "Edited", True, 3, "edit", timestamp=_TS)]
+        "wrb_retry": [build_tool_result_activity("edit_block", "Edited", True, 3, "edit", timestamp=_TS)]
     }
     ctx.narrator_state = state
 

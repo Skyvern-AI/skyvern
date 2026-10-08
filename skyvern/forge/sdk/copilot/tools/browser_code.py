@@ -43,8 +43,10 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     _browser_session_loss_result,
     _prepare_browser_session_for_dispatch,
     _record_browser_call_outcome,
+    is_redaction_withheld,
     scrub_model_facing_tool_result,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.runtime import (
     SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     SENSITIVE_ORIGIN_PAGE_ERROR,
@@ -81,7 +83,8 @@ MAX_CODE_CHARS = 20_000
 MAX_VALUE_CHARS = 32_000
 SESSION_LIFETIME_SECONDS = float(TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
 
-TOOL_DESCRIPTION = """Run Python against the live browser in a persistent interpreter.
+TOOL_DESCRIPTION = (
+    """Run Python against the live browser in a persistent interpreter.
 
 `target` names the browser: 'debug' (default) is the one this chat drives; 'last_run' is the one the
 most recent test run executed in, when that run minted its own. A continuation on the page a run
@@ -105,9 +108,9 @@ Browser API (async, Playwright-shaped):
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
-- After a sensitive sign-in on this page, screenshots and `page.evaluate` are refused for the rest of
+- After a sensitive sign-in on this page, screenshots, `page.evaluate` and `search_web` are refused for the rest of
   the turn. Reading text still works; that is the way to inspect such a page.
-- Tabs and popups: each call starts on the browser's current tab, the one the direct browser tools act on.
+- Tabs and popups: each call starts on the browser's current tab.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
   `await click_and_wait_for_popup(selector)` clicks and returns the new tab's `index` and `url`.
 - Downloads and files: `await click_and_download(selector)` clicks and returns `{file_id, name, size}`
@@ -117,8 +120,21 @@ Browser API (async, Playwright-shaped):
   Files belong to this chat turn.
 - Saved credentials are not filled from here. Call `fill_credential_field` between calls to this tool,
   with the same `target`; every call starts on the tab that tool acts on.
+- `await solve_captcha(page)` runs the platform CAPTCHA solver on the current `page`, as in a saved block,
+  and raises when the CAPTCHA stays unsolved. A solve can take up to about two minutes, longer than the
+  60-second default `timeout_seconds`, and a call that times out mid-solve stops the interpreter. For a
+  distorted-text image CAPTCHA, `await solve_captcha(page, image=<selector>, input=<selector>)` reads the
+  image with the same OCR a saved block uses and types the text into the answer field, raising with
+  nothing typed when no text is read. It requires image OCR enabled for the organization; otherwise it
+  raises.
+- `await search_web(query, max_results=10)` is the saved block's search helper: it calls the server-side
+  search API, touches no tab, and returns the same result shape as the `search_web` tool.
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
-  `click_and_download`, and `files`.
+  `click_and_download`, and `files`. A saved block claims a download with
+  `"""
+    + DownloadClaimHelperContract().call
+    + """`, which is not available here;
+  `get_block_schema` for block type `code` returns its parameters.
 
 Not available: imports, names starting with `_`, event listeners (`page.on`, `expect_*`), cookies,
 request interception, and new browser contexts. Using one returns an error that says so.
@@ -138,6 +154,7 @@ block should read and promoted unchanged.
 Limits: code up to 20,000 characters; `value` up to 32,000 characters of JSON and `stdout` up to 16 KB,
 cut beyond that, so return or print a summary; the first 50 operations are listed; a chat turn holds at
 most 32 files of 16 MB each."""
+)
 
 TOOL_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -361,7 +378,7 @@ def _take_interruption_note(host: BrowserCodeHost) -> dict[str, Any]:
     if operation is not None:
         note["last_operation"] = _operation_fact(operation)
         if operation.succeeded is None:
-            note["page_state"] = "unknown: that operation reached the browser without a reply"
+            note["page_after_call"] = "unknown: that operation reached the browser without a reply"
     return {"previous_call_interrupted": note}
 
 
@@ -522,7 +539,7 @@ async def run_browser_code(
             else result
         )
         scrubbed = scrub_model_facing_tool_result(copilot_ctx, result_to_scrub)
-        if retained_reference is not None:
+        if retained_reference is not None and scrubbed and not is_redaction_withheld(scrubbed):
             # This server-generated capability is not derived from credential data. Scrubbing a coincidental
             # secret substring would corrupt the lookup key and make exact-source promotion impossible.
             scrubbed["executed_source_reference"] = retained_reference
@@ -717,7 +734,7 @@ async def _run_bound_cell(
             if last is not None and not cell.operations:
                 ended: dict[str, Any] = {"last_operation": _operation_fact(last)}
                 if last.succeeded is None:
-                    ended["page_state"] = "unknown: that operation reached the browser without a reply"
+                    ended["page_after_call"] = "unknown: that operation reached the browser without a reply"
                 notes["session_ended_during_call"] = ended
             await _discard_session(host)
         if recovering:

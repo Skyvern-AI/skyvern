@@ -12,7 +12,7 @@ from skyvern.utils.phone_validation import (
     normalize_phone_identifier,
 )
 
-PhoneNumberStatus = Literal["active", "disabled", "released", "quarantined"]
+PhoneNumberStatus = Literal["active", "disabled", "released", "quarantined", "provisioning"]
 PHONE_NUMBER_STATUSES: frozenset[str] = frozenset(get_args(PhoneNumberStatus))
 SMSConfigMode = Literal["connected", "manual", "managed"]
 SMS_CONFIG_MODES: frozenset[str] = frozenset(get_args(SMSConfigMode))
@@ -49,6 +49,7 @@ class OrganizationPhoneNumber(BaseModel):
     price_cents: int | None = None
     status: PhoneNumberStatus
     quarantined_until: datetime | None = None
+    provisioning_claimed_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

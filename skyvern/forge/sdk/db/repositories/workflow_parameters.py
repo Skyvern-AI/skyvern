@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import structlog
-from sqlalchemy import cast, func, or_, select
+from sqlalchemy import cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import defer, load_only
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.ask_user import (
     QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    CredentialDeleteOutcome,
     QuestionInteraction,
     QuestionResponse,
+    claim_credential_deletion,
+    credential_deletion_lease_expired,
+    fail_unrecorded_credential_deletion,
+    finish_credential_deletion,
     question_wait_is_live,
     resolve_question_response,
 )
@@ -24,7 +32,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_js
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
-from skyvern.forge.sdk.db.base_alchemy_db import read_with_disconnect_recovery
+from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory, read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import (
@@ -33,6 +41,7 @@ from skyvern.forge.sdk.db.exceptions import (
     DuplicateCopilotTurnError,
     NotFoundError,
 )
+from skyvern.forge.sdk.db.id import generate_credential_parameter_id
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -46,7 +55,6 @@ from skyvern.forge.sdk.db.models import (
     OnePasswordCredentialParameterModel,
     OutputParameterModel,
     TaskGenerationModel,
-    TaskModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowCopilotCompletionCriteriaSetModel,
@@ -65,13 +73,14 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_STEER_MESSAGES_PER_TURN,
     CopilotAttachedFile,
     CopilotCandidateDisposition,
     CopilotPendingTurn,
     CopilotProposalMetadata,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
@@ -79,6 +88,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
+    WorkflowCopilotMessageFeedbackRating,
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.trace import traced
@@ -96,11 +106,25 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
 
 PENDING_TURN_RETENTION = timedelta(days=30)
+# ponytail: SQLite has no advisory locks and runs in one process, so an in-process set stands in.
+_SQLITE_FINALISING_TURNS: set[str] = set()
+
+
+def _turn_finalisation_lock_key(workflow_copilot_chat_id: str, turn_id: str) -> str:
+    return f"copilot_turn_finalisation:{workflow_copilot_chat_id}:{turn_id}"
+
+
+async def _turn_finalisation_held(session: AsyncSession, key: str) -> bool:
+    if session.bind is not None and session.bind.dialect.name == "sqlite":
+        return key in _SQLITE_FINALISING_TURNS
+    acquired = await session.scalar(text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": key})
+    return not acquired
 
 
 def _pending_turn_id_for_idempotency_digest(
@@ -246,9 +270,11 @@ def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
         for question in entry.get("question_interactions") or []:
             if not isinstance(question, dict):
                 continue
-            resolved_at = _parse_pending_turn_timestamp(question.get("resolved_at"))
-            if resolved_at is not None:
-                last_activity = max(last_activity, resolved_at) if last_activity else resolved_at
+            review = question.get("credential_delete_review") or {}
+            for stamp in (question.get("resolved_at"), review.get("claimed_at")):
+                activity_at = _parse_pending_turn_timestamp(stamp)
+                if activity_at is not None:
+                    last_activity = max(last_activity, activity_at) if last_activity else activity_at
             client_seen = _parse_pending_turn_timestamp(
                 entry.get("question_client_seen_at")
             ) or _parse_pending_turn_timestamp(question.get("created_at"))
@@ -273,6 +299,16 @@ def _dump_attached_files(attached_files: list[CopilotAttachedFile] | None) -> li
 
 class WorkflowParametersRepository(BaseRepository):
     """Database operations for workflow parameters, copilot chat, task generation, actions, and runs."""
+
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        db_engine: AsyncEngine | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._db_engine = db_engine
 
     @db_operation("create_workflow_parameter")
     async def create_workflow_parameter(
@@ -492,7 +528,8 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_id: str,
         parameters: list[PARAMETER_TYPE],
     ) -> None:
-        """Reconcile persisted WorkflowParameter + OutputParameter rows against ``parameters``.
+        """Reconcile persisted WorkflowParameter + OutputParameter rows, and each CredentialParameter row's
+        ``credential_id`` binding, against ``parameters``.
 
         Preserves primary keys on in-place updates (workflow-run FKs reference
         them) and mutates each matched incoming parameter so its ID equals the
@@ -582,6 +619,49 @@ class WorkflowParametersRepository(BaseRepository):
                 continue
             if row.deleted_at is None:
                 row.deleted_at = now
+
+        desired_credentials = {p.key: p for p in parameters if isinstance(p, CredentialParameter)}
+        live_credential_rows = (
+            await session.scalars(
+                select(CredentialParameterModel)
+                .filter_by(workflow_id=workflow_id)
+                .where(CredentialParameterModel.deleted_at.is_(None))
+            )
+        ).all()
+        for row in live_credential_rows:
+            desired = desired_credentials.pop(row.key, None)
+            if desired is None:
+                row.deleted_at = now
+            elif row.credential_id != desired.credential_id:
+                # Run search dates a binding by its row, so the replaced credential stays as a closed row.
+                session.add(
+                    CredentialParameterModel(
+                        workflow_id=workflow_id,
+                        key=row.key,
+                        credential_id=row.credential_id,
+                        created_at=row.created_at,
+                        deleted_at=now,
+                    )
+                )
+                row.credential_id = desired.credential_id
+                row.created_at = now
+        for parameter in desired_credentials.values():
+            parameter_id = parameter.credential_parameter_id
+            if await session.get(CredentialParameterModel, parameter_id) is not None:
+                parameter_id = generate_credential_parameter_id()
+            session.add(
+                CredentialParameterModel(
+                    credential_parameter_id=parameter_id,
+                    workflow_id=workflow_id,
+                    key=parameter.key,
+                    description=parameter.description,
+                    credential_id=parameter.credential_id,
+                    credential_ids=parameter.credential_ids,
+                    selection_strategy=parameter.selection_strategy,
+                    fallback_credential_ids=parameter.fallback_credential_ids,
+                    fallback_trigger=parameter.fallback_trigger,
+                )
+            )
 
     @db_operation("get_workflow_output_parameters")
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
@@ -795,6 +875,7 @@ class WorkflowParametersRepository(BaseRepository):
         proposal: dict[str, Any],
         owner_turn_id: str,
         canonical_fingerprint: str,
+        canonical_title: str | None,
         disposition: ProposalDisposition,
         expected_owner_turn_id: str | None,
         expected_revision: int | None,
@@ -811,6 +892,7 @@ class WorkflowParametersRepository(BaseRepository):
                 owner_turn_id=owner_turn_id,
                 revision=revision,
                 canonical_fingerprint=canonical_fingerprint,
+                canonical_title=canonical_title,
                 disposition=disposition,
             )
             chat.proposed_workflow = {
@@ -912,6 +994,50 @@ class WorkflowParametersRepository(BaseRepository):
             await session.refresh(chat)
             return WorkflowCopilotChat.model_validate(chat)
 
+    @db_operation("claim_untokened_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def claim_untokened_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_proposal: dict[str, Any],
+        owner_turn_id: str,
+    ) -> tuple[WorkflowCopilotChat, int | None]:
+        """Tokens a tokenless proposal, already claimed, and returns the saved version read in the claim's transaction."""
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            if chat.proposed_workflow != expected_proposal:
+                raise CopilotProposalConflictError("Copilot proposal changed")
+            # The proposal records no base, so this is the only version Accept can hold a later save against.
+            # Same filter as WorkflowsRepository.get_workflow_by_permanent_id, the read expected_version uses.
+            base_version = await session.scalar(
+                select(WorkflowModel.version)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == chat.workflow_permanent_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
+                .order_by(WorkflowModel.version.desc())
+                .limit(1)
+            )
+            # It was published against no recorded canonical, so the token records none. An empty fingerprint
+            # never matches, which keeps reads from showing it while claimed or after a write whose clear failed.
+            metadata = CopilotProposalMetadata(
+                owner_turn_id=owner_turn_id,
+                revision=1,
+                canonical_fingerprint="",
+                disposition="accepting",
+                claimed_at=datetime.now(timezone.utc),
+            )
+            chat.proposed_workflow = {
+                **expected_proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat), base_version
+
     @db_operation("release_workflow_copilot_candidate_claim", expected_errors=(CopilotProposalConflictError,))
     async def release_workflow_copilot_candidate_claim(
         self,
@@ -922,6 +1048,7 @@ class WorkflowParametersRepository(BaseRepository):
         expected_revision: int,
         expected_claimed_at: datetime | None,
         disposition: ProposalDisposition,
+        restore_untokened: bool = False,
     ) -> WorkflowCopilotChat:
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
@@ -935,11 +1062,16 @@ class WorkflowParametersRepository(BaseRepository):
                 or current.claimed_at != expected_claimed_at
             ):
                 raise CopilotProposalConflictError("Copilot proposal claim changed")
-            metadata = current.model_copy(update={"disposition": disposition, "claimed_at": None})
-            chat.proposed_workflow = {
-                **chat.proposed_workflow,
-                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
-            }
+            if restore_untokened:
+                chat.proposed_workflow = {
+                    key: value for key, value in chat.proposed_workflow.items() if key != COPILOT_PROPOSAL_METADATA_KEY
+                }
+            else:
+                metadata = current.model_copy(update={"disposition": disposition, "claimed_at": None})
+                chat.proposed_workflow = {
+                    **chat.proposed_workflow,
+                    COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                }
             await session.commit()
             await session.refresh(chat)
             return WorkflowCopilotChat.model_validate(chat)
@@ -955,6 +1087,7 @@ class WorkflowParametersRepository(BaseRepository):
         expected_disposition: CopilotCandidateDisposition | None = None,
         expected_claimed_at: datetime | None = None,
         auto_accept: bool | None = None,
+        record_acceptance: bool = False,
     ) -> WorkflowCopilotChat:
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
@@ -966,12 +1099,42 @@ class WorkflowParametersRepository(BaseRepository):
                 or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
             ):
                 raise CopilotProposalConflictError("Copilot proposal disposition changed")
+            if record_acceptance:
+                if current is None:
+                    raise CopilotProposalConflictError("Copilot proposal has no owner to record")
+                accepted_turn_ids = list(chat.accepted_turn_ids or [])
+                if current.owner_turn_id not in accepted_turn_ids:
+                    accepted_turn_ids.append(current.owner_turn_id)
+                chat.accepted_turn_ids = accepted_turn_ids
             chat.proposed_workflow = None
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
             await session.commit()
             await session.refresh(chat)
             return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("get_workflow_copilot_claim_expires_in")
+    async def get_workflow_copilot_claim_expires_in(
+        self, organization_id: str, workflow_permanent_id: str
+    ) -> float | None:
+        """Seconds left on the longest live Accept claim held by any chat on the workflow."""
+        proposal = WorkflowCopilotChatModel.proposed_workflow
+        async with self.Session() as session:
+            claims = (
+                await session.scalars(
+                    select(proposal[COPILOT_PROPOSAL_METADATA_KEY])
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(proposal[(COPILOT_PROPOSAL_METADATA_KEY, "disposition")].as_string() == "accepting")
+                )
+            ).all()
+        now = datetime.now(timezone.utc)
+        remaining = [
+            metadata.claim_expires_in(now)
+            for claim in claims
+            if (metadata := copilot_proposal_metadata({COPILOT_PROPOSAL_METADATA_KEY: claim})) is not None
+        ]
+        return max((seconds for seconds in remaining if seconds is not None), default=None)
 
     @db_operation("create_workflow_copilot_chat_message")
     async def create_workflow_copilot_chat_message(
@@ -1002,6 +1165,42 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_message)
             return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    @db_operation("set_workflow_copilot_chat_message_feedback")
+    async def set_workflow_copilot_chat_message_feedback(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_copilot_chat_message_id: str,
+        rating: WorkflowCopilotMessageFeedbackRating | None,
+        reason: str | None,
+    ) -> WorkflowCopilotChatMessage | None:
+        async with self.Session() as session:
+            message = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .filter(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .filter(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
+                        == workflow_copilot_chat_message_id
+                    )
+                    .filter(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                )
+            ).first()
+            if message is None:
+                return None
+            if rating is None:
+                message.feedback_rating = None
+                message.feedback_reason = None
+                message.feedback_at = None
+            else:
+                message.feedback_rating = rating
+                message.feedback_reason = reason or None
+                message.feedback_at = naive_utc_now()
+            await session.commit()
+            await session.refresh(message)
+            return convert_to_workflow_copilot_chat_message(message, self.debug_enabled)
 
     @db_operation("start_copilot_turn")
     async def start_copilot_turn(
@@ -1102,11 +1301,28 @@ class WorkflowParametersRepository(BaseRepository):
         chat.pending_turns = {**(chat.pending_turns or {}), entry.turn_id: entry.model_dump(mode="json")}
 
     @staticmethod
-    def _expire_absent_question_client(entry: CopilotPendingTurn, now: datetime) -> bool:
-        expired = False
+    def _expire_credential_deletion_leases(entry: CopilotPendingTurn, now: datetime) -> bool:
+        expired = [
+            item.interaction_id for item in entry.question_interactions if credential_deletion_lease_expired(item, now)
+        ]
+        if expired:
+            LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+            entry.question_interactions = [
+                fail_unrecorded_credential_deletion(item) if item.interaction_id in expired else item
+                for item in entry.question_interactions
+            ]
+        return bool(expired)
+
+    @staticmethod
+    def _question_in_entry(entry: CopilotPendingTurn, interaction_id: str) -> QuestionInteraction:
+        return next(item for item in entry.question_interactions if item.interaction_id == interaction_id)
+
+    @classmethod
+    def _expire_absent_question_client(cls, entry: CopilotPendingTurn, now: datetime) -> bool:
+        expired = cls._expire_credential_deletion_leases(entry, now)
         for item in entry.question_interactions:
             if (
-                item.status == "pending"
+                item.awaiting_answer
                 and now - (entry.question_client_seen_at or item.created_at) >= QUESTION_CLIENT_GRACE
             ):
                 item.status = "interrupted"
@@ -1160,7 +1376,7 @@ class WorkflowParametersRepository(BaseRepository):
             if self._expire_absent_question_client(entry, now):
                 self._store_question_turn(chat, entry)
                 await session.commit()
-                return item
+                return self._question_in_entry(entry, interaction_id)
             if item.status == "pending" and (
                 entry.question_heartbeat_at is None or now - entry.question_heartbeat_at >= timedelta(seconds=5)
             ):
@@ -1177,6 +1393,7 @@ class WorkflowParametersRepository(BaseRepository):
         interaction_id: str,
         response: QuestionResponse,
         *,
+        account_group_decision: AccountGroupDecision | None = None,
         preflight_only: bool = False,
     ) -> QuestionInteraction:
         """Validate before external screening, then recheck and commit the screened reply."""
@@ -1200,17 +1417,22 @@ class WorkflowParametersRepository(BaseRepository):
                 raise
             if item.status == "resolved":
                 return item
-            if self._expire_absent_question_client(entry, datetime.now(timezone.utc)):
-                self._store_question_turn(chat, entry)
-                await session.commit()
-            if item.status != "pending":
-                raise ValueError("The question is no longer active")
-            if not question_wait_is_live(entry.question_heartbeat_at, datetime.now(timezone.utc)):
+            now = datetime.now(timezone.utc)
+            expired = self._expire_absent_question_client(entry, now)
+            if item.awaiting_answer and not question_wait_is_live(entry.question_heartbeat_at, now):
                 item.status = "interrupted"
                 self._store_question_turn(chat, entry)
                 await session.commit()
                 raise ValueError("The question's execution was interrupted")
-            resolved = resolve_question_response(item, response)
+            try:
+                if not item.awaiting_answer:
+                    raise ValueError("The question is no longer active")
+                resolved = resolve_question_response(item, response, account_group_decision)
+            except ValueError:
+                if expired:
+                    self._store_question_turn(chat, entry)
+                    await session.commit()
+                raise
             if preflight_only:
                 entry.question_client_seen_at = datetime.now(timezone.utc)
                 self._store_question_turn(chat, entry)
@@ -1223,6 +1445,156 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             return resolved
 
+    @db_operation("record_copilot_account_group_submission")
+    async def record_copilot_account_group_submission(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None:
+                raise ValueError("This question has no account review")
+            item.account_group_review.workflow_run_group_id = workflow_run_group_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("claim_copilot_credential_deletion")
+    async def claim_copilot_credential_deletion(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        approved_ids: list[str],
+        confirmed_by: str | None,
+    ) -> QuestionInteraction:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            now = datetime.now(timezone.utc)
+            expired = self._expire_absent_question_client(entry, now)
+            if item.awaiting_answer and not question_wait_is_live(entry.question_heartbeat_at, now):
+                item.status = "interrupted"
+                self._store_question_turn(chat, entry)
+                await session.commit()
+                raise ValueError("The question's execution was interrupted")
+            try:
+                claimed = claim_credential_deletion(item, approved_ids, confirmed_by)
+            except ValueError:
+                if expired:
+                    self._store_question_turn(chat, entry)
+                    await session.commit()
+                raise
+            entry.question_interactions = [
+                claimed if prior.interaction_id == interaction_id else prior for prior in entry.question_interactions
+            ]
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return claimed
+
+    @db_operation("record_copilot_credential_deletion")
+    async def record_copilot_credential_deletion(
+        self, organization_id: str, chat_id: str, interaction_id: str, outcomes: list[CredentialDeleteOutcome]
+    ) -> QuestionInteraction:
+        """Resolve a claimed deletion with its outcomes, in the pending turn or, once that turn ended, its row."""
+        return await self._settle_credential_deletion(
+            organization_id, chat_id, interaction_id, lambda item: finish_credential_deletion(item, outcomes)
+        )
+
+    @db_operation("fail_copilot_credential_deletion")
+    async def fail_copilot_credential_deletion(
+        self, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction:
+        return await self._settle_credential_deletion(
+            organization_id, chat_id, interaction_id, fail_unrecorded_credential_deletion
+        )
+
+    @db_operation("expire_copilot_credential_deletion_leases")
+    async def expire_copilot_credential_deletion_leases(
+        self, organization_id: str, chat_id: str, interactions: list[QuestionInteraction]
+    ) -> list[QuestionInteraction]:
+        now = datetime.now(timezone.utc)
+        expired = [item.interaction_id for item in interactions if credential_deletion_lease_expired(item, now)]
+        if not expired:
+            return interactions
+        LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+        settled = {
+            interaction_id: await self._settle_credential_deletion(
+                organization_id, chat_id, interaction_id, fail_unrecorded_credential_deletion
+            )
+            for interaction_id in expired
+        }
+        return [settled.get(item.interaction_id, item) for item in interactions]
+
+    async def _settle_credential_deletion(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        settle: Callable[[QuestionInteraction], QuestionInteraction],
+    ) -> QuestionInteraction:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                entry = None
+                stored = await self._narrative_question(session, organization_id, chat_id, interaction_id)
+                if stored is None:
+                    raise
+                item = stored
+            if item.status != "pending":
+                LOG.warning("copilot_credential_deletion_settled_after_resolution", interaction_id=interaction_id)
+                return item
+            resolved = settle(item)
+            if entry is not None:
+                entry.question_interactions = [
+                    resolved if prior.interaction_id == interaction_id else prior
+                    for prior in entry.question_interactions
+                ]
+                self._store_question_turn(chat, entry)
+            await self._patch_narrative_questions(session, organization_id, chat_id, [resolved])
+            await session.commit()
+            return resolved
+
+    @staticmethod
+    async def _narrative_question(
+        session: AsyncSession, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction | None:
+        payloads = await session.scalars(
+            select(WorkflowCopilotChatMessageModel.narrative_payload)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+        )
+        for payload in payloads:
+            for raw in (payload or {}).get("questionInteractions", []):
+                if raw.get("interaction_id") == interaction_id:
+                    return QuestionInteraction.model_validate(raw)
+        return None
+
+    @staticmethod
+    async def _patch_narrative_questions(
+        session: AsyncSession, organization_id: str, chat_id: str, interactions: list[QuestionInteraction]
+    ) -> None:
+        by_id = {item.interaction_id: item.model_dump(mode="json") for item in interactions}
+        messages = await session.scalars(
+            select(WorkflowCopilotChatMessageModel)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+            .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+            .options(
+                load_only(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id,
+                    WorkflowCopilotChatMessageModel.narrative_payload,
+                )
+            )
+        )
+        for message in messages:
+            payload: dict[str, Any] = dict(message.narrative_payload or {})
+            questions: list[dict[str, Any]] = payload.get("questionInteractions", [])
+            if any(raw.get("interaction_id") in by_id for raw in questions):
+                payload["questionInteractions"] = [by_id.get(raw["interaction_id"], raw) for raw in questions]
+                message.narrative_payload = payload
+
     @db_operation("interrupt_copilot_question")
     async def interrupt_copilot_question(
         self, organization_id: str, chat_id: str, interaction_id: str, *, stale_only: bool = False
@@ -1233,13 +1605,15 @@ class WorkflowParametersRepository(BaseRepository):
                 entry, item = self._question_in_pending(chat, interaction_id)
             except NotFoundError:
                 return None
-            if stale_only and question_wait_is_live(entry.question_heartbeat_at, datetime.now(timezone.utc)):
-                return item
-            if item.status == "pending":
+            now = datetime.now(timezone.utc)
+            changed = self._expire_credential_deletion_leases(entry, now)
+            item = self._question_in_entry(entry, interaction_id)
+            if item.awaiting_answer and not (stale_only and question_wait_is_live(entry.question_heartbeat_at, now)):
                 item.status = "interrupted"
+                changed = True
+            if changed:
                 self._store_question_turn(chat, entry)
                 await session.commit()
-
             return item
 
     @db_operation("cancel_copilot_questions")
@@ -1251,13 +1625,88 @@ class WorkflowParametersRepository(BaseRepository):
                 entry = CopilotPendingTurn.model_validate(raw)
                 if entry.cancel_token != cancel_token:
                     continue
+                self._expire_credential_deletion_leases(entry, datetime.now(timezone.utc))
                 for item in entry.question_interactions:
-                    if item.status == "pending":
+                    if item.awaiting_answer:
                         item.status = "cancelled"
                         changed = True
                 self._store_question_turn(chat, entry)
             await session.commit()
             return changed
+
+    @db_operation("record_copilot_steer_message", expected_errors=(ValueError,))
+    async def record_copilot_steer_message(
+        self,
+        organization_id: str,
+        chat_id: str,
+        cancel_token: str,
+        steer_id: str,
+        steer: CopilotSteerMessage | None = None,
+    ) -> CopilotSteerMessage | None:
+        """Validate the running turn before external screening (``steer`` None), then recheck and record.
+
+        An already-recorded ``steer_id`` returns the stored message, so a retry never records twice.
+        """
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry = next(
+                (
+                    candidate
+                    for candidate in map(CopilotPendingTurn.model_validate, (chat.pending_turns or {}).values())
+                    if candidate.cancel_token == cancel_token and candidate.recovering_at is None
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError("The Copilot turn has ended")
+            existing = next((item for item in entry.steer_messages if item.steer_id == steer_id), None)
+            if existing is not None:
+                return existing
+            if len(entry.steer_messages) >= MAX_STEER_MESSAGES_PER_TURN:
+                raise ValueError("This Copilot turn cannot take more messages")
+            if steer is None:
+                return None
+            entry.steer_messages.append(steer)
+            entry.steer_messages.sort(key=lambda item: item.created_at)
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return steer
+
+    @db_operation("undelivered_copilot_steer_ids")
+    async def undelivered_copilot_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
+        async with self.Session() as session:
+            pending_turns = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel.pending_turns)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                )
+            ).first()
+        raw = (pending_turns or {}).get(turn_id)
+        if raw is None:
+            return set()
+        entry = CopilotPendingTurn.model_validate(raw)
+        return {item.steer_id for item in entry.steer_messages if item.delivered_at is None}
+
+    @db_operation("take_copilot_steer_messages")
+    async def take_copilot_steer_messages(
+        self, organization_id: str, chat_id: str, turn_id: str
+    ) -> list[CopilotSteerMessage]:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            raw = (chat.pending_turns or {}).get(turn_id)
+            if raw is None:
+                return []
+            entry = CopilotPendingTurn.model_validate(raw)
+            undelivered = [item for item in entry.steer_messages if item.delivered_at is None]
+            if not undelivered:
+                return []
+            delivered_at = datetime.now(timezone.utc)
+            for item in undelivered:
+                item.delivered_at = delivered_at
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return undelivered
 
     @db_operation("claim_pending_copilot_turn")
     async def claim_pending_copilot_turn(
@@ -1293,17 +1742,92 @@ class WorkflowParametersRepository(BaseRepository):
             ):
                 return False
             if any(
-                item.resolved_at is not None and item.resolved_at > claim_before
+                item.last_activity_at is not None and item.last_activity_at > claim_before
                 for item in question_turn.question_interactions
             ):
                 return False
             recovering_at = _parse_pending_turn_timestamp(entry.get("recovering_at"))
             if recovering_at is not None and recovering_at > claim_before:
                 return False
+            if await _turn_finalisation_held(session, _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)):
+                return False
+            credential_resumed_at = _parse_pending_turn_timestamp(entry.get("credential_resumed_at"))
+            if credential_resumed_at is not None and credential_resumed_at > claim_before:
+                return False
             pending[turn_id] = {**entry, "recovering_at": datetime.now(timezone.utc).isoformat()}
             chat.pending_turns = pending
             await session.commit()
             return True
+
+    @db_operation("record_pending_copilot_turn_credential_resume")
+    async def record_pending_copilot_turn_credential_resume(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            pending[turn_id] = {**entry, "credential_resumed_at": datetime.now(timezone.utc).isoformat()}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("claim_pending_copilot_turn_for_finalisation")
+    async def claim_pending_copilot_turn_for_finalisation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> Literal["claimed", "reconciling", "no_marker"]:
+        """ "claimed" means the live handler owns the turn and "reconciling" that reconcile does. Call it inside
+        ``hold_copilot_turn_finalisation``: reconcile cannot claim a turn while that lock is held."""
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return "no_marker"
+            entry = (chat.pending_turns or {}).get(turn_id)
+            if not isinstance(entry, dict):
+                return "no_marker"
+            return "reconciling" if entry.get("recovering_at") is not None else "claimed"
+
+    @asynccontextmanager
+    async def hold_copilot_turn_finalisation(self, workflow_copilot_chat_id: str, turn_id: str) -> AsyncIterator[None]:
+        """Keep reconcile off this turn while the live handler writes its outcome. The lock lives on this
+        transaction's connection, so a dead process releases it and a stalled live one keeps it."""
+        if self._db_engine is None:
+            raise RuntimeError("Copilot turn finalisation locking requires a database engine")
+        key = _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)
+        if self._db_engine.dialect.name == "sqlite":
+            _SQLITE_FINALISING_TURNS.add(key)
+            try:
+                yield
+            finally:
+                _SQLITE_FINALISING_TURNS.discard(key)
+            return
+        # A raw connection, never the ambient session: the handler's own writes commit on their own.
+        async with self._db_engine.connect() as connection, connection.begin():
+            await connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+            yield
 
     @db_operation("clear_pending_copilot_turn")
     async def clear_pending_copilot_turn(
@@ -1324,9 +1848,18 @@ class WorkflowParametersRepository(BaseRepository):
             if chat is None:
                 return
             pending = dict(chat.pending_turns or {})
-            if pending.pop(turn_id, None) is None:
+            popped = pending.pop(turn_id, None)
+            if popped is None:
                 return
             chat.pending_turns = pending
+            # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since.
+            claimed = [
+                item
+                for item in CopilotPendingTurn.model_validate(popped).question_interactions
+                if item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None
+            ]
+            if claimed:
+                await self._patch_narrative_questions(session, organization_id, workflow_copilot_chat_id, claimed)
             await session.commit()
 
     @db_operation("record_superseded_build_test_run")
@@ -1962,6 +2495,8 @@ class WorkflowParametersRepository(BaseRepository):
         action_id: str,
         reasoning: str,
     ) -> Action:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the rows it targets are recorded without a reasoning.
         async with self.Session() as session:
             action = (
                 await session.scalars(
@@ -1974,28 +2509,3 @@ class WorkflowParametersRepository(BaseRepository):
                 await session.refresh(action)
                 return Action.model_validate(action)
             raise NotFoundError(f"Action {action_id}")
-
-    @db_operation("retrieve_action_plan")
-    async def retrieve_action_plan(self, task: Task) -> list[Action]:
-        async with self.Session() as session:
-            subquery = (
-                select(TaskModel.task_id)
-                .filter(TaskModel.url == task.url)
-                .filter(TaskModel.navigation_goal == task.navigation_goal)
-                .filter(TaskModel.status == TaskStatus.completed)
-                .order_by(TaskModel.created_at.desc())
-                .limit(1)
-                .subquery()
-            )
-
-            query = (
-                select(ActionModel)
-                .filter(ActionModel.task_id == subquery.c.task_id)
-                .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
-            )
-
-            actions = (await session.scalars(query)).all()
-            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
-            # validating the row directly drops every subclass field a cached action was recorded
-            # with. Matches every other retrieval site.
-            return [hydrate_action(action) for action in actions]

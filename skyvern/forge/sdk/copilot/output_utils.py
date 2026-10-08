@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import itertools
 import json
 import re
 import unicodedata
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 import structlog
 from pydantic import JsonValue
 
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
@@ -34,6 +36,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketPageState,
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
+    LoopInputs,
     append_omission_notice,
     coerce_block_action_observations,
     coerce_block_end_urls,
@@ -47,9 +50,13 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionSelectorCandidate,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_raw_secrets_in_object
+from skyvern.forge.sdk.copilot.secret_redaction import (
+    redact_raw_secrets_for_prompt,
+    redact_raw_secrets_in_object,
+    redact_totp_runtime_values,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
-from skyvern.schemas.workflows import BlockType
+from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_settings
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -61,6 +68,7 @@ _INTERNAL_RUN_OUTCOME_RECORDED_KEY = "_copilot_internal_run_outcome_recorded"
 _INTERNAL_GOAL_PATH_OMISSIONS_KEY = "_copilot_internal_goal_path_omissions"
 _BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken successfully]"
 BUILD_TEST_PACKET_KEY = "build_test_packet"
+LOOP_INPUTS_KEY = "loop_inputs"
 
 _BUILD_TEST_PACKET_MAX_CHARS = 47_000
 _BUILD_TEST_WORKFLOW_MAX_CHARS = 30_000
@@ -89,6 +97,22 @@ _BUILD_TEST_LOCATOR_CANDIDATE_MAX_ITEMS = 6
 _BUILD_TEST_LOCATOR_SELECTOR_MAX_CHARS = 240
 _BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS = 240
 _BUILD_TEST_IDENTITY_LABEL_MAX_CHARS = 2_048
+_LOOP_INPUT_MAX_CHARS = {
+    "workflow_run_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "workflow_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "workflow_permanent_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].block_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].enclosing_loop_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].loop_over_parameter_key": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].producer_block_label": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].producer_output_parameter_id": _BUILD_TEST_IDENTIFIER_MAX_CHARS,
+    "loops[].loop_variable_reference": 200,
+}
+# The exact notices bounded_loop_inputs emits; the handoff cannot re-derive them from already-shortened values.
+LOOP_INPUT_OMISSION_NOTICES = frozenset(
+    f"loop_inputs.{field_name} shortened at {max_chars} characters."
+    for field_name, max_chars in _LOOP_INPUT_MAX_CHARS.items()
+)
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
@@ -185,6 +209,24 @@ def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
     return isinstance(type_value, str) and type_value.upper() in COPILOT_RESPONSE_TYPES
 
 
+def _last_envelope_in(text: str) -> dict[str, Any] | None:
+    # A reply can hold a draft object before the final one, so the span from the first brace to the
+    # last is not one JSON value; each object is decoded where it starts and the last envelope wins.
+    decoder = json.JSONDecoder(strict=False)
+    found: dict[str, Any] | None = None
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            # The next brace may open an object nested in this unparseable one, which is not a reply.
+            break
+        if isinstance(value, dict) and _looks_like_envelope(value):
+            found = value
+        index = text.find("{", end)
+    return found
+
+
 def _text_looks_envelope_shaped(text: str) -> bool:
     # require leading `{` so prose that merely quotes the field names (e.g.,
     # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
@@ -220,13 +262,9 @@ def parse_final_response(text: str) -> dict[str, Any]:
             return parsed
         cleaned = label_stripped
 
-    first = cleaned.find("{")
-    last = cleaned.rfind("}")
-    # skip when the slice equals the full string — _try_loads_dict above already tried it
-    if first != -1 and last > first and not (first == 0 and last == len(cleaned) - 1):
-        parsed = _try_loads_dict(cleaned[first : last + 1])
-        if parsed is not None and _looks_like_envelope(parsed):
-            return parsed
+    parsed = _last_envelope_in(cleaned)
+    if parsed is not None:
+        return parsed
 
     if _text_looks_envelope_shaped(cleaned):
         sniffed_type = _sniff_response_type(cleaned)
@@ -241,26 +279,6 @@ def parse_final_response(text: str) -> dict[str, Any]:
         return {"type": sniffed_type, "user_response": "Done."}
 
     return {"type": "REPLY", "user_response": text}
-
-
-# A `block_type:` line whose value is a real BlockType, or a `workflow_definition:`
-# line — both keyed to canonical identifiers and anchored at line start, so inline
-# prose ("the block_type field") cannot trip them. The optional quote group also
-# matches the JSON serialization (`"block_type": "navigation"`).
-_BLOCK_TYPE_LINE_RE = re.compile(
-    r'^\s*-?\s*["\']?block_type["\']?\s*:\s*["\']?(?:' + "|".join(re.escape(bt.value) for bt in BlockType) + r")\b",
-    re.MULTILINE,
-)
-_WORKFLOW_DEFINITION_LINE_RE = re.compile(r'^\s*["\']?workflow_definition["\']?\s*:', re.MULTILINE)
-
-
-def looks_like_workflow_yaml_in_chat(text: Any) -> bool:
-    """Return True when ``text`` contains serialized Skyvern workflow YAML/JSON."""
-    if not isinstance(text, str):
-        return False
-    if "block_type" not in text and "workflow_definition" not in text:
-        return False
-    return bool(_WORKFLOW_DEFINITION_LINE_RE.search(text) or _BLOCK_TYPE_LINE_RE.search(text))
 
 
 def extract_screenshot_b64(result: dict[str, Any]) -> str | None:
@@ -781,6 +799,40 @@ def _bounded_packet_page_state(
     return page_state.model_copy(update=updates)
 
 
+def bounded_loop_inputs(loop_inputs: LoopInputs, notices: list[str]) -> LoopInputs:
+    def bounded(value: str | None, field_name: str) -> str | None:
+        return _bounded_packet_string(
+            value,
+            field_name=f"loop_inputs.{field_name}",
+            max_chars=_LOOP_INPUT_MAX_CHARS[field_name],
+            notices=notices,
+        )
+
+    loops = [
+        loop.model_copy(
+            update={
+                "block_label": bounded(loop.block_label, "loops[].block_label"),
+                "enclosing_loop_label": bounded(loop.enclosing_loop_label, "loops[].enclosing_loop_label"),
+                "loop_over_parameter_key": bounded(loop.loop_over_parameter_key, "loops[].loop_over_parameter_key"),
+                "producer_block_label": bounded(loop.producer_block_label, "loops[].producer_block_label"),
+                "producer_output_parameter_id": bounded(
+                    loop.producer_output_parameter_id, "loops[].producer_output_parameter_id"
+                ),
+                "loop_variable_reference": bounded(loop.loop_variable_reference, "loops[].loop_variable_reference"),
+            }
+        )
+        for loop in loop_inputs.loops
+    ]
+    return loop_inputs.model_copy(
+        update={
+            "workflow_run_id": bounded(loop_inputs.workflow_run_id, "workflow_run_id"),
+            "workflow_id": bounded(loop_inputs.workflow_id, "workflow_id"),
+            "workflow_permanent_id": bounded(loop_inputs.workflow_permanent_id, "workflow_permanent_id"),
+            "loops": loops,
+        }
+    )
+
+
 def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]) -> BuildTestEvidencePacket:
     return packet.model_copy(
         update={
@@ -803,6 +855,24 @@ def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]
             "omission_notices": notices,
         }
     )
+
+
+def _compact_loop_inputs(packet: BuildTestEvidencePacket, notices: list[str]) -> BuildTestEvidencePacket:
+    loop_inputs = packet.run.loop_inputs
+    if not isinstance(loop_inputs, LoopInputs):
+        return packet
+    loops = _compacted(loop_inputs.loops, 6, field_name="run.loop_inputs.loops", notices=notices, keep="first")
+    if not (dropped := len(loop_inputs.loops) - len(loops)):
+        return packet
+    loops_omitted = (loop_inputs.loops_omitted or 0) + dropped
+    compacted = loop_inputs.model_copy(update={"loops": loops, "loops_omitted": loops_omitted})
+    return packet.model_copy(
+        update={"run": packet.run.model_copy(update={"loop_inputs": compacted}), "omission_notices": notices}
+    )
+
+
+def _clipped_120(text: str | None) -> str | None:
+    return text[:117] + "..." if text is not None and len(text) > 120 else text
 
 
 def _compact_packet_for_aggregate_limit(
@@ -928,6 +998,18 @@ def _compact_packet_for_aggregate_limit(
             "unfinished_items": _compacted(
                 packet.unfinished_items, 12, field_name="unfinished_items", notices=notices, keep="first"
             ),
+            "ai_fallback_blocks": [
+                block.model_copy(
+                    update={
+                        "failure_text": _clipped_120(block.failure_text),
+                        "recovery_failure_text": _clipped_120(block.recovery_failure_text),
+                    }
+                )
+                for block in _compacted(
+                    packet.ai_fallback_blocks or [], 6, field_name="ai_fallback_blocks", notices=notices, keep="last"
+                )
+            ]
+            or None,
             "omission_notices": notices,
         }
     )
@@ -1334,6 +1416,11 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                 max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                 notices=notices,
             ),
+            "loop_inputs": (
+                bounded_loop_inputs(loop_inputs, notices)
+                if isinstance(loop_inputs := projected.run.loop_inputs, LoopInputs)
+                else loop_inputs
+            ),
         }
     )
     screenshot = projected.screenshot.model_copy(
@@ -1352,6 +1439,9 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
         # Repeated per-block facts give way before the workflow readback the repair turn needs more.
         projected = _compact_block_fact_maps(projected, notices)
+        serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
+        projected = _compact_loop_inputs(projected, notices)
         serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS and projected.canonical_workflow_yaml is not None:
         excess = len(serialized) - _BUILD_TEST_PACKET_MAX_CHARS
@@ -1382,11 +1472,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
 
 
 def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
-    # This handoff rebuilds its own notices, so it carries forward only the mint-time fact it cannot
+    # This handoff rebuilds its own notices, so it carries forward only the mint-time facts it cannot
     # reconstruct; adopting the recorded list wholesale would relay run-supplied prose to the model.
     notices: list[str] = []
     if OBSERVED_BLOCK_END_URLS_WITHHELD in packet.omission_notices:
         notices.append(OBSERVED_BLOCK_END_URLS_WITHHELD)
+    notices.extend(notice for notice in packet.omission_notices if notice in LOOP_INPUT_OMISSION_NOTICES)
     if packet.canonical_workflow_yaml is None:
         notices.append("canonical_workflow_yaml omitted: no persisted workflow readback was recorded.")
     if packet.run.workflow_run_id is None:
@@ -1486,6 +1577,7 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
                 "failure": failure,
                 "observed_block_end_urls": handoff_block_end_urls,
                 "omission_notices": notices,
+                "ai_fallback_blocks": None,
             }
         )
     )
@@ -1540,7 +1632,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
     """Strip large/binary fields from tool results before sending to the LLM."""
     sanitized = sanitize_generic_tool_result_for_llm(
         tool_name,
-        result,
+        without_output_only_labels(result),
         drop_top_level_keys=(
             "action",
             "browser_context",
@@ -1615,15 +1707,6 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name == "get_run_results" and not had_build_test_packet:
-            blocks = data.get("blocks")
-            if isinstance(blocks, list):
-                data["blocks"] = [
-                    {**block, "output": truncate_output(block["output"])}
-                    if isinstance(block, dict) and "output" in block
-                    else block
-                    for block in blocks
-                ]
         repair_context = data.get("authoring_repair_context")
         if isinstance(repair_context, dict):
             repair_context = dict(repair_context)
@@ -1658,6 +1741,8 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             # and values registered for secret scrubbing during finalization.
             data.pop("action_observations", None)
             data.pop("action_trace_summary", None)
+            data.pop(LOOP_INPUTS_KEY, None)
+            data.pop("loop_inputs_omission_notices", None)
             data.pop("observed_block_end_urls", None)
             data.pop("per_block_action_observations", None)
             data.pop("block_fact_omission_notices", None)
@@ -1701,7 +1786,13 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             else:
                 data.pop("block_fact_omission_notices", None)
             sanitized["data"] = data
-    return sanitized
+    if tool_name in {"get_org_workflow", "skyvern_workflow_get"} and isinstance(sanitized.get("data"), dict):
+        strip_private_workflow_settings(sanitized["data"])
+        return {
+            **redact_totp_runtime_values({key: value for key, value in sanitized.items() if key != "data"}),
+            "data": sanitized["data"],
+        }
+    return redact_totp_runtime_values(sanitized)
 
 
 def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
@@ -1826,6 +1917,11 @@ def _structured_failure_summary_for_user(
 _NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"authority_denied"})
 
 
+def _is_unconfirmed_extension(result: dict[str, Any]) -> bool:
+    # The request may already have applied, so this outcome is neither a grant nor a failure.
+    return result.get("confirmed") is False and "session_readback" in result
+
+
 def user_facing_success(
     result: dict[str, Any],
     *,
@@ -1835,6 +1931,8 @@ def user_facing_success(
     activity stream. A raw ``ok=False`` still counts as success here when it's explained
     by a precondition/authority blocker signal — the agent was redirected, not broken."""
     if result.get("ok", True):
+        return True
+    if _is_unconfirmed_extension(result):
         return True
     # A run waiting on a human approval is the designed outcome of a human_interaction block, not a
     # break, so it must not stream with failure affect.
@@ -1933,6 +2031,89 @@ def _workflow_write_phrase(data: dict[str, Any]) -> str:
     return "Staged a workflow draft" if data.get("persistence") else "Workflow updated"
 
 
+_BROWSER_CODE_OPERATION_PHRASES = {
+    "goto": "opened a page",
+    "go_back": "went back",
+    "reload": "reloaded the page",
+    "click": "clicked",
+    "dblclick": "double-clicked",
+    "fill": "filled",
+    "type": "typed into",
+    "press": "pressed a key",
+    "check": "checked",
+    "uncheck": "unchecked",
+    "select_option": "selected an option",
+    "hover": "hovered",
+    "count": "counted",
+    "text_content": "read",
+    "inner_text": "read",
+    "inner_html": "read",
+    "all_text_contents": "read",
+    "all_inner_texts": "read",
+    "get_attribute": "read",
+    "input_value": "read",
+    "is_visible": "checked visibility of",
+    "content": "read the page",
+    "title": "read the title",
+    "evaluate": "ran a page script",
+    "wait_for_selector": "waited for",
+    "wait_for": "waited for",
+    "wait_for_url": "waited for navigation",
+    "wait_for_load_state": "waited for the page to load",
+    "wait_for_timeout": "waited",
+    "search_web": "searched the web",
+    "solve_captcha": "ran the CAPTCHA solver",
+    "click_and_download": "downloaded a file",
+    "click_and_wait_for_popup": "opened a popup",
+}
+_MAX_BROWSER_CODE_SELECTOR_CHARS = 40
+
+
+def browser_code_steps_for_user(tool_name: str, result: dict[str, Any]) -> list[str] | None:
+    """A successful run_browser_code call's reported operations as phrases, e.g. ``["Opened a page", "read ×10"]``."""
+    if tool_name != "run_browser_code" or result.get("ok") is not True:
+        return None
+    operations = result.get("operations")
+    if not isinstance(operations, list):
+        return None
+    facts = [op for op in operations if isinstance(op, dict) and isinstance(op.get("operation"), str)]
+    steps: list[str] = []
+    for name, group in itertools.groupby(facts, key=lambda op: op["operation"]):
+        run = list(group)
+        step = _BROWSER_CODE_OPERATION_PHRASES.get(name, name.replace("_", " "))
+        selectors = {op.get("selector") for op in run}
+        selector = next(iter(selectors)) if len(selectors) == 1 else None
+        if isinstance(selector, str) and selector.strip():
+            # Model-authored; collapsed and clamped so one long selector cannot take over the row.
+            shown = " ".join(selector.split())
+            if len(shown) > _MAX_BROWSER_CODE_SELECTOR_CHARS:
+                shown = shown[: _MAX_BROWSER_CODE_SELECTOR_CHARS - 1] + "…"
+            step += f" '{shown}'"
+        if len(run) > 1:
+            step += f" ×{len(run)}"
+        if any(op.get("status") == "failed" for op in run):
+            step += " (failed)"
+        steps.append(step)
+    if not steps:
+        return None
+    omitted = result.get("operations_omitted")
+    if isinstance(omitted, int) and omitted > 0:
+        # Only the first operations are listed, so the true last action is unknown.
+        steps.append(f"{omitted} more operation(s)")
+    steps[0] = steps[0][:1].upper() + steps[0][1:]
+    return steps
+
+
+_PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
+    "solved": "Challenge solver reported the challenge solved",
+    "typed": "Challenge solver typed the CAPTCHA image's text",
+    "none": "Challenge solver found no challenge on the page",
+    "unsupported": "Challenge solver has no route for the challenge on screen",
+    "unsolved": "Challenge solver could not clear the challenge in this browser",
+    "unavailable": "Challenge solving is not available for this page",
+}
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -1941,6 +2122,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     def block_label(value: object) -> str:
         return sanitize_block_label_for_display(str(value)) if for_display else str(value)
 
+    if _is_unconfirmed_extension(result):
+        return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
         return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
@@ -1973,6 +2156,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "list_integrations":
         return f"Found {data.get('count', 0)} connected integration(s)"
+    if tool_name == "read_google_sheet":
+        rows = data.get("connections")
+        opened = (
+            sum(1 for row in rows if isinstance(row, dict) and row.get("status") == "opened")
+            if isinstance(rows, list)
+            else 0
+        )
+        if not opened:
+            return "No connection opened the Google Sheet"
+        if data.get("values_error"):
+            return f"Opened the Google Sheet through {opened} connection(s), but could not read its values"
+        return f"Read the Google Sheet through {opened} connection(s)"
     if tool_name == "get_block_schema":
         if "block_types" in data:
             return f"Listed {data.get('count', '?')} block types"
@@ -2040,11 +2235,24 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if field_count:
             return f"Inspected the page ({field_count} form field(s))"
         return "Inspected the page"
+    if tool_name == "solve_page_challenge":
+        summary = _PAGE_CHALLENGE_OUTCOME_SUMMARIES.get(str(result.get("outcome")), "Challenge solver finished")
+        return f"{summary} (timed out)" if result.get("timed_out") else summary
+    if tool_name == "start_fresh_browser":
+        return "Started a fresh browser; the old browser's cookies, sign-ins and open tabs are gone"
+    if tool_name == "extend_browser_session":
+        return f"Extended the browser session by {result.get('granted_minutes')} minutes"
+    if tool_name == "upload_attached_file":
+        return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
         url = result.get("current_url")
         summary = f"Ran browser code ({count} operation(s))"
+        # Only the display form changes: context.merge_turn_summary parses "Ran browser code ... at <url>".
+        steps = browser_code_steps_for_user(tool_name, result) if for_display else None
+        if steps:
+            summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
     return "OK"
 
@@ -2151,6 +2359,8 @@ def format_tool_result_for_user(
     summarize_tool_result is parsed by context.merge_turn_summary for state
     extraction — rewriting it would corrupt agent state.
     """
+    if _is_unconfirmed_extension(result):
+        return summarize_tool_result(tool_name, result, for_display=True)
     if not result.get("ok", False):
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
@@ -2159,20 +2369,3 @@ def format_tool_result_for_user(
     if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
         return ""
     return summarize_tool_result(tool_name, result, for_display=True)
-
-
-def truncate_output(output: Any, max_chars: int = 2000) -> str | None:
-    if output is None:
-        return None
-
-    if isinstance(output, str):
-        text = output
-    else:
-        try:
-            text = json.dumps(output, default=str)
-        except (TypeError, ValueError):
-            text = str(output)
-
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n... [truncated]"
-    return text

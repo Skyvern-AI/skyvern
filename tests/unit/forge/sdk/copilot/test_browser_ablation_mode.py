@@ -154,13 +154,18 @@ def test_a_turn_without_browser_authority_advertises_no_browser_tool() -> None:
 
     assert BROWSER_BOUND_TOOL_NAMES.isdisjoint(withheld.ordered_native_names)
     assert BROWSER_CODE_TOOL_NAME not in withheld.ordered_native_names
-    assert withheld.ordered_native_names
+    assert "search_web" in withheld.ordered_native_names
     assert withheld.ordered_mcp_names == (
         "get_workflow_knowledge",
         "get_block_schema",
         "validate_block",
         "list_org_workflows",
         "get_org_workflow",
+        "list_workflow_schedules",
+        "get_workflow_schedule",
+        "list_browser_profiles",
+        "get_browser_profile",
+        "list_workflow_runs",
     )
     assert withheld.alias_map == {name: aliases[name] for name in withheld.ordered_mcp_names}
     assert withheld.overlays == {name: overlays[name] for name in withheld.ordered_mcp_names}
@@ -247,7 +252,9 @@ def _production_surfaces(registered: list[RegisteredTool]) -> tuple[CopilotToolS
     # browser-code tool is not available to it; where it is, they are withdrawn.
     normal = resolve_copilot_tool_surface(
         mode=None,
-        native_tools=copilot_native_tools(supports_question_tool=True, browser_code_available=False),
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=False, run_tools_available=True
+        ),
         alias_map=aliases,
         overlays=overlays,
     )
@@ -268,7 +275,8 @@ async def test_the_advertised_tab_contract_is_closed_around_the_fields_it_offers
 
     tab_new = (await _advertised_schemas(ablation, registered))["skyvern_tab_new"]
 
-    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME}
+    assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME, "user_facing_reason"}
+    assert "user_facing_reason" not in tab_new.get("required", [])
     assert tab_new["additionalProperties"] is False
     validator = Draft202012Validator(tab_new)
     assert validator.is_valid({"url": "https://example.com"})

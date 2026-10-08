@@ -1,18 +1,30 @@
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
+import httpx
 import orjson
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+import pytest_asyncio
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import WorkflowNotFound
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -193,6 +205,7 @@ async def test_get_runs_v2_serializes_mapping_rows_from_database(monkeypatch: py
             "workflow_deleted": False,
             "script_run": False,
             "trigger_type": "mcp",
+            "created_by": None,
             "attempt": 1,
             "retry_pending": False,
             "next_attempt_at": None,
@@ -440,6 +453,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         reuse_browser_session=None,
         browser_profile_id="bprof_123",
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with="code",
         ai_fallback=True,
     )
@@ -639,6 +653,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
+        browser_settings_receipt=None,
         run_with=None,
         ai_fallback=None,
     )
@@ -992,3 +1007,126 @@ async def test_legacy_task_routes_schedule_run_created_hook(monkeypatch: pytest.
             caller_type=CallerType.API_KEY,
         ),
     ]
+
+
+@dataclass
+class _CreatorHarness:
+    client: httpx.AsyncClient
+    db: AgentDB
+    current_user: dict[str, str]
+
+
+@pytest_asyncio.fixture
+async def creator_harness(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> AsyncIterator[_CreatorHarness]:
+    db = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    now = datetime.now(UTC)
+    organization = Organization(
+        organization_id="o_creator", organization_name="Creator Org", created_at=now, modified_at=now
+    )
+    async with db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="w_creator",
+                workflow_permanent_id="wpid_creator",
+                organization_id=organization.organization_id,
+                title="Creator Workflow",
+                workflow_definition={
+                    "blocks": [
+                        {
+                            "block_type": "goto_url",
+                            "label": "navigate",
+                            "url": "https://example.com",
+                            "output_parameter": {
+                                "parameter_type": "output",
+                                "key": "navigate_output",
+                                "output_parameter_id": "op_creator",
+                                "workflow_id": "w_creator",
+                                "created_at": "2026-01-01T00:00:00",
+                                "modified_at": "2026-01-01T00:00:00",
+                            },
+                        }
+                    ],
+                    "parameters": [],
+                },
+                status="published",
+                version=1,
+            )
+        )
+        await session.commit()
+
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(app_instance, "DATABASE", db)
+    monkeypatch.setattr(app_instance, "WORKFLOW_SERVICE", WorkflowService())
+    monkeypatch.setattr(app_instance, "RATE_LIMITER", SimpleNamespace(rate_limit_submit_run=AsyncMock()), raising=False)
+    monkeypatch.setattr(
+        app_instance,
+        "EXPERIMENTATION_PROVIDER",
+        SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False)),
+        raising=False,
+    )
+    executor = SimpleNamespace(execute_workflow=AsyncMock(), execute_task_v2=AsyncMock())
+    monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
+
+    current_user = {"id": "user_member"}
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(base_router, prefix="/v1")
+    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: SimpleNamespace(
+        organization=organization, caller_id=current_user["id"], caller_type=CallerType.USER
+    )
+    fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
+    fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: current_user["id"]
+
+    @fastapi_app.middleware("http")
+    async def _request_context(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        skyvern_context.set(SkyvernContext(request_id="req_creator"))
+        try:
+            return await call_next(request)
+        finally:
+            skyvern_context.reset()
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
+        yield _CreatorHarness(client=client, db=db, current_user=current_user)
+
+
+async def _list_creators(client: httpx.AsyncClient) -> dict[str, str | None]:
+    response = await client.get("/v1/runs")
+    assert response.status_code == 200, response.text
+    return {row["run_id"]: row["created_by"] for row in response.json()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "run_id_key"),
+    [
+        ("/api/v1/workflows/wpid_creator/run", {}, "workflow_run_id"),
+        ("/v1/run/agents", {"workflow_id": "wpid_creator"}, "run_id"),
+        ("/v1/run/tasks", {"prompt": "Find the pricing page", "engine": "skyvern-2.0"}, "run_id"),
+    ],
+)
+async def test_run_records_creator_and_runs_list_returns_it(
+    creator_harness: _CreatorHarness, path: str, body: dict[str, Any], run_id_key: str
+) -> None:
+    response = await creator_harness.client.post(path, json=body, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
+    assert response.status_code == 200, response.text
+
+    assert await _list_creators(creator_harness.client) == {response.json()[run_id_key]: "user_member"}
+
+
+@pytest.mark.asyncio
+async def test_retry_records_the_retrying_user_as_creator(creator_harness: _CreatorHarness) -> None:
+    client = creator_harness.client
+    original = await client.post("/api/v1/workflows/wpid_creator/run", json={})
+    assert original.status_code == 200, original.text
+    original_run_id = original.json()["workflow_run_id"]
+    await creator_harness.db.workflow_runs.update_workflow_run(
+        workflow_run_id=original_run_id, status=WorkflowRunStatus.failed
+    )
+
+    creator_harness.current_user["id"] = "user_retrier"
+    retry = await client.post(f"/v1/workflows/runs/{original_run_id}/retry")
+    assert retry.status_code == 200, retry.text
+
+    assert await _list_creators(client) == {original_run_id: "user_member", retry.json()["run_id"]: "user_retrier"}

@@ -6,9 +6,11 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useAuth } from "@clerk/clerk-react";
 import { getClientWithRequestHeaders } from "@/api/AxiosClient";
+import { retryTransientNetworkFailures } from "@/api/QueryClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useUser } from "@/hooks/useUser";
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import { OnboardingContext } from "./useOnboardingState";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import type {
@@ -47,7 +49,11 @@ function isAuthoritativeConfirmedResponse(
   response: OnboardingStateResponse,
 ): boolean {
   const status = response.questionnaire_prompt_result?.status;
-  return status !== "flag_disabled" && status !== "ineligible";
+  return (
+    status !== "flag_disabled" &&
+    status !== "flag_unavailable" &&
+    status !== "ineligible"
+  );
 }
 
 function mergeConfirmedResponse(
@@ -122,7 +128,8 @@ type Props = {
 
 function OnboardingProvider({ children }: Readonly<Props>) {
   const credentialGetter = useCredentialGetter();
-  const { isSignedIn, userId, orgId } = useAuth();
+  const userId = useUser().get()?.id;
+  const orgId = useActiveOrgId();
   const queryClient = useQueryClient();
   const queryKey = useMemo(
     (): OnboardingQueryKey => ["userOnboarding", userId, orgId ?? null],
@@ -172,25 +179,26 @@ function OnboardingProvider({ children }: Readonly<Props>) {
     },
     [credentialGetter, isCurrent],
   );
-  const { data, isLoading } = useQuery<OnboardingStateResponse>({
-    queryKey,
-    queryFn: async () => {
-      const { client, headers } = await requestClient(generation);
-      const response = await client.get<OnboardingStateResponse>(
-        "/users/me/onboarding",
-        { headers },
-      );
-      if (!isCurrent(generation)) throw new CancelledError();
-      const legacyFields = legacyFieldsToReplay(
-        legacyWritesRef.current,
-        legacyWriteVersionRef.current + 1,
-      );
-      return Object.keys(legacyFields).length === 0
-        ? response.data
-        : mergeNewerLegacyFields(response.data, legacyFields);
-    },
-    enabled: !!credentialGetter && isSignedIn === true && !!userId,
-  });
+  const { data, isLoading, isError, isFetching, refetch } =
+    useQuery<OnboardingStateResponse>({
+      queryKey,
+      queryFn: async () => {
+        const { client, headers } = await requestClient(generation);
+        const response = await client.get<OnboardingStateResponse>(
+          "/users/me/onboarding",
+          { headers },
+        );
+        if (!isCurrent(generation)) throw new CancelledError();
+        const legacyFields = legacyFieldsToReplay(
+          legacyWritesRef.current,
+          legacyWriteVersionRef.current + 1,
+        );
+        return Object.keys(legacyFields).length === 0
+          ? response.data
+          : mergeNewerLegacyFields(response.data, legacyFields);
+      },
+      enabled: !!credentialGetter && !!userId,
+    });
 
   useEffect(() => {
     if (typeof BroadcastChannel === "undefined") return;
@@ -245,6 +253,8 @@ function OnboardingProvider({ children }: Readonly<Props>) {
   >({
     scope: MUTATION_SCOPE,
     mutationFn: writeState,
+    // Callers fire and forget, so a request routed to a dying API task would drop the write.
+    retry: retryTransientNetworkFailures,
     onMutate: async ({
       patch,
       generation: writeGeneration,
@@ -452,11 +462,14 @@ function OnboardingProvider({ children }: Readonly<Props>) {
       value={{
         state: data?.onboarding_state ?? null,
         isLoading,
+        loadFailed: isError && !isFetching,
+        retryLoad: () => void refetch(),
         updateState,
         updateStateConfirmed,
         isNewUser,
         abVariant,
         recoveryGuidanceAssignment: data?.recovery_guidance_assignment ?? null,
+        organizationId: data?.organization_id ?? null,
       }}
     >
       {children}

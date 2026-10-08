@@ -6,7 +6,31 @@ from typing import Any
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.webeye.action_deadline import (
+    ACTION_DEADLINE_HEADROOM_MS,
+    cancellation_pending,
+    outer_cap_seconds,
+    raise_if_cancelled,
+    record_browser_timeout,
+    under_action_deadline,
+)
 from skyvern.webeye.browser_health import BrowserOperation
+
+__all__ = [
+    "ACTION_DEADLINE_HEADROOM_MS",
+    "CallerJsDispatchError",
+    "cancel_aware",
+    "cancellation_pending",
+    "deadline_ended_the_call",
+    "deadline_reached",
+    "outer_cap_seconds",
+    "raise_if_cancelled",
+    "record_browser_timeout",
+    "record_unreported_timeout",
+    "under_action_deadline",
+    "unwrap_caller_js_error",
+    "without_navigation_recovery",
+]
 
 
 class CallerJsDispatchError(Exception):
@@ -42,15 +66,6 @@ def deadline_reached(deadline: float) -> bool:
     return asyncio.get_running_loop().time() >= deadline
 
 
-def cancellation_pending() -> bool:
-    """Whether this task carries an unhandled cancellation request.
-
-    A driver can translate an external cancellation into an ordinary transport error, and returning a
-    result for that would let the caller treat a cancelled operation as one that completed."""
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
 def deadline_ended_the_call(exc: Exception, deadline: float) -> bool:
     """Whether the action deadline is what ended this call. Pure; records nothing."""
     return isinstance(exc, SkyvernPageAnalysisTimeout) or deadline_reached(deadline)
@@ -63,23 +78,6 @@ def record_unreported_timeout(exc: Exception) -> None:
     hang never counts toward marking the browser degraded."""
     if not isinstance(exc, SkyvernPageAnalysisTimeout):
         skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
-
-
-def record_browser_timeout() -> None:
-    """Tally a strike for a browser-protocol call that never answered within the action deadline.
-
-    For the callers that detect this themselves rather than letting the engine raise, so that a
-    synthesized timeout is not mistaken by ``record_unreported_timeout`` for one the engine tallied."""
-    skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
-
-
-def raise_if_cancelled() -> None:
-    """Re-raise an external cancellation that never surfaced as an exception.
-
-    Navigation recovery can settle and retry straight through a cancellation the driver translated
-    or swallowed, so a successful return is not proof the caller still wants the result."""
-    if cancellation_pending():
-        raise asyncio.CancelledError
 
 
 def cancel_aware(dispatch: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:

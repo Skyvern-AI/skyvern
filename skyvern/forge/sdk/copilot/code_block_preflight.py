@@ -558,10 +558,6 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        wizard_step_diagnostic = _wizard_step_selector_diagnostic(node)
-        if wizard_step_diagnostic is not None:
-            diagnostics.append(wizard_step_diagnostic)
-            continue
         evaluate_diagnostic = _page_evaluate_diagnostic(node)
         if evaluate_diagnostic is not None:
             diagnostics.append(evaluate_diagnostic)
@@ -751,31 +747,6 @@ def _assignment_value_and_targets(node: ast.Assign | ast.AnnAssign) -> tuple[ast
     return node.value, [node.target]
 
 
-def _wizard_step_selector_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "locator" or not node.args:
-        return None
-
-    selector = node.args[0]
-    if not isinstance(selector, ast.Constant) or not isinstance(selector.value, str):
-        return None
-    normalized_selector = selector.value.lower()
-    if "data-next-step" not in normalized_selector and "data-step" not in normalized_selector:
-        return None
-    if "button" not in normalized_selector:
-        return None
-
-    return CodeBlockPreflightDiagnostic(
-        code="AMBIGUOUS_WIZARD_STEP_SELECTOR",
-        message=(
-            "Code block targets a wizard step button by metadata selector only. Step metadata can match "
-            "both forward and back controls under Playwright strict mode. Target the visible semantic control "
-            "instead, such as `page.get_by_role('button', name='Continue')`, or narrow the locator to visible "
-            "button text before clicking."
-        ),
-    )
-
-
 def _page_evaluate_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
     func = node.func
     if not isinstance(func, ast.Attribute) or func.attr != "evaluate":
@@ -807,7 +778,7 @@ def _global_get_by_text_wait_for_diagnostic(
         message=(
             "Code block waits on global `page.get_by_text(...).wait_for(...)`, which can collide with "
             "multiple matching text nodes under Playwright strict mode. Scope the text lookup "
-            "through a locator/container or narrow it with `first`, `nth`, or `filter` before waiting."
+            "through a locator/container or `filter` it before waiting."
         ),
     )
 
@@ -1055,8 +1026,7 @@ def _broad_table_record_scan_diagnostic(tree: ast.AST) -> CodeBlockPreflightDiag
             "Code block appears to extract row-like records by scanning broad containers such as `section`, "
             "`.card`, `article`, or `li`. For table-like or list-like records, iterate the actual row/item "
             'elements (`tr`, `[role="row"]`, or equivalent repeated item containers) and read fields from '
-            "the same row so fields from separate records cannot be mixed. Derive summary status fields only "
-            "from parsed row objects."
+            "the same row so fields from separate records cannot be mixed."
         ),
     )
 

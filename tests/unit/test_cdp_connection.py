@@ -15,6 +15,7 @@ import skyvern.webeye.cdp_connection as cdp_connection
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.schemas.runs import TaskRunRequest
+from skyvern.webeye import browser_acquisition_sample as sample_mod
 from skyvern.webeye.cdp_connection import (
     REDACTED,
     build_cdp_connect_headers,
@@ -390,3 +391,111 @@ async def test_cdp_connect_never_logs_a_credential_bearing_remote_url(monkeypatc
     # Redacted, not dropped: the session it dialed still has to be identifiable.
     assert "pbs_routed" in rendered
     assert REDACTED in rendered
+
+
+class TestCdpConnectAcquireMode:
+    """_create_cdp_connection_browser resolves the acquisition mode at its actual dispatch: dialing a
+    caller address or a configured/already-running remote endpoint is attach; only launching a new
+    Chrome process is create. The fixed cdp-connect worker (no per-run address) must not be mislabeled
+    create by the pre-dispatch heuristic."""
+
+    @pytest.mark.asyncio
+    async def test_caller_address_marks_attach(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            browser_factory, "_connect_to_cdp_browser", AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+        )
+        scope = sample_mod.begin_browser_acquisition_sample()
+        try:
+            await browser_factory._create_cdp_connection_browser(MagicMock(), browser_address="ws://caller:9222")
+            assert sample_mod.current_browser_acquisition_sample().resolved_acquire_mode == "attach"
+        finally:
+            sample_mod.close_browser_acquisition_sample(scope)
+
+    @pytest.mark.asyncio
+    async def test_configured_remote_endpoint_marks_attach(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(browser_factory.settings, "BROWSER_TYPE", "cdp-connect")
+        monkeypatch.setattr(browser_factory.settings, "CHROME_EXECUTABLE_PATH", "")  # no launch → configured remote
+        monkeypatch.setattr(
+            browser_factory, "_connect_to_cdp_browser", AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+        )
+        scope = sample_mod.begin_browser_acquisition_sample()
+        try:
+            await browser_factory._create_cdp_connection_browser(MagicMock())
+            assert sample_mod.current_browser_acquisition_sample().resolved_acquire_mode == "attach"
+        finally:
+            sample_mod.close_browser_acquisition_sample(scope)
+
+    @pytest.mark.asyncio
+    async def test_launching_new_chrome_marks_create(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(browser_factory.settings, "BROWSER_TYPE", "cdp-connect")
+        monkeypatch.setattr(browser_factory.settings, "CHROME_EXECUTABLE_PATH", "/usr/bin/chromium")
+        monkeypatch.setattr(browser_factory, "_is_port_in_use", lambda port: False)  # free → launch
+        monkeypatch.setattr(browser_factory, "_is_chrome_running", lambda: False)
+        monkeypatch.setattr(browser_factory.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(browser_factory, "is_valid_chromium_user_data_dir", lambda p: True)  # skip copytree
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None  # process stayed alive
+        monkeypatch.setattr(browser_factory.subprocess, "Popen", lambda *a, **k: fake_proc)
+        monkeypatch.setattr(browser_factory.time, "sleep", lambda s: None)
+        monkeypatch.setattr(
+            browser_factory, "_connect_to_cdp_browser", AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+        )
+        scope = sample_mod.begin_browser_acquisition_sample()
+        try:
+            await browser_factory._create_cdp_connection_browser(MagicMock())
+            assert sample_mod.current_browser_acquisition_sample().resolved_acquire_mode == "create"
+        finally:
+            sample_mod.close_browser_acquisition_sample(scope)
+
+
+class TestDiagnosticsDialRetryRecording:
+    """connect_over_cdp_with_diagnostics records each dial (first URL + every resolved-address
+    fallback) as a CDP-connect attempt, so a first-try acquisition sample reports the retries this
+    helper makes — its retry loop never routes through connect_over_cdp_with_retry."""
+
+    @staticmethod
+    def _resolving_getaddrinfo(host: str, port: int, family: socket.AddressFamily) -> list[Any]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.65.254", port))]
+
+    @pytest.mark.asyncio
+    async def test_ipv4_fallback_dial_counts_as_retry_defeating_first_try(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeChromium:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def connect_over_cdp(self, url: str, *, timeout: int | None = None, headers: Any = None) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    raise Exception("Unexpected status 500 when connecting to http://host.docker.internal:9222/")
+                return object()
+
+        pw = SimpleNamespace(chromium=FakeChromium())
+        monkeypatch.setattr(cdp_connection.socket, "getaddrinfo", self._resolving_getaddrinfo)
+        scope = sample_mod.begin_browser_acquisition_sample()
+        try:
+            await connect_over_cdp_with_diagnostics(
+                cast(Playwright, pw), "http://host.docker.internal:9222/", validate_browser_address=False
+            )
+            sample = sample_mod.current_browser_acquisition_sample()
+            assert sample is not None
+            assert sample.cdp_connect_attempts == 2  # first dial failed, IPv4 fallback succeeded
+            assert sample_mod.is_first_try_success(sample, outcome_success=True) is False
+        finally:
+            sample_mod.close_browser_acquisition_sample(scope)
+
+    @pytest.mark.asyncio
+    async def test_first_dial_success_is_one_attempt_first_try_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pw = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=object())))
+        scope = sample_mod.begin_browser_acquisition_sample()
+        try:
+            await connect_over_cdp_with_diagnostics(
+                cast(Playwright, pw), "http://host.docker.internal:9222/", validate_browser_address=False
+            )
+            sample = sample_mod.current_browser_acquisition_sample()
+            assert sample is not None
+            assert sample.cdp_connect_attempts == 1
+            assert sample_mod.is_first_try_success(sample, outcome_success=True) is True
+        finally:
+            sample_mod.close_browser_acquisition_sample(scope)

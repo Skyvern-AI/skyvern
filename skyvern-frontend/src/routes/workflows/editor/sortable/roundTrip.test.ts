@@ -1,7 +1,14 @@
 import type { Edge } from "@xyflow/react";
 import { describe, expect, test } from "vitest";
+import { parse, stringify } from "yaml";
 
 import { ProxyLocation } from "@/api/types";
+import {
+  applySettingsPatch,
+  buildWorkflowSaveRequest,
+  buildWorkflowYamlDocument,
+} from "../workflowYamlDocument";
+import { yamlCommitInputs } from "../workflowVersionFromSaveData";
 
 import type { AppNode } from "../nodes";
 import {
@@ -21,7 +28,10 @@ import {
   type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
-import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
+import type {
+  CodeBlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "../../types/workflowYamlTypes";
 
 import { rewireBlockDropInScope } from "./rewire";
 import { TOP_LEVEL_SCOPE } from "./scope";
@@ -123,6 +133,10 @@ describe("send email SMTP round trip", () => {
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: false,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -137,7 +151,6 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
@@ -416,6 +429,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
 
   test("nested loop code manifest survives save and reload", () => {
     const nestedCode = makeCodeBlock("Nested Guard", null);
+    nestedCode.parameters = [makeWorkflowParameter("items")];
     nestedCode.error_code_mapping = {
       nested_lowercase: "when the nested condition occurs",
     };
@@ -441,6 +455,38 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       nestedCode.error_code_mapping,
     );
     expect(firstSaved.loop_blocks[0]).not.toHaveProperty("error_code");
+
+    const input = {
+      workflow: {
+        status: "published",
+        is_saved_task: false,
+      } as WorkflowApiResponse,
+      settings: DEFAULT_SETTINGS,
+      title: "Loop workflow",
+      description: null,
+      blocks: getWorkflowBlocks(first.nodes, first.edges),
+      parameters: [],
+      definitionVersion: 2,
+    };
+    const yaml = stringify(buildWorkflowYamlDocument(input));
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    const saved = parse(
+      stringify(
+        buildWorkflowSaveRequest({
+          ...input,
+          blocks: committed.definition.blocks,
+          parameters: committed.definition.parameters,
+          settings: applySettingsPatch(input.settings, committed.settingsPatch),
+          workflowDefinitionVersion: 2,
+        }),
+      ),
+    );
+    expect(saved.workflow_definition.blocks).toEqual(input.blocks);
+    expect(
+      saved.workflow_definition.blocks[0].loop_blocks[0].parameter_keys,
+    ).toEqual(["items"]);
   });
 
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
@@ -764,5 +810,23 @@ describe("login block configuration round trip", () => {
         }
       ).include_action_history_in_verification,
     ).toBe(true);
+  });
+});
+
+test("workflow export includes error mapping, CDP headers, and TOTP identifier", () => {
+  const workflow = {
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: {
+      version: 2,
+      parameters: [],
+      blocks: [],
+      error_code_mapping: { RETRY: "Retry the request" },
+    },
+  } as unknown as WorkflowApiResponse;
+  expect(convert(workflow)).toMatchObject({
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: { error_code_mapping: { RETRY: "Retry the request" } },
   });
 });

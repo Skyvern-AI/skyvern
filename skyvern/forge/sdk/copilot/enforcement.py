@@ -8,14 +8,17 @@ import json
 import re
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import structlog
 from agents.exceptions import MaxTurnsExceeded
+from agents.items import TResponseInputItem
 from agents.memory.session import Session
+from agents.model_settings import ModelSettings
 from agents.run import Runner
+from agents.run_config import RunConfig
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
@@ -54,7 +57,6 @@ from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTI
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
-from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -67,6 +69,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
     parse_final_response,
+    screened_recorded_url,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
     install_pending_operation_slot,
@@ -91,6 +94,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -115,6 +119,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
     from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
@@ -131,6 +136,21 @@ SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
+FINAL_REPLY_OBSERVATION = (
+    NUDGE_SENTINEL + "Your last response was empty. Tools are unavailable for this one response; "
+    "reply to the user now with your final response for this turn."
+)
+
+
+def raw_secret_reply_withheld_observation(label: str | None) -> str:
+    flagged = f" The flagged value was the one given for `{label}`." if label else ""
+    return (
+        NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it read the "
+        f"reply as containing a raw secret value.{flagged} Tools are unavailable for this one response; reply to the user now with your "
+        "final response for this turn."
+    )
+
+
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
@@ -748,6 +768,23 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
     return kept
 
 
+def _summarize_page_state(page_state: dict[str, Any]) -> dict[str, Any]:
+    vendor = page_state.get("challenge_vendor")
+    kept: dict[str, Any] = {
+        "read": "ok" if page_state.get("read") == "ok" else "failed",
+        "challenge_vendor": vendor[:200] if isinstance(vendor, str) else None,
+    }
+    # A withheld location has no url or title key at all, and must not gain one here.
+    if "url" in page_state:
+        url = page_state["url"]
+        screened = screened_recorded_url(url)[0] if isinstance(url, str) else None
+        kept["url"] = screened[:200] if screened is not None else None
+    if "title" in page_state:
+        title = page_state["title"]
+        kept["title"] = title if isinstance(title, str) else None
+    return kept
+
+
 def _summarize_tool_output(output: str) -> str:
     """Compress an old function_call_output to a compact JSON synopsis that
     preserves only signal fields (ok/error/status/failure_reason/block labels).
@@ -763,6 +800,24 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
+    # page_state rides on every browser result; it must not be what pushes a short result into compaction.
+    if isinstance(parsed.get("page_state"), dict):
+        without_page_state = {key: value for key, value in parsed.items() if key != "page_state"}
+        if len(json.dumps(without_page_state)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+            return output
+
+    # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
+    # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
+    if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
+        return output
+    # An account group result is the only record of which runs exist and what each did.
+    if (
+        MCP_RESULT_PROVENANCE_KEY not in parsed
+        and "workflow_run_group_id" in parsed
+        and isinstance(parsed.get("rows"), list)
+    ):
+        return output
+
     synopsis: dict[str, Any] = {}
     # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
     # re-stamped rather than copied, so this is not where an attacker-chosen provenance survives.
@@ -772,6 +827,8 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["ok"] = parsed["ok"]
     if parsed.get("error"):
         synopsis["error"] = str(parsed["error"])[:200]
+    if isinstance(parsed.get("page_state"), dict):
+        synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the
@@ -834,21 +891,34 @@ def _summarize_tool_output(output: str) -> str:
         if isinstance(categories, list) and categories:
             synopsis["failure_categories"] = categories
 
-        blocks = data.get("blocks")
-        if isinstance(blocks, list):
+        for list_key in ("blocks", "block_details"):
+            blocks = data.get(list_key)
+            if not isinstance(blocks, list):
+                continue
             block_summary: list[dict[str, Any]] = []
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
                 entry: dict[str, Any] = {"label": block.get("label"), "status": block.get("status")}
+                # A paged run-results row keeps its key and iteration, so the model can map it and read it again.
+                for key in ("row_key", "current_index"):
+                    if key in block:
+                        entry[key] = block[key]
                 if block.get("failure_reason"):
                     entry["failure_reason"] = str(block["failure_reason"])[:120]
                 codes = block.get("error_codes")
                 if isinstance(codes, list) and codes:
                     entry["error_codes"] = _bounded_error_codes(codes)
+                ai_fallback = block.get("ai_fallback")
+                if isinstance(ai_fallback, dict):
+                    entry["ai_fallback"] = {
+                        key: str(value)[:120] for key in ("status", "failure_text") if (value := ai_fallback.get(key))
+                    }
+                if block.get("parent_block_label"):
+                    entry["parent_block_label"] = str(block["parent_block_label"])[:120]
                 block_summary.append(entry)
             if block_summary:
-                synopsis["blocks"] = block_summary
+                synopsis[list_key] = block_summary
 
     synopsis["_summarized"] = "older tool output — only key fields retained"
     try:
@@ -912,13 +982,54 @@ def _summarize_tool_arguments(args_json: str) -> str:
         return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
 
 
-def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int, tool_names: list[str]) -> None:
     LOG.warning(
         "copilot_recent_tool_output_truncated",
         truncated_count=truncated_count,
         cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         largest_original_chars=largest_original_chars,
+        tool_name=sorted(set(tool_names)),
     )
+
+
+def _is_model_authored(item: Any) -> bool:
+    return _item_field(item, "type") in ("reasoning", "function_call") or _item_field(item, "role") == "assistant"
+
+
+def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
+    """Indices of tool outputs no model call has seen yet: those after the last model-authored item. The SDK
+    appends a response's calls, then all of their outputs, so any later model item means the model read them.
+    User, synthetic and screenshot messages are not reads."""
+    unread: set[int] = set()
+    for index in range(len(items) - 1, -1, -1):
+        if _is_model_authored(items[index]):
+            break
+        if _item_field(items[index], "type") == "function_call_output":
+            unread.add(index)
+    return unread
+
+
+def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
+    """Return, oldest first, the index of every tool output or real user message that precedes both the compaction
+    window and every unpruned screenshot. Later model calls resend every item up to the last of them unchanged."""
+    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
+    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+    unstable = {
+        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *unread_tool_output_indices(items),
+        *(
+            i
+            for i, item in enumerate(items)
+            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+        ),
+    }
+    return [
+        index
+        for index, item in enumerate(items[: min(unstable, default=len(items))])
+        if _item_field(item, "type") == "function_call_output"
+        or (_item_field(item, "role") == "user" and not is_synthetic_user_message(item))
+    ]
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -936,12 +1047,16 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
     recent_fco_set = set(fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
+    recent_fco_set |= unread_tool_output_indices(items)
+
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
+    tool_names = {_item_field(items[i], "call_id"): _item_field(items[i], "name") for i in fc_indices}
 
     result: list[Any] = []
     recent_truncated_count = 0
     recent_truncated_largest = 0
+    recent_truncated_names: list[str] = []
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -957,6 +1072,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                         if new_output != output:
                             recent_truncated_count += 1
                             recent_truncated_largest = max(recent_truncated_largest, len(output))
+                            recent_truncated_names.append(tool_names.get(_item_field(item, "call_id")) or "unknown")
                     else:
                         new_output = output
                 else:
@@ -972,7 +1088,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
 
         result.append(item)
     if recent_truncated_count:
-        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest, recent_truncated_names)
     return result
 
 
@@ -1206,6 +1322,8 @@ async def _run_streamed_with_deadline(
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
+    *,
+    watch_steer: bool = False,
 ) -> Any:
     """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
@@ -1234,12 +1352,17 @@ async def _run_streamed_with_deadline(
                 result.cancel(mode="after_turn")
 
         ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
+        steer_watcher = asyncio.create_task(watch_for_steer(result, ctx)) if watch_steer else None
         try:
             try:
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                if steer_watcher is not None:
+                    steer_watcher.cancel()
+                    await asyncio.wait({steer_watcher})
+                ctx.model_call_in_flight = False
                 ctx.model_stream_deadline = None
                 ctx.check_model_work_deadline = None
                 # A request_credential call the SDK rejected before its handler ran leaves the gate
@@ -1310,6 +1433,41 @@ async def _run_budget_drain(
     finally:
         state.drain_active = False
     return result
+
+
+async def run_final_reply_drain(
+    agent: Agent,
+    ctx: CopilotContext,
+    stream: EventSourceStream,
+    *,
+    session: Session | None,
+    hooks: FinalReplyRunHooks,
+    run_config: RunConfig,
+    observation: str = FINAL_REPLY_OBSERVATION,
+) -> RunResultStreaming:
+    reply_run_config = replace(
+        run_config,
+        model_settings=(run_config.model_settings or ModelSettings()).resolve(ModelSettings(tool_choice="none")),
+    )
+    state = ctx.budget_expiry_state
+    expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded)
+    LOG.info("copilot_final_reply_drain_started")
+    try:
+        return await _run_streamed_with_deadline(
+            agent,
+            observation,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            {"max_turns": 1, "hooks": hooks, "run_config": reply_run_config},
+            ctx.copilot_run_start_monotonic or time.monotonic(),
+            0,
+        )
+    except CopilotTotalTimeoutError:
+        # The hard backstop marks the turn budget-expired; this call is not a budget drain.
+        state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded = expiry_snapshot
+        LOG.warning("copilot_final_reply_drain_turn_deadline_rolled_back")
+        raise
 
 
 # Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf
@@ -1883,6 +2041,7 @@ async def run_with_enforcement(
                     current_runner_kwargs,
                     start_time,
                     iteration,
+                    watch_steer=True,
                 )
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
@@ -1938,6 +2097,7 @@ async def run_with_enforcement(
                         current_runner_kwargs,
                         start_time,
                         iteration,
+                        watch_steer=True,
                     )
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
@@ -1976,6 +2136,14 @@ async def run_with_enforcement(
                 iteration,
                 "deadline",
             )
+
+        steer_input = await take_steer_input(ctx)
+        if steer_input:
+            current_input = (
+                steer_input if session is not None else _prune_input_list(result.to_input_list()) + steer_input
+            )
+            iteration += 1
+            continue
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace
@@ -2029,12 +2197,4 @@ async def run_with_enforcement(
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )
-        # Signal the narrator that the agent is re-entering the loop after an
-        # enforcement correction. stream_to_sse creates the state on the first
-        # pass; on later passes we poke the transition latch directly so the
-        # next narration (produced after the next tool round-trip) can describe
-        # the course-correction.
-        narrator_state = getattr(ctx, "narrator_state", None)
-        if narrator_state is not None:
-            narrator_state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
         iteration += 1

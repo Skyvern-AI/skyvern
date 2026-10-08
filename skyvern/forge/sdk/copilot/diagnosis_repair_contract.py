@@ -3,18 +3,23 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ACTION_TRACE_PER_TASK_LIMIT,
     SOLVER_ATTEMPT_KEY,
     SOLVER_RESULTS,
     ChallengeEffects,
     Lever,
+    SolverFacts,
+    SolverReceipt,
     failed_block_bound_credential_ids,
+    governing_solver_receipt,
+    solver_receipt,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES,
@@ -41,7 +46,9 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
+from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -212,7 +219,7 @@ def build_diagnosis_repair_contract(
         challenge_runtime_clearable=run_challenge_is_runtime_clearable(ctx, run_id_from_result_data(data)),
     )
     next_action = _next_action(failure_type, ctx, data, repair_context)
-    challenge = _challenge_effects(ctx, blocks, categories, data)
+    challenge = _challenge_effects(ctx, blocks, categories, data, run_passed=run_ok and not suspicious)
     frontier = _safe_str(data.get("frontier_start_label"))
     target_blocks = failed_blocks or ([frontier] if frontier else []) if next_action == RepairNextAction.REPAIR else []
     if next_action == RepairNextAction.REPAIR and not target_blocks and repair_context is not None:
@@ -321,47 +328,64 @@ def build_diagnosis_repair_contract(
     )
 
 
-def _solver_facts(blocks: list[Any], data: dict[str, Any]) -> tuple[str, str | None]:
-    """Returns (result, failure_text) over failed / not_solved / attempted / not_attempted / unresolved.
-
-    A completed row carrying no boolean means the solve step ran, not that the challenge cleared: the
-    runtime's no-solver fallback also reports success. An absent action history means unresolved, not a
-    non-attempt: the optional lookup swallows its own failures, and a later tool result in the
-    same turn carries no run history at all."""
-    """Prefer the record captured before the traces were stripped; fall back to any trace still present."""
-    carried = data.get(SOLVER_ATTEMPT_KEY)
-    if isinstance(carried, dict):
-        result = str(carried.get("result") or "unresolved")
-        if result not in SOLVER_RESULTS:
-            result = "unresolved"
-        return result, _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX)
-    attempted = False
-    failed = False
-    not_solved = False
+def solver_facts_from_traces(blocks: Sequence[object], *, code_block_only: bool = False) -> SolverFacts:
+    """A completed row with no boolean means the step ran, not that the challenge cleared, since the no-solver
+    fallback also reports success. An absent history is unresolved, not a non-attempt, because the lookup
+    swallows its own failures."""
     saw_history = False
-    failure: str | None = None
+    truncated = False
+    rows: list[Mapping[str, Any]] = []
     for block in blocks:
-        trace = block.get("action_trace") if isinstance(block, dict) else None
+        if not isinstance(block, Mapping):
+            continue
+        if code_block_only and str(block.get("block_type") or "").upper() != BlockType.CODE.name:
+            continue
+        trace = block.get("action_trace")
         if not isinstance(trace, list):
             continue
         saw_history = True
-        for entry in trace:
-            if not isinstance(entry, dict) or entry.get("action") != ActionType.SOLVE_CAPTCHA.value:
-                continue
-            attempted = True
-            if entry.get("status") == "failed":
-                failed = True
-                if failure is None:
-                    failure = _safe_text(_safe_str(entry.get("response")), _SOLVER_FAILURE_MAX)
-            elif entry.get("solver_cleared") is False:
-                not_solved = True
-    if failed:
-        return "failed", failure
-    if not_solved:
-        return "not_solved", failure
-    if attempted:
-        return "attempted", failure
-    return ("not_attempted" if saw_history else "unresolved"), failure
+        block_rows = [
+            entry
+            for entry in trace
+            if isinstance(entry, Mapping) and entry.get("action") == ActionType.SOLVE_CAPTCHA.value
+        ]
+        if code_block_only and block_rows:
+            # Blocks are chronological and each trace is newest-first, so this is the newest call; a raise
+            # the code's own retry loop recovered from must not outrank it.
+            rows = block_rows[:1]
+            truncated = False
+        elif code_block_only and len(trace) >= ACTION_TRACE_PER_TASK_LIMIT:
+            # A full trace may have cut this block's own call, so an earlier block's row cannot stand in for it.
+            truncated = True
+        else:
+            rows.extend(block_rows)
+    if truncated:
+        return {"attempted": False, "result": "unresolved", "failure": None}
+    failed_row = next((row for row in rows if row.get("status") == ActionStatus.failed.value), None)
+    if failed_row is not None:
+        failure = _safe_text(_safe_str(failed_row.get("response")), _SOLVER_FAILURE_MAX) or None
+        return {"attempted": True, "result": "failed", "failure": failure}
+    if any(row.get("solver_cleared") is False for row in rows):
+        return {"attempted": True, "result": "not_solved", "failure": None}
+    if rows:
+        return {"attempted": True, "result": "attempted", "failure": None}
+    return {"attempted": False, "result": "not_attempted" if saw_history else "unresolved", "failure": None}
+
+
+def _solver_facts(blocks: list[Any], data: dict[str, Any], *, code_block_only: bool = False) -> tuple[str, str | None]:
+    record = data.get(SOLVER_ATTEMPT_KEY)
+    if not isinstance(record, dict):
+        facts = solver_facts_from_traces(blocks, code_block_only=code_block_only)
+        return facts["result"], facts["failure"]
+    carried = record.get("code_block") if code_block_only else record
+    if not isinstance(carried, dict) or str(carried.get("result")) not in SOLVER_RESULTS:
+        return "unresolved", None
+    return str(carried["result"]), _safe_text(_safe_str(carried.get("failure")), _SOLVER_FAILURE_MAX) or None
+
+
+def _governing_receipt(blocks: Sequence[Mapping[str, object]], data: dict[str, Any]) -> SolverReceipt | None:
+    record = data.get(SOLVER_ATTEMPT_KEY)
+    return solver_receipt(record.get("receipt")) if isinstance(record, dict) else governing_solver_receipt(blocks)
 
 
 def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -> list[str]:
@@ -374,12 +398,14 @@ def _same_run_challenge_frame_hosts(ctx: CopilotContext, data: dict[str, Any]) -
 
 
 def _challenge_effects(
-    ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any]
+    ctx: CopilotContext, blocks: list[Any], categories: list[str], data: dict[str, Any], *, run_passed: bool
 ) -> ChallengeEffects | None:
-    """A run_wall record with solver facts when the run met a wall, a page_frames record carrying only
-    frame hosts when the final page merely mounted a vendor frame, and None otherwise."""
+    """Classify a run's challenge evidence as run_wall, solver_call, page_frames, or None."""
     frame_hosts = _same_run_challenge_frame_hosts(ctx, data)
     result, failure = _solver_facts(blocks, data)
+    receipt = (
+        None if run_passed else _governing_receipt([block for block in blocks if isinstance(block, Mapping)], data)
+    )
     walled = any(category in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES for category in categories) or bool(
         ctx.last_test_anti_bot
     )
@@ -389,6 +415,17 @@ def _challenge_effects(
         walled = bool(frame_hosts) or (
             same_run_typed_challenge_kind(ctx.composition_page_evidence, run_id_from_result_data(data)) is not None
         )
+    if not walled and not run_passed:
+        code_result, code_failure = _solver_facts(blocks, data, code_block_only=True)
+        if code_result in {"failed", "not_solved", "attempted"}:
+            return ChallengeEffects(
+                basis="solver_call",
+                solver_attempted=True,
+                solver_result=code_result,
+                solver_failure=code_failure,
+                solver_receipt=receipt,
+                frame_hosts=frame_hosts or None,
+            )
     if not walled:
         return ChallengeEffects(basis="page_frames", frame_hosts=frame_hosts) if frame_hosts else None
     kind = typed_challenge_kind(ctx.composition_page_evidence)
@@ -399,6 +436,7 @@ def _challenge_effects(
         solver_attempted=None if result == "unresolved" else result in {"failed", "not_solved", "attempted"},
         solver_result=result,
         solver_failure=failure,
+        solver_receipt=receipt,
         frame_hosts=frame_hosts or None,
     )
 

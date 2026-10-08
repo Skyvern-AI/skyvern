@@ -53,7 +53,7 @@ class NetworkRequest:
         self._post_data = raw.get("postData")
         raw_type = str(params.get("type", "Other"))
         self.resource_type = _RESOURCE_TYPES.get(raw_type.lower(), raw_type.lower())
-        self._frame_id = params.get("frameId")
+        self._frame_id: str | None = params.get("frameId")
         self.redirected_from: NetworkRequest | None = None
         self._response: NetworkResponse | None = None
         self._failure: str | None = None
@@ -73,6 +73,10 @@ class NetworkRequest:
     @property
     def post_data(self) -> str | None:
         return None if self._post_data is None else str(self._post_data)
+
+    @property
+    def frame_id(self) -> str | None:
+        return self._frame_id
 
     @property
     def frame(self) -> Any:

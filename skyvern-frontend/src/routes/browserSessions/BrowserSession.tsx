@@ -374,6 +374,7 @@ function BrowserSession() {
               !vncFailed && (
                 <BrowserStream
                   browserSessionId={browserSessionId}
+                  browserSession={browserSession}
                   interactive={false}
                   showControlButtons={true}
                   isVisible={activeTab === "stream"}

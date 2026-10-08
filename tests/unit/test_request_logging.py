@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
 import typing
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import psycopg.errors
 import pytest
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -33,6 +37,9 @@ from skyvern.forge.request_logging import (
     log_raw_request_middleware,
     set_request_organization,
 )
+from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
 # ---------------------------------------------------------------------------
 # _client_ip_from_headers
@@ -116,6 +123,15 @@ class TestIsSensitiveKey:
             "cdp_connect_headers",
             # One-time codes
             "cached_totp",
+            # OAuth credentials
+            "client_secret",
+            "access_token",
+            "refresh_token",
+            # Payment-provider payer details and webhook signatures
+            "billing_details",
+            "payment_method_details",
+            "receipt_email",
+            "Stripe-Signature",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -568,6 +584,7 @@ class TestSanitizeBody:
         [
             "/v1/workflow/copilot/chat-post",
             "/v1/workflow/copilot/question-response",
+            "/v1/workflow/copilot/steer",
             "/v1/workflow/copilot/credential-response",
             "/v1/workflow/copilot/convert-yaml-to-blocks",
         ],
@@ -705,6 +722,16 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     @app.get("/payment-required")
     async def payment_required() -> dict:
         raise HTTPException(status_code=402, detail="Payment Required")
+
+    @app.post("/runs/shed")
+    async def shed_run_submission() -> dict:
+        gate = RunSubmissionGate(limit=1, wait_seconds=0.01)
+        async with gate.slot(), gate.slot():
+            return {"dispatched": True}
+
+    @app.post("/runs/unavailable")
+    async def unavailable() -> dict:
+        raise HTTPException(status_code=503, detail="Service unavailable")
 
     @app.post("/post-only")
     async def post_only() -> dict:
@@ -844,7 +871,7 @@ class TestMiddlewareLogVolume:
         call = log_mock.error.call_args
         assert call.args == ("api.raw_request",)
         assert call.kwargs["body"] == REDACTED
-        assert call.kwargs["exc_info"] is True
+        assert call.kwargs["error_type"] == "builtins.ValueError"
         assert call.kwargs["status_code"] == 500
         assert call.kwargs["duration_seconds"] >= 0
         assert "SYNTHETIC_SECRET" not in repr(call)
@@ -921,7 +948,16 @@ class TestMiddlewareLogVolume:
 
         @app.post("/_test_request_logging_authed")
         async def authed() -> dict:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            # A same-day org is 0 days old; the record must still carry the age as a number.
+            now = datetime.now(UTC)
+            apply_request_org_context(
+                Organization(
+                    organization_id="o_385835488455492960",
+                    organization_name="Acme Corp",
+                    created_at=now,
+                    modified_at=now,
+                )
+            )
             return {"ok": True}
 
         response = TestClient(app).post("/_test_request_logging_authed")
@@ -930,6 +966,7 @@ class TestMiddlewareLogVolume:
         logged = log_mock.info.call_args.kwargs
         assert logged["organization_id"] == "o_385835488455492960"
         assert logged["organization_name"] == "Acme Corp"
+        assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
     def test_unhandled_exception_is_attributed_to_its_organization(
         self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -1038,6 +1075,15 @@ class TestMiddlewareLogVolume:
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == 403
 
+    @pytest.mark.parametrize(("path", "level"), [("/runs/shed", "warning"), ("/runs/unavailable", "error")])
+    def test_shed_run_submission_logs_at_warning_while_other_503s_stay_errors(
+        self, log_mock: MagicMock, path: str, level: str
+    ) -> None:
+        response = TestClient(_make_app()).post(path)
+
+        assert response.status_code == 503
+        assert [(call[0], call.kwargs["status_code"]) for call in log_mock.mock_calls] == [(level, 503)]
+
     def test_artifact_url_queries_are_redacted_from_logged_bodies(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
         response = client.post(
@@ -1130,6 +1176,89 @@ class TestMiddlewareLogVolume:
         client = TestClient(_make_app())
         client.post("/tasks")
         log_mock.info.assert_not_called()
+
+
+# The API's container log driver splits a longer stdout line into partial records that Datadog
+# indexes as unparsed text, so the row loses @status_code and @path.
+_LOG_DRIVER_LINE_LIMIT_BYTES = 16 * 1024
+# Deep enough that the traceback alone passes the limit, as production pool-timeout errors do.
+_ROUTE_CALL_DEPTH = 25
+_TEST_ORGANIZATION_ID = "o_385835488455492960"
+
+
+def _raise_from_depth(depth: int) -> None:
+    if depth == 0:
+        raise RuntimeError("connection pool exhausted")
+    _call_deeper(depth - 1)
+
+
+def _call_deeper(depth: int) -> None:
+    # Alternating frames keep the traceback from collapsing into "[Previous line repeated]".
+    _raise_from_depth(depth)
+
+
+def _raw_request_lines(stream: io.StringIO) -> list[tuple[str, dict]]:
+    lines = [line for line in stream.getvalue().splitlines() if line]
+    records = [(line, json.loads(line)) for line in lines]
+    return [(line, record) for line, record in records if record.get("msg", "").startswith("api.raw_request")]
+
+
+class TestRenderedRawRequestLine:
+    """Each failed request must reach the log collector as one parseable api.raw_request line."""
+
+    @pytest.mark.parametrize(
+        ("path", "client_status", "error_type"),
+        [
+            ("/_test_raw_request/raises", 500, "builtins.RuntimeError"),
+            ("/_test_raw_request/database-unavailable", 503, None),
+            ("/_test_raw_request/returns-500", 500, None),
+            ("/_test_raw_request/stream-raises", 200, "builtins.RuntimeError"),
+        ],
+        ids=["unhandled-exception", "database-unavailable", "handled-500", "exception-after-stream-start"],
+    )
+    def test_api_app_failure_logs_one_line_the_collector_keeps_whole(
+        self, rendered_log_stream: io.StringIO, path: str, client_status: int, error_type: str | None
+    ) -> None:
+        app = api_app.create_api_app()
+
+        @app.post("/_test_raw_request/raises")
+        async def raises() -> None:
+            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+            _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+        @app.post("/_test_raw_request/database-unavailable")
+        async def database_unavailable() -> None:
+            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+            raise OperationalError(
+                "SELECT 1", {}, psycopg.errors.ConnectionFailure("server closed the connection unexpectedly")
+            )
+
+        @app.post("/_test_raw_request/returns-500")
+        async def returns_500() -> JSONResponse:
+            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+            return JSONResponse(status_code=500, content={"detail": "failed"})
+
+        @app.post("/_test_raw_request/stream-raises")
+        async def stream_raises() -> StreamingResponse:
+            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+
+            async def events() -> typing.AsyncIterator[bytes]:
+                yield b"data: first\n\n"
+                _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+            return StreamingResponse(events(), media_type="text/event-stream")
+
+        response = TestClient(app, raise_server_exceptions=False).post(path)
+
+        assert response.status_code == client_status
+        [(line, record)] = _raw_request_lines(rendered_log_stream)
+        assert len(line.encode()) <= _LOG_DRIVER_LINE_LIMIT_BYTES
+        assert record["level"] == "error"
+        assert record["path"] == path
+        assert record["status_code"] == client_status
+        assert record["organization_id"] == _TEST_ORGANIZATION_ID
+        assert record["duration_seconds"] >= 0
+        assert record.get("error_type") == error_type
 
 
 class TestClientDisconnectDuringBodyRead:

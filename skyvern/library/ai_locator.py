@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402
+from collections.abc import Awaitable
 from typing import Any, Callable
 
 from skyvern.exceptions import require_local_extra_modules
@@ -10,6 +11,8 @@ require_local_extra_modules("skyvern.library.ai_locator")
 from playwright.async_api import Locator, Page
 
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.exceptions import ActionDeadlineExceeded
+from skyvern.webeye.action_deadline import under_action_deadline
 
 LOCATOR_CHAIN_METHODS = {
     "nth",
@@ -47,7 +50,7 @@ class AILocator(Locator):
         selector: str | None = None,
         selector_kwargs: dict[str, Any] | None = None,
         try_selector_first: bool = True,
-        parent_resolver: Callable[[], Any] | None = None,
+        parent_resolver: Callable[[int | None], Awaitable[Locator]] | None = None,
     ):
         super().__init__(page)
         self._page = page
@@ -61,18 +64,22 @@ class AILocator(Locator):
         # For chaining: store a resolver function that returns the final Locator
         self._parent_resolver = parent_resolver
 
-    async def _resolve(self) -> Locator:
+    async def _resolve(self, budget_ms: int | None = None) -> Locator:
         if self._resolved_locator is None:
             if self._parent_resolver:
-                self._resolved_locator = await self._parent_resolver()
+                self._resolved_locator = await self._parent_resolver(budget_ms)
             else:
                 if self._try_selector_first and self._selector:
                     try:
                         selector_locator = self._page.locator(self._selector, **self._selector_kwargs)
-                        count = await selector_locator.count()
+                        # The probe is a driver call, so it shares the bound the caller's action carries.
+                        async with under_action_deadline(budget_ms=budget_ms):
+                            count = await selector_locator.count()
                         if count > 0:
                             self._resolved_locator = selector_locator
                             return self._resolved_locator
+                    except ActionDeadlineExceeded:
+                        raise
                     except Exception:
                         # Selector failed, will try AI below
                         pass
@@ -101,8 +108,8 @@ class AILocator(Locator):
         if name in LOCATOR_CHAIN_METHODS:
 
             def locator_chain_wrapper(*args: Any, **kwargs: Any) -> AILocator:
-                async def resolver() -> Locator:
-                    parent_locator = await self._resolve()
+                async def resolver(budget_ms: int | None = None) -> Locator:
+                    parent_locator = await self._resolve(budget_ms)
                     method = getattr(parent_locator, name)
                     return method(*args, **kwargs)
 
@@ -120,9 +127,13 @@ class AILocator(Locator):
 
         # For all other methods (async actions like click, fill, etc.)
         async def async_method_wrapper(*args: Any, **kwargs: Any) -> Any:
-            locator = await self._resolve()
+            timeout = kwargs.get("timeout")
+            budget_ms = int(timeout) if timeout else None
+            locator = await self._resolve(budget_ms)
             method = getattr(locator, name)
-            result = method(*args, **kwargs)
-            return await result
+            # Inference inside the resolve stays unbounded; the driver call carries its own timeout,
+            # which a driver that stopped answering never honours.
+            async with under_action_deadline(budget_ms=budget_ms):
+                return await method(*args, **kwargs)
 
         return async_method_wrapper

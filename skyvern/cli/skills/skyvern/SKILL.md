@@ -178,7 +178,8 @@ skyvern block schema --type navigation                # discover block types
 skyvern block validate --block-json @block.json       # validate before creating
 ```
 
-Engine: known path = 1.0 (default). Dynamic planning = 2.0. Split into multiple 1.0 blocks when in doubt.
+Engine: known path = omit `engine` (the default engine). Dynamic planning = 2.0. Split into multiple default-engine blocks when in doubt.
+User asks for 1.0 (or 2.0) -> set `engine: skyvern-1.0` (or `engine: skyvern-2.0`) explicitly.
 Status lifecycle: `created -> queued -> running -> completed | failed | canceled | terminated | timed_out`
 
 ## Common Patterns

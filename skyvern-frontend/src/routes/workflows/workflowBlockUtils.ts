@@ -1,10 +1,12 @@
 import {
   ActionTypes,
   getReadableActionType,
+  Status,
   type ActionsApiResponse,
   type ActionSummary,
   type ActionSummaryBody,
 } from "@/api/types";
+import { isRecord } from "@/util/utils";
 
 import {
   isNestedLoopWorkflowBlock,
@@ -184,16 +186,44 @@ export function taskV3CallText(
 export type ActionSummarySource = Partial<
   Pick<
     ActionsApiResponse,
-    "action_type" | "reasoning" | "intention" | "response" | "text"
+    | "action_type"
+    | "created_by"
+    | "description"
+    | "intention"
+    | "output"
+    | "reasoning"
+    | "response"
+    | "status"
+    | "text"
   >
 >;
+
+// Only Task V3, code-block recorder and cached-script rows write a result into `response` (a script
+// select records the option it chose there and nowhere else). The agent stores its
+// `user_detail_answer` there and computer use its click coordinates, neither of which is a result.
+function recordsOutcome(action: ActionSummarySource): boolean {
+  return (
+    action.created_by === "script" ||
+    taskV3CallText(action.description) !== null ||
+    (isRecord(action.output) && "code_line" in action.output)
+  );
+}
 
 export function getActionInputValue(
   action: ActionSummarySource,
 ): string | null {
-  // Script-generated input text lives in response, not text.
   if (action.action_type === ActionTypes.InputText) {
-    return action.text ?? action.response ?? null;
+    // A Task V3 type call records the typed value in `text`; a script-generated row records it in
+    // `response` and leaves `text` empty, so an empty `text` is not an answer.
+    if (action.text) {
+      return action.text;
+    }
+    // A recorded fill that raised also leaves `text` empty, but its `response` is the exception
+    // that stopped it (code_block_recorder), which is an outcome and not an input.
+    if (action.status === Status.Failed) {
+      return null;
+    }
+    return action.response ?? null;
   }
   return action.text ?? null;
 }
@@ -248,7 +278,9 @@ export function getActionSummary(
       break;
     }
   }
-  const recorded = normalizeInlineText(getActionOutcome(action));
+  const recorded = recordsOutcome(action)
+    ? normalizeInlineText(getActionOutcome(action))
+    : null;
   const outcome =
     recorded !== null && recorded !== normalizeInlineText(body?.text)
       ? recorded

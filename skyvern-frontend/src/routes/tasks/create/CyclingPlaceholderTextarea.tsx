@@ -6,7 +6,7 @@ import { useCyclingPlaceholder } from "./useCyclingPlaceholder";
 
 type Props = Omit<
   ComponentProps<typeof AutoResizingTextarea>,
-  "placeholder"
+  "placeholder" | "aria-label"
 > & {
   cycling: boolean;
 };
@@ -16,7 +16,12 @@ const CyclingPlaceholderTextarea = forwardRef<HTMLTextAreaElement, Props>(
   function CyclingPlaceholderTextarea({ cycling, ...props }, ref) {
     const placeholder = useCyclingPlaceholder(cycling);
     return (
-      <AutoResizingTextarea ref={ref} placeholder={placeholder} {...props} />
+      <AutoResizingTextarea
+        ref={ref}
+        {...props}
+        aria-label="Prompt"
+        placeholder={placeholder}
+      />
     );
   },
 );

@@ -4,6 +4,7 @@ import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
   CodeIcon,
+  CrossCircledIcon,
   CursorTextIcon,
   DownloadIcon,
   EnvelopeClosedIcon,
@@ -88,6 +89,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "wait": {
       return <StopwatchIcon className={className} />;
+    }
+    case "terminate": {
+      return <CrossCircledIcon className={className} />;
     }
     case "pdf_parser": {
       return <FileTextIcon className={className} />;

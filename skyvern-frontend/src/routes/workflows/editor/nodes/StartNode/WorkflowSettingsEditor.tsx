@@ -3,7 +3,13 @@ import { RetryPolicyEditor } from "./RetryPolicyEditor";
 import { collectKnownErrorCodes } from "./retryPolicyUtils";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SyntheticEvent,
+} from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
@@ -23,7 +29,6 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -42,9 +47,12 @@ import {
 } from "@/routes/workflows/utils";
 import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
-import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { updateWorkflowBrowserSessionReuse } from "@/store/WorkflowSettingsStore";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import { BrowserProfileSettingsSection } from "./BrowserProfileSettingsSection";
 
@@ -105,18 +113,22 @@ function WorkflowSettingsEditorBody({
   const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes<AppNode>();
   const readOnly = useWorkflowScopeReadOnly();
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  // Portal controls remain in this React subtree even outside the disabled fieldset.
+  const preventLockedInteraction = (event: SyntheticEvent) => {
+    if (!mutationLocked) return;
+    event.preventDefault();
+    event.stopPropagation();
+  };
   const knownErrorCodes = useMemo(() => collectKnownErrorCodes(nodes), [nodes]);
   const edges = useEdges();
-  const update = useUpdate<StartNode["data"]>({ id: blockId, editable: true });
-  const studioEnabled = useWorkflowStudioEnabled();
+  const update = useUpdate<StartNode["data"]>({
+    id: blockId,
+    editable: true,
+  });
   const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const { data: browserTypeOptions } = useBrowserTypeOptionsQuery();
-  // Self-healing is restricted to copilot-authored workflows; hide the toggle
-  // elsewhere so it never reads as a switch that silently does nothing.
-  // copilot_authored is lineage-derived server-side — the current version's
-  // created_by/edited_by get re-stamped by user saves and are not durable.
-  const copilotAuthored = workflow?.copilot_authored === true;
   const persistBrowserSessionEnabled = data.persistBrowserSession;
 
   const [localWebhookUrl, setLocalWebhookUrl] = useState(
@@ -151,15 +163,26 @@ function WorkflowSettingsEditorBody({
   );
   useEffect(() => {
     if (
+      !mutationLocked &&
       data.finallyBlockLabel &&
       !terminalBlockLabelSet.has(data.finallyBlockLabel)
     ) {
-      update({ finallyBlockLabel: null });
+      update({ finallyBlockLabel: null }, { source: "workflow" });
     }
-  }, [data.finallyBlockLabel, terminalBlockLabelSet, update]);
+  }, [data.finallyBlockLabel, terminalBlockLabelSet, update, mutationLocked]);
 
   return (
-    <div data-testid="workflow-settings-block-form" className="space-y-4">
+    <fieldset
+      data-testid="workflow-settings-block-form"
+      className="space-y-4"
+      disabled={mutationLocked}
+      {...{ inert: mutationLocked ? "" : undefined }}
+      onPointerDownCapture={preventLockedInteraction}
+      onPointerUpCapture={preventLockedInteraction}
+      onClickCapture={preventLockedInteraction}
+      onKeyDownCapture={preventLockedInteraction}
+      onChangeCapture={preventLockedInteraction}
+    >
       <RetryPolicyEditor
         value={data.retryPolicy ?? null}
         onChange={(retryPolicy) => update({ retryPolicy })}
@@ -183,6 +206,7 @@ function WorkflowSettingsEditorBody({
           <HelpTooltip content="Applied to every LLM call in this agent, including any sub-agents." />
         </div>
         <WorkflowBlockInputTextarea
+          name="workflowSystemPrompt"
           nodeId={blockId}
           onChange={(value) =>
             update({
@@ -294,30 +318,13 @@ function WorkflowSettingsEditorBody({
               />
             </div>
           </div>
-          {studioEnabled && copilotAuthored && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <Label>Code Block Self-Healing</Label>
-                <Badge variant="warning" className="px-1.5 py-0.5 text-[10px]">
-                  Beta
-                </Badge>
-                <HelpTooltip content="If a code block fails on a changed page, an AI agent takes over the live browser to finish that block's goal, then the run continues." />
-                <Switch
-                  className="ml-auto"
-                  checked={data.enableSelfHealing}
-                  onCheckedChange={(value) =>
-                    update({ enableSelfHealing: value })
-                  }
-                />
-              </div>
-            </div>
-          )}
           <div className="space-y-2">
             <div className="flex gap-2">
               <Label>Code Key (optional)</Label>
               <HelpTooltip content="A static or dynamic key for directing code generation." />
             </div>
             <WorkflowBlockInputTextarea
+              name="scriptCacheKey"
               nodeId={blockId}
               onChange={(value) => {
                 const v = value.length ? value : null;
@@ -366,6 +373,7 @@ function WorkflowSettingsEditorBody({
                 <HelpTooltip content={SEQUENTIAL_KEY_TOOLTIP} />
               </div>
               <WorkflowBlockInputTextarea
+                name="sequentialKey"
                 nodeId={blockId}
                 onChange={(value) => {
                   const v = value.length ? value : null;
@@ -446,6 +454,7 @@ function WorkflowSettingsEditorBody({
               </div>
               <div className="flex flex-col gap-2">
                 <WorkflowBlockInputTextarea
+                  name="browserProfileKey"
                   nodeId={blockId}
                   onChange={(value) => {
                     update({
@@ -631,7 +640,7 @@ function WorkflowSettingsEditorBody({
           </SelectContent>
         </Select>
       </div>
-    </div>
+    </fieldset>
   );
 }
 

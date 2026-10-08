@@ -24,6 +24,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -164,10 +165,10 @@ workflow_definition:
 
     result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow_yaml": workflow_yaml, "block_labels": ["staged_step"], "parameters": {}}),
+        json.dumps({"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["staged_step"], "parameters": {}}),
     )
 
-    assert ctx.staged_workflow_yaml == workflow_yaml
+    assert safe_load_no_dates(ctx.staged_workflow_yaml) == safe_load_no_dates(workflow_yaml)
     assert ctx.has_staged_proposal is True
     assert json.loads(result) == {
         "ok": False,
@@ -226,7 +227,7 @@ def test_prior_expiry_and_question_are_serialized_into_next_model_history(resolv
     )
 
     question_line, message_line, _ = history.splitlines()
-    prefix = "ask_user result: " if resolved else "ask_user request: "
+    prefix = "user question result: " if resolved else "user question request: "
     expected = interaction.tool_result() if resolved else interaction.model_dump(mode="json")
     assert json.loads(question_line.removeprefix(prefix)) == expected
     assert message_line == "ai: I saved the draft."

@@ -168,6 +168,7 @@ export type FailureCategory = {
   category: string;
   confidence_float: number;
   reasoning: string;
+  reason_code?: string | null;
 };
 
 export type TaskApiResponse = {
@@ -216,6 +217,7 @@ export type User = {
   id: string;
   email: string;
   name: string;
+  createdAt?: Date;
 };
 
 export type OrganizationApiResponse = {
@@ -895,6 +897,7 @@ export type TaskRunListItem = {
   workflow_deleted: boolean;
   script_run: boolean;
   trigger_type?: TriggerType | null;
+  created_by?: string | null;
   searchable_text: string | null;
 } & Pick<
   WorkflowRunRetryFields,
@@ -1123,6 +1126,7 @@ export type CredentialApiResponse = {
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
+  created_by?: string | null;
 };
 
 export function isPasswordCredential(
@@ -1249,6 +1253,26 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 
 export type PylonEmailHash = {
   hash: string;
+};
+
+export type RunFeedbackTargetType =
+  | "workflow_run"
+  | "task"
+  | "browser_recording";
+export type FeedbackRating = "up" | "down";
+
+export type RunFeedbackApiResponse = {
+  run_feedback_id: string;
+  organization_id: string;
+  target_type: RunFeedbackTargetType;
+  target_id: string;
+  context_id: string | null;
+  rating: FeedbackRating;
+  reason: string | null;
+  needs_support: boolean;
+  submitted_by: string | null;
+  created_at: string;
+  modified_at: string;
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;

@@ -61,6 +61,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "delete_block",
     "list_credentials",
     "list_integrations",
+    "read_google_sheet",
     "run_blocks_and_collect_debug",
     "test_workflow_from_blank_browser",
     "get_run_results",
@@ -72,6 +73,10 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "fill_credential_field",
     "request_credential",
     "run_browser_code",
+    "solve_page_challenge",
+    "start_fresh_browser",
+    "extend_browser_session",
+    "upload_attached_file",
 ]
 
 
@@ -86,6 +91,7 @@ def test_the_tool_joins_every_catalog_combination_without_displacing_one(
         for tool in copilot_native_tools(
             supports_question_tool=supports_question_tool,
             browser_code_available=browser_code_available,
+            run_tools_available=True,
         )
     ]
 
@@ -102,7 +108,7 @@ def test_the_tool_joins_every_catalog_combination_without_displacing_one(
 async def test_a_self_heal_turn_cannot_read_account_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
     ctx = make_copilot_context()
-    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback
 
     payload = json.loads(
         await get_organization_usage_quota_tool.on_invoke_tool(

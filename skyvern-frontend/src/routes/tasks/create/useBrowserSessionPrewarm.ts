@@ -1,10 +1,10 @@
 import { useCallback, useRef } from "react";
-import { useAuth } from "@clerk/clerk-react";
 import type { ProxyLocation } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useUser } from "@/hooks/useUser";
 import { BROWSER_SESSION_PREWARM_FLAG } from "@/util/featureFlags";
 
 const PREWARM_DISPATCH_WAIT_TIMEOUT_MS = 10_000;
@@ -50,7 +50,7 @@ function waitForBrowserSessionPrewarm(): Promise<void> {
 
 function useBrowserSessionPrewarm(proxyLocation: ProxyLocation) {
   const credentialGetter = useCredentialGetter();
-  const { userId } = useAuth();
+  const userId = useUser().get()?.id;
   const organizationId = useCurrentOrgId();
   const enabled = useFeatureFlag(BROWSER_SESSION_PREWARM_FLAG) === true;
   const attemptedIdentity = useRef<string>();

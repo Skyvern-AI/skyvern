@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { useState } from "react";
-import { AxiosHeaders } from "axios";
+import { AxiosError, AxiosHeaders } from "axios";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import {
   act,
@@ -27,8 +27,13 @@ const { mockGet, mockPost, mockAuth, mockRequestClient } = vi.hoisted(() => ({
   mockRequestClient: vi.fn(),
 }));
 
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ isSignedIn: true, ...mockAuth }),
+vi.mock("@/hooks/useUser", () => ({
+  useUser: () => ({
+    get: () => ({ id: mockAuth.userId, email: "", name: "" }),
+  }),
+}));
+vi.mock("@/store/ActiveOrgContext", () => ({
+  useActiveOrgId: () => mockAuth.orgId ?? undefined,
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => () => Promise.resolve("test-token"),
@@ -131,6 +136,7 @@ function response(
   return {
     onboarding_state: {
       tour_completed_at: null,
+      studio_tour_completed_at: null,
       modal_dismissed_at: null,
       first_save_at: null,
       first_run_at: null,
@@ -452,6 +458,28 @@ describe("OnboardingProvider writes", () => {
     expect(OnboardingTelemetry.error).toHaveBeenCalledExactlyOnceWith(
       "dashboard",
     );
+  });
+
+  it("retries a write whose request got no response", async () => {
+    mockGet
+      .mockResolvedValueOnce({ data: response() })
+      .mockResolvedValue({ data: response({ seen_canvas: true }) });
+    mockPost
+      .mockRejectedValueOnce(
+        new AxiosError("Network Error", AxiosError.ERR_NETWORK),
+      )
+      .mockResolvedValueOnce({ data: response({ seen_canvas: true }) });
+    const { queryClient } = renderProvider();
+    await waitFor(() => expect(mockGet).toHaveBeenCalledOnce());
+
+    fireEvent.click(screen.getByText("see canvas"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2), {
+      timeout: 3000,
+    });
+    await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+    expect(OnboardingTelemetry.error).not.toHaveBeenCalled();
+    expect(screen.getByTestId("seen").textContent).toBe("true");
   });
 
   it("lets a later successful field value supersede an older failure", async () => {

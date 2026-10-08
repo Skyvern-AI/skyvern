@@ -16,6 +16,11 @@ def admit_block_dispatch(status: WorkflowRunStatus = WorkflowRunStatus.running) 
     )
 
 
+def released_session_stub() -> SimpleNamespace:
+    """A ``Session`` stand-in whose ``released()`` is the no-op the real one is outside a pinned scope."""
+    return SimpleNamespace(released=MagicMock(side_effect=lambda: nullcontext()))
+
+
 def create_forge_stub_app() -> ForgeApp:
     class _LazyNamespace:
         def __getattr__(self, name):
@@ -25,6 +30,8 @@ def create_forge_stub_app() -> ForgeApp:
 
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
+    # Auto-mocked, Session.released() would hand `async with` a coroutine.
+    fake_app_module.DATABASE.workflow_runs.Session.released = released_session_stub().released
     # Retry-policy-aware production paths query the attempt repository even for legacy runs.
     # Keep the shared stub's no-policy behavior explicit instead of letting _LazyNamespace
     # manufacture truthy AsyncMocks for these reads.
@@ -38,6 +45,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check = MagicMock(return_value=set())
+    # Sync lookup feeding the redactor's placeholder exemption — _LazyNamespace would auto-mock it as
+    # a non-iterable AsyncMock and make every redacting call site raise.
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run = MagicMock(return_value=frozenset())
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_attempt_number = MagicMock(return_value=1)
     # Sync liveness predicate — _LazyNamespace would auto-mock it as a truthy (never-awaited) AsyncMock,
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
@@ -66,9 +76,8 @@ def create_forge_stub_app() -> ForgeApp:
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
-    # Same footgun: _LazyNamespace's truthy AsyncMock would inject extra guidance text into every
-    # v3 task's extra_system_guidance join.
-    fake_app_module.AGENT_FUNCTION.resolve_task_v3_extra_guidance = base_agent_function.resolve_task_v3_extra_guidance
+    fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
+    fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values
@@ -87,11 +96,14 @@ def create_forge_stub_app() -> ForgeApp:
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
+    fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.supports_image_captcha_ocr = base_agent_function.supports_image_captcha_ocr
     # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
     # forcing the update/delete credential routes down the lock path and handing `async with` a
     # coroutine instead of a context manager. Match the real OSS base no-ops (unlocked path).
@@ -135,8 +147,13 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.OPENAI_CLIENT = AsyncMock()
     fake_app_module.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     fake_app_module.EXPERIMENTATION_PROVIDER = _LazyNamespace()
+    # An auto-mocked cached flag read returns a truthy MagicMock, switching on every flag read through it.
+    fake_app_module.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
     fake_app_module.STORAGE = _LazyNamespace()
     fake_app_module.CACHE = _LazyNamespace()
+    # The real app starts with no bearer authentication; without the attributes a bearer raises AttributeError.
+    fake_app_module.authentication_function = None
+    fake_app_module.authenticate_user_function = None
 
     return fake_app_module
 

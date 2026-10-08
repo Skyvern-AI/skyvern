@@ -50,7 +50,7 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { useFeatureFlagVariantKey, usePostHog } from "posthog-js/react";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
@@ -73,7 +73,6 @@ import {
   CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
-  WorkflowBlock,
   WorkflowParameter,
   WorkflowParameterTypes,
 } from "./types/workflowTypes";
@@ -103,28 +102,7 @@ import {
   isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
-import { visitWorkflowBlocks } from "./workflowBlockUtils";
-
-/**
- * Recursively finds all login blocks that don't have any credential parameters selected.
- * Checks nested blocks inside for_loop blocks as well.
- */
-function getLoginBlocksWithoutCredentials(
-  blocks: Array<WorkflowBlock>,
-): Array<{ label: string }> {
-  const result: Array<{ label: string }> = [];
-
-  visitWorkflowBlocks(blocks, (block) => {
-    if (block.block_type === "login") {
-      // Login block requires at least one parameter (credential) to be selected
-      if (!block.parameters || block.parameters.length === 0) {
-        result.push({ label: block.label });
-      }
-    }
-  });
-
-  return result;
-}
+import { getLoginBlocksWithoutCredentials } from "./runValidation";
 
 /**
  * Validates the workflow for issues that would prevent it from running.
@@ -568,6 +546,7 @@ function RunWorkflowForm({
   const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const apiCredential = useApiCredential();
   const recoveryGuidanceRetryContext = getRecoveryGuidanceRetryContext(
     location.state,
@@ -609,6 +588,8 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  // Mirrors the backend, which fails a run whose top-level block list is empty.
+  const hasNoBlocks = workflow?.workflow_definition.blocks.length === 0;
   const onboarding = useOnboardingStateOptional();
   const credentialFallbackRetryEnabled =
     useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
@@ -676,6 +657,7 @@ function RunWorkflowForm({
   );
 
   const runWorkflowMutation = useMutation({
+    mutationKey: ["runWorkflow"],
     mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
       const body = getRunWorkflowRequestBody(
@@ -690,6 +672,10 @@ function RunWorkflowForm({
       >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
+      postHog.capture("workflow.run.started", {
+        org_id: workflow?.organization_id,
+        workflow_permanent_id: workflowPermanentId,
+      });
       handleRunWorkflowSuccess(
         response.data?.workflow_run_id,
         recoveryGuidanceRetryContext,
@@ -958,7 +944,8 @@ function RunWorkflowForm({
               disabled={
                 runWorkflowMutation.isPending ||
                 hasLoginBlockValidationError ||
-                hasBlockingParameterError
+                hasBlockingParameterError ||
+                hasNoBlocks
               }
             >
               {runWorkflowMutation.isPending && (
@@ -971,6 +958,22 @@ function RunWorkflowForm({
             </Button>
           </div>
         </header>
+
+        {hasNoBlocks && (
+          <Alert>
+            <ExclamationTriangleIcon className="h-4 w-4" />
+            <AlertTitle>This agent has no blocks yet</AlertTitle>
+            <AlertDescription>
+              <Link
+                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                className="underline hover:no-underline"
+              >
+                Add a block
+              </Link>{" "}
+              or ask Copilot to build the agent, then run it.
+            </AlertDescription>
+          </Alert>
+        )}
 
         {hasLoginBlockValidationError && isActivation && (
           <CredentialSetupPrompt

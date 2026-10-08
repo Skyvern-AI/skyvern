@@ -671,6 +671,21 @@ If `verify_login` sees a login error, the agent terminates with `output.error = 
 
 ---
 
+## Requests refused before a run is created
+
+Some agent run requests can never start. `POST /v1/run/agents` (and its older forms `POST /v1/run/workflows` and `POST /api/v1/workflows/{workflow_id}/run`) answers them with HTTP 400 and a `detail` message, and no run is created, so there is no `run_id` to poll and no webhook:
+
+| Cause | Example `detail` |
+|-------|------------------|
+| A required parameter has no value and no default | `Missing value for parameter email in workflow wpid_123` |
+| A credential parameter names a credential that does not exist in your organization | `Invalid credential ID: cred_123. Failed to resolve to a valid credential.` |
+| A parameter value does not match its type | `Invalid workflow parameter. Expected parameter type: integer. Value: three.` |
+| A key the workflow does not declare looks like a credential parameter the request left out, such as `logn` for `login` | `The run request sent parameter(s) this workflow does not declare: logn. No credential resolved for login, so the run would have started without one. ...` |
+| A Bitwarden credential's item ID, known when the run is requested, is not a UUID | `Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: item_123. Workflow permanent id: wpid_123` |
+| A credential override names a credential outside the parameter's rotation or fallback credentials | `Credential override for parameter login must be one of the configured rotation or fallback credentials.` |
+
+Fix the request and send it again. Retrying returns the same 400 until the parameter is fixed, for example until the missing credential exists in your organization.
+
 ## Common error patterns
 
 | Error Code | Description | Typical Response |

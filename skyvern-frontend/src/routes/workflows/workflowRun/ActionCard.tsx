@@ -93,7 +93,7 @@ function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
         {summary?.outcome && (
           <div className="break-words text-xs text-neutral-600 dark:text-slate-400">
             <span className="text-neutral-500 dark:text-slate-500">
-              Outcome:{" "}
+              Result:{" "}
             </span>
             {summary.outcome}
           </div>

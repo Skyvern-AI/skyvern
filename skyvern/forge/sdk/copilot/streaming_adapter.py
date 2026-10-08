@@ -3,42 +3,53 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
+import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from agents import Agent, FunctionTool
+from agents.items import RunItem
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 from skyvern.config import settings
+from skyvern.forge import app
 
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
+from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
+from skyvern.forge.sdk.copilot.context import (
+    USER_FACING_REASON_PARAM,
+    CopilotContext,
+    InFlightStreamToolCall,
+    NarrativeActivityEntry,
+    normalize_action_reason,
+)
 from skyvern.forge.sdk.copilot.narration import (
     CODE_REPAIR_PROGRESS_SURFACE_KIND,
     NarratorState,
-    TransitionKind,
     build_narration_activity,
     build_tool_call_activity,
     build_tool_result_activity,
-    cancel_in_flight,
-    detect_transitions,
-    extract_tool_details,
-    resolve_narrator_handler,
-    schedule_narration,
-    snapshot_ctx,
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    browser_code_steps_for_user,
     format_tool_result_for_user,
     summarize_tool_result_detail,
     user_facing_success,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import ChatScreenshotFrame, as_png
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -49,11 +60,14 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError,
     _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCodegenProgressUpdate,
     WorkflowCopilotDesignEndUpdate,
     WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotNarrationUpdate,
+    WorkflowCopilotScreenshotUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotTitleUpdate,
     WorkflowCopilotToolCallUpdate,
@@ -65,11 +79,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
-    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
+
+# One budget for a whole batch: the save runs inside the stream consumer, so slow storage would
+# otherwise hold back every later frame.
+_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS = 5.0
 
 _OBSERVATION_TOOLS = {
     "evaluate",
@@ -89,6 +106,8 @@ _OBSERVATION_TOOLS = {
 }
 
 _AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})
+# edit_block_and_run's top-level `label` names the existing block it edits, not a drafted one.
+_BLOCK_DEFINITION_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
 
 
 def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -> list[CodeWriteDiff] | None:
@@ -101,10 +120,69 @@ def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -
     return diffs or None
 
 
-# Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
-# that happens to contain the literal "label:" would also match. Accepted trade-off of not
-# json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
-_CODEGEN_LABEL_RE = re.compile(r"label:\s*\\?\"?([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
+async def _store_chat_screenshot(organization_id: str, chat_id: str, frame: ChatScreenshotFrame) -> str:
+    png = await asyncio.to_thread(as_png, frame.image)
+    # The chat's own key is a barrier dictation requests also wait on. A key per upload keeps this
+    # save's timeout from cancelling their uploads or surfacing as a cancellation in their wait.
+    upload_key = f"chat-screenshot:{uuid.uuid4().hex}"
+    # The manager stamps a new row with the ambient context's run ids, which a browser session
+    # created this turn sets; a chat-owned row must not inherit them.
+    with skyvern_context.scoped(SkyvernContext(organization_id=organization_id, copilot_session_id=chat_id)):
+        artifact_id = await app.ARTIFACT_MANAGER.create_log_artifact(
+            log_entity_type=LogEntityType.WORKFLOW_COPILOT_CHAT,
+            log_entity_id=chat_id,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            organization_id=organization_id,
+            data=png,
+            upload_key=upload_key,
+        )
+    try:
+        await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([upload_key])
+    except BaseException:
+        LOG.warning("copilot_chat_screenshot_upload_incomplete", artifact_id=artifact_id)
+        raise
+    return artifact_id
+
+
+async def _drain_chat_screenshots(stream: EventSourceStream, ctx: CopilotContext, *, client_gone: bool) -> None:
+    frames = list(ctx.pending_chat_screenshots)
+    ctx.pending_chat_screenshots.clear()
+    if not frames or not (chat_id := ctx.workflow_copilot_chat_id):
+        return
+    narrator_state = ctx.narrator_state or NarratorState()
+    ctx.narrator_state = narrator_state
+    try:
+        async with asyncio.timeout(_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS):
+            for frame in frames:
+                try:
+                    artifact_id = await _store_chat_screenshot(ctx.organization_id, chat_id, frame)
+                    narrator_state.screenshots.append(
+                        {
+                            "artifactId": artifact_id,
+                            "capturedAt": frame.captured_at.isoformat(),
+                            "toolCallId": frame.tool_call_id,
+                        }
+                    )
+                    if not client_gone:
+                        await stream.send(
+                            WorkflowCopilotScreenshotUpdate(
+                                artifact_id=artifact_id, captured_at=frame.captured_at, tool_call_id=frame.tool_call_id
+                            )
+                        )
+                except Exception as exc:
+                    LOG.warning(
+                        "copilot_chat_screenshot_failed",
+                        workflow_copilot_chat_id=chat_id,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+    except TimeoutError:
+        LOG.warning("copilot_chat_screenshot_save_timed_out", workflow_copilot_chat_id=chat_id, frames=len(frames))
+
+
+# Substring match over the unparsed argument buffer, covering JSON `"label": "x"` keys and YAML `label: x`
+# lines; free text containing "label:" also matches, and the worst case is a spurious drafted-block entry.
+_CODEGEN_LABEL_RE = re.compile(r"(?<![A-Za-z0-9_])label\"?:\s*\\?\"?(?!null\b)([A-Za-z0-9_][A-Za-z0-9_ \-]{0,79})")
 _CODEGEN_MIN_GAP_SECONDS = 2.0
 # Keep enough trailing context that a label split across two argument deltas still matches.
 _CODEGEN_TAIL_OVERLAP = 96
@@ -134,6 +212,8 @@ class _CodegenCallState:
         self.started_monotonic = time.monotonic()
 
     def add_labels(self, text: str) -> bool:
+        if self.tool_name not in _BLOCK_DEFINITION_TOOL_NAMES:
+            return False
         found_new = False
         for match in _CODEGEN_LABEL_RE.finditer(text):
             if match.end() == len(text):
@@ -159,6 +239,9 @@ class _CodegenProgressTracker:
 
     def __init__(self) -> None:
         self._calls: dict[int, _CodegenCallState] = {}
+        # A uuid, not a counter: each enforcement pass builds a fresh tracker, and a counter would repeat
+        # the previous pass's id so the client could not tell the restarted generation apart.
+        self._generation_id = uuid.uuid4().hex
 
     async def on_raw_event(
         self,
@@ -171,6 +254,7 @@ class _CodegenProgressTracker:
 
         if event_type == "response.created":
             self._calls.clear()
+            self._generation_id = uuid.uuid4().hex
             return
 
         if event_type == "response.output_item.added":
@@ -244,6 +328,7 @@ class _CodegenProgressTracker:
                     blocks_drafted=list(state.labels),
                     chars_streamed=state.chars,
                     iteration=iteration,
+                    generation_id=self._generation_id,
                     timestamp=datetime.now(timezone.utc),
                 )
             )
@@ -265,7 +350,7 @@ def _code_repair_progress_text(parsed: dict[str, Any]) -> str | None:
 async def stream_to_sse(
     result: RunResultStreaming,
     stream: EventSourceStream,
-    ctx: Any,
+    ctx: CopilotContext,
 ) -> None:
     """Consume SDK stream events and emit SSE payloads to the client.
 
@@ -294,25 +379,8 @@ async def stream_to_sse(
 
     codegen_tracker = _CodegenProgressTracker() if settings.WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED else None
 
-    # Narrator state persists across enforcement iterations via ctx so
-    # cadence (last_emitted_at, min-gap) survives run_with_enforcement retries.
-    # Resolve the handler once (PostHog override → env-driven fallback) so
-    # per-emission calls don't re-hit PostHog and so per-event bookkeeping
-    # (snapshot, detect, extract) is skipped when no narrator LLM is wired.
-    narrator_state: NarratorState = getattr(ctx, "narrator_state", None) or NarratorState()
-    if narrator_state.resolved_handler is None:
-        narrator_state.resolved_handler = await resolve_narrator_handler(
-            getattr(ctx, "workflow_permanent_id", None),
-            getattr(ctx, "organization_id", None),
-        )
-    narrator_enabled = narrator_state.resolved_handler is not None
-    # Iteration numbers restart at 0 on every enforcement pass, so a tag carried
-    # over would pair a banked transition to this pass's same-numbered step.
-    narrator_state.pending_transition_iteration = None
+    narrator_state = ctx.narrator_state or NarratorState()
     ctx.narrator_state = narrator_state
-    user_message = getattr(ctx, "user_message", "") or ""
-    if user_message and not narrator_state.user_goal:
-        narrator_state.user_goal = user_message
 
     try:
         async for event in result.stream_events():
@@ -338,6 +406,7 @@ async def stream_to_sse(
                     LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
+                ctx.model_call_streamed_tool_call = True
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
@@ -355,8 +424,11 @@ async def stream_to_sse(
                     if not isinstance(tool_input, dict):
                         tool_input = {"raw": "<unparsed arguments>"}
                 elif isinstance(raw_args, dict):
-                    tool_input = raw_args
+                    tool_input = dict(raw_args)
 
+                reason = normalize_action_reason(tool_input.pop(USER_FACING_REASON_PARAM, None))
+                if reason is not None:
+                    reason = _scrub_actor_text(ctx, reason)
                 display_label = tool_activity_display_label(tool_name, tool_input)
                 if getattr(ctx, "eval_mode", None) == "browser_ablation":
                     ctx.eval_tool_activity.append(
@@ -367,13 +439,34 @@ async def stream_to_sse(
                         }
                     )
                 call_id_to_label[call_id] = display_label
-                ctx.in_flight_stream_tool_call = InFlightStreamToolCall(
-                    call_id=call_id, tool_name=tool_name, iteration=iteration, display_label=display_label
-                )
                 tool_call_ts = datetime.now(timezone.utc)
+                presentation = ctx.stream_tool_calls.get(call_id)
+                if presentation is None:
+                    presentation = InFlightStreamToolCall(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        iteration=iteration,
+                        display_label=display_label,
+                        reason=reason,
+                        started_at=tool_call_ts,
+                        activity_bucket=narrator_state.activity_bucket(),
+                    )
+                    ctx.stream_tool_calls[call_id] = presentation
+                    ctx.pending_stream_tool_call_ids.add(call_id)
+                    if isinstance(raw_args, str):
+                        await _capture_actor_dispatch(ctx, presentation, raw_args, event.item)
+                ctx.in_flight_stream_tool_call = presentation
+                narrator_state.current_iteration = iteration
                 narrator_state.record_activity(
-                    build_tool_call_activity(
-                        tool_name, iteration, call_id, timestamp=tool_call_ts, display_label=display_label
+                    _present_activity(
+                        build_tool_call_activity(
+                            tool_name,
+                            iteration,
+                            call_id,
+                            timestamp=presentation.started_at or tool_call_ts,
+                            display_label=presentation.display_label,
+                        ),
+                        presentation,
                     )
                 )
 
@@ -382,28 +475,25 @@ async def stream_to_sse(
                         WorkflowCopilotToolCallUpdate(
                             type=WorkflowCopilotStreamMessageType.TOOL_CALL,
                             tool_name=tool_name,
-                            display_label=display_label,
+                            display_label=presentation.display_label,
+                            reason=presentation.reason,
+                            activity_bucket=presentation.activity_bucket,
                             tool_input=_sanitize_input(tool_input),
                             iteration=iteration,
                             tool_call_id=call_id,
-                            timestamp=tool_call_ts,
+                            timestamp=presentation.started_at or tool_call_ts,
                         )
                     )
 
-                if narrator_enabled:
-                    narrator_state.pending_tool_name = tool_name
-                    narrator_state.current_iteration = iteration
-                    narrator_state.record_transition(TransitionKind.TOOL_STARTED)
-                    schedule_narration(narrator_state, stream)
-
             elif event.name == "tool_output":
+                await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
-                tool_name = call_id_to_name.get(call_id, "unknown")
-                ctx.in_flight_stream_tool_call = None
-                # Clear pending_tool_name so post-tool transitions describe
-                # what the agent just finished, not what it's still doing.
-                narrator_state.pending_tool_name = None
+                presentation = ctx.stream_tool_calls.get(call_id)
+                tool_name = presentation.tool_name if presentation else call_id_to_name.get(call_id, "unknown")
+                ctx.pending_stream_tool_call_ids.discard(call_id)
+                if ctx.in_flight_stream_tool_call is not None and ctx.in_flight_stream_tool_call.call_id == call_id:
+                    ctx.in_flight_stream_tool_call = None
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
@@ -426,7 +516,9 @@ async def stream_to_sse(
                     detail = summarize_tool_result_detail(
                         parsed, tool_name=tool_name, blocker_signal=blocker_signals, success=success
                     )
-                    result_label = call_id_to_label.get(call_id) or tool_activity_display_label(tool_name)
+                    result_label = (
+                        presentation.display_label if presentation else call_id_to_label.get(call_id)
+                    ) or tool_activity_display_label(tool_name)
                     if getattr(ctx, "eval_mode", None) == "browser_ablation":
                         for activity in reversed(ctx.eval_tool_activity):
                             if activity.get("tool_call_id") == call_id:
@@ -435,18 +527,26 @@ async def stream_to_sse(
                                 break
                     tool_result_ts = datetime.now(timezone.utc)
                     code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
+                    work_plan = _tool_result_work_plan(tool_name, parsed)
+                    browser_steps = browser_code_steps_for_user(tool_name, parsed)
                     narrator_state.record_activity(
-                        build_tool_result_activity(
-                            tool_name,
-                            summary,
-                            success,
-                            iteration,
-                            call_id,
-                            timestamp=tool_result_ts,
-                            display_label=result_label,
-                            code_diffs=code_diffs,
+                        _present_activity(
+                            build_tool_result_activity(
+                                tool_name,
+                                summary,
+                                success,
+                                iteration,
+                                call_id,
+                                timestamp=tool_result_ts,
+                                display_label=result_label,
+                                code_diffs=code_diffs,
+                                browser_steps=browser_steps,
+                            ),
+                            presentation,
                         )
                     )
+                    if work_plan is not None:
+                        narrator_state.work_plan = {"toolCallId": call_id, "items": work_plan}
 
                     if not client_gone:
                         await stream.send(
@@ -454,11 +554,16 @@ async def stream_to_sse(
                                 type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
                                 tool_name=tool_name,
                                 display_label=result_label,
+                                reason=presentation.reason if presentation else None,
+                                activity_bucket=presentation.activity_bucket if presentation else {"kind": "design"},
+                                activity_started_at=presentation.started_at if presentation else None,
                                 success=success,
                                 summary=summary,
                                 iteration=iteration,
                                 tool_call_id=call_id,
                                 code_diffs=code_diffs,
+                                work_plan=work_plan,
+                                browser_steps=browser_steps,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
@@ -466,27 +571,7 @@ async def stream_to_sse(
                             )
                         )
 
-                    if narrator_enabled:
-                        ctx_before = snapshot_ctx(ctx)
-                        _update_enforcement_from_tool(ctx, tool_name, parsed)
-                        ctx_after = snapshot_ctx(ctx)
-
-                        prior_tool_name = (
-                            narrator_state.pending_activity[-1].tool_name if narrator_state.pending_activity else None
-                        )
-                        narrator_state.record_tool(
-                            tool_name=tool_name,
-                            summary=summary,
-                            success=success,
-                            iteration=iteration,
-                            details=extract_tool_details(tool_name, parsed, success=success),
-                        )
-                        for transition in detect_transitions(ctx_before, ctx_after, tool_name, prior_tool_name):
-                            narrator_state.record_transition(transition)
-                        narrator_state.current_iteration = iteration
-                        schedule_narration(narrator_state, stream)
-                    else:
-                        _update_enforcement_from_tool(ctx, tool_name, parsed)
+                    _update_enforcement_from_tool(ctx, tool_name, parsed)
 
                 try:
                     _maybe_raise_unrecoverable_tool_error(ctx, tool_name, parsed)
@@ -513,10 +598,6 @@ async def stream_to_sse(
         # run to free provider resources.
         result.cancel()
         raise
-    finally:
-        # Cancel any in-flight narration before the stream tears down so
-        # tasks don't try to send on a disconnected channel.
-        await cancel_in_flight(narrator_state)
 
 
 async def _emit_code_repair_progress(
@@ -536,10 +617,6 @@ async def _emit_code_repair_progress(
     if progress_text in narrator_state.emitted_progress_texts:
         return
     narrator_state.emitted_progress_texts.add(progress_text)
-
-    # An LLM tool-start narration scheduled at tool_called would otherwise double
-    # up with this progress entry for the same iteration; drop it.
-    await cancel_in_flight(narrator_state)
 
     narration_ts = datetime.now(timezone.utc)
     narrator_state.record_activity(build_narration_activity(progress_text, iteration, narration_ts))
@@ -570,6 +647,16 @@ def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str 
     return run_id if isinstance(run_id, str) else None
 
 
+def _tool_result_work_plan(tool_name: str, parsed: dict[str, Any]) -> list[str] | None:
+    # A refused write echoes the plan still in force, which is not a new plan for this row.
+    if tool_name != "set_work_plan" or parsed.get("ok") is not True:
+        return None
+    items = parsed.get("items")
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        return None
+    return list(items)
+
+
 def _tool_result_executed_source_reference(tool_name: str, parsed: dict[str, Any]) -> str | None:
     if tool_name != "run_browser_code":
         return None
@@ -584,46 +671,64 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     yields the matching ``tool_output`` event, so the frame the loop above
     would have sent never streams; the exit path calls this instead.
     """
-    pending = ctx.in_flight_stream_tool_call
+    client_gone = await stream.is_disconnected()
+    await _drain_chat_screenshots(stream, ctx, client_gone=client_gone)
+    call_id = ctx.goal_satisfied_tool_call_id
+    pending = ctx.stream_tool_calls.get(call_id) if call_id is not None else None
     parsed = ctx.goal_satisfied_tool_output
-    tool_name = ctx.goal_satisfied_tool_name
-    ctx.in_flight_stream_tool_call = None
+    if pending is None or parsed is None or call_id not in ctx.pending_stream_tool_call_ids:
+        return
+    ctx.pending_stream_tool_call_ids.discard(call_id)
+    if ctx.in_flight_stream_tool_call is not None and ctx.in_flight_stream_tool_call.call_id == call_id:
+        ctx.in_flight_stream_tool_call = None
     ctx.goal_satisfied_tool_output = None
     ctx.goal_satisfied_tool_name = None
-    if pending is None or parsed is None or tool_name != pending.tool_name:
-        return
+    ctx.goal_satisfied_tool_call_id = None
     blocker_signals = _tool_blocker_signal_candidates(ctx)
     summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
     success = user_facing_success(parsed, blocker_signal=blocker_signals)
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
     flush_ts = datetime.now(timezone.utc)
     code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
+    work_plan = _tool_result_work_plan(pending.tool_name, parsed)
+    browser_steps = browser_code_steps_for_user(pending.tool_name, parsed)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
-            build_tool_result_activity(
-                pending.tool_name,
-                summary,
-                success,
-                pending.iteration,
-                pending.call_id,
-                timestamp=flush_ts,
-                display_label=display_label,
-                code_diffs=code_diffs,
+            _present_activity(
+                build_tool_result_activity(
+                    pending.tool_name,
+                    summary,
+                    success,
+                    pending.iteration,
+                    pending.call_id,
+                    timestamp=flush_ts,
+                    display_label=display_label,
+                    code_diffs=code_diffs,
+                    browser_steps=browser_steps,
+                ),
+                pending,
             )
         )
-    if await stream.is_disconnected():
+        if work_plan is not None:
+            narrator_state.work_plan = {"toolCallId": pending.call_id, "items": work_plan}
+    if client_gone:
         return
     await stream.send(
         WorkflowCopilotToolResultUpdate(
             type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
             tool_name=pending.tool_name,
             display_label=display_label,
+            reason=pending.reason,
+            activity_bucket=pending.activity_bucket,
+            activity_started_at=pending.started_at,
             success=success,
             summary=summary,
             iteration=pending.iteration,
             tool_call_id=pending.call_id,
             code_diffs=code_diffs,
+            work_plan=work_plan,
+            browser_steps=browser_steps,
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
@@ -632,6 +737,110 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
             timestamp=flush_ts,
         )
     )
+
+
+def _present_activity(
+    entry: NarrativeActivityEntry | None,
+    presentation: InFlightStreamToolCall | None,
+) -> NarrativeActivityEntry | None:
+    if entry is not None and presentation is not None:
+        if presentation.reason is not None:
+            entry["reason"] = presentation.reason
+        if presentation.started_at is not None:
+            entry["activityStartedAt"] = presentation.started_at.isoformat()
+        if presentation.activity_bucket is not None:
+            entry["activityBucket"] = presentation.activity_bucket
+    return entry
+
+
+def _scrub_actor_text(ctx: CopilotContext, text: str) -> str:
+    safe = scrub_secrets_from_text(ctx, text)
+    if ctx.codeblock_redaction_parameters:
+        redacted = app.AGENT_FUNCTION.redact_codeblock_parameter_values(safe, ctx.codeblock_redaction_parameters)
+        if isinstance(redacted, str):
+            safe = redacted
+    return safe
+
+
+def _capture_commit() -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=2).strip()
+
+
+def _scrub_actor_arguments(ctx: CopilotContext, value: Any) -> Any:
+    if isinstance(value, str):
+        return scrub_secrets_from_text(ctx, value)
+    if isinstance(value, int | float):
+        text = str(value)
+        scrubbed = scrub_secrets_from_text(ctx, text)
+        return scrubbed if scrubbed != text else value
+    if isinstance(value, dict):
+        return {_scrub_actor_arguments(ctx, key): _scrub_actor_arguments(ctx, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_actor_arguments(ctx, item) for item in value]
+    return value
+
+
+def _argument_shape(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {"dict": [_argument_shape(item) for item in value.values()]}
+    if isinstance(value, list):
+        return [_argument_shape(item) for item in value]
+    return type(value).__name__
+
+
+async def _declared_parameter_names(agent: Agent[Any], tool_name: str) -> tuple[str, ...]:
+    for tool in agent.tools:
+        if isinstance(tool, FunctionTool) and tool.name == tool_name:
+            return tuple(tool.params_json_schema.get("properties", {}))
+    for server in agent.mcp_servers:
+        for mcp_tool in await server.list_tools():
+            if mcp_tool.name == tool_name:
+                return tuple(mcp_tool.inputSchema.get("properties", {}))
+    return ()
+
+
+async def _capture_actor_dispatch(
+    ctx: CopilotContext,
+    presentation: InFlightStreamToolCall,
+    arguments_json: str,
+    item: RunItem,
+) -> None:
+    """Best-effort local actor output evidence; never participates in dispatch."""
+    root = os.environ.get("COPILOT_DUMP_MODEL_INPUTS")
+    if settings.ENV != "local" or not root:
+        return
+    try:
+        arguments = _scrub_actor_arguments(ctx, json.loads(arguments_json))
+        if ctx.codeblock_redaction_parameters:
+            arguments = app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+                arguments, ctx.codeblock_redaction_parameters
+            )
+        # Nothing the model wrote is kept beyond its choice of a served tool: scrubbing only knows
+        # registered secrets, and the call arrives unvalidated, so only schema-declared names are written.
+        top_level = arguments if isinstance(arguments, dict) else {}
+        declared = await _declared_parameter_names(item.agent, presentation.tool_name)
+        argument_bytes = json.dumps(arguments, ensure_ascii=False).encode()
+        record = {
+            "type": "copilot-actor-dispatch-v2",
+            "turn_id": ctx.turn_id,
+            "turn_index": ctx.turn_index,
+            "commit": _capture_commit(),
+            "tool_call_id": presentation.call_id,
+            "tool_name": presentation.tool_name,
+            "activity_bucket": presentation.activity_bucket,
+            "timestamp": presentation.started_at.isoformat() if presentation.started_at else None,
+            "arguments_shape": {name: _argument_shape(top_level[name]) for name in declared if name in top_level},
+            "undeclared_argument_shapes": [
+                _argument_shape(value) for name, value in top_level.items() if name not in declared
+            ],
+            "arguments_sha256": hashlib.sha256(argument_bytes).hexdigest(),
+        }
+        directory = Path(root) / "actor-dispatch" / ctx.turn_id
+        directory.mkdir(parents=True, exist_ok=True)
+        filename = hashlib.sha256(presentation.call_id.encode()).hexdigest() + ".json"
+        (directory / filename).write_text(json.dumps(record, indent=2, ensure_ascii=False))
+    except Exception:
+        LOG.warning("copilot_actor_dispatch_capture_failed", turn_id=ctx.turn_id)
 
 
 def _get_raw_field(raw: Any, key: str) -> Any:
@@ -751,15 +960,9 @@ def _update_enforcement_from_tool(
 
 
 def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
-    # Redacts tool-call args before they hit the SSE payload sent to the UI.
-    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes
-    # tool *results* for LLM context consumption.
-    # Drop the large workflow YAML blob (it's displayed elsewhere in the UI),
-    # then run the remaining args through the shared exact-match redactor to
-    # strip values under sensitive key names like `password`, `api_key`,
-    # `totp`, etc. Benign identifiers (`credential_id`, `page_token`,
-    # `username`) pass through unchanged.
-    trimmed = {k: v for k, v in raw_args.items() if k != "workflow_yaml"}
+    # Drop the submitted workflow or block definition (displayed elsewhere), then redact sensitive fields.
+    # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes tool results for LLM context.
+    trimmed = {k: v for k, v in raw_args.items() if k not in ("workflow_yaml", "workflow", "block")}
     redacted = redact_sensitive_fields(trimmed)
     if isinstance(redacted, dict):
         return redacted
@@ -776,12 +979,13 @@ async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> Non
             turn_index=ctx.turn_index,
             timestamp=now,
             prior_block_count=ctx.prior_block_count,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
         )
     )
 
 
-async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> None:
-    await stream.send(
+async def emit_title_update(stream: EventSourceStream, ctx: CopilotContext, title: str) -> bool:
+    return await stream.send(
         WorkflowCopilotTitleUpdate(
             turn_id=ctx.turn_id,
             workflow_permanent_id=ctx.workflow_permanent_id,

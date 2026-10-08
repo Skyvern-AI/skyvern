@@ -12,6 +12,19 @@ import {
 describe("credentialRecovery", () => {
   beforeEach(() => sessionStorage.clear());
 
+  it("A46 reports unavailable storage when reads work but writes exceed quota", () => {
+    const write = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new DOMException("Full", "QuotaExceededError");
+      });
+    try {
+      expect(ensureCredentialRecoveryToken("wpid-full")).toBeNull();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it("retains one capability for every recoverable turn in the workflow", () => {
     const first = ensureCredentialRecoveryToken("wpid-1");
     expect(first).toMatch(/^[0-9a-f]{64}$/);
@@ -71,5 +84,39 @@ describe("credentialRecovery", () => {
 
     expect(reads).toBe(2);
     expect(response.data.workflow_copilot_chat_id).toBe("chat-1");
+    expect(response.hadCredentialRecoveryToken).toBe(true);
   });
+
+  it.each([false, true])(
+    "reports whether the successful retry carried a recovery token: %s",
+    async (hadToken) => {
+      if (!hadToken) ensureCredentialRecoveryToken("wpid-1");
+      const get = vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          if (hadToken) ensureCredentialRecoveryToken("wpid-1");
+          else sessionStorage.clear();
+          throw new Error("temporary network failure");
+        })
+        .mockResolvedValueOnce({ data: {} });
+      const client = { get } as unknown as Pick<AxiosInstance, "get">;
+
+      const response = await readCredentialRecoveryHistory(
+        client,
+        "wpid-1",
+        {},
+        { retryTransientFailure: true },
+      );
+
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(
+        Boolean(
+          get.mock.calls[1]?.[1]?.headers[
+            "X-Copilot-Credential-Recovery-Token"
+          ],
+        ),
+      ).toBe(hadToken);
+      expect(response.hadCredentialRecoveryToken).toBe(hadToken);
+    },
+  );
 });

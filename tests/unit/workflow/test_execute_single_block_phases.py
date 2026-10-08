@@ -14,20 +14,24 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     Block,
     BranchCondition,
     CodeBlock,
     ConditionalBlock,
+    ForLoopBlock,
     JinjaBranchCriteria,
     LoginBlock,
     NavigationBlock,
+    WaitBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -42,6 +46,7 @@ from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -126,7 +131,7 @@ def _script_block(label: str, run_signature: str, requires_agent: bool = False) 
     )
 
 
-def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock) -> BlockResult:
+def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock | ForLoopBlock) -> BlockResult:
     return BlockResult(
         success=True,
         output_parameter=block.output_parameter,
@@ -137,7 +142,7 @@ def _completed_result(block: NavigationBlock | LoginBlock | ConditionalBlock) ->
 
 async def _run_single_block(
     service: WorkflowService,
-    block: NavigationBlock | LoginBlock | ConditionalBlock,
+    block: NavigationBlock | LoginBlock | ConditionalBlock | ForLoopBlock,
     *,
     workflow: MagicMock | None = None,
     workflow_run: MagicMock | None = None,
@@ -370,7 +375,7 @@ def _wire_real_execute_safe(
     monkeypatch: pytest.MonkeyPatch,
     status_holder: list[WorkflowRunStatus],
     *,
-    execute: AsyncMock,
+    execute: AsyncMock | None = None,
     pause_point: str | None = None,
 ) -> _PausableAwait:
     pause = _PausableAwait()
@@ -397,7 +402,8 @@ def _wire_real_execute_safe(
         pause if pause_point == "artifact" else AsyncMock(),
     )
     monkeypatch.setattr(Block, "_generate_workflow_run_block_description", AsyncMock())
-    monkeypatch.setattr(NavigationBlock, "execute", execute)
+    if execute is not None:
+        monkeypatch.setattr(NavigationBlock, "execute", execute)
     return pause
 
 
@@ -753,6 +759,72 @@ async def test_script_success_skips_agent_execution(monkeypatch: pytest.MonkeyPa
     assert should_stop is False
 
 
+def _loop_holding_a_conditional() -> ForLoopBlock:
+    conditional = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("cond_output"),
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ current_value }}"), next_block_label="nav_a"),
+            BranchCondition(is_default=True, next_block_label="nav_b"),
+        ],
+    )
+    return ForLoopBlock(
+        label="loop",
+        output_parameter=_output_parameter("loop_output"),
+        loop_blocks=[conditional, _navigation_block("nav_a"), _navigation_block("nav_b")],
+    )
+
+
+async def _run_cached_loop_holding_a_conditional(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], AsyncMock, set]:
+    """Script run of a loop whose script and executed branch are already cached; nav_b never ran."""
+    block = _loop_holding_a_conditional()
+    script_calls: list[str] = []
+    execute_safe = AsyncMock(return_value=_completed_result(block))
+    monkeypatch.setattr(ForLoopBlock, "execute_safe", execute_safe)
+    # Only reached if the cached script runs and fails; stubbed so that regression fails on the assertions.
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", AsyncMock())
+
+    _, blocks_to_update, _, _, _ = await _run_single_block(
+        WorkflowService(),
+        block,
+        workflow_run=_workflow_run(ai_fallback=False),
+        is_script_run=True,
+        script_blocks_by_label={
+            "loop": _script_block("loop", "record_dispatch()"),
+            "nav_a": _script_block("nav_a", "record_dispatch()"),
+        },
+        loaded_script_module=SimpleNamespace(record_dispatch=lambda: script_calls.append("called")),
+    )
+    return script_calls, execute_safe, blocks_to_update
+
+
+@pytest.mark.asyncio
+async def test_cached_loop_holding_a_conditional_runs_through_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    script_calls, execute_safe, _ = await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    assert script_calls == []
+    execute_safe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_engine_only_loop_logs_which_child_kept_it_off_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    with capture_logs() as logs:
+        await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    [mode_resolved] = [log for log in logs if log["event"] == "Block execution mode resolved"]
+    assert mode_resolved["execution_mode"] == "ai"
+    assert mode_resolved["engine_only_child_types"] == ["conditional"]
+
+
+@pytest.mark.asyncio
+async def test_engine_only_loop_does_not_queue_its_children_for_regeneration(monkeypatch: pytest.MonkeyPatch) -> None:
+    # nav_b sits on a branch that did not run, so codegen has no actions to mint it from:
+    # queueing it would regenerate the script on every run.
+    _, _, blocks_to_update = await _run_cached_loop_holding_a_conditional(monkeypatch)
+
+    assert blocks_to_update == set()
+
+
 @pytest.mark.asyncio
 async def test_conditional_block_returns_branch_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     service = WorkflowService()
@@ -1014,6 +1086,70 @@ async def test_adaptive_caching_conditional_records_conditional_episode(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_expression", "plan", "branch_taken", "records_episode"),
+    [
+        pytest.param("{{ plan == 'pro' }}", "pro", "paid", True, id="branch_matched"),
+        pytest.param("{{ plan == 'pro' }}", "basic", "free", True, id="every_condition_false_takes_default"),
+        pytest.param("{{ plan == 'pro' || plan == 'team' }}", "basic", "free", False, id="errored_takes_default"),
+        pytest.param("{{ plan == 'pro' || plan == 'team' }}", "trial", "trial", False, id="errored_then_later_match"),
+    ],
+)
+async def test_conditional_episode_is_recorded_only_when_every_walked_branch_was_evaluated(
+    monkeypatch: pytest.MonkeyPatch,
+    first_expression: str,
+    plan: str,
+    branch_taken: str,
+    records_episode: bool,
+) -> None:
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("cond_output"),
+        branch_conditions=[
+            BranchCondition(criteria=JinjaBranchCriteria(expression=first_expression), next_block_label="paid"),
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ plan == 'trial' }}"), next_block_label="trial"),
+            BranchCondition(is_default=True, next_block_label="free"),
+        ],
+    )
+    # The block itself runs, so the episode gate is exercised against the output a real evaluation writes.
+    _wire_real_execute_safe(monkeypatch, [WorkflowRunStatus.running])
+    monkeypatch.setattr(
+        app.WORKFLOW_CONTEXT_MANAGER,
+        "get_workflow_run_context",
+        MagicMock(return_value=FakeWorkflowRunContext(values={"plan": plan})),
+    )
+    monkeypatch.setattr(ConditionalBlock, "record_output_parameter_value", AsyncMock())
+    monkeypatch.setattr(WorkflowService, "_mark_script_fallback_triggered", AsyncMock())
+    create_episode = AsyncMock(return_value=SimpleNamespace(episode_id="cep_1"))
+    update_episode = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.scripts, "create_fallback_episode", create_episode)
+    monkeypatch.setattr(app.DATABASE.scripts, "update_fallback_episode", update_episode)
+
+    _, _, block_result, should_stop, branch_metadata = await _run_single_block(
+        WorkflowService(),
+        block,
+        workflow=_adaptive_workflow(),
+        is_script_run=True,
+        script_blocks_by_label={"cond": _script_block("cond", "True", requires_agent=True)},
+    )
+
+    # Every case routes and reports completed, including the two whose first branch could not be evaluated.
+    assert block_result is not None
+    assert block_result.status == BlockStatus.completed
+    assert branch_metadata is not None
+    assert branch_metadata["branch_taken"] == branch_taken
+    assert should_stop is False
+    if records_episode:
+        create_episode.assert_awaited_once()
+        assert create_episode.await_args.kwargs["fallback_type"] == "conditional_agent"
+        assert create_episode.await_args.kwargs["agent_actions"]["branch_taken"] == branch_taken
+        update_episode.assert_awaited_once_with(episode_id="cep_1", organization_id="org_test", fallback_succeeded=True)
+    else:
+        create_episode.assert_not_awaited()
+        update_episode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_enrich_fallback_episode_excludes_decision_row_from_agent_action_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1059,4 +1195,162 @@ async def test_enrich_fallback_episode_excludes_decision_row_from_agent_action_c
     assert (
         update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
         == script_service.VERIFIER_SWAP_FAILURE_REASON
+    )
+
+
+def _real_run_context(monkeypatch: pytest.MonkeyPatch) -> WorkflowRunContext:
+    context = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="wf",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=AsyncMock(),
+    )
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=context))
+    return context
+
+
+@pytest.mark.asyncio
+async def test_outcome_record_failure_does_not_fail_completed_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _real_run_context(monkeypatch)
+    monkeypatch.setattr(context, "mask_secrets_in_data", MagicMock(side_effect=RuntimeError("Mask unavailable")))
+    block = _navigation_block("nav")
+    result = BlockResult(
+        success=True,
+        status=BlockStatus.completed,
+        failure_reason="diagnostic",
+        output_parameter=block.output_parameter,
+        workflow_run_block_id="wrb_nav",
+    )
+    monkeypatch.setattr(NavigationBlock, "_execute_to_block_result", AsyncMock(return_value=result))
+
+    assert await block.execute_safe("wr_test") is result
+    assert context.get_block_outcome("nav") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_codes", "failure_reason", "ends_run"),
+    [
+        (BlockStatus.completed, [], None, False),
+        (BlockStatus.failed, ["AUTH_FAILURE"], "login rejected", True),
+        (BlockStatus.failed, [], "login rejected", True),
+        (BlockStatus.terminated, [], "nothing left to do", True),
+        (BlockStatus.canceled, [], None, True),
+        (BlockStatus.timed_out, [], "page never loaded", True),
+    ],
+)
+async def test_engine_records_the_same_outcome_shape_for_every_terminal_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status: BlockStatus,
+    error_codes: list[str],
+    failure_reason: str | None,
+    ends_run: bool,
+) -> None:
+    block = _navigation_block("nav")
+    result = BlockResult(
+        success=status is BlockStatus.completed,
+        output_parameter=block.output_parameter,
+        status=status,
+        failure_reason=failure_reason,
+        error_codes=error_codes,
+        workflow_run_block_id="wrb_nav",
+    )
+    _wire_real_execute_safe(monkeypatch, [WorkflowRunStatus.running], execute=AsyncMock(return_value=result))
+    context = _real_run_context(monkeypatch)
+    service = WorkflowService()
+    for finalizer in (
+        "mark_workflow_run_as_failed_if_not_final",
+        "mark_workflow_run_as_terminated_if_not_final",
+        "mark_workflow_run_as_canceled",
+    ):
+        monkeypatch.setattr(service, finalizer, AsyncMock(return_value=_workflow_run()))
+
+    _, _, block_result, should_stop, _ = await _run_single_block(service, block)
+
+    assert block_result is result
+    assert should_stop is ends_run
+    assert context.get_block_outcome("nav") == BlockOutcome(
+        status=status, error_codes=error_codes, failure_reason=failure_reason
+    )
+    assert context.get_block_outcome("never_ran") is None
+
+
+@pytest.mark.asyncio
+async def test_a_block_the_run_ended_before_is_recorded_as_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _navigation_block("nav")
+    execute = AsyncMock()
+    status_holder = [WorkflowRunStatus.running]
+    pause = _wire_real_execute_safe(monkeypatch, status_holder, execute=execute, pause_point="screenshot")
+    context = _real_run_context(monkeypatch)
+
+    run_task = asyncio.create_task(_run_single_block(WorkflowService(), block))
+    await pause.entered.wait()
+    status_holder[0] = WorkflowRunStatus.completed
+    pause.release.set()
+    _, _, block_result, _, _ = await run_task
+
+    execute.assert_not_awaited()
+    assert block_result is not None and block_result.status is BlockStatus.skipped
+    assert context.get_block_outcome("nav") == BlockOutcome(
+        status=BlockStatus.skipped, error_codes=[], failure_reason=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_loop_child_outcome_is_its_last_iteration_and_the_loop_records_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = WaitBlock(
+        label="child", output_parameter=_output_parameter("child_output"), wait_sec=1, continue_on_failure=True
+    )
+    loop = ForLoopBlock(label="each_row", output_parameter=_output_parameter("each_row_output"), loop_blocks=[child])
+    monkeypatch.setattr(
+        app.DATABASE.observer,
+        "create_workflow_run_block",
+        AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_1")),
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=None))
+    monkeypatch.setattr(Block, "_generate_workflow_run_block_description", AsyncMock())
+    monkeypatch.setattr(ForLoopBlock, "get_loop_over_parameter_values", AsyncMock(return_value=["r1", "r2"]))
+    monkeypatch.setattr(ForLoopBlock, "get_loop_block_context_parameters", lambda self, *args, **kwargs: [])
+    monkeypatch.setattr(ForLoopBlock, "_snapshot_loop_baseline_pages", AsyncMock(return_value=None))
+    monkeypatch.setattr(ForLoopBlock, "_reset_browser_tabs_for_iteration", AsyncMock())
+    monkeypatch.setattr(ForLoopBlock, "_persist_partial_loop_output", AsyncMock())
+    context = _real_run_context(monkeypatch)
+    iteration_results = iter(
+        [(BlockStatus.failed, ["ROW_REJECTED"], "row rejected"), (BlockStatus.completed, [], None)]
+    )
+    seen_before_second_iteration: list[BlockOutcome | None] = []
+
+    async def run_child(
+        self: WaitBlock, workflow_run_id: str, workflow_run_block_id: str, **kwargs: Any
+    ) -> BlockResult:
+        status, error_codes, failure_reason = next(iteration_results)
+        if status is BlockStatus.completed:
+            seen_before_second_iteration.append(context.get_block_outcome("child"))
+        return await self.build_block_result(
+            success=status is BlockStatus.completed,
+            failure_reason=failure_reason,
+            status=status,
+            error_codes=error_codes or None,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+    monkeypatch.setattr(WaitBlock, "execute", run_child)
+    with patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as block_context:
+        block_context.current.return_value = None
+        _, _, block_result, should_stop, _ = await _run_single_block(WorkflowService(), loop)
+
+    assert block_result is not None and block_result.status is BlockStatus.completed
+    assert should_stop is False
+    # Each iteration writes the child's record; the one that survives is the last iteration's.
+    assert seen_before_second_iteration == [
+        BlockOutcome(status=BlockStatus.failed, error_codes=["ROW_REJECTED"], failure_reason="row rejected")
+    ]
+    assert context.get_block_outcome("child") == BlockOutcome(
+        status=BlockStatus.completed, error_codes=[], failure_reason=None
+    )
+    assert context.get_block_outcome("each_row") == BlockOutcome(
+        status=BlockStatus.completed, error_codes=[], failure_reason=None
     )

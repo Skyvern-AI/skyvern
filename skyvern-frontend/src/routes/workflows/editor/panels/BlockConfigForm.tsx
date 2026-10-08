@@ -33,6 +33,7 @@ import { TextPromptBlockForm } from "./BlockConfigForm/TextPromptBlockForm";
 import { URLBlockForm } from "./BlockConfigForm/URLBlockForm";
 import { UploadBlockForm } from "./BlockConfigForm/UploadBlockForm";
 import { ValidationBlockForm } from "./BlockConfigForm/ValidationBlockForm";
+import { TerminateBlockForm } from "./BlockConfigForm/TerminateBlockForm";
 import { WaitBlockForm } from "./BlockConfigForm/WaitBlockForm";
 import { WorkflowSettingsBlockForm } from "./BlockConfigForm/WorkflowSettingsBlockForm";
 import { WorkflowTriggerBlockForm } from "./BlockConfigForm/WorkflowTriggerBlockForm";
@@ -49,6 +50,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   action: ActionBlockForm,
   login: LoginBlockForm,
   wait: WaitBlockForm,
+  terminate: TerminateBlockForm,
   loop: LoopBlockForm,
   conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,

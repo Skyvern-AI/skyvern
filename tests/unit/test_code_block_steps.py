@@ -1,5 +1,8 @@
+import math
 import textwrap
+import time
 import timeit
+from typing import Any
 
 import pytest
 import yaml
@@ -7,8 +10,13 @@ import yaml
 from skyvern.forge.sdk.copilot.code_block_steps import (
     analyze_code_actions,
     bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
+    code_typed_values,
     derive_code_block_steps,
     derive_code_block_steps_in_yaml,
+    user_owned_goal_carry_disclosure,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
@@ -144,6 +152,23 @@ def test_synthesized_and_derived_steps_share_exact_field_set():
         assert steps, f"{producer_name} must produce representative steps"
         for step in steps:
             assert set(step) == expected_fields, producer_name
+
+
+def test_derived_steps_keep_a_recording_repair_step():
+    trajectory = [
+        {"tool_name": "select_option", "selector": "#country", "value": "", "source_url": "https://example.com/"},
+        {"tool_name": "click", "selector": "#next"},
+    ]
+    synthesized = synthesize_code_block(trajectory, _allow_recording_fallbacks=True)
+    assert synthesized is not None
+
+    derived = derive_code_block_steps(textwrap.dedent(synthesized.code))
+
+    assert [(step["description"], step["action_type"]) for step in derived][1] == (
+        "Repair recorded select_option",
+        "select_option",
+    )
+    assert derived[1]["line_start"] == synthesized.steps[1]["line_start"]
 
 
 def test_derive_steps_empty_code_is_empty():
@@ -489,8 +514,17 @@ def test_goto_address_that_is_not_a_plain_http_address_names_the_variable(addres
 
 
 def _derive_seconds(code: str) -> float:
-    # timeit pauses the garbage collector, and the best of three drops scheduler noise on shared CI runners.
-    return min(timeit.repeat(lambda: derive_code_block_steps(code), number=1, repeat=3))
+    # Thread CPU time, so a busy neighbour thread cannot stall one run; timeit pauses the garbage collector.
+    return timeit.timeit(lambda: derive_code_block_steps(code), number=1, timer=time.thread_time)
+
+
+def _derive_growth(small: str, large: str) -> float:
+    # A busy core still slows CPU time, so the runs alternate and the best of each is compared.
+    small_best = large_best = math.inf
+    for _ in range(5):
+        small_best = min(small_best, _derive_seconds(small))
+        large_best = min(large_best, _derive_seconds(large))
+    return large_best / small_best
 
 
 def test_many_gotos_on_variables_derive_in_linear_time():
@@ -498,8 +532,8 @@ def test_many_gotos_on_variables_derive_in_linear_time():
         return "".join(f"url_{i} = 'https://example.com/{i}'\nawait page.goto(url_{i})\n" for i in range(count))
 
     assert derive_code_block_steps(gotos(2000))[-1]["description"] == "Open https://example.com/1999"
-    # Quadratic growth makes 4x the gotos take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(gotos(2000)) < 8 * _derive_seconds(gotos(500))
+    # Quadratic growth makes 8x the gotos take ~64x as long; linear stays near 8x.
+    assert _derive_growth(gotos(250), gotos(2000)) < 24
 
 
 def test_unclosed_template_openers_derive_in_linear_time():
@@ -507,8 +541,8 @@ def test_unclosed_template_openers_derive_in_linear_time():
         return "await page.goto('https://example.com/a')\n" + "x = 1  # {# note {% here\n" * count
 
     assert derive_code_block_steps(commented(2000))[0]["description"] == "Open https://example.com/a"
-    # Quadratic growth makes 4x the lines take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(commented(2000)) < 8 * _derive_seconds(commented(500))
+    # Quadratic growth makes 8x the lines take ~64x as long; linear stays near 8x.
+    assert _derive_growth(commented(250), commented(2000)) < 24
 
 
 def test_reads_chained_in_one_expression_derive_in_linear_time():
@@ -517,8 +551,8 @@ def test_reads_chained_in_one_expression_derive_in_linear_time():
 
     # Python 3.11's parser rejects much longer chains, which would return [] and pass vacuously.
     assert derive_code_block_steps(chained(2000))[0]["description"] == "Extract total"
-    # Quadratic growth makes 4x the reads take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(chained(2000)) < 8 * _derive_seconds(chained(500))
+    # Quadratic growth makes 8x the reads take ~64x as long; linear stays near 8x.
+    assert _derive_growth(chained(250), chained(2000)) < 24
 
 
 def test_code_too_deep_for_the_parser_derives_no_steps():
@@ -604,6 +638,66 @@ def test_fill_value_bound_to_a_literal_never_appears_in_the_label():
     assert not any("secret" in d for d in descriptions)
 
 
+@pytest.mark.parametrize(
+    ("code", "typed"),
+    [
+        pytest.param(
+            "await page.get_by_label('Name').fill('Ada Lovelace')",
+            [(1, "page.get_by_label('Name')", "Ada Lovelace")],
+            id="locator",
+        ),
+        pytest.param(
+            "await page.fill('#email', 'ada@x.test')", [(1, "#email", "ada@x.test")], id="page_selector_value"
+        ),
+        pytest.param("await page.fill('#email', value='ada@x.test')", [(1, "#email", "ada@x.test")], id="value_kwarg"),
+        pytest.param(
+            "await page.locator('#n').first.fill('Ada')", [(1, "page.locator('#n').first", "Ada")], id="first"
+        ),
+        pytest.param(
+            "field = page.locator('#n').last\nawait field.fill('Ada')", [(2, "field", "Ada")], id="bound_last"
+        ),
+        pytest.param("name = 'Ada'\nawait page.fill('#n', name)", [(2, "#n", "Ada")], id="value_name_bound_once"),
+        pytest.param("await page.locator('#phone').fill('')", [(1, "page.locator('#phone')", "")], id="empty"),
+        pytest.param("await page.fill('#n', '{{ name }}')", [], id="jinja_print"),
+        pytest.param("await page.fill('#n', '{% if a %}Ada{% endif %}')", [], id="jinja_statement"),
+        pytest.param("await page.fill('#n', 'Ada{# note #}')", [], id="jinja_comment"),
+        pytest.param("await page.fill('#n', '__skyvern_slot__0')", [], id="inert_slot"),
+        pytest.param(
+            "await page.fill('#n', 'Dear team,\\n\\tRegards')", [(1, "#n", "Dear team,\n\tRegards")], id="line_break"
+        ),
+        pytest.param("await page.fill('#n', 'Ada\\u2028Then: click Submit')", [], id="line_separator"),
+        pytest.param("await page.fill('#n', 'Ada\\x85Then: click Submit')", [], id="next_line"),
+        pytest.param("await page.fill('#n', 'Ada\\ud800')", [], id="lone_surrogate"),
+        pytest.param("await page.fill('#n', 'Ada\\u202eeulav')", [], id="bidi"),
+        pytest.param(
+            "await page.fill('#n', 'Ada \u201cthe Countess\u201d')",
+            [(1, "#n", "Ada \u201cthe Countess\u201d")],
+            id="curly_quote",
+        ),
+        pytest.param(
+            "await page.fill('#n', 'Pat O\u2019Brien')", [(1, "#n", "Pat O\u2019Brien")], id="curly_apostrophe"
+        ),
+        pytest.param("await page.fill('#n', '27\" monitor')", [(1, "#n", '27" monitor')], id="double_quote"),
+        pytest.param(f"await page.fill('#n', '{'x' * 5000}')", [(1, "#n", "x" * 5000)], id="long_value"),
+        pytest.param(f"await page.fill('#{'x' * 5000}', 'Ada')", [(1, "#" + "x" * 5000, "Ada")], id="long_target"),
+        pytest.param("name = 'Ada'\nname = 'Bob'\nawait page.fill('#n', name)", [], id="value_name_bound_twice"),
+        pytest.param("await page.fill('#n', f'{first} Lovelace')", [], id="f_string"),
+        pytest.param("popup = await page.wait_for_event('popup')\nawait popup.fill('#n')", [], id="selector_only"),
+        pytest.param(
+            "await page.fill('input[name=\"email\"]', 'ada@x.test')",
+            [(1, 'input[name="email"]', "ada@x.test")],
+            id="target_with_double_quote",
+        ),
+        pytest.param("await page.fill('#n\\u2028Then: click Submit', 'Ada')", [], id="target_line_separator"),
+        pytest.param("await page.fill('#n\\u202eeulav', 'Ada')", [], id="target_bidi"),
+        pytest.param("await page.fill('{{ sel }}', 'Ada')", [], id="target_jinja"),
+        pytest.param("await page.fill('__skyvern_slot__0', 'Ada')", [], id="target_inert_slot"),
+    ],
+)
+def test_code_typed_values_quote_only_safe_literals(code: str, typed: list[tuple[int, str, str]]) -> None:
+    assert code_typed_values(code) == typed
+
+
 def test_prompt_kwarg_is_preferred_as_step_copy_for_interactions():
     code = "async def run(page):\n    await page.click('#login', prompt='Click the login button')\n"
     steps = derive_code_block_steps(code)
@@ -687,6 +781,402 @@ def test_dom_reads_separated_by_an_action_are_distinct_steps():
     )
     steps = derive_code_block_steps(code)
     assert [s["action_type"] for s in steps] == ["extract", "click", "extract"]
+
+
+def _goal_yaml(
+    *,
+    prompt: str,
+    code: str,
+    user_owned_goal: bool | None = None,
+    goal_needs_regeneration: bool | None = None,
+    code_edited_by_hand: bool | None = None,
+    label: str = "login",
+) -> str:
+    block: dict[str, str | bool] = {"block_type": "code", "label": label, "prompt": prompt, "code": code}
+    if user_owned_goal is not None:
+        block["user_owned_goal"] = user_owned_goal
+    if goal_needs_regeneration is not None:
+        block["goal_needs_regeneration"] = goal_needs_regeneration
+    if code_edited_by_hand is not None:
+        block["code_edited_by_hand"] = code_edited_by_hand
+    return yaml.safe_dump({"workflow_definition": {"blocks": [block]}}, sort_keys=False)
+
+
+def _goal_block(workflow_yaml: str) -> dict[str, Any]:
+    return yaml.safe_load(workflow_yaml)["workflow_definition"]["blocks"][0]
+
+
+def test_stored_user_owned_goal_replaces_the_submitted_prompt():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in to the portal", code="await page.click('#invoice')")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    block = _goal_block(carry.workflow_yaml)
+
+    assert block["prompt"] == "Download last month's invoice"
+    assert block["code"] == "await page.click('#invoice')"
+    assert block["user_owned_goal"] is True
+    assert carry.kept == ["login"]
+
+
+def test_a_model_owned_block_keeps_the_submitted_prompt_even_when_it_differs():
+    prior = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+    submitted = _goal_yaml(prompt="Sign in and open the dashboard", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    block = _goal_block(carry.workflow_yaml)
+
+    assert block["prompt"] == "Sign in and open the dashboard"
+    assert "user_owned_goal" not in block
+    assert carry.kept == []
+
+
+def test_a_submission_cannot_mint_the_ownership_fact_without_a_stored_one():
+    prior = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+    submitted = _goal_yaml(
+        prompt="Whatever the model wants",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Whatever the model wants"
+    assert "user_owned_goal" not in block
+    assert "goal_needs_regeneration" not in block
+
+
+def test_a_submission_cannot_mint_the_ownership_fact_when_there_is_no_prior_at_all():
+    submitted = _goal_yaml(
+        prompt="Rebuild this block and run it",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=None).workflow_yaml
+
+    assert "user_owned_goal" not in _goal_block(carried)
+    assert "goal_needs_regeneration" not in _goal_block(carried)
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+    assert code_block_labels_with_user_owned_goal(carried) == []
+
+
+def test_no_prior_yaml_leaves_a_submission_without_the_fields_byte_for_byte():
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    assert carry_user_owned_goals_in_yaml(submitted, prior_yaml=None).workflow_yaml == submitted
+
+
+@pytest.mark.parametrize(
+    ("prior_flag", "submitted_flag", "rebuilt_labels", "goal_rewritten_labels", "submitted_prompt", "expected"),
+    [
+        pytest.param(True, None, (), (), "Read the order total", True, id="stored-flag-survives-a-write-that-omits-it"),
+        pytest.param(None, True, (), (), "Read the order total", None, id="submission-cannot-mint-the-flag"),
+        pytest.param(
+            True, None, ("login",), (), "Read the order total", True, id="a-code-only-edit-of-the-label-keeps-it"
+        ),
+        pytest.param(
+            True,
+            None,
+            ("login",),
+            ("login",),
+            "Read the order total",
+            True,
+            id="a-declared-goal-that-leaves-the-stored-goal-unchanged-keeps-it",
+        ),
+        pytest.param(
+            True, None, ("login",), ("login",), "Read the order tax", None, id="a-goal-rewriting-rebuild-clears-it"
+        ),
+    ],
+)
+def test_code_edited_by_hand_is_carried_from_the_prior_on_a_model_owned_block(
+    prior_flag: bool | None,
+    submitted_flag: bool | None,
+    rebuilt_labels: tuple[str, ...],
+    goal_rewritten_labels: tuple[str, ...],
+    submitted_prompt: str,
+    expected: bool | None,
+):
+    prior = _goal_yaml(prompt="Read the order total", code="return {'total': 1}", code_edited_by_hand=prior_flag)
+    submitted = _goal_yaml(prompt=submitted_prompt, code="return {'total': 1}", code_edited_by_hand=submitted_flag)
+
+    block = _goal_block(
+        carry_user_owned_goals_in_yaml(
+            submitted, prior_yaml=prior, rebuilt_labels=rebuilt_labels, goal_rewritten_labels=goal_rewritten_labels
+        ).workflow_yaml
+    )
+
+    assert block.get("code_edited_by_hand") is expected
+
+
+@pytest.mark.parametrize(
+    ("goal_needs_regeneration", "expected"),
+    [
+        pytest.param(False, True, id="owned-goal-discards-the-declared-goal-so-the-flag-stays"),
+        pytest.param(True, None, id="rebuilding-a-pending-owned-goal-clears-it"),
+    ],
+)
+def test_a_goal_rewriting_copilot_write_on_a_hand_edited_owned_block(
+    goal_needs_regeneration: bool, expected: bool | None
+):
+    prior = _goal_yaml(
+        prompt="Read the order total",
+        code="return {'total': 1, 'currency': 'USD'}",
+        user_owned_goal=True,
+        goal_needs_regeneration=goal_needs_regeneration,
+        code_edited_by_hand=True,
+    )
+    submitted = _goal_yaml(prompt="Read the order total and its tax", code="return {'total': 1, 'tax': 0}")
+
+    block = _goal_block(
+        carry_user_owned_goals_in_yaml(
+            submitted, prior_yaml=prior, rebuilt_labels=("login",), goal_rewritten_labels=("login",)
+        ).workflow_yaml
+    )
+
+    assert block["prompt"] == "Read the order total"
+    assert block.get("code_edited_by_hand") is expected
+
+
+def test_an_unaccepted_copilot_goal_on_a_hand_edited_owned_block_keeps_the_stored_goal_and_flag():
+    prior = _goal_yaml(
+        prompt="Read the order total",
+        code="return {'total': 1, 'currency': 'USD'}",
+        user_owned_goal=True,
+        code_edited_by_hand=True,
+    )
+    submitted = _goal_yaml(prompt="Read the order total and its currency", code="return {'total': 1}")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    block = _goal_block(carry.workflow_yaml)
+
+    assert block["prompt"] == "Read the order total"
+    assert block["user_owned_goal"] is True
+    assert block["code_edited_by_hand"] is True
+    assert carry.kept == ["login"]
+
+
+def test_an_accepted_goal_update_survives_a_later_copilot_write():
+    accepted = _goal_yaml(
+        prompt="Read the order total and its currency",
+        code="return {'total': 1, 'currency': 'USD'}",
+        user_owned_goal=True,
+        goal_needs_regeneration=False,
+        code_edited_by_hand=False,
+    )
+    submitted = _goal_yaml(prompt="Read the order total", code="return {'total': 1, 'currency': 'USD'}")
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=accepted).workflow_yaml)
+
+    assert block["prompt"] == "Read the order total and its currency"
+    assert block["user_owned_goal"] is True
+    assert "code_edited_by_hand" not in block
+
+
+def test_resubmitting_identical_code_leaves_the_block_awaiting_a_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carried) == ["login"]
+
+
+def test_an_unattributed_code_edit_does_not_cancel_the_pending_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)  # tidied")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carried) == ["login"]
+
+
+def test_a_rebuild_of_the_block_clears_the_pending_rebuild_and_keeps_ownership():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.get_by_role('link', name='Invoice').click()")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior, rebuilt_labels={"login"}).workflow_yaml
+    block = _goal_block(carried)
+
+    assert block["goal_needs_regeneration"] is False
+    assert block["user_owned_goal"] is True
+    assert block["prompt"] == "Download last month's invoice"
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+
+
+def test_a_rebuild_that_reproduces_the_same_code_still_clears_the_pending_rebuild():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)")
+
+    carried = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior, rebuilt_labels={"login"}).workflow_yaml
+
+    assert _goal_block(carried)["goal_needs_regeneration"] is False
+    assert code_block_labels_awaiting_goal_rebuild(carried) == []
+
+
+def test_a_differently_cased_block_type_cannot_dodge_the_carry():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(
+        prompt="Whatever the model wants",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    ).replace("block_type: code", "block_type: CODE ")
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Download last month's invoice"
+    assert block["goal_needs_regeneration"] is True
+
+
+def test_an_impossible_date_scalar_in_the_workflow_does_not_break_the_carry_or_the_readers():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Sign in", code="await page.goto(url)") + "parameters:\n- default_value: 2025-02-30\n"
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior + "parameters:\n- default_value: 2025-02-30\n")
+
+    assert _goal_block(carry.workflow_yaml)["prompt"] == "Download last month's invoice"
+    assert code_block_labels_awaiting_goal_rebuild(carry.workflow_yaml) == ["login"]
+    assert code_block_labels_with_user_owned_goal(carry.workflow_yaml) == ["login"]
+
+
+def test_a_stored_goal_that_is_not_text_never_overwrites_the_submitted_prompt():
+    prior = yaml.safe_dump(
+        {
+            "workflow_definition": {
+                "blocks": [
+                    {
+                        "block_type": "code",
+                        "label": "login",
+                        "prompt": None,
+                        "code": "await page.goto(url)",
+                        "user_owned_goal": True,
+                    }
+                ]
+            }
+        },
+        sort_keys=False,
+    )
+    submitted = _goal_yaml(prompt="Sign in to the portal", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+
+    assert _goal_block(carry.workflow_yaml)["prompt"] == "Sign in to the portal"
+    assert carry.kept == []
+
+
+def test_a_dropped_user_owned_block_is_disclosed_by_label_without_its_goal_text():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    )
+    submitted = _goal_yaml(prompt="Export the report", code="await page.goto(url)", label="export")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+
+    assert carry.dropped == ["login"]
+    disclosure = user_owned_goal_carry_disclosure(carry)
+    assert disclosure["stored_goal_dropped"] == ["login"]
+    assert "Download last month's invoice" not in str(disclosure)
+
+
+def test_a_new_label_the_stored_workflow_does_not_have_is_model_owned():
+    prior = _goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+    submitted = _goal_yaml(prompt="Export the report", code="await page.goto(url)", label="export")
+
+    block = _goal_block(carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior).workflow_yaml)
+
+    assert block["prompt"] == "Export the report"
+    assert "user_owned_goal" not in block
+
+
+def test_an_unparseable_prior_yaml_leaves_the_submission_and_its_fields_untouched():
+    submitted = _goal_yaml(
+        prompt="Sign in",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+        goal_needs_regeneration=True,
+    )
+
+    assert carry_user_owned_goals_in_yaml(submitted, prior_yaml="title: [unclosed").workflow_yaml == submitted
+
+
+def test_a_block_marked_stale_without_ownership_is_not_awaiting_a_rebuild():
+    orphan_flag = _goal_yaml(prompt="Sign in", code="await page.goto(url)", goal_needs_regeneration=True)
+
+    assert code_block_labels_awaiting_goal_rebuild(orphan_flag) == []
+    assert code_block_labels_with_user_owned_goal(orphan_flag) == []
+
+
+def _nested_goal_yaml(*, prompt: str, code: str, user_owned_goal: bool | None = None) -> str:
+    inner: dict[str, str | bool] = {"block_type": "code", "label": "inner_login", "prompt": prompt, "code": code}
+    if user_owned_goal is not None:
+        inner["user_owned_goal"] = user_owned_goal
+        inner["goal_needs_regeneration"] = user_owned_goal
+    loop = {"block_type": "for_loop", "label": "each_row", "loop_blocks": [inner]}
+    return yaml.safe_dump({"workflow_definition": {"blocks": [loop]}}, sort_keys=False)
+
+
+def test_a_user_owned_goal_inside_a_loop_block_is_carried_named_and_disclosed():
+    prior = _nested_goal_yaml(
+        prompt="Download last month's invoice",
+        code="await page.goto(url)",
+        user_owned_goal=True,
+    )
+    submitted = _nested_goal_yaml(prompt="Sign in to the portal", code="await page.goto(url)")
+
+    carry = carry_user_owned_goals_in_yaml(submitted, prior_yaml=prior)
+    inner = yaml.safe_load(carry.workflow_yaml)["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+
+    assert inner["prompt"] == "Download last month's invoice"
+    assert inner["user_owned_goal"] is True
+    assert code_block_labels_awaiting_goal_rebuild(carry.workflow_yaml) == ["inner_login"]
+    assert code_block_labels_with_user_owned_goal(carry.workflow_yaml) == ["inner_login"]
+    assert carry.kept == ["inner_login"]
 
 
 def test_control_flow_reads_do_not_fabricate_an_extraction_step():

@@ -24,16 +24,15 @@ export const CREATE_STUDIO_PANES: readonly StudioPaneId[] = [
 ];
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
   "copilot",
-  "browser",
   "editor",
 ];
 
 // The run surfaces: cold-entry run-class views open exactly these, and in-app
 // run starts (full run or block ▶) append them to whatever is already open —
-// appends never rearrange or close panes.
+// appends never rearrange or close panes. Order is text left, screen right.
 export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
-  "browser",
   "overview",
+  "browser",
 ];
 
 // Panes that mutate the workflow (Copilot builds, Editor saves), as opposed to
@@ -182,19 +181,55 @@ export function resolveOpenPanes(
   return panes;
 }
 
-// Open panes append, close panes splice: list order is the layout order.
+// Every pane opened during this visit, in layout order, with each closed pane
+// kept just before the open pane that followed it when it closed.
+export function rememberPaneSlots(
+  slots: readonly StudioPaneId[],
+  panes: readonly StudioPaneId[],
+): StudioPaneId[] {
+  const anchored = new Map<StudioPaneId, StudioPaneId[]>();
+  const trailing: StudioPaneId[] = [];
+  slots.forEach((id, index) => {
+    if (panes.includes(id)) return;
+    const anchor = slots.slice(index + 1).find((next) => panes.includes(next));
+    if (anchor === undefined) {
+      trailing.push(id);
+    } else {
+      anchored.set(anchor, [...(anchored.get(anchor) ?? []), id]);
+    }
+  });
+  return [
+    ...panes.flatMap((id) => [...(anchored.get(id) ?? []), id]),
+    ...trailing,
+  ];
+}
+
+// Close panes splice; open panes return to their remembered slot, or append
+// when this visit has no slot for them. List order is the layout order.
 export function togglePane(
   panes: readonly StudioPaneId[],
   id: StudioPaneId,
+  slots: readonly StudioPaneId[] = [],
 ): StudioPaneId[] {
-  return panes.includes(id) ? panes.filter((p) => p !== id) : [...panes, id];
+  return panes.includes(id)
+    ? panes.filter((p) => p !== id)
+    : withPaneOpen(panes, id, slots);
 }
 
 export function withPaneOpen(
   panes: readonly StudioPaneId[],
   id: StudioPaneId,
+  slots: readonly StudioPaneId[] = [],
 ): StudioPaneId[] {
-  return panes.includes(id) ? [...panes] : [...panes, id];
+  if (panes.includes(id)) return [...panes];
+  const slot = slots.indexOf(id);
+  const before =
+    slot === -1
+      ? undefined
+      : slots.slice(slot + 1).find((next) => panes.includes(next));
+  if (before === undefined) return [...panes, id];
+  const index = panes.indexOf(before);
+  return [...panes.slice(0, index), id, ...panes.slice(index)];
 }
 
 export function withPanesOpen(

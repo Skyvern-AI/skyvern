@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,7 +31,12 @@ from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.config import settings
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
-from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
+    BuildTestConnectFailure,
+    BuildTestConnectFailureState,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -39,15 +44,21 @@ from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
     RAW_SECRET_BROWSER_ERROR,
     AgentContext,
+    BrowserSessionReplacement,
+    BuildTestBrowserSeed,
     ensure_browser_session,
+    ensure_build_test_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
+    replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
     BrowserRetryableCdpError,
@@ -99,8 +110,31 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
-            {"ok": False, "error": "boom. retry later", "error_code": "E1"},
-            id="error_with_hint_joins_message_and_hint",
+            {"ok": False, "error": "boom", "error_code": "E1"},
+            id="error_with_hint_forwards_the_message_only",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error": {
+                    "code": "ACTION_FAILED",
+                    "message": "No unambiguous option matched 'Blue'",
+                    "hint": "Retry with one of the observed options: Navy, Teal",
+                    "details": {
+                        "element_state": "no_unambiguous_match",
+                        "selector": "#color",
+                        "observed_options": ["Navy", "Teal"],
+                    },
+                },
+            },
+            {
+                "ok": False,
+                "error": "No unambiguous option matched 'Blue'",
+                "error_code": "ACTION_FAILED",
+                "element_state": "no_unambiguous_match",
+                "observed_options": ["Navy", "Teal"],
+            },
+            id="select_mismatch_lifts_the_observed_options_without_the_hint",
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom"}},
@@ -381,6 +415,13 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
     assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
+    assert mock_manager.create_session.call_args.kwargs.keys() == {
+        "organization_id",
+        "timeout_minutes",
+        "created_by",
+        "session_kind",
+    }
+    assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
 
 @pytest.mark.asyncio
@@ -440,6 +481,59 @@ async def test_a_duplicate_session_from_a_creation_race_closes_cleanly(monkeypat
     mock_manager.close_session.assert_awaited_once_with(
         "org_1", "bs_loser", reason=BrowserSessionCloseReason.user_requested
     )
+
+
+async def _replace_held_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pane_session: object = None,
+    close_error: Exception | None = None,
+    create_error: Exception | None = None,
+) -> tuple[AgentContext, MagicMock, object]:
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.close_session = AsyncMock(side_effect=close_error)
+    if create_error is not None:
+        manager.create_session = AsyncMock(side_effect=create_error)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    mock_app.DATABASE.debug.get_debug_session_by_browser_session_id = AsyncMock(return_value=pane_session)
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_old"
+    return ctx, manager, await replace_browser_session(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_session", "close_error", "expected_closed"),
+    [(None, None, True), (SimpleNamespace(debug_session_id="ds_1"), None, False), (None, RuntimeError("down"), False)],
+    ids=["copilot_owned", "studio_pane_keeps_it", "close_failed"],
+)
+async def test_a_replaced_browser_is_recorded_and_closed_only_when_nothing_else_streams_it(
+    monkeypatch: pytest.MonkeyPatch, pane_session: object, close_error: Exception | None, expected_closed: bool
+) -> None:
+    ctx, manager, replacement = await _replace_held_browser(
+        monkeypatch, pane_session=pane_session, close_error=close_error
+    )
+
+    assert replacement == BrowserSessionReplacement(
+        "pbs_old", "pbs_fresh", old_closed=expected_closed, pane_kept_old=pane_session is not None
+    )
+    assert ctx.browser_session_id == "pbs_fresh"
+    assert ctx.browser_session_replacements == {"pbs_old": "pbs_fresh"}
+    assert ctx.browser_session_continuity_generation == 1
+    assert (manager.close_session.await_count == 0) is (pane_session is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_that_cannot_start_keeps_the_old_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, manager, replacement = await _replace_held_browser(monkeypatch, create_error=RuntimeError("no capacity"))
+
+    assert not isinstance(replacement, BrowserSessionReplacement)
+    assert ctx.browser_session_id == "pbs_old"
+    assert ctx.browser_session_replacements == {}
+    assert ctx.browser_session_continuity_generation == 0
+    manager.close_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -816,6 +910,18 @@ async def test_an_undetermined_attach_is_not_read_as_session_loss(monkeypatch: p
     assert _is_unrecoverable_browser_session_error("evaluate", _tool_output(retired.value))
 
 
+def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> None:
+    output = {
+        "ok": False,
+        "error": "evaluate failed: element not visible",
+        "page_state": {"read": "ok", "url": None, "title": "Browser session not found", "challenge_vendor": None},
+    }
+
+    assert not _is_unrecoverable_browser_session_error("evaluate", output)
+    nested = {"ok": False, "error": "evaluate failed", "data": {"page_state": {"reason": "Browser session not found"}}}
+    assert _is_unrecoverable_browser_session_error("evaluate", nested)
+
+
 @pytest.mark.asyncio
 async def test_create_closes_its_session_when_a_sibling_installed_one_first(
     monkeypatch: pytest.MonkeyPatch,
@@ -851,11 +957,89 @@ async def test_create_closes_its_session_when_a_sibling_installed_one_first(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_session_id", "proxy_kwargs", "workflow_proxy"),
+    [
+        (None, {"inherit_profile_proxy": True}, None),
+        (None, {"inherit_profile_proxy": True, "proxy_location": ProxyLocation.NONE}, ProxyLocation.NONE),
+        (
+            "ps_pinned",
+            {"proxy_session_id": "ps_pinned", "proxy_location": ProxyLocation.RESIDENTIAL_ISP},
+            ProxyLocation.NONE,
+        ),
+    ],
+)
+async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over_it(
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_session_id: str | None,
+    proxy_kwargs: dict[str, object],
+    workflow_proxy: ProxyLocation | None,
+) -> None:
+    ready = MagicMock()
+    ready.browser_context = _FakeBrowserContext()
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="bs_seeded"))
+    mock_manager.get_browser_state = AsyncMock(return_value=ready)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    ctx = _make_ctx()
+
+    result = await ensure_build_test_browser_session(
+        ctx,
+        seed=BuildTestBrowserSeed(browser_profile_id="bp_saved", proxy_session_id=proxy_session_id),
+        proxy_location=workflow_proxy,
+    )
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_seeded"
+    create = mock_manager.create_session.call_args.kwargs
+    assert create == {
+        "organization_id": ctx.organization_id,
+        "timeout_minutes": 30,
+        "created_by": "copilot",
+        "session_kind": BrowserSessionKind.copilot,
+        "browser_profile_id": "bp_saved",
+        "profile_read_only": True,
+        "generate_browser_profile": True,
+        **proxy_kwargs,
+    }
+    session_row = PersistentBrowserSession(
+        persistent_browser_session_id="bs_seeded",
+        organization_id=ctx.organization_id,
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
+        browser_profile_id=create["browser_profile_id"],
+        profile_read_only=create["profile_read_only"],
+    )
+    assert not session_row.should_export_profile()
+    fallback_export_target = export_profile_storage_id(
+        session_id="bs_seeded",
+        browser_profile_id=create["browser_profile_id"],
+        generate_browser_profile=create["generate_browser_profile"],
+    )
+    assert fallback_export_target == "bs_seeded"
+
+
+def test_every_connect_failure_without_a_retry_reads_back_as_recorded() -> None:
+    no_retry_states = []
+    for state in get_args(BuildTestConnectFailureState):
+        try:
+            failure = BuildTestConnectFailure(state=state, retry_action=None)
+        except ValueError:
+            continue
+        no_retry_states.append(state)
+        assert connect_failure_from_run_blocks_result(runtime._build_test_connect_failure_result(failure)) == failure
+
+    assert {"saved_profile_unresolved", "saved_profile_not_applied"} <= set(no_retry_states)
+
+
+@pytest.mark.asyncio
 async def test_self_heal_browser_state_adoption_does_not_enter_persistent_resolve_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _make_ctx()
-    ctx.turn_origin = runtime.TurnOrigin.runtime_self_heal
+    ctx.turn_origin = runtime.TurnOrigin.code_block_ai_fallback
     ctx.browser_session_id = "self-heal:wr_test"
     browser_state = MagicMock()
     resolve_self_heal = AsyncMock(return_value=(ctx.browser_session_id, browser_state, MagicMock()))
@@ -1978,7 +2162,7 @@ async def test_a_self_heal_turn_leaves_the_healers_injected_driver_alone(
         manager=manager,
         exit_path="normal",
         browser_state=MagicMock(),
-        turn_origin=runtime.TurnOrigin.runtime_self_heal,
+        turn_origin=runtime.TurnOrigin.code_block_ai_fallback,
     )
 
     manager.evict_cached_browser_state.assert_not_awaited()
@@ -2615,7 +2799,7 @@ def _install_tabbed_session(
     ctx = _make_ctx()
     ctx.browser_session_id = "pbs_tabbed"
     if self_heal:
-        ctx.turn_origin = runtime.TurnOrigin.runtime_self_heal
+        ctx.turn_origin = runtime.TurnOrigin.code_block_ai_fallback
         ctx.injected_browser_state = browser_state
         ctx.heal_workflow_run_id = "wr_heal"
     return ctx, browser_state, context

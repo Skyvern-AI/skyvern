@@ -1,9 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
-  ChevronDownIcon,
-  Cross2Icon,
-  LockClosedIcon,
-} from "@radix-ui/react-icons";
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { ChevronDownIcon, LockClosedIcon } from "@radix-ui/react-icons";
 import { useDebounce } from "use-debounce";
 
 import { getClient } from "@/api/AxiosClient";
@@ -28,11 +31,24 @@ import {
   useCredentialQuery,
 } from "@/routes/workflows/hooks/useCredentialQuery";
 
-// Union of both a request-policy-time classifier's real reason tokens and a
-// mid-build run-failure reason that isn't emitted by any shipped backend
-// path yet. `type`/`reason` are the only fields a minimal signal guarantees;
-// everything else on the frame below is populated only by a richer,
-// timed pause signal and stays undefined otherwise.
+import {
+  AppliedCheck,
+  CardBody,
+  CardFooter,
+  CardHeader,
+  CopilotCard,
+  GutterRow,
+} from "./cardChrome";
+import {
+  AttentionMarker,
+  AttentionTray,
+  type AttentionTrayPresentation,
+} from "./AttentionTray";
+import { TURN_ROW_INSET } from "./cardLayout";
+import { useDemoLoginGuide } from "@/hooks/useDemoLoginGuide";
+
+// Union of the request-policy reason tokens and the run-derived pause reasons. `type`/`reason` are the
+// only fields a minimal signal guarantees; the rest is populated only by a timed pause signal.
 export type CredentialRequiredReason =
   | "workflow_credential_inputs_unbound"
   | "credential_name_unresolved"
@@ -42,7 +58,16 @@ export type CredentialRequiredReason =
   | "assistant_directed"
   | "missing_credential_run_failure"
   | "credential_missing_totp"
-  | "credential_rejected_by_site";
+  | "credential_rejected_by_site"
+  | "credential_registration";
+
+// What Generate and save would store. Never carries a password; the server generates it.
+export interface CredentialRegistrationDetails {
+  username: string;
+  credential_name: string;
+  attempted?: boolean;
+  outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+}
 
 export interface CredentialRequiredFrame {
   type: "credential_required";
@@ -55,12 +80,18 @@ export interface CredentialRequiredFrame {
   credential_refs?: string[];
   timeout_seconds?: number;
   expires_at?: string;
+  signing_in?: boolean;
+  registration?: CredentialRegistrationDetails | null;
   timestamp?: string;
 }
 
 export type CredentialCardMode = "terminal" | "inline-pause" | "auto-bound";
 
-export type CredentialPauseOutcome = "connected" | "skipped" | "timeout";
+export type CredentialPauseOutcome =
+  | "connected"
+  | "skipped"
+  | "timeout"
+  | "signed_in";
 
 export interface CredentialPauseHistorical {
   outcome: CredentialPauseOutcome;
@@ -107,6 +138,22 @@ export interface CredentialCardProps {
   // "auto-bound" mode only: whether the Change affordance is live (the tail turn). A scrollback
   // receipt stays read-only so a pick can't optimistically resolve without an actual continuation.
   canChange?: boolean;
+  // Set when the chat docks this ask above the composer instead of in the transcript.
+  tray?: AttentionTrayPresentation;
+  // Offered only when the card's browser is the one on screen, so the user signs in where the agent looks.
+  signIn?: ManualSignInOffer;
+  // Registration cards only: saves a server-generated password under the frame's username and name.
+  onGenerate?: () => void;
+}
+
+export interface ManualSignInOffer {
+  busy: boolean;
+  // Set after a Done that found no sign-in cookies for the site.
+  notFoundHost?: string;
+  // Set after a Done whose sign-in could not be read or saved.
+  saveFailed?: boolean;
+  onStart: () => void;
+  onDone: () => void;
 }
 
 const SIGN_IN_WHY_LINE =
@@ -119,7 +166,7 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
   string
 > = {
   workflow_credential_inputs_unbound: SIGN_IN_WHY_LINE,
-  // Lower-confidence text-marker detection of the same underlying need.
+  // Neutral reason when no more specific typed cause applies; older stored chats also carry it.
   assistant_directed: SIGN_IN_WHY_LINE,
   credential_name_unresolved:
     "I couldn't tell which saved credential you meant — connect or pick the right one so the workflow can sign in.",
@@ -135,6 +182,8 @@ export const CREDENTIAL_WHY_LINE_BY_REASON: Record<
     "This saved login has no 2FA method, so the workflow can't pass the verification step. Add one in the credential editor — codes never go through chat.",
   credential_rejected_by_site:
     "Update the saved password or one-time code here and I'll try the sign-in again.",
+  credential_registration:
+    "Generate and save creates a strong password and stores it in your credentials — it never appears in chat. Saving it does not create the account; I'll still submit the sign-up form.",
 };
 
 // Mirrors the credentials route: it caps `search` at 200 characters and pages at 100. A longer term
@@ -159,12 +208,24 @@ const LIVE_REGION_SELECTOR =
   '[aria-live]:not([aria-live="off"]), [role="status"], [role="log"], [role="alert"]';
 const SEARCH_FAILED_ANNOUNCEMENT = "Couldn't run that search.";
 
-const SKIP_COPY =
-  "Credential setup skipped — test run may stop at the login step";
-const UPDATE_SKIP_COPY =
-  "Credential not updated — the workflow keeps its saved sign-in";
-const TIMEOUT_COPY =
-  "Credential request timed out — test run may stop at the login step";
+// Title and meta fit the one-line receipt; detail is the full sentence behind its chevron.
+const SKIP_OUTCOME = {
+  title: "Sign-in skipped",
+  meta: "test may stop at login",
+  detail: "Credential setup skipped — test run may stop at the login step.",
+};
+const UPDATE_SKIP_OUTCOME = {
+  title: "Credential not updated",
+  meta: "keeps its saved sign-in",
+  detail: "Credential not updated — the workflow keeps its saved sign-in.",
+};
+const SIGNED_IN_DETAIL =
+  "No password stored · your sign-in is saved as browser cookies in this profile";
+const TIMEOUT_OUTCOME = {
+  title: "Sign-in request timed out",
+  meta: "test may stop at login",
+  detail: "Credential request timed out — test run may stop at the login step.",
+};
 
 function siteFromLoginPageUrls(urls: string[] | undefined): string {
   const first = urls?.[0];
@@ -233,15 +294,6 @@ function useCountdown(expiresAt: string, active: boolean) {
   return { remainingMs, expired: remainingMs <= 0 };
 }
 
-function CredentialSystemRow({ text }: { text: string }) {
-  return (
-    <div className="flex items-center gap-2 px-1 py-1 text-xs text-muted-foreground">
-      <span className="h-1 w-1 flex-none rounded-full bg-muted-foreground dark:bg-slate-600" />
-      {text}
-    </div>
-  );
-}
-
 // Searchable picker over the whole org credential list. Built on the cmdk primitives (same pattern as
 // the workflow-builder CredentialCombobox) rather than importing it, since that one pulls react-query
 // and the copilot chat's test harness has no QueryClientProvider.
@@ -256,11 +308,11 @@ function CredentialPicker({
   searchPending,
   resultsTruncated,
   onRetrySearch,
-  triggerLabel = "Use existing…",
-  triggerClassName = "h-6 w-[200px] justify-between px-3 text-xs font-normal",
+  triggerLabel = "Saved logins",
+  triggerClassName = "gap-1",
   // Popover content matches the trigger width by default; a content-width trigger (e.g. "Change")
   // needs an explicit width here or the dropdown collapses to the label and hides its search/rows.
-  contentClassName = "w-[var(--radix-popover-trigger-width)]",
+  contentClassName = "w-[var(--radix-popover-trigger-width)] min-w-[240px]",
 }: {
   credentials: PickerCredential[];
   // Copilot's suggested candidates for this sign-in (only inline-pause frames carry them; terminal
@@ -330,11 +382,12 @@ function CredentialPicker({
           role="combobox"
           aria-expanded={open}
           variant="outline"
+          size="sm"
           disabled={disabled}
           className={triggerClassName}
         >
           <span className="truncate">{triggerLabel}</span>
-          <ChevronDownIcon className="ml-2 size-3 shrink-0 opacity-50" />
+          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </PopoverTrigger>
       <PopoverContent className={`${contentClassName} p-0`} align="start">
@@ -433,15 +486,16 @@ function SkipButton({
   disabled: boolean;
 }) {
   return (
-    <button
+    <Button
       type="button"
+      size="sm"
+      variant="outline"
       aria-label="Skip for now"
       onClick={() => onSkip()}
       disabled={disabled}
-      className="flex h-5 w-5 flex-none items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 dark:text-slate-500"
     >
-      <Cross2Icon className="h-3 w-3" />
-    </button>
+      Skip
+    </Button>
   );
 }
 
@@ -458,11 +512,13 @@ function CredentialUpdateAsk({
   credentialId,
   onUpdateCredential,
   onSkip,
+  tray,
 }: {
   frame: CredentialRequiredFrame;
   credentialId: string;
   onUpdateCredential?: (credential: CredentialApiResponse) => void;
   onSkip: () => void;
+  tray?: AttentionTrayPresentation;
 }) {
   const { remainingMs, expired } = useCountdown(frame.expires_at ?? "", true);
   const [rootRef, insideLiveRegion] = useInsideLiveRegion();
@@ -480,67 +536,212 @@ function CredentialUpdateAsk({
   const status = credential ? "" : (loadFailure ?? "Loading saved login…");
 
   return (
-    <div ref={rootRef}>
-      {frame.message ? (
-        <p className="text-sm leading-relaxed text-foreground">
-          {frame.message}
-        </p>
-      ) : null}
-      <div
-        className={`rounded-lg border border-border bg-slate-elevation2 p-3 ${frame.message ? "mt-2" : ""}`}
-      >
-        <div className="flex items-start gap-2">
-          <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-warning/10 text-warning">
-            <LockClosedIcon className="h-3 w-3" />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="break-words text-xs font-semibold text-foreground">
-              {rejected
-                ? `Update ${credential ? `'${credential.name}'` : "your saved login"} to sign in to ${site}`
-                : credential
-                  ? `Add 2FA to '${credential.name}' to sign in to ${site}`
-                  : `Add 2FA to your saved login for ${site}`}
-            </div>
-            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-              {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
-            </p>
-          </div>
-          <PauseCountdown remainingMs={remainingMs} expired={expired} />
-          <SkipButton onSkip={onSkip} disabled={expired} />
-        </div>
-        <div className="ml-7 mt-2.5 flex flex-wrap items-center gap-2">
-          <button
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      message={frame.message}
+      title={
+        rejected
+          ? `Update ${credential ? `'${credential.name}'` : "your saved login"} to sign in to ${site}`
+          : credential
+            ? `Add 2FA to '${credential.name}' to sign in to ${site}`
+            : `Add 2FA to your saved login for ${site}`
+      }
+      countdown={<PauseCountdown remainingMs={remainingMs} expired={expired} />}
+      lines={[
+        <span
+          key="why"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
+        </span>,
+      ]}
+      footer={
+        <>
+          <Button
             type="button"
+            size="sm"
             disabled={expired || !credential || !onUpdateCredential}
             onClick={() => credential && onUpdateCredential?.(credential)}
-            className="rounded-md bg-cta px-3 py-1 text-xs font-medium text-cta-foreground hover:bg-cta-hover disabled:pointer-events-none disabled:opacity-50"
           >
             {rejected ? "Update credential" : "Add 2FA method"}
-          </button>
+          </Button>
           {status ? (
-            <span className="text-xs text-muted-foreground">{status}</span>
+            <span className="min-w-0 text-xs text-muted-foreground">
+              {status}
+            </span>
           ) : null}
           {loadFailure && !notFound ? (
-            <button
+            <Button
               type="button"
+              size="sm"
+              variant="outline"
               disabled={expired}
               onClick={() => void credentialQuery.refetch()}
-              className="rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
             >
               Retry
-            </button>
+            </Button>
           ) : null}
-          {/* Mounted for the card's lifetime so only its text changes; inside an outer live region
-              the visible status is already announced. */}
-          <span
-            className="sr-only"
-            role={insideLiveRegion ? undefined : "status"}
-          >
-            {insideLiveRegion ? "" : status}
-          </span>
-        </div>
+          <div className="ml-auto">
+            <SkipButton onSkip={onSkip} disabled={expired} />
+          </div>
+        </>
+      }
+      announcer={
+        // Mounted for the card's lifetime so only its text changes; inside an outer live region
+        // the visible status is already announced.
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {insideLiveRegion ? "" : status}
+        </span>
+      }
+    />
+  );
+}
+
+// One unresolved ask, drawn either as a transcript card or as the tray docked above the composer.
+// The tray leaves the assistant's words to the transcript marker, which sits where the ask was raised.
+function AskChrome({
+  tray,
+  rootRef,
+  message,
+  title,
+  countdown,
+  lines,
+  footer,
+  announcer,
+}: {
+  tray?: AttentionTrayPresentation;
+  rootRef: RefObject<HTMLDivElement>;
+  message?: string;
+  title: string;
+  countdown: ReactNode;
+  lines: ReactNode[];
+  footer: ReactNode;
+  // Outside the collapsible body, so a minimized tray still announces a failure.
+  announcer: ReactNode;
+}) {
+  if (tray) {
+    return (
+      <div ref={rootRef}>
+        <AttentionTray
+          aria-label="Sign-in request"
+          title={title}
+          wrapTitle
+          meta={countdown}
+          collapsedTitle="Copilot needs to sign in"
+          collapsedMeta={countdown}
+          collapsed={tray.collapsed}
+          onCollapsedChange={tray.onCollapsedChange}
+          minimizeLabel="Minimize sign-in request"
+          upNext={tray.upNext}
+        >
+          <div className="flex min-h-0 flex-col gap-1 overflow-y-auto px-3 pb-2.5 pt-1">
+            {lines.map((line, index) => (
+              <div key={index}>{line}</div>
+            ))}
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5">
+            {footer}
+          </div>
+        </AttentionTray>
+        {announcer}
       </div>
+    );
+  }
+  return (
+    <div ref={rootRef}>
+      <AskMessage message={message} />
+      <CopilotCard>
+        <CardHeader
+          icon={<LockClosedIcon className="h-3.5 w-3.5 text-warning" />}
+          wrapTitle
+          title={title}
+          right={countdown}
+        />
+        <CardBody>
+          {lines.map((line, index) => (
+            <GutterRow key={index}>{line}</GutterRow>
+          ))}
+        </CardBody>
+        <CardFooter className="flex flex-wrap items-center gap-2">
+          {footer}
+        </CardFooter>
+      </CopilotCard>
+      {announcer}
     </div>
+  );
+}
+
+// Where a docked ask was raised: the assistant's words for it, then a pointer to the tray.
+export function CredentialAskMarker({ message }: { message?: string }) {
+  return (
+    <div>
+      <AskMessage message={message} />
+      <AttentionMarker
+        icon={<LockClosedIcon aria-hidden className="size-3.5 shrink-0" />}
+        title="Copilot needs to sign in"
+      />
+    </div>
+  );
+}
+
+// The assistant's own words for the ask, set on the turn's text edge rather than the card's.
+function AskMessage({ message }: { message?: string }) {
+  if (!message) return null;
+  return (
+    <p
+      className={`${TURN_ROW_INSET} pb-2 text-sm leading-relaxed text-foreground`}
+    >
+      {message}
+    </p>
+  );
+}
+
+function ResolvedCredentialCard({
+  tone,
+  title,
+  meta,
+  detail,
+}: {
+  tone: "done" | "warn";
+  title: string;
+  meta?: string;
+  detail?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <CopilotCard>
+      <CardHeader
+        icon={
+          tone === "warn" ? (
+            <span
+              aria-hidden="true"
+              className="text-xs font-bold text-amber-700 dark:text-amber-300"
+            >
+              !
+            </span>
+          ) : (
+            <AppliedCheck />
+          )
+        }
+        title={title}
+        meta={meta}
+        expanded={expanded}
+        onToggle={detail ? () => setExpanded((value) => !value) : undefined}
+      />
+      {expanded && detail ? (
+        <CardBody>
+          <GutterRow>
+            <span className="text-[11px] leading-relaxed text-muted-foreground">
+              {detail}
+            </span>
+          </GutterRow>
+        </CardBody>
+      ) : null}
+    </CopilotCard>
   );
 }
 
@@ -559,6 +760,7 @@ export function CredentialCard(props: Readonly<CredentialCardProps>) {
         credentialId={updateTargetId}
         onUpdateCredential={props.onUpdateCredential}
         onSkip={props.onSkip}
+        tray={props.tray}
       />
     );
   }
@@ -575,6 +777,9 @@ function CredentialAskCard({
   reloadKey,
   autoBound,
   canChange = false,
+  tray,
+  signIn,
+  onGenerate,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -586,6 +791,10 @@ function CredentialAskCard({
     countdownActive,
   );
   const disabled = countdownActive && expired;
+  useDemoLoginGuide(
+    frame.login_page_urls?.[0],
+    !resolvedOutcome && mode !== "auto-bound" && !disabled,
+  );
 
   const credentialGetter = useCredentialGetter();
   const [orgCredentials, setOrgCredentials] = useState<OrgCredentialList>({
@@ -699,30 +908,50 @@ function CredentialAskCard({
   // interim result closes the dropdown and drops the user's focus mid-edit.
   const pickerEngaged = Boolean(search) || searchPending || searchFailed;
   const retryButton = (
-    <button
+    <Button
       type="button"
+      size="sm"
+      variant="outline"
       disabled={disabled}
       onClick={retryCredentialList}
-      className="rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
     >
       Retry
-    </button>
+    </Button>
   );
 
   if (resolvedOutcome) {
     switch (resolvedOutcome.outcome) {
       case "skipped":
         return (
-          <CredentialSystemRow
-            text={
-              frame.reason === "credential_rejected_by_site"
-                ? UPDATE_SKIP_COPY
-                : SKIP_COPY
-            }
+          <ResolvedCredentialCard
+            tone="warn"
+            {...(frame.reason === "credential_rejected_by_site"
+              ? UPDATE_SKIP_OUTCOME
+              : SKIP_OUTCOME)}
           />
         );
       case "timeout":
-        return <CredentialSystemRow text={TIMEOUT_COPY} />;
+        return frame.registration?.outcome === "created_not_connected" ? (
+          <ResolvedCredentialCard
+            tone="warn"
+            title={`Saved as ${frame.registration.credential_name}, not connected`}
+            detail="The request ended before this login was connected. It is on the Credentials page."
+          />
+        ) : (
+          <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />
+        );
+      case "signed_in":
+        return (
+          <ResolvedCredentialCard
+            tone="done"
+            title={
+              resolvedOutcome.name
+                ? `Signed in, saved as '${resolvedOutcome.name}'`
+                : "Signed in, saved as a browser profile"
+            }
+            detail={SIGNED_IN_DETAIL}
+          />
+        );
       case "connected": {
         const name = resolvedOutcome.name;
         // A save from the editor does not prove 2FA was added; the retried step says whether it was.
@@ -738,16 +967,11 @@ function CredentialAskCard({
                 ? `Credential '${name}' added`
                 : "Credential added";
         return (
-          <div className="rounded-lg border border-border bg-slate-elevation2 p-3">
-            <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
-              <span className="text-success">✓</span>
-              {heading}
-            </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Stored encrypted · used to sign in on your behalf · never enters
-              the chat
-            </p>
-          </div>
+          <ResolvedCredentialCard
+            tone="done"
+            title={heading}
+            detail="Stored encrypted · used to sign in on your behalf · never enters the chat"
+          />
         );
       }
       default: {
@@ -757,7 +981,12 @@ function CredentialAskCard({
         // network, where a crash would take down the whole chat pane.
         const _exhaustive: never = resolvedOutcome.outcome;
         void _exhaustive;
-        return <CredentialSystemRow text="Credential status unavailable" />;
+        return (
+          <ResolvedCredentialCard
+            tone="warn"
+            title="Credential status unavailable"
+          />
+        );
       }
     }
   }
@@ -770,59 +999,50 @@ function CredentialAskCard({
       (credential) => credential.credentialId !== autoBound.credentialId,
     );
     return (
-      <div
-        ref={rootRef}
-        className="rounded-lg border border-border bg-slate-elevation2 p-3"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-foreground">
-            <span aria-hidden="true">🔑</span>
-            <span className="truncate" title={autoBound.name}>
-              Using credential &apos;{autoBound.name}&apos;
-            </span>
-          </div>
-          {canChange ? (
-            // An active search stays mounted on zero results: unmounting the picker would discard
-            // the term the user is still typing and read as "you own nothing by that name".
-            others.length > 0 || pickerEngaged ? (
-              <CredentialPicker
-                credentials={others}
-                onPick={(credentialId, name) => onConnect(credentialId, name)}
-                search={search}
-                onSearchChange={changeSearch}
-                searchFailed={searchFailed}
-                searchPending={searchPending}
-                resultsTruncated={resultsTruncated}
-                onRetrySearch={retrySearch}
-                triggerLabel="Change"
-                triggerClassName="h-6 gap-1 px-2 text-xs font-medium"
-                contentClassName="w-[240px]"
-              />
-            ) : (
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => onConnect(undefined)}
-                className="h-6 flex-none px-2 text-xs font-medium"
-              >
-                Change
-              </Button>
-            )
-          ) : null}
-        </div>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {canChange
-            ? "Auto-selected to sign in on your behalf — Change it if this isn't right."
-            : "Auto-selected to sign in on your behalf."}
-        </p>
-        {canChange && orgCredentials.status === "error" ? (
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <span className="text-xs text-muted-foreground">
-              Couldn&apos;t load your other saved logins.
-            </span>
-            {retryButton}
-          </div>
-        ) : null}
+      <div ref={rootRef}>
+        <AutoBoundReceipt
+          name={autoBound.name}
+          canChange={canChange}
+          change={
+            canChange ? (
+              // An active search stays mounted on zero results: unmounting the picker would discard
+              // the term the user is still typing and read as "you own nothing by that name".
+              others.length > 0 || pickerEngaged ? (
+                <CredentialPicker
+                  credentials={others}
+                  onPick={(credentialId, name) => onConnect(credentialId, name)}
+                  search={search}
+                  onSearchChange={changeSearch}
+                  searchFailed={searchFailed}
+                  searchPending={searchPending}
+                  resultsTruncated={resultsTruncated}
+                  onRetrySearch={retrySearch}
+                  triggerLabel="Change"
+                  contentClassName="w-[240px]"
+                />
+              ) : (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onConnect(undefined)}
+                >
+                  Change
+                </Button>
+              )
+            ) : null
+          }
+          loadError={
+            canChange && orgCredentials.status === "error" ? (
+              <div className="flex flex-wrap items-center gap-2 pl-7">
+                <span className="text-xs text-muted-foreground">
+                  Couldn&apos;t load your other saved logins.
+                </span>
+                {retryButton}
+              </div>
+            ) : null
+          }
+        />
         {/* Mounted for the card's lifetime so only its text changes: a live region that appears
             already holding its text is read as ordinary new content and never announced. It carries
             the search failure too, whose visible text sits in a portaled popover no region reaches. */}
@@ -843,47 +1063,173 @@ function CredentialAskCard({
   }
 
   const site = siteFromLoginPageUrls(frame.login_page_urls);
-  return (
-    <div ref={rootRef}>
-      {frame.message ? (
-        <p className="text-sm leading-relaxed text-foreground">
-          {frame.message}
-        </p>
-      ) : null}
-      <div
-        className={`rounded-lg border border-border bg-slate-elevation2 p-3 ${frame.message ? "mt-2" : ""}`}
-      >
-        <div className="flex items-start gap-2">
-          <span className="flex h-5 w-5 flex-none items-center justify-center rounded-md bg-warning/10 text-warning">
-            <LockClosedIcon className="h-3 w-3" />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="text-xs font-semibold text-foreground">
-              Copilot needs to sign in to {site}
-            </div>
-            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-              {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
-            </p>
-            {mode === "terminal" ? (
-              <p className="mt-1 text-[11px] font-medium leading-relaxed text-foreground">
-                Connect a credential and I&apos;ll continue.
-              </p>
-            ) : null}
-          </div>
-          {countdownActive ? (
-            <PauseCountdown remainingMs={remainingMs} expired={expired} />
-          ) : null}
-          <SkipButton onSkip={onSkip} disabled={disabled} />
-        </div>
-        <div className="ml-7 mt-2.5 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={() => onConnect(undefined)}
-            className="rounded-md bg-cta px-3 py-1 text-xs font-medium text-cta-foreground hover:bg-cta-hover disabled:pointer-events-none disabled:opacity-50"
+  const registration = frame.registration ?? null;
+  const offerGenerate = Boolean(
+    registration && onGenerate && !registration.attempted,
+  );
+  const registrationLines = registration
+    ? [
+        <span key="destination" className="text-[11px] leading-relaxed">
+          Sign-up page: {frame.login_page_urls?.[0] ?? site}
+        </span>,
+        <span key="username" className="text-[11px] leading-relaxed">
+          Username: {registration.username}
+        </span>,
+        <span key="saved-as" className="text-[11px] leading-relaxed">
+          Saved as: {registration.credential_name}
+        </span>,
+        ...(registration.outcome
+          ? [
+              <span key="outcome" className="text-[11px] font-medium">
+                {registration.outcome === "rejected"
+                  ? "Nothing was saved — the credential couldn't be created. Pick or add a login instead."
+                  : registration.outcome === "created_not_connected"
+                    ? `Saved as ${registration.credential_name}, not connected.`
+                    : "The vault didn't confirm the save. Check your credentials before adding another."}
+              </span>,
+            ]
+          : []),
+      ]
+    : [];
+  const connectButton = (
+    <Button
+      type="button"
+      size="sm"
+      variant={
+        (signIn && frame.signing_in) || offerGenerate ? "outline" : "default"
+      }
+      disabled={disabled}
+      onClick={() => onConnect(undefined)}
+      data-tour="credential-connect"
+    >
+      Connect credential
+    </Button>
+  );
+  if (signIn && frame.signing_in) {
+    const notFound = signIn.saveFailed
+      ? "Couldn't save your sign-in. Click Done to try again, or connect a credential."
+      : signIn.notFoundHost
+        ? `No sign-in found for ${signIn.notFoundHost}. Sign in, then click Done again.`
+        : "";
+    return (
+      <AskChrome
+        tray={tray}
+        rootRef={rootRef}
+        message={frame.message}
+        title={`Sign in to ${site} in the browser`}
+        countdown={
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+        }
+        lines={[
+          <span
+            key="how"
+            className="text-[11px] leading-relaxed text-muted-foreground"
           >
-            Connect credential
-          </button>
+            Use the browser to sign in, including any verification code, then
+            click Done. Skyvern saves the sign-in as a browser profile; no
+            password is stored.
+          </span>,
+          ...(notFound
+            ? [
+                <span key="not-found" className="text-[11px] font-medium">
+                  {notFound}
+                </span>,
+              ]
+            : []),
+        ]}
+        footer={
+          <>
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onDone}
+            >
+              {signIn.busy ? "Saving sign-in…" : "Done"}
+            </Button>
+            {connectButton}
+            <div className="ml-auto">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => onSkip()}
+                disabled={disabled || signIn.busy}
+              >
+                Cancel
+              </Button>
+            </div>
+          </>
+        }
+        announcer={
+          <span
+            className="sr-only"
+            role={insideLiveRegion ? undefined : "status"}
+          >
+            {insideLiveRegion ? "" : notFound}
+          </span>
+        }
+      />
+    );
+  }
+  return (
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      message={frame.message}
+      title={
+        registration
+          ? `Create a login for ${site}`
+          : `Copilot needs to sign in to ${site}`
+      }
+      countdown={
+        countdownActive ? (
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+        ) : null
+      }
+      lines={[
+        <span
+          key="why"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
+        </span>,
+        ...registrationLines,
+        ...(mode === "terminal"
+          ? [
+              <span
+                key="continue"
+                className="text-[11px] font-medium leading-relaxed"
+              >
+                Connect a credential and I&apos;ll continue.
+              </span>,
+            ]
+          : []),
+      ]}
+      footer={
+        <>
+          {offerGenerate ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={() => onGenerate?.()}
+            >
+              Generate and save
+            </Button>
+          ) : null}
+          {connectButton}
+          {signIn ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onStart}
+            >
+              Sign in myself
+            </Button>
+          ) : null}
           {orgCredentials.status === "ready" &&
           (pickable.length > 0 || pickerEngaged) ? (
             <CredentialPicker
@@ -912,26 +1258,70 @@ function CredentialAskCard({
               {retryButton}
             </>
           ) : null}
-          {/* Mounted for the card's lifetime so only its text changes: a live region that appears
-              already holding its text is read as ordinary new content and never announced. Inside
-              an outer live region it takes no role and repeats nothing that region already
-              contains, only the search failure, whose visible text sits in a portaled popover. */}
-          <span
-            className="sr-only"
-            role={insideLiveRegion ? undefined : "status"}
-          >
-            {searchFailed
-              ? SEARCH_FAILED_ANNOUNCEMENT
-              : insideLiveRegion
-                ? ""
-                : orgCredentials.status === "loading"
-                  ? "Loading saved logins…"
-                  : orgCredentials.status === "error"
-                    ? "Couldn't load your saved logins."
-                    : ""}
-          </span>
-        </div>
-      </div>
-    </div>
+          <div className="ml-auto">
+            <SkipButton onSkip={onSkip} disabled={disabled} />
+          </div>
+        </>
+      }
+      announcer={
+        // Mounted for the card's lifetime so only its text changes: a live region that appears
+        // already holding its text is read as ordinary new content and never announced. Inside an
+        // outer live region it takes no role and repeats nothing that region already contains,
+        // only the search failure, whose visible text sits in a portaled popover.
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {searchFailed
+            ? SEARCH_FAILED_ANNOUNCEMENT
+            : insideLiveRegion
+              ? ""
+              : orgCredentials.status === "loading"
+                ? "Loading saved logins…"
+                : orgCredentials.status === "error"
+                  ? "Couldn't load your saved logins."
+                  : ""}
+        </span>
+      }
+    />
+  );
+}
+
+function AutoBoundReceipt({
+  name,
+  canChange,
+  change,
+  loadError,
+}: {
+  name: string;
+  canChange: boolean;
+  change: ReactNode;
+  loadError: ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <CopilotCard>
+      <CardHeader
+        icon={<AppliedCheck />}
+        title={<span title={name}>Using credential &apos;{name}&apos;</span>}
+        actions={change}
+        expanded={expanded}
+        onToggle={() => setExpanded((value) => !value)}
+      />
+      {expanded || loadError ? (
+        <CardBody>
+          {expanded ? (
+            <GutterRow>
+              <span className="text-[11px] leading-relaxed text-muted-foreground">
+                {canChange
+                  ? "Auto-selected to sign in on your behalf — Change it if this isn't right."
+                  : "Auto-selected to sign in on your behalf."}
+              </span>
+            </GutterRow>
+          ) : null}
+          {loadError}
+        </CardBody>
+      ) : null}
+    </CopilotCard>
   );
 }

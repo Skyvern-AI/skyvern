@@ -49,6 +49,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
+from skyvern.services.webhook_delivery import log_workflow_webhook_delivery_finalized
 from skyvern.utils.url_validators import validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
@@ -295,6 +296,14 @@ async def replay_run_webhook(
         and 200 <= status_code < 300
         and error is None
     ):
+        log_workflow_webhook_delivery_finalized(
+            workflow_run_id=run_id,
+            delivery_outcome=WebhookDeliveryStatus.delivered,
+            status_code=status_code,
+            attempts=1,
+            finished_at=workflow_run.finished_at,
+            replay=True,
+        )
         try:
             await app.DATABASE.workflow_runs.update_workflow_webhook_delivery(
                 workflow_run_id=run_id,
@@ -497,6 +506,7 @@ async def _build_workflow_payload(
         finished_at=status_response.finished_at,
         errors=status_response.errors,
         browser_seed_source=status_response.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
     )
 
     payload_dict = json.loads(
@@ -561,9 +571,13 @@ async def _deliver_webhook(
     except httpx.TimeoutException:
         error = "Request timed out after 60 seconds."
         LOG.warning("Webhook replay timed out", url=url)
-    except httpx.NetworkError as exc:
+    except (httpx.NetworkError, httpx.ProxyError) as exc:
         error = f"Could not reach URL: {exc}"
         LOG.warning("Webhook replay network error", url=url, error=str(exc))
+    except BlockedHost:
+        # The host passed validation, then resolved to a blocked address at delivery (DNS rebinding or proxy refusal).
+        error = "The target host was refused by SSRF protection."
+        LOG.warning("Webhook replay target refused", url=url)
     except Exception as exc:  # pragma: no cover - defensive guard
         error = f"Unexpected error: {exc}"
         LOG.error("Webhook replay unexpected error", url=url, error=str(exc), exc_info=True)

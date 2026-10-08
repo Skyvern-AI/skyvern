@@ -53,6 +53,7 @@ function SplitPdfEditorBody({
           <HelpTooltip content={helpTooltips["split_pdf"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
+          name="fileUrl"
           nodeId={blockId}
           value={data.fileUrl}
           onChange={(next) => update({ fileUrl: next })}
@@ -66,6 +67,7 @@ function SplitPdfEditorBody({
           <HelpTooltip content={helpTooltips["split_pdf"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="prompt"
           nodeId={blockId}
           value={data.prompt}
           onChange={(next) => update({ prompt: next })}
@@ -113,6 +115,7 @@ function SplitPdfEditorBody({
                   <HelpTooltip content={helpTooltips["split_pdf"]["llmKey"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="llmKey"
                   nodeId={blockId}
                   value={data.llmKey}
                   onChange={(next) => update({ llmKey: next })}

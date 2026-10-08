@@ -7,7 +7,7 @@ import pytest
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_direct_copilot_model_usage,
+    _emit_direct_copilot_model_usage,
     is_workflow_copilot_prompt_name,
     normalize_gen_ai_provider,
 )
@@ -57,7 +57,7 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
         prompt_name="workflow-copilot-narration",
     )
 
-    assert emit_direct_copilot_model_usage(event, logger=logger)
+    assert _emit_direct_copilot_model_usage(event, logger=logger)
 
     assert logger.events == [
         (
@@ -90,7 +90,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         prompt_name="workflow-copilot-raw-secret-safety",
     )
 
-    emit_direct_copilot_model_usage(event, logger=logger)
+    _emit_direct_copilot_model_usage(event, logger=logger)
 
     fields = logger.events[0][1]
     assert set(fields) == {
@@ -119,6 +119,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "cache_mode",
         "cache_breakpoint_count",
         "cache_stable_prefix_chars",
+        "ref_tool_outputs_escaped",
     }
     assert normalize_gen_ai_provider(event.provider_name, event.response_model) == "gcp.vertex_ai"
 
@@ -157,7 +158,7 @@ def test_unrelated_direct_event_does_not_log() -> None:
         prompt_name="extract-actions",
     )
 
-    assert not emit_direct_copilot_model_usage(event, logger=logger)
+    assert not _emit_direct_copilot_model_usage(event, logger=logger)
     assert logger.events == []
 
 

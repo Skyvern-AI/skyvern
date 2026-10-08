@@ -37,6 +37,8 @@ const CAPTURE_DEBOUNCE_MS = 300;
 type UseWorkflowHistoryParams = {
   nodes: AppNode[];
   edges: Edge[];
+  organizationId: string;
+  workflowPermanentId: string;
   // Match React Flow's useNodesState / useEdgesState signatures so
   // callers can pass the setter dispatcher straight through (and use
   // the updater-function form elsewhere if they want).
@@ -84,6 +86,8 @@ type UseWorkflowHistoryResult = {
 export function useWorkflowHistory({
   nodes,
   edges,
+  organizationId,
+  workflowPermanentId,
   setNodes,
   setEdges,
 }: UseWorkflowHistoryParams): UseWorkflowHistoryResult {
@@ -407,13 +411,22 @@ export function useWorkflowHistory({
       nodesBeforeUndo - result.applied.nodes.length,
     );
     posthog.capture("builder.undo_redo.used", {
+      org_id: organizationId,
+      workflow_permanent_id: workflowPermanentId,
       action: "undo",
       node_count: result.applied.nodes.length,
       edge_count: result.applied.edges.length,
       history_depth: result.state.past.length,
       cap_reached: result.state.past.length >= MAX_HISTORY_ENTRIES,
     });
-  }, [applySnapshot, flushPendingCapture, refreshFlags, posthog]);
+  }, [
+    applySnapshot,
+    flushPendingCapture,
+    refreshFlags,
+    posthog,
+    organizationId,
+    workflowPermanentId,
+  ]);
 
   const redo = useCallback(() => {
     if (useWorkflowHasChangesStore.getState().internalUpdateCount > 0) return;
@@ -426,13 +439,22 @@ export function useWorkflowHistory({
     applySnapshot(result.applied.nodes, result.applied.edges);
     refreshFlags();
     posthog.capture("builder.undo_redo.used", {
+      org_id: organizationId,
+      workflow_permanent_id: workflowPermanentId,
       action: "redo",
       node_count: result.applied.nodes.length,
       edge_count: result.applied.edges.length,
       history_depth: result.state.past.length,
       cap_reached: result.state.past.length >= MAX_HISTORY_ENTRIES,
     });
-  }, [applySnapshot, flushPendingCapture, refreshFlags, posthog]);
+  }, [
+    applySnapshot,
+    flushPendingCapture,
+    refreshFlags,
+    posthog,
+    organizationId,
+    workflowPermanentId,
+  ]);
 
   return useMemo(
     () => ({

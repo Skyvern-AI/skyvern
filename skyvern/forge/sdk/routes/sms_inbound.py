@@ -3,11 +3,13 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request, Response, status
+from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.organizations import TwilioCredential
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.twilio_service import build_inbound_sms_url, validate_twilio_signature
 from skyvern.services.otp_service import parse_otp_login, redact_otp_identifier_for_log
@@ -55,7 +57,11 @@ async def receive_inbound_sms(
     token: Annotated[str | None, Query()] = None,
     twilio_signature: Annotated[str | None, Header(alias="X-Twilio-Signature")] = None,
 ) -> Response:
-    config_with_secret = await app.DATABASE.sms.get_sms_config_with_secret_for_inbound(sms_config_id=sms_config_id)
+    try:
+        config_with_secret = await app.DATABASE.sms.get_sms_config_with_secret_for_inbound(sms_config_id=sms_config_id)
+    except ValidationError:
+        LOG.error("Rejecting invalid persisted SMS configuration", sms_config_id=sms_config_id)
+        raise HTTPException(status_code=403, detail="Invalid SMS configuration") from None
     if config_with_secret is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SMS configuration not found")
 
@@ -63,26 +69,36 @@ async def receive_inbound_sms(
     if not hmac.compare_digest(token or "", webhook_secret):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid webhook token")
 
-    if sms_config.mode == "managed":
-        LOG.warning(
-            "Rejecting managed inbound SMS until managed signing credentials are persisted",
-            organization_id=sms_config.organization_id,
-            sms_config_id=sms_config.sms_config_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Managed SMS signing token is unavailable",
-        )
-
     form = await request.form()
     form_params = {key: value if isinstance(value, str) else str(value) for key, value in form.items()}
 
-    if sms_config.mode == "connected":
+    auth_token: str | None = None
+    if sms_config.mode == "managed":
+        try:
+            auth_token = await app.DATABASE.sms.get_sms_config_signing_token(sms_config_id)
+        except Exception as exc:
+            LOG.warning(
+                "Rejecting managed inbound SMS without a decryptable signing token",
+                organization_id=sms_config.organization_id,
+                sms_config_id=sms_config.sms_config_id,
+                exception_type=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Managed SMS signing token is unavailable",
+            ) from exc
+        if not auth_token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Managed SMS signing token is unavailable",
+            )
+    elif sms_config.mode == "connected":
         twilio_token = await app.DATABASE.organizations.get_valid_org_auth_token(
             sms_config.organization_id,
             OrganizationAuthTokenType.twilio_credential.value,
         )
-        auth_token = twilio_token.credential.auth_token if twilio_token is not None else None
+        if twilio_token is not None and isinstance(twilio_token.credential, TwilioCredential):
+            auth_token = twilio_token.credential.auth_token
         if not auth_token:
             LOG.warning(
                 "Rejecting inbound SMS because the connected Twilio auth token is unavailable",
@@ -94,6 +110,14 @@ async def receive_inbound_sms(
                 detail="Connected SMS signing token is unavailable",
             )
 
+    elif sms_config.mode == "manual":
+        # Manual forwarding trusts only the per-config webhook token checked above.
+        pass
+    else:
+        LOG.error("Rejecting unknown SMS mode", sms_config_id=sms_config_id)
+        raise HTTPException(status_code=403, detail="Invalid SMS configuration mode")
+
+    if auth_token:
         base_url = settings.SKYVERN_BASE_URL.strip()
         if not base_url:
             LOG.error(
@@ -115,11 +139,10 @@ async def receive_inbound_sms(
     redacted_identifier = redact_otp_identifier_for_log(to_identifier)
     phone_number = await app.DATABASE.sms.get_phone_number_by_number(
         to_identifier,
-        sms_config.organization_id,
+        organization_id=sms_config.organization_id,
     )
     if (
         phone_number is None
-        or phone_number.organization_id != sms_config.organization_id
         or phone_number.sms_config_id != sms_config.sms_config_id
         or phone_number.status not in {"active", "releasing"}
     ):

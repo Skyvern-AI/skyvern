@@ -588,7 +588,6 @@ label: <unique_label>
 navigation_goal: <download_instruction>        # Required: How to trigger the download
 url: <starting_url>                            # Optional: URL to navigate to first
 title: str                                     # Optional: Title for the block
-engine: skyvern-1.0                            # Optional: Run engine
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
 max_steps_per_run: null                        # Optional: Limit steps per execution
@@ -740,7 +739,7 @@ Purpose: Pause the workflow and wait for a person. This is the "Human Interactio
 
 Use Cases:
 - A person approves before the workflow continues (high-value action, compliance review, a check of extracted data)
-- A person does a step by hand in the browser that has no automated path: solving a CAPTCHA, biometric or voice verification, or a sign-in that credentialed login cannot complete
+- A person does a step by hand in the browser that has no automated path: a CAPTCHA the solver and the image-text form of `solve_captcha` cannot clear, biometric or voice verification, or a sign-in that credentialed login cannot complete
 - Escalation for a case the agent is not allowed to decide on its own
 
 Structure:
@@ -771,13 +770,16 @@ blocks:
 
 ** CAPTCHA SOLVER (captcha_solver) **
 
-Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), a DataDome or Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
+Purpose: The managed captcha solver is a product capability, enabled by default for cloud organizations; it can be turned off per browser session under "Captcha Solver", and an organization-level kill switch exists on the platform side. It clears Cloudflare Turnstile and hCaptcha challenges through the solver extension and mints reCAPTCHA v2/v3 tokens, and it hands a DataDome or PerimeterX challenge page to that vendor's handler, reporting it solved only when a fresh look shows the page cleared. It cannot clear a widget the page never renders, an IP-reputation block ("unusual traffic", "access denied"), an Akamai deny page, or an account security prompt ("verify it's you", authenticator codes).
 
 How a run reaches it:
 - Task-shaped blocks (navigation, login, action) invoke the solver automatically when a challenge is detected.
-- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A failed solve raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+- A code block invokes it only when its code calls the builtin `await solve_captcha(page)`; nothing runs the solver for a code block otherwise. A challenge that stays unsolved, or that the solver has no route for, raises inside the code block and the run's action trace records a `solve_captcha` action with status `failed`.
+- A distorted-text image CAPTCHA (characters drawn in an image, typed into a field) is read by the image form, `await solve_captcha(page, image=<selector>, input=<selector>)`. In Workflow Copilot, while scouting, `solve_page_challenge` with `image` and `input` runs the same OCR, so the selectors are proven on the live page before they are saved. `image` selects the observed <img>, <svg> or <canvas> holding the text and `input` the observed answer field; both come from the inspected page. It reads the text and types it, and does not submit. It requires image OCR enabled for the organization; otherwise it raises. It raises with nothing typed when the image yields no text, and the runtime enforces a per-block call limit, raising on every call past it. So the block runs a short bounded loop: solve; if the call raised, click the observed refresh control and retry; otherwise submit, and if the form is still shown, click the refresh control and retry. With no refresh control, raise instead of retrying; raise after the last try. An answer typed while scouting fits only that one image and never belongs in the saved code.
 
-Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+Reading the run: the build-test packet's `challenge` record says whether the solver is available for this organization (`solver_available`), whether this run invoked it (`solver_attempted`, absent when unknown), and what happened (`solver_result`: failed, attempted, not_attempted, or unresolved). "not_attempted" on a code block means the code never called the builtin, not that the product declined. "attempted" means the solve step ran and returned without an error, which is not the same as the challenge clearing: when no solver handles the page the call still reports success. "unresolved" means the run's action history was unavailable or cut short, so whether the solver ran is unknown and should not be stated either way. `solver_available` is resolved per page, and is absent when it was only resolved for a different URL.
+
+A run that did not pass and met no wall can still carry a `challenge` record with the solver keys and no levers: it reports the last `solve_captcha` call in a code block, not that a challenge blocked the run. "attempted" there means that call returned without an error, for either form: the image form typed an answer and the widget fallback also returns success, so neither says the site accepted anything. Whether the form moved on is read from the final page and the block status.
 
 ** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **
 

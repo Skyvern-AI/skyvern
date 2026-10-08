@@ -75,9 +75,11 @@ Use skyvern_block_schema() to see full schemas and examples for any block type.
 
 ### Engine selection for workflow blocks
 
-Task-based blocks (navigation, extraction, action, login, file_download) default to engine 1.0 (`skyvern-1.0`).
-Omit the `engine` field unless you need 2.0.  Non-task blocks (for_loop, conditional, code, wait, etc.)
-do not have an engine field — do not set one.
+Task-based blocks (navigation, extraction, action, login, file_download) run on the default engine
+when `engine` is omitted; which engine that is depends on when the workflow was created.
+Omit the `engine` field unless you need 2.0 or the user asks for a specific engine.
+If the user asks for 1.0, set `engine: skyvern-1.0` explicitly (likewise `engine: skyvern-2.0` for 2.0).
+Non-task blocks (for_loop, conditional, code, wait, etc.) do not have an engine field — do not set one.
 
 Use engine 2.0 (`"engine": "skyvern-2.0"`) on a **navigation** block when:
 - The block's goal requires dynamic planning — discovering what to do at runtime, conditional
@@ -85,12 +87,12 @@ Use engine 2.0 (`"engine": "skyvern-2.0"`) on a **navigation** block when:
 - Example: "Navigate through a multi-step insurance quote wizard, handling dynamic questions
   based on previous answers, then extract the final quote."
 
-Keep engine 1.0 (default, omit field) when:
+Keep the default engine (omit the field) when:
 - The path is known upfront — all fields, values, and actions are specified in the prompt.
-- A long prompt with many form fields is still 1.0.  Complexity means dynamic planning, not field count.
+- A long prompt with many form fields still omits it.  Complexity means dynamic planning, not field count.
 - Example: "Fill in SSN, first name, last name, select 'Sole Proprietor', click Continue."
 
-When in doubt, split into multiple 1.0 blocks rather than using one 2.0 block — it's cheaper and
+When in doubt, split into multiple default-engine blocks rather than using one 2.0 block — it's cheaper and
 gives you per-block observability.  Only navigation blocks support engine 2.0.
 
 ### Model selection for text_prompt blocks
@@ -666,6 +668,26 @@ skyvern_navigate(url="http://localhost:<port>/<route>")
 
 Health gate:
 
+In extension mode, use this health gate. Do not call `skyvern_evaluate`. Before each `skyvern_navigate` to a route under test, call `skyvern_get_errors(clear=True)`, `skyvern_console_messages(clear=True)`, `skyvern_handle_dialog(clear=True)`, and `skyvern_network_requests(clear=True)`; discard what they return.
+
+```text
+skyvern_tab_list()
+skyvern_get_errors()
+skyvern_console_messages(level="error")
+skyvern_get_html(selector="body")
+skyvern_find(by="role", value="alert")
+skyvern_find(by="role", value="dialog")
+skyvern_handle_dialog()
+```
+
+PASS requires the active tab URL to match the expected route, with no unexpected login redirect.
+The body must contain the expected page content, not only scripts or an empty app container.
+Require no unexpected error text, visible alerts, visible dialogs, JavaScript errors, console errors, or JavaScript dialog events.
+`skyvern_handle_dialog` reads dialog history; JavaScript dialogs are auto-dismissed by default.
+If a call fails or evidence is incomplete, record FAIL and stop this test. Do not treat missing evidence as PASS.
+
+Outside extension mode, use this health gate:
+
 ```text
 skyvern_evaluate(expression="(() => {
   const errors = [];
@@ -682,7 +704,15 @@ skyvern_evaluate(expression="(() => {
 })()")
 ```
 
-Prefer deterministic DOM assertions:
+In extension mode, use `skyvern_find`, `skyvern_get_html`, `skyvern_get_value`, or `skyvern_tab_list` for assertions.
+
+```text
+skyvern_find(by="role", value="button")
+skyvern_get_html(selector="h1")
+skyvern_tab_list()
+```
+
+Outside extension mode, prefer deterministic DOM assertions:
 
 ```text
 skyvern_evaluate(expression="!!document.querySelector('button')")
@@ -698,7 +728,9 @@ skyvern_validate(prompt="The page shows the success toast and the form is no lon
 skyvern_screenshot()
 ```
 
-Also check for failed network requests once per page:
+In extension mode, call `skyvern_network_requests()` and inspect captured requests for failures or HTTP status codes of 400 or greater.
+If capture is unavailable or incomplete, report the network check as unverified.
+Outside extension mode, check for failed network requests once per page:
 
 ```text
 skyvern_evaluate(expression="(() => {
@@ -890,13 +922,16 @@ other reviewers.
 
 | What you need | Tool | Speed |
 |---------------|------|-------|
-| Check element exists, text, count, URL | `skyvern_evaluate` | ~10ms |
+| Check element exists, text, count, URL outside extension mode | `skyvern_evaluate` | ~10ms |
 | Click, type, fill forms, multi-step interaction | `skyvern_act` | 5-30s |
 | Visual check | `skyvern_validate` | 15-50s |
 | Screenshot | `skyvern_screenshot` | ~1s |
 | Wait for async content | `skyvern_wait` | varies |
 
-Default to `skyvern_evaluate` for frontend/browser assertions. For backend API validation, prefer simple
+Outside extension mode only:
+Default to `skyvern_evaluate` for frontend/browser assertions.
+In extension mode, use `skyvern_find`, `skyvern_get_html`, `skyvern_get_value`, or `skyvern_tab_list` for assertions.
+For backend API validation, prefer simple
 HTTP requests and deterministic response checks over browser-based inference.
 
 ---
@@ -1037,7 +1072,8 @@ If the backend contract is broken, frontend results are not trustworthy.
 ## Step 3A: Frontend/Browser QA
 
 - Use browser automation against the provided URL
-- Prefer deterministic assertions with `skyvern_evaluate`
+- Outside extension mode, prefer deterministic assertions with `skyvern_evaluate`
+- In extension mode, use `skyvern_find`, `skyvern_get_html`, `skyvern_get_value`, or `skyvern_tab_list` for assertions
 - Use `skyvern_act` only when a real interaction is required
 - Capture a screenshot when visual evidence matters
 

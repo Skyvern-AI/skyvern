@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
+from structlog.testing import capture_logs
 
 import skyvern.browser_extension.relay as relay_module
 from skyvern.browser_extension.auth import compute_ext_proof, compute_server_proof
@@ -808,6 +809,29 @@ async def test_scope_events_add_create_and_remove_scoped_tabs(relay_harness: Rel
 
         await asyncio.wait_for(all_events_received(), 1)
         assert relay_harness.server.scoped_tabs == [{"tabId": 22, "url": "https://example.com/two", "title": ""}]
+
+
+@pytest.mark.asyncio
+async def test_raising_event_callback_is_logged_once_and_reader_keeps_reading(relay_harness: RelayHarness) -> None:
+    async def failing_on_event(event: str, params: dict) -> None:
+        await relay_harness.on_event(event, params)
+        if event == "scope.tabAdded":
+            raise RuntimeError("callback boom")
+
+    async with ClientSession() as session:
+        websocket = await authenticate(session, relay_harness)
+        relay_harness.server._on_event = failing_on_event
+        with capture_logs() as logs:
+            await websocket.send_json(
+                {"v": 1, "type": "event", "event": "scope.tabAdded", "params": {"tabId": 21, "url": "about:blank"}}
+            )
+            await websocket.send_json({"v": 1, "type": "ping"})
+            assert await asyncio.wait_for(websocket.receive_json(), 1) == {"v": 1, "type": "pong"}
+
+    failures = [log for log in logs if log["event"] == "browser extension event callback failed"]
+    assert len(failures) == 1
+    assert failures[0]["event_name"] == "scope.tabAdded"
+    assert failures[0]["log_level"] == "error"
 
 
 @pytest.mark.asyncio

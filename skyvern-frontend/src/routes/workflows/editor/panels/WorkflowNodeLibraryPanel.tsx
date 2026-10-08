@@ -251,6 +251,17 @@ const nodeLibraryItems: Array<{
     description: "Wait for a specified amount of time",
   },
   {
+    nodeType: "terminate",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Terminate}
+        className="size-6"
+      />
+    ),
+    title: "Terminate Block",
+    description: "End the run as terminated with a reason",
+  },
+  {
     nodeType: "web_search",
     icon: (
       <WorkflowBlockIcon

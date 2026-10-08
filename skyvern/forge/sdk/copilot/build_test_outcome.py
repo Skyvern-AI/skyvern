@@ -7,7 +7,7 @@ import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
-from typing import Any, Literal, Protocol, TypeVar, get_args
+from typing import Any, Literal, Protocol, TypedDict, TypeVar, get_args
 from urllib.parse import urlsplit
 
 import structlog
@@ -46,6 +46,8 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
 
 LOG = structlog.get_logger()
 
@@ -112,6 +114,8 @@ TerminalCause = Literal[
     "cdp_connect_failed",
     "occupied",
     "billing_credit_admission_refusal",
+    "saved_profile_unresolved",
+    "saved_profile_not_applied",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -201,6 +205,43 @@ class BuildTestPacketRunBrowser(BaseModel):
     note: str
 
 
+LoopSelectedInput = Literal["loop_variable_reference", "loop_over_parameter_key", "none"]
+
+
+class LoopInputFact(BaseModel):
+    """One for_loop's declared input in the executed definition, and the loop_values its run rows recorded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str
+    enclosing_loop_label: str | None = None
+    loop_over_parameter_key: str | None = None
+    producer_block_label: str | None = None
+    producer_output_parameter_id: str | None = None
+    loop_variable_reference: str | None = None
+    selected_input: LoopSelectedInput
+    run_rows: int | None = None
+    loop_values_counts: list[int | Literal["not_recorded"]] | None = None
+    loop_values_counts_omitted: int | None = None
+
+
+class LoopInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str | None = None
+    workflow_id: str
+    workflow_permanent_id: str
+    version: int
+    loops: list[LoopInputFact]
+    loops_omitted: int | None = None
+
+
+class LoopInputsUnavailable(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    executed_definition: Literal["unavailable"] = "unavailable"
+
+
 class BuildTestPacketRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -210,6 +251,7 @@ class BuildTestPacketRun(BaseModel):
     browser: BuildTestPacketRunBrowser | None = None
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
+    loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -326,6 +368,19 @@ class BuildTestPacketFailure(BaseModel):
     locator_observations: list[BuildTestPacketLocatorObservation] = Field(default_factory=list)
 
 
+class BuildTestPacketAiFallbackBlock(BaseModel):
+    """A block whose code failed and that the AI fallback then handled; ``failure_text`` is the code's own error."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str | None = None
+    status: str
+    task_id: str | None = None
+    failing_line: int | None = None
+    failure_text: str | None = None
+    recovery_failure_text: str | None = None
+
+
 class BuildTestPacketRegisteredOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -362,6 +417,8 @@ class BuildTestPacketDownload(BaseModel):
 
     artifact_id: str
     file_name: str | None = None
+    # Rendered by the run's own code, so it is not evidence that a site delivered a file.
+    generated: Literal[True] | None = None
 
 
 class BuildTestPacketScreenshot(BaseModel):
@@ -381,9 +438,61 @@ class BuildTestPacketUnfinishedItem(BaseModel):
 
 
 SOLVER_ATTEMPT_KEY = "solver_attempt"
+ACTION_TRACE_PER_TASK_LIMIT = 15
 
 SolverResult = Literal["failed", "not_solved", "attempted", "not_attempted", "unresolved"]
 SOLVER_RESULTS: frozenset[str] = frozenset(get_args(SolverResult))
+
+
+class SolverReceipt(BaseModel):
+    """The shared solver's own typed receipt for one ``solve_captcha`` call; ``vendor`` is never page text."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    status: ChallengeStatus
+    vendor: str | None = None
+    arm: ChallengeArm | None = None
+    page_state: ChallengePageState = "not_rechecked"
+
+
+def solver_receipt(value: object) -> SolverReceipt | None:
+    try:
+        return SolverReceipt.model_validate(value)
+    except ValidationError:
+        return None
+
+
+_UNFINISHED_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed.value, BlockStatus.terminated.value, BlockStatus.timed_out.value, BlockStatus.canceled.value}
+)
+
+
+def governing_solver_receipt(block_rows: Sequence[Mapping[str, object]]) -> SolverReceipt | None:
+    """The newest ``solve_captcha`` receipt in the last block that did not finish, so a completed finally block
+    after it never hides it; blocks are chronological and each trace is newest-first."""
+    stopped = next(
+        (row for row in reversed(block_rows) if str(row.get("status") or "").lower() in _UNFINISHED_BLOCK_STATUSES),
+        None,
+    )
+    trace = stopped.get("action_trace") if stopped is not None else None
+    if not isinstance(trace, list):
+        return None
+    solver_row = next(
+        (entry for entry in trace if isinstance(entry, Mapping) and entry.get("action") == ActionType.SOLVE_CAPTCHA),
+        None,
+    )
+    return solver_receipt(solver_row.get("challenge")) if solver_row is not None else None
+
+
+class SolverFacts(TypedDict):
+    attempted: bool
+    result: SolverResult
+    failure: str | None
+
+
+class SolverAttempt(SolverFacts, total=False):
+    code_block: SolverFacts
+    receipt: dict[str, str | None]
 
 
 class ChallengeEffects(BaseModel):
@@ -394,11 +503,12 @@ class ChallengeEffects(BaseModel):
     kind: str | None = None
     # ``page_frames`` means only a vendor frame the page mounted or declared built this record; it is
     # the default because the dump excludes the field, so a revalidated record cannot mint a wall.
-    basis: Literal["run_wall", "page_frames"] = Field(default="page_frames", exclude=True, repr=False)
+    basis: Literal["run_wall", "page_frames", "solver_call"] = Field(default="page_frames", exclude=True, repr=False)
     solver_available: bool | None = None
     solver_attempted: bool | None = None
     solver_result: SolverResult | None = None
     solver_failure: str | None = None
+    solver_receipt: SolverReceipt | None = None
     frame_hosts: list[str] | None = Field(default=None, max_length=MAX_CHALLENGE_FRAME_HOSTS)
 
 
@@ -410,6 +520,20 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
         notices.append(
             "challenge frames: the final page mounted or declared a frame served by a challenge vendor; that is "
             f"what the page holds, not a finding that this run was blocked. Frame hosts: {hosts}."
+        )
+    elif challenge is not None and challenge.basis == "solver_call":
+        if challenge.solver_result == "failed":
+            outcome = "raised (see `solver_failure`)"
+        elif challenge.solver_result == "not_solved":
+            outcome = "returned `false`, the solver's own report that it did nothing"
+        else:
+            outcome = "returned without error, which for either form only means it ran"
+        frames = ""
+        if challenge.frame_hosts:
+            frames = f" Vendor frames on the final page: {', '.join(challenge.frame_hosts)}."
+        notices.append(
+            f"solver call: the last `solve_captcha` call in this run's code {outcome}; a call is an attempt, not "
+            f"page advancement, so the final page and block status say whether the form moved on.{frames}"
         )
     elif challenge is not None:
         kind = challenge.kind or "unclassified"
@@ -424,27 +548,34 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
             availability = "the managed captcha solver's availability was not resolved"
         if challenge.solver_result == "attempted":
             outcome = (
-                "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
+                "this run called `solve_captcha` and the call returned without an error, which does not by "
                 "itself mean the challenge cleared: the no-solver fallback also returns success"
             )
         elif challenge.solver_result == "not_solved":
             outcome = (
-                "this run called `solve_captcha(page)` and the call returned `false`, the solver's own report that "
+                "this run called `solve_captcha` and the call returned `false`, the solver's own report that "
                 "it cleared nothing; separately, a challenge was recorded for this run, and the call may have run "
                 "before that challenge appeared"
             )
         elif challenge.solver_result == "failed":
-            outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
+            outcome = "this run called `solve_captcha` and the solver did not clear it"
             if challenge.solver_failure:
                 outcome += f" ({challenge.solver_failure})"
         elif challenge.solver_result == "not_attempted":
             outcome = (
-                "no `solve_captcha(page)` call appears in this run's recorded actions; a code block reaches the "
+                "no `solve_captcha` call appears in this run's recorded actions; a code block reaches the "
                 "solver only when its code calls that builtin"
             )
         else:
-            outcome = "whether this run called `solve_captcha(page)` is unresolved, so do not state either way"
+            outcome = "whether this run called `solve_captcha` is unresolved, so do not state either way"
         notices.append(f"challenge: {kind}; {availability}; {outcome}.")
+    receipt = challenge.solver_receipt if challenge is not None else None
+    if receipt is not None:
+        notices.append(
+            f"solver receipt: the newest `solve_captcha` call reported status `{receipt.status.value}`, vendor "
+            f"`{receipt.vendor or 'not identified'}`, arm `{receipt.arm or 'none'}`, and page state "
+            f"`{receipt.page_state}` after its last arm."
+        )
     if levers:
         names = ", ".join(lever.mechanism for lever in levers)
         notices.append(
@@ -626,6 +757,7 @@ class BuildTestEvidencePacket(BaseModel):
     challenge: ChallengeEffects | None = None
     levers: list[Lever] = Field(default_factory=list)
     challenge_notices: list[str] = Field(default_factory=list)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
 
 class CodeSafetyRejectionFact(BaseModel):
@@ -704,6 +836,7 @@ class RecordedBuildTestOutcome(BaseModel):
     display_text: str = ""
     observed_page_value_excerpt: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
     @property
     def structural_key_payload(self) -> dict[str, object] | None:
@@ -757,7 +890,7 @@ def _recorded_outcome_degrade_eligible(
 
 
 class _RecordedBuildTestOutcomeContext(Protocol):
-    workflow_yaml: str
+    workflow_yaml: str | None
     persisted_workflow_yaml: str | None
     staged_workflow_yaml: str | None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
@@ -914,7 +1047,7 @@ def _attempted_block_code_hash(ctx: _RecordedBuildTestOutcomeContext, outcome: R
     return authored_block_code_hashes_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
 
 
-def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str:
+def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str | None:
     return ctx.staged_workflow_yaml or ctx.workflow_yaml
 
 

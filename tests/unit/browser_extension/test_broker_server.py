@@ -5052,3 +5052,36 @@ async def _tab_queue_setup(
     assert client_id is not None
     await server._grant_lease(7, client_id, origin="shared")
     return server, relay, client, server_task, server._clients[client_id]
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_obeys_tab_ownership_and_requires_shared_scope() -> None:
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    first_task = await _connect_over_socketpair(server, first)
+    second_task = await _connect_over_socketpair(server, second)
+    try:
+        relay.scoped_tabs = [{"tabId": 7, "url": "https://example.test/form"}]
+        args = {"tabId": 7, "selector": "#email", "text": "example"}
+        result = await first.request("dom.fill", args)
+        assert result["op"] == "dom.fill"
+        assert relay.requests == [("dom.fill", args)]
+
+        for client, fields, code in [
+            (second, args, "LEASE_HELD"),
+            (first, {**args, "tabId": 99}, "LEASE_REQUIRED"),
+            (first, {"selector": "#email", "text": "example"}, "LEASE_REQUIRED"),
+        ]:
+            with pytest.raises(BrowserExtensionBrokerError) as error:
+                await client.request("dom.fill", fields)
+            assert error.value.code == code
+        assert relay.requests == [("dom.fill", args)]
+    finally:
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_task, 1.0)
+        await asyncio.wait_for(first_task, 1.0)
+        await server.stop()

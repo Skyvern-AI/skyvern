@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 
 type StudioShellContextValue = {
+  organizationId?: string | null;
   // Left-column target Workspace portals the docked Copilot into; null when
   // collapsed or when Workspace isn't embedded in the studio shell.
   copilotPortalEl: HTMLElement | null;
@@ -20,6 +21,7 @@ type StudioShellContextValue = {
 };
 
 export const StudioShellContext = createContext<StudioShellContextValue>({
+  organizationId: null,
   copilotPortalEl: null,
   panelPortalEl: null,
   setEditorStreamSlot: () => {},

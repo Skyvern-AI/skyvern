@@ -30,7 +30,9 @@ type WorkflowPanelState = {
     version2?: WorkflowVersion;
     showComparison?: boolean;
     mode?: "history" | "copilot";
-    onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
+    onCopilotReviewClose?: (
+      status: CopilotReviewStatus,
+    ) => void | Promise<void>;
   };
 };
 

@@ -46,11 +46,11 @@ from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 LOG = structlog.get_logger()
 
 
-def _validate_url(url: str | None) -> str | None:
+def _validate_url(url: str | None, *, field_name: str = "url") -> str | None:
     if not url:
         return None
     try:
-        return prepend_scheme_and_validate_url(url)
+        return prepend_scheme_and_validate_url(url, field_name=field_name)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -68,6 +68,7 @@ async def _run_workflow_and_build_response(
     caller_type: CallerType,
     x_api_key: str | None,
     x_user_agent: str | None = None,
+    created_by: str | None = None,
 ) -> WorkflowRunResponse:
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -97,6 +98,7 @@ async def _run_workflow_and_build_response(
             request=request,
             background_tasks=background_tasks,
             trigger_type=trigger_type,
+            created_by=created_by,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -133,6 +135,7 @@ async def _run_workflow_and_build_response(
         browser_session_id=run_block_request.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         browser_seed_source=workflow_run.browser_seed_source,
+        browser_settings_receipt=workflow_run.browser_settings_receipt,
     )
 
 
@@ -165,6 +168,7 @@ async def login(
     background_tasks: BackgroundTasks,
     login_request: LoginRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
@@ -175,8 +179,8 @@ async def login(
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
     url = _validate_url(login_request.url)
-    totp_verification_url = _validate_url(login_request.totp_url)
-    webhook_url = _validate_url(login_request.webhook_url)
+    totp_verification_url = _validate_url(login_request.totp_url, field_name="totp_url")
+    webhook_url = _validate_url(login_request.webhook_url, field_name="webhook_url")
 
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
@@ -184,7 +188,6 @@ async def login(
         "Login",
         proxy_location=login_request.proxy_location,
         max_screenshot_scrolling_times=login_request.max_screenshot_scrolling_times,
-        extra_http_headers=login_request.extra_http_headers,
         status=WorkflowStatus.auto_generated,
     )
     # 2. add a login block to the workflow
@@ -288,6 +291,8 @@ async def login(
         workflow_definition=workflow_definition_yaml,
         status=new_workflow.status,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
+        extra_http_headers={},
+        cdp_connect_headers={},
     )
     workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
         organization=organization,
@@ -311,6 +316,7 @@ async def login(
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
         caller_type=caller.caller_type,
+        created_by=user_id,
     )
 
 
@@ -339,6 +345,7 @@ async def download_files(
     background_tasks: BackgroundTasks,
     download_files_request: DownloadFilesRequest,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
@@ -349,8 +356,8 @@ async def download_files(
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
     url = _validate_url(download_files_request.url)
-    totp_verification_url = _validate_url(download_files_request.totp_url)
-    webhook_url = _validate_url(download_files_request.webhook_url)
+    totp_verification_url = _validate_url(download_files_request.totp_url, field_name="totp_url")
+    webhook_url = _validate_url(download_files_request.webhook_url, field_name="webhook_url")
 
     # 1. create empty workflow
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
@@ -358,7 +365,6 @@ async def download_files(
         "File Download",
         proxy_location=download_files_request.proxy_location,
         max_screenshot_scrolling_times=download_files_request.max_screenshot_scrolling_times,
-        extra_http_headers=download_files_request.extra_http_headers,
         status=WorkflowStatus.auto_generated,
     )
 
@@ -388,6 +394,8 @@ async def download_files(
         workflow_definition=workflow_definition_yaml,
         status=new_workflow.status,
         max_screenshot_scrolls=download_files_request.max_screenshot_scrolling_times,
+        extra_http_headers={},
+        cdp_connect_headers={},
     )
     workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
         organization=organization,
@@ -411,4 +419,5 @@ async def download_files(
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
         caller_type=caller.caller_type,
+        created_by=user_id,
     )

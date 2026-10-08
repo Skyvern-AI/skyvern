@@ -22,9 +22,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
+from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import CopilotContext, advertises
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
+from skyvern.forge.sdk.copilot.credential_generation import (
+    REGISTRATION_PASSWORD_MAX_LENGTH,
+    REGISTRATION_PASSWORD_MIN_LENGTH,
+)
 from skyvern.forge.sdk.copilot.credential_pause import (
     RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
@@ -40,6 +45,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
+    SteerMessageSiteURLSource,
     UserMessageSiteURLSource,
     admit_credential_for_live_page,
     loggable_origin,
@@ -76,11 +82,12 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     TotpType,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
-from .banned_blocks import _copilot_block_authoring_policy
+from .banned_blocks import _copilot_authoring_capability
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import (
@@ -92,19 +99,19 @@ from .mcp_hooks import (
 from .scouting import (
     _attach_scout_observation_step,
     _attach_scout_page_summary,
-    _capture_element_fingerprint,
     _capture_enclosing_form_submits,
     _capture_post_interaction_screenshot,
-    _capture_scout_selector_candidates,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
     _live_working_page_url,
     _mark_pending_browser_interaction_observation,
+    _non_negative_count,
+    _packet_role_name,
+    _parse_selector_candidates,
+    _probe_target_facts,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
-    _resolve_scout_role_name,
-    _role_name_match_count,
     _selector_live_match_count,
 )
 
@@ -164,8 +171,8 @@ async def _normalize_totp_config_for_organization(totp_secret: str, organization
 
 def _runtime_otp_steering_error(credential_id: str) -> str:
     return (
-        f"Credential `{credential_id}` receives one-time codes by email/SMS, so `fill_credential_field` cannot "
-        "safely retrieve the code during scouting without a workflow run/task context to anchor polling. "
+        f"Credential `{credential_id}` receives one-time codes by email/SMS, so the code cannot be retrieved "
+        "during scouting without a workflow run/task context to anchor polling. "
         "Persist the OTP step in a code block as `await <credential_parameter>.otp()` after the action that "
         "triggers delivery; the runtime will poll for the fresh code during the workflow run without exposing it."
     )
@@ -178,9 +185,9 @@ def _scrub_secret_from_text(text: str, secret_value: str) -> str:
 
 
 def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id: str) -> str | None:
-    if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(copilot_ctx).code_blocks:
         return (
-            "fill_credential_field is only available in code-only browser authoring mode. "
+            "fill_credential_field is only available when this turn may author code blocks. "
             "Author a `login` block bound to the credential parameter instead."
         )
     policy = getattr(copilot_ctx, "request_policy", None)
@@ -229,7 +236,7 @@ def _credential_fill_origin_mismatch_error() -> str:
 def _credential_origin_declined_text(origin: str) -> str:
     return (
         f"No login authorized for {origin} was connected, and the saved login will not be released on that site. "
-        f"Tell the user the sign-in on {origin} needs its own saved login."
+        f"The sign-in on {origin} needs its own saved login."
     )
 
 
@@ -464,6 +471,8 @@ def _log_fill_grant(
         source_fields = {"source_kind": source.kind, "source_user_message": source.message_index}
     elif isinstance(source, QuestionResponseSiteURLSource):
         source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
+    elif isinstance(source, SteerMessageSiteURLSource):
+        source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
     LOG.info(
         "copilot credential fill grant",
         route=route,
@@ -490,6 +499,40 @@ _CREDENTIAL_CARD_FALLBACK = (
     "Ask the user in prose to add the login on the Credentials page and reply with its exact saved name."
 )
 
+_REGISTRATION_OUTCOME_NOTES: dict[str, dict[str, str]] = {
+    "rejected": {
+        "registration_outcome": "rejected",
+        "registration_detail": (
+            "Generate and save saved nothing: validation or the vault refused it, or the pre-check timed out."
+        ),
+    },
+    "unknown": {
+        "registration_outcome": "unknown",
+        "registration_detail": "Generate and save was not confirmed, so a credential under this name may exist.",
+    },
+}
+
+
+def _registration_ask_error(
+    registration: CredentialRegistration, policy: RequestPolicy, credential_id: str | None
+) -> dict[str, Any] | None:
+    if credential_id:
+        return {"ok": False, "error": "Pass either `registration` or `credential_id`, not both."}
+    if policy.raw_secret_detected:
+        return {"ok": False, "error": "Generating a credential is unavailable on a turn that contains a secret."}
+    if not registration.username.strip() or not registration.credential_name.strip():
+        return {"ok": False, "error": "`registration` needs a non-empty `username` and `credential_name`."}
+    if not REGISTRATION_PASSWORD_MIN_LENGTH <= registration.password_length <= REGISTRATION_PASSWORD_MAX_LENGTH:
+        return {
+            "ok": True,
+            "status": "unsupported_constraints",
+            "detail": (
+                f"Generated passwords are {REGISTRATION_PASSWORD_MIN_LENGTH} to "
+                f"{REGISTRATION_PASSWORD_MAX_LENGTH} characters, so no card was shown."
+            ),
+        }
+    return None
+
 
 def _missing_totp_card_fallback(credential_name: str) -> str:
     return (
@@ -512,7 +555,8 @@ def _password_totp_method(credential: PasswordCredential) -> Literal["authentica
 def _rejected_credential_card_fallback(credential_name: str) -> str:
     return (
         f"Ask the user in prose to update the saved credential {defang_card_text(credential_name)} on the "
-        "Credentials page, then say when it is done. Never ask for a password, secret, or code in chat."
+        "Credentials page, then say when it is done. Never ask for a raw secret value (for example, a password) "
+        "in chat."
     )
 
 
@@ -542,15 +586,13 @@ async def _update_ask_target(
         return credential_item.name, None
     method = _password_totp_method(credential)
     if method == "authenticator":
-        return None, {
-            "ok": True,
-            "status": "has_code_method",
-            "method": "authenticator",
-            "next": (
-                f"Fill the code with `fill_credential_field` field=totp for `{credential_id}`, passing the "
+        result: dict[str, Any] = {"ok": True, "status": "has_code_method", "method": "authenticator"}
+        if advertises(copilot_ctx, CREDENTIAL_FILL_TOOL_NAME):
+            result["next"] = (
+                f"Fill the code with `{CREDENTIAL_FILL_TOOL_NAME}` field=totp for `{credential_id}`, passing the "
                 "same `target` that reached the verification step."
-            ),
-        }
+            )
+        return None, result
     if method == "out_of_band":
         return None, {
             "ok": True,
@@ -589,6 +631,8 @@ async def _request_credential(
     copilot_ctx: CopilotContext,
     credential_id: str | None = None,
     rejected_by_site: bool = False,
+    anchor_tool_call_id: str | None = None,
+    registration: CredentialRegistration | None = None,
 ) -> dict[str, Any]:
     policy = copilot_ctx.request_policy
     if not isinstance(policy, RequestPolicy) or (policy.raw_secret_detected and not policy.raw_secret_redacted_draft):
@@ -596,6 +640,29 @@ async def _request_credential(
     ask_origin = canonicalize_origin(login_page_url)
     if not is_resolved_page_url(login_page_url) or ask_origin is None:
         return {"ok": False, "error": "Provide the absolute HTTP(S) sign-in page URL for the credential card."}
+    card_registration: WorkflowCopilotCredentialRegistration | None = None
+    if registration is not None:
+        registration_error = _registration_ask_error(registration, policy, credential_id)
+        if registration_error is not None:
+            return registration_error
+        if copilot_ctx.credential_generation_spent:
+            return {
+                "ok": True,
+                "status": "already_generated",
+                "detail": "Generate and save already ran on this turn, so no second generate card was shown.",
+            }
+        if not copilot_ctx.client_supports_credential_generation:
+            return {
+                "ok": True,
+                "status": "unavailable",
+                "detail": "Generating a credential from the card is not available on this turn.",
+            }
+        card_registration = WorkflowCopilotCredentialRegistration(
+            username=registration.username.strip(),
+            credential_name=registration.credential_name.strip(),
+            password_length=registration.password_length,
+            charset=registration.charset,
+        )
     if policy.raw_secret_redacted_draft:
         if credential_id:
             return {
@@ -610,7 +677,7 @@ async def _request_credential(
                 "ok": False,
                 "error": (
                     "This turn has a redacted secret, so the credential card opens only for a sign-in site the "
-                    "user gave. Call `ask_user` for the site's sign-in URL, then call `request_credential` with it."
+                    "user gave. Ask the user for the site's sign-in URL, then call `request_credential` with it."
                 ),
             }
 
@@ -692,6 +759,8 @@ async def _request_credential(
             update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
             admit_connected=admit_connected,
             allow_second_ask=handback,
+            anchor_tool_call_id=anchor_tool_call_id,
+            registration=card_registration,
         )
     except BaseException:
         if recovery is not None:
@@ -724,15 +793,30 @@ async def _request_credential(
         clear_tool_blocker_signals_for_reason_codes(
             copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
         )
+    registration_outcome = copilot_ctx.credential_registration_outcome if card_registration is not None else None
+    registration_note = _REGISTRATION_OUTCOME_NOTES[registration_outcome] if registration_outcome is not None else {}
     if resolution is None:
-        return {
+        unanswered: dict[str, Any] = {
             "ok": True,
             "status": "unanswered",
             "outcome": copilot_ctx.credential_pause_outcome or "timeout",
-            "next": (
+            **registration_note,
+        }
+        if card_registration is None:
+            unanswered["next"] = (
                 "The user did not answer the card. Continue without the credential: keep the credential "
                 "parameter placeholder in the draft and do not ask again this turn."
-            ),
+            )
+        return unanswered
+    if resolution.signed_in is not None:
+        return {
+            "ok": True,
+            "status": "signed_in",
+            "site": resolution.signed_in.site,
+            "browser_profile_id": resolution.signed_in.browser_profile_id,
+            "browser_profile_name": defang_card_text(resolution.signed_in.profile_name),
+            "cookie_count": resolution.signed_in.cookie_count,
+            "credential_provided": False,
         }
     if resolution.action == "connected" and credential is None:
         return {
@@ -744,26 +828,31 @@ async def _request_credential(
             ),
         }
     if credential is None:
-        return {
-            "ok": True,
-            "status": "skipped",
-            "next": (
+        skipped: dict[str, Any] = {"ok": True, "status": "skipped", **registration_note}
+        if card_registration is None:
+            skipped["next"] = (
                 "The user chose not to connect a credential now. Keep the credential parameter placeholder "
                 "in the draft, do not ask again this turn, and say a test run may stop at the login step."
-            ),
-        }
-    return {
+            )
+        return skipped
+    connected: dict[str, Any] = {
         "ok": True,
         "status": "connected",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
-        "next": (
-            RAW_SECRET_CONNECTED_NEXT
-            if policy.raw_secret_redacted_draft
-            else "Bind this credential as the workflow's credential parameter and continue the build; run the "
-            "blocks that were waiting on the login."
-        ),
     }
+    if policy.raw_secret_redacted_draft:
+        connected["next"] = RAW_SECRET_CONNECTED_NEXT
+    elif card_registration is not None:
+        if resolution.generated:
+            connected["generated"] = True
+            connected["site_effect"] = "none"
+    else:
+        connected["next"] = (
+            "Bind this credential as the workflow's credential parameter and continue the build; run the "
+            "blocks that were waiting on the login."
+        )
+    return connected
 
 
 async def _missing_totp_ask_outcome(
@@ -776,7 +865,7 @@ async def _missing_totp_ask_outcome(
     """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
     not_added_next = (
         f"{defang_card_text(credential_name)} still has no authenticator. Keep it as the workflow's credential "
-        "and do not ask again this turn; say the verification step needs an authenticator on that credential "
+        "and do not ask again this turn. The verification step needs an authenticator on that credential "
         "before a run can pass it."
     )
     if credential is None:
@@ -808,8 +897,8 @@ def _rejected_credential_ask_outcome(
             "ok": True,
             "status": "unanswered" if answered is None else "skipped",
             "next": (
-                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential, do not "
-                "ask again this turn, and say the workflow keeps its saved sign-in."
+                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential and "
+                "do not ask again this turn. The workflow keeps its saved sign-in."
             ),
         }
     return {
@@ -1115,13 +1204,12 @@ def _fill_observed_effects(outcome: ScoutReadbackOutcome, *, landing_inferred_fr
 
 
 async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, fingerprint: bool) -> _ScoutTargetProbe:
-    await _capture_scout_selector_candidates(copilot_ctx, selector)
-    captured_selector_candidates = copilot_ctx.pending_scout_selector_candidates
     copilot_ctx.pending_scout_selector_candidates = None
+    packet, element_fingerprint = await _probe_target_facts(copilot_ctx, selector, fingerprint=fingerprint)
     selector_candidates: list[ScoutedSelectorCandidate] = [
         {"selector": selector, "source": "requested", "match_count": None}
     ]
-    for candidate in captured_selector_candidates or []:
+    for candidate in _parse_selector_candidates(packet.get("selector_candidates")):
         existing = next(
             (item for item in selector_candidates if item["selector"] == candidate["selector"]),
             None,
@@ -1130,17 +1218,17 @@ async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, finge
             selector_candidates.append(candidate)
         elif existing["match_count"] is None:
             existing["match_count"] = candidate["match_count"]
-    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    role, accessible_name = _packet_role_name(packet)
     return _ScoutTargetProbe(
         selector=selector,
         selector_candidates=selector_candidates,
-        selector_match_count=await _selector_live_match_count(copilot_ctx, selector),
+        selector_match_count=_non_negative_count(packet.get("selector_match_count")),
         role=role,
         accessible_name=accessible_name,
         role_name_match_count=(
-            await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
+            _non_negative_count(packet.get("role_name_match_count")) if role and accessible_name else None
         ),
-        fingerprint=await _capture_element_fingerprint(copilot_ctx, selector) if fingerprint else {},
+        fingerprint=element_fingerprint,
     )
 
 
