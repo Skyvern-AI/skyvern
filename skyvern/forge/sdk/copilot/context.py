@@ -72,12 +72,12 @@ class NarrativeDraft(TypedDict):
     summary: str | None
 
 
+REPLY_TOOL_NAME = "reply"
 USER_FACING_REASON_PARAM = "user_facing_reason"
 USER_FACING_REASON_SCHEMA = {
     "type": ["string", "null"],
     "description": (
-        "One short sentence displayed above this action while it runs, saying what it is for. "
-        "Null or absence is accepted."
+        "One short sentence displayed above this action while it runs, saying what it is for. Null is accepted."
     ),
 }
 
@@ -306,6 +306,8 @@ class TurnNarrativePayload(TypedDict):
 
 
 if TYPE_CHECKING:
+    from agents.items import ModelResponse
+
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
@@ -1261,6 +1263,8 @@ class CopilotContext(AgentContext):
     budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
     check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
+    # The latest model response this turn, or None while a model call is in flight.
+    last_model_response: ModelResponse | None = field(default=None, repr=False)
     tool_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()

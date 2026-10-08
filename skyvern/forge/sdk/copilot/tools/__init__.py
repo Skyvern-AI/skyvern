@@ -13,8 +13,11 @@ from typing import Annotated, Any
 
 import structlog
 from agents import FunctionTool, function_tool
+from agents.agent import ToolsToFinalOutputResult
 from agents.run_context import RunContextWrapper
+from agents.tool import FunctionToolResult
 from agents.tool_context import ToolContext
+from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field, JsonValue
 
 from skyvern.forge import app as app
@@ -40,7 +43,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.config import AuthoringCapability, BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM, USER_FACING_REASON_SCHEMA, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    REPLY_TOOL_NAME,
+    USER_FACING_REASON_PARAM,
+    USER_FACING_REASON_SCHEMA,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELD_NAMES
 from skyvern.forge.sdk.copilot.credential_pause import (
     await_pending_credential_pause,
@@ -1108,6 +1116,65 @@ async def ask_user_tool(ctx: ToolContext[CopilotContext], parts: list[QuestionIn
     from skyvern.forge.sdk.copilot.ask_user import ask_user
 
     return json.dumps(await ask_user(ctx.context, AskUserArguments(parts=parts), ctx.tool_call_id))
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=REPLY_TOOL_NAME, strict_mode=False)
+async def _reply(
+    ctx: ToolContext[CopilotContext],
+    user_response: str,
+    global_llm_context: dict[str, Any] | str | None = None,
+) -> str:
+    """Send your final answer to the user and end this turn. Call it once, when you are done using other tools."""
+    response = ctx.context.last_model_response
+    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)] if response else []
+    if len(calls) > 1:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": (
+                    "Not sent: this response made more than one tool call. "
+                    "Call reply once, by itself, after any other results are in."
+                ),
+            }
+        )
+    if not user_response.strip():
+        return json.dumps({"ok": False, "error": "Not sent: user_response is empty. Call reply with your answer."})
+    return json.dumps({"type": "REPLY", "user_response": user_response, "global_llm_context": global_llm_context})
+
+
+reply_tool = dataclasses.replace(
+    _reply,
+    params_json_schema={
+        "type": "object",
+        "properties": {
+            "user_response": {
+                "type": "string",
+                "description": "The answer shown to the user, rendered as Markdown.",
+            },
+            "global_llm_context": {
+                "type": "object",
+                "description": "Context carried to the next turn.",
+            },
+        },
+        "required": ["user_response", "global_llm_context"],
+    },
+)
+
+
+def reply_ends_turn(
+    context: RunContextWrapper[CopilotContext], tool_results: list[FunctionToolResult]
+) -> ToolsToFinalOutputResult:
+    """End the run on a sent reply only: a refused or invalid `reply` call returns a result and the turn goes on."""
+    for result in tool_results:
+        if result.tool.name != REPLY_TOOL_NAME or not isinstance(result.output, str):
+            continue
+        try:
+            sent = json.loads(result.output)
+        except ValueError:
+            continue
+        if isinstance(sent, dict) and sent.get("type") == "REPLY":
+            return ToolsToFinalOutputResult(is_final_output=True, final_output=result.output)
+    return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
 
 
 @function_tool(
@@ -2284,6 +2351,7 @@ NATIVE_TOOLS = [
     get_account_group_status_tool,
     cancel_account_group_tool,
     delete_saved_credentials_tool,
+    reply_tool,
 ]
 
 
@@ -2360,6 +2428,9 @@ def _with_page_state(tool: FunctionTool) -> FunctionTool:
 def _with_action_reason(tool: FunctionTool) -> FunctionTool:
     schema = copy.deepcopy(tool.params_json_schema)
     schema.setdefault("properties", {})[USER_FACING_REASON_PARAM] = dict(USER_FACING_REASON_SCHEMA)
+    required = schema.get("required", [])
+    if USER_FACING_REASON_PARAM not in required:
+        schema["required"] = [*required, USER_FACING_REASON_PARAM]
 
     async def invoke(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
         with capturing_tool_call(_originating_call_id(ctx)):
@@ -2437,6 +2508,9 @@ def copilot_native_tools(
                 and not (supports_credential_delete_card and credential_delete_enabled())
             )
         ):
+            continue
+        if tool.name == REPLY_TOOL_NAME:
+            tools.append(tool)
             continue
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)

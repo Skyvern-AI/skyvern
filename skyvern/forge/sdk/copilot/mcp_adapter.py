@@ -1397,7 +1397,9 @@ def _apply_schema_overlay(
     props.update(overlay.copilot_params)
 
     if overlay.required_overrides is not None:
-        required = overlay.required_overrides
+        required = list(overlay.required_overrides)
+    if USER_FACING_REASON_PARAM in props and USER_FACING_REASON_PARAM not in required:
+        required.append(USER_FACING_REASON_PARAM)
 
     return {
         **input_schema,

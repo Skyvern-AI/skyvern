@@ -16,6 +16,7 @@ from agents.tool import Tool
 from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME
 from skyvern.forge.sdk.copilot.credential_pause import arm_credential_pause_gate
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
@@ -105,6 +106,7 @@ class CopilotRunHooks(RunHooksBase):
     ) -> None:
         self._ctx.model_call_in_flight = True
         self._ctx.model_call_streamed_tool_call = False
+        self._ctx.last_model_response = None
         try:
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
@@ -117,6 +119,7 @@ class CopilotRunHooks(RunHooksBase):
 
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
         self._ctx.model_call_in_flight = False
+        self._ctx.last_model_response = response
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         try:
@@ -149,6 +152,9 @@ class CopilotRunHooks(RunHooksBase):
         agent: AgentBase,
         tool: Tool,
     ) -> None:
+        # A reply is the turn's answer, not work the turn did: like a text reply it is not counted as a tool call.
+        if tool.name == REPLY_TOOL_NAME:
+            return
         # Retry safety depends on this monotonic fact, so record it before the
         # tool executes and outside the best-effort activity-summary path.
         self._ctx.tool_calls_this_turn += 1
@@ -160,6 +166,8 @@ class CopilotRunHooks(RunHooksBase):
         tool: Tool,
         result: Any,
     ) -> None:
+        if tool.name == REPLY_TOOL_NAME:
+            return
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         # Activity recording is observability -- a malformed tool result or an
@@ -287,6 +295,8 @@ class FinalReplyRunHooks(CopilotRunHooks):
         agent: AgentBase,
         tool: Tool,
     ) -> None:
-        # The SDK awaits this before it creates the invoke task, so a tool call returned despite
-        # tool_choice="none" never runs and never counts as a tool call this turn.
+        if tool.name == REPLY_TOOL_NAME:
+            return
+        # The drain offers only `reply`. The SDK awaits this before it creates the invoke task, so any other
+        # tool that reaches here never runs or counts.
         raise FinalReplyToolRefusedError(tool.name)
