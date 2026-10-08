@@ -59,6 +59,7 @@ const {
   modalEditingCredentialId,
   modalDefaultTotpType,
   toastFn,
+  realPopover,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const streaming = vi.fn(
@@ -139,6 +140,7 @@ const {
     modalEditingCredentialId: { current: undefined as string | undefined },
     modalDefaultTotpType: { current: undefined as string | undefined },
     toastFn: vi.fn(),
+    realPopover: { current: false },
   };
 });
 
@@ -160,35 +162,43 @@ vi.mock("@/components/ui/use-toast", () => ({ toast: toastFn }));
 // Unlike the card unit test's always-render stub, this one honors `open` and wires the trigger —
 // WorkflowCopilotHistory also renders a Popover whose (closed) content pulls react-query, so an
 // unconditional PopoverContent would force-mount it and crash with "No QueryClient".
-vi.mock("@/components/ui/popover", async () => {
+// `realPopover` swaps in the Radix popover for a test that needs its Escape handling.
+vi.mock("@/components/ui/popover", async (importOriginal) => {
   const React = await import("react");
+  const actual =
+    await importOriginal<typeof import("@/components/ui/popover")>();
   const OpenCtx = React.createContext<{
     open: boolean;
     setOpen: (value: boolean) => void;
   }>({ open: false, setOpen: () => {} });
   return {
-    Popover: ({
-      open,
-      onOpenChange,
-      children,
-    }: {
-      open?: boolean;
-      onOpenChange?: (value: boolean) => void;
-      children?: ReactNode;
-    }) => (
-      <OpenCtx.Provider
-        value={{ open: Boolean(open), setOpen: onOpenChange ?? (() => {}) }}
-      >
-        {children}
-      </OpenCtx.Provider>
-    ),
-    PopoverTrigger: ({ children }: { children?: ReactNode }) => {
+    Popover: (props: ComponentProps<typeof actual.Popover>) =>
+      realPopover.current ? (
+        <actual.Popover {...props} />
+      ) : (
+        <OpenCtx.Provider
+          value={{
+            open: Boolean(props.open),
+            setOpen: props.onOpenChange ?? (() => {}),
+          }}
+        >
+          {props.children}
+        </OpenCtx.Provider>
+      ),
+    PopoverTrigger: (props: ComponentProps<typeof actual.PopoverTrigger>) => {
       const { open, setOpen } = React.useContext(OpenCtx);
-      return <div onClick={() => setOpen(!open)}>{children}</div>;
+      return realPopover.current ? (
+        <actual.PopoverTrigger {...props} />
+      ) : (
+        <div onClick={() => setOpen(!open)}>{props.children}</div>
+      );
     },
-    PopoverContent: ({ children }: { children?: ReactNode }) => {
+    PopoverContent: (props: ComponentProps<typeof actual.PopoverContent>) => {
       const { open } = React.useContext(OpenCtx);
-      return open ? <div>{children}</div> : null;
+      if (realPopover.current) {
+        return <actual.PopoverContent {...props} />;
+      }
+      return open ? <div>{props.children}</div> : null;
     },
   };
 });
@@ -528,6 +538,7 @@ beforeEach(() => {
   toastFn.mockClear();
   credentialsData.current = [];
   credsFail.current = false;
+  realPopover.current = false;
   modalOverrideType.current = undefined;
   modalDefaultTestUrl.current = undefined;
   modalEditingCredentialId.current = undefined;
@@ -2277,6 +2288,38 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       credential_id: "new-cred-1",
     });
     expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("Escape closes the open login picker without stopping the turn", async () => {
+    realPopover.current = true;
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(screen.getByPlaceholderText("Search credentials..."), {
+        key: "Escape",
+      });
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Search credentials...")).toBeNull(),
+    );
+    expect(sansApiPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it("shows the full org credential list on a pause ask (not just the frame's candidates) and answers via the typed POST", async () => {

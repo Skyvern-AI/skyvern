@@ -395,7 +395,12 @@ function CredentialPicker({
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className={`${contentClassName} p-0`} align="start">
+      <PopoverContent
+        className={`${contentClassName} p-0`}
+        align="start"
+        // The chat stops the running turn on any Escape that reaches the window.
+        onEscapeKeyDown={(event) => event.stopPropagation()}
+      >
         <Command shouldFilter={false}>
           <CommandInput
             placeholder="Search credentials..."

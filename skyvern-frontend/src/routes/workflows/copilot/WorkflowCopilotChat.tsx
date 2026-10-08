@@ -183,6 +183,8 @@ import {
   type RecordingRefinementStatus,
 } from "./RecordingRefinementProgressCard";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
+import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useHistoryLoad } from "./useHistoryLoad";
 import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import {
@@ -263,6 +265,7 @@ import {
   liveSearch,
 } from "@/routes/workflows/studio/liveSearch";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
+import { useStudioPaneDefaults } from "@/routes/workflows/studio/StudioPaneDefaultsContext";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
@@ -2280,6 +2283,7 @@ export function WorkflowCopilotChat({
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
   const { resolveLivePanes } = useStudioPanes();
+  const { reopenEditor } = useStudioPaneDefaults();
   const switchStudioRun = useSwitchStudioRun({
     replace: true,
     systemFocus: true,
@@ -2557,15 +2561,61 @@ export function WorkflowCopilotChat({
     actionPollRef.current.forEach((timer) => clearInterval(timer));
     actionPollRef.current.clear();
   }, []);
+  const releasedTurnRunId = useRef<string | null>(null);
+  const arrivedTurnRunId = useRef<string | null>(null);
+  const pendingReleaseRunId = useRef<string | null>(null);
+  const studioRunIdRef = useRef(workflowRunId);
+  studioRunIdRef.current = workflowRunId;
   const focusTurnRun = useCallback(
     (runId: string | null | undefined) => {
       if (!docked || !runId) return;
       if (focusedTurnRunId.current === runId) return;
       focusedTurnRunId.current = runId;
+      if (studioRunIdRef.current === runId) arrivedTurnRunId.current = runId;
       switchStudioRun(runId);
     },
     [docked, switchStudioRun],
   );
+  // A narrow stage drops Editor for the run's Browser; give it back once the
+  // run this turn focused is over, once per run, and only while the studio
+  // shows that run. An end that beats the focus navigation waits for it; once
+  // the user leaves the run the release is spent, so returning later never
+  // reopens Editor.
+  const releaseTurnRun = useCallback(
+    (runId: string) => {
+      if (
+        focusedTurnRunId.current !== runId ||
+        releasedTurnRunId.current === runId
+      )
+        return;
+      if (studioRunIdRef.current !== runId) {
+        pendingReleaseRunId.current = runId;
+        return;
+      }
+      releasedTurnRunId.current = runId;
+      reopenEditor();
+    },
+    [reopenEditor],
+  );
+  useEffect(() => {
+    const focused = focusedTurnRunId.current;
+    if (!focused) return;
+    if (workflowRunId === focused) {
+      arrivedTurnRunId.current = focused;
+      if (pendingReleaseRunId.current === focused) releaseTurnRun(focused);
+    } else if (arrivedTurnRunId.current === focused) {
+      releasedTurnRunId.current = focused;
+    }
+  }, [workflowRunId, releaseTurnRun]);
+  // The polled run status also ends it, for a stream severed before run_outcome.
+  const { data: focusedRunData } = useWorkflowRunQuery({
+    workflowRunId: docked ? (workflowRunId ?? undefined) : undefined,
+  });
+  useEffect(() => {
+    if (focusedRunData && runIsLogicallyFinal(focusedRunData)) {
+      releaseTurnRun(focusedRunData.workflow_run_id);
+    }
+  }, [focusedRunData, releaseTurnRun]);
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       if (!buildFollowEngaged.current) return;
@@ -8988,6 +9038,7 @@ export function WorkflowCopilotChat({
                     // Terminal verdict: one convergent fetch, then stop polling.
                     void fetchRecordedActions(payload.workflow_run_id);
                     finalizeRecordedActionsPoll(payload.workflow_run_id);
+                    releaseTurnRun(payload.workflow_run_id);
                   }
                 }
                 return false;
@@ -9349,6 +9400,7 @@ export function WorkflowCopilotChat({
       recordingFocusOpen,
       pendingAttachments,
       focusTurnRun,
+      releaseTurnRun,
       followBuildLabel,
       inputValue,
       questionInteractions,
