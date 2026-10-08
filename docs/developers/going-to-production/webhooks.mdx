@@ -161,6 +161,11 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 When creating an agent, use `webhook_callback_url` inside `json_definition`; this sets the default for all runs. When running an agent, use `webhook_url` at the top level to override for that specific run.
 </Info>
 
+### For job recipe runs
+
+[Apply and Extract requests](/cookbooks/job-application-filler#get-notified-when-a-run-finishes) accept `webhook_url`.
+A recipe request without `webhook_url` sends no webhook. Omitted, null, or blank values count as absent.
+
 **Quick reference:**
 
 | Context | Parameter | Location |
@@ -168,6 +173,7 @@ When creating an agent, use `webhook_callback_url` inside `json_definition`; thi
 | Task run | `webhook_url` | Top-level parameter |
 | Agent creation | `webhook_callback_url` | Inside `json_definition` |
 | Agent run (override) | `webhook_url` | Top-level parameter |
+| Job recipe run | `webhook_url` | Top-level JSON field or Apply text part |
 
 <Warning>
 **Watch the parameter names.** Using `webhook_url` when creating an agent (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error. Your runs will just complete without notifications.
