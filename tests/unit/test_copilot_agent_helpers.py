@@ -5423,8 +5423,7 @@ class TestCredentialRefusalReachesAgent:
             desc = tool.description
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
-            assert "Ask the user to store it as a saved" in desc
-            assert "do not build or run with" in desc
+            assert "do not build or run with the raw value" in desc
 
 
 class TestNativeToolSurface:

@@ -40,10 +40,12 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfileUsageWorkflow,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    EXTERNAL_CDP_BROWSER_VENDOR,
     FINAL_STATUSES,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     Extensions,
     PersistentBrowserSession,
+    PersistentBrowserSessionStatus,
     PersistentBrowserType,
     is_final_status,
     resolve_terminal_status,
@@ -63,10 +65,31 @@ _FINAL_STATUS_VALUES = tuple(status.value for status in FINAL_STATUSES)
 # owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
 # customer-facing session surfaces. Self-hosted routed rows set both columns together, and
 # rows created before routing existed set neither — both cases stay visible.
-_VISIBLE_TO_CUSTOMER = or_(
-    PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
-    PersistentBrowserSessionModel.browser_address.isnot(None),
+_VISIBLE_TO_CUSTOMER = and_(
+    or_(
+        PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
+        PersistentBrowserSessionModel.browser_address.isnot(None),
+    ),
+    PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR),
 )
+
+
+def clear_terminal_session_fields(row: PersistentBrowserSessionModel) -> None:
+    """A registration's upstream carries the caller's CDP credential, which must not outlive it."""
+    row.download_run_id = None
+    if row.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR:
+        row.upstream_cdp_url = None
+
+
+# Longer than a registration probe can run: a 10 s connect plus a detach bounded by BROWSER_CLOSE_TIMEOUT (180 s).
+_ABANDONED_RESERVATION_AGE = timedelta(minutes=5)
+
+
+async def _take_advisory_xact_lock(session: AsyncSession, key: str) -> None:
+    bind = session.get_bind()
+    if bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(key))))
 
 
 def _managed_browser_profile_query(
@@ -1189,6 +1212,8 @@ class BrowserSessionsRepository(BaseRepository):
                         values["status"] = resolve_terminal_status(status, persistent_browser_session.close_reason)
                     for field, value in values.items():
                         setattr(persistent_browser_session, field, value)
+                    if completed_at or status in FINAL_STATUSES:
+                        clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
             except StatementError as exc:
                 exc.hide_parameters = True
@@ -1528,7 +1553,7 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.status = resolve_terminal_status(
                     "completed", persistent_browser_session.close_reason
                 )
-                persistent_browser_session.download_run_id = None
+                clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -1564,10 +1589,66 @@ class BrowserSessionsRepository(BaseRepository):
             await session.commit()
 
     @db_operation("get_uncompleted_persistent_browser_sessions")
-    async def get_uncompleted_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+    async def get_uncompleted_persistent_browser_sessions(
+        self, vendor_held_by: str | None = None, organization_id: str | None = None
+    ) -> list[PersistentBrowserSessionModel]:
         """Get all browser sessions that have not been completed or deleted."""
-        async with self.Session() as session:
-            result = await session.execute(
-                select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+        query = select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+        if organization_id is not None:
+            query = query.filter_by(organization_id=organization_id)
+        if vendor_held_by is not None:
+            # The vendor-held shape (an upstream, no browser_address) restated so idx_pbs_vendor_held_lease serves this.
+            query = query.filter_by(browser_vendor=vendor_held_by, browser_address=None).filter(
+                PersistentBrowserSessionModel.upstream_cdp_url.isnot(None)
             )
+        async with self.Session() as session:
+            result = await session.execute(query)
             return result.scalars().all()
+
+    @db_operation("reserve_external_cdp_session")
+    async def reserve_external_cdp_session(
+        self, organization_id: str, timeout_minutes: int, *, max_open: int, max_attempts_per_minute: int
+    ) -> PersistentBrowserSession | None:
+        """Take a registration slot before its probe runs, or return None when the org is at either limit. The row
+        holds no address until the probe succeeds, and it stays behind as the record of the attempt."""
+        model = PersistentBrowserSessionModel
+        async with self.Session() as session:
+            await _take_advisory_xact_lock(session, f"external_cdp_registration:{organization_id}")
+            # A reservation still without an address past its probe's longest run was left by a cancelled or killed
+            # process; nothing else would ever close it, and open it would hold a slot forever.
+            await session.execute(
+                update(model)
+                .where(
+                    model.organization_id == organization_id,
+                    model.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
+                    model.upstream_cdp_url.is_(None),
+                    model.completed_at.is_(None),
+                    model.created_at < naive_utc_now() - _ABANDONED_RESERVATION_AGE,
+                )
+                .values(status=PersistentBrowserSessionStatus.failed.value, completed_at=naive_utc_now())
+            )
+            open_count, recent_count = (
+                await session.execute(
+                    select(
+                        func.count().filter(model.completed_at.is_(None)),
+                        func.count().filter(model.created_at >= naive_utc_now() - timedelta(minutes=1)),
+                    ).where(
+                        model.organization_id == organization_id,
+                        model.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
+                        model.deleted_at.is_(None),
+                    )
+                )
+            ).one()
+            if open_count >= max_open or recent_count >= max_attempts_per_minute:
+                return None
+            reserved = model(
+                organization_id=organization_id,
+                status=PersistentBrowserSessionStatus.created.value,
+                started_at=naive_utc_now(),
+                timeout_minutes=timeout_minutes,
+                browser_vendor=EXTERNAL_CDP_BROWSER_VENDOR,
+            )
+            session.add(reserved)
+            await session.commit()
+            await session.refresh(reserved)
+            return PersistentBrowserSession.model_validate(reserved)

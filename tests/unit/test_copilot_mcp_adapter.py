@@ -28,7 +28,7 @@ from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.result import ErrorCode, make_error
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_state_error
-from skyvern.cli.mcp_tools.blocks import skyvern_block_validate
+from skyvern.cli.mcp_tools.blocks import skyvern_block_validate, skyvern_workflow_knowledge
 from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
@@ -85,6 +85,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _FOR_LOOP_EXAMPLE,
     _FOR_LOOP_GUIDANCE,
     _FOR_LOOP_PROPERTY_DESCRIPTIONS,
+    _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC,
     _build_skyvern_mcp_overlays,
     get_skyvern_mcp_alias_map,
 )
@@ -3759,14 +3760,19 @@ async def test_a_frame_staged_inside_a_tool_names_the_call_that_staged_it() -> N
     assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call-mcp", "call-native", None]
 
 
-@pytest.mark.asyncio
-async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+_ModelCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+@asynccontextmanager
+async def _real_server_tools(
+    capability: AuthoringCapability, *names: str
+) -> AsyncIterator[tuple[dict[str, MCPTool], _ModelCall]]:
     ctx = make_copilot_ctx(api_key="in-process-test-key")
+    ctx.authoring_capability = capability
     aliases = get_skyvern_mcp_alias_map()
-    names = ("get_block_schema", "get_workflow_knowledge")
     server = SkyvernOverlayMCPServer(
         transport=mcp,
-        overlays=_build_skyvern_mcp_overlays(),
+        overlays=_build_skyvern_mcp_overlays(capability),
         alias_map={name: aliases[name] for name in names},
         allowlist=frozenset(aliases[name] for name in names),
         context_provider=lambda: ctx,
@@ -3779,12 +3785,20 @@ async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_
             tool = MCPUtil.to_function_tool(tools[name], server, convert_schemas_to_strict=False)
             tc = ToolContext(context=ctx, tool_name=name, tool_call_id=f"{name}-call", tool_arguments="{}")
             output = await tool.on_invoke_tool(tc, json.dumps(arguments))
-            return json.loads(output["text"])["data"]
+            return json.loads(output["text"])
 
-        schema_data = await call("get_block_schema", {"block_type": "for_loop"})
-        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["sections"]["for_loop_block"]
+        yield tools, call
     finally:
         await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_refusing_both_inputs() -> None:
+    async with _real_server_tools(AGENT_BLOCKS_ONLY, "get_block_schema", "get_workflow_knowledge") as (_, call):
+        schema_data = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]
+        knowledge = (await call("get_workflow_knowledge", {"topics": ["for_loop_block"]}))["data"]["sections"][
+            "for_loop_block"
+        ]
 
     schema = schema_data["schema"]
     properties = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]["properties"]
@@ -3810,6 +3824,51 @@ async def test_for_loop_schema_and_knowledge_state_reference_precedence_without_
     submitted = copy.deepcopy(both_inputs)
     assert _block_authoring_violations(submitted, AGENT_BLOCKS_ONLY) == []
     assert submitted == both_inputs
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])
+@pytest.mark.asyncio
+async def test_the_task_unavailable_topic_never_reaches_the_model(capability: AuthoringCapability) -> None:
+    assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC in (await skyvern_workflow_knowledge())["data"]["topics"]
+
+    async with _real_server_tools(capability, "get_workflow_knowledge") as (_, call):
+        catalog = await call("get_workflow_knowledge", {})
+        beside_another = await call(
+            "get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC, "for_loop_block"]}
+        )
+        alone = await call("get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC.upper()]})
+
+    topics = catalog["data"]["topics"]
+    assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in topics
+    assert "for_loop_block" in topics
+    assert catalog["data"]["count"] == len(topics)
+    assert list(beside_another["data"]["sections"]) == ["for_loop_block"]
+    assert alone == catalog
+
+
+@pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])
+@pytest.mark.asyncio
+async def test_validate_block_hides_code_only_and_never_calls_an_authorable_task_block_deprecated(
+    capability: AuthoringCapability,
+) -> None:
+    task = json.dumps(
+        {"block_type": "task", "label": "open_report", "url": "https://example.com", "navigation_goal": "Open it."}
+    )
+    code = json.dumps({"block_type": "code", "label": "read_total", "code": "total = 1"})
+    assert (await skyvern_block_validate(block_json=task))["warnings"]
+
+    async with _real_server_tools(capability, "validate_block") as (tools, call):
+        assert "code_only" not in json.dumps(tools["validate_block"].inputSchema)
+        task_result = await call("validate_block", {"block_json": task, "code_only": True})
+        code_result = await call("validate_block", {"block_json": code})
+
+    assert "warnings" not in task_result
+    assert task_result["ok"] is capability.agent_blocks
+    if capability.agent_blocks:
+        assert task_result["data"]["valid"] is True
+    if capability.code_blocks:
+        assert code_result["data"]["valid"] is True
+        assert code_result["warnings"]
 
 
 @pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])

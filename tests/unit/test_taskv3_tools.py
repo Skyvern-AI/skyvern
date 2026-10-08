@@ -8965,6 +8965,8 @@ async def test_click_reports_opened_menu_with_stable_tags() -> None:
     assert "Most popular" in r.content
     # the model is told the options are volatile: re-clicking the trigger destroys them
     assert "closes the menu" in r.content
+    # Opening a menu to read it must not read as an order to pick: the reply names a way out that selects nothing.
+    assert "does not oblige a pick" in r.content and "leave it without selecting" in r.content
 
 
 @pytest.mark.asyncio

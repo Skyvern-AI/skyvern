@@ -588,8 +588,7 @@ async def edit_block_and_run_tool(
     and recorded workflow run available for the next turn.
 
     Pass current non-secret values for runtime workflow parameters in ``parameters``. For a raw
-    secret value (for example, a password), do NOT pass an inline value. Ask the user to store it as a saved
-    credential and reply with the credential name; do not build or run with the raw value.
+    secret value (for example, a password), do NOT pass an inline value; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -1317,9 +1316,7 @@ async def run_blocks_tool(
     keys must match the workflow parameter `key` field. For a raw secret value (for example, a password), call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`. Ask the user to store it as a saved
-    credential and reply with the credential name; do not build or run with
-    the raw value.
+    the inline value via `parameters`; do not build or run with the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps before
     changing the workflow. If visible state is uncertain, inspect the live
@@ -1572,9 +1569,7 @@ async def update_and_run_blocks_tool(
     keys must match the workflow parameter `key` field. For a raw secret value (for example, a password), call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`. Ask the user to store it as a saved
-    credential and reply with the credential name; do not build or run with
-    the raw value.
+    the inline value via `parameters`; do not build or run with the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps while
     building, editing, or debugging the workflow. Do not invent URL params,

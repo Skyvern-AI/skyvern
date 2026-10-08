@@ -10862,14 +10862,16 @@ def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool =
         return (
             "This click opened a menu, but its options could not be read as whole rows, so they are not "
             f"listed here. Re-observe to read them before picking one; clicking {closer} again or elsewhere "
-            f"closes the menu, and {stale}"
+            f"closes the menu, and {stale} Opening a menu does not oblige a pick."
         )
     if isinstance(declared, int) and not isinstance(declared, bool) and declared > count:
         overflow += f" (the list declares {declared} options; {count} are listed)"
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
-        f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
-        f"and destroys these options. These numbers are freshly assigned: {stale}"
+        f'its [data-tv3-menu="N"] selector, as your next action if you mean to pick: clicking {closer} again or '
+        f"elsewhere, or a page change, closes the menu and destroys these options. Opening a menu does not oblige a "
+        f"pick: if none of them should be chosen, leave it without selecting. These numbers are freshly assigned: "
+        f"{stale}"
     )
 
 

@@ -194,17 +194,17 @@ else:
     WorkflowRunTypeField = Literal[RunType.workflow_run]
 
 
-def _validate_browser_address(browser_address: str | None) -> str | None:
+def _validate_browser_address(browser_address: str | None, *, field_name: str = "browser_address") -> str | None:
     if not browser_address:
         return browser_address
 
     try:
         parsed = _BROWSER_ADDRESS_ADAPTER.validate_python(browser_address)
     except ValidationError as exc:
-        raise ValueError("browser_address must be an HTTP(S) or WebSocket URL with a host") from exc
+        raise ValueError(f"{field_name} must be an HTTP(S) or WebSocket URL with a host") from exc
 
     if not parsed.host:
-        raise ValueError("browser_address must include a host")
+        raise ValueError(f"{field_name} must include a host")
 
     validate_browser_host(parsed.host)
     return browser_address

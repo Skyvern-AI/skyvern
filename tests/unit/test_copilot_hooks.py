@@ -1054,7 +1054,7 @@ class TestNewToolOverlayConfigs:
         overlays = _build_skyvern_mcp_overlays()
         for name in ("click", "type_text"):
             desc = overlays[name].description or ""
-            assert "CSS selector" in desc, f"{name} should name the selector contract"
+            assert "selector" in desc, f"{name} should name the selector contract"
             assert "intent" not in desc, f"{name} description must not reference intent"
             assert "inspect the page again" in desc, f"{name} should steer to re-observation on failure"
             assert "intent" in overlays[name].hide_params

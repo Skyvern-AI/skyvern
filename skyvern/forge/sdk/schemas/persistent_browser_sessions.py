@@ -1,13 +1,15 @@
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import TypeGuard
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionExpired,
     BrowserSessionStartupTimeout,
+    ExternalBrowserSessionNotRunnable,
     SkyvernHTTPException,
 )
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
@@ -79,6 +81,9 @@ class Extensions(StrEnum):
     CaptchaSolver = "captcha-solver"
 
 
+# browser_vendor of a registration that attaches to a browser the caller already runs; Skyvern
+# only ever detaches from it.
+EXTERNAL_CDP_BROWSER_VENDOR = "external_cdp"
 FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE = "forced_workflow_run"
 SESSION_RETIREMENT_RUNNABLE_TYPE = "session_retirement"
 
@@ -97,7 +102,7 @@ class PersistentBrowserSession(BaseModel):
     # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
     # remains the client-facing proxy URL. These must never reach a client or a log —
     # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
-    upstream_cdp_url: str | None = None
+    upstream_cdp_url: str | None = Field(default=None, repr=False)
     browser_vendor: str | None = None
     # The upstream provider's own id for this browser. Server-side only, under the same allowlist
     # as the two fields above. It is the sole handle for terminating a session out of band, so the
@@ -172,6 +177,10 @@ class PersistentBrowserSession(BaseModel):
         return not self.profile_read_only and bool(self.generate_browser_profile or self.browser_profile_id)
 
 
+def is_external_cdp_session(browser_session: PersistentBrowserSession | None) -> TypeGuard[PersistentBrowserSession]:
+    return browser_session is not None and browser_session.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR
+
+
 def unusable_browser_session_error(
     session: PersistentBrowserSession, *, refused_at_submission: bool = False
 ) -> SkyvernHTTPException | None:
@@ -181,6 +190,8 @@ def unusable_browser_session_error(
     if not (
         is_final_status(session.status) or session.completed_at is not None or session.close_requested_at is not None
     ):
+        if is_external_cdp_session(session):
+            return ExternalBrowserSessionNotRunnable(session.persistent_browser_session_id)
         return None
     session_id = session.persistent_browser_session_id
     timed_out = session.status == PersistentBrowserSessionStatus.timeout

@@ -64,6 +64,7 @@ from skyvern.exceptions import (
     BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
+    ExternalBrowserSessionNotRunnable,
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
@@ -147,6 +148,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     PersistentBrowserSession,
+    is_external_cdp_session,
     is_final_status,
     unusable_browser_session_error,
 )
@@ -5396,6 +5398,8 @@ class WorkflowService:
             )
         )
         session_id = browser_session.persistent_browser_session_id
+        if is_external_cdp_session(browser_session):
+            raise ExternalBrowserSessionNotRunnable(session_id)
         if is_final_status(browser_session.status):
             raise BrowserSessionClosed(session_id)
         status = getattr(browser_session.status, "value", browser_session.status)
