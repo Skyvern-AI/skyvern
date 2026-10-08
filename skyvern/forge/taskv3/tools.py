@@ -64,6 +64,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
+    CLICK_DISPATCHED_DATA_KEY,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
@@ -79,6 +80,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     current_tool_call_seq,
     mark_is_filler,
+    record_click_dispatched,
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
@@ -7214,8 +7216,32 @@ _CLICK_PRECHECK_JS = (
 )
 
 # Same-document token for the click retry: a navigation destroys window, a pushState does not.
-_CLICK_SAME_DOC_PLANT_JS = "() => { window.__tv3_click_same = 1; }"
+# Also arms a capture listener that records whether the document received a trusted press, so a click that
+# raised afterwards (its navigation not yet committed) is known to have been dispatched.
+_CLICK_SAME_DOC_PLANT_JS = """() => {
+  window.__tv3_click_same = 1;
+  window.__tv3_click_seen = 0;
+  if (!window.__tv3_click_hook) {
+    window.__tv3_click_hook = 1;
+    for (const type of ["pointerdown", "mousedown", "click"]) {
+      window.addEventListener(type, (event) => { if (event.isTrusted) window.__tv3_click_seen = 1; }, true);
+    }
+  }
+}"""
 _CLICK_SAME_DOC_CHECK_JS = "() => window.__tv3_click_same === 1"
+_CLICK_SEEN_CHECK_JS = "() => window.__tv3_click_seen === 1"
+
+
+async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
+    try:
+        # An unarmed marker cannot say the press never landed, so it reads as dispatched, the safe side.
+        seen = not marker_armed or await page.evaluate(_CLICK_SEEN_CHECK_JS)
+    except Exception:
+        # The document cannot be read (it may be navigating away): treated as dispatched, the safe side.
+        seen = True
+    if seen:
+        record_click_dispatched()
+
 
 # Planted on window before an option click; a navigation clears window, so its absence afterwards is
 # the page saying "different document" even when the post-click probe's own JS is what failed.
@@ -14818,10 +14844,11 @@ def build_browser_tools(
                 )
             base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
+            marker_armed = True
             try:
                 await page.evaluate(_CLICK_SAME_DOC_PLANT_JS)
             except Exception:
-                pass
+                marker_armed = False
             try:
                 if label_over_control:
                     # The probe already answered: the only thing "over" this control is its own label
@@ -14831,6 +14858,7 @@ def build_browser_tools(
                 else:
                     await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
             except Exception as e:
+                await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
                 try:
                     gone = not await page.evaluate(_SELECTOR_EXISTS_JS, await _probe_arg(page, selector))
@@ -14904,6 +14932,7 @@ def build_browser_tools(
                         await page.locator(selector).first.wait_for(state="visible", timeout=3000)
                         await input_dispatch.click(page, selector, timeout=5000, force=True)
                     except Exception:
+                        await _note_click_dispatch(page, marker_armed=marker_armed)
                         raise e from None
                 else:
                     raise
@@ -14925,6 +14954,7 @@ def build_browser_tools(
             "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before),
             # The re-ask's URL rule reads where this click started: its result reports only where it landed.
             "url_before": page_url_before,
+            CLICK_DISPATCHED_DATA_KEY: True,
         }
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later

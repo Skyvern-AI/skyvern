@@ -305,6 +305,8 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Extra action rounds a single-action block may spend before its own action lands; see the loop.
+    target_action_reserve: int = 0,
     # Asked before a single-action block completes on its step cap.
     block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
@@ -636,6 +638,7 @@ async def run_task_v3_agent_loop(
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
+            target_action_reserve=target_action_reserve,
             block_completion_check=_block_completion_check if block_check_on else None,
         )
     finally:
