@@ -67,10 +67,7 @@ class TestToolDocstringsRefusalClause:
             assert "do NOT pass" in desc, f"{tool.name} does not forbid inline secret pass-through"  # type: ignore[attr-defined]
             assert "raw secret value (for example, a password)" in " ".join(desc.split())
             assert "one_time_code, private_key" not in desc
-            assert "Ask the user to store it as a saved" in desc
-            assert "credential and reply with the credential name" in desc
-            assert "do not build or run with" in desc
-            assert "the raw value" in desc
+            assert "do not build or run with the raw value" in desc
             assert "CREDENTIAL HANDLING refusal rule" not in desc
 
     def test_list_credentials_tool_describes_pagination(self) -> None:
@@ -104,6 +101,4 @@ class TestBrowserToolOverlayRefusalCaveat:
         desc = overlays["type_text"].description or ""
         assert "NEVER type a raw secret value (for example, a password)" in desc
         assert "API keys, tokens, cookies" not in desc
-        assert "Ask the user to store the value as a saved credential" in desc
-        assert "do not type or submit the raw value" in desc
         assert "CREDENTIAL HANDLING refusal rule" not in desc

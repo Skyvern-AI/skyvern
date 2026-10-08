@@ -858,6 +858,24 @@ class TestLocatorSynthesis:
         assert '"error_count"' in result.code
         assert [d["selector"] for d in _dropped_root_targets(result)] == ["body"]
 
+    def test_a_synthesized_read_passes_both_code_security_checks(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/report", trajectory_index=0),
+                _interaction(
+                    "read_value",
+                    read_expression="document.querySelector('#count').textContent",
+                    read_output_path="output.error_count",
+                    trajectory_index=1,
+                ),
+            ]
+        )
+        assert result is not None
+        block_code = textwrap.dedent(result.code)
+        assert "await page.evaluate(" in block_code
+        assert author_time_code_security_errors(label="read_count", code=block_code) == []
+        assert runtime_code_security_errors([CodeBlockSecurityInput(label="read_count", code=block_code)]) == []
+
     def test_strict_dynamic_row_gate_outranks_the_root_container_role_retarget(self) -> None:
         interaction = _interaction(
             "click",
