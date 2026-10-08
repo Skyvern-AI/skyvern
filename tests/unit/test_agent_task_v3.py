@@ -1930,6 +1930,7 @@ async def _run_execute_step_gate(
     workflow_run: Any = None,
     workflow_owned_recovery: bool = False,
     recovery_code_progress: CodeProgressRecord | None = None,
+    observer: Any = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -1967,6 +1968,10 @@ async def _run_execute_step_gate(
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock()
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=workflow_run)
+            if observer is not None:
+                mock_app.DATABASE.observer = observer
+            else:
+                mock_app.DATABASE.observer.set_workflow_run_block_engine_by_task_id = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -2124,7 +2129,7 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     # The engine handed down is the one every later step of this task recurses with, so a v3 pin
     # here would re-read the flag next step and could restart the task on v3 mid-way.
     assert step_engine_mock.await_args.kwargs["engine"] == agent_module.RunEngine.skyvern_v1
-    # The run's persisted type and arm still read v3, so this line is what cohort reads exclude it by.
+    # The run's arm still reads v3, so this line is what cohort reads exclude it by.
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
