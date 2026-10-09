@@ -1745,6 +1745,15 @@ async def _fallback_to_ai_run(
             complete_verification=complete_verification,
             include_action_history_in_verification=include_action_history_in_verification,
         )
+        if workflow_run_block_id and engine == RunEngine.skyvern_v3:
+            # The row was created for cached code with no engine; script generation and the reviewer
+            # read this column to keep a v3 run's actions out of the workflow's script. Not swallowed:
+            # a v3 fallback whose row still reads v1 could be minted into a dead-selector script.
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                engine=engine.value,
+            )
         await app.agent.execute_step(
             organization=organization,
             task=task,

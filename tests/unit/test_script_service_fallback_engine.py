@@ -266,7 +266,7 @@ async def test_fallback_of_an_unset_engine_block_follows_the_chosen_engine_cutof
         context,
         FakeExperimentationProvider(),
         workflow_run_id="wr_test",
-        ineligibility_reason=v3_ab_ineligibility_reason(blocks, is_script_run=True),
+        ineligibility_reason=v3_ab_ineligibility_reason(blocks),
         takes_default_engine=takes_default_engine(blocks),
         first_version_created_at=born_at,
     )
@@ -333,7 +333,7 @@ async def test_an_uncached_script_block_runs_where_its_stored_block_would_only_p
         context,
         FakeExperimentationProvider(),
         workflow_run_id="wr_test",
-        ineligibility_reason=v3_ab_ineligibility_reason(workflow.workflow_definition.blocks, is_script_run=True),
+        ineligibility_reason=v3_ab_ineligibility_reason(workflow.workflow_definition.blocks),
         takes_default_engine=takes_default_engine(workflow.workflow_definition.blocks),
         first_version_created_at=born_at,
     )
@@ -546,3 +546,62 @@ async def test_fallback_episode_excludes_decision_row_from_agent_action_count() 
         update_episode.await_args.kwargs["agent_actions"]["failure_reason"]
         == script_service.VERIFIER_SWAP_FAILURE_REASON
     )
+
+
+class _DispatchReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("block_engine", "recorded"), [(RunEngine.skyvern_v3, ["skyvern-3.0"]), (RunEngine.skyvern_v1, [])]
+)
+@pytest.mark.asyncio
+async def test_a_v3_fallback_records_its_engine_on_the_cached_blocks_row(
+    block_engine: RunEngine, recorded: list[str]
+) -> None:
+    # The row was created for cached code with no engine. Script generation and the reviewer read this
+    # column to keep a v3 run's selector-less actions out of the workflow's script.
+    workflow = _make_workflow([_make_task_block("my_block", engine=block_engine)])
+    app = _make_app(workflow)
+    app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+    # The engine is written before dispatch; stop there instead of faking everything after it.
+    app.agent.execute_step = AsyncMock(side_effect=_DispatchReached())
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        pytest.raises(_DispatchReached),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+            workflow_run_block_id="wrb_cached",
+        )
+
+    engines = [
+        call.kwargs["engine"]
+        for call in app.DATABASE.observer.update_workflow_run_block.call_args_list
+        if "engine" in call.kwargs
+    ]
+    assert engines == recorded
+
+
+@pytest.mark.asyncio
+async def test_a_v3_fallback_that_cannot_record_its_engine_does_not_run() -> None:
+    # Running anyway would leave a v3 run whose rows read v1, which script generation would then mint.
+    workflow = _make_workflow([_make_task_block("my_block", engine=RunEngine.skyvern_v3)])
+    app = _make_app(workflow)
+    app.DATABASE.observer.update_workflow_run_block = AsyncMock(side_effect=RuntimeError("db unavailable"))
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        pytest.raises(RuntimeError),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+            workflow_run_block_id="wrb_cached",
+        )
+
+    app.agent.execute_step.assert_not_awaited()

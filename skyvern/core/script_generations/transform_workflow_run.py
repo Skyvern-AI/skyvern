@@ -6,12 +6,17 @@ import structlog
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, reasoning_is_turn_scoped
 
 LOG = structlog.get_logger(__name__)
+
+
+class TaskV3RunNotScriptableError(Exception):
+    """Task V3 actions carry no element data, so a script built from them has dead selectors."""
 
 
 @dataclass
@@ -258,6 +263,10 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     workflow_run_blocks.sort(key=lambda x: x.created_at)
+    # Checked on the same snapshot the actions are read through: a block row records its engine before any of
+    # its actions exist, so an in-flight mint cannot read a v3 task's actions without also reading its v3 row.
+    if any(block.engine == RunEngine.skyvern_v3 for block in workflow_run_blocks):
+        raise TaskV3RunNotScriptableError(workflow_run_id)
 
     # Create mapping from definition blocks by label for quick lookup
     workflow_run_blocks_by_label = {block.label: block for block in workflow_run_blocks if block.label}

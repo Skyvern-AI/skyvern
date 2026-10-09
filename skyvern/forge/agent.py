@@ -3672,6 +3672,7 @@ class ForgeAgent:
                 )
                 return step, detailed_output, None
 
+            dispatched_as_v3 = engine == RunEngine.skyvern_v3
             # A bare task always qualifies; a workflow block must be an allowed type.
             task_block_supports_v3 = task_block is None or _task_block_supports_v3(task_block)
             if engine == RunEngine.skyvern_v3 and task_block is not None and not task_block_supports_v3:
@@ -3697,7 +3698,7 @@ class ForgeAgent:
                         "DISABLE_TASK_V3 could not be evaluated; falling back to the step engine",
                         task_id=task.task_id,
                         workflow_run_id=task.workflow_run_id,
-                        # The persisted run type and arm still read v3; cohort reads exclude these by this line.
+                        # The arm still reads v3; cohort reads exclude these by this line.
                         route_reason="flag_error",
                         exc_info=True,
                     )
@@ -3744,6 +3745,23 @@ class ForgeAgent:
                     list_files_before=list_files_before,
                 )
                 return step, detailed_output, None
+
+            if dispatched_as_v3 and task.workflow_run_id:
+                # The block row was labeled v3 before dispatch, and script generation skips a run with a
+                # v3 row, so a fallback left labeled v3 would lose a script the run was asked to generate.
+                try:
+                    await app.DATABASE.observer.set_workflow_run_block_engine_by_task_id(
+                        task.task_id, RunEngine.skyvern_v1, organization_id=task.organization_id
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Could not record the step-engine fallback on the block row",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        exc_info=True,
+                    )
+                # Later steps recurse with this engine; pinning v1 keeps them off the gate and this write.
+                engine = RunEngine.skyvern_v1
 
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
