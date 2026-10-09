@@ -63,6 +63,7 @@ from skyvern.forge.taskv3.code_surface import (
     apply_surface,
     configured_surface,
 )
+from skyvern.forge.taskv3.field_commit import Tier
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
@@ -135,54 +136,6 @@ def test_classify_commit_matrix() -> None:
     assert _classify_commit(None, 1, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
     assert _classify_commit(None, 0, S, committed_value=True) == CommitStatus.UNVERIFIED
     assert _classify_commit(None, 2, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
-
-
-def test_match_menu_option_matrix() -> None:
-    from skyvern.forge.taskv3.tools import _match_menu_option
-
-    opts = [
-        {"n": 1, "text": "Analytics"},
-        {"n": 2, "text": "Engineering"},
-        {"n": 3, "text": "People Operations"},
-    ]
-    # Exact normalized match (case/whitespace-insensitive) wins.
-    assert _match_menu_option("Analytics", opts) == 1
-    assert _match_menu_option("  analytics ", opts) == 1
-    assert _match_menu_option("PEOPLE   OPERATIONS", opts) == 3
-    # FORWARD token-prefix only: a short observed value matches the fuller option label.
-    assert _match_menu_option("People", opts) == 3
-    eeo = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "No"}, {"n": 3, "text": "Decline to self-identify"}]
-    assert _match_menu_option("Decline", eeo) == 3
-    # REVERSE is refused: a longer value must NOT commit a shorter, more-general option — the fuller row
-    # may simply be unrendered (virtualised list), so committing "People Operations" for a "…Team" value
-    # or "New" for "New York" would be a silent wrong success.
-    assert _match_menu_option("People Operations Team", opts) is None
-    assert _match_menu_option("New York", [{"n": 1, "text": "New"}, {"n": 2, "text": "Newark"}]) is None
-    # CRITICAL: a value that is only an incidental SUBSTRING of an option is NOT matched — "No" is inside
-    # "prefer not to answer" but must never commit the "No" row on a sensitive question.
-    assert _match_menu_option("Prefer not to answer", eeo) is None
-    # ...and an abbreviation that is not a whole-token prefix is not guessed at either.
-    assert _match_menu_option("Eng", opts) is None
-    # Apostrophe/quote folding comes from the shared exact/stem matcher.
-    assert _match_menu_option("Masters Degree", [{"n": 1, "text": "Master's Degree"}, {"n": 2, "text": "PhD"}]) == 1
-    # No match -> None (hand the options back to the model, don't guess).
-    assert _match_menu_option("Legal", opts) is None
-    assert _match_menu_option("", opts) is None
-    # Exact wins even when a token-prefix is otherwise ambiguous: "Yes" is an exact row despite
-    # "Yes, I consent" sharing its first token.
-    yn = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "Yes, I consent"}, {"n": 3, "text": "No"}]
-    assert _match_menu_option("Yes", yn) == 1
-    # Ambiguous forward-prefix with no exact match -> None, never an arbitrary pick.
-    ambiguous = [{"n": 1, "text": "United States Minor"}, {"n": 2, "text": "United States Major"}]
-    assert _match_menu_option("United States", ambiguous) is None
-    # A row missing a usable index is ignored rather than crashing.
-    assert _match_menu_option("Analytics", [{"n": None, "text": "Analytics"}, {"n": 5, "text": "Analytics"}]) == 5
-    # A leading comma token is folded away, so a short value forward-prefix-matches a punctuated label
-    # ("Yes" -> "Yes, I consent") instead of silently missing on the attached comma.
-    punct = [{"n": 1, "text": "Yes, I consent"}, {"n": 2, "text": "No"}]
-    assert _match_menu_option("Yes", punct) == 1
-    # A slash is left intact so a combined single option is NOT prefix-matched by one of its halves.
-    assert _match_menu_option("Yes", [{"n": 1, "text": "Yes/No"}, {"n": 2, "text": "Maybe"}]) is None
 
 
 def test_annotate_screenshot_downscales_and_draws_marks() -> None:
@@ -32610,7 +32563,7 @@ _WRAPPED_INPUT_COMBOBOX_HTML = """
 async def test_select_combobox_refuses_single_leading_clause_match_when_unique() -> None:
     # The middle step of the cascade above on its own: with #state committed to "IL", "Springfield" is
     # a unique city match -- but only a word-prefix of the row's full label, so it is refused rather
-    # than auto-committed; the caller must supply "Springfield, Sangamon, IL".
+    # than auto-committed, and the row is offered first; the caller must supply "Springfield, Sangamon, IL".
     async with _address_lookup_page() as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         state_r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "IL"})
@@ -32618,7 +32571,8 @@ async def test_select_combobox_refuses_single_leading_clause_match_when_unique()
 
         city_r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
         assert city_r.status == "error", city_r.content
-        assert "Springfield, Sangamon, IL" in city_r.content, city_r.content
+        first_offer = city_r.content.split("nearest: ", 1)[1].split(";")[0]
+        assert "'Springfield, Sangamon, IL' (starts with it" in first_offer, city_r.content
 
 
 @_skip_no_browser
@@ -33693,7 +33647,7 @@ async def test_type_ambiguity_puts_back_the_value_the_field_arrived_with() -> No
     # from text this call typed and the widget never accepted.
     async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": "#country", "text": "United States"})
+        r = await _tool(tools, "type").handler({"selector": "#country", "text": "United"})
         assert r.status == "error", r.content
         assert "United States (+1)" in r.content, r.content
         assert "United States Minor Outlying Islands (+1)" in r.content, r.content
@@ -34372,12 +34326,12 @@ async def test_click_on_a_container_wrapping_a_checkbox_and_a_button_gets_no_rea
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_ambiguity_puts_back_the_value_the_field_arrived_with() -> None:
-    # "United States" matches two rows, so the pick refuses. The field arrived holding "+1" -- a value
+    # "United" starts several rows, so the pick refuses. The field arrived holding "+1" -- a value
     # the page put there -- and the refusal must hand it back: leaving the query behind replaces a real
     # answer with text the widget never accepted, and a later read of the form cannot tell the two apart.
     async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "select_combobox").handler({"selector": "#country", "value": "United States"})
+        r = await _tool(tools, "select_combobox").handler({"selector": "#country", "value": "United"})
         assert r.status == "error", r.content
         assert "United States (+1)" in r.content, r.content
         assert "United States Minor Outlying Islands (+1)" in r.content, r.content
@@ -42656,3 +42610,334 @@ async def test_select_option_reads_a_visible_single_select_back(
     assert r.status == status, r.content
     if status == "error":
         assert r.error_class == "did_not_commit" and "'Alpha'" in r.content, r.content
+
+
+# A phone-country picker: each declared row renders a flag, the country name and its dial code. With `virtual`, the
+# list ignores the query and renders only the window of its 300 rows the scroller shows.
+_PHONE_COUNTRY_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="cc" type="text" role="combobox" aria-autocomplete="list" aria-controls="cc-list" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:320px;height:24px">
+  <div id="cc-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:320px;max-height:240px;overflow:auto;background:#fff;display:none">
+    <div id="cc-space" style="position:relative"></div>
+  </div>
+  <script>
+    var VIRTUAL = %s;
+    var ROWS = [['\\u{1F1FA}\\u{1F1F8}', 'United States', '+1'], ['\\u{1F1FA}\\u{1F1F2}', 'United States Minor Outlying Islands', '+1'],
+                ['\\u{1F1EC}\\u{1F1E7}', 'United Kingdom', '+44'], ['\\u{1F1E8}\\u{1F1E6}', 'Canada', '+1']];
+    if (VIRTUAL) { for (var i = 0; i < 296; i++) { ROWS.push(['', 'Region ' + (100 + i), '+' + (200 + i)]); } }
+    var input = document.getElementById('cc'), list = document.getElementById('cc-list');
+    var space = document.getElementById('cc-space');
+    var shown = [];
+    function row(r, top) {
+      var el = document.createElement('div');
+      el.setAttribute('role', 'option');
+      el.style.cssText = 'height:24px;cursor:pointer;' + (VIRTUAL ? 'position:absolute;left:0;right:0;top:' + top + 'px' : '');
+      el.innerHTML = '<span>' + r[0] + '</span> <span>' + r[1] + '</span> <span>' + r[2] + '</span>';
+      el.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      el.addEventListener('click', function () {
+        input.value = el.innerText;
+        input.setAttribute('data-committed', r[1]);
+        list.style.display = 'none';
+      });
+      return el;
+    }
+    function render() {
+      space.innerHTML = '';
+      if (!VIRTUAL) { shown.forEach(function (r) { space.appendChild(row(r, 0)); }); return; }
+      space.style.height = (shown.length * 24) + 'px';
+      var first = Math.floor(list.scrollTop / 24);
+      shown.slice(first, first + 12).forEach(function (r, k) { space.appendChild(row(r, (first + k) * 24)); });
+    }
+    list.addEventListener('scroll', render);
+    input.addEventListener('input', function () {
+      var q = input.value.trim().toLowerCase();
+      shown = VIRTUAL ? ROWS : ROWS.filter(function (r) { return q && r[1].toLowerCase().indexOf(q) === 0; });
+      render();
+      list.style.display = q && shown.length ? 'block' : 'none';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_a_country_row_decorated_with_its_dial_code() -> None:
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") == "United States"
+    match = [e for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert match and match[-1]["tier"] == "primary" and match[-1]["settle_ms"] > 0, match
+    (picked,) = (e for e in logs if e["event"] == "taskv3 combobox pick verdict")
+    assert picked["verdict"] == "ok" and picked["tier"] == "primary", picked
+    assert "United States" not in repr(match), match
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_commits_a_decorated_row_a_late_row_joins() -> None:
+    # A second "Canada" row lands between the first read and the settle's; the settle must see it, not only re-read the
+    # rows it tagged.
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        await page.evaluate(
+            """() => document.getElementById('cc').addEventListener('input', (e) => {
+                 if (!e.isTrusted || window.JOINED) return;
+                 clearTimeout(window.LATE);
+                 window.LATE = setTimeout(() => {
+                   window.JOINED = true;
+                   ROWS.push(['', 'Canada', '+2']);
+                   document.getElementById('cc').dispatchEvent(new Event('input'));
+                 }, 700);
+               })"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    # The settle refused, not a later re-resolve, and the refusal lists the rows as it last tagged them.
+    reasons = [e["reason"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert reasons[0] == "unsettled", reasons
+    assert "+2" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_with_the_nonexact_switch_off_commits_no_main_label_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CHOICE_NONEXACT_COMMIT", False)
+    assert taskv3_tools._choice_tiers(typeahead=True) == frozenset({Tier.EXACT})
+    assert taskv3_tools._choice_tiers(typeahead=False) == frozenset(Tier) - {Tier.PRIMARY}
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_decorated_row_from_a_list_it_could_not_read_whole() -> None:
+    async with _content_page(_PHONE_COUNTRY_HTML % "true") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    near = r.content.split("nearest: ", 1)[1]
+    assert near.split(";")[0].endswith(
+        "United States +1' (its main label is it — not picked: the list may hold more rows)"
+    ), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_decorated_row_for_a_value_with_no_word_to_overlap() -> None:
+    # "UK" has no 3-character word, so the finder admits rows by exact text alone and never sees every row that
+    # shares a word with it: the one row it found is not a complete view, whatever the list's coverage says.
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        await page.evaluate("ROWS.push(['\\u{1F1EC}\\u{1F1E7}', 'UK', '+44'])")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "UK"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    assert "UK +44' (its main label is it — not picked" in r.content, r.content
+
+
+# A click-opened list built when its trigger is clicked. `ANNOUNCE` lands beside the rows inside the popup.
+_CLICK_OPEN_LIST_HTML = """
+<!doctype html><html><body style="margin:0">
+  <button id="pick" aria-haspopup="true" style="position:absolute;top:20px;left:20px;width:260px;height:28px">Choose</button>
+  <script>
+    var ROWS = ROWS_JSON;
+    var b = document.getElementById('pick');
+    window.undone = false;
+    b.addEventListener('click', function () {
+      var old = document.getElementById('pop');
+      if (old) old.remove();
+      var pop = document.createElement('div');
+      pop.id = 'pop';
+      pop.style.cssText = 'position:absolute;top:52px;left:20px;width:260px;background:#fff';
+      pop.innerHTML = 'WRAP_OPEN<div id="opts" LIST_ATTRS></div>WRAP_CLOSE ANNOUNCE';
+      document.body.appendChild(pop);
+      var opts = document.getElementById('opts');
+      ROWS.forEach(function (t) {
+        var d = document.createElement('div');
+        if (ROW_ROLE) d.setAttribute('role', ROW_ROLE);
+        d.textContent = t;
+        d.style.cssText = 'height:24px;cursor:pointer';
+        d.addEventListener('click', function () {
+          b.textContent = t;
+          b.setAttribute('data-committed', t);
+          pop.remove();
+        });
+        opts.appendChild(d);
+      });
+      var undo = document.getElementById('undo');
+      if (undo) undo.addEventListener('click', function () { window.undone = true; });
+    });
+  </script>
+</body></html>
+"""
+
+
+def _click_open_list_html(
+    rows: list[str], *, list_attrs: str = "", wrap: str = "", announce: str = "", row_role: str = "option"
+) -> str:
+    return (
+        _CLICK_OPEN_LIST_HTML.replace("ROWS_JSON", json.dumps(rows))
+        .replace("ROW_ROLE", json.dumps(row_role))
+        .replace("LIST_ATTRS", list_attrs)
+        .replace("WRAP_OPEN", f"<div {wrap}>" if wrap else "")
+        .replace("WRAP_CLOSE", "</div>" if wrap else "")
+        .replace("ANNOUNCE", announce)
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "value", "row"),
+    [
+        (["10023(Example Co)", "10024(Sample Group)", "20045(Other Org)"], "10023", "10023(Example Co)"),
+        (["Full-time - Permanent", "Part-time - Temporary"], "Full-time", "Full-time - Permanent"),
+    ],
+    ids=["id-name", "value-qualifier"],
+)
+async def test_select_combobox_commits_a_click_opened_row_named_by_its_main_label(
+    rows: list[str], value: str, row: str
+) -> None:
+    async with _content_page(_click_open_list_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": value})
+        assert r.status == "ok", r.content
+        assert "not an exact match" in r.content, r.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") == row
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_menu_never_lists_an_alerts_actions_as_its_rows() -> None:
+    # Undeclared rows and row-shaped actions: nothing but the announcement rule tells the toast from the menu.
+    toast = (
+        '<div role="alert"><div id="undo" style="height:24px;cursor:pointer">Undo</div>'
+        '<div style="height:24px;cursor:pointer">Dismiss</div></div>'
+    )
+    html = _click_open_list_html(["Alpha", "Beta", "Gamma"], announce=toast, row_role="")
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "Undo"})
+        assert r.status == "error", r.content
+        assert "Alpha" in r.content and "Dismiss" not in r.content, r.content
+        assert await page.evaluate("window.undone") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_listbox_inside_a_status_region_is_still_a_menu() -> None:
+    html = _click_open_list_html(["Alpha", "Beta", "Gamma"], list_attrs='role="listbox"', wrap='role="status"')
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "Beta"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") == "Beta"
+
+
+_SENTENCE_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="auth" type="text" role="combobox" aria-autocomplete="list" aria-controls="auth-list" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:560px;height:24px">
+  <div id="auth-list" role="listbox" style="position:absolute;top:50px;left:20px;width:560px;background:#fff"></div>
+  <script>
+    var ROWS = ROWS_JSON;
+    var input = document.getElementById('auth'), list = document.getElementById('auth-list');
+    input.addEventListener('input', function () {
+      var q = input.value.trim().toLowerCase();
+      list.innerHTML = '';
+      ROWS.filter(function (t) { return q && t.toLowerCase().indexOf(q) === 0; }).forEach(function (t) {
+        var d = document.createElement('div');
+        d.setAttribute('role', 'option');
+        d.textContent = t;
+        d.style.cssText = 'height:40px;cursor:pointer;font-size:12px';
+        d.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        d.addEventListener('click', function () { input.value = t; input.setAttribute('data-committed', t); list.innerHTML = ''; });
+        list.appendChild(d);
+      });
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "rows"),
+    [("Lawyers", ["Lawyers (Corporate)", "Lawyer"]), ("Lawyers", ["Lawyer"]), ("New", ["News", "New York"])],
+    ids=["main-label-beside-a-singular", "lone-singular", "plural-beside-a-longer-row"],
+)
+async def test_select_combobox_never_picks_a_row_that_shares_only_a_singular_or_plural(
+    value: str, rows: list[str]
+) -> None:
+    # A singular/plural row shares no whole word with the value: it reaches the matcher as a rival, never as the pick.
+    html = _SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(rows)).replace(
+        "t.toLowerCase().indexOf(q) === 0", "q.length > 0"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": value})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") is None
+    if rows == ["Lawyers (Corporate)", "Lawyer"]:
+        assert all(repr(t) in r.content for t in rows), r.content
+        tied = [e["tied"] for e in logs if e["event"] == "taskv3 choice match" and e["reason"] == "ambiguous"]
+        assert tied and tied[0] == ["primary", "stem"], tied
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_keeps_waiting_past_a_row_that_shares_only_a_singular() -> None:
+    # The singular renders first and the exact row a second later: a reaction made only of a singular/plural rival is
+    # no reaction, so the wait goes on until the value's own row arrives.
+    html = _SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(["Lawyer"])).replace(
+        "t.toLowerCase().indexOf(q) === 0", "q.length > 0"
+    )
+    async with _content_page(html) as page:
+        await page.evaluate(
+            """() => document.getElementById('auth').addEventListener('input', (e) => {
+                 if (!e.isTrusted || window.LATE) return;
+                 window.LATE = setTimeout(() => {
+                   ROWS.push('Lawyers');
+                   document.getElementById('auth').dispatchEvent(new Event('input'));
+                 }, 1000);
+               })"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": "Lawyers"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") == "Lawyers"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reads_a_declared_sentence_row_longer_than_a_caption() -> None:
+    rows = [
+        "Yes, I am authorized to work in this country and will not require sponsorship now or in the future",
+        "No, I will require sponsorship to work in this country now or at some point in the future",
+    ]
+    assert all(len(t) > 80 for t in rows)
+    async with _content_page(_SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(rows))) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": rows[0]})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") == rows[0]
+    # The full value's own read admits the row; a shorter search reaching it would be a "searched" gate.
+    gates = [e["gate"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert gates == ["overlap"], gates
