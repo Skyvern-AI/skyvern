@@ -1333,6 +1333,22 @@ def _task_v3_run_secret_values(task: Task) -> set[str]:
     )
 
 
+async def _settle_before_post_action_screenshot(browser_state: BrowserState) -> None:
+    # Never raises: `safe_wait_for_animation_end` swallows its own timeout, and a page or frame this
+    # cannot reach is one the capture that follows has to handle anyway.
+    try:
+        page = await browser_state.get_working_page()
+        if page is None:
+            return
+        skyvern_frame = await SkyvernFrame.create_instance(
+            frame=page,
+            engine_selection=browser_state.engine_selection,
+        )
+        await skyvern_frame.safe_wait_for_animation_end(caller="taskv3_post_action_artifact")
+    except Exception:
+        LOG.debug("task_v3 could not settle the page before the post-action screenshot", exc_info=True)
+
+
 def _task_v3_goal_check_redactor(task: Task, context: SkyvernContext | None) -> Callable[[str], str]:
     """One secret set per goal check, built when the check starts."""
     # Raw runtime values too, not only the artifact-redaction set: a verification code the run read
@@ -2693,6 +2709,10 @@ class ForgeAgent:
             nonlocal v3_round_billed
             screenshot_artifact_id: str | None = None
             try:
+                # A tool call returns as soon as the page accepts it, so a navigating click leaves this
+                # capture racing the next paint and it lands on a blank page (SKY-18163). Settle first,
+                # bounded, the way the step engine's own post-action capture does.
+                await _settle_before_post_action_screenshot(browser_state)
                 screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                 screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
                     step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot

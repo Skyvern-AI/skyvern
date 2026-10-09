@@ -117,6 +117,9 @@ async def _run_execute_task_v3(
     action_rounds: list[list[RoundAction]] | None = None,
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
+    # Records what the post-action capture path does, in order: "settle" per page settle,
+    # "screenshot" per capture. Also stubs SkyvernFrame so the settle needs no real frame.
+    capture_order: list[str] | None = None,
     task_block: BaseTaskBlock | None = None,
     recovery_credential_parameter_keys: list[str] | None = None,
     validation_without_page_information: bool = False,
@@ -184,6 +187,20 @@ async def _run_execute_task_v3(
         return_value=b"png-bytes",
         side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
     )
+    if capture_order is not None:
+
+        async def _record_capture(**_kwargs: Any) -> bytes:
+            capture_order.append("screenshot")
+            if screenshot_raises:
+                raise RuntimeError("screenshot boom")
+            return b"png-bytes"
+
+        browser_state.take_post_action_screenshot = AsyncMock(side_effect=_record_capture)
+        settling_frame = MagicMock()
+        settling_frame.safe_wait_for_animation_end = AsyncMock(
+            side_effect=lambda **_kwargs: capture_order.append("settle")
+        )
+        monkeypatch.setattr("skyvern.forge.agent.SkyvernFrame.create_instance", AsyncMock(return_value=settling_frame))
 
     async def _loop(**kwargs: Any) -> LoopOutcome:
         # Exposed so tests can probe context state as seen from inside the loop (and, since this
@@ -1202,6 +1219,32 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
     assert [a.reasoning for a in persisted] == [round_texts[0], round_texts[0], round_texts[1]]
     assert [a.intention for a in persisted] == ["Clicked an element", "Typed into a text field", "Clicked an element"]
     assert all(a.response is None for a in persisted)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_settles_the_page_before_each_post_action_screenshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-18163: a tool call returns as soon as the page accepts it, so capturing straight after a
+    # navigating click photographs the blank page mid-paint and the run details show empty
+    # screenshots. Every round's capture must be preceded by the bounded page settle.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    rounds = [
+        [RoundAction("click", {"selector": "#next"}, True, billable=True)],
+        [RoundAction("click", {"selector": "#submit"}, True, billable=True)],
+    ]
+    capture_order: list[str] = []
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        capture_order=capture_order,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    # The two action rounds, each settled before its own capture. The terminal decision capture that
+    # follows them runs after the loop has already finished, so it is not part of this contract.
+    assert capture_order[:4] == ["settle", "screenshot", "settle", "screenshot"]
 
 
 _GOTO_OUTCOME = {
