@@ -57,6 +57,16 @@ async def test_mark_canceled_if_not_final_returns_conditional_result(
     )
 
 
+def _patch_service_log(monkeypatch: pytest.MonkeyPatch, **methods: object) -> None:
+    """Replace the service module's LOG rather than a method on it. Undoing a patched method on
+    structlog's lazy proxy leaves a bound logger stuck to the proxy, and later tests in the same
+    process then miss that module's lines in structlog.testing.capture_logs."""
+    log = MagicMock(wraps=service_module.LOG)
+    for name, method in methods.items():
+        setattr(log, name, method)
+    monkeypatch.setattr(service_module, "LOG", log)
+
+
 def _make_updated_row(now: datetime | None = None) -> MagicMock:
     now = now or datetime.now(UTC)
     row = MagicMock()
@@ -202,7 +212,7 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     def fake_info(event: str, **kwargs: object) -> None:
         info_calls.append((event, dict(kwargs)))
 
-    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+    _patch_service_log(monkeypatch, info=fake_info)
 
     svc = WorkflowService()
     result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_live")
@@ -276,7 +286,7 @@ async def test_mark_canceled_if_not_final_skips_side_effects_on_terminal_row(
     def fake_info(event: str, **kwargs: object) -> None:
         info_calls.append(event)
 
-    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+    _patch_service_log(monkeypatch, info=fake_info)
 
     svc = WorkflowService()
     result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_already_done")
@@ -537,7 +547,7 @@ async def test_cancel_policy_run_retries_failed_terminal_release_without_raising
 
     monkeypatch.setattr(svc, "run_terminal_side_effects", fail_release)
     warning = MagicMock()
-    monkeypatch.setattr(service_module.LOG, "warning", warning)
+    _patch_service_log(monkeypatch, warning=warning)
 
     # The cancel operation itself succeeded; a failed best-effort release is retried and left
     # for the durable recovery owner instead of being raised through the API path.
