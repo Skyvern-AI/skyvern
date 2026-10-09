@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
 import httpx
 import structlog
@@ -97,7 +97,7 @@ from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
-    from playwright.async_api import BrowserContext, Locator, Request, Response
+    from playwright.async_api import BrowserContext
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
@@ -116,7 +116,6 @@ if TYPE_CHECKING:
     from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
-    from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -974,32 +973,6 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
-@dataclass(frozen=True)
-class DownloadRecoveryRemap:
-    """Bounded outcome of a download-recovery ``remap``.
-
-    ``locator`` is the retry target on the pinned page, or ``None`` when recovery must not click.
-    ``resolution`` names how the locator was found (``cached_css`` or ``fresh_scrape``) and is set only
-    when ``locator`` is present. ``reason`` is a bounded, non-sensitive rejection code when ``locator``
-    is ``None`` so the single structured log line can distinguish sub-outcomes without leaking URLs,
-    query parameters, or customer data.
-    """
-
-    locator: Locator | None
-    resolution: str | None = None
-    reason: str | None = None
-
-
-class DownloadRecoveryHook(Protocol):
-    def matches_target(self, request: Request) -> bool: ...
-
-    def matches_failure(self, response: Response) -> bool: ...
-
-    async def remap(self, page: Page) -> DownloadRecoveryRemap: ...
-
-    async def reverify(self, page: Page) -> str | None: ...
-
-
 class AgentFunction:
     async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
         """OSS has no customer audit store; cloud overrides this best-effort hook."""
@@ -1011,11 +984,6 @@ class AgentFunction:
         action: str,
         resource: Mapping[str, object],
     ) -> str | None:
-        return None
-
-    def build_download_recovery(
-        self, *, action: Action, scraped_page: ScrapedPage, page: Page
-    ) -> DownloadRecoveryHook | None:
         return None
 
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
