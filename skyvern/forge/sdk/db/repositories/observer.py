@@ -719,15 +719,16 @@ class ObserverRepository(BaseRepository):
         task_id: str,
         engine: RunEngine,
         organization_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         async with self.Session() as session:
-            await session.execute(
+            result = await session.execute(
                 update(WorkflowRunBlockModel)
                 .where(WorkflowRunBlockModel.task_id == task_id)
                 .where(WorkflowRunBlockModel.organization_id == organization_id)
                 .values(engine=engine.value)
             )
             await session.commit()
+            return result.rowcount > 0
 
     @db_operation("workflow_run_has_block_on_engine")
     async def workflow_run_has_block_on_engine(

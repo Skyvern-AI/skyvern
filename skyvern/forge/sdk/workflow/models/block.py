@@ -2079,10 +2079,10 @@ class BaseTaskBlock(Block):
         """The engine this block dispatches to, after the per-run A/B.
 
         Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this; when the
-        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A block pinned to a non-default
-        engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine or on a block whose skyvern_v1 a person pinned.
+        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A
+        block pinned to a non-default engine is honored as-authored, and a block the eligibility check
+        never saw is left alone; neither is ever rerouted. An unset engine routes like skyvern_v1, except
+        in a run that honors the chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
