@@ -2340,11 +2340,13 @@ class LLMAPIHandlerFactory:
                     # so litellm's router fallback (which only fires on exceptions) never
                     # recovers it. Gemini's non-configurable safety filters block PII-heavy
                     # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
-                    # another Gemini tier hits the same block — jump straight to the first
-                    # non-Gemini fallback group. Fires for any Gemini model that produced the
-                    # block, including a standard tier litellm already fell back to (SKY-11766).
+                    # another Gemini tier hits the same block — jump straight to a non-Gemini
+                    # group: the config's dedicated escape group when it names one, else the
+                    # first non-Gemini group in the fallback chain. Fires for any Gemini model
+                    # that produced the block, including a standard tier litellm already fell
+                    # back to (SKY-11766, SKY-18083).
                     if is_content_filtered_response(response) and "gemini" in (model_used or "").lower():
-                        non_gemini_fallback = next(
+                        non_gemini_fallback = llm_config.content_filter_fallback_model_group or next(
                             (group for group in fallback_groups if "gemini" not in group.lower()), None
                         )
                         if non_gemini_fallback is not None:
@@ -2659,8 +2661,10 @@ class LLMAPIHandlerFactory:
                         parsed_response = parse_api_response(
                             response, llm_config.add_assistant_prefix, force_dict, prompt_name
                         )
-                    except BaseLLMError:
+                    except BaseLLMError as e:
                         _llm_span.set_attribute("status", "error")
+                        e.llm_key = llm_key
+                        e.prompt_name = prompt_name
                         raise
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
@@ -3313,8 +3317,10 @@ class LLMAPIHandlerFactory:
                         parsed_response = parse_api_response(
                             response, llm_config.add_assistant_prefix, force_dict, prompt_name
                         )
-                    except BaseLLMError:
+                    except BaseLLMError as e:
                         _llm_span.set_attribute("status", "error")
+                        e.llm_key = llm_key
+                        e.prompt_name = prompt_name
                         raise
                 parsed_response_json = json.dumps(parsed_response, indent=2)
                 if should_persist_llm_artifacts:
@@ -4139,8 +4145,10 @@ class LLMCaller:
                 parsed_response = parse_api_response(
                     response, self.llm_config.add_assistant_prefix, force_dict, prompt_name
                 )
-            except BaseLLMError:
+            except BaseLLMError as e:
                 _llm_span.set_attribute("status", "error")
+                e.llm_key = self.llm_key
+                e.prompt_name = prompt_name
                 raise
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if should_persist_llm_artifacts:

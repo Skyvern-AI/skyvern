@@ -84,7 +84,9 @@ from skyvern.forge.taskv3.loop import (
     CLICK_DISPATCHED_DATA_KEY,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
+    OPENED_LIST_ERROR_CLASSES,
     PAGE_UNAVAILABLE_ERROR,
+    PICKED_OPTION_DATA_KEY,
     REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
@@ -14063,8 +14065,10 @@ def build_browser_tools(
             # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
             # so on a refusal the two can disagree about which element the selector meant -- a cloned
             # marker matching twice resolves here to the clone and is then refused for exactly that
-            # ambiguity, and naming the twin nobody touched is worse than naming nothing.
-            if (name is None and kind is None) or result.status != "ok":
+            # ambiguity, and naming the twin nobody touched is worse than naming nothing. A list that could not
+            # settle a row is not a refusal: the control was opened and its list waits for a pick.
+            acted = result.status == "ok" or result.error_class in OPENED_LIST_ERROR_CLASSES
+            if (name is None and kind is None) or not acted:
                 return result
             data = {**(result.data or {})}
             if name is not None:
@@ -14180,6 +14184,7 @@ def build_browser_tools(
 
     # What the last menu-open note reported, for the click's call record; reset before each reaction read.
     menu_note_census: dict[str, Any] = {}
+    menu_pick: dict[str, str] = {}
 
     def _menu_note(found: dict[str, Any], selector: str, *, clicked_row: bool = False) -> str:
         menu_note_census.clear()
@@ -14196,6 +14201,11 @@ def build_browser_tools(
         # Returns (note, commit_error) — at most one set. Raises are the caller's to swallow (fail-open:
         # a probe failure must degrade to the bare pre-feature ok, never fail the click).
         opt = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", _model_text(pre.get("optText") or "", 80)) or selector
+
+        def _selected(text: str) -> str:
+            menu_pick[PICKED_OPTION_DATA_KEY] = text
+            return f"Selected option {text!r}"
+
         if pre.get("isOption"):
             # Commit evidence, any one suffices: navigation, the menu closing, the option's own state
             # changing vs the post-hover baseline (multi-select menus commit WITHOUT closing), or a
@@ -14313,21 +14323,18 @@ def build_browser_tools(
                     await asyncio.sleep(0.3)
 
             async def _state_change_note(opt_text: str, after: dict[str, Any]) -> str:
-                picked = f"Selected option {opt_text!r} — its state changed (the menu stayed open)."
                 # A row that did not grow cannot have expanded into itself, so nothing competes with
                 # the commit reading and the probe is not worth its page walk -- which is the
                 # ordinary multi-select click.
-                if not _grew(after):
-                    return picked
-                child = await _child_menu_note()
+                child = await _child_menu_note() if _grew(after) else None
                 if not child:
-                    return picked
+                    return f"{_selected(opt_text)} — its state changed (the menu stayed open)."
                 # It grew AND opened child rows, so a selection attribute means it did both and
                 # dropping either half would be a false report. Without the "menu stayed open" clause:
                 # the child note has just renumbered the markers, so what the model was holding is
                 # precisely what did not stay.
                 if _picked(after):
-                    return f"Selected option {opt_text!r} — its state changed.\n{child}"
+                    return f"{_selected(opt_text)} — its state changed.\n{child}"
                 return child
 
             async def _same_document() -> bool | None:
@@ -14344,19 +14351,19 @@ def build_browser_tools(
             if url_before and url_now and url_now != url_before and await _same_document() is not True:
                 # A moved URL is a navigation unless the page says it is the same document --
                 # a menu that syncs its selection into the query string never left.
-                return f"Selected option {opt!r} — {_navigated_phrase()}.", None
+                return f"{_selected(opt)} — {_navigated_phrase()}.", None
             after, navigated = await _after_read()
             if after is None and navigated:
-                return f"Selected option {opt!r} — {_navigated_phrase()}.", None
+                return f"{_selected(opt)} — {_navigated_phrase()}.", None
             if after is not None and not after.get("stillOpen"):
                 child = await _cascade_child_note()
                 if child:
                     return child, None
-                return f"Selected option {opt!r} — the menu closed.", None
+                return f"{_selected(opt)} — the menu closed.", None
             if after is not None and _committed_state(after):
                 held, failure = await _state_holds(after.get("optState") or "")
                 if failure == "navigated":
-                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
+                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
@@ -14368,17 +14375,17 @@ def build_browser_tools(
             settled, navigated = await _after_read()
             if settled is None:
                 if navigated:
-                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
+                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
                 return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
                 child = await _cascade_child_note()
                 if child:
                     return child, None
-                return f"Selected option {opt!r} — the menu closed.", None
+                return f"{_selected(opt)} — the menu closed.", None
             if _committed_state(settled):
                 held, failure = await _state_holds(settled.get("optState") or "")
                 if failure == "navigated":
-                    return f"Selected option {opt!r} — {_navigated_phrase()}.", None
+                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
@@ -14540,7 +14547,23 @@ def build_browser_tools(
         except Exception:
             reach_pre = None
         enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
-        while isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
+
+        async def _gate_refuses() -> bool:
+            """Whether the driver would refuse this target as not enabled, right now.
+
+            Asked of the driver rather than re-derived: its rule is wider than `:disabled` and the
+            remainder is version-dependent (see cloud_docs/task-v3/README.md).
+            """
+            if isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
+                return True
+            if isinstance(reach_pre, dict) and not reach_pre.get("exists"):
+                # Nothing to ask about, and asking costs the resolve timeout before failing open.
+                return False
+            # In-page first: `_engine_enabled` fails open on a selector it cannot resolve, so asking it
+            # about a target re-rendered away mid-grace would skip the stale-selector branch below.
+            return not await _engine_enabled(page, selector)
+
+        while await _gate_refuses():
             if time.monotonic() >= enable_deadline:
                 return ToolResult.error(
                     f"{selector} is disabled — it cannot be clicked until the page enables it",
@@ -14899,6 +14922,7 @@ def build_browser_tools(
                 # option); the menu reaction is the authority on that before the toggle verdict stands.
                 if pre is not None:
                     menu_note_census.clear()
+                    menu_pick.clear()
                     try:
                         note, commit_error = await _click_reaction(
                             page, selector, pre, url_before, doc_planted=doc_planted
@@ -14906,6 +14930,7 @@ def build_browser_tools(
                     except Exception:
                         note, commit_error = None, None
                     transition_data.update(menu_note_census)
+                    transition_data.update(menu_pick)
                     if commit_error is not None:
                         return ToolResult.error(commit_error, data=transition_data)
                     if note:
@@ -14919,12 +14944,14 @@ def build_browser_tools(
         if pre is None:
             return ToolResult.ok(base, data=transition_data)
         menu_note_census.clear()
+        menu_pick.clear()
         try:
             note, commit_error = await _click_reaction(page, selector, pre, url_before, doc_planted=doc_planted)
         except Exception:
             LOG.debug("taskv3 click reaction probe failed", selector=selector, exc_info=True)
             return ToolResult.ok(base, data=transition_data)
         transition_data.update(menu_note_census)
+        transition_data.update(menu_pick)
         if commit_error is not None:
             return ToolResult.error(commit_error, data=transition_data)
         return ToolResult.ok(base + "\n" + note if note else base, data=transition_data)
@@ -14996,8 +15023,29 @@ def build_browser_tools(
         if isinstance(probe, dict) and probe.get("exists"):
             # fill() waits for "enabled" and "editable" on its own, so without these the run pays a
             # second full timeout for a state the probe has already read.
-            if probe.get("disabled") or probe.get("readOnly"):
-                raise _FieldNotEditable(selector, bool(probe.get("readOnly")))
+            if probe.get("readOnly"):
+                raise _FieldNotEditable(selector, True)
+            if probe.get("disabled"):
+                raise _FieldNotEditable(selector, False)
+            # `disabled` above is the page script's `:disabled`, narrower than what fill() waits on, so
+            # the driver is asked for the rest of its rule -- see the click gate. Held for that gate's
+            # grace rather than refused outright, because fill()'s own wait used to cover a field the
+            # page releases a moment later.
+            enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
+            while not await _engine_enabled(page, selector):
+                if time.monotonic() >= enable_deadline:
+                    raise _FieldNotEditable(selector, False)
+                await asyncio.sleep(0.1)
+                # Re-read rather than only polling the driver: a page that answers the grace by making
+                # the field readonly has made it un-typable for a different reason, and the accurate
+                # message is the one the caller renders.
+                held: Any = None
+                with contextlib.suppress(Exception):
+                    held = await _probe_evaluate(
+                        page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector)
+                    )
+                if isinstance(held, dict) and held.get("exists") and held.get("readOnly"):
+                    raise _FieldNotEditable(selector, True)
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):
@@ -21447,6 +21495,33 @@ def build_browser_tools(
         result = await _resolve_toggle_target(dict(args))
         return result.status == "ok" and result.data is not None and result.data.get("toggle") is True
 
+    async def _address_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        target = page.locator(str(args.get("selector") or ""))
+        row = None
+        if await target.count() == 1:
+            row = await target.get_attribute("data-tv3-menu", timeout=_TOGGLE_PROBE_EVALUATE_TIMEOUT_MS)
+        return ToolResult.ok("", data={"menu_row": row is not None})
+
+    _resolve_address_target = _with_act_by_mark(
+        _with_ref_resolution("address_probe", _with_selector_guard(_address_target))
+    )
+
+    async def _click_address(args: dict[str, Any]) -> tuple[str, bool]:
+        selector = str(args.get("selector") or "")
+        if args.get("mark") is None and not REF_SELECTOR_RE.match(selector):
+            return selector, False
+        resolved = dict(args)
+        try:
+            result = await _resolve_address_target(resolved)
+        except Exception:
+            return "", False
+        if result.status != "ok":
+            return "", False
+        return str(resolved.get("selector") or ""), bool((result.data or {}).get("menu_row"))
+
     tools = [
         _spec(
             "observe",
@@ -21681,6 +21756,7 @@ def build_browser_tools(
         _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name == "click":
             _tool_spec.toggle_probe = _click_targets_toggle
+            _tool_spec.address_probe = _click_address
     # Inside the download signal, so a download notice stays the last thing in a result.
     _apply_text_delta(tools)
     _apply_download_signal(tools, downloads_dir)

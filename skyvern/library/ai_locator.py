@@ -12,7 +12,7 @@ from playwright.async_api import Locator, Page
 
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.exceptions import ActionDeadlineExceeded
-from skyvern.webeye.action_deadline import under_action_deadline
+from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
 
 LOCATOR_CHAIN_METHODS = {
     "nth",
@@ -74,7 +74,7 @@ class AILocator(Locator):
                         selector_locator = self._page.locator(self._selector, **self._selector_kwargs)
                         # The probe is a driver call, so it shares the bound the caller's action carries.
                         async with under_action_deadline(budget_ms=budget_ms):
-                            count = await selector_locator.count()
+                            count = await cancellable_driver_call(selector_locator.count)
                         if count > 0:
                             self._resolved_locator = selector_locator
                             return self._resolved_locator
@@ -134,6 +134,6 @@ class AILocator(Locator):
             # Inference inside the resolve stays unbounded; the driver call carries its own timeout,
             # which a driver that stopped answering never honours.
             async with under_action_deadline(budget_ms=budget_ms):
-                return await method(*args, **kwargs)
+                return await cancellable_driver_call(lambda: method(*args, **kwargs))
 
         return async_method_wrapper

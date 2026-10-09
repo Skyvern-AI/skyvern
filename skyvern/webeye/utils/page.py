@@ -36,7 +36,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.contained_effects import contained_effect
-from skyvern.webeye.action_deadline import under_action_deadline
+from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
@@ -989,7 +989,9 @@ async def _bounded_page_screenshot(
     # The driver's own screenshot timeout has been seen not to fire for hours on an unresponsive page. The
     # action deadline also re-cancels a driver that swallows the first cancellation and rejects a late image.
     async with under_action_deadline(budget_ms=int(timeout)):
-        screenshot = await page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+        screenshot = await cancellable_driver_call(
+            lambda: page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+        )
     return screenshot
 
 
@@ -2027,7 +2029,7 @@ class SkyvernFrame:
         deadline = deadline if deadline is not None else loop.time() + timeout_ms / 1000
         try:
             async with asyncio.timeout_at(deadline):
-                result = await evaluate_expression()
+                result = await cancellable_driver_call(evaluate_expression)
         except asyncio.TimeoutError as error:
             skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
             # Re-raised and handled by the caller (scrape retries / failure classification),
@@ -2128,7 +2130,7 @@ class SkyvernFrame:
                     async with asyncio.timeout(inject_budget):
                         # Same dispatch helper so a prefixed Page re-injects
                         # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
-                        await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
+                        await cancellable_driver_call(lambda: _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None))
                 except asyncio.TimeoutError as error:
                     LOG.warning(
                         "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
@@ -2162,7 +2164,7 @@ class SkyvernFrame:
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    result = await evaluate_expression()
+                    result = await cancellable_driver_call(evaluate_expression)
                 # The final evaluate answered, so this run-wide health tally is no longer stale.
                 skyvern_context.record_browser_success()
                 return result

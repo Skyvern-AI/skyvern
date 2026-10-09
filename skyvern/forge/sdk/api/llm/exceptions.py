@@ -6,7 +6,11 @@ LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE = "LLMProviderErrorRetryableTask"
 
 
 class BaseLLMError(SkyvernException):
-    pass
+    # Stamped by the handler the error escaped from. Response-shape errors are raised deep in
+    # parsing, where neither is known, so callers that only see the exception (e.g. the complete
+    # verification) can't otherwise say which model route and prompt produced it.
+    llm_key: str | None = None
+    prompt_name: str | None = None
 
 
 class MissingLLMProviderEnvVarsError(BaseLLMError):

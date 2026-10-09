@@ -2660,15 +2660,37 @@ class ForgeAgent:
                 step_cap=step_cap,
                 max_tokens=max_tokens,
             )
-        # Per-action persistence (parity with the step engine): the loop hands us each successful
-        # action round, and we persist one DB row per action + one screenshot per round, so the Task
-        # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
-        # best-effort — billing still meters off outcome.billable_actions below.
+        # Per-action persistence (parity with the step engine): the loop hands us the batch's actions
+        # as it dispatches them, and we persist one DB row + screenshot per hand-off, so the Task
+        # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3 and the run
+        # view shows a long batch progressing instead of publishing it all at once (SKY-18164).
+        # Additive and best-effort — billing still meters off outcome.billable_actions below.
         v3_persisted_actions: list[Action] = []
         v3_round_index = 0
+        v3_round_billed = False
 
-        async def _on_action_round(round_actions: list[RoundAction], turn_reasoning: str | None) -> None:
-            nonlocal v3_round_index
+        def _close_v3_action_round() -> None:
+            nonlocal v3_round_index, v3_round_billed
+            # One budget unit per CHARGED round, not per action: every row a round produced shares
+            # the index, so it advances only once the round closes.
+            if v3_round_billed:
+                v3_round_index += 1
+            v3_round_billed = False
+
+        async def _on_action_round(
+            round_actions: list[RoundAction], turn_reasoning: str | None, /, *, round_done: bool
+        ) -> None:
+            try:
+                if round_actions:
+                    await _persist_v3_action_rows(round_actions, turn_reasoning)
+            finally:
+                # In a `finally` so a persist that raised anyway cannot leave the index behind and
+                # make the next round's rows share this one's.
+                if round_done:
+                    _close_v3_action_round()
+
+        async def _persist_v3_action_rows(round_actions: list[RoundAction], turn_reasoning: str | None) -> None:
+            nonlocal v3_round_billed
             screenshot_artifact_id: str | None = None
             try:
                 screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
@@ -2687,13 +2709,14 @@ class ForgeAgent:
                         turn_reasoning, secret_values, placeholder_ids=placeholder_ids
                     )
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
-            # A round that bills nothing claims no budget unit, so its rows ride the LAST consumed
-            # index (or the single Step's own order 0) the way the decision row below does: a fresh
-            # index nothing later claims would be a distinct (task_id, step_order) pair, and the
-            # workflow-run step budget counts those pairs.
-            billable_round = any(entry.billable for entry in round_actions)
-            row_step_order = v3_round_index if billable_round else max(v3_round_index - 1, 0)
             for round_action in round_actions:
+                v3_round_billed = v3_round_billed or round_action.billable
+                # A row that bills nothing rides the LAST consumed index (or the single Step's own
+                # order 0) the way the decision row below does: the workflow-run step budget counts
+                # distinct (task_id, step_order) pairs, and a fresh index nothing later claims would
+                # open one of its own. Read per row because a row publishes before the rest of its
+                # batch has run, so it cannot see whether a later call bills.
+                row_step_order = v3_round_index if v3_round_billed else max(v3_round_index - 1, 0)
                 name, args, succeeded = round_action.tool, round_action.args, round_action.succeeded
                 try:
                     tool_args = _redact_tool_args(
@@ -2746,8 +2769,6 @@ class ForgeAgent:
                     )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
-            if billable_round:
-                v3_round_index += 1
 
         pre_submit_ring: PreSubmitCaptureRing | None = None
         if not page_free_validation and is_run_sampled(
