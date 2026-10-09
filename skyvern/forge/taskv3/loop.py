@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
@@ -575,6 +575,14 @@ CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
 # sides; splitting them into two hooks would scatter it.
 VerificationBlocker = Callable[[str], Awaitable[str | None]]
+# The deployment's completion gate, consulted last on finish(completed): False refuses the verdict, while
+# CompletionGateTerminationError ends the run terminated and StepTerminationError ends it failed.
+CompletionGate = Callable[[], Awaitable[bool]]
+COMPLETION_GATE_REFUSAL = (
+    "The completion check did not confirm the result on the current page. If you have not submitted yet, "
+    "finish the step and call finish again. If you already submitted, do not submit again: wait for or look "
+    "for the confirmation, then call finish."
+)
 # The status a re-ask conversion asks the verification gate about: a completion the model never claimed.
 CONVERSION_VERIFICATION_STATUS = "converted"
 
@@ -658,6 +666,8 @@ class LoopOutcome:
     converted_from: NonCompletedStatus | None = None
     converted_from_reason: str = ""
     unlisted_reask: dict[str, Any] | None = None
+    # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
+    gate_passed: bool = False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -1559,6 +1569,7 @@ class ActivityRecency:
     turn: int = 0
     turns_remaining: int | None = None
     tool_calls_remaining: int | None = None
+    action_steps_remaining: int | None = None
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
@@ -2448,6 +2459,7 @@ def make_finish_tool(
     verification_blocker: VerificationBlocker | None = None,
     unlisted_reask: UnlistedReaskCheck | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
+    completion_gate: CompletionGate | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2484,7 +2496,11 @@ def make_finish_tool(
     missed a screen the site skipped. A grounded yes becomes completed unless a completed-side gate vetoes it;
     it never gives a turn back, and a completed verdict cannot reach it. Its settle gate samples as many times as
     the completed path would defer. When `document_identity` is wired, it is read before the judge and again after
-    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
+    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not.
+
+    `completion_gate` runs after every other completed-side gate, and only while the run has the turns and
+    action steps to act on a refusal; without them, or when the gate errors, the caller's post-loop check
+    decides. A refusal never ends the run, so only a later finish the gate approves can complete it."""
     deferrals = 0
     failure_deferrals = 0
     reask_asked = False
@@ -2751,6 +2767,40 @@ def make_finish_tool(
                     "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
                     "report failure."
                 )
+        gate_passed = False
+        if (
+            status == "completed"
+            and completion_gate is not None
+            and _has_hold_headroom(activity, deadline_at)
+            and (activity is None or activity.action_steps_remaining is None or activity.action_steps_remaining > 0)
+        ):
+            try:
+                async with asyncio.timeout(None if deadline_at is None else deadline_at - time.monotonic()):
+                    gate_passed = await completion_gate()
+            except CompletionGateTerminationError as termination:
+                return ToolResult.ok(
+                    content="Task attempt ended. No further actions are permitted.",
+                    data={
+                        "status": "terminated",
+                        "reason": termination.reason,
+                        "extracted_output": args.get("extracted_output"),
+                    },
+                )
+            except StepTerminationError as exhausted:
+                return ToolResult.ok(
+                    content="Task attempt ended. No further actions are permitted.",
+                    data={
+                        "status": "failed",
+                        "reason": exhausted.message or "",
+                        "extracted_output": args.get("extracted_output"),
+                    },
+                )
+            except Exception:
+                LOG.warning("taskv3 completion gate errored; leaving the verdict to the caller", exc_info=True)
+            else:
+                if not gate_passed:
+                    LOG.info("taskv3 completed verdict refused by the completion gate")
+                    return ToolResult.error(COMPLETION_GATE_REFUSAL)
         if (
             status == "failed"
             and activity is not None
@@ -2826,6 +2876,7 @@ def make_finish_tool(
                 "status": status,
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
+                "gate_passed": gate_passed,
             },
         )
 
@@ -3882,6 +3933,8 @@ async def run_agent_tool_loop(
             activity.turn = st.turns
             activity.turns_remaining = st.max_turns - st.turns
             activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
+            if st.max_action_steps is not None:
+                activity.action_steps_remaining = st.max_action_steps - st.action_steps
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
@@ -4544,6 +4597,8 @@ async def run_agent_tool_loop(
             elif call_charged:
                 st.uncharged_refusals = 0
             turn_charged = turn_charged or call_charged
+            if activity is not None and st.max_action_steps is not None:
+                activity.action_steps_remaining = st.max_action_steps - st.action_steps - int(turn_charged)
             # Entry is recorded only when the tool succeeded (a stale-ref failure put nothing in the
             # field), but the submit is recorded on DISPATCH whatever the verdict: the loop ran the
             # click itself, so nothing here asks the page whether a submission completed. Entry first,
@@ -5024,6 +5079,7 @@ async def run_agent_tool_loop(
                     extracted_output=data.get("extracted_output"),
                     converted_from=_non_completed(data.get("converted_from")),
                     converted_from_reason=data.get("converted_from_reason", ""),
+                    gate_passed=bool(data.get("gate_passed")),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,

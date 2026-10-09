@@ -60,6 +60,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_RETAIN_CHARS_HIGH,
     ActivityRecency,
     CompletionBlocker,
+    CompletionGate,
     CompletionProbe,
     LoopOutcome,
     RoundAction,
@@ -277,6 +278,7 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
     completion_blocker: CompletionBlocker | None = None,
+    completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
@@ -553,6 +555,7 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
         unlisted_reask=_unlisted_reask if reask_on else None,
         document_identity=None if page_free else document_identity,
+        completion_gate=None if page_free else completion_gate,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish

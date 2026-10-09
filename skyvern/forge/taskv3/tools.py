@@ -28,7 +28,7 @@ import sys
 import time
 import weakref
 from collections import Counter, defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from types import MappingProxyType
@@ -40,11 +40,6 @@ from PIL import Image, ImageDraw
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
-from skyvern.core.script_generations.fuzzy_matcher import (
-    match_option_exact_or_stem,
-    match_option_exact_or_stem_with_tier,
-    normalize_option_label,
-)
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
@@ -61,15 +56,28 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.field_commit import (
     _ZERO_WIDTH_RE,
+    OFFER_WHY,
     CommitStatus,
     EntryMatch,
+    Pick,
+    Refusal,
+    Tier,
     _canon_label,
     _classify_commit,
+    _exact_tier_key,
+    _lone_duplicate_candidate,
+    _row_identity,
     _same_cell_value,
     _typed_text_landed,
+    _without_nested_copies,
     compare_text,
+    contender_texts,
     entry_outcome,
+    match_choice,
+    nearest,
+    tier_of,
     unconfirmed_ok,
+    with_tier_note,
 )
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
@@ -629,6 +637,9 @@ class _TypeaheadPick(NamedTuple):
     shared_surface: str | None = None
     # The call's final result when pressing Enter to search settled it before any row was picked.
     verdict: ToolResult | None = None
+    # How the picked row names the value, and why no row was picked.
+    tier: Tier | None = None
+    refusal: Refusal | None = None
 
 
 # The smallest query many closed-vocabulary pickers need before they render candidates. Read by the
@@ -654,37 +665,6 @@ def _label_names_value(label: str, value: str) -> bool:
     return bool(inner) and "(" not in inner and ")" not in inner
 
 
-def _match_option_exact(value: str, options: list[dict[str, Any]]) -> int | None:
-    """Pick the row whose WHOLE label IS `value` after canonical cleanup (case/whitespace/apostrophes/
-    Unicode forms/zero-width). No stem, prefix, or other inferred tier is ever accepted here — anything
-    short of that exact match returns None so the caller hands the rows back instead of guessing.
-    """
-    rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
-    if not value or not rows:
-        return None
-    idx, tier = match_option_exact_or_stem_with_tier(_canon_label(value), [_canon_label(label) for _, label in rows])
-    return rows[idx][0] if idx is not None and tier == "exact" else None
-
-
-def _without_nested_copies(value: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop an exact-match row that holds another exact-match row: a wrapper and the element carrying its
-    label are one candidate, and the innermost stands for it. `inside` is a row's nearest tagged ancestor;
-    siblings never share a chain, so identical siblings stay separate and are refused."""
-    want = _exact_tier_key(value)
-    exact = {o.get("n") for o in rows if _exact_tier_key(str(o.get("text") or "")) == want}
-    by_n = {o.get("n"): o for o in rows}
-    wrappers: set[Any] = set()
-    for n in exact:
-        seen: set[Any] = set()
-        up = (by_n.get(n) or {}).get("inside")
-        while up is not None and up not in seen:
-            if up in exact:
-                wrappers.add(up)
-            seen.add(up)
-            up = (by_n.get(up) or {}).get("inside")
-    return [o for o in rows if o.get("n") not in wrappers]
-
-
 def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     """The labels of rows whose `inside` chain reaches row `n`."""
     by_n = {o.get("n"): o for o in rows}
@@ -701,17 +681,10 @@ def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     return nested
 
 
-def _exact_tier_key(text: str) -> str:
-    """The exact tier's own equality key — `_canon_label` plus the shared matcher's case/apostrophe fold —
-    for pre-filters asking "which rows did that tier see as this value". A plain `_canon_label` filter
-    folds less than the tier does and would disagree with it, so pre-filters must use this key instead.
-    """
-    return normalize_option_label(_canon_label(text))
-
-
-def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str) -> None:
+def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None) -> None:
     # Whether the clicked row IS the requested value, or the value plus one parenthesized decoration, so an
-    # inexact pick can be counted apart from an exact one. No form values and no selector.
+    # inexact pick can be counted apart from an exact one; `tier` is the matcher's decision, None where no tier
+    # decided the row. No form values and no selector.
     LOG.info(
         "taskv3 combobox pick verdict",
         tool_call_seq=current_tool_call_seq(),
@@ -719,74 +692,8 @@ def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str) 
         verdict=verdict.value,
         committed_matches_row=_exact_tier_key(row) == _exact_tier_key(value),
         row_names_value=_label_names_value(row, value),
+        tier=tier.value if tier is not None else None,
     )
-
-
-def _row_identity(o: dict[str, Any]) -> str:
-    """The row's identity as `_MENU_OPTION_TEXTS_JS`'s `rowIdentity` derived it. A row with no `identity` key
-    is a note entry, whose `text` is already that identity; an empty one (a row nothing could read) is absent."""
-    identity = o.get("identity")
-    return identity if isinstance(identity, str) and identity else str(o.get("text") or "")
-
-
-def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
-    """Whether ≥2 matched rows are the SAME candidate rendered more than once: canonical row IDENTITY
-    agreement across every row is the load-bearing check, and a present aria-label, `val`, or other declared
-    value is a VETO on top of it — one disagreeing across otherwise-identical rows marks them distinct, an
-    absent one never does. Returns the FIRST row's `n` when the whole set collapses to one candidate, else
-    None so the caller keeps refusing.
-    """
-    if len(rows) < 2:
-        return None
-    if len({_canon_label(_row_identity(o)) for o in rows}) != 1:
-        return None
-    # The tagged leaf and its option ancestor are independent name surfaces: a shared leaf label
-    # ("Choose") must not mask ancestors that disagree, so each position vetoes on its own.
-    for surface in range(2):
-        names = {
-            _canon_label(str((o.get("labels") or [None, None])[surface]))
-            for o in rows
-            if (o.get("labels") or [None, None])[surface]
-        }
-        if len(names) >= 2:
-            return None
-    present_labels = {_canon_label(str(o.get("label"))) for o in rows if o.get("label")}
-    if len(present_labels) >= 2:
-        return None
-    # Vals are machine identifiers, not display text: compared byte-exact, never case/Unicode-folded,
-    # so "ID-A" and "id-a" stay two candidates. `vals` is the collapse's OWN read of the other value
-    # surfaces (data-code, data-key, name, title, ...) — unfiltered by the commit verifier's numeric/
-    # length drops, so "101" vs "202" is a real disagreement here. Non-empty sets must agree byte-exact;
-    # an empty set says nothing and cannot contradict.
-    present_vals = {str(o.get("val")) for o in rows if o.get("val") is not None}
-    if len(present_vals) >= 2:
-        return None
-    # Two-rule agreement over the surface+attribute-keyed entries. (1) A key present on BOTH rows
-    # must carry one value — crossed values across surfaces refuse, while a value carried on one
-    # row's surface only says nothing against the other row. (2) The depth-blind floor: one row's
-    # flattened attr=value pairs must nest inside the other's. Rows declaring identity on disjoint
-    # attributes cannot be confirmed the same, and an agreeing generic attribute (a shared title)
-    # beside disjoint identifiers is ordinary markup, not identity evidence — the pairs don't nest,
-    # so it refuses. A row declaring NOTHING still constrains nothing (its empty set nests, so an
-    # attribute-less a11y copy collapses).
-    val_maps: list[dict[str, str]] = []
-    for o in rows:
-        entries: dict[str, str] = {}
-        for raw in o.get("vals") or []:
-            key, _, val_part = str(raw).partition("=")
-            entries[key] = val_part
-        val_maps.append(entries)
-    for i, first in enumerate(val_maps):
-        for second in val_maps[i + 1 :]:
-            for shared in first.keys() & second.keys():
-                if first[shared] != second[shared]:
-                    return None
-            flat_first = {f"{k.partition(':')[2]}={v}" for k, v in first.items()}
-            flat_second = {f"{k.partition(':')[2]}={v}" for k, v in second.items()}
-            if not (flat_first <= flat_second or flat_second <= flat_first):
-                return None
-    n = rows[0].get("n")
-    return n if isinstance(n, int) else None
 
 
 _ORDINAL_CAP = 2**31 - 1
@@ -1072,136 +979,6 @@ def _lead_clause(text: str) -> str:
     return re.split(r"\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+", norm)[0].strip()
 
 
-def _prefix_tokens(s: str) -> list[str]:
-    # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" → "Yes, I
-    # consent"). A slash is left intact so a combined "Yes/No" option is not prefix-matched by "Yes".
-    return re.sub(r"[,'’]", " ", s).lower().split()
-
-
-def _is_forward_prefix(want: list[str], label: list[str]) -> bool:
-    return bool(want) and len(want) < len(label) and label[: len(want)] == want
-
-
-def _tier_for(want_canon: str, want_tokens: list[str], text: str) -> int | None:
-    _, tier = match_option_exact_or_stem_with_tier(want_canon, [_canon_label(text)])
-    if tier is not None:
-        return 0 if tier == "exact" else 1
-    return 2 if _is_forward_prefix(want_tokens, _prefix_tokens(text)) else None
-
-
-def _option_tier(value: str, text: str) -> int | None:
-    """The best `_match_menu_option` tier that accepts `text` for `value`: 0 exact, 1 singular/plural stem,
-    2 forward word-prefix; None when no tier would."""
-    return _tier_for(_canon_label(value), _prefix_tokens(value), text)
-
-
-def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_duplicates: bool = False) -> int | None:
-    """Pick the enumerated menu row (its data-tv3-menu index) whose label matches the wanted value.
-
-    Deterministic and site-agnostic, precision-first. Exact/singular-plural-stem matching (apostrophe
-    folding, unique-or-None) is delegated to the shared `match_option_exact_or_stem` so this is not a
-    third copy of that logic. Failing that, a UNIQUE FORWARD token-prefix — the observed value is a whole-
-    token prefix of a fuller option label ("Decline" → "Decline to self-identify") — is accepted. The
-    REVERSE direction is deliberately NOT matched: committing a shorter, more-general option for a longer
-    value ("New York" → "New") is a silent wrong success, and on a virtualised window the fuller row may
-    simply be unrendered. A value that is only an incidental SUBSTRING of an option is never matched ("No"
-    inside "Prefer not to answer"). Ambiguity or no match returns None so the caller hands the options
-    back to the model. Uniqueness is only meaningful over the COMPLETE list — the caller must not pass a
-    truncated slice.
-
-    `collapse_duplicates` is for the one call site that reads the whole, non-overflowed menu: when the
-    exact/stem tier or the prefix tier finds more than one hit, it hands those rows to
-    `_lone_duplicate_candidate` before giving up — a value that matches several DOM rows wearing the
-    same candidate still resolves, while several genuinely distinct rows still refuse. Off by default so
-    a caller working from a partial or reconstructed row set (a virtualised scroll-search window) never
-    collapses on incomplete evidence.
-    """
-    rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
-    if not value or not rows:
-        return None
-
-    # Canonicalize before the exact/stem tier — the shared normalizer folds case and apostrophes but
-    # not internal spacing, Unicode forms or zero-width characters.
-    want_canon = _canon_label(value)
-    hit = match_option_exact_or_stem(want_canon, [_canon_label(label) for _, label in rows])
-    if hit is not None:
-        return rows[hit][0]
-    if collapse_duplicates:
-        want_key = _exact_tier_key(value)
-        exact_matched = [
-            o for o in options if isinstance(o.get("n"), int) and _exact_tier_key(str(o.get("text") or "")) == want_key
-        ]
-        if len(exact_matched) >= 2:
-            collapsed = _lone_duplicate_candidate(exact_matched)
-            if collapsed is not None:
-                return collapsed
-        elif not exact_matched:
-            # Mirror the shared matcher's stem tier (trailing-s stem, 3-char floor) so a duplicated row
-            # that would stem-commit as a lone row still collapses. Only when the exact tier saw
-            # NOTHING — the matcher never consults stems once exact matches exist.
-            want_stem = want_key.rstrip("s")
-            if len(want_stem) >= 3:
-                stem_matched = [
-                    o
-                    for o in options
-                    if isinstance(o.get("n"), int)
-                    and len(k := _exact_tier_key(str(o.get("text") or "")).rstrip("s")) >= 3
-                    and k == want_stem
-                ]
-                if len(stem_matched) >= 2:
-                    collapsed = _lone_duplicate_candidate(stem_matched)
-                    if collapsed is not None:
-                        return collapsed
-
-    want = _prefix_tokens(value)
-    if not want:
-        return None
-    prefixed = [n for n, label in rows if _is_forward_prefix(want, _prefix_tokens(label))]
-    if len(prefixed) == 1:
-        return prefixed[0]
-    if collapse_duplicates and len(prefixed) > 1:
-        prefixed_ns = set(prefixed)
-        prefixed_rows = [o for o in options if isinstance(o.get("n"), int) and o.get("n") in prefixed_ns]
-        return _lone_duplicate_candidate(prefixed_rows)
-    return None
-
-
-def _same_row(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """Two reads of ONE row: the same raw text and no value or name that tells them apart. Rows that only share an
-    identity key are distinct rows and stay two contenders."""
-    return str(a.get("text") or "") == str(b.get("text") or "") and _lone_duplicate_candidate([a, b]) is not None
-
-
-def _distinct_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        if not any(_same_row(row, o) for o in out):
-            out.append(row)
-    return out
-
-
-def _value_contenders(value: str, texts: list[str]) -> list[str]:
-    """The texts any tier of `_match_menu_option` would accept for `value`, one entry per row."""
-    want_canon, want_tokens = _canon_label(value), _prefix_tokens(value)
-    return [t for t in texts if _tier_for(want_canon, want_tokens, t) is not None]
-
-
-def _commit_gate(
-    hit_text: str, value: str, *, complete: bool, twins_seen: bool, contenders: list[str]
-) -> Literal["commit", "ambiguous", "incomplete"]:
-    """The one rule every open-observe-pick path applies before clicking a matched row: the rows judged are the
-    whole list, and nothing else the value names competes with the hit (the post-click read-back verifies it).
-    `contenders` holds one entry per distinct row, so a label listed twice is two rows wearing it."""
-    if twins_seen:
-        return "ambiguous"
-    tier = _option_tier(value, hit_text)
-    rank = 3 if tier is None else tier
-    # The hit is one of the contender rows; a second row at its tier or better competes with it.
-    if sum(1 for t in contenders if (r := _option_tier(value, t)) is not None and r <= rank) >= 2:
-        return "ambiguous"
-    return "commit" if complete else "incomplete"
-
-
 async def _read_list_window(page: Any, raw: Any, *, scroller: bool) -> _ListWindow:
     """One read of the rows `raw` against the scroller the finder tagged. A tagged scroller whose state cannot be
     read leaves an unbounded extent, so the read never proves the list whole."""
@@ -1227,6 +1004,67 @@ def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any
     )
 
 
+def _choice_tiers(*, typeahead: bool) -> frozenset[Tier]:
+    # The one read of the kill switch: off, a typeahead commits exact rows only and no path commits a main-label hit.
+    if not settings.TASK_V3_CHOICE_NONEXACT_COMMIT:
+        return frozenset({Tier.EXACT}) if typeahead else frozenset(Tier) - {Tier.PRIMARY}
+    # A typed search's row that only starts with the value is often one record of a hierarchy (an address lookup's
+    # top-k), so it is offered, never committed.
+    return frozenset(Tier) - {Tier.PREFIX} if typeahead else frozenset(Tier)
+
+
+def _same_row(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """Two reads of ONE row: the same raw text and no value or name that tells them apart."""
+    return str(a.get("text") or "") == str(b.get("text") or "") and _lone_duplicate_candidate([a, b]) is not None
+
+
+def _log_choice(path: str, choice: Pick | Refusal, rows: int, value: str, **facts: Any) -> None:
+    # No values and no selector. `tied` names the match kinds an ambiguous refusal weighed, so a main-label vs plural
+    # tie can be read apart from rows that merely share a label.
+    tied = (
+        sorted({t.value for o in choice.contenders if (t := tier_of(value, o)) is not None})
+        if isinstance(choice, Refusal) and choice.reason == "ambiguous"
+        else None
+    )
+    LOG.info(
+        "taskv3 choice match",
+        tool_call_seq=current_tool_call_seq(),
+        path=path,
+        tier=choice.tier.value if isinstance(choice, Pick) else None,
+        reason=choice.reason if isinstance(choice, Refusal) else None,
+        tied=tied,
+        rows=rows,
+        **facts,
+    )
+
+
+_NOT_PICKED = {
+    "incomplete": "the list may hold more rows",
+    "reduced_query": "the typed query was shortened",
+    "unsettled": "the list was still changing",
+    "held": "the field already shows the value",
+    "none": "a typed search commits only a row that is the value or its main label",
+}
+
+
+def _nearest_sentence(
+    value: str, rows: Sequence[Mapping[str, Any]], refusal: Refusal | None, sel: Callable[[Mapping[str, Any]], str]
+) -> str:
+    """The rows most like `value`, each with what it shares with it and why it was not picked; '' when none is near."""
+    offers = nearest(value, rows)
+    why_not = _NOT_PICKED.get(refusal.reason, "") if refusal is not None else ""
+    if refusal is not None and refusal.reason == "ambiguous":
+        why_not = f"{len(refusal.contenders)} rows match it equally"
+    parts = []
+    for offer in offers:
+        why = [OFFER_WHY[offer.tier]] if offer.tier is not None else []
+        if why and offer.tier is not Tier.EXACT and why_not:
+            why.append(f"not picked: {why_not}")
+        text = _model_text(offer.row.get("text") or "", 120)
+        parts.append(f"{sel(offer.row)}{text!r}" + (f" ({' — '.join(why)})" if why else ""))
+    return f"nearest: {'; '.join(parts)}" if parts else ""
+
+
 def _ambiguous_rows_error(
     selector: str,
     value: str,
@@ -1237,6 +1075,7 @@ def _ambiguous_rows_error(
     rows_unread: bool = False,
     live_token: str | None = None,
     live_search: str | None = None,
+    choice: Refusal | None = None,
 ) -> ToolResult:
     """The refusal owed a caller when rows reacted and none of them IS the requested value.
 
@@ -1255,8 +1094,17 @@ def _ambiguous_rows_error(
         }
         rows = [row for row in rows if id(row) not in copies]
     shown = rows[:15]
+    if len(rows) > 15:
+        # Past 15 rows the ones shown are the contenders and the nearest, still printed in list order.
+        ranked = [*(choice.contenders if choice else ()), *(o.row for o in nearest(value, rows, k=15)), *rows]
+        keep = list(dict.fromkeys(o.get("n") for o in ranked))[:15]
+        shown = [o for o in rows if o.get("n") in keep]
+
+    def _sel(o: Mapping[str, Any]) -> str:
+        return f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else ""
+
     listing = "; ".join(
-        (f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else "")
+        _sel(o)
         + repr(_model_text(o.get("text") or "", 60))
         + (_row_value_suffix(o, groups[_canon_label(str(o.get("text") or ""))]) if live_token is not None else "")
         for o in shown
@@ -1267,7 +1115,7 @@ def _ambiguous_rows_error(
         if several
         else f"{value!r} is not the one row showing in {selector}: "
     )
-    data = {"release_own_list": True}
+    data: dict[str, Any] = {"release_own_list": True}
     if live_token is not None:
         lead = (
             f"{value!r} is not exactly any of the {len(rows)} rows showing in {selector}: "
@@ -1291,6 +1139,8 @@ def _ambiguous_rows_error(
             note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     message = f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+    if choice is not None and (near := _nearest_sentence(value, rows, choice, _sel)):
+        message += f"; {near}"
     # Spelled as literal writes rather than one computed error_class: the source census can only read a
     # literal, and a single-file mypy run does not bind the annotation across the import either.
     if several:
@@ -1947,7 +1797,7 @@ _PRESNAPSHOT_JS = (
 # the field declares (rowSelFor: role=option, or a gridcell of a grid popup the field itself declares),
 # EVERY such row is promoted, tagged data-tv3-sugg="1..N" top-to-bottom and returned as
 # {count, options, declared: true} — geometry must never break a tie between real options, so the
-# caller's own precision matcher (_match_menu_option) picks, over the full text _MENU_OPTION_TEXTS_JS
+# caller's own precision matcher (match_choice) picks, over the full text _MENU_OPTION_TEXTS_JS
 # reads back. Where nothing declares a row, reconstructing one from geometry does not converge, so the
 # finder keeps the single-winner contract instead: highest score, innermost, refusing an ambiguous
 # leading-clause tie and a multi-row container, as {count: 1, options: [the row], declared: false}.
@@ -1956,7 +1806,8 @@ _PRESNAPSHOT_JS = (
 # snippet: two hand-copied predicates drifted once (menuitem listed as both option and nav, so
 # `<a role=menuitem href>` read as an option and was clicked off the form). Semantics resolve from the
 # closest declaring ANCESTOR, not the reduced leaf (`<a href><span>` reduces to the span).
-_ROW_SEMANTICS_JS = r"""
+_ROW_SEMANTICS_JS = (
+    r"""
   const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
   const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
@@ -2089,6 +1940,25 @@ _ROW_SEMANTICS_JS = r"""
       if (field && pContains(region, field)) return false;
       return !declaredTargets(field).some((t) => t === region || pContains(t, region) || pContains(region, t));
     } catch (e) { return false; }
+  };
+  // The one row admission both finders apply. 80 characters is the "row-sized text, not a paragraph" ceiling; a row
+  // the page declares an option may run to ROW_TEXT_MAX, and a searched row to what was searched plus 80.
+  const UNDECLARED_ROW_TEXT_MAX = 80;
+  const ROW_TEXT_MAX = """
+    + str(_MENU_ROW_TEXT_MAX)
+    + r""";
+  const declaresOption = (el) => {
+    try {
+      return el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
+        || !!composedClosest(el, '[role="listbox"],[role="menu"]');
+    } catch (e) { return false; }
+  };
+  const admitRow = (el, txt, o) => {
+    const cap = Math.max(UNDECLARED_ROW_TEXT_MAX, o.searchedCap || 0);
+    if (txt.length > cap && (txt.length > Math.max(ROW_TEXT_MAX, cap) || !o.declares(el))) return 'caption';
+    if (o.vetoNav && isNavRow(el)) return 'nav';
+    if (isAnnouncement(el, o.field)) return 'announcement';
+    return null;
   };
   // A control the row only WRAPS reaches the click just as the row's own box does -- but only while
   // it is rendered. A display:none or visibility:hidden action never receives that click, so it says
@@ -2256,6 +2126,7 @@ _ROW_SEMANTICS_JS = r"""
     return lists[0];
   };
 """
+)
 
 # The values a row declares for itself: the attributes on the row or on its option ancestor that NAME
 # a value. A widget that commits a code ("CA" for "California") commits one of these, and nothing else
@@ -2301,12 +2172,9 @@ _FIND_SUGGESTION_BODY_JS = (
   // appear, so no word of it gates a row, and which reacting node is the value is the caller's exact
   // matcher's decision, never this script's.
   const searched = typeof args.match === 'string';
-  // 80 is the shared "row-sized text, not a paragraph" ceiling (_FIND_MENU_JS uses the same one). It
-  // is a flat number everywhere else because no other finder knows what it is looking for -- this one
-  // does: on a searched path the caller named the value in args.match, and only a row whose whole text
-  // IS that value can ever be committed. So the ceiling is measured from it, keeping 80 as the
-  // allowance for the extra parts a declared row can render beside its label.
-  const txtCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 80;
+  // On a searched path the caller named the value in args.match, and only a row that is that value can ever be
+  // committed, so the caption ceiling is measured from it.
+  const searchedCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 0;
   pQSA('[data-tv3-sugg], [data-tv3-pick]').forEach((e) => {
     e.removeAttribute('data-tv3-sugg');
     e.removeAttribute('data-tv3-pick');
@@ -2372,11 +2240,9 @@ _FIND_SUGGESTION_BODY_JS = (
       if (!(ownPopup && pContains(ownPopup, el)) && (r.top < fr.top - 400 || r.top > fr.bottom + 500)) continue;
     }
     const txt = (el.innerText || '').trim();
-    if (!txt || txt.length > txtCap) continue;
-    // never click something navigational (would leave the form) unless it's explicitly an option;
-    // last of the gates because it is the only one that walks a subtree
-    if (isNavRow(el)) continue;
+    if (!txt) continue;
     let score = 0;
+    let stemOnly = false;
     const norm = txt.replace(/\s+/g, ' ').trim().toLowerCase();
     // Without the dropdown region to lean on, what is left to separate a suggestion from a segmented
     // control's own echo -- which is a node the widget REPLACES on input, so it reads as new -- is
@@ -2397,10 +2263,22 @@ _FIND_SUGGESTION_BODY_JS = (
       const have = toks(txt);
       for (const w of want) if (have.has(w)) score++;
       if (isExact && score > 0) score += 100;
+      // A singular/plural of a word ranks beside the main label in the caller's matcher, so the gate has to let that
+      // row through as a rival (the shared stem rule: trailing s stripped, 3+ characters left); it never wins alone.
+      if (score <= 0) {
+        const stem = (w) => w.replace(/s+$/, '');
+        const haveStems = new Set([...have].map(stem).filter((w) => w.length >= 3));
+        stemOnly = [...want].some((w) => haveStems.has(stem(w)));
+      }
     }
-    if (score <= 0) continue;
-    // Last, so a skipped node is one that scored (a wrapper around a region included).
-    if (isAnnouncement(el, field)) { announceSkipped++; skippedEls.push(el); continue; }
+    if (score <= 0 && !stemOnly) continue;
+    // Last, so a skipped node is one that scored (a wrapper around a region included). The nav veto keeps anything
+    // navigational (it would leave the form) from being clicked unless it is explicitly an option.
+    const skip = admitRow(el, txt, {
+      field, vetoNav: true, searchedCap, declares: (e) => declaresOption(e) || !!composedClosest(e, rowSel),
+    });
+    if (skip === 'announcement') { announceSkipped++; skippedEls.push(el); }
+    if (skip) continue;
     cands.push({ el, score, h: r.height, exactRow: isExact, r });
   }
   // A skipped node still takes part in containment: a wrapper whose scoring content is an announcement is no row.
@@ -2450,21 +2328,28 @@ _FIND_SUGGESTION_BODY_JS = (
     const units = rows.concat(bare.map((c) => ({ el: c.el, r: c.r, bare: true })));
     if (!units.length) return null;
     // Top-to-bottom order, same as _FIND_MENU_JS. This finder only says which rows reacted; the caller
-    // (via _match_menu_option, over the full untruncated text _MENU_OPTION_TEXTS_JS reads back) picks
+    // (via match_choice, over the full untruncated text _MENU_OPTION_TEXTS_JS reads back) picks
     // which one is the wanted value -- geometry never breaks a tie between them.
     units.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
     const options = [];
     // Which tagged units the widget declared NO row for. Same text is not the same option: the caller
     // needs the split to keep a bare node from standing in for a row the widget actually declared.
     const bareNs = [];
+    // Units sharing no whole word with the value got in as singular/plural rivals only: never a pick on their own, and
+    // a reaction made of nothing else is no reaction.
+    const stemNs = [];
+    const sharesWord = (c) => searched || exact !== null || [...toks(c.el.innerText || '')].some((w) => want.has(w));
+    if (!units.some(sharesWord)) return null;
     let n = 0;
     for (const c of units) {
       n++;
       c.el.setAttribute('data-tv3-sugg', String(n));
       if (c.bare) bareNs.push(n);
+      if (!sharesWord(c)) stemNs.push(n);
       if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim() });
     }
-    return { count: n, options, declared: true, bare: bareNs };
+    // `gate`: whether every row sharing a word with the value was a candidate, which a non-exact pick relies on.
+    return { count: n, options, declared: true, bare: bareNs, stemOnly: stemNs, gate: searched ? 'searched' : exact !== null ? 'exact' : 'overlap' };
   }
   // Nothing here declares a row, so there is no unit to name: take the highest score, breaking ties
   // toward the smallest (innermost) row.
@@ -2488,7 +2373,7 @@ _FIND_SUGGESTION_BODY_JS = (
   // An empty-state row is never the winner.
   const typedNorm = String(args.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const emptyState = (n) => emptyStateRow(n, typedNorm);
-  const live = pool.filter((c) => !emptyState(c.el));
+  const live = pool.filter((c) => !emptyState(c.el) && c.score > 0);
   // The exact row the widget will not take still names the answer, so no lesser row may stand in for it.
   const barred = pool.find((c) => c.exactRow && emptyState(c.el));
   if (barred && !live.some((c) => c.exactRow)) {
@@ -2522,7 +2407,7 @@ _FIND_SUGGESTION_JS = (
 )
 
 # Read back the row _FIND_SUGGESTION_JS tagged data-tv3-sugg="N" once the caller has picked `n` (via
-# _match_menu_option): its declared value/data-* attributes -- a widget that commits a code ("CA" for a
+# match_choice): its declared value/data-* attributes -- a widget that commits a code ("CA" for a
 # row displaying "California") commits one of these -- and whether it came from the FOCUS-opened list
 # rather than reacting to a keystroke (that pick is verified under the open->observe->pick contract, not
 # the typeahead's change-based one; see _VERIFY_COMMIT_JS's `noSuggestionList`).
@@ -2725,22 +2610,26 @@ _DECLARED_LIST_ANSWER_JS = (
   const ROW = DECLARED_ROW_SEL + ',[role="gridcell"]';
   // A natively disabled row is not an answer; a label drawn in a shadow root still is.
   const dead = (row) => emptyStateRow(row, typedNorm) || row.hasAttribute('disabled');
-  const label = (row) => ((row.innerText || '').trim() || composedRowText(row)).replace(/\s+/g, ' ').trim().toLowerCase();
+  // The owned list's live rows, hidden ones included: Python judges which one IS the typed text.
+  const labels = [];
   const owned = fieldOwnPopup(field, false);
   if (owned) {
     for (const row of pScopeAll()) {
       if (!pContains(owned, row) || !row.matches(ROW) || dead(row)) continue;
-      if (typedNorm && label(row) === typedNorm) return 'option';
+      labels.push((row.innerText || '').trim() || composedRowText(row));
     }
   }
-  const popup = fieldOwnPopup(field, true);
-  if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
-  for (const row of pScopeAll()) {
-    if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
-    const r = row.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
-  }
-  return 'none';
+  const state = (() => {
+    const popup = fieldOwnPopup(field, true);
+    if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
+    for (const row of pScopeAll()) {
+      if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
+      const r = row.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
+    }
+    return 'none';
+  })();
+  return { state, labels };
 }"""
 )
 
@@ -7325,6 +7214,21 @@ _LIST_BOX_JS = r"""
   };
 """
 
+# Tags the scroller of the rows the suggestion finder tagged, so `_list_coverage` judges a typeahead's rows as it
+# judges a menu's.
+_TAG_SUGG_SCROLLER_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _TAG_LIST_SCROLLER_JS
+    + r"""
+  pQSA('[data-tv3-menu-scroller]').forEach((e) => e.removeAttribute('data-tv3-menu-scroller'));
+  const g = pQSA('[data-tv3-sugg]').map((el) => ({ el, r: el.getBoundingClientRect() }));
+  g.sort((a, b) => a.r.top - b.r.top);
+  return g.length ? tagListScroller(g, g[0].el) : false;
+}"""
+)
+
 # Behavioral, site-agnostic menu finder: after a click (with the pre-snapshot taken first),
 # look for the option list the page rendered IN REACTION — a NEW container (not data-tv3-pre: a
 # pre-existing visible container whose rows merely changed, e.g. pagination refreshing a results list,
@@ -7345,12 +7249,6 @@ _FIND_MENU_JS = (
     + _MENU_ROW_ROLES_JS
     + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
-  // 80 is the shared "row-sized text, not a paragraph" ceiling. A row the page declares an option or
-  // menu item may run to ROW_TEXT_MAX, so a long option caption is listed whole.
-  const UNDECLARED_ROW_TEXT_MAX = 80;
-  const ROW_TEXT_MAX = """
-    + str(_MENU_ROW_TEXT_MAX)
-    + r""";
   // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
   // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
   // FLOATING container carry the claim instead (enforced below).
@@ -7426,17 +7324,12 @@ _FIND_MENU_JS = (
     const { r, txt } = box;
     // A long row is an option only where the page declares one on it, in it, around it, or by its list (a
     // listbox/menu, or the list a combobox controls): a pointer cursor alone makes every paragraph a row.
-    if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
-      let declaresOption = false;
-      try {
-        declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
-          || !!composedClosest(el, '[role="listbox"],[role="menu"]')
-          || (controlledList && controlled !== el && pContains(controlled, el));
-      } catch (e) { declaresOption = false; }
-      if (!declaresOption) {
-        if (arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
-        continue;
-      }
+    const skip = admitRow(el, txt, {
+      field: trigger, declares: (e) => declaresOption(e) || (controlledList && controlled !== e && pContains(controlled, e)),
+    });
+    if (skip) {
+      if (skip === 'caption' && arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
+      continue;
     }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
@@ -7846,6 +7739,8 @@ _MENU_OPTION_TEXTS_JS = (
       setsize_unknown: setsize === -1,
       group: grp ? accessibleName(grp) || grp.id || 'group' : '',
       lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      // The tag of the declared row's first leaf: leaves of one row are one option to the matcher.
+      unit: rowOf(el) ? num(leadOf.get(rowOf(el))) : null,
       box: box,
       after: after,
       line: Number.isFinite(line) && line > 0 ? line : null,
@@ -15617,6 +15512,7 @@ def build_browser_tools(
         # row before the results); the last reaction is returned when time runs out.
         found: dict[str, Any] | None = None
         refused_a_reaction = False
+        was_busy = False
         soft_deadline = time.monotonic() + 0.4 * rounds
         hard_deadline = time.monotonic() + 8.0
         while True:
@@ -15645,8 +15541,11 @@ def build_browser_tools(
                     busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
                 except Exception:
                     busy = False
-                if not busy:
+                # Rows that replace the indicator land between the read above and this probe, so a list that just
+                # stopped being busy gets one more read before the wait ends.
+                if not busy and not was_busy:
                     break
+                was_busy = busy
         return found
 
     async def _commit_typeahead(
@@ -15661,9 +15560,9 @@ def build_browser_tools(
         live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> _TypeaheadPick:
         # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
-        # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
-        # commit is exact-only: a row is picked when its whole label IS `value`, never on a stem or
-        # prefix hit, so an ambiguous reaction is always handed back rather than guessed at. Where
+        # pick among them, click, and verify the field committed. When the widget DECLARES its rows,
+        # `match_choice` picks: a row whose whole label IS `value`, or a lone main-label or singular/plural
+        # hit on a whole, settled list the full value was typed into; anything else is handed back. Where
         # nothing declares a list, the finder returns the single winner it always did and the pick is
         # that row. `candidates` is the full-text reacting rows when a declared pick refused — the
         # caller reports these instead of guessing which one was meant; None when nothing reacted, when
@@ -15694,17 +15593,14 @@ def build_browser_tools(
             # floor under the pick, not the filter that does the work.
             return [o for o in raw if isinstance(o, dict) and isinstance(o.get("n"), int) and not o.get("nav")]
 
-        def _pick(rows: list[dict[str, Any]]) -> int | None:
-            # A declared row commits solely on an exact label match, never on inferred meaning — an
-            # unmatched row, lone or not, is refused like any other so the model chooses explicitly.
-            return _match_option_exact(value, rows)
-
         # Which tagged units the widget declared no row for, kept so verification can ask about the row
         # actually CHOSEN rather than about the mixed pool it came from.
         bare_tagged: set[int] = set()
+        choice: Pick | Refusal | None = None
+        choice_facts: dict[str, Any] = {}
 
         async def _resolve(found: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], int | None, int]:
-            # A widget that declares its rows hands the pick to the exact matcher over every row it
+            # A widget that declares its rows hands the pick to `match_choice` over every row it
             # tagged. Where nothing declares one, the finder already reduced the reaction to a single
             # winner and there is nothing left to choose between — except under a reduced query, whose
             # rows answer a broader question than the caller asked. The 4th value is the declared
@@ -15714,49 +15610,47 @@ def build_browser_tools(
             if not tagged:
                 return bool(found.get("declared")), [], None, 0
             if found.get("declared"):
+                # The scroller is tagged before the rows are read: a row's box is read against the tagged scroller.
+                try:
+                    scroller = await page.evaluate(_TAG_SUGG_SCROLLER_JS, {}) is True
+                except Exception:
+                    scroller = False
                 rows = await _full_rows()
-                nonlocal bare_tagged
+                nonlocal bare_tagged, choice, choice_facts
                 bare_ns = {x for x in (found.get("bare") or []) if isinstance(x, int)}
                 bare_tagged = bare_ns
                 # Only rows the widget DECLARED count against its own aria-setsize; a bare node padding
                 # the list would hide a genuinely truncated one.
                 declared_rendered = [o for o in rows if o.get("n") not in bare_ns]
                 overflow = _declared_shortfall([_list_row(o) for o in declared_rendered])
-                idx = _pick(rows)
-                if idx is None and overflow == 0:
-                    # No exact-label winner over the complete rendered list — but "several rows" may be
-                    # one candidate wearing more than one face (an a11y duplicate, a portal+inline
-                    # render). Collapse only over the FULL list (never a partial/overflowed one), and
-                    # only to a genuinely lone survivor; several distinct candidates still refuse below.
-                    want = _exact_tier_key(value)
-                    matched = [o for o in rows if _exact_tier_key(str(o.get("text") or "")) == want]
-                    if len(matched) >= 2:
-                        # A row the widget DECLARED outranks a bare node wearing the same label. Text
-                        # agreement is what the collapse reads, and these two agree on it while being
-                        # different options — the bare one can commit another record under an identical
-                        # label, which reads as success. Only the declared unit may stand for them.
-                        declared_matched = [o for o in matched if o.get("n") not in bare_ns]
-                        if declared_matched:
-                            idx = (
-                                _lone_duplicate_candidate(declared_matched)
-                                if len(declared_matched) >= 2
-                                else declared_matched[0].get("n")
-                            )
-                        else:
-                            # Every exact match is bare, so the text-agreement collapse cannot run:
-                            # bare rows carry no declared identity for it to veto on, and two distinct
-                            # records wearing one label would read as a single candidate. Only nesting
-                            # is decidable here — a wrapper and the node carrying its label are ONE
-                            # candidate, related by the `inside` chain, and the innermost stands for
-                            # them. Siblings never share that chain, so they survive as two and refuse.
-                            survivors = _without_nested_copies(value, matched)
-                            if len(survivors) == 1:
-                                idx = survivors[0].get("n")
-                return True, rows, idx, overflow
+                window = await _read_list_window(page, declared_rendered, scroller=scroller)
+                # A non-exact row is judged only where every row sharing a word with the value was a candidate.
+                choice_facts = {
+                    "gate": found.get("gate"),
+                    "complete": overflow == 0 and _list_coverage([window]) == "complete",
+                    "query_full": not exact_only,
+                }
+                choice = match_choice(
+                    value,
+                    rows,
+                    complete=bool(choice_facts["complete"]) and choice_facts["gate"] == "overlap",
+                    query_full=not exact_only,
+                    allow=_choice_tiers(typeahead=True),
+                    collapse=overflow == 0,
+                    bare=frozenset(bare_ns),
+                )
+                stem_only = {x for x in (found.get("stemOnly") or []) if isinstance(x, int)}
+                if isinstance(choice, Pick) and choice.n in stem_only:
+                    # A row that shares only a singular/plural with the value stands as a rival, never as the answer.
+                    choice = Refusal("none", tuple(o for o in rows if o.get("n") == choice.n))
+                return True, rows, choice.n if isinstance(choice, Pick) else None, overflow
             if exact_only:
                 # The tagger returns at most 15 rows; an exact match has to see every one.
                 rows = await _full_rows()
-                return False, rows, _match_option_exact(value, _without_nested_copies(value, rows)), 0
+                choice = match_choice(
+                    value, _without_nested_copies(value, rows), complete=False, allow=frozenset({Tier.EXACT})
+                )
+                return False, rows, choice.n if isinstance(choice, Pick) else None, 0
             return False, tagged, 1, 0
 
         async def _row_info(n: int) -> dict[str, Any]:
@@ -15765,6 +15659,43 @@ def build_browser_tools(
             except Exception:
                 info = None
             return info if isinstance(info, dict) else {}
+
+        async def _rows_hold(judged_rows: list[dict[str, Any]]) -> tuple[int, bool, list[dict[str, Any]]]:
+            # A top-k list still answering can swap a twin in under a non-exact hit: the rows judged must read back the
+            # same, with the list not busy, 0.6 s later, within 2.4 s. The rows last read come back too: re-running the finder
+            # renumbers the tags, so a refusal must list those, never the judged ones.
+            start = time.monotonic()
+
+            def sig(rows: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+                # Text alone misses a same-text row carrying another value and a list that grew its declared size.
+                return [
+                    (
+                        o.get("n"),
+                        o.get("text"),
+                        o.get("label"),
+                        o.get("val"),
+                        repr(o.get("vals")),
+                        o.get("setsize"),
+                        o.get("setsize_unknown"),
+                    )
+                    for o in rows
+                ]
+
+            want = sig(judged_rows)
+            last = judged_rows
+            while time.monotonic() - start < 2.4:
+                await asyncio.sleep(0.6)
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if busy:
+                    continue
+                # Re-run the finder so a row that arrived after the first read is tagged and counted.
+                last = await _full_rows() if await _find() is not None else []
+                if sig(last) == want:
+                    return round((time.monotonic() - start) * 1000), True, last
+            return round((time.monotonic() - start) * 1000), False, last
 
         judged: tuple[bool, list[dict[str, Any]], int | None, int] | None = None
 
@@ -15778,8 +15709,9 @@ def build_browser_tools(
         if live_offer is not None:
             token, rows = live_offer
             bare_tagged = {row["n"] for row in rows if row.get("bare")}
-            matched = [row for row in rows if _exact_tier_key(str(row.get("text") or "")) == _exact_tier_key(value)]
-            idx = matched[0]["n"] if len(matched) == 1 else _lone_duplicate_candidate(matched)
+            # A follow-up names a row by its exact label, so it commits only an exact row.
+            live = match_choice(value, rows, complete=False, allow=frozenset({Tier.EXACT}), collapse=True)
+            idx = live.n if isinstance(live, Pick) else None
             if idx is None:
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
             stamp = f'[data-tv3-sugg="{idx}"][data-tv3-pick="{token}"]'
@@ -15808,6 +15740,17 @@ def build_browser_tools(
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False, verdict=verdict)
             declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
             stamp = f'[data-tv3-sugg="{idx}"]'
+            if isinstance(choice, Pick) and choice.tier is not Tier.EXACT:
+                held = bool(pre_own) and _exact_tier_key(pre_own or "") == _exact_tier_key(value)
+                settle_ms, settled, last = (0, False, rows) if held else await _rows_hold(rows)
+                choice_facts["settle_ms"] = settle_ms
+                if not settled:
+                    # A list that emptied leaves no tag behind, so the judged rows name nothing a click could reach.
+                    rows = last or rows
+                    hit = tuple(o for o in rows if tier_of(value, o) is not None)
+                    choice, idx = Refusal("held" if held else "unsettled", hit), None
+            if choice is not None:
+                _log_choice("typeahead", choice, len(rows), value, **choice_facts)
         if idx is None:
             declares = "its total unknown" if overflow < 0 else f"{overflow} rows"
             note = (
@@ -15824,6 +15767,7 @@ def build_browser_tools(
                 declared=declared_rows,
                 note=note,
                 overflow=overflow,
+                refusal=choice if isinstance(choice, Refusal) else None,
             )
         best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
         info = await _row_info(idx)
@@ -15869,11 +15813,15 @@ def build_browser_tools(
             if live_offer is not None:
                 LOG.debug("taskv3 live row click failed; retrying through typing", selector=selector, exc_info=True)
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            # The re-resolve below sets `choice` only on the declared path, so an earlier decision must not stand in for it.
+            choice = None
             try:
                 refound = await _find()
                 if refound is not None:
                     declared_rows, rows, idx2, _overflow = await _resolve(refound)
-                    if idx2 is not None:
+                    # A list that re-rendered under the click is the case the settle exists for, so only an exact
+                    # row is re-picked here.
+                    if idx2 is not None and not (isinstance(choice, Pick) and choice.tier is not Tier.EXACT):
                         idx = idx2
                         best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
                         info = await _row_info(idx)
@@ -15956,6 +15904,7 @@ def build_browser_tools(
             declared=declared_rows,
             pre_surface_hit=pre_surface_hit,
             shared_surface=shared_surface,
+            tier=choice.tier if isinstance(choice, Pick) else None,
         )
 
     async def _is_native_date_input(page: Any, selector: str) -> bool:
@@ -16110,9 +16059,15 @@ def build_browser_tools(
         # Fail toward an answer: a list that could not be read is no evidence the text matched nothing.
         try:
             arg = {**(await _probe_arg(page, selector)), "typed": text}
-            return await page.evaluate(_DECLARED_LIST_ANSWER_JS, arg) != "none"
+            read = await page.evaluate(_DECLARED_LIST_ANSWER_JS, arg)
         except Exception:
             return True
+        if not isinstance(read, dict):
+            return True
+        want = _exact_tier_key(text)
+        return read.get("state") != "none" or (
+            bool(want) and any(isinstance(t, str) and _exact_tier_key(t) == want for t in read.get("labels") or [])
+        )
 
     async def _answers_as_search(page: Any, selector: str) -> bool:
         # Rows that reacted to the keystrokes, or aria-autocomplete list/both/inline, which also covers a combobox
@@ -18532,12 +18487,13 @@ def build_browser_tools(
                 note=pick.note,
                 rows_unread=bool(pick.overflow),
                 live_token=live_token,
+                choice=pick.refusal,
             )
         if pick.suggestion:
             suggestion = _model_text(pick.suggestion, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
             if pick.clicked:
-                _log_committed_pick(pick.suggestion, text, verdict, "type")
+                _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -18545,9 +18501,13 @@ def build_browser_tools(
                     )
                     if closed is not None:
                         return closed
-                return ToolResult.ok(
-                    f"typed into {selector}; it is a typeahead — selected {suggestion!r} "
-                    f"(committed value: {pick.committed!r})"
+                return with_tier_note(
+                    ToolResult.ok(
+                        f"typed into {selector}; it is a typeahead — selected {suggestion!r} "
+                        f"(committed value: {pick.committed!r})"
+                    ),
+                    pick.tier,
+                    _model_text(text, 60),
                 )
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
@@ -18815,7 +18775,7 @@ def build_browser_tools(
             # after each step and matching over everything accumulated so far, keyed by TEXT: the
             # virtualiser recycles nodes and `data-tv3-menu` numbers are reassigned 1..N on every scan,
             # so a number from an earlier window is not an identity. Any hit, exact or forward-prefix ("United
-            # States" -> "United States Minor Outlying Islands"), commits only through `_commit_gate` once the walk
+            # States" -> "United States Minor Outlying Islands"), commits only through `match_choice` once the walk
             # has reached the end: a twin, or the exact row a prefix stands in for, may still be below. A label
             # read on two distinct rows (two boxes, or twice in one window) is two rows wearing one text and is
             # refused as ambiguous.
@@ -18893,13 +18853,12 @@ def build_browser_tools(
 
             def _match_seen() -> str | None:
                 twins = _twin_keys()
-                texts = list(
-                    dict.fromkeys(
-                        r.text for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins
-                    )
-                )
-                hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
-                return texts[hit] if hit is not None else None
+                labels: dict[str, Any] = {}
+                for r in (r for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins):
+                    labels.setdefault(r.text, r.read.get("label"))
+                rows = [{"n": k, "text": t, "label": label} for k, (t, label) in enumerate(labels.items())]
+                hit = match_choice(value, rows, complete=True, allow=_choice_tiers(typeahead=False))
+                return hit.text if isinstance(hit, Pick) else None
 
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
@@ -18990,13 +18949,20 @@ def build_browser_tools(
 
             def _verdict(text: str) -> Literal["commit", "ambiguous", "incomplete"]:
                 twins = _twin_keys()
-                return _commit_gate(
-                    text,
-                    value,
-                    complete=complete,
-                    twins_seen=want in twins or _exact_tier_key(text) in twins,
-                    contenders=_value_contenders(value, [r.text for r in _log_rows(log.windows) if not r.nav]),
-                )
+                if want in twins or _exact_tier_key(text) in twins:
+                    return "ambiguous"
+                rows = [
+                    {"n": k, "text": r.text, "label": r.read.get("label")}
+                    for k, r in enumerate(_log_rows(log.windows))
+                    if not r.nav
+                ]
+                choice = match_choice(value, rows, complete=complete, allow=_choice_tiers(typeahead=False))
+                if isinstance(choice, Pick):
+                    # A walk that did not read the whole list may have missed an exact twin, so even EXACT waits.
+                    if choice.text != text:
+                        return "ambiguous"
+                    return "commit" if complete else "incomplete"
+                return "incomplete" if choice.reason == "incomplete" else "ambiguous"
 
             def _result(
                 current: list[dict[str, Any]],
@@ -19065,11 +19031,14 @@ def build_browser_tools(
                 },
             )
 
-        # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
-        # read in full, so "several rows matched" can safely be checked for one candidate wearing more
-        # than one face. The scroll-search's own `_match_seen` call below builds rows from an
-        # accumulated, possibly-partial scan and must never collapse on that incomplete evidence.
-        idx = None if overflowed else _match_menu_option(value, options, collapse_duplicates=True)
+        # Collapse only here: `options` is the COMPLETE, non-overflowed list this call just read in full, so
+        # "several rows matched" can safely be checked for one candidate wearing more than one face. The
+        # scroll-search's own `_match_seen` builds rows from an accumulated, possibly-partial scan and never collapses.
+        first = None
+        if not overflowed:
+            first = match_choice(value, options, complete=True, allow=_choice_tiers(typeahead=False), collapse=True)
+            _log_choice("open_pick", first, len(options), value, complete=True, query_full=True)
+        idx = first.n if isinstance(first, Pick) else None
         matched_from_scroll: str | None = None
         scanned_all = False
         if idx is None and overflowed:
@@ -19100,7 +19069,7 @@ def build_browser_tools(
             held = [t for t in row_texts if _exact_tier_key(t) == key]
             if held and n > len(held):
                 row_texts += [held[0]] * (n - len(held))
-        contenders = _value_contenders(value, row_texts)
+        contenders = contender_texts(value, row_texts)
 
         def _ambiguous_error() -> ToolResult:
             named = "; ".join(repr(_model_text(t, 60)) for t in contenders[:15])
@@ -19110,20 +19079,24 @@ def build_browser_tools(
                 error_class="list_ambiguous",
             )
 
-        if idx is not None and matched_from_scroll is None:
-            full_hit = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
-            if (
-                _commit_gate(
-                    full_hit,
-                    value,
-                    # `idx` is only matched over a read that did not overflow.
-                    complete=True,
-                    twins_seen=False,
-                    contenders=_value_contenders(value, [str(o.get("text") or "") for o in _distinct_rows(options)]),
-                )
-                != "commit"
-            ):
-                return _ambiguous_error()
+        if isinstance(first, Refusal) and first.reason == "ambiguous":
+            # The list was read whole and stays open, so each contender is named by its row tag, with what tells
+            # apart rows that share a label.
+            rivals = [dict(o) for o in first.contenders]
+            keys = Counter(_canon_label(str(o.get("text") or "")) for o in rivals)
+
+            def _rival(o: dict[str, Any]) -> str:
+                key = _canon_label(str(o.get("text") or ""))
+                same = [p for p in rivals if _canon_label(str(p.get("text") or "")) == key]
+                suffix = _row_value_suffix(o, same) if keys[key] >= 2 else ""
+                return f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}{suffix}'
+
+            return ToolResult.error(
+                f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
+                f"({'; '.join(_rival(o) for o in rivals[:15])}); click the intended row by its listed selector, "
+                "or pass the one option's full text",
+                error_class="list_ambiguous",
+            )
 
         async def _popup_filter_pick() -> tuple[int, list[dict[str, Any]]] | ToolResult | None:
             # A list that renders only a fixed window of rows never shows one past it, however it is
@@ -19201,7 +19174,7 @@ def build_browser_tools(
                 except Exception:
                     raw = []
                 read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
-                # The same rule as the unfiltered read. `_commit_gate` commits no row from an incomplete read.
+                # The same rule as the unfiltered read: `match_choice` commits no non-exact row from an incomplete read.
                 window = await _read_list_window(
                     page, read_now, scroller=isinstance(tagged, dict) and bool(tagged.get("scroller"))
                 )
@@ -19275,6 +19248,7 @@ def build_browser_tools(
             still_busy = False
             verdict: str | None = None
             unproven: str | None = None
+            rival_texts: list[str] = []
             # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
             # flight, so the wait ends only past the deadline on a settled, not-busy read.
             soft_deadline = time.monotonic() + 2.4
@@ -19299,27 +19273,36 @@ def build_browser_tools(
                         if [str(o.get("text") or "") for o in filtered] != texts:
                             last = [str(o.get("text") or "") for o in filtered]
                         else:
-                            hit = _match_menu_option(value, filtered, collapse_duplicates=complete) if reacted else None
-                            hit_text = next((str(o.get("text") or "") for o in filtered if o.get("n") == hit), None)
-                            if hit is not None and hit_text is not None:
-                                verdict = _commit_gate(
-                                    hit_text,
-                                    value,
-                                    complete=complete,
-                                    twins_seen=exact_twins,
-                                    contenders=contenders
-                                    + _value_contenders(
-                                        value,
-                                        [
-                                            str(o.get("text") or "")
-                                            for o in _distinct_rows(filtered)
-                                            if not any(_same_row(o, p) for p in evidence_rows)
-                                        ],
-                                    ),
-                                )
-                                if verdict == "commit":
-                                    return hit, filtered
-                                unproven = hit_text if verdict == "incomplete" else None
+                            # Rows read before the filter still compete, each with its own values so a twin is never
+                            # collapsed into a filtered row it is not; numbered below zero, none of them is clicked.
+                            rivals = [
+                                o
+                                for o in evidence_rows
+                                if tier_of(value, o) is not None and not any(_same_row(o, f) for f in filtered)
+                            ]
+                            pool = [
+                                *filtered,
+                                *({**o, "n": -1 - k, "unit": None, "inside": None} for k, o in enumerate(rivals)),
+                            ]
+                            # The filter only narrows the list this call opened, so the open list's tier rules hold.
+                            choice = match_choice(
+                                value,
+                                pool,
+                                complete=complete,
+                                allow=_choice_tiers(typeahead=False),
+                                collapse=complete,
+                            )
+                            _log_choice("popup_filter", choice, len(pool), value, complete=complete)
+                            if reacted and isinstance(choice, Pick) and choice.n >= 0:
+                                if complete:
+                                    return choice.n, filtered
+                                # A filtered list read only in part may hide an exact twin, as on the walk.
+                                verdict, unproven = "incomplete", choice.text
+                                break
+                            if reacted and isinstance(choice, Refusal) and choice.reason != "none":
+                                verdict = "ambiguous" if choice.reason in ("ambiguous", "identical") else "incomplete"
+                                unproven = choice.contenders[0].get("text") if verdict == "incomplete" else None
+                                rival_texts = [str(o.get("text") or "") for o in choice.contenders]
                             break
                 if time.monotonic() >= hard_deadline:
                     break
@@ -19341,9 +19324,10 @@ def build_browser_tools(
                     "the field is NOT filled — pass one option's exact text, or look() and click the option",
                     error_class="filter_not_found",
                 )
-            several = _value_contenders(value, [str(o.get("text") or "") for o in filtered])
+            several = contender_texts(value, [str(o.get("text") or "") for o in filtered])
             if verdict == "ambiguous":
-                several = list(dict.fromkeys(contenders + several))
+                # One entry per contending row: two rows wearing one label are two contenders.
+                several = rival_texts
             if len(several) < 2 or verdict == "incomplete":
                 several = []
             listed = "; ".join(
@@ -19419,9 +19403,11 @@ def build_browser_tools(
                     )
                 vocab = "; ".join(repr(_model_text(o.get("text") or "", 60)) for o in shown)
                 more = f"; +{len(options) - len(shown)} more" if len(options) > len(shown) else ""
+                # Row numbers from earlier windows are not identities, so the nearest rows are named by text only.
+                near = _nearest_sentence(value, options, None, lambda o: "")
                 return ToolResult.error(
                     f"{value!r} matched no option in {selector}'s list — scrolled through all "
-                    f"{len(options)} options ({vocab}{more}); pass one option's exact text",
+                    f"{len(options)} options ({vocab}{more}); pass one option's exact text{f'; {near}' if near else ''}",
                     error_class="list_no_match",
                 )
             listing = "; ".join(
@@ -19456,17 +19442,19 @@ def build_browser_tools(
                 return _identical_text_rows_error(selector, value, same_as_value, menu_open=True)
             listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
             not_shown = len(options) - len(shown)
+            near = _nearest_sentence(value, options, None, lambda o: f'[data-tv3-menu="{o.get("n")}"] ')
+            near = f"; {near}" if near else ""
             if not_shown > 0:
                 # The match ran over every row the list rendered; only the listing is cut to 15.
                 return ToolResult.error(
                     f"opened {selector} but none of the {len(options)} options the list rendered matched "
                     f"{value!r} (the first {len(shown)}: {listing}) — pick the right one by its "
-                    '[data-tv3-menu="N"] selector, or pass one option\'s exact text',
+                    f'[data-tv3-menu="N"] selector, or pass one option\'s exact text{near}',
                     error_class="list_no_match",
                 )
             return ToolResult.error(
                 f"opened {selector} but no option matched {value!r}; the list shows {listing} — "
-                'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu',
+                f'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu{near}',
                 error_class="list_no_match",
             )
         matched = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
@@ -19576,9 +19564,23 @@ def build_browser_tools(
             pre_surface_hit,
         )
         verdict, matches = await _typeahead_commit_verdict(page, selector, committed or None, readable)
-        _log_committed_pick(matched, value, verdict, "open_pick")
+        # The matcher's own decision where it made one; a walk or filter pick is graded under the same switch.
+        tier = (
+            first.tier
+            if isinstance(first, Pick) and first.n == idx
+            else tier_of(
+                value,
+                next((o for o in options if o.get("n") == idx), {"text": matched}),
+                _choice_tiers(typeahead=False),
+            )
+        )
+        _log_committed_pick(matched, value, verdict, "open_pick", tier)
         if verdict is CommitStatus.OK:
-            return ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})")
+            return with_tier_note(
+                ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})"),
+                tier,
+                _model_text(value, 60),
+            )
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
             return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
@@ -19681,10 +19683,11 @@ def build_browser_tools(
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
             clicked: bool,
+            tier: Tier | None = None,
         ) -> ToolResult:
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
             if clicked:
-                _log_committed_pick(opt_txt, value, verdict, "typeahead")
+                _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -19740,6 +19743,7 @@ def build_browser_tools(
                     surface_vouched_pre_click=live_pick.pre_surface_hit,
                     shared_surface=live_pick.shared_surface,
                     clicked=True,
+                    tier=live_pick.tier,
                 )
 
         def _reduced_queries() -> list[str]:
@@ -19810,6 +19814,7 @@ def build_browser_tools(
                         surface_vouched_pre_click=rung_pick.pre_surface_hit,
                         shared_surface=rung_pick.shared_surface,
                         clicked=rung_pick.clicked,
+                        tier=rung_pick.tier,
                     )
                 if rung_pick.candidates:
                     ladder_rung = rung
@@ -19825,6 +19830,7 @@ def build_browser_tools(
                                 rows_unread=bool(rung_pick.overflow),
                                 live_token=live_token,
                                 live_search=rung,
+                                choice=rung_pick.refusal,
                             )
                     return rung_pick.candidates
             return []
@@ -19926,6 +19932,7 @@ def build_browser_tools(
                         note=pick.note,
                         rows_unread=bool(pick.overflow),
                         live_token=live_token,
+                        choice=pick.refusal,
                     )
                     # The field's own text may be uncommitted (an earlier type()), so it is never reported
                     # as a fill — only named, so the caller can judge it.
@@ -20026,9 +20033,12 @@ def build_browser_tools(
                         )
                     else:
                         offered_note = ""
+                    near = _nearest_sentence(
+                        value, [{"n": k, "text": t} for k, t in enumerate(offered)], None, lambda o: ""
+                    )
                     message = (
                         f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
-                        f"— do not assume success or move on as if it were{offered_note}"
+                        f"— do not assume success or move on as if it were{offered_note}{f'; {near}' if near else ''}"
                     )
                     if offered:
                         return ToolResult.error(
@@ -20054,14 +20064,19 @@ def build_browser_tools(
                 ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
-            verdict = await _typeahead_verdict_result(
-                pick.suggestion,
-                pick.committed,
-                pick.readable,
-                declared=pick.declared,
-                surface_vouched_pre_click=pick.pre_surface_hit,
-                shared_surface=pick.shared_surface,
-                clicked=pick.clicked,
+            verdict = with_tier_note(
+                await _typeahead_verdict_result(
+                    pick.suggestion,
+                    pick.committed,
+                    pick.readable,
+                    declared=pick.declared,
+                    surface_vouched_pre_click=pick.pre_surface_hit,
+                    shared_surface=pick.shared_surface,
+                    clicked=pick.clicked,
+                    tier=pick.tier,
+                ),
+                pick.tier,
+                _model_text(value, 60),
             )
             # A click the widget ignored leaves the caller's search in the field, which is text the
             # widget never accepted as a value.
