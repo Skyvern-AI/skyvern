@@ -4783,10 +4783,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -7856,6 +7856,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7921,6 +7956,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -8041,6 +8111,31 @@
                     "type": "string",
                     "format": "binary",
                     "title": "Resume File"
+                  },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
                   },
                   "other_information": {
                     "anyOf": [
@@ -14788,6 +14883,14 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -23754,6 +23857,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -23915,7 +24055,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -23949,12 +24091,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
