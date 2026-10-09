@@ -595,7 +595,8 @@ export function useCdpInput({
       }
 
       e.preventDefault();
-      const isPrintable = e.key.length === 1 && !e.metaKey && !e.ctrlKey;
+      const isPrintable =
+        e.key.length === 1 && !e.metaKey && (!e.ctrlKey || e.altKey);
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
       const commands = editingCommandsFor(e);
       const payload: Record<string, unknown> = {

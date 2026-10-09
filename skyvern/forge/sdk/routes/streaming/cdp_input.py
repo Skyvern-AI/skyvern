@@ -15,6 +15,7 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from opentelemetry import metrics
 from playwright.async_api import CDPSession
+from playwright.async_api import Error as PlaywrightError
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
@@ -425,13 +426,17 @@ def _is_navigation_target_loss(error: BaseException) -> bool:
 
 
 async def _copy_selected_text(websocket: WebSocket, cdp_session: CDPSession) -> None:
-    result = await cdp_session.send(
-        "Runtime.evaluate",
-        {
-            "expression": _COPY_SELECTED_TEXT_EXPRESSION,
-            "returnByValue": True,
-        },
-    )
+    try:
+        result = await cdp_session.send(
+            "Runtime.evaluate",
+            {
+                "expression": _COPY_SELECTED_TEXT_EXPRESSION,
+                "returnByValue": True,
+            },
+        )
+    except PlaywrightError:
+        LOG.warning("CDP input: selection unavailable during copy", exc_info=True)
+        result = None
     if not isinstance(result, dict) or result.get("exceptionDetails"):
         await websocket.send_json({"kind": "copied-text", "text": ""})
         return

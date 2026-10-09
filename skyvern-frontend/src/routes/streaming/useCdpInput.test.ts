@@ -547,6 +547,33 @@ describe("useCdpInput key handling", () => {
   // SKY-13682: Delete (and every other non-printable key - Backspace, Enter, arrows, ...) was a
   // no-op in the remote page. CDP's Input.dispatchKeyEvent only performs the default edit action
   // when non-printable keys carry a windowsVirtualKeyCode, dispatched as eventType "rawKeyDown".
+  it.each([
+    ["@", "KeyQ", true, "keyDown", "@"],
+    ["ł", "KeyL", true, "keyDown", "ł"],
+    ["q", "KeyQ", false, "rawKeyDown", ""],
+  ])(
+    "preserves AltGr text and Ctrl shortcuts for %s",
+    async (key, code, altKey, eventType, text) => {
+      const result = await renderControllingInputHook();
+
+      act(() => {
+        result.current.handlers.handleKeyDown(
+          fakeKeyboardEvent(key, code, { ctrlKey: true, altKey }),
+        );
+      });
+
+      expect(
+        JSON.parse(latestSocketSend().mock.calls.at(-1)![0]),
+      ).toMatchObject({
+        type: "keyEvent",
+        eventType,
+        key,
+        text,
+        modifiers: altKey ? 3 : 2,
+      });
+    },
+  );
+
   it("sends windowsVirtualKeyCode and eventType rawKeyDown for Delete", async () => {
     const result = await renderControllingInputHook();
 

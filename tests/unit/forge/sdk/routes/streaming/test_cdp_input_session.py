@@ -680,6 +680,45 @@ class TestInteractiveInputDispatch:
 
         assert websocket.sent_json == [{"kind": "copied-text", "text": "selected remotely"}]
 
+    @pytest.mark.asyncio
+    async def test_copy_evaluation_failure_keeps_input_channel_usable(self) -> None:
+        class _NavigatingSession(_FakeSession):
+            async def send(self, method: str, params: dict) -> dict | None:
+                if method == "Runtime.evaluate":
+                    raise PlaywrightError("Execution context was destroyed")
+                return await super().send(method, params)
+
+        session = _NavigatingSession("s")
+        websocket = _FakeWebSocket(
+            [
+                json.dumps({"type": "copySelectedText"}),
+                json.dumps({"type": "insertText", "text": "still typing"}),
+            ]
+        )
+
+        await cdp_input._run_input_loop(
+            websocket,
+            SimpleNamespace(interactor="user", client_id="c1"),
+            _FakeInputSession(session),
+            "browser_session_id",
+            "pbs_test",
+        )
+
+        assert websocket.sent_json == [{"kind": "copied-text", "text": ""}]
+        assert websocket.closed is None
+        assert _dispatched(session) == [("Input.insertText", {"text": "still typing"})]
+
+    @pytest.mark.asyncio
+    async def test_copy_cancellation_propagates(self) -> None:
+        class _CancelledSession(_FakeSession):
+            async def send(self, method: str, params: dict) -> dict | None:
+                raise asyncio.CancelledError()
+
+        websocket = _FakeWebSocket([])
+        with pytest.raises(asyncio.CancelledError):
+            await cdp_input._copy_selected_text(websocket, _CancelledSession("s"))
+        assert websocket.sent_json == []
+
 
 def _history(current_index: int, *urls: str) -> dict:
     return {
