@@ -583,7 +583,8 @@ class Settings(BaseSettings):
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
     # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
-    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # task block's chosen engine and run a block with no engine on Task V3 (or on the per-run split of
+    # WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS for a listed org or workflow), outside WORKFLOW_TASK_V3_AB.
     # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
     # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
     TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
