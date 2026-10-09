@@ -279,7 +279,7 @@ describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () =
   }
 
   test("a live run targeted by the URL still makes the block controls inert", () => {
-    queryClient.setQueryData(["workflowRun", "wf-test", "wr_1"], {
+    queryClient.setQueryData(["workflowRun", "wr_1"], {
       workflow_run_id: "wr_1",
       status: Status.Running,
     });
@@ -292,7 +292,7 @@ describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () =
   });
 
   test("a payload retained after the targeted run clears does not", () => {
-    queryClient.setQueryData(["workflowRun", "wf-test", undefined], {
+    queryClient.setQueryData(["workflowRun", undefined], {
       workflow_run_id: "wr_1",
       status: Status.Running,
     });
@@ -302,7 +302,7 @@ describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () =
 });
 
 test("a paused block run leaves per-block controls idle", () => {
-  queryClient.setQueryData(["workflowRun", "wf-test", "wr_paused"], {
+  queryClient.setQueryData(["workflowRun", "wr_paused"], {
     workflow_run_id: "wr_paused",
     status: Status.Paused,
   });
