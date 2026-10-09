@@ -245,11 +245,14 @@ class CodeArtifactCompletionCriterion(BaseModel):
     terminal: bool | None = None
     output_path: str | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource | None = None
-    deliverable_kind: Literal["registered_download"] | None = Field(
+    deliverable_kind: Literal["registered_download", "generated_file"] | None = Field(
         default=None,
         description=(
-            "Set to `registered_download` only when this criterion promises the user a downloaded file. "
-            "Run finalization then verifies execution-layer file registration; authored code output cannot satisfy it."
+            "Set only when this criterion promises the user a file. `registered_download`: a file the site serves and "
+            "the browser downloads. `generated_file`: a file the workflow builds itself and publishes with "
+            "`publish_file`, such as a screenshot or report. Run finalization verifies the matching "
+            "execution-layer registration: a published file never satisfies `registered_download`, a site download "
+            "never satisfies `generated_file`, and authored code output satisfies neither."
         ),
     )
     judgment_predicate: JudgmentPredicate | None = Field(
