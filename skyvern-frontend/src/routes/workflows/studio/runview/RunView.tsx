@@ -1080,7 +1080,7 @@ export function RunView({
                   onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
                   onViewScreenshot={(workflowRunBlockId) => {
                     if (embedded) {
-                      setOpenPanes(["browser"]);
+                      setOpenPanes(["browser"], { byUser: true });
                     } else {
                       openPane("browser");
                     }

@@ -208,13 +208,7 @@ def deserialize_proxy_location(
                     subdivision=redact_proxy_location(subdivision),
                 )
                 data["subdivision"] = None
-            result = GeoTarget.model_validate(data)
-            LOG.info(
-                "Deserialized proxy_location as GeoTarget",
-                db_value=redact_proxy_location(value),
-                result=redact_proxy_location(result),
-            )
-            return result
+            return GeoTarget.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             if raise_on_invalid_geo_target:
                 raise

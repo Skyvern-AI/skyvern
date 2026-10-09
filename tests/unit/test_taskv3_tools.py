@@ -63,6 +63,7 @@ from skyvern.forge.taskv3.code_surface import (
     apply_surface,
     configured_surface,
 )
+from skyvern.forge.taskv3.field_commit import Tier
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
@@ -135,54 +136,6 @@ def test_classify_commit_matrix() -> None:
     assert _classify_commit(None, 1, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
     assert _classify_commit(None, 0, S, committed_value=True) == CommitStatus.UNVERIFIED
     assert _classify_commit(None, 2, S, committed_value=False) == CommitStatus.DID_NOT_COMMIT
-
-
-def test_match_menu_option_matrix() -> None:
-    from skyvern.forge.taskv3.tools import _match_menu_option
-
-    opts = [
-        {"n": 1, "text": "Analytics"},
-        {"n": 2, "text": "Engineering"},
-        {"n": 3, "text": "People Operations"},
-    ]
-    # Exact normalized match (case/whitespace-insensitive) wins.
-    assert _match_menu_option("Analytics", opts) == 1
-    assert _match_menu_option("  analytics ", opts) == 1
-    assert _match_menu_option("PEOPLE   OPERATIONS", opts) == 3
-    # FORWARD token-prefix only: a short observed value matches the fuller option label.
-    assert _match_menu_option("People", opts) == 3
-    eeo = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "No"}, {"n": 3, "text": "Decline to self-identify"}]
-    assert _match_menu_option("Decline", eeo) == 3
-    # REVERSE is refused: a longer value must NOT commit a shorter, more-general option — the fuller row
-    # may simply be unrendered (virtualised list), so committing "People Operations" for a "…Team" value
-    # or "New" for "New York" would be a silent wrong success.
-    assert _match_menu_option("People Operations Team", opts) is None
-    assert _match_menu_option("New York", [{"n": 1, "text": "New"}, {"n": 2, "text": "Newark"}]) is None
-    # CRITICAL: a value that is only an incidental SUBSTRING of an option is NOT matched — "No" is inside
-    # "prefer not to answer" but must never commit the "No" row on a sensitive question.
-    assert _match_menu_option("Prefer not to answer", eeo) is None
-    # ...and an abbreviation that is not a whole-token prefix is not guessed at either.
-    assert _match_menu_option("Eng", opts) is None
-    # Apostrophe/quote folding comes from the shared exact/stem matcher.
-    assert _match_menu_option("Masters Degree", [{"n": 1, "text": "Master's Degree"}, {"n": 2, "text": "PhD"}]) == 1
-    # No match -> None (hand the options back to the model, don't guess).
-    assert _match_menu_option("Legal", opts) is None
-    assert _match_menu_option("", opts) is None
-    # Exact wins even when a token-prefix is otherwise ambiguous: "Yes" is an exact row despite
-    # "Yes, I consent" sharing its first token.
-    yn = [{"n": 1, "text": "Yes"}, {"n": 2, "text": "Yes, I consent"}, {"n": 3, "text": "No"}]
-    assert _match_menu_option("Yes", yn) == 1
-    # Ambiguous forward-prefix with no exact match -> None, never an arbitrary pick.
-    ambiguous = [{"n": 1, "text": "United States Minor"}, {"n": 2, "text": "United States Major"}]
-    assert _match_menu_option("United States", ambiguous) is None
-    # A row missing a usable index is ignored rather than crashing.
-    assert _match_menu_option("Analytics", [{"n": None, "text": "Analytics"}, {"n": 5, "text": "Analytics"}]) == 5
-    # A leading comma token is folded away, so a short value forward-prefix-matches a punctuated label
-    # ("Yes" -> "Yes, I consent") instead of silently missing on the attached comma.
-    punct = [{"n": 1, "text": "Yes, I consent"}, {"n": 2, "text": "No"}]
-    assert _match_menu_option("Yes", punct) == 1
-    # A slash is left intact so a combined single option is NOT prefix-matched by one of its halves.
-    assert _match_menu_option("Yes", [{"n": 1, "text": "Yes/No"}, {"n": 2, "text": "Maybe"}]) is None
 
 
 def test_annotate_screenshot_downscales_and_draws_marks() -> None:
@@ -8834,8 +8787,13 @@ class _ClickFakePage:
         click_raises: Exception | None = None,
         match_counts: list[int] | None = None,
         doc_same: bool | None = True,
+        click_seen: bool | None = False,
+        plant_raises: bool = False,
     ) -> None:
         self.url = "https://example.test/results"
+        # whether the document received the press; None => the page cannot be asked
+        self._click_seen = click_seen
+        self._plant_raises = plant_raises
         # the post-click "is this still the same document" answer; None => the page cannot be asked
         self._doc_same = doc_same
         self.calls: list[tuple[str, Any]] = []
@@ -8868,6 +8826,12 @@ class _ClickFakePage:
             return self._doc_same
         if "__tv3_click_doc = 1" in js:
             return None
+        if "__tv3_click_hook" in js and self._plant_raises:
+            raise RuntimeError("plant refused")
+        if "__tv3_click_seen === 1" in js:
+            if self._click_seen is None:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return self._click_seen
         if self._probe_raises:
             raise RuntimeError("probe boom")
         if "menuOpen" in js:
@@ -8954,6 +8918,8 @@ async def test_click_reports_opened_menu_with_stable_tags() -> None:
     assert "Most popular" in r.content
     # the model is told the options are volatile: re-clicking the trigger destroys them
     assert "closes the menu" in r.content
+    # Opening a menu to read it must not read as an order to pick: the reply names a way out that selects nothing.
+    assert "does not oblige a pick" in r.content and "leave it without selecting" in r.content
 
 
 @pytest.mark.asyncio
@@ -9011,6 +8977,8 @@ async def test_click_option_no_commit_errors_loud(monkeypatch: pytest.MonkeyPatc
     assert "did not commit" in r.content
     assert "Most popular" in r.content
     assert "Do not repeat" in r.content
+    # The click fired before the verification failed: an action block must not be granted a second one.
+    assert (r.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY) is True
 
 
 @pytest.mark.asyncio
@@ -11232,6 +11200,42 @@ async def test_click_timeout_on_live_element_reraises_original() -> None:
         await _tool(tools, "click").handler({"selector": "#covered"})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seen", "plant_raises", "dispatched"),
+    [(True, False, True), (False, False, False), (None, False, True), (False, True, True)],
+    ids=["received", "never", "unreadable", "marker_never_armed"],
+)
+@pytest.mark.parametrize("covered", [False, True], ids=["reraised", "covered_after_raise"])
+async def test_a_raised_click_reports_whether_the_page_received_it(
+    seen: bool | None, plant_raises: bool, dispatched: bool, covered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A slow submit raises after the page took the press; the loop must not grant a single-action block a second
+    # click then. An overlay the submit raised is the covered branch, which returns instead of re-raising.
+    if covered:
+        monkeypatch.setattr(
+            taskv3_tools,
+            "_probe_evaluate",
+            AsyncMock(return_value={"exists": True, "occluded": True, "occluder": {"tag": "div"}}),
+        )
+    page = _ClickFakePage(
+        exists=True,
+        click_raises=TimeoutError("Page.click: Timeout 15000ms exceeded"),
+        click_seen=seen,
+        plant_raises=plant_raises,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    token = taskv3_loop._CLICK_DISPATCHED.set(False)
+    try:
+        try:
+            await _tool(tools, "click").handler({"selector": "#submit"})
+        except TimeoutError:
+            assert not covered
+        assert taskv3_loop._CLICK_DISPATCHED.get() is dispatched
+    finally:
+        taskv3_loop._CLICK_DISPATCHED.reset(token)
+
+
 # --- DOM-level tests: the REAL precheck/finder/after JS against live Chromium, on a faithful mimic
 # of the staging widget (conditional-render popover, option nodes REMOUNTED on every toggle). ---
 
@@ -13335,13 +13339,16 @@ async def test_type_into_an_unclickable_field_never_reports_a_fill_that_did_not_
         except Exception as exc:
             assert "outside of the viewport" in str(exc), exc
         else:
-            assert r.status == "error", r.content
             if text != text.strip():
-                # The focus path Tabs out, so the widget has committed its trimmed value: it is reported
-                # and left in place, not taken back.
-                assert "holds '2023'" in r.content, r.content
+                # The focus path Tabs out and the widget commits "2023". The skinned group's settle confirms that year,
+                # so the write landed; the plain group's does not, so the trimmed value is reported and left in place.
+                if template == _SEGMENTED_DATE_SKINNED_SUBPIXEL_HTML:
+                    assert r.status == "ok", r.content
+                else:
+                    assert r.status == "error" and "holds '2023'" in r.content, r.content
                 assert await page.eval_on_selector("#year", "el => el.value") == "2023"
                 return
+            assert r.status == "error", r.content
             assert "NOT filled" in r.content, r.content
         assert await page.eval_on_selector("#year", "el => el.value") == ""
         assert await page.eval_on_selector("#month", "el => el.value") == ""
@@ -15174,6 +15181,57 @@ async def test_type_errors_when_the_other_date_segment_cannot_be_read_back() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": "2023"})
         assert r.status == "error" and r.error_class == "date_sibling_unverified", r.content
+        # Only a genuine read failure says the date could not be read back.
+        assert "could not be read back" in r.content, r.content
+
+
+# The year's first key lands in the day, and the day then refuses focus, so the tool cannot put it back.
+_DAY_BLEED_LOCKED = """
+<script>
+  window.DAYBLEED = 1;
+  document.addEventListener("keydown", (e) => {
+    if (e.target.id !== "year" || !/^[0-9]$/.test(e.key) || window.DAYBLEED <= 0) return;
+    window.DAYBLEED--;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    document.getElementById("day").value = e.key;
+    window.LOCKDAY = 1;
+  }, true);
+  document.getElementById("day").addEventListener("focus", () => {
+    if (window.LOCKDAY) document.getElementById("other").focus();
+  });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret", [False, True], ids=["plain", "secret"])
+@pytest.mark.parametrize("year_trimmed", [False, True], ids=["year_kept", "year_trimmed"])
+async def test_a_moved_day_that_cannot_be_put_back_is_named_with_its_value(secret: bool, year_trimmed: bool) -> None:
+    # The group reads fine, so "could not be read back" would send the model on with a wrong day; the result names the
+    # day and, unless the typed text is a secret, what it holds and what it should hold. A written segment the page
+    # changed after the Tab is named with it, since no caller re-reads it.
+    trim = (
+        '<script>document.getElementById("year").addEventListener("blur", (e) => {'
+        " e.target.value = e.target.value.slice(0, 3); });</script>"
+        if year_trimmed
+        else ""
+    )
+    html = _clamping_group("03", "15", "2024").replace("</script>", "</script>" + _DAY_BLEED_LOCKED + trim, 1)
+    async with _content_page(html) as page:
+        resolve = (lambda t: "2023" if t == "placeholder_year" else t) if secret else None  # noqa: E731
+        tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=resolve)
+        text = "placeholder_year" if secret else "2023"
+        r = await _tool(tools, "type").handler({"selector": "#year", "text": text})
+        assert await page.eval_on_selector("#day", "el => el.value") == "2", "fixture did not misroute the key"
+    assert r.status == "error" and r.error_class == "date_sibling_moved", r.content
+    assert "could not be read back" not in r.content and "re-type the day" in r.content, r.content
+    if secret:
+        assert "15" not in r.content and "holds 2" not in r.content, r.content
+    else:
+        assert "the day holds 2, not 15" in r.content, r.content
+    assert ("year" in r.content.split("re-type")[-1]) is year_trimmed, r.content
 
 
 @_skip_no_browser
@@ -15229,24 +15287,28 @@ def _segment_reformatting_on_blur(reformat: str) -> str:
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reformat", "typed", "held"),
+    ("reformat", "typed", "held", "landed"),
     [
-        ('year.value = year.value.padStart(2, "0");', "3", "03"),
-        ('if (year.value.length === 2) year.value = "20" + year.value;', "23", "2023"),
+        # The same segment value, written the widget's way: the group settle compares segments by integer.
+        ('year.value = year.value.padStart(2, "0");', "3", "03", True),
+        ('if (year.value.length === 2) year.value = "20" + year.value;', "23", "2023", False),
         # A substitution the model did not ask for: reported, never a success.
-        ("year.value = String(Math.min(12, Number(year.value)));", "13", "12"),
-        ('year.value = "1999";', "2023", "1999"),
-        # Differs only by whitespace: taking it back would empty the input while the widget keeps "3".
-        ("year.value = year.value.trim();", "3 ", "3"),
+        ("year.value = String(Math.min(12, Number(year.value)));", "13", "12", False),
+        ('year.value = "1999";', "2023", "1999", False),
+        ("year.value = year.value.trim();", "3 ", "3", True),
     ],
     ids=["zero-pad", "century", "clamp", "unrelated", "trim"],
 )
 async def test_type_reports_a_value_the_widget_committed_in_place_of_the_typed_text(
-    reformat: str, typed: str, held: str
+    reformat: str, typed: str, held: str, landed: bool
 ) -> None:
     async with _content_page(_segment_reformatting_on_blur(reformat)) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#year", "text": typed})
+        if landed:
+            assert r.status == "ok", r.content
+            assert await page.eval_on_selector("#year", "el => el.value") == held
+            return
         assert r.status == "error", r.content
         assert f"holds '{held}'" in r.content, r.content
         assert "NOT filled" not in r.content, r.content
@@ -32501,7 +32563,7 @@ _WRAPPED_INPUT_COMBOBOX_HTML = """
 async def test_select_combobox_refuses_single_leading_clause_match_when_unique() -> None:
     # The middle step of the cascade above on its own: with #state committed to "IL", "Springfield" is
     # a unique city match -- but only a word-prefix of the row's full label, so it is refused rather
-    # than auto-committed; the caller must supply "Springfield, Sangamon, IL".
+    # than auto-committed, and the row is offered first; the caller must supply "Springfield, Sangamon, IL".
     async with _address_lookup_page() as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         state_r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "IL"})
@@ -32509,7 +32571,8 @@ async def test_select_combobox_refuses_single_leading_clause_match_when_unique()
 
         city_r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Springfield"})
         assert city_r.status == "error", city_r.content
-        assert "Springfield, Sangamon, IL" in city_r.content, city_r.content
+        first_offer = city_r.content.split("nearest: ", 1)[1].split(";")[0]
+        assert "'Springfield, Sangamon, IL' (starts with it" in first_offer, city_r.content
 
 
 @_skip_no_browser
@@ -33584,7 +33647,7 @@ async def test_type_ambiguity_puts_back_the_value_the_field_arrived_with() -> No
     # from text this call typed and the widget never accepted.
     async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "type").handler({"selector": "#country", "text": "United States"})
+        r = await _tool(tools, "type").handler({"selector": "#country", "text": "United"})
         assert r.status == "error", r.content
         assert "United States (+1)" in r.content, r.content
         assert "United States Minor Outlying Islands (+1)" in r.content, r.content
@@ -34263,12 +34326,12 @@ async def test_click_on_a_container_wrapping_a_checkbox_and_a_button_gets_no_rea
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_combobox_ambiguity_puts_back_the_value_the_field_arrived_with() -> None:
-    # "United States" matches two rows, so the pick refuses. The field arrived holding "+1" -- a value
+    # "United" starts several rows, so the pick refuses. The field arrived holding "+1" -- a value
     # the page put there -- and the refusal must hand it back: leaving the query behind replaces a real
     # answer with text the widget never accepted, and a later read of the form cannot tell the two apart.
     async with _live_page(_PREFILLED_COUNTRY_FIXTURE_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "select_combobox").handler({"selector": "#country", "value": "United States"})
+        r = await _tool(tools, "select_combobox").handler({"selector": "#country", "value": "United"})
         assert r.status == "error", r.content
         assert "United States (+1)" in r.content, r.content
         assert "United States Minor Outlying Islands (+1)" in r.content, r.content
@@ -42386,3 +42449,495 @@ async def test_the_failed_read_count_resets_on_a_success_and_on_navigation(monke
         await page.goto("http://shop.test/review?again=1")
         after = await act(1)
         assert after[4] is None and after[1] == 0, after
+
+
+# One field per variant the field-entry read-back judges; each script stands in for a page's own handling of the value.
+_FIELD_ENTRY_MATRIX_HTML = """
+<input id="date" type="date">
+<input id="date_masked" type="date" placeholder="dd/mm/yyyy">
+<input id="number" type="number">
+<input id="email" type="email">
+<input id="phone" type="text" style="width:200px">
+<input id="capped" type="text" maxlength="3">
+<input id="cleared" type="email">
+<input id="rewritten" type="text">
+<div id="rich" contenteditable="true" style="width:200px;height:30px"></div>
+<select id="pick"><option>Alpha</option><option>Beta</option></select>
+<select id="reset"><option>Alpha</option><option>Beta</option></select>
+<select id="coded"><option value="CA">Canada</option><option value="US">United States</option></select>
+<button id="go">Go</button>
+<script>
+  const digits = (v) => v.replace(/\\D/g, "");
+  document.getElementById("phone").addEventListener("input", (e) => {
+    const d = digits(e.target.value);
+    if (d.length === 10) e.target.value = `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
+  });
+  document.getElementById("cleared").addEventListener("input", (e) => { e.target.value = ""; });
+  document.getElementById("rewritten").addEventListener("change", (e) => { e.target.value = "N/A"; });
+  document.getElementById("rewritten").addEventListener("input", (e) => { e.target.value = "N/A"; });
+  document.getElementById("reset").addEventListener("change", (e) => { e.target.selectedIndex = 0; });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "text", "status", "ok_class", "error_class", "held"),
+    [
+        ("#date", "09/18/2026", "ok", None, None, "2026-09-18"),
+        ("#date", "05/09/2026", "error", None, "date_format_refused", ""),
+        ("#date_masked", "05/09/2026", "ok", None, None, "2026-09-05"),
+        ("#number", "1500", "ok", None, None, "1500"),
+        ("#email", "a@b.co", "ok", None, None, "a@b.co"),
+        ("#phone", "5551234567", "ok", "held_as", None, "(555) 123-4567"),
+        ("#capped", "abcdef", "ok", "held_differs", None, "abc"),
+        ("#cleared", "a@b.co", "error", None, "text_not_held", ""),
+        ("#rewritten", "Paris", "ok", "held_differs", None, "N/A"),
+    ],
+    ids=[
+        "native_date_us_text",
+        "native_date_ambiguous",
+        "native_date_masked_order",
+        "number",
+        "email",
+        "mask_reformats",
+        "capped",
+        "page_clears",
+        "page_rewrites",
+    ],
+)
+async def test_type_reads_every_field_back_and_names_what_it_holds(
+    selector: str, text: str, status: str, ok_class: str | None, error_class: str | None, held: str
+) -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": selector, "text": text})
+        assert await page.eval_on_selector(selector, "el => el.value") == held
+    assert (r.status, r.ok_class, r.error_class) == (status, ok_class, error_class), r.content
+    assert r.entry_unconfirmed is (ok_class == "held_differs")
+    if ok_class in ("held_as", "held_differs"):
+        assert f"'{held}'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_does_not_press_enter_on_a_value_the_field_did_not_keep() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="q" type="email"></form>'
+    html += (
+        "<script>document.getElementById('q').addEventListener('input', (e) => { e.target.value = 'x@y.z'; });</script>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#q", "text": "a@b.co", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+    assert r.status == "ok" and r.entry_unconfirmed and "Enter was not pressed" in r.content, r.content
+    assert not submitted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_password_the_page_changed_is_never_a_reformat_and_is_not_submitted() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="pw" type="password"></form>'
+    html += "<script>document.getElementById('pw').addEventListener('input', (e) => {"
+    html += " e.target.value = e.target.value.toLowerCase(); });</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#pw", "text": "AbCd", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+    assert r.ok_class == "held_differs" and "Enter was not pressed" in r.content, r.content
+    # The tool-call record carries the withheld Enter, so the read can count what the skip costs.
+    assert (taskv3_loop._ENTRY_RECORD.get() or {}).get("entry_enter_withheld") is True
+    assert "abcd" not in r.content
+    assert not submitted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_delivered_code_typed_as_is_is_not_echoed_once_the_page_spaces_it() -> None:
+    html = '<input id="code" type="text" style="width:120px">'
+    html += "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    html += " const d = e.target.value.replace(/\\D/g, ''); if (d.length === 6) e.target.value = d.slice(0, 3) + ' ' + d.slice(3); });"
+    html += "</script>"
+    async with _content_page(html) as page:
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3", runtime_secret_values={"482913"})):
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert r.status == "ok" and "482" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_contenteditable_is_read_back() -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#rich", "text": "Some notes"})
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_does_not_echo_what_a_secret_field_holds() -> None:
+    html = '<input id="pin" type="text" maxlength="3">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(
+            _fixed_page_provider(page), resolve_typed_text=lambda t: "44171" if t == "placeholder_pin" else t
+        )
+        r = await _tool(tools, "type").handler({"selector": "#pin", "text": "placeholder_pin"})
+    assert r.ok_class == "held_differs" and "441" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "args", "status"),
+    [
+        ("#pick", {"label": "Beta"}, "ok"),
+        ("#pick", {"labels": ["Beta"]}, "ok"),
+        ("#pick", {"value": "Beta"}, "ok"),
+        ("#reset", {"label": "Beta"}, "error"),
+        ("#coded", {"value": "United States"}, "ok"),
+        ("#coded", {"value": "US"}, "ok"),
+    ],
+    ids=["label", "label_list", "value", "page_resets", "value_names_a_label", "value_names_a_value"],
+)
+async def test_select_option_reads_a_visible_single_select_back(
+    selector: str, args: dict[str, Any], status: str
+) -> None:
+    async with _content_page(_FIELD_ENTRY_MATRIX_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": selector, **args})
+    assert r.status == status, r.content
+    if status == "error":
+        assert r.error_class == "did_not_commit" and "'Alpha'" in r.content, r.content
+
+
+# A phone-country picker: each declared row renders a flag, the country name and its dial code. With `virtual`, the
+# list ignores the query and renders only the window of its 300 rows the scroller shows.
+_PHONE_COUNTRY_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="cc" type="text" role="combobox" aria-autocomplete="list" aria-controls="cc-list" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:320px;height:24px">
+  <div id="cc-list" role="listbox"
+       style="position:absolute;top:50px;left:20px;width:320px;max-height:240px;overflow:auto;background:#fff;display:none">
+    <div id="cc-space" style="position:relative"></div>
+  </div>
+  <script>
+    var VIRTUAL = %s;
+    var ROWS = [['\\u{1F1FA}\\u{1F1F8}', 'United States', '+1'], ['\\u{1F1FA}\\u{1F1F2}', 'United States Minor Outlying Islands', '+1'],
+                ['\\u{1F1EC}\\u{1F1E7}', 'United Kingdom', '+44'], ['\\u{1F1E8}\\u{1F1E6}', 'Canada', '+1']];
+    if (VIRTUAL) { for (var i = 0; i < 296; i++) { ROWS.push(['', 'Region ' + (100 + i), '+' + (200 + i)]); } }
+    var input = document.getElementById('cc'), list = document.getElementById('cc-list');
+    var space = document.getElementById('cc-space');
+    var shown = [];
+    function row(r, top) {
+      var el = document.createElement('div');
+      el.setAttribute('role', 'option');
+      el.style.cssText = 'height:24px;cursor:pointer;' + (VIRTUAL ? 'position:absolute;left:0;right:0;top:' + top + 'px' : '');
+      el.innerHTML = '<span>' + r[0] + '</span> <span>' + r[1] + '</span> <span>' + r[2] + '</span>';
+      el.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      el.addEventListener('click', function () {
+        input.value = el.innerText;
+        input.setAttribute('data-committed', r[1]);
+        list.style.display = 'none';
+      });
+      return el;
+    }
+    function render() {
+      space.innerHTML = '';
+      if (!VIRTUAL) { shown.forEach(function (r) { space.appendChild(row(r, 0)); }); return; }
+      space.style.height = (shown.length * 24) + 'px';
+      var first = Math.floor(list.scrollTop / 24);
+      shown.slice(first, first + 12).forEach(function (r, k) { space.appendChild(row(r, (first + k) * 24)); });
+    }
+    list.addEventListener('scroll', render);
+    input.addEventListener('input', function () {
+      var q = input.value.trim().toLowerCase();
+      shown = VIRTUAL ? ROWS : ROWS.filter(function (r) { return q && r[1].toLowerCase().indexOf(q) === 0; });
+      render();
+      list.style.display = q && shown.length ? 'block' : 'none';
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_a_country_row_decorated_with_its_dial_code() -> None:
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") == "United States"
+    match = [e for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert match and match[-1]["tier"] == "primary" and match[-1]["settle_ms"] > 0, match
+    (picked,) = (e for e in logs if e["event"] == "taskv3 combobox pick verdict")
+    assert picked["verdict"] == "ok" and picked["tier"] == "primary", picked
+    assert "United States" not in repr(match), match
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_commits_a_decorated_row_a_late_row_joins() -> None:
+    # A second "Canada" row lands between the first read and the settle's; the settle must see it, not only re-read the
+    # rows it tagged.
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        await page.evaluate(
+            """() => document.getElementById('cc').addEventListener('input', (e) => {
+                 if (!e.isTrusted || window.JOINED) return;
+                 clearTimeout(window.LATE);
+                 window.LATE = setTimeout(() => {
+                   window.JOINED = true;
+                   ROWS.push(['', 'Canada', '+2']);
+                   document.getElementById('cc').dispatchEvent(new Event('input'));
+                 }, 700);
+               })"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    # The settle refused, not a later re-resolve, and the refusal lists the rows as it last tagged them.
+    reasons = [e["reason"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert reasons[0] == "unsettled", reasons
+    assert "+2" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_with_the_nonexact_switch_off_commits_no_main_label_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CHOICE_NONEXACT_COMMIT", False)
+    assert taskv3_tools._choice_tiers(typeahead=True) == frozenset({Tier.EXACT})
+    assert taskv3_tools._choice_tiers(typeahead=False) == frozenset(Tier) - {Tier.PRIMARY}
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_decorated_row_from_a_list_it_could_not_read_whole() -> None:
+    async with _content_page(_PHONE_COUNTRY_HTML % "true") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "United States"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    near = r.content.split("nearest: ", 1)[1]
+    assert near.split(";")[0].endswith(
+        "United States +1' (its main label is it — not picked: the list may hold more rows)"
+    ), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_offers_a_decorated_row_for_a_value_with_no_word_to_overlap() -> None:
+    # "UK" has no 3-character word, so the finder admits rows by exact text alone and never sees every row that
+    # shares a word with it: the one row it found is not a complete view, whatever the list's coverage says.
+    async with _content_page(_PHONE_COUNTRY_HTML % "false") as page:
+        await page.evaluate("ROWS.push(['\\u{1F1EC}\\u{1F1E7}', 'UK', '+44'])")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "UK"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#cc", "el => el.getAttribute('data-committed')") is None
+    assert "UK +44' (its main label is it — not picked" in r.content, r.content
+
+
+# A click-opened list built when its trigger is clicked. `ANNOUNCE` lands beside the rows inside the popup.
+_CLICK_OPEN_LIST_HTML = """
+<!doctype html><html><body style="margin:0">
+  <button id="pick" aria-haspopup="true" style="position:absolute;top:20px;left:20px;width:260px;height:28px">Choose</button>
+  <script>
+    var ROWS = ROWS_JSON;
+    var b = document.getElementById('pick');
+    window.undone = false;
+    b.addEventListener('click', function () {
+      var old = document.getElementById('pop');
+      if (old) old.remove();
+      var pop = document.createElement('div');
+      pop.id = 'pop';
+      pop.style.cssText = 'position:absolute;top:52px;left:20px;width:260px;background:#fff';
+      pop.innerHTML = 'WRAP_OPEN<div id="opts" LIST_ATTRS></div>WRAP_CLOSE ANNOUNCE';
+      document.body.appendChild(pop);
+      var opts = document.getElementById('opts');
+      ROWS.forEach(function (t) {
+        var d = document.createElement('div');
+        if (ROW_ROLE) d.setAttribute('role', ROW_ROLE);
+        d.textContent = t;
+        d.style.cssText = 'height:24px;cursor:pointer';
+        d.addEventListener('click', function () {
+          b.textContent = t;
+          b.setAttribute('data-committed', t);
+          pop.remove();
+        });
+        opts.appendChild(d);
+      });
+      var undo = document.getElementById('undo');
+      if (undo) undo.addEventListener('click', function () { window.undone = true; });
+    });
+  </script>
+</body></html>
+"""
+
+
+def _click_open_list_html(
+    rows: list[str], *, list_attrs: str = "", wrap: str = "", announce: str = "", row_role: str = "option"
+) -> str:
+    return (
+        _CLICK_OPEN_LIST_HTML.replace("ROWS_JSON", json.dumps(rows))
+        .replace("ROW_ROLE", json.dumps(row_role))
+        .replace("LIST_ATTRS", list_attrs)
+        .replace("WRAP_OPEN", f"<div {wrap}>" if wrap else "")
+        .replace("WRAP_CLOSE", "</div>" if wrap else "")
+        .replace("ANNOUNCE", announce)
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "value", "row"),
+    [
+        (["10023(Example Co)", "10024(Sample Group)", "20045(Other Org)"], "10023", "10023(Example Co)"),
+        (["Full-time - Permanent", "Part-time - Temporary"], "Full-time", "Full-time - Permanent"),
+    ],
+    ids=["id-name", "value-qualifier"],
+)
+async def test_select_combobox_commits_a_click_opened_row_named_by_its_main_label(
+    rows: list[str], value: str, row: str
+) -> None:
+    async with _content_page(_click_open_list_html(rows)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": value})
+        assert r.status == "ok", r.content
+        assert "not an exact match" in r.content, r.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") == row
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_menu_never_lists_an_alerts_actions_as_its_rows() -> None:
+    # Undeclared rows and row-shaped actions: nothing but the announcement rule tells the toast from the menu.
+    toast = (
+        '<div role="alert"><div id="undo" style="height:24px;cursor:pointer">Undo</div>'
+        '<div style="height:24px;cursor:pointer">Dismiss</div></div>'
+    )
+    html = _click_open_list_html(["Alpha", "Beta", "Gamma"], announce=toast, row_role="")
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "Undo"})
+        assert r.status == "error", r.content
+        assert "Alpha" in r.content and "Dismiss" not in r.content, r.content
+        assert await page.evaluate("window.undone") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_listbox_inside_a_status_region_is_still_a_menu() -> None:
+    html = _click_open_list_html(["Alpha", "Beta", "Gamma"], list_attrs='role="listbox"', wrap='role="status"')
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#pick", "value": "Beta"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#pick", "el => el.getAttribute('data-committed')") == "Beta"
+
+
+_SENTENCE_ROWS_HTML = """
+<!doctype html><html><body style="margin:0">
+  <input id="auth" type="text" role="combobox" aria-autocomplete="list" aria-controls="auth-list" autocomplete="off"
+         style="position:absolute;top:20px;left:20px;width:560px;height:24px">
+  <div id="auth-list" role="listbox" style="position:absolute;top:50px;left:20px;width:560px;background:#fff"></div>
+  <script>
+    var ROWS = ROWS_JSON;
+    var input = document.getElementById('auth'), list = document.getElementById('auth-list');
+    input.addEventListener('input', function () {
+      var q = input.value.trim().toLowerCase();
+      list.innerHTML = '';
+      ROWS.filter(function (t) { return q && t.toLowerCase().indexOf(q) === 0; }).forEach(function (t) {
+        var d = document.createElement('div');
+        d.setAttribute('role', 'option');
+        d.textContent = t;
+        d.style.cssText = 'height:40px;cursor:pointer;font-size:12px';
+        d.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        d.addEventListener('click', function () { input.value = t; input.setAttribute('data-committed', t); list.innerHTML = ''; });
+        list.appendChild(d);
+      });
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "rows"),
+    [("Lawyers", ["Lawyers (Corporate)", "Lawyer"]), ("Lawyers", ["Lawyer"]), ("New", ["News", "New York"])],
+    ids=["main-label-beside-a-singular", "lone-singular", "plural-beside-a-longer-row"],
+)
+async def test_select_combobox_never_picks_a_row_that_shares_only_a_singular_or_plural(
+    value: str, rows: list[str]
+) -> None:
+    # A singular/plural row shares no whole word with the value: it reaches the matcher as a rival, never as the pick.
+    html = _SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(rows)).replace(
+        "t.toLowerCase().indexOf(q) === 0", "q.length > 0"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": value})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") is None
+    if rows == ["Lawyers (Corporate)", "Lawyer"]:
+        assert all(repr(t) in r.content for t in rows), r.content
+        tied = [e["tied"] for e in logs if e["event"] == "taskv3 choice match" and e["reason"] == "ambiguous"]
+        assert tied and tied[0] == ["primary", "stem"], tied
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_keeps_waiting_past_a_row_that_shares_only_a_singular() -> None:
+    # The singular renders first and the exact row a second later: a reaction made only of a singular/plural rival is
+    # no reaction, so the wait goes on until the value's own row arrives.
+    html = _SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(["Lawyer"])).replace(
+        "t.toLowerCase().indexOf(q) === 0", "q.length > 0"
+    )
+    async with _content_page(html) as page:
+        await page.evaluate(
+            """() => document.getElementById('auth').addEventListener('input', (e) => {
+                 if (!e.isTrusted || window.LATE) return;
+                 window.LATE = setTimeout(() => {
+                   ROWS.push('Lawyers');
+                   document.getElementById('auth').dispatchEvent(new Event('input'));
+                 }, 1000);
+               })"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": "Lawyers"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") == "Lawyers"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reads_a_declared_sentence_row_longer_than_a_caption() -> None:
+    rows = [
+        "Yes, I am authorized to work in this country and will not require sponsorship now or in the future",
+        "No, I will require sponsorship to work in this country now or at some point in the future",
+    ]
+    assert all(len(t) > 80 for t in rows)
+    async with _content_page(_SENTENCE_ROWS_HTML.replace("ROWS_JSON", json.dumps(rows))) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "select_combobox").handler({"selector": "#auth", "value": rows[0]})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#auth", "el => el.getAttribute('data-committed')") == rows[0]
+    # The full value's own read admits the row; a shorter search reaching it would be a "searched" gate.
+    gates = [e["gate"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
+    assert gates == ["overlap"], gates

@@ -12,7 +12,7 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.exceptions import BrowserSessionExpired
+from skyvern.exceptions import BrowserSessionExpired, ExternalBrowserSessionNotRunnable
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
@@ -33,7 +33,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_runs import PrepareNextAttemptResult, WorkflowRunDispatchFinalization
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import BrowserSessionCloseReason
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import EXTERNAL_CDP_BROWSER_VENDOR, BrowserSessionCloseReason
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.browser_profile_key import (
@@ -2439,6 +2439,7 @@ async def test_retry_preparation_preserves_session_after_transient_forced_pin_fa
             AsyncMock(
                 return_value=SimpleNamespace(
                     browser_profile_id=None,
+                    browser_vendor=None,
                     runnable_id="wr_other",
                     status="running",
                     completed_at=None,
@@ -2510,6 +2511,15 @@ async def test_submission_refuses_a_session_past_its_lifetime_and_accepts_a_live
                     started_at=datetime.now(UTC).replace(tzinfo=None),
                     created_by="api",
                 ),
+                PersistentBrowserSessionModel(
+                    persistent_browser_session_id="pbs_external",
+                    organization_id="o_test",
+                    status="running",
+                    timeout_minutes=240,
+                    started_at=datetime.now(UTC).replace(tzinfo=None),
+                    browser_vendor=EXTERNAL_CDP_BROWSER_VENDOR,
+                    upstream_cdp_url="sealed-address",
+                ),
             ]
         )
         await session.commit()
@@ -2534,6 +2544,9 @@ async def test_submission_refuses_a_session_past_its_lifetime_and_accepts_a_live
 
     assert refused.value.status_code == 410
     assert "pbs_expired" in refused.value.message
+    with pytest.raises(ExternalBrowserSessionNotRunnable) as refused_external:
+        await submit("pbs_external")
+    assert refused_external.value.status_code == 409
     async with database.Session() as session:
         assert (await session.scalars(select(WorkflowRunModel))).all() == []
         assert (await session.scalars(select(TaskModel))).all() == []

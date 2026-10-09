@@ -33,9 +33,6 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserGenerationRetired,
     browser_session_recovery,
-    record_sensitive_origin_run_taint,
-    register_sensitive_origin_run_lease,
-    sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import (
@@ -46,7 +43,6 @@ from skyvern.forge.sdk.copilot.tools import (
     copilot_native_tools,
     edit_block_and_run_tool,
     get_skyvern_mcp_alias_map,
-    mcp_hooks,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import (
@@ -63,10 +59,8 @@ from tests.unit.copilot_test_helpers import (
     OPENED_INVISIBLE_RECAPTCHA_HTML,
     FakeTabbedBrowserState,
     challenge_browser_page,
-    patch_browser_tab_count,
     patch_browser_tabs,
     skip_no_browser,
-    taint_by_terminal_run,
 )
 
 
@@ -551,15 +545,12 @@ async def test_interaction_credit_follows_what_the_workbench_can_actually_promot
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tainted", [True, False])
+@pytest.mark.parametrize("secret_run", [True, False])
 async def test_a_page_used_for_a_sensitive_sign_in_denies_the_cell_its_pixels(
-    monkeypatch: pytest.MonkeyPatch, tainted: bool
+    monkeypatch: pytest.MonkeyPatch, secret_run: bool
 ) -> None:
-    """Facts stop being withheld once the secret registry is complete, but the page stays tainted.
-
-    Result scrubbing compares values and an image is not a value, so a cell that can photograph the
-    page can carry it out a chunk at a time. The refusal is decided here, where the taint is known.
-    """
+    """Result scrubbing compares values and an image is not a value, so a cell that can photograph the
+    page can carry it out a chunk at a time."""
     denials: list[bool] = []
     probe = _LeaseProbeSession(denials_sink=denials)
 
@@ -580,77 +571,39 @@ async def test_a_page_used_for_a_sensitive_sign_in_denies_the_cell_its_pixels(
     monkeypatch.setattr(browser_code_module, "get_page", current_page)
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
-    # The state the gap lives in: the run has finished and its values are bound, so facts are no longer
-    # withheld. Stubbed because reaching it otherwise means rebuilding the whole secret registry; the
-    # taint below is the real thing, and it is what this test is about.
-    monkeypatch.setattr(browser_code_module, "sensitive_origin_page_facts_withheld", lambda *_a, **_k: False)
 
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_1"
-    # The real taint, not a stand-in for it: this is what a sensitive-origin run leaves behind.
-    ctx.sensitive_origin_browser_session_ids = {"pbs_1"} if tainted else set()
+    ctx.secret_run_browser_session_ids = {"pbs_1"} if secret_run else set()
 
     result = await browser_code_module.run_browser_code(ctx, "1")
 
     assert result["ok"] is True
-    assert denials == [tainted]
+    assert denials == [secret_run]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("result_url", "lifted"), [("https://x.test/", True), ("https://portal.test/a#top", False)])
-async def test_a_readable_tainted_page_regains_pixels_only_after_a_recorded_navigation_off_it(
-    monkeypatch: pytest.MonkeyPatch, result_url: str, lifted: bool
+async def test_a_cell_is_refused_with_a_reason_while_a_run_on_its_browser_still_owes_its_secrets(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With the navigate tool withdrawn, a cell's own navigation is the only way off a tainted page
-    whose facts are readable again; a fragment hop leaves the sensitive document up."""
-    from skyvern.forge.sdk.copilot.runtime import sensitive_origin_page_is_tainted
-
-    denials: list[bool] = []
-
-    class _NavigatingSession(_LeaseProbeSession):
-        async def run_cell(
-            self, code: str, *, timeout_seconds: float, deny_pixels: bool = False
-        ) -> BrowserCodeCellResult:
-            cell = await super().run_cell(code, timeout_seconds=timeout_seconds, deny_pixels=deny_pixels)
-            op = BrowserCodeOperation(
-                operation="goto",
-                selector=None,
-                succeeded=True,
-                source_url="https://portal.test/a",
-                result_url=result_url,
-            )
-            return replace(cell, operations=(op,), current_url=result_url)
-
-    probe = _NavigatingSession(denials_sink=denials)
-
-    @asynccontextmanager
-    async def lease(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
-        yield
-
-    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
-        return SimpleNamespace(page=probe.page), None
-
-    async def open_session(**_kwargs: object) -> BrowserCodeSession:
-        return probe
-
     async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
         return None, None, None
 
-    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
-    monkeypatch.setattr(browser_code_module, "get_page", current_page)
+    async def still_owed() -> None:
+        return None
+
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
-    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
-    monkeypatch.setattr(browser_code_module, "sensitive_origin_page_facts_withheld", lambda *_a, **_k: False)
-    patch_browser_tab_count(monkeypatch, 1)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_1"
-    ctx.sensitive_origin_browser_session_ids = {"pbs_1"}
+    ctx.awaited_run_secret_handoffs[("pbs_1", "wr_owed")] = still_owed
 
-    await browser_code_module.run_browser_code(ctx, f'await page.goto("{result_url}")')
-    await browser_code_module.run_browser_code(ctx, "1")
+    raw = await browser_code_module.run_browser_code_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx),  # type: ignore[arg-type]
+        json.dumps({"code": "1"}),
+    )
 
-    assert denials == [True, not lifted]
-    assert sensitive_origin_page_is_tainted(ctx) is not lifted
+    assert json.loads(raw)["ok"] is False
+    assert "wr_owed" in json.loads(raw)["error"]
 
 
 @pytest.mark.asyncio
@@ -749,197 +702,6 @@ async def test_a_cell_targeted_at_the_last_run_acts_in_that_runs_browser(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_withheld_page_lifts_only_on_a_recorded_navigation_to_another_document(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The replace surface withdraws every other route off a tainted page, so the code tool offers the
-    recovery the error names, keyed on the worker's record of the navigation rather than on the cell's
-    text: a rebound `page.goto` runs no operation, and a fragment hop leaves the sensitive document up."""
-    from skyvern.forge.sdk.copilot.runtime import (
-        record_sensitive_origin_run_taint,
-        register_sensitive_origin_run_lease,
-        release_sensitive_origin_run_lease,
-        sensitive_origin_page_facts_withheld,
-    )
-
-    tainted_url = "https://portal.test/account?tab=billing"
-    scripted: list[tuple[BrowserCodeOperation, ...]] = []
-    denials: list[bool] = []
-    sessions_discarded: list[bool] = []
-
-    def goto(result_url: str) -> BrowserCodeOperation:
-        return BrowserCodeOperation(
-            operation="goto", selector=None, succeeded=True, source_url=tainted_url, result_url=result_url
-        )
-
-    class _ScriptedSession(_LeaseProbeSession):
-        async def run_cell(
-            self, code: str, *, timeout_seconds: float, deny_pixels: bool = False
-        ) -> BrowserCodeCellResult:
-            denials.append(deny_pixels)
-            operations = scripted.pop(0)
-            current_url = operations[-1].result_url if operations else tainted_url
-            return BrowserCodeCellResult(
-                ok=True,
-                value="<response>",
-                stdout="leaked?",
-                stdout_truncated=False,
-                error_code=None,
-                error=None,
-                failing_line=None,
-                operations=operations,
-                operations_omitted=0,
-                session_alive=True,
-                current_url=current_url,
-            )
-
-    probe = _ScriptedSession()
-
-    @asynccontextmanager
-    async def lease(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
-        yield
-
-    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
-        return SimpleNamespace(page=probe.page), None
-
-    opened: list[bool] = []
-
-    async def open_session(**_kwargs: object) -> BrowserCodeSession:
-        opened.append(True)
-        return probe
-
-    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
-        return None, None, None
-
-    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
-    monkeypatch.setattr(browser_code_module, "get_page", current_page)
-    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
-    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
-    patch_browser_tab_count(monkeypatch, 1)
-    ctx = make_copilot_context()
-    ctx.browser_session_id = "pbs_1"
-    # An interpreter from before the page turned sensitive, whose namespace a recovery must not inherit.
-    ctx.browser_code_host.session = probe
-    ctx.browser_code_host.browser_session_id = "pbs_1"
-    record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_secret", session_id="pbs_1")
-    assert sensitive_origin_page_facts_withheld(ctx, None)
-    bare = 'await page.goto("https://x.test/")'
-
-    mixed = await browser_code_module.run_browser_code(ctx, f"print(await page.title())\n{bare}")
-    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr_secret", session_id="pbs_1")
-    while_active = await browser_code_module.run_browser_code(ctx, bare)
-    release_sensitive_origin_run_lease(ctx, workflow_run_id="wr_secret")
-    scripted.append(())
-    no_operation = await browser_code_module.run_browser_code(ctx, bare)
-    still_withheld_after_no_operation = sensitive_origin_page_facts_withheld(ctx, None)
-    sessions_discarded.append(ctx.browser_code_host.session is None)
-    scripted.append((goto(tainted_url + "#top"),))
-    fragment = await browser_code_module.run_browser_code(ctx, bare)
-    still_withheld_after_fragment = sensitive_origin_page_facts_withheld(ctx, None)
-    sessions_discarded.append(ctx.browser_code_host.session is None)
-    scripted.append((goto("https://x.test/"),))
-    recovered = await browser_code_module.run_browser_code(ctx, bare)
-
-    assert mixed["ok"] is False and 'await page.goto("<url>")' in mixed["error"]
-    assert while_active["ok"] is False and "while a run with sensitive inputs is active" in while_active["error"]
-    assert denials == [True, True, True], "every recovery attempt runs with pixels denied"
-    for refused in (no_operation, fragment):
-        assert refused["ok"] is False
-        assert "current_url" not in refused and "value" not in refused and "stdout" not in refused
-        assert tainted_url not in json.dumps(refused)
-        assert "session_ended" in refused
-    assert "session_ended" in recovered
-    # Every recovery ran in a fresh interpreter, never the one that predates the taint.
-    assert len(opened) == 3 and sessions_discarded == [False, False]
-    assert still_withheld_after_no_operation and still_withheld_after_fragment
-    assert recovered["ok"] is True and recovered["current_url"] == "https://x.test/"
-    assert "value" not in recovered and "stdout" not in recovered
-    assert not sensitive_origin_page_facts_withheld(ctx, None)
-
-
-@pytest.mark.asyncio
-async def test_a_recovery_navigation_with_another_tab_open_keeps_the_browser_withheld(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tainted_url = "https://portal.test/account?tab=billing"
-
-    class _RecoveringSession(_LeaseProbeSession):
-        async def run_cell(
-            self, code: str, *, timeout_seconds: float, deny_pixels: bool = False
-        ) -> BrowserCodeCellResult:
-            operation = BrowserCodeOperation(
-                operation="goto", selector=None, succeeded=True, source_url=tainted_url, result_url="https://x.test/"
-            )
-            return BrowserCodeCellResult(
-                ok=True,
-                value=None,
-                stdout=None,
-                stdout_truncated=False,
-                error_code=None,
-                error=None,
-                failing_line=None,
-                operations=(operation,),
-                operations_omitted=0,
-                session_alive=True,
-                current_url="https://x.test/",
-            )
-
-    probe = _RecoveringSession()
-
-    @asynccontextmanager
-    async def lease(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
-        yield
-
-    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
-        return SimpleNamespace(page=probe.page), None
-
-    async def open_session(**_kwargs: object) -> BrowserCodeSession:
-        return probe
-
-    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
-        return None, None, None
-
-    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
-    monkeypatch.setattr(browser_code_module, "get_page", current_page)
-    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
-    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
-    browser = FakeTabbedBrowserState(tainted_url, "https://portal.test/help", "blob:https://portal.test/export")
-    patch_browser_tabs(monkeypatch, browser)
-    ctx = make_copilot_context()
-    ctx.browser_session_id = "pbs_1"
-    record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_secret", session_id="pbs_1")
-
-    held = await browser_code_module.run_browser_code(ctx, 'await page.goto("https://x.test/")')
-
-    assert held["ok"] is False
-    # Every tab counts, the blob: one too, and the other tabs are named by the index tab_close takes.
-    assert "3 tabs" in held["error"] and "skyvern_tab_close" in held["error"] and "(index 2, 1)" in held["error"]
-    assert "current_url" not in held and "x.test" not in held["error"] and "portal.test" not in held["error"]
-    assert sensitive_origin_page_facts_withheld(ctx, None)
-
-    # The route the error names is open on the surface that only navigates through code: tab_close
-    # survives the required-code projection and is not refused while tainted, and once the other
-    # tabs are gone the next code navigation lifts the hold.
-    required = resolve_copilot_tool_surface(
-        mode=None,
-        native_tools=copilot_native_tools(
-            supports_question_tool=True, browser_code_available=True, run_tools_available=True
-        ),
-        alias_map=get_skyvern_mcp_alias_map(),
-        overlays=_build_skyvern_mcp_overlays(),
-        browser_code_mode=CopilotBrowserCodeMode.REPLACE,
-    )
-    assert "skyvern_tab_close" in required.ordered_mcp_names
-    assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
-    browser.close(browser.tabs[1])
-    browser.close(browser.tabs[2])
-    lifted = await browser_code_module.run_browser_code(ctx, 'await page.goto("https://x.test/")')
-
-    assert lifted["ok"] is True and lifted["current_url"] == "https://x.test/"
-    assert not sensitive_origin_page_facts_withheld(ctx, None)
-
-
-@pytest.mark.asyncio
 async def test_a_debug_reestablishment_does_not_rebind_a_cell_pinned_to_the_last_run_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -996,7 +758,7 @@ async def test_browser_code_uses_the_existing_page_then_recovery_lock_order(
     page_held = asyncio.Event()
     browser_code_waiting_for_page = asyncio.Event()
     probe = _LeaseProbeSession([])
-    real_page_custody_lock = browser_code_module.browser_page_custody_lock
+    real_page_custody_lock = browser_code_module.browser_session_turn
 
     @asynccontextmanager
     async def observed_page_custody(ctx: Any) -> AsyncIterator[None]:
@@ -1024,7 +786,7 @@ async def test_browser_code_uses_the_existing_page_then_recovery_lock_order(
             async with browser_session_recovery(ctx):
                 pass
 
-    monkeypatch.setattr(browser_code_module, "browser_page_custody_lock", observed_page_custody)
+    monkeypatch.setattr(browser_code_module, "browser_session_turn", observed_page_custody)
     monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
     monkeypatch.setattr(browser_code_module, "get_page", current_page)
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
@@ -1147,29 +909,6 @@ async def test_fresh_namespace_does_not_reset_a_session_opened_for_a_replacement
 
     assert result["ok"] is True
     replacement_session.reset_namespace.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_sensitive_origin_refusal_does_not_claim_the_namespace_was_reset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_context()
-    session = MagicMock(session_id="browser_code_session")
-    session.reset_namespace = AsyncMock()
-    ctx.browser_code_host.session = session
-    monkeypatch.setattr(browser_code_module, "_authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr(
-        browser_code_module,
-        "_prepare_browser_session_for_dispatch",
-        AsyncMock(return_value=(None, None, None)),
-    )
-    monkeypatch.setattr(browser_code_module, "sensitive_origin_page_facts_withheld", lambda *_args: True)
-
-    result = await browser_code_module.run_browser_code(ctx, "result = 1", fresh_namespace=True)
-
-    assert result["ok"] is False
-    assert "fresh_namespace" not in result
-    session.reset_namespace.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2011,10 +1750,6 @@ def _deny_raw_secrets(ctx: CopilotContext) -> None:
     ctx.request_policy = RequestPolicy(raw_secret_detected=True)
 
 
-def _lease_to_a_sensitive_run(ctx: CopilotContext) -> None:
-    register_sensitive_origin_run_lease(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
-
-
 _UNREAD = {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
 
 
@@ -2042,13 +1777,6 @@ _UNREAD = {"read": "failed", "url": None, "title": None, "challenge_vendor": Non
             id="browser-session-unavailable",
         ),
         pytest.param({"code": "1"}, {}, _deny_raw_secrets, _UNREAD, id="raw-secret"),
-        pytest.param(
-            {"code": "1"},
-            {},
-            _lease_to_a_sensitive_run,
-            {"read": "failed", "challenge_vendor": None},
-            id="active-sensitive-run",
-        ),
     ],
 )
 async def test_a_browser_code_call_that_may_not_read_the_page_is_reported_unread_without_a_read(
@@ -2120,21 +1848,6 @@ async def test_a_last_run_browser_code_call_reads_the_run_browser(monkeypatch: p
 
     assert result["page_state"]["read"] == "ok"
     assert resolved == ["pbs_run"]
-
-
-@pytest.mark.asyncio
-async def test_a_tainted_page_withholds_its_location_from_browser_code_page_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_cell_runtime(monkeypatch)
-    ctx = make_copilot_context()
-    ctx.browser_session_id = "pbs_1"
-    taint_by_terminal_run(ctx, workflow_run_id="wr_sensitive", session_id="pbs_1")
-    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Account")))
-
-    result = await _invoke_advertised_tool(ctx, {"code": "1"})
-
-    assert result["page_state"] == {"read": "ok", "challenge_vendor": None}
 
 
 @pytest.mark.asyncio

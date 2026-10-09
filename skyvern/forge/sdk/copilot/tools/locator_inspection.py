@@ -17,6 +17,7 @@ from typing import Any
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
+from skyvern.forge.sdk.copilot.browser_target import BrowserTarget
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 TOOL_NAME = "inspect_locator_matches"
@@ -39,7 +40,7 @@ TOOL_SCHEMA: dict[str, Any] = {
     "properties": {
         "target": {
             "type": "string",
-            "enum": ["debug", "last_run"],
+            "enum": [target.value for target in BrowserTarget],
             "description": "Which browser to inspect in.",
         },
         "selectors": {

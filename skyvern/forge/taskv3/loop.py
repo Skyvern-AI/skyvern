@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
@@ -40,7 +40,7 @@ from skyvern.forge.taskv3.goal_check import (
     TrailEntry,
     UnlistedReask,
 )
-from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
+from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
@@ -81,6 +81,8 @@ ToolErrorClass = Literal[
     "date_sibling_unverified",
     # `type`: the date segment written did not hold its value afterwards.
     "date_segment_not_committed",
+    # `type`: a date input stores year-month-day and the text could be read as more than one date, so nothing was typed.
+    "date_format_refused",
     # `type`: the field does not hold the typed text afterwards -- an append that is partial or unchanged, or a
     # one-character-per-box code field whose boxes did not all keep their character.
     "text_not_held",
@@ -185,6 +187,11 @@ ToolOkClass = Literal[
     "loaded",
     "document_ready",
     "committed_not_loaded",
+    # A field-entry read-back (field_commit): the field shows the value in its own format, holds something other
+    # than what was entered, or could not be read at all.
+    "held_as",
+    "held_differs",
+    "unverified",
 ]
 
 # Which `covered` message the model actually got. They are one `tool_error_class`, so without this
@@ -254,6 +261,9 @@ class ToolResult:
     # A refused call that still dispatched input to the page first, to release a previous field's
     # suggestion list. It is charged and the page may have changed, though the requested action never ran.
     touched_page: bool = False
+    # An ok field entry whose value the field could not confirm (unreadable, or holding something else). The loop
+    # skips a later submit-shaped call in the same batch, so the model sees the field before anything submits it.
+    entry_unconfirmed: bool = False
 
     @classmethod
     def ok(
@@ -333,6 +343,10 @@ _HIT_CLASS: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_hit_class", d
 _COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_layer", default=None)
 # Where a typing call's reach probe ran and whether it scrolled first; set only by that probe.
 _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach", default=None)
+# A click that raised after the page received it (a slow submit whose navigation had not committed).
+_CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
+# Which field shape a field-entry read-back judged (field_commit), so an unconfirmed entry is countable per variant.
+_ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_record", default=None)
 # The text-delta read's cost and yield for the one tool call this context covers.
 _TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
     "taskv3_text_delta", default=None
@@ -429,6 +443,18 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
         "hit_on_document_root": hit_on_document_root,
     }
     _TYPE_REACH.set({key: value or seen.get(key, False) for key, value in new.items()})
+
+
+def record_click_dispatched() -> None:
+    _CLICK_DISPATCHED.set(True)
+
+
+def record_entry_variant(variant: str) -> None:
+    _ENTRY_RECORD.set({"entry_variant": variant})
+
+
+def record_entry_enter_withheld() -> None:
+    _ENTRY_RECORD.set({**(_ENTRY_RECORD.get() or {}), "entry_enter_withheld": True})
 
 
 # What observe() prints and the model hands back, BYTE-IDENTICAL in both directions: the digest
@@ -549,6 +575,14 @@ CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
 # sides; splitting them into two hooks would scatter it.
 VerificationBlocker = Callable[[str], Awaitable[str | None]]
+# The deployment's completion gate, consulted last on finish(completed): False refuses the verdict, while
+# CompletionGateTerminationError ends the run terminated and StepTerminationError ends it failed.
+CompletionGate = Callable[[], Awaitable[bool]]
+COMPLETION_GATE_REFUSAL = (
+    "The completion check did not confirm the result on the current page. If you have not submitted yet, "
+    "finish the step and call finish again. If you already submitted, do not submit again: wait for or look "
+    "for the confirmation, then call finish."
+)
 # The status a re-ask conversion asks the verification gate about: a completion the model never claimed.
 CONVERSION_VERIFICATION_STATUS = "converted"
 
@@ -632,6 +666,8 @@ class LoopOutcome:
     converted_from: NonCompletedStatus | None = None
     converted_from_reason: str = ""
     unlisted_reask: dict[str, Any] | None = None
+    # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
+    gate_passed: bool = False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -770,6 +806,13 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # Refusals left uncharged in a row before a refusal is charged like any failed call. The repeat guard cannot
 # bound them (a stale address resets it), so this does.
 UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
+# Rounds a single-action block may spend past its cap before its own action has landed. The step engine
+# completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
+# precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
+ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
+# Set on a click result once the driver's click returned, so a later verification error still reads as dispatched.
+CLICK_DISPATCHED_DATA_KEY = "click_dispatched"
+TARGET_ACTION_ROUND_EVENT = "taskv3 loop target action round"
 # Facetable event names — both the grant and the refusal are queryable so the gate's decision
 # precision is measurable on the canary; change only with the dashboards that read them.
 ACTION_BUDGET_EXTENDED_EVENT = "taskv3 loop action budget extended"
@@ -833,6 +876,14 @@ class _NavDeadEnd(NamedTuple):
 
     status: int
     url: str | None
+    requested_url: str | None = None
+    revisit: bool = False
+
+
+def _dead_end_provenance(urls: tuple[object, ...], task_target_urls: Collection[str], revisit: bool) -> dict[str, Any]:
+    task_supplied = any(normalized_url(url) in task_target_urls for url in urls)
+    provenance = "task_supplied" if task_supplied else "previously_visited" if revisit else "undecided"
+    return {"task_supplied": task_supplied, "previously_visited": revisit, "provenance": provenance}
 
 
 # Defined here (not tools.py) so the batch-dispatch poisoning check below can compare against it
@@ -1302,11 +1353,11 @@ class _ProgressLedger:
         self.peak_actions_since_progress = max(self.peak_actions_since_progress, self.actions_since_progress)
 
 
-# Failure-evidence gate: finish(failed) and finish(terminated) shortly after a submit-class action or a
-# solve_captcha attempt are held for ONE evidence turn per fresh trigger, because submissions and
-# captcha protocols complete asynchronously — the sampled false-negative verdicts fired 2-7s after
-# the model's last look while the page went on to show the submission confirmation. Trigger tools
-# are the ones whose page effects can land after their tool result; the window is in loop turns so intervening
+# Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
+# solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
+# complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
+# look while the page went on to show the submission confirmation. Trigger tools are the ones whose
+# page effects can land after their tool result; the window is in loop turns so intervening
 # perception does NOT disarm it (the state can flip after the last observe while a protocol is in
 # flight). The true verdict-to-flip latency is unmeasured in the sampled replays: the quiescence
 # wait exits on the first stable fingerprint pair (so honest gated failures pay ~one sample), the
@@ -1526,11 +1577,10 @@ class ActivityRecency:
     turn: int = 0
     turns_remaining: int | None = None
     tool_calls_remaining: int | None = None
+    action_steps_remaining: int | None = None
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
-    # Trigger actions can occur more than once in a model turn.
-    failure_evidence_trigger_generation: int = 0
     # True while one more read of some probe, returning what it last returned, would trip the stall
     # terminator: a deferral-forced observe must never be the snapshot that trips it. KNOWN LIMIT: a
     # run that reaches the edge and then stops reading that tool altogether leaves this true for the
@@ -2001,14 +2051,17 @@ def _verdict_target(
     return describe_target(tool, name, kind, secret_values)
 
 
-def _action_loop_reason(target: str | None) -> str:
+def _action_loop_reason(target: str | None, *, page_unchanged: bool) -> str:
     """`target` is the control the run kept acting on, or None when the repeated call reported no name
-    (a failed call reports none) — then the verdict names no place rather than guessing one."""
+    (a failed call reports none) — then the verdict names no place rather than guessing one.
+    `page_unchanged` is True only when the streak's page fingerprint was sampled and never moved."""
     where = f" on {target}" if target else ""
-    return (
-        f"The run repeated the same action{where} and the page did not change in response, so the task "
-        "could not make progress — commonly the site rejecting the action and showing the same page again."
-    )
+    if page_unchanged:
+        return (
+            f"The run repeated the same action{where} and the page did not change in response, so the task "
+            "could not make progress — commonly the site rejecting the action and showing the same page again."
+        )
+    return f"The run repeated the same action{where} without making progress, so the task was stopped."
 
 
 def _budget_exhausted_reason(cap_trip: str) -> str:
@@ -2039,6 +2092,8 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "selector_kind",
         "tool_error_class",
         "tool_ok_class",
+        "entry_variant",
+        "entry_enter_withheld",
         "resolve_seconds",
         "billable",
         "turn",
@@ -2415,6 +2470,7 @@ def make_finish_tool(
     verification_blocker: VerificationBlocker | None = None,
     unlisted_reask: UnlistedReaskCheck | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
+    completion_gate: CompletionGate | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2424,9 +2480,9 @@ def make_finish_tool(
     is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
     True, so probing cannot outlive the loop's own bounds.
 
-    The symmetric non-completed side: when `activity` reports recent submit-class/captcha activity,
-    finish(failed) and finish(terminated) are held for ONE evidence turn (`max_failure_deferrals` per
-    fresh trigger, not per run or verdict attempt) — a quiescence wait
+    The symmetric failure side: when `activity` reports recent submit-class/captcha activity, a
+    finish(failed) is held for ONE evidence turn (`max_failure_deferrals`, per run like the
+    completed-side cap, not per verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
 
@@ -2435,8 +2491,8 @@ def make_finish_tool(
     run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
-    headroom to fund the blocking poll slice it asks for. Terminated verdicts otherwise follow the
-    same evidence gate as failed verdicts.
+    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
+    ungated on both sides.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -2451,10 +2507,13 @@ def make_finish_tool(
     missed a screen the site skipped. A grounded yes becomes completed unless a completed-side gate vetoes it;
     it never gives a turn back, and a completed verdict cannot reach it. Its settle gate samples as many times as
     the completed path would defer. When `document_identity` is wired, it is read before the judge and again after
-    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not."""
+    the settle window, and a conversion whose identity changed or could not be read is refused, settled or not.
+
+    `completion_gate` runs after every other completed-side gate, and only while the run has the turns and
+    action steps to act on a refusal; without them, or when the gate errors, the caller's post-loop check
+    decides. A refusal never ends the run, so only a later finish the gate approves can complete it."""
     deferrals = 0
     failure_deferrals = 0
-    failure_deferral_trigger_generation: int | None = None
     reask_asked = False
 
     async def _bounded_fingerprint() -> str | None:
@@ -2617,15 +2676,12 @@ def make_finish_tool(
         )
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, failure_deferral_trigger_generation, reask_asked
+        nonlocal deferrals, failure_deferrals, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
-        if activity is not None and activity.failure_evidence_trigger_generation != failure_deferral_trigger_generation:
-            failure_deferrals = 0
-            failure_deferral_trigger_generation = activity.failure_evidence_trigger_generation
         if (
             status == "completed"
             and pending_marker is not None
@@ -2722,8 +2778,42 @@ def make_finish_tool(
                     "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
                     "report failure."
                 )
+        gate_passed = False
         if (
-            status in ("failed", "terminated")
+            status == "completed"
+            and completion_gate is not None
+            and _has_hold_headroom(activity, deadline_at)
+            and (activity is None or activity.action_steps_remaining is None or activity.action_steps_remaining > 0)
+        ):
+            try:
+                async with asyncio.timeout(None if deadline_at is None else deadline_at - time.monotonic()):
+                    gate_passed = await completion_gate()
+            except CompletionGateTerminationError as termination:
+                return ToolResult.ok(
+                    content="Task attempt ended. No further actions are permitted.",
+                    data={
+                        "status": "terminated",
+                        "reason": termination.reason,
+                        "extracted_output": args.get("extracted_output"),
+                    },
+                )
+            except StepTerminationError as exhausted:
+                return ToolResult.ok(
+                    content="Task attempt ended. No further actions are permitted.",
+                    data={
+                        "status": "failed",
+                        "reason": exhausted.message or "",
+                        "extracted_output": args.get("extracted_output"),
+                    },
+                )
+            except Exception:
+                LOG.warning("taskv3 completion gate errored; leaving the verdict to the caller", exc_info=True)
+            else:
+                if not gate_passed:
+                    LOG.info("taskv3 completed verdict refused by the completion gate")
+                    return ToolResult.error(COMPLETION_GATE_REFUSAL)
+        if (
+            status == "failed"
             and activity is not None
             and page_fingerprint is not None
             and failure_deferrals < max_failure_deferrals
@@ -2759,9 +2849,9 @@ def make_finish_tool(
                 pass  # unknown page state still defers: the model's re-observe is the evidence step
             if should_defer:
                 failure_deferrals += 1
-                LOG.info("taskv3 finish failure deferred for evidence", status=status, turn=activity.turn)
+                LOG.info("taskv3 finish failure deferred for evidence", turn=activity.turn)
                 return ToolResult.error(
-                    "non-completed verdict held for one evidence check: it follows recent page actions or "
+                    "failure verdict held for one evidence check: it follows recent page actions or "
                     "a captcha attempt whose effects can land after your last look — submissions and "
                     "captcha protocols often complete asynchronously, so the page may no longer show "
                     "the state this verdict was based on. Re-observe the page once (waiting briefly "
@@ -2797,6 +2887,7 @@ def make_finish_tool(
                 "status": status,
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
+                "gate_passed": gate_passed,
             },
         )
 
@@ -3173,6 +3264,11 @@ class LoopState:
     block_completion_offered: bool = False
     # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
     block_action_transitioned: bool = False
+    # A billable call that succeeded and did more than reveal state, as a hover or a menu-opening click does. One that
+    # may have submitted, or a failed call that may have moved the page, also sets the second flag: no round follows it.
+    block_action_committed: bool = False
+    block_action_may_have_landed: bool = False
+    target_action_rounds_granted: int = 0
 
 
 async def run_agent_tool_loop(
@@ -3219,10 +3315,13 @@ async def run_agent_tool_loop(
     # Only ever named in the dead-end verdict's text, so a caller that has the status but not the URL
     # (or whose URL is unfit to print) still gets the same verdict, minus the place.
     initial_navigation_url: str | None = None,
+    initial_navigation_requested_url: str | None = None,
     # Every URL the CALLER gave this run, normalized by `caller_known_published_urls`. A guard verdict
     # publishes a landed URL's path only when it is one of these; every other path is elided to its
     # host. Computed once by the caller (it owns the task config) and never read by a tool.
     caller_known_urls: frozenset[str] = frozenset(),
+    # Log-only: the URLs the task's RENDERED inputs name, for a dead end's provenance fields. Never published.
+    task_target_urls: frozenset[str] = frozenset(),
     # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
     # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
     label_secret_values: Callable[[], Collection[str]] | None = None,
@@ -3251,6 +3350,8 @@ async def run_agent_tool_loop(
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
     single_action_block: bool = False,
+    # Rounds such a block may add, one per cap trip, while its own action has not landed.
+    target_action_reserve: int = 0,
     # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
     block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
 ) -> LoopOutcome:
@@ -3622,6 +3723,47 @@ async def run_agent_tool_loop(
     started_at = time.monotonic()
     deadline_at = started_at + deadline_seconds if deadline_seconds is not None else None
 
+    async def _reserve_target_action_round(tool_name: str) -> bool:
+        if (
+            not single_action_block
+            or st.target_action_rounds_granted >= target_action_reserve
+            or st.block_action_transitioned
+            or st.final_turn_granted
+        ):
+            return False
+        verdict: str | None = None
+        if st.block_action_may_have_landed:
+            # A click or Enter may have submitted without moving the URL, and a failed call that moved the page left
+            # it; another round could submit twice or act on the next page.
+            reason = "may_have_landed"
+        elif not st.block_action_committed:
+            reason = "nothing_committed"
+        elif block_completion_check is None:
+            reason = "no_judge"
+        else:
+            try:
+                judged = await block_completion_check()
+                verdict = judged.verdict if judged.skipped_reason is None else None
+                reason = f"judge_{judged.skipped_reason or judged.verdict}"
+            except Exception:
+                LOG.warning("taskv3 target action judge raised", exc_info=True)
+                reason = "judge_error"
+        granted = reason == "nothing_committed" or verdict == "not_achieved"
+        if granted:
+            st.target_action_rounds_granted += 1
+            st.max_action_steps = (st.max_action_steps or 0) + 1
+        LOG.info(
+            TARGET_ACTION_ROUND_EVENT,
+            granted=granted,
+            reason=reason,
+            rounds_granted=st.target_action_rounds_granted,
+            max_action_steps=st.max_action_steps,
+            action_steps=st.action_steps,
+            tool=tool_name,
+            turn=st.turns,
+        )
+        return granted
+
     def _extension_gate(extension: int, headroom_gain: tuple[int, int, int]) -> tuple[bool, str]:
         refresh_ctx = skyvern_context.current()
         if refresh_ctx is not None and refresh_ctx.refresh_working_page:
@@ -3732,6 +3874,9 @@ async def run_agent_tool_loop(
             LOG.info(
                 "taskv3 loop initial navigation dead end",
                 http_status=initial_navigation_status,
+                **_dead_end_provenance(
+                    (initial_navigation_url, initial_navigation_requested_url), task_target_urls, False
+                ),
                 guard=NAV_DEAD_END_GUARD,
             )
             st.outcome = _guard_verdict(
@@ -3805,6 +3950,8 @@ async def run_agent_tool_loop(
             activity.turn = st.turns
             activity.turns_remaining = st.max_turns - st.turns
             activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
+            if st.max_action_steps is not None:
+                activity.action_steps_remaining = st.max_action_steps - st.action_steps
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
@@ -3925,6 +4072,7 @@ async def run_agent_tool_loop(
         batch_had_failure = False
         # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
         batch_had_refusal = False
+        batch_entry_unconfirmed = False
         marks_stale = False
         # Loop events minted this batch, emitted only after every progress signal the batch can
         # produce has been absorbed (see the end-of-batch emission below).
@@ -4013,7 +4161,7 @@ async def run_agent_tool_loop(
                     }
                 )
                 continue
-            if batch_had_failure and _is_finish(tool_name):
+            if (batch_had_failure or batch_entry_unconfirmed) and _is_finish(tool_name):
                 # Any verdict queued behind the failure was written before the model saw it: a completed
                 # one may be false, and a failed/terminated one carries a reason that predates the error.
                 st.messages.append(
@@ -4024,6 +4172,9 @@ async def run_agent_tool_loop(
                         "content": (
                             "skipped: a field in this batch failed before this verdict was reached; "
                             "re-observe, then finish with a status that reflects the failure"
+                            if batch_had_failure
+                            else "skipped: a field in this batch could not confirm the value it was given before this "
+                            "verdict was reached; check that field, then finish"
                         ),
                     }
                 )
@@ -4101,9 +4252,10 @@ async def run_agent_tool_loop(
                 )
                 continue
             toggle_exempted = False
-            if batch_had_failure and not batch_had_refusal and _may_submit(tool_name, args):
+            held_back = batch_had_failure or batch_entry_unconfirmed
+            if held_back and not batch_had_refusal and _may_submit(tool_name, args):
                 toggle_exempted = await _is_toggle_click(tool_name, spec, args)
-            if batch_had_failure and _may_submit(tool_name, args) and not toggle_exempted:
+            if held_back and _may_submit(tool_name, args) and not toggle_exempted:
                 st.messages.append(
                     {
                         "role": "tool",
@@ -4112,6 +4264,9 @@ async def run_agent_tool_loop(
                         "content": (
                             "skipped: a field in this batch failed and this call may submit the form; "
                             "fix the field, then re-queue it"
+                            if batch_had_failure
+                            else "skipped: a field in this batch could not confirm the value it was given and this "
+                            "call may submit the form; check that field, then re-queue it"
                         ),
                     }
                 )
@@ -4131,6 +4286,7 @@ async def run_agent_tool_loop(
                 and spec.billable
                 and st.max_action_steps is not None
                 and st.action_steps >= st.max_action_steps
+                and not await _reserve_target_action_round(tool_name)
             ):
                 base_cap = st.original_action_steps if st.original_action_steps else st.max_action_steps
                 raw_extension = base_cap // 2
@@ -4173,7 +4329,7 @@ async def run_agent_tool_loop(
                         and next_tokens <= backstops_for_cap(st.max_action_steps)[2]
                         and grant_max_turns > st.max_turns
                     )
-                if st.max_action_steps >= extension_limit:
+                if st.max_action_steps - st.target_action_rounds_granted >= extension_limit:
                     allowed, gate_reason = False, "extension_limit_reached"
                 elif raw_extension <= 0:
                     allowed, gate_reason = False, "cap_too_small"
@@ -4313,7 +4469,7 @@ async def run_agent_tool_loop(
                         )
                         if judged is not None and judged.verdict == "achieved":
                             block_reason = (
-                                f"performed the block's action ({st.billable_actions[0]}); "
+                                f"performed the block's action ({st.billable_actions[-1]}); "
                                 "a further action was past the block's step limit"
                             )
                             # Through the real handler, so every guard on a completed verdict still applies.
@@ -4415,6 +4571,8 @@ async def run_agent_tool_loop(
             _HIT_CLASS.set(None)
             _COVERED_LAYER.set(None)
             _TYPE_REACH.set(None)
+            _CLICK_DISPATCHED.set(False)
+            _ENTRY_RECORD.set(None)
             _TEXT_DELTA.set(None)
             _TOOL_CALL_SEQ.set(st.total_tool_calls)
             dispatch_ctx = skyvern_context.current()
@@ -4456,6 +4614,8 @@ async def run_agent_tool_loop(
             elif call_charged:
                 st.uncharged_refusals = 0
             turn_charged = turn_charged or call_charged
+            if activity is not None and st.max_action_steps is not None:
+                activity.action_steps_remaining = st.max_action_steps - st.action_steps - int(turn_charged)
             # Entry is recorded only when the tool succeeded (a stale-ref failure put nothing in the
             # field), but the submit is recorded on DISPATCH whatever the verdict: the loop ran the
             # click itself, so nothing here asks the page whether a submission completed. Entry first,
@@ -4479,7 +4639,8 @@ async def run_agent_tool_loop(
             # arguments themselves being logged.
             navigate_fields = _navigate_record_fields(tool_name, args, result)
             menu_note_fields = _menu_note_record_fields(tool_name, result)
-            reach_fields = _TYPE_REACH.get() or {}
+            reach_fields: dict[str, Any] = dict(_TYPE_REACH.get() or {})
+            reach_fields.update(_ENTRY_RECORD.get() or {})
             # The stall counter is the zero-read signal for "solved, page unchanged, solved again", since a solve-only
             # batch takes no fingerprint. Its 0 is unjudged until a batch is judged, flagged because a null is dropped.
             stall_judged = st.page_state_ever_judged
@@ -4696,6 +4857,16 @@ async def run_agent_tool_loop(
             st.messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": transcript_content}
             )
+            # The two ways a secret reaches the page: a credential placeholder typed by an entry tool, and a value a
+            # tool registered as secret (a delivered verification code) for the model to type next. `navigate`
+            # resolves placeholders in a URL too.
+            call_entered_secret = (
+                (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
+                and bool(_credential_placeholders(args))
+            ) or (dispatch_ctx is not None and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before)
+            if call_entered_secret and (result.touched_page or not result.refused):
+                # A second round after a secret, ok or failed, could submit it again and spend a lockout attempt.
+                st.block_action_may_have_landed = True
             if tool_trail is not None and spec is not None and not spec.terminal:
                 tool_trail.record(
                     TrailEntry(
@@ -4704,18 +4875,7 @@ async def run_agent_tool_loop(
                         content=model_facing_content,
                         perception=spec.compactable,
                         page_changing=spec.touches_page and (result.touched_page or not result.refused),
-                        # The two ways a secret reaches the page: a credential placeholder typed by an
-                        # entry tool, and a value a tool registered as secret (a delivered verification
-                        # code) for the model to type next.
-                        # `navigate` resolves placeholders in a URL too.
-                        secret_entered=(
-                            (tool_name in CREDENTIAL_ENTRY_TOOLS or tool_name == "navigate")
-                            and bool(_credential_placeholders(args))
-                        )
-                        or (
-                            dispatch_ctx is not None
-                            and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before
-                        ),
+                        secret_entered=call_entered_secret,
                         entered=entered_values(tool_name, args),
                         # Masked like the content, so an unchanged URL compares equal to the one observe prints.
                         url_before=_trail_url_before(result, skyvern_ctx),
@@ -4728,6 +4888,7 @@ async def run_agent_tool_loop(
             if result.screenshots:
                 st.pending_screenshots = list(result.screenshots)
             result_data = result.data or {}
+            batch_entry_unconfirmed = batch_entry_unconfirmed or (result.status == "ok" and result.entry_unconfirmed)
             # The page-state stall detector (SKY-15265) re-baselines on these flags. Keeps the FIRST
             # qualifying signal this batch -- the reason field is diagnostic (telemetry), not the
             # decision itself, so a later call's signal never overwrites it.
@@ -4829,7 +4990,10 @@ async def run_agent_tool_loop(
                         label_secret_values,
                         skyvern_ctx,
                     )
-                    st.outcome = _guard_verdict(ACTION_LOOP_GUARD, _action_loop_reason(named_target))
+                    page_unchanged = streak_fp is not None and batch_fp_before is not None and not streak_moved
+                    st.outcome = _guard_verdict(
+                        ACTION_LOOP_GUARD, _action_loop_reason(named_target, page_unchanged=page_unchanged)
+                    )
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "action loop")
                     break
                 if (
@@ -4871,6 +5035,9 @@ async def run_agent_tool_loop(
                 )
                 if spec.billable and result.status == "ok":
                     st.billable_actions.append(tool_name)
+                    if not (tool_name == "hover" or (tool_name == "click" and result_data.get("menu_note"))):
+                        st.block_action_committed = True
+                        st.block_action_may_have_landed |= _may_submit(tool_name, args)
                     # click reports it at the top level, navigate inside its action outcome. A navigation that
                     # landed on an error page moved the URL without doing the block's action.
                     if not _outcome_reports_failure(round_outcome) and (
@@ -4880,7 +5047,6 @@ async def run_agent_tool_loop(
                         st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
-                    activity.failure_evidence_trigger_generation += 1
                 if submit_watch is not None:
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
                     if submit_selector is not None:
@@ -4920,7 +5086,12 @@ async def run_agent_tool_loop(
                 # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
                 # it but do NOT break the batch: a later navigate in the same turn can land the run on a
                 # live page and clear it below. Applied once the batch settles (after this for-loop).
-                st.pending_nav_dead_end = _NavDeadEnd(dead_end_status, result_data.get("navigation_dead_end_url"))
+                st.pending_nav_dead_end = _NavDeadEnd(
+                    dead_end_status,
+                    result_data.get("navigation_dead_end_url"),
+                    args.get("url"),
+                    result_data.get("nav_revisit") is True,
+                )
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
@@ -4933,6 +5104,7 @@ async def run_agent_tool_loop(
                     extracted_output=data.get("extracted_output"),
                     converted_from=_non_completed(data.get("converted_from")),
                     converted_from_reason=data.get("converted_from_reason", ""),
+                    gate_passed=bool(data.get("gate_passed")),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
@@ -4987,6 +5159,18 @@ async def run_agent_tool_loop(
                         # document, and the fingerprint may render identically on the new one (a
                         # same-template step) — absorb it here or the rung survives that blindness.
                         st.canonical.progress(_ProgressEvidence.PROBE_MISMATCH)
+                # Only a click reports whether the page received it; a failed Enter or code call may have submitted.
+                may_have_submitted = (
+                    _CLICK_DISPATCHED.get()
+                    or bool(result_data.get(CLICK_DISPATCHED_DATA_KEY))
+                    or (tool_name != "click" and _may_submit(tool_name, args))
+                )
+                if spec is not None and spec.billable and (poisoned or may_have_submitted) and not list_left_open:
+                    st.block_action_may_have_landed = True
+                elif tool_name in FILL_TOOLS and (result.touched_page or not result.refused):
+                    # A failed entry may still have written the field (a partial or other value); only the judge,
+                    # which also skips after a typed secret, can say another round is safe.
+                    st.block_action_committed = True
                 if poisoned:
                     if tool_calls[idx + 1 :]:
                         if list_left_open:
@@ -5041,11 +5225,13 @@ async def run_agent_tool_loop(
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
         if st.outcome is None and st.pending_nav_dead_end is not None:
+            dead = st.pending_nav_dead_end
             LOG.info(
                 "taskv3 loop navigation dead end",
-                http_status=st.pending_nav_dead_end.status,
+                http_status=dead.status,
                 turn=st.turns,
                 guard=NAV_DEAD_END_GUARD,
+                **_dead_end_provenance((dead.url, dead.requested_url), task_target_urls, dead.revisit),
             )
             st.outcome = _guard_verdict(
                 NAV_DEAD_END_GUARD,

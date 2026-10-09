@@ -17,7 +17,11 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     item_parts_key,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
@@ -147,6 +151,8 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
         current_datetime=fixed_now.isoformat(),
         tool_usage_guide="tool guide",
         security_rules=config.security_rules,
+        model_written_context_fields=model_written_context_fields(),
+        tool_recorded_context_fields=tool_recorded_context_fields(),
     )
 
     actual = agent_module._build_system_prompt(tool_usage_guide="tool guide", config=config)

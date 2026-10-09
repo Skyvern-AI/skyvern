@@ -66,6 +66,8 @@ LOG = structlog.get_logger()
 
 # Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
 _UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+_ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
+_ORIGINAL_FILENAME_TEMPLATE_RE = re.compile(r"\{\{\s*original_filename\s*\}\}")
 _LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
 
 
@@ -616,6 +618,8 @@ async def download_file(
     authorize_redirect: Callable[[str], bool] | None = None,
     preserve_existing_files: bool = False,
     staging_dir: str | None = None,
+    *,
+    limit_managed_file_size: bool = False,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
@@ -649,6 +653,12 @@ async def download_file(
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
             app.STORAGE.assert_managed_file_access(url, organization_id)
+            managed_limit_mb = max_size_mb if limit_managed_file_size else None
+            if managed_limit_mb:
+                # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
+                managed_size = await app.STORAGE.managed_file_size(url, organization_id)
+                if managed_size is not None and managed_size > managed_limit_mb * 1024 * 1024:
+                    raise DownloadFileMaxSizeExceeded(managed_limit_mb)
 
             LOG.info(
                 "Downloading managed storage file",
@@ -659,6 +669,8 @@ async def download_file(
             data = await app.STORAGE.download_managed_file(url, organization_id)
             if data is None:
                 raise Exception(f"Failed to download managed storage file: {url}")
+            if managed_limit_mb and len(data) > managed_limit_mb * 1024 * 1024:
+                raise DownloadFileMaxSizeExceeded(managed_limit_mb)
             # A local upload's URI percent-encodes its name, which can triple a non-ASCII name's
             # length past the filesystem limit; the decoded name is the one storage already wrote.
             filename = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.scheme == "file" else url.split("/")[-1]
@@ -1386,8 +1398,13 @@ def recover_download_extension(file_path: str | Path, download_suffix: str | Non
     Returns "" when ``download_suffix`` already carries its own extension, so the final
     ``download_suffix + extension`` name is not doubled (e.g. invoice.pdf + .pdf).
     """
-    if download_suffix and Path(download_suffix).suffix:
-        return ""
+    if download_suffix:
+        suffix_for_extension = _ORIGINAL_FILENAME_TEMPLATE_RE.sub(_ORIGINAL_FILENAME_MARKER, download_suffix)
+        if _ORIGINAL_FILENAME_MARKER in suffix_for_extension:
+            # Dots before the site-name placeholder are part of the prefix, not an explicit extension.
+            suffix_for_extension = suffix_for_extension.rsplit(_ORIGINAL_FILENAME_MARKER, 1)[1]
+        if Path(suffix_for_extension).suffix:
+            return ""
     return guess_extension_from_file(file_path)
 
 

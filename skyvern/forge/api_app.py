@@ -282,6 +282,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "slug", "VARCHAR"),
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("google_oauth_credentials", "google_subject", "VARCHAR"),
 )
 
 
@@ -632,8 +633,8 @@ def create_api_app() -> FastAPI:
         if path == "/api/v1/users/me/onboarding":
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
-        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+        sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(

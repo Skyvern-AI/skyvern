@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, saf
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.credential_site_policy import same_site
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
@@ -1031,7 +1032,37 @@ async def _run_credential_pause(
         if isinstance(policy, RequestPolicy):
             # Bind an answer to the URLs on this card, never an earlier unanswered ask.
             policy.credential_ask_login_page_urls = list(login_page_urls)
-        credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
+        # A recovery card pins nothing: its ask follows a refusal of the credential already in hand.
+        credential_refs = (
+            list(policy.credential_refs) if isinstance(policy, RequestPolicy) and admit_connected is None else []
+        )
+    # The same record the missing-origin fill refusal reads, so the card offers what that refusal promised.
+    named = policy.current_turn_named_credential_ids if isinstance(policy, RequestPolicy) else set()
+    plain_pick_ask = update_credential_id is None and registration is None and admit_connected is None
+    # One origin, as `_bind_connected_credential_origin` requires: the card names the site the click binds.
+    # Every URL must parse: the card reads the site from the first one with a more lenient parser.
+    ask_origins = [parts[-1] if (parts := url_parts(url)) is not None else None for url in login_page_urls]
+    one_site = None not in ask_origins and len(set(ask_origins)) == 1
+    named_credential_id = next(iter(named)) if len(named) == 1 and plain_pick_ask and one_site else None
+    if named_credential_id is not None and isinstance(policy, RequestPolicy):
+        # A login already saved or confirmed for another site is left to the picker, so one click never rebinds it.
+        known_urls = [
+            policy.live_page_admitted_urls.get(named_credential_id),
+            policy.carried_credential_urls.get(named_credential_id),
+        ] + [
+            credential.tested_url
+            for credential in policy.resolved_credentials
+            if credential.credential_id == named_credential_id
+        ]
+        if any(url and (parts := url_parts(url)) is not None and parts[-1] != ask_origins[0] for url in known_urls):
+            named_credential_id = None
+    if named_credential_id is not None:
+        from skyvern.forge.sdk.copilot.tools.credential_fill import _read_vault_named_sites  # circular import
+
+        # The vault entry's sites grant whole-site, so they are compared by site; an unreadable entry offers nothing.
+        vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        if vault_sites is None or (vault_sites and not any(same_site(login_page_urls[0], uri) for uri in vault_sites)):
+            named_credential_id = None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
@@ -1058,6 +1089,7 @@ async def _run_credential_pause(
         message=message,
         login_page_urls=login_page_urls,
         credential_refs=credential_refs,
+        named_credential_id=named_credential_id,
         timeout_seconds=timeout_seconds,
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,

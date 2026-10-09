@@ -25,15 +25,23 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import {
+  googleCredentialGmailCapabilities,
+  googleCredentialHasGmailCapability,
   hasGoogleOAuthCredentialScopes,
   isGoogleOAuthCredentialActive,
   useGoogleOAuthCredentials,
+  type GmailCapability,
 } from "@/hooks/useGoogleOAuthCredentials";
 import {
   GOOGLE_DRIVE_REQUIRED_SCOPES,
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
+  gmailScopeProfile,
 } from "@/util/googleScopes";
+import {
+  GmailCapabilityCheckboxes,
+  GmailCapabilityPills,
+} from "./GmailCapabilities";
 import {
   buildGoogleOAuthRedirectUri,
   getGoogleOAuthAppOrigin,
@@ -51,7 +59,7 @@ const integrations = [
   {
     id: "gmail",
     title: "Gmail",
-    description: "Read verification emails for OTP polling.",
+    description: "Read verification codes and send email from your agents.",
     scopeProfile: "gmail",
     capabilityScopes: GOOGLE_GMAIL_REQUIRED_SCOPES,
   },
@@ -67,6 +75,15 @@ const integrations = [
 function Integrations() {
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
+  const [enabling, setEnabling] = useState<{
+    credentialId: string;
+    capability: GmailCapability;
+  } | null>(null);
+  const [gmailCapabilities, setGmailCapabilities] = useState({
+    read: true,
+    send: false,
+  });
+  const newGmailScopeProfile = gmailScopeProfile(gmailCapabilities);
   const {
     credentials,
     isFetching,
@@ -74,7 +91,7 @@ function Integrations() {
     isStartingAuthorize,
     deleteCredential,
     isDeletingCredential,
-  } = useGoogleOAuthCredentials();
+  } = useGoogleOAuthCredentials({ includeEmail: true });
 
   const connect = async (integration: (typeof integrations)[number]) => {
     setConnectingId(integration.id);
@@ -83,7 +100,9 @@ function Integrations() {
         redirect_uri: buildGoogleOAuthRedirectUri(),
         app_origin: getGoogleOAuthAppOrigin(),
         credential_name: integration.title,
-        scope_profile: integration.scopeProfile,
+        scope_profile:
+          (integration.id === "gmail" ? newGmailScopeProfile : null) ??
+          integration.scopeProfile,
       });
       storeGoogleOAuthIntegrationIdForState(response.state, integration.id);
       window.location.assign(response.authorize_url);
@@ -109,6 +128,27 @@ function Integrations() {
     }
   };
 
+  // Adds a Gmail permission to an existing connection. It keeps its id and current
+  // access; if consent is cancelled or declined the connection is left as it was.
+  const enableCapability = async (
+    credential: GoogleOAuthCredential,
+    capability: GmailCapability,
+  ) => {
+    setEnabling({ credentialId: credential.id, capability });
+    try {
+      const response = await startAuthorize({
+        redirect_uri: buildGoogleOAuthRedirectUri(),
+        app_origin: getGoogleOAuthAppOrigin(),
+        credential_id: credential.id,
+        scope_profile: capability === "send" ? "gmail_send" : "gmail",
+      });
+      storeGoogleOAuthIntegrationIdForState(response.state, "gmail");
+      window.location.assign(response.authorize_url);
+    } finally {
+      setEnabling(null);
+    }
+  };
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
       <Card>
@@ -123,14 +163,20 @@ function Integrations() {
         </CardContent>
       </Card>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2">
         {integrations.map((integration) => {
-          const matchingCredentials = credentials.filter((credential) =>
-            hasGoogleOAuthCredentialScopes(
+          const isGmail = integration.id === "gmail";
+          const matchingCredentials = credentials.filter((credential) => {
+            if (isGmail) {
+              const { read, send } =
+                googleCredentialGmailCapabilities(credential);
+              return read || send;
+            }
+            return hasGoogleOAuthCredentialScopes(
               credential,
               Array.from(integration.capabilityScopes),
-            ),
-          );
+            );
+          });
           const activeCount = matchingCredentials.filter(
             isGoogleOAuthCredentialActive,
           ).length;
@@ -144,10 +190,19 @@ function Integrations() {
                 <div className="text-sm text-muted-foreground">
                   {activeCount} active connection{activeCount === 1 ? "" : "s"}
                 </div>
+                {isGmail ? (
+                  <GmailCapabilityCheckboxes
+                    value={gmailCapabilities}
+                    onChange={setGmailCapabilities}
+                  />
+                ) : null}
                 <Button
                   type="button"
                   className="w-full gap-2"
-                  disabled={isStartingAuthorize}
+                  disabled={
+                    isStartingAuthorize ||
+                    (isGmail && newGmailScopeProfile === null)
+                  }
                   onClick={() => void connect(integration)}
                 >
                   {connectingId === integration.id ? (
@@ -182,6 +237,8 @@ function Integrations() {
               {credentials.map((credential) => {
                 const isActive = isGoogleOAuthCredentialActive(credential);
                 const isReconnecting = reconnectingId === credential.id;
+                const showGmailPills =
+                  isActive && googleCredentialHasGmailCapability(credential);
                 return (
                   <div
                     key={credential.id}
@@ -202,6 +259,20 @@ function Integrations() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
+                      {showGmailPills ? (
+                        <GmailCapabilityPills
+                          credential={credential}
+                          pendingAction={
+                            enabling?.credentialId === credential.id
+                              ? enabling.capability
+                              : null
+                          }
+                          disabled={isStartingAuthorize}
+                          onEnable={(capability) =>
+                            void enableCapability(credential, capability)
+                          }
+                        />
+                      ) : null}
                       <Button
                         type="button"
                         variant={isActive ? "outline" : "default"}

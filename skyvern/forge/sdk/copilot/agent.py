@@ -33,6 +33,7 @@ import structlog
 import yaml
 from agents.items import ToolCallItem
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
@@ -97,6 +98,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
+    REPLY_TOOL_NAME,
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
     AgentResult,
     CodeAuthoringRepairContext,
@@ -117,10 +119,12 @@ from skyvern.forge.sdk.copilot.context import (
     clear_proposed_credential,
     coerce_ask_subject,
     finalize_observation_context,
+    model_written_context_fields,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
     record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
+    tool_recorded_context_fields,
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
@@ -231,6 +235,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
+from skyvern.forge.sdk.copilot.tools import reply_ends_turn
 from skyvern.forge.sdk.copilot.tools._shared import (
     EDIT_BLOCK_TOOL_NAME,
     UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
@@ -278,6 +283,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     with_copilot_code_mode_diagnostics,
 )
 from skyvern.forge.sdk.copilot.video_attachment import (
+    VIDEO_ATTACHMENT_FORMAT_NAMES,
     VideoAttachmentArtifact,
     VideoAttachmentEvidence,
     build_video_attachment_message,
@@ -910,6 +916,8 @@ def _build_system_prompt(
         current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
+        model_written_context_fields=model_written_context_fields(),
+        tool_recorded_context_fields=tool_recorded_context_fields(),
     )
     prompt_with_boundary = f"{_MCP_RESULT_SECURITY_BOUNDARY}\n\n{prompt_with_boundary}"
     stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
@@ -1513,6 +1521,7 @@ def _build_user_context(
         user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
         untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
+        video_attachment_formats="/".join(VIDEO_ATTACHMENT_FORMAT_NAMES.values()),
         scope_check=scope_check,
     )
 
@@ -4129,6 +4138,15 @@ def _model_attempt_source_revision() -> str | None:
     return result.stdout.strip() or None
 
 
+def _work_tool_call_count(result: RunResultStreaming) -> int:
+    """Tool calls the run made, leaving out `reply`: it is the turn's answer, like a text reply."""
+    return sum(
+        isinstance(item, ToolCallItem)
+        and not (isinstance(item.raw_item, ResponseFunctionToolCall) and item.raw_item.name == REPLY_TOOL_NAME)
+        for item in result.new_items
+    )
+
+
 def _empty_completion_error(
     result: RunResultStreaming,
     *,
@@ -4141,9 +4159,7 @@ def _empty_completion_error(
         return None
     if extract_final_text(result).strip():
         return None
-    tool_calls_observed = ctx.tool_calls_this_turn > tool_call_count_start or any(
-        isinstance(item, ToolCallItem) for item in result.new_items
-    )
+    tool_calls_observed = ctx.tool_calls_this_turn > tool_call_count_start or _work_tool_call_count(result) > 0
     return CopilotEmptyCompletionError(
         llm_key=llm_key,
         stop_metadata=stop_metadata,
@@ -4308,6 +4324,7 @@ async def _run_agent_loop_with_surface(
         mcp_servers=[mcp_server],
         model=model_name,
         output_guardrails=output_guardrails,
+        tool_use_behavior=reply_ends_turn,
     )
     owns_session = session is None
     if session is None:
@@ -4378,7 +4395,7 @@ async def _run_agent_loop_with_surface(
                 attempt_outcome = empty_error.reason if empty_error is not None else "success"
                 attempt_tool_call_count = max(
                     ctx.tool_calls_this_turn - tool_call_count_start,
-                    sum(isinstance(item, ToolCallItem) for item in result.new_items),
+                    _work_tool_call_count(result),
                 )
                 if not final_reply:
                     _dump_model_attempt_packet(

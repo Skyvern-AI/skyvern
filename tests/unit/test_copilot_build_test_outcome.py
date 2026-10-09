@@ -7248,47 +7248,6 @@ def test_the_direct_handoff_does_not_report_an_all_filtered_url_map_as_never_rec
     assert not any("no per-block end URL was recorded" in notice for notice in projected.omission_notices)
 
 
-SECRET_BEARING_EXTRACTION_YAML = """
-title: extraction example
-workflow_definition:
-  parameters:
-    - parameter_type: aws_secret
-      key: site_password
-      aws_key: SKYVERN_SITE_PASSWORD
-  blocks:
-    - block_type: extraction
-      label: extract_heading
-      url: https://example.com
-      data_extraction_goal: Extract the page heading.
-"""
-
-
-@pytest.mark.asyncio
-async def test_a_credential_bearing_run_mints_no_per_block_end_url_for_the_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def run_failed_block(*, workflow_yaml: str) -> dict[str, Any]:
-        harness = await install_run_blocks_harness(
-            monkeypatch,
-            workflow_yaml=workflow_yaml,
-            polled_status="failed",
-            terminal_blocks=[
-                terminal_extraction_block("failed", final_url="https://fixture.test/results/widget"),
-            ],
-        )
-        ctx = make_copilot_ctx(browser_session_id="pbs_chat")
-        ctx.staged_workflow = harness["workflow"]
-        ctx.frontier_resume_session_id = "pbs_run"
-        return await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
-
-    ordinary = await run_failed_block(workflow_yaml=HANDBACK_WORKFLOW_YAML)
-    credential_bearing = await run_failed_block(workflow_yaml=SECRET_BEARING_EXTRACTION_YAML)
-
-    assert ordinary["data"]["observed_block_end_urls"] == {"extract_heading": "https://fixture.test/results/widget"}
-    assert "observed_block_end_urls" not in credential_bearing["data"]
-    assert credential_bearing["data"]["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
-
-
 _ELEMENT_TIMEOUT_CATEGORY = {"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}
 
 
@@ -7369,6 +7328,8 @@ async def test_prior_run_hydration_mints_per_block_facts_and_drops_the_urls_for_
     assert "block_fact_omission_notices" not in ordinary
     assert "observed_block_end_urls" not in credential_bearing
     assert credential_bearing["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+    # A withheld end URL is not a missing one.
+    assert "current_url_evidence" not in credential_bearing
 
 
 @pytest.mark.asyncio
@@ -7749,7 +7710,6 @@ def test_predecessor_blocks_the_action_budget_drops_are_named_in_an_omission_not
         [],
         run_execution_module._retained_action_observations_by_label(results),
         unreported_predecessor_labels=run_execution_module._unreported_predecessor_labels(results),
-        sensitive_origin_run=False,
     )
 
     assert "predecessor_1" not in data["per_block_action_observations"]

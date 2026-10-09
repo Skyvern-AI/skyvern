@@ -31,7 +31,10 @@ from skyvern.forge.sdk.copilot.nav_attribution import (
     proxy_owns_nav_codes,
     target_owns_nav_codes,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    GENERATED_FILE_ARTIFACT_IDS_KEY,
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
@@ -2417,6 +2420,45 @@ async def test_completed_heal_records_extracted_information(
     # The block fails on an absent key, so the goal must offer the route a legitimate miss takes.
     assert "empty value" in goal
     assert "empty object" not in goal
+
+
+@pytest.mark.asyncio
+async def test_completed_heal_drops_the_published_file_key_from_extracted_information(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    """The fallback's answer is not the secure worker's, so it cannot carry the worker's published-file list."""
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    state = _install_db_fakes(
+        monkeypatch,
+        final_status=TaskStatus.completed,
+        extracted_information={"order_total": "42.50", GENERATED_FILE_ARTIFACT_IDS_KEY: ["a_site"]},
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total",
+        data_schema={
+            "type": "object",
+            "properties": {
+                "order_total": {"type": "string"},
+                GENERATED_FILE_ARTIFACT_IDS_KEY: {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    code_row_outputs = [
+        update["output"]
+        for update in state["workflow_run_block_updates"]
+        if update["workflow_run_block_id"] == "wrb_test"
+    ]
+    assert code_row_outputs == [{"order_total": "42.50"}]
+    assert result.output_parameter_value == {"order_total": "42.50"}
+    assert record.await_args.args[2] == {"order_total": "42.50"}
 
 
 @pytest.mark.parametrize("extracted", [{"total": "1"}, "oops", 3])

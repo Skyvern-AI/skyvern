@@ -2470,7 +2470,10 @@ async def get_credentials(
     search: str | None = Query(
         default=None,
         max_length=200,
-        description="Case-insensitive search across credential name, username, secret label, and card details",
+        description=(
+            "Case-insensitive search across credential name, username, secret label, and card details, "
+            "or an exact credential ID"
+        ),
     ),
     folder_id: str | None = Query(
         default=None,

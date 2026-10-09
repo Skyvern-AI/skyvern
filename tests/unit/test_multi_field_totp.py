@@ -976,6 +976,7 @@ async def test_multi_field_totp_browser_privacy_after_fill(monkeypatch: pytest.M
                     shadow.innerHTML = '<span>Ready</span>';
                     window.globalDomDepthMap = new Map();
                     window.globalListnerFlag = true;
+                    window.globalIncrementalSession = {open: true, remaining: 3000, depthMap: window.globalDomDepthMap};
                     window.globalParsedElementCounter = new SafeCounter();
                     window.globalHoverStylesMap = await getHoverStylesMap();
                     const wrapper = document.createElement('div');

@@ -64,6 +64,7 @@ from skyvern.exceptions import (
     BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
+    ExternalBrowserSessionNotRunnable,
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
@@ -131,6 +132,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_trans
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     ARM_ATTRIBUTION_LOST,
     WorkflowBlockEngineArmAttribution,
+    code_mode_displaced,
     engine_arm_log_value,
     resolve_workflow_block_engine_arm,
     resolved_workflow_block_engine_arm_attribution,
@@ -147,6 +149,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     PersistentBrowserSession,
+    is_external_cdp_session,
     is_final_status,
     unusable_browser_session_error,
 )
@@ -436,6 +439,7 @@ _T3 = TypeVar("_T3")
 _T4 = TypeVar("_T4")
 _T5 = TypeVar("_T5")
 _T6 = TypeVar("_T6")
+_VersionWrite = TypeVar("_VersionWrite")
 
 
 _USER_DEFINED_ERROR_KEYS = {"error_code", "reasoning", "confidence_float", "error_type"}
@@ -5396,6 +5400,8 @@ class WorkflowService:
             )
         )
         session_id = browser_session.persistent_browser_session_id
+        if is_external_cdp_session(browser_session):
+            raise ExternalBrowserSessionNotRunnable(session_id)
         if is_final_status(browser_session.status):
             raise BrowserSessionClosed(session_id)
         status = getattr(browser_session.status, "value", browser_session.status)
@@ -7701,6 +7707,7 @@ class WorkflowService:
                     if (
                         is_adaptive_caching(workflow, workflow_run)
                         and is_script_execution
+                        and not await self._ran_a_block_on_v3(workflow_run)
                         and pre_finally_status
                         not in (
                             WorkflowRunStatus.canceled,
@@ -8153,7 +8160,11 @@ class WorkflowService:
         # share an arm. Covers the DAG executor too, which this method delegates to.
         current_context = skyvern_context.current()
         if current_context:
-            ineligibility_reason = v3_ab_ineligibility_reason(all_blocks, is_script_run=is_script_run)
+            ineligibility_reason = (
+                V3AbIneligibleReason.code_generation_requested
+                if workflow_run.code_gen
+                else v3_ab_ineligibility_reason(all_blocks)
+            )
             await resolve_workflow_block_engine_arm(
                 current_context,
                 workflow_run_id=workflow_run_id,
@@ -8162,19 +8173,34 @@ class WorkflowService:
                 workflow_status=workflow.status,
                 trigger_type=workflow_run.trigger_type,
                 ineligibility_reason=ineligibility_reason,
-                takes_default_engine=takes_default_engine(all_blocks),
+                # A code_gen request has no engine to choose: the chosen-engine rule would put it on v3,
+                # whose actions cannot yield the script it asked for.
+                takes_default_engine=None if workflow_run.code_gen else takes_default_engine(all_blocks),
                 # Counted only when the pin is what left the A/B, so pinned_v1_engine never labels another reason.
                 pinned_v1_blocks=(
                     pinned_v1_block_count(all_blocks)
                     if ineligibility_reason == V3AbIneligibleReason.pinned_engine
                     else 0
                 ),
+                would_be_code=is_script_run,
             )
         else:
             LOG.warning(
                 "No context to pin the workflow-block engine arm on; the run stays on control",
                 workflow_run_id=workflow_run_id,
             )
+
+        if is_script_run and code_mode_displaced(workflow_run_id):
+            LOG.info(
+                "A/B treatment runs this code-mode run on v3 as an agent, without its script",
+                workflow_run_id=workflow_run_id,
+                script_id=script.script_id if script else None,
+            )
+            script = None
+            script_is_pinned = False
+            is_script_run = False
+            if current_context:
+                current_context.generate_script = False
 
         # A cached script can be superseded (e.g. a stale pin replaced by a platform static
         # script) — drop it here so the ensure_static_script path below re-creates the pin.
@@ -8660,6 +8686,24 @@ class WorkflowService:
             name=f"script_gen_{workflow_run.workflow_run_id}",
         )
 
+    async def _ran_a_block_on_v3(self, workflow_run: WorkflowRun) -> bool:
+        """Task V3 records no element data on its actions, so a script generated from a run that used it
+        carries dead selectors, and later code-mode runs of the workflow would load it."""
+        try:
+            return await app.DATABASE.observer.workflow_run_has_block_on_engine(
+                workflow_run_id=workflow_run.workflow_run_id,
+                engine=RunEngine.skyvern_v3,
+                organization_id=workflow_run.organization_id,
+            )
+        except Exception:
+            # Unknown counts as v3: a skipped script is regenerated by the next v1 run, a dead one is loaded.
+            LOG.warning(
+                "Could not read the run's block engines; skipping script work",
+                workflow_run_id=workflow_run.workflow_run_id,
+                exc_info=True,
+            )
+            return True
+
     async def _do_generate_pending_script(
         self,
         workflow: Workflow,
@@ -8667,6 +8711,8 @@ class WorkflowService:
     ) -> None:
         """Fire-and-forget wrapper for pending script generation with error handling."""
         try:
+            if await self._ran_a_block_on_v3(workflow_run):
+                return
             await workflow_script_service.generate_or_update_pending_workflow_script(
                 workflow_run=workflow_run,
                 workflow=workflow,
@@ -10920,9 +10966,9 @@ class WorkflowService:
         *,
         workflow_permanent_id: str,
         version: int,
-        insert: Callable[[int], Awaitable[Workflow]],
+        insert: Callable[[int], Awaitable[_VersionWrite]],
         next_version_after_conflict: Callable[[], Awaitable[int]],
-    ) -> Workflow:
+    ) -> _VersionWrite:
         """Postgres raises the unique violation only after the competing insert commits, so a fresh read
         without a pause sees the winner's version."""
         for attempt in range(1, WORKFLOW_VERSION_ALLOCATION_ATTEMPTS):
@@ -13432,6 +13478,7 @@ class WorkflowService:
                 # run that was never randomized. Per-arm reads filter on route_reason, and the tier
                 # is what the non-enterprise ramp steps on.
                 route_reason=engine_arm_log_value(arm_decision.route_reason),
+                would_be_code=arm_decision.would_be_code,
                 billing_tier=engine_arm_log_value(arm_decision.billing_tier),
             )
             # Run minutes measure compute. A run finalized without ever reaching
@@ -13706,7 +13753,7 @@ class WorkflowService:
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
             )
-            # A file the run's own code generated is a real download but not a delivered one.
+            # A file the run's own code generated is left out of the download count only.
             run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
@@ -13720,7 +13767,15 @@ class WorkflowService:
             # downloads), so they are separate files and both count.
             registered_ids = {file.artifact_id for file in registered if file.artifact_id}
             download_count = len(registered) + len(session_download_ids - registered_ids)
-            verdict = grade_completion_contract(criteria, registered_download_count=download_count)
+            # A CODE row carries this key only from the secure worker: the in-process executor and the AI
+            # fallback drop it. On any other block type it is authored data.
+            worker_generated = generated_file_artifact_ids(
+                block.output for block in run_blocks if block.block_type == BlockType.CODE
+            )
+            generated_file_count = len({file.artifact_id for file in files if file.artifact_id in worker_generated})
+            verdict = grade_completion_contract(
+                criteria, registered_download_count=download_count, generated_file_count=generated_file_count
+            )
             LOG.info(
                 "workflow_completion_contract_graded",
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -13729,6 +13784,7 @@ class WorkflowService:
                 registered_download_count=len(registered),
                 session_download_count=len(session_download_ids),
                 graded_download_count=download_count,
+                generated_file_count=generated_file_count,
             )
             return verdict
         except Exception:
@@ -16947,6 +17003,55 @@ class WorkflowService:
                 request.webhook_callback_url, field_name="webhook_callback_url"
             )
 
+        async def persist_version_with_definition(
+            insert_version_row: Callable[[], Awaitable[Workflow]],
+        ) -> tuple[Workflow, WorkflowDefinition]:
+            """Allocate the new version row and fill in its definition as one transaction.
+
+            The definition can only be built once the row's ``workflow_id`` exists, so the row is
+            inserted empty first. Committing it on its own would publish an empty workflow as the
+            latest version: readers would resolve it, a concurrent save would inherit its settings,
+            and a save precondition checked against it would reject a valid draft over a version
+            that validation is about to discard.
+            """
+            async with app.DATABASE.workflows.version_write_transaction():
+                allocated_workflow = await insert_version_row()
+                built_definition = await self.make_workflow_definition(
+                    allocated_workflow.workflow_id,
+                    request.workflow_definition,
+                )
+
+                # Validate the block graph before persisting (detects orphans, cycles, dangling references)
+                self.validate_workflow_block_graph(built_definition)
+                built_definition.validate()
+
+                # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
+                self._validate_payload_templates(built_definition)
+
+                saved_workflow = await self.update_workflow_definition(
+                    workflow_id=allocated_workflow.workflow_id,
+                    organization_id=organization_id,
+                    title=title,
+                    description=request.description,
+                    workflow_definition=built_definition,
+                    edited_by=edited_by,
+                    created_via=created_via,
+                    notify_workflow_saved=False,
+                    validate_code_block_templates=validate_code_block_templates,
+                )
+
+            self._schedule_workflow_saved_hook_best_effort(
+                organization_id=saved_workflow.organization_id,
+                edited_by=edited_by,
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                workflow=saved_workflow,
+                version=saved_workflow.version,
+                status=saved_workflow.status,
+                actor_user_id=edited_by,
+                created_via=created_via,
+            )
+            return saved_workflow, built_definition
+
         try:
             if existing_latest_workflow:
                 # Public CDP headers are masked during serialization; public extra HTTP headers are literal.
@@ -17033,11 +17138,13 @@ class WorkflowService:
                         raise WorkflowVersionConflict(existing_latest_workflow.workflow_permanent_id)
                     return latest_version + 1
 
-                # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self._insert_next_workflow_version(
+                async def insert_version_with_definition(version: int) -> tuple[Workflow, WorkflowDefinition]:
+                    return await persist_version_with_definition(lambda: insert_version(version))
+
+                updated_workflow, workflow_definition = await self._insert_next_workflow_version(
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
-                    insert=insert_version,
+                    insert=insert_version_with_definition,
                     next_version_after_conflict=next_version_from_same_settings,
                 )
             else:
@@ -17045,40 +17152,20 @@ class WorkflowService:
                 # any keys whose value is the mask sentinel so we never persist the
                 # literal "***" placeholder from a misbehaving client.
                 new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
-                # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self._create_initial_workflow_from_request(
-                    organization_id=organization_id,
-                    request=request,
-                    title=title,
-                    workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-                    cdp_connect_headers=new_cdp_connect_headers,
-                    created_by=created_by,
-                    edited_by=edited_by,
+                updated_workflow, workflow_definition = await persist_version_with_definition(
+                    lambda: self._create_initial_workflow_from_request(
+                        organization_id=organization_id,
+                        request=request,
+                        title=title,
+                        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+                        cdp_connect_headers=new_cdp_connect_headers,
+                        created_by=created_by,
+                        edited_by=edited_by,
+                    )
                 )
-            # Keeping track of the new workflow id to delete it if an error occurs during the creation process
-            new_workflow_id = potential_workflow.workflow_id
-
-            workflow_definition = await self.make_workflow_definition(
-                potential_workflow.workflow_id,
-                request.workflow_definition,
-            )
-
-            # Validate the block graph before persisting (detects orphans, cycles, dangling references)
-            self.validate_workflow_block_graph(workflow_definition)
-
-            # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
-            self._validate_payload_templates(workflow_definition)
-
-            updated_workflow = await self.update_workflow_definition(
-                workflow_id=potential_workflow.workflow_id,
-                organization_id=organization_id,
-                title=title,
-                description=request.description,
-                workflow_definition=workflow_definition,
-                edited_by=edited_by,
-                created_via=created_via,
-                validate_code_block_templates=validate_code_block_templates,
-            )
+            # Only the steps below still need the version cleaned up by hand; a failure inside the
+            # transaction above already rolled it back.
+            new_workflow_id = updated_workflow.workflow_id
 
             if recording_id_to_attach is not None:
                 try:
@@ -17410,6 +17497,14 @@ class WorkflowService:
         if block_labels and not code_gen:
             # Do not generate script if block_labels is provided, and an explicit code_gen
             # request is not made
+            return
+
+        if await self._ran_a_block_on_v3(workflow_run):
+            LOG.info(
+                "Skipping script generation: this run executed a block on Task V3",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
             return
 
         existing_script, rendered_cache_key_value, _is_pinned = await workflow_script_service.get_workflow_script(

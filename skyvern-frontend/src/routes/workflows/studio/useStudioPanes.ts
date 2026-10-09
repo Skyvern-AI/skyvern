@@ -65,7 +65,7 @@ export function useStudioPanes() {
         current: StudioPaneId[],
         slots: readonly StudioPaneId[],
       ) => StudioPaneId[],
-      options?: ApplyPanesOptions,
+      options?: ApplyPanesOptions & { byUser?: boolean; layout?: boolean },
     ) => {
       restoreExpandedPane?.();
       updatePanes((current, slots) => {
@@ -81,7 +81,7 @@ export function useStudioPanes() {
           });
         }
         return next;
-      });
+      }, options);
       if (
         !options ||
         (!("state" in options) && options.selectedBlockLabel === undefined)
@@ -124,7 +124,9 @@ export function useStudioPanes() {
 
   const togglePane = useCallback(
     (id: StudioPaneId) =>
-      applyPanes((current, slots) => togglePaneIn(current, id, slots)),
+      applyPanes((current, slots) => togglePaneIn(current, id, slots), {
+        byUser: true,
+      }),
     [applyPanes],
   );
   const openPane = useCallback(
@@ -133,11 +135,13 @@ export function useStudioPanes() {
     [applyPanes],
   );
   const closePane = useCallback(
-    (id: StudioPaneId) => applyPanes((current) => withPaneClosed(current, id)),
+    (id: StudioPaneId) =>
+      applyPanes((current) => withPaneClosed(current, id), { byUser: true }),
     [applyPanes],
   );
   const setOpenPanes = useCallback(
-    (panes: readonly StudioPaneId[]) => applyPanes(() => [...panes]),
+    (panes: readonly StudioPaneId[], options?: { byUser?: boolean }) =>
+      applyPanes(() => [...panes], { ...options, layout: true }),
     [applyPanes],
   );
   const setPanesOrder = useCallback(

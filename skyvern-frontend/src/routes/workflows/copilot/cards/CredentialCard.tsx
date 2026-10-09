@@ -78,6 +78,8 @@ export interface CredentialRequiredFrame {
   message?: string;
   login_page_urls?: string[];
   credential_refs?: string[];
+  // Set by the server only when the user named exactly one login this turn.
+  named_credential_id?: string | null;
   timeout_seconds?: number;
   expires_at?: string;
   signing_in?: boolean;
@@ -343,7 +345,7 @@ function CredentialPicker({
   const renderItem = (credential: PickerCredential) => (
     <CommandItem
       key={credential.credentialId}
-      // cmdk filters on value; append username + id so identical names stay findable.
+      // cmdk tracks the highlighted row by value, so it carries the id to stay unique per row.
       value={`${credential.name} ${credential.secondary ?? ""} ${credential.credentialId}`}
       onSelect={() => {
         // A pick after the pause expires would submit an already-rejected resume token; the popover
@@ -360,6 +362,9 @@ function CredentialPicker({
             {credential.secondary}
           </span>
         ) : null}
+        <span className="truncate text-[11px] text-muted-foreground">
+          {credential.credentialId}
+        </span>
       </div>
     </CommandItem>
   );
@@ -390,7 +395,12 @@ function CredentialPicker({
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className={`${contentClassName} p-0`} align="start">
+      <PopoverContent
+        className={`${contentClassName} p-0`}
+        align="start"
+        // The chat stops the running turn on any Escape that reaches the window.
+        onEscapeKeyDown={(event) => event.stopPropagation()}
+      >
         <Command shouldFilter={false}>
           <CommandInput
             placeholder="Search credentials..."
@@ -876,6 +886,47 @@ function CredentialAskCard({
     })();
   }, [needsCredentialList, reloadKey, retryKey, searchTerm, credentialGetter]);
 
+  // Fetched by id rather than read from the list above: that list is one page narrowed by the
+  // search box, so either can drop the one login the ask is about.
+  const namedCredentialId =
+    isAsk && mode !== "auto-bound"
+      ? (frame.named_credential_id ?? undefined)
+      : undefined;
+  const [namedCredential, setNamedCredential] =
+    useState<PickerCredential | null>(null);
+  // Holds the Use button's slot while the lookup runs, so a successful lookup does not move the
+  // buttons beside it under a click.
+  const [namedLookupPending, setNamedLookupPending] = useState(
+    Boolean(namedCredentialId),
+  );
+  useEffect(() => {
+    setNamedCredential(null);
+    setNamedLookupPending(Boolean(namedCredentialId));
+    if (!namedCredentialId) return;
+    let stale = false;
+    void (async () => {
+      try {
+        const client = await getClient(credentialGetter);
+        const res = await client.get<CredentialApiResponse>(
+          `/credentials/${encodeURIComponent(namedCredentialId)}`,
+        );
+        if (stale) return;
+        if (res.data?.credential_type === "password") {
+          setNamedCredential({
+            credentialId: namedCredentialId,
+            name: res.data.name,
+          });
+        }
+      } catch {
+        // The picker still offers every saved login, so a failed lookup leaves a plain ask.
+      }
+      if (!stale) setNamedLookupPending(false);
+    })();
+    return () => {
+      stale = true;
+    };
+  }, [namedCredentialId, reloadKey, retryKey, credentialGetter]);
+
   const retryCredentialList = () => {
     setOrgCredentials({ status: "loading" });
     setRetryKey((key) => key + 1);
@@ -1096,7 +1147,12 @@ function CredentialAskCard({
       type="button"
       size="sm"
       variant={
-        (signIn && frame.signing_in) || offerGenerate ? "outline" : "default"
+        (signIn && frame.signing_in) ||
+        offerGenerate ||
+        namedCredential ||
+        namedLookupPending
+          ? "outline"
+          : "default"
       }
       disabled={disabled}
       onClick={() => onConnect(undefined)}
@@ -1195,6 +1251,18 @@ function CredentialAskCard({
           {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
         </span>,
         ...registrationLines,
+        ...(namedCredential
+          ? [
+              <span
+                key="named"
+                className="break-words text-[11px] font-medium leading-relaxed"
+              >
+                You named this login ({namedCredential.credentialId}). Copilot
+                wants to use it on {site}. Check that is the right site before
+                you confirm.
+              </span>,
+            ]
+          : []),
         ...(mode === "terminal"
           ? [
               <span
@@ -1216,6 +1284,24 @@ function CredentialAskCard({
               onClick={() => onGenerate?.()}
             >
               Generate and save
+            </Button>
+          ) : null}
+          {namedCredential ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              // Wraps rather than truncates: the site is what the click agrees to.
+              className="h-auto max-w-full whitespace-normal break-words py-1 text-left"
+              onClick={() =>
+                onConnect(namedCredential.credentialId, namedCredential.name)
+              }
+            >
+              Use &apos;{namedCredential.name}&apos; on {site}
+            </Button>
+          ) : namedLookupPending ? (
+            <Button type="button" size="sm" disabled>
+              Use saved login
             </Button>
           ) : null}
           {connectButton}

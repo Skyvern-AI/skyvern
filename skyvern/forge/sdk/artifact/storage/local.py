@@ -820,6 +820,13 @@ class LocalStorage(BaseStorage):
             LOG.exception("Failed to read local file", uri=uri)
             return None
 
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self.assert_managed_file_access(uri, organization_id)
+        try:
+            return os.path.getsize(parse_uri_to_path(uri))
+        except OSError:
+            return None
+
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given local URI."""
         try:

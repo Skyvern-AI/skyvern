@@ -21,6 +21,11 @@ def released_session_stub() -> SimpleNamespace:
     return SimpleNamespace(released=MagicMock(side_effect=lambda: nullcontext()))
 
 
+def version_write_transaction_stub() -> MagicMock:
+    """The save path's version/definition transaction, for workflow repositories faked without an engine."""
+    return MagicMock(side_effect=lambda: nullcontext())
+
+
 def create_forge_stub_app() -> ForgeApp:
     class _LazyNamespace:
         def __getattr__(self, name):
@@ -32,6 +37,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.DATABASE = _LazyNamespace()
     # Auto-mocked, Session.released() would hand `async with` a coroutine.
     fake_app_module.DATABASE.workflow_runs.Session.released = released_session_stub().released
+    # Same trap on the save path's version/definition transaction: no stub DB has an engine to
+    # open one against, and the writes inside the block are mocked anyway.
+    fake_app_module.DATABASE.workflows.version_write_transaction = version_write_transaction_stub()
     # Retry-policy-aware production paths query the attempt repository even for legacy runs.
     # Keep the shared stub's no-policy behavior explicit instead of letting _LazyNamespace
     # manufacture truthy AsyncMocks for these reads.

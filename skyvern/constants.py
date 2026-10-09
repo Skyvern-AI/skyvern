@@ -28,6 +28,10 @@ BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 # BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
 # and can never consume the budget the paid-provider cleanup phase needs.
 BROWSER_INTERCEPTOR_DISABLE_TIMEOUT = 30  # 30 seconds
+# Budget for the whole browser-context teardown phase: on-close callbacks, cookie persistence, then context
+# close. Healthy closes finish in seconds (prod p99.9 ~4.5s); one still running at this point is wedged, and
+# holding it to BROWSER_CLOSE_TIMEOUT only delays the run's result. Keep on-close callbacks cheap.
+BROWSER_CONTEXT_CLOSE_TIMEOUT = 30  # 30 seconds
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute

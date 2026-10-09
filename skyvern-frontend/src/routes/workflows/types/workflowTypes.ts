@@ -468,6 +468,7 @@ export type FileUploadBlock = WorkflowBlockBase & {
 };
 
 export type EmailBodyFormat = "text" | "html";
+export type EmailTransport = "smtp" | "gmail";
 
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
@@ -485,6 +486,10 @@ export type SendEmailBlock = WorkflowBlockBase & {
   body: string;
   body_format?: EmailBodyFormat;
   file_attachments: Array<string>;
+  transport?: EmailTransport | null;
+  credential_id?: string | null;
+  cc?: Array<string>;
+  bcc?: Array<string>;
 };
 
 export type FileURLParserBlock = WorkflowBlockBase & {

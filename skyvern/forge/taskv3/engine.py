@@ -60,6 +60,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_RETAIN_CHARS_HIGH,
     ActivityRecency,
     CompletionBlocker,
+    CompletionGate,
     CompletionProbe,
     LoopOutcome,
     RoundAction,
@@ -277,11 +278,14 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
     completion_blocker: CompletionBlocker | None = None,
+    completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
     initial_navigation_url: str | None = None,
+    initial_navigation_requested_url: str | None = None,
     caller_known_urls: frozenset[str] = frozenset(),
+    task_target_urls: frozenset[str] = frozenset(),
     label_secret_values: Callable[[], Collection[str]] | None = None,
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
@@ -305,6 +309,8 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Extra action rounds a single-action block may spend before its own action lands; see the loop.
+    target_action_reserve: int = 0,
     # Asked before a single-action block completes on its step cap.
     block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
@@ -551,6 +557,7 @@ async def run_task_v3_agent_loop(
         verification_blocker=verification_blocker,
         unlisted_reask=_unlisted_reask if reask_on else None,
         document_identity=None if page_free else document_identity,
+        completion_gate=None if page_free else completion_gate,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -624,7 +631,9 @@ async def run_task_v3_agent_loop(
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
             initial_navigation_url=initial_navigation_url,
+            initial_navigation_requested_url=initial_navigation_requested_url,
             caller_known_urls=caller_known_urls,
+            task_target_urls=task_target_urls,
             label_secret_values=label_secret_values,
             login_identifier_tokens=login_identifier_tokens,
             page_probe=None if page_free else page_probe,
@@ -636,6 +645,7 @@ async def run_task_v3_agent_loop(
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
+            target_action_reserve=target_action_reserve,
             block_completion_check=_block_completion_check if block_check_on else None,
         )
     finally:

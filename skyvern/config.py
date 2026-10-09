@@ -553,6 +553,9 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
+    # Kill switch for committing a list row that names the value without being it exactly (its main label, a
+    # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
+    TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
@@ -580,7 +583,8 @@ class Settings(BaseSettings):
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
     # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
-    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # task block's chosen engine and run a block with no engine on Task V3 (or on the per-run split of
+    # WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS for a listed org or workflow), outside WORKFLOW_TASK_V3_AB.
     # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
     # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
     TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None

@@ -42,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_folder_id,
+    generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
@@ -930,6 +931,13 @@ class WorkflowRunModel(Base):
             "organization_id",
             text("queued_at DESC"),
             postgresql_where=text("status IN ('queued', 'running', 'paused')"),
+        ),
+        Index(
+            "ix_workflow_runs_job_recipe_listing",
+            "organization_id",
+            text("created_at DESC"),
+            text("workflow_run_id DESC"),
+            postgresql_where=text("trigger_type IN ('job_recipe_apply', 'job_recipe_extract')"),
         ),
         Index(
             "ix_workflow_runs_retried_from_workflow_run_id",
@@ -2322,6 +2330,7 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     email_address = Column(String, nullable=True)
+    google_subject = Column(String, nullable=True)
     provider = Column(String, nullable=False, default="google")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
@@ -2334,6 +2343,38 @@ class GoogleOAuthCredentialModel(Base):
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
     client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class GmailSendDispatchModel(Base):
+    """One row per logical send_email execution that reached the Gmail send call."""
+
+    __tablename__ = "gmail_send_dispatches"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "execution_key", name="uq_gmail_send_dispatches_execution"),
+        CheckConstraint(
+            "status IN ('dispatching', 'accepted', 'failed', 'unknown')",
+            name="ck_gmail_send_dispatches_status",
+        ),
+    )
+
+    gmail_send_dispatch_id = Column(String, primary_key=True, default=generate_gmail_send_dispatch_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    execution_key = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="dispatching")
+    provider_message_id = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    provider_status = Column(Integer, nullable=True)
+    provider_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

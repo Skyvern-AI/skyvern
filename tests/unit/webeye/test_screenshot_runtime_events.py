@@ -382,30 +382,6 @@ async def test_selected_engine_failure_classification(page: MagicMock, outcome: 
 
 
 @pytest.mark.asyncio
-async def test_cdp_first_local_deadline_is_timeout(page: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
-    now = 100.0
-    monkeypatch.setattr(page_module, "_monotonic", lambda: now)
-    context = SkyvernContext(
-        workflow_run_id="workflow-owner",
-        screenshot_arm_resolved_distinct_id="workflow-owner",
-        screenshot_cdp_first=True,
-    )
-
-    async def fail(method: str, params: dict[str, Any]) -> dict[str, Any]:
-        nonlocal now
-        now += 1
-        raise PlaywrightError("CDP unavailable")
-
-    page.context.new_cdp_session.return_value.send.side_effect = fail
-    with skyvern_context.scoped(context), capture_logs() as logs, pytest.raises(FailedToTakeScreenshot) as raised:
-        await SkyvernFrame.take_scrolling_screenshot(page, scrolling_number=0, timeout=100)
-    assert isinstance(raised.value.__cause__, page_module._ScreenshotDeadlineExceeded)
-    assert [entry["outcome"] for entry in runtime_events(logs)] == ["timeout"]
-    assert runtime_events(logs)[0]["elapsed_ms"] == 1000.0
-    page.screenshot.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_suppressed_scroll_restore_timeout_is_still_success(page: MagicMock) -> None:
     frame = await SkyvernFrame.create_instance(page)
     frame.safe_scroll_to_x_y.side_effect = TimeoutError("restore deadline")

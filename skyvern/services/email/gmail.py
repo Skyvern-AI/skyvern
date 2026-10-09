@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import timezone
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from typing import Any
@@ -5,6 +6,7 @@ from urllib.parse import quote
 
 import httpx
 
+from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.services.email.gmail_client import (
     GMAIL_API_BASE,
     GmailAPIError,
@@ -14,6 +16,41 @@ from skyvern.services.email.gmail_client import (
 )
 from skyvern.services.email.types import EmailAttachment, EmailMessage
 
+GMAIL_SEND_URL = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send"
+GMAIL_SEND_TIMEOUT_SECONDS = 120.0
+# Gmail's documented ceiling for an uploaded message.
+GMAIL_MAX_MESSAGE_BYTES = 35 * 1024 * 1024
+# google.rpc.Code names: the only provider text kept from a rejected send.
+_GOOGLE_RPC_CODES = frozenset(
+    {
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+    }
+)
+# The only statuses read as "not sent". A send recorded as failed may be attempted again, so any other
+# status, including 408 and 409, stays unknown.
+_REJECTED_STATUS_ERROR_CODES = {
+    400: GmailSendErrorCode.PROVIDER_REJECTED,
+    401: GmailSendErrorCode.RECONNECT,
+    403: GmailSendErrorCode.PROVIDER_REJECTED,
+    404: GmailSendErrorCode.PROVIDER_REJECTED,
+    413: GmailSendErrorCode.ATTACHMENT_TOO_LARGE,
+    429: GmailSendErrorCode.RATE_LIMITED,
+}
 _SYSTEM_LABELS = {"INBOX", "SENT", "DRAFT", "SPAM", "TRASH", "STARRED", "IMPORTANT", "UNREAD"}
 
 
@@ -207,3 +244,76 @@ async def list_folder_messages(
         async with httpx.AsyncClient(timeout=20.0) as owned_client:
             return await _list(owned_client)
     return await _list(client)
+
+
+@dataclass(frozen=True)
+class GmailSendResult:
+    outcome: GmailSendOutcome
+    provider_message_id: str | None = None
+    error_code: GmailSendErrorCode | None = None
+    provider_status: int | None = None
+    provider_reason: str | None = None
+
+
+def _response_object(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _response_error(response: httpx.Response) -> dict[str, Any]:
+    error = _response_object(response).get("error")
+    return error if isinstance(error, dict) else {}
+
+
+def _accepted_message_id(response: httpx.Response) -> str | None:
+    message_id = _response_object(response).get("id")
+    return message_id if isinstance(message_id, str) and message_id else None
+
+
+async def send_raw_message(
+    access_token: str, mime_bytes: bytes, client: httpx.AsyncClient | None = None
+) -> GmailSendResult:
+    """Send one RFC 822 message with exactly one HTTP attempt."""
+
+    async def _post(client_: httpx.AsyncClient) -> httpx.Response:
+        return await client_.post(
+            GMAIL_SEND_URL,
+            params={"uploadType": "media"},
+            content=mime_bytes,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "message/rfc822"},
+            timeout=GMAIL_SEND_TIMEOUT_SECONDS,
+        )
+
+    # Never retried: after a timeout, a dropped connection or a 5xx, Gmail may already have accepted the message.
+    try:
+        if client is not None:
+            response = await _post(client)
+        else:
+            async with httpx.AsyncClient() as owned_client:
+                response = await _post(owned_client)
+    except Exception:
+        return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+
+    status = response.status_code
+    if 200 <= status < 300:
+        message_id = _accepted_message_id(response)
+        if message_id is not None:
+            return GmailSendResult(GmailSendOutcome.ACCEPTED, provider_message_id=message_id)
+        return GmailSendResult(
+            GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN, provider_status=status
+        )
+    error_code = _REJECTED_STATUS_ERROR_CODES.get(status)
+    if error_code is not None:
+        rpc_code = _response_error(response).get("status")
+        return GmailSendResult(
+            GmailSendOutcome.FAILED,
+            error_code=error_code,
+            provider_status=status,
+            provider_reason=rpc_code if rpc_code in _GOOGLE_RPC_CODES else None,
+        )
+    return GmailSendResult(
+        GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN, provider_status=status
+    )

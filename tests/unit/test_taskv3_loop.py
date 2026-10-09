@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import functools
 import hashlib
 import json
 import random
@@ -25,7 +26,7 @@ from typing import Any, Awaitable, Callable, Collection
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -36,6 +37,7 @@ from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTIO
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_MAX_FACTOR,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
@@ -43,7 +45,9 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
+    COMPLETION_GATE_REFUSAL,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -65,6 +69,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    TARGET_ACTION_ROUND_EVENT,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
@@ -90,6 +95,7 @@ from skyvern.forge.taskv3.loop import (
     _RevisitMemory,
     current_tool_call_seq,
     make_finish_tool,
+    record_click_dispatched,
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
@@ -633,6 +639,74 @@ async def test_initial_navigation_dead_end_yields_canceled_when_cancelling() -> 
 
     assert outcome.status == "canceled"
     assert caller.calls == 0
+
+
+_PORTAL = "https://jobs.example.test/portal.action"
+
+
+@pytest.mark.parametrize(
+    ("targets", "requested", "landed", "revisit", "expected"),
+    [
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (True, False)),
+        # A redirect: the task named the URL asked for, not the one the 404 came back on.
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", _PORTAL + "?gone=1", False, (True, False)),
+        (set(), _PORTAL, None, True, (False, True)),
+        # Both hold: the logged provenance prefers the task's own URL, the flags stay independent.
+        ({_PORTAL}, _PORTAL, None, True, (True, True)),
+        # Same page, different query: on query-routed sites that is a different page, not the task's.
+        ({_PORTAL + "?page=intro&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (False, False)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_navigate_dead_end_logs_its_provenance_without_a_url(
+    targets: set[str], requested: str, landed: str | None, revisit: bool, expected: tuple[bool, bool]
+) -> None:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        data = {
+            "page_state_changed": True,
+            "navigation_dead_end": 404,
+            "navigation_dead_end_url": landed or args["url"],
+        }
+        return ToolResult.ok("navigated", data={**data, "nav_revisit": True} if revisit else data)
+
+    tools = [ToolSpec(name="navigate", description="n", parameters={}, handler=handler), make_finish_tool()]
+    script = [[("navigate", {"url": requested})], [("finish", {"status": "completed", "reason": "never"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, task_target_urls=caller_known_published_urls(*targets, keep_query=True))
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"]) == expected
+    assert line["provenance"] == (
+        "task_supplied" if expected[0] else "previously_visited" if expected[1] else "undecided"
+    )
+    assert not any("http" in str(value) for value in line.values())
+
+
+@pytest.mark.parametrize(
+    ("requested", "landed"),
+    [
+        ("http://jobs.example.test/acme/42", "https://jobs.example.test/acme/42"),
+        ("https://jobs.example.test/acme/42", "https://jobs.example.test/acme/expired"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_after_a_redirect_is_logged_task_supplied(
+    requested: str, landed: str
+) -> None:
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[("finish", {"status": "completed", "reason": "never"})]],
+            [make_finish_tool()],
+            initial_navigation_status=404,
+            initial_navigation_url=landed,
+            initial_navigation_requested_url=requested,
+            task_target_urls=caller_known_published_urls(requested, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop initial navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"], line["provenance"]) == (True, False, "task_supplied")
 
 
 @pytest.mark.asyncio
@@ -1254,6 +1328,287 @@ async def test_step_cap_block_completion_evidence_log_carries_the_verdict_not_th
     assert "482913" not in repr(evidence)
 
 
+def _flaky_click(sink: list[dict[str, Any]], fail_first: int, landed: dict[str, Any] | None = None) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(args)
+        if len(sink) <= fail_first:
+            return ToolResult.error("click timed out: element is not stable")
+        return ToolResult.ok("clicked button 'Next'", data=landed if landed is not None else _REACHED_TARGET)
+
+    return ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+
+
+def _scripted_block_check(*verdicts: GoalVerdict) -> tuple[Callable[[], Awaitable[GoalVerdict]], list[GoalVerdict]]:
+    asked: list[GoalVerdict] = []
+
+    async def check() -> GoalVerdict:
+        verdict = verdicts[min(len(asked), len(verdicts) - 1)]
+        asked.append(verdict)
+        return verdict
+
+    return check, asked
+
+
+_NOT_ACHIEVED = GoalVerdict("not_achieved", "Next", "the next page", None, 0.1)
+_ACHIEVED = GoalVerdict("achieved", "", "", None, 0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserve", [0, ACTION_BLOCK_TARGET_ACTION_RESERVE], ids=["no_reserve", "reserve"])
+async def test_a_one_click_block_lands_its_click_after_a_hover_and_a_failed_click(reserve: int) -> None:
+    # Cap 1 is the action block's default. The hover and the click that failed without moving the page did not
+    # do the block's action, so they must not leave the click it asked for unspent (the step engine retries a
+    # failed step and completes on the one that succeeds).
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=1), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=reserve,
+    )
+
+    if reserve:
+        assert outcome.status == "completed"
+        assert "(click)" in outcome.reason
+        assert len(clicks) == 2  # the failed click and the one that landed; the follow-up got the completion
+    else:
+        assert outcome.status == "budget_exhausted"
+        assert clicks == []
+
+
+@pytest.mark.asyncio
+async def test_a_menu_opening_click_is_a_precursor_like_a_hover() -> None:
+    clicks: list[dict[str, Any]] = []
+    opener = {"menu_note": "listed"}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        return ToolResult.ok("clicked", data=opener if len(clicks) == 1 else _REACHED_TARGET)
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    check, asked = _scripted_block_check(_ACHIEVED)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "completed"
+    assert len(clicks) == 2
+    assert len(asked) == 1  # only the completion offer after the landed click; the menu open needed no judge
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "granted"),
+    [
+        (_NOT_ACHIEVED, True),
+        (_ACHIEVED, False),
+        (GoalVerdict("impossible", "", "", None, 0.1), False),
+        (GoalVerdict("achieved", "", "", "secret_entered", 0.0), False),
+        (None, False),
+    ],
+    ids=["not_achieved", "achieved", "impossible", "judge_skipped", "judge_raises"],
+)
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_a_precursor_that_committed_needs_the_judges_not_achieved_for_another_round(
+    verdict: GoalVerdict | None, granted: bool, entry: str
+) -> None:
+    # A typed value can be the block's whole action, and a type that errored may still have written part of it (a
+    # partial credential); only the block judge saying it is not done yet earns a round.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+
+    async def check() -> GoalVerdict:
+        if verdict is None:
+            raise RuntimeError("judge down")
+        return verdict
+
+    script = [[("type", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [
+            _recording_tool("type", types, billable=True)
+            if entry == "typed"
+            else _erroring_tool("type", types, billable=True),
+            _flaky_click(clicks, fail_first=0),
+            make_finish_tool(),
+        ],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert len(clicks) == (1 if granted else 0)
+    if not granted:
+        assert outcome.status == "budget_exhausted"
+        assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "landed", ["ok_url_unchanged", "failed_page_moved", "failed_select_moved_url", "failed_enter", "click_unverified"]
+)
+async def test_no_round_is_reserved_after_a_call_that_may_have_submitted_or_left_the_page(landed: str) -> None:
+    # A click that did not move the URL may have submitted, and a failed call that moved the page left it; another
+    # round could submit twice or act on the next page, so the judge is not even asked.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tool_name = {"failed_select_moved_url": "select_option", "failed_enter": "press_key"}.get(landed, "click")
+    call_args = {"key": "Enter"} if landed == "failed_enter" else {}
+    if landed == "ok_url_unchanged":
+        click = _recording_tool("click", clicks, billable=True, ok_data={"page_transitioned": False})
+    elif landed == "failed_page_moved":
+        click = _erroring_tool("click", clicks, billable=True, error_data={"page_state_changed": True})
+    elif landed == "click_unverified":
+        click = _erroring_tool("click", clicks, billable=True, error_data={CLICK_DISPATCHED_DATA_KEY: True})
+    elif landed == "failed_select_moved_url":
+        click = _erroring_tool("select_option", clicks, billable=True, error_data={"page_transitioned": True})
+    else:
+        click = _erroring_tool("press_key", clicks, billable=True)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[(tool_name, call_args)], [(tool_name, call_args)], [(tool_name, call_args)]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1
+    assert asked == []
+    [decision] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["granted"] is False and decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdict(entry: str) -> None:
+    # A partial or full credential is on the page; a second round could submit it and spend a lockout attempt.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    secret = {"selector": "#password", "text": "placeholder_TlK9_password"}
+    typer = (
+        _recording_tool("type", types, billable=True)
+        if entry == "typed"
+        else _erroring_tool("type", types, billable=True)
+    )
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("type", secret)], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [typer, _flaky_click(clicks, fail_first=0), make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == [] and asked == []
+    [decision] = [log for log in logs if log["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+async def test_an_action_that_moved_the_page_goes_to_the_completion_offer_not_the_reserve() -> None:
+    # A select that navigated landed the block's action; a not-done verdict fails the block as before rather than
+    # granting a round on the page it moved to.
+    selects: list[tuple[str, dict[str, Any]]] = []
+    select = _recording_tool("select_option", selects, billable=True, ok_data=_REACHED_TARGET)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("select_option", {})], [("select_option", {})], [("select_option", {})]]
+    outcome, _ = await _run(
+        script,
+        [select, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(selects) == 1
+    assert len(asked) == 1  # the completion offer's judge only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [True, False], ids=["page_received_it", "never_dispatched"])
+async def test_a_click_that_raised_after_the_page_received_it_gets_no_reserve_round(dispatched: bool) -> None:
+    # A slow submit: the click raised while its navigation had not committed, so the probe reads the same page. A
+    # second click could post the form twice; a click that never reached the page is the retry v1 also makes.
+    clicks: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        if dispatched:
+            record_click_dispatched()
+        raise TimeoutError("click timed out")
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=_achieved_block_check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    [first] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT][:1]
+    assert first["granted"] is (not dispatched)
+    assert len(clicks) == (1 if dispatched else 3)
+
+
+@pytest.mark.asyncio
+async def test_the_target_action_reserve_is_bounded() -> None:
+    clicks: list[dict[str, Any]] = []
+    script = [[("click", {})] for _ in range(8)]
+    outcome, _ = await _run(
+        script,
+        [_flaky_click(clicks, fail_first=99), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1 + ACTION_BLOCK_TARGET_ACTION_RESERVE
+
+
+@pytest.mark.asyncio
+async def test_a_multi_action_block_gets_no_target_action_reserve() -> None:
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=0), make_finish_tool()],
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == []
+
+
 @pytest.mark.asyncio
 async def test_step_gate_on_the_granted_turn_salvages_a_staged_finish_output() -> None:
     # The granted turn batches an over-cap action AND a finish: the refused action voids the
@@ -1454,6 +1809,45 @@ async def test_tool_error_stops_batch_and_skips_remaining() -> None:
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
     assert any(m.get("name") == "boom" and "boom failed" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["unconfirmed", "confirmed"])
+async def test_a_field_entry_that_could_not_confirm_its_value_holds_back_a_submit_in_the_batch(
+    unconfirmed: bool,
+) -> None:
+    # The value is not known to be in the field, so a click queued behind it must not submit the form; an ordinary
+    # entry, and a later entry into another field, still run.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    later_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        return ToolResult("ok", "typed into #a", entry_unconfirmed=unconfirmed)
+
+    typer = ToolSpec(
+        name="type", description="type", parameters={"type": "object"}, handler=type_handler, billable=True
+    )
+    tools = [typer, _recording_tool("click", click_calls, billable=True), _recording_tool("select_option", later_calls)]
+    script = [
+        [
+            ("type", {"selector": "#a"}),
+            ("select_option", {"selector": "#b"}),
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "completed", "reason": "submitted"}),
+        ],
+        [("finish", {"status": "completed", "reason": "checked first"})],
+    ]
+    outcome, _ = await _run(script, [*tools, make_finish_tool()])
+
+    assert len(type_calls) == 1 and len(later_calls) == 1
+    assert len(click_calls) == (0 if unconfirmed else 1)
+    # A verdict queued behind the unconfirmed field was written before the model saw it.
+    assert outcome.reason == ("checked first" if unconfirmed else "submitted")
+    if unconfirmed:
+        [skip] = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        assert "could not confirm" in skip["content"]
 
 
 @pytest.mark.asyncio
@@ -4915,6 +5309,36 @@ async def test_action_loop_terminates_with_bounded_verdict_on_resubmit_signature
     assert caller.calls <= 15
 
 
+@pytest.mark.parametrize(
+    ("fingerprint_mode", "says_unchanged"),
+    [("never_moves", True), ("moves", False), ("not_sampled", False)],
+)
+@pytest.mark.asyncio
+async def test_action_loop_verdict_says_the_page_did_not_change_only_when_its_fingerprint_never_moved(
+    fingerprint_mode: str, says_unchanged: bool
+) -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    samples = {"n": 0}
+
+    async def fingerprint() -> str:
+        samples["n"] += 1
+        return f"dom-{samples['n']}" if fingerprint_mode == "moves" else "rejected"
+
+    outcome, _ = await _run(
+        _resubmit_script(12),
+        tools,
+        max_turns=200,
+        max_tool_calls=500,
+        page_fingerprint=None if fingerprint_mode == "not_sampled" else fingerprint,
+    )
+
+    assert outcome.guard == ACTION_LOOP_GUARD
+    assert outcome.reason.startswith("The run repeated the same action")
+    assert ("did not change" in outcome.reason) is says_unchanged
+    assert ("without making progress" in outcome.reason) is not says_unchanged
+
+
 @pytest.mark.asyncio
 async def test_action_loop_warns_once_naming_action_count_and_unchanged_state() -> None:
     # Compaction elides superseded observes, so the model cannot see its own repetition in the
@@ -6022,10 +6446,9 @@ async def test_dead_posting_real_trace_shape_gains_at_most_one_observe() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["failed", "terminated"])
-async def test_finish_without_recent_trigger_is_not_gated(status: str) -> None:
-    # A non-completed verdict with no recent submit-class or captcha activity (missing input data,
-    # dead page never interacted with) needs no page evidence: accepted immediately, page never sampled.
+async def test_finish_failed_without_recent_trigger_is_not_gated() -> None:
+    # A failure with no recent submit-class or captcha activity (missing input data, dead page
+    # never interacted with) needs no page evidence: accepted immediately, page never sampled.
     activity = ActivityRecency()
     fingerprint, fp_calls = _fingerprint_seq(["fp"])
     tools = [
@@ -6034,10 +6457,10 @@ async def test_finish_without_recent_trigger_is_not_gated(status: str) -> None:
     ]
     script = [
         [("observe", {})],
-        [("finish", {"status": status, "reason": "the posting does not exist"})],
+        [("finish", {"status": "failed", "reason": "the posting does not exist"})],
     ]
     outcome, _ = await _run(script, tools, activity=activity)
-    assert outcome.status == status
+    assert outcome.status == "failed"
     assert outcome.turns == 2
     assert fp_calls["n"] == 0
 
@@ -6182,9 +6605,9 @@ async def test_failure_settle_wait_is_bounded_on_a_never_quiet_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_finish_terminated_after_submit_click_defers_for_evidence_then_stands() -> None:
-    # A terminated verdict after a submit-shaped click uses the same one-turn evidence check as a
-    # failed verdict: a re-observe is required before the page-blocked reason can stand.
+async def test_finish_terminated_after_submit_click_stands_without_a_relook() -> None:
+    # terminate_criterion verdicts stay cheap: terminated never consults the page, even with
+    # submit activity in the window.
     activity = ActivityRecency()
     fingerprint, fp_calls = _fingerprint_seq(["fp"])
     clicks: list[tuple[str, dict[str, Any]]] = []
@@ -6201,75 +6624,9 @@ async def test_finish_terminated_after_submit_click_defers_for_evidence_then_sta
     ]
     outcome, _ = await _run(script, tools, activity=activity)
     assert outcome.status == "terminated"
-    assert outcome.reason == "submission still rejected after re-observe"
-    deferrals = [
-        m
-        for m in outcome.messages
-        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
-    ]
-    assert len(deferrals) == 1
-    assert fp_calls["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_held_terminated_verdict_can_complete_after_confirmation_is_observed() -> None:
-    activity = ActivityRecency()
-    fingerprint, fp_calls = _fingerprint_seq(["before-confirmation", "confirmation", "confirmation"])
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _billable_tool("click", clicks),
-        _perception_tool("observe", "url=x text: 'Submission confirmation received.'"),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
-    ]
-    script = [
-        [("click", {"selector": "#btn-submit"})],
-        [("finish", {"status": "terminated", "reason": "submission still processing"})],
-        [("observe", {})],
-        [("finish", {"status": "completed", "reason": "confirmation visible"})],
-    ]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, activity=activity)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "confirmation visible"
-    assert fp_calls["n"] == 3
-    held = next(log for log in logs if log["event"] == "taskv3 finish failure deferred for evidence")
-    assert held["status"] == "terminated"
-
-
-@pytest.mark.asyncio
-async def test_failure_evidence_budget_rearms_after_new_submit_activity() -> None:
-    # A previous held verdict must not spend the evidence check for a later submit attempt.
-    activity = ActivityRecency()
-    fingerprint, fp_calls = _fingerprint_seq(["fp"])
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _billable_tool("click", clicks),
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
-    ]
-    script = [
-        [("click", {"selector": "#first-submit"})],
-        [("finish", {"status": "failed", "reason": "first submission rejected"})],
-        [("observe", {})],
-        [("click", {"selector": "#retry-submit"})],
-        [("finish", {"status": "terminated", "reason": "retry still processing"})],
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "retry rejected after re-observe"})],
-    ]
-
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert outcome.status == "terminated"
-    assert outcome.reason == "retry rejected after re-observe"
-    deferrals = [
-        m
-        for m in outcome.messages
-        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
-    ]
-    assert len(deferrals) == 2
-    assert fp_calls["n"] == 2
+    assert outcome.reason == "submission rejected"
+    assert outcome.turns == 2
+    assert fp_calls["n"] == 0
 
 
 @pytest.mark.asyncio
@@ -8086,6 +8443,176 @@ async def test_completion_blocker_gates_completed_status_only() -> None:
     outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
     assert outcome2.status == "failed"
     assert outcome2.reason == "blocked reason"
+
+
+def _gate_refusals(outcome: LoopOutcome) -> int:
+    return sum(
+        1 for m in outcome.messages if m.get("role") == "tool" and COMPLETION_GATE_REFUSAL in m.get("content", "")
+    )
+
+
+async def _async_value(value: Any) -> Any:
+    return value
+
+
+class _CountingGate:
+    """A completion gate that answers `verdict` and counts the vetoes it handed out."""
+
+    def __init__(self, verdict: bool = False) -> None:
+        self.verdict = verdict
+        self.calls = 0
+
+    async def __call__(self) -> bool:
+        self.calls += 1
+        return self.verdict
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_veto_refuses_the_finish_and_a_later_approved_finish_completes() -> None:
+    verdicts = iter([False, True])
+
+    async def gate() -> bool:
+        return next(verdicts)
+
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
+    script = [
+        [("finish", {"status": "completed", "reason": "looks done"})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", True)
+    assert click_calls == [("click", {"selector": "#submit"})]
+    assert _gate_refusals(outcome) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised, status, reason",
+    [
+        (StepTerminationError("vetoed too often", step_id="stp_1"), "failed", "vetoed too often"),
+        (CompletionGateTerminationError("an earlier entry exists"), "terminated", "an earlier entry exists"),
+    ],
+    ids=["veto_budget_spent", "already_applied"],
+)
+async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
+    raised: Exception, status: str, reason: str
+) -> None:
+    async def gate() -> bool:
+        raise raised
+
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "done"})]], [make_finish_tool(completion_gate=gate)]
+    )
+
+    assert outcome.status == status
+    assert reason in outcome.reason
+    assert not outcome.gate_passed
+    assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [{"max_turns": 2}, {"max_action_steps": 1}], ids=["no_turns_left", "no_steps_left"])
+async def test_completion_gate_without_headroom_leaves_the_verdict_to_the_caller(budget: dict[str, int]) -> None:
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=_CountingGate(), activity=activity)]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, **budget)
+
+    assert (outcome.status, outcome.gate_passed) == ("completed", False)
+    assert _gate_refusals(outcome) == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_is_skipped_when_a_click_earlier_in_the_turn_spent_the_last_action_step() -> None:
+    gate = _CountingGate()
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
+    script = [[("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "submitted"})]]
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=1)
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", False)
+    assert gate.calls == 0
+
+
+async def _never_answers() -> bool:
+    await asyncio.Event().wait()
+    return True
+
+
+async def _errors() -> bool:
+    raise RuntimeError("gate bug")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [_errors, _never_answers], ids=["gate_errors", "gate_outlives_the_deadline"])
+async def test_a_gate_that_cannot_answer_lets_the_finish_through_for_the_caller_to_decide(
+    monkeypatch: pytest.MonkeyPatch, gate: Callable[[], Awaitable[bool]]
+) -> None:
+    # The headroom floor is a minute; drop it so a sub-second deadline still lets the gate run.
+    monkeypatch.setattr(
+        loop_module,
+        "_has_hold_headroom",
+        functools.partial(loop_module._has_hold_headroom, min_deadline_headroom_seconds=0.0),
+    )
+    finish = make_finish_tool(completion_gate=gate, deadline_at=time.monotonic() + 0.3)
+    started = time.monotonic()
+    async with asyncio.timeout(5):
+        outcome, caller = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "done", False)
+    assert caller.calls == 1
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "terminated"])
+async def test_completion_gate_never_holds_a_non_completed_finish(status: str) -> None:
+    gate = _CountingGate()
+    outcome, _ = await _run(
+        [[("finish", {"status": status, "reason": "the site offers no way on"})]],
+        [make_finish_tool(completion_gate=gate)],
+    )
+
+    assert (outcome.status, outcome.reason) == (status, "the site offers no way on")
+    assert gate.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_kwargs, held_with",
+    [
+        (
+            {"completion_blocker": lambda _downloads: _async_value("the download has not landed")},
+            "the download has not landed",
+        ),
+        (
+            {"page_fingerprint": lambda: _async_value(str(time.monotonic_ns())), "settle_wait_seconds": 0},
+            "still rendering",
+        ),
+    ],
+    ids=["completion_blocker", "unsettled_page"],
+)
+async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent(
+    finish_kwargs: dict[str, Any], held_with: str
+) -> None:
+    gate = _CountingGate()
+    outcome, _ = await _run(
+        [[("finish", {"status": "completed", "reason": "done"})]],
+        [make_finish_tool(completion_gate=gate, **finish_kwargs)],
+    )
+
+    first_finish_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert held_with in first_finish_result
+    assert gate.calls == 0
 
 
 @pytest.mark.asyncio
@@ -10904,7 +11431,7 @@ def test_tools_error_sites_without_a_class_only_go_down() -> None:
             and len(node.args) < 5
         ):
             unlabelled.append(node.lineno)
-    assert len(unlabelled) == 31, sorted(unlabelled)
+    assert len(unlabelled) == 29, sorted(unlabelled)
 
 
 @pytest.mark.parametrize(

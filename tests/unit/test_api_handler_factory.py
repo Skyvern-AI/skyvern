@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from asyncio import CancelledError
 from datetime import datetime
@@ -15,6 +16,7 @@ import openai
 import pytest  # type: ignore[import-not-found]
 import structlog
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from PIL import Image
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -710,11 +712,13 @@ def _stub_successful_llm_caller(
     monkeypatch: pytest.MonkeyPatch,
     *,
     parse_error: Exception | None = None,
+    llm_key: str = "TEST_LLM_CALLER_USAGE",
+    supports_vision: bool = False,
 ) -> tuple[LLMCaller, DummyLogger]:
     llm_config = LLMConfig(
         model_name="gpt-4",
         required_env_vars=[],
-        supports_vision=False,
+        supports_vision=supports_vision,
         add_assistant_prefix=False,
     )
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
@@ -730,7 +734,7 @@ def _stub_successful_llm_caller(
     response.usage.completion_tokens = 3
     response.usage.prompt_tokens_details.cached_tokens = 0
     response.usage.prompt_tokens_details.cache_write_tokens = 2
-    caller = LLMCaller("TEST_LLM_CALLER_USAGE")
+    caller = LLMCaller(llm_key)
     monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
     monkeypatch.setattr(
         caller,
@@ -2541,6 +2545,39 @@ async def test_llm_caller_logs_the_served_leg_and_where_the_tier_came_from(
     assert metrics["served_model_group"] == "openai-unittest-flex"
     assert metrics["service_tier_source"] == "inferred"
     assert metrics["service_tier"] == "flex"
+
+
+@pytest.mark.parametrize(("routed", "image_block_type"), [(True, "image_url"), (False, "image")])
+@pytest.mark.asyncio
+async def test_llm_caller_image_blocks_follow_the_dispatch_path_not_the_key_name(
+    monkeypatch: pytest.MonkeyPatch, routed: bool, image_block_type: str
+) -> None:
+    """A router key named *ANTHROPIC* reaches litellm, which rejects Anthropic-native image blocks; only
+    the raw Anthropic SDK branch takes them. Every Task V3 turn carries a screenshot."""
+    real_builder = api_handler_factory.llm_messages_builder_with_history
+    caller, _ = _stub_successful_llm_caller(
+        monkeypatch, llm_key="BEDROCK_ANTHROPIC_TEST_WITH_ANTHROPIC_FALLBACK", supports_vision=True
+    )
+    monkeypatch.setattr(api_handler_factory, "llm_messages_builder_with_history", real_builder)
+    if routed:
+        caller._router = MagicMock(name="litellm_router")  # type: ignore[assignment]
+    screenshot = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(screenshot, format="PNG")
+    caller.message_history = [{"role": "user", "content": [{"type": "text", "text": "goal"}]}]
+
+    await caller.call(
+        prompt=None, prompt_name="taskv3-agent-loop", screenshots=[screenshot.getvalue()], use_message_history=True
+    )
+
+    messages = caller._dispatch_llm_call.await_args.kwargs["messages"]  # type: ignore[attr-defined]
+    image_blocks = [
+        block
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if block.get("type") in ("image", "image_url")
+    ]
+    assert [block["type"] for block in image_blocks] == [image_block_type]
 
 
 @pytest.mark.asyncio

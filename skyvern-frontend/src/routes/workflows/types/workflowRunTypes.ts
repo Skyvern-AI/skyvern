@@ -308,3 +308,42 @@ export function hasEvaluations(
     Array.isArray((output as ConditionalBlockOutput).evaluations)
   );
 }
+
+export type GmailSendOutput = {
+  transport: "gmail";
+  outcome: "accepted" | "failed" | "unknown";
+  provider_message_id: string | null;
+  replayed: boolean;
+};
+
+export function readGmailSendOutput(output: unknown): GmailSendOutput | null {
+  if (typeof output !== "object" || output === null) {
+    return null;
+  }
+  const candidate = output as Partial<GmailSendOutput>;
+  if (
+    candidate.transport !== "gmail" ||
+    (candidate.outcome !== "accepted" &&
+      candidate.outcome !== "failed" &&
+      candidate.outcome !== "unknown")
+  ) {
+    return null;
+  }
+  return {
+    transport: "gmail",
+    outcome: candidate.outcome,
+    provider_message_id: candidate.provider_message_id ?? null,
+    replayed: candidate.replayed === true,
+  };
+}
+
+export const gmailOutcomeTitles: Record<GmailSendOutput["outcome"], string> = {
+  accepted: "Gmail accepted the message",
+  failed: "Not sent",
+  unknown: "Outcome unknown",
+};
+
+export function gmailSendOutcomeSummary(output: GmailSendOutput): string {
+  const title = gmailOutcomeTitles[output.outcome];
+  return output.replayed ? `${title} (not sent again)` : title;
+}

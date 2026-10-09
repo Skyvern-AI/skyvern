@@ -194,7 +194,7 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
 )
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
-from skyvern.forge.taskv3.loop import LoopOutcome, RoundAction
+from skyvern.forge.taskv3.loop import ACTION_BLOCK_TARGET_ACTION_RESERVE, LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
@@ -679,6 +679,10 @@ _LLM_STEP_EXCEPTIONS = frozenset(
         "LLMResponseMissingActionsError",
     }
 )
+
+# Typed step failures that are an expected outcome: step_exception carries them to the run record and the failure
+# summary, so agent_step logs them at warning instead of paging as an unexpected error.
+_EXPECTED_STEP_FAILURES = (FailedToReloadPage, LLMResponseMissingActionsError)
 
 
 def _llm_error_category(reasoning: str) -> list[dict]:
@@ -1685,8 +1689,8 @@ class ForgeAgent:
                 with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
                     f.write(file_data)
 
-            file_extension = Path(local_file_name).suffix
-            if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+            local_basename = Path(local_file_name).name
+            if Path(local_basename).suffix == BROWSER_DOWNLOADING_SUFFIX:
                 LOG.warning(
                     "Detecting incompleted download file, skip the rename",
                     file=local_file_name,
@@ -1695,6 +1699,8 @@ class ForgeAgent:
                 )
                 continue
 
+            applied_download = context.download_suffix_applied_files.get(local_basename) if context else None
+            file_extension = Path(applied_download[0] if applied_download else local_basename).suffix
             if not file_extension:
                 file_extension = recover_download_extension(
                     os.path.join(workflow_download_directory, local_file_name), download_suffix
@@ -1712,13 +1718,17 @@ class ForgeAgent:
                 # local_file_name is a bare basename for session (s3/gs) files but an absolute path for
                 # run-dir files; compare on basenames so a file already named by download_suffix is not
                 # treated as its own collision and bumped to ``<name>_1``.
-                local_basename = Path(local_file_name).name
                 existing_names = {
                     Path(f).name
                     for f in list_files_in_directory(workflow_download_directory)
                     if Path(f).name != local_basename
                 }
-                desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                desired_name = download_filename_from_suffix(
+                    download_suffix,
+                    file_extension,
+                    existing_names,
+                    original_filename=applied_download[0] if applied_download else local_basename,
+                )
                 # finalize_* keys avoid the forge_log processor, which overwrites bare task_id/
                 # workflow_run_id with the ambient context's values; under a stale/shared context those
                 # would otherwise mask the task actually being finalized (the divergence to diagnose).
@@ -2206,6 +2216,7 @@ class ForgeAgent:
             caller_known_published_urls,
             mask_signed_urls_in_text,
             sanitize_handoff_url,
+            string_leaves,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
@@ -2390,6 +2401,10 @@ class ForgeAgent:
                 workflow_run_id=task.workflow_run_id,
                 block_label=task_block.label if task_block is not None else None,
             )
+        )
+        payload_strings = string_leaves(coerce_v3_parameters(task.navigation_payload))
+        task_target_urls = caller_known_published_urls(
+            task.url, task.navigation_goal, *payload_strings, keep_query=True
         )
 
         def _label_secret_values() -> Collection[str]:
@@ -2627,6 +2642,7 @@ class ForgeAgent:
                     return step, task
                 step_cap = min(step_cap, remaining_workflow_steps)
                 workflow_step_ceiling = remaining_workflow_steps
+        workflow_pool_ceiling = workflow_step_ceiling
         if atomic_block_budget:
             # A block that owns a deliberately small budget (action/validation) keeps it: the
             # in-loop extension is refused by pinning the hard ceiling to the cap itself.
@@ -2948,6 +2964,12 @@ class ForgeAgent:
             )
             # A block that completes on a download is not done by its one action.
             single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
+            target_action_reserve = 0
+            if single_action_block:
+                # The pinned ceiling above refuses the extension; the reserve answers to the org's run-wide pool.
+                target_action_reserve = ACTION_BLOCK_TARGET_ACTION_RESERVE
+                if workflow_pool_ceiling is not None:
+                    target_action_reserve = max(0, min(target_action_reserve, workflow_pool_ceiling - step_cap))
             block_completion_judge: GoalJudge | None = None
             if single_action_block:
                 # The run's own model, on its non-flex twin as flex queueing outlasts the judge's timeout.
@@ -2978,6 +3000,16 @@ class ForgeAgent:
                         peek_page=_fingerprint_page,
                         prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
                     )
+
+            async def _completion_gate() -> bool:
+                return await app.AGENT_FUNCTION.gate_step_completion(
+                    task=task,
+                    step=step,
+                    task_block=task_block,
+                    page=await browser_state.get_working_page(),
+                    browser_state=browser_state,
+                )
+
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3040,6 +3072,7 @@ class ForgeAgent:
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,
+                completion_gate=_completion_gate,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
                 verification_blocker=verification_state.block_finish,
@@ -3051,10 +3084,13 @@ class ForgeAgent:
                     browser_state.last_navigation_status if task_block is None and not workflow_owned_recovery else None
                 ),
                 initial_navigation_url=initial_navigation_url,
+                initial_navigation_requested_url=task.url,
                 caller_known_urls=verdict_known_urls,
+                task_target_urls=task_target_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
                 single_action_block=single_action_block,
+                target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
             )
@@ -3078,13 +3114,12 @@ class ForgeAgent:
         )
         completion_rejection: str | None = None
         if outcome.status == "completed":
-            # Same deployment gate the step engine applies before accepting a completion verdict
-            # (e.g. a submit block that must show a deterministic confirmation). The loop has already
-            # returned, so a veto fails safe instead of falsely completing.
+            # The deployment gate for a completion the finish tool could not put to it (no headroom left to
+            # act on a refusal, a re-ask conversion, or a gate error). The loop has returned, so a veto fails.
             gate_page = None
             try:
                 gate_page = await browser_state.get_working_page()
-                if not await app.AGENT_FUNCTION.gate_step_completion(
+                if not outcome.gate_passed and not await app.AGENT_FUNCTION.gate_step_completion(
                     task=task,
                     step=step,
                     task_block=task_block,
@@ -3094,12 +3129,20 @@ class ForgeAgent:
                     completion_rejection = "the deployment completion gate rejected it"
             except CompletionGateTerminationError as termination:
                 outcome = replace(outcome, status="terminated", reason=termination.reason)
+            except StepTerminationError as exhausted:
+                if outcome.converted_from is not None:
+                    # A vetoed re-ask conversion restores the model's own verdict below, whatever the veto count.
+                    completion_rejection = exhausted.message or "the deployment completion gate rejected it"
+                else:
+                    outcome = replace(outcome, status="failed", reason=exhausted.message or "")
             except Exception:
                 LOG.warning(
                     "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
                 )
             if outcome.status == "terminated":
                 LOG.info("task_v3 completion terminated by completion gate", task_id=task.task_id)
+            elif outcome.status == "failed":
+                LOG.info("task_v3 completion failed by completion gate", task_id=task.task_id)
             elif completion_rejection is not None:
                 LOG.info("task_v3 completion vetoed by completion gate", task_id=task.task_id)
             # A page-bound goal cannot have been met on a tab with no document, and reporting it
@@ -3490,6 +3533,8 @@ class ForgeAgent:
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
+        if download_baseline_files is None:
+            context.download_suffix_applied_files = {}
         context.download_suffix = task_block.download_suffix if task_block else None
 
         # do not need to do complete verification when it's a CUA task
@@ -3652,6 +3697,7 @@ class ForgeAgent:
                 )
                 return step, detailed_output, None
 
+            dispatched_as_v3 = engine == RunEngine.skyvern_v3
             # A bare task always qualifies; a workflow block must be an allowed type.
             task_block_supports_v3 = task_block is None or _task_block_supports_v3(task_block)
             if engine == RunEngine.skyvern_v3 and task_block is not None and not task_block_supports_v3:
@@ -3677,7 +3723,7 @@ class ForgeAgent:
                         "DISABLE_TASK_V3 could not be evaluated; falling back to the step engine",
                         task_id=task.task_id,
                         workflow_run_id=task.workflow_run_id,
-                        # The persisted run type and arm still read v3; cohort reads exclude these by this line.
+                        # The arm still reads v3; cohort reads exclude these by this line.
                         route_reason="flag_error",
                         exc_info=True,
                     )
@@ -3724,6 +3770,28 @@ class ForgeAgent:
                     list_files_before=list_files_before,
                 )
                 return step, detailed_output, None
+
+            if dispatched_as_v3 and task.workflow_run_id:
+                # The block row was labeled v3 before dispatch, and script generation skips a run with a
+                # v3 row, so a fallback left labeled v3 would lose a script the run was asked to generate.
+                try:
+                    if not await app.DATABASE.observer.set_workflow_run_block_engine_by_task_id(
+                        task.task_id, RunEngine.skyvern_v1, organization_id=task.organization_id
+                    ):
+                        LOG.warning(
+                            "No block row matched the step-engine fallback relabel",
+                            task_id=task.task_id,
+                            workflow_run_id=task.workflow_run_id,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Could not record the step-engine fallback on the block row",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        exc_info=True,
+                    )
+                # Later steps recurse with this engine; pinning v1 keeps them off the gate and this write.
+                engine = RunEngine.skyvern_v1
 
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
@@ -4866,11 +4934,20 @@ class ForgeAgent:
             raise
 
         except Exception as e:
-            LOG.exception(
-                "Unexpected exception in agent_step, marking step as failed",
-                step_order=step.order,
-                step_retry=step.retry_index,
-            )
+            if isinstance(e, _EXPECTED_STEP_FAILURES):
+                LOG.warning(
+                    "Expected exception in agent_step, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    error_type=e.__class__.__name__,
+                    exc_info=True,
+                )
+            else:
+                LOG.exception(
+                    "Unexpected exception in agent_step, marking step as failed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                )
             detailed_agent_step_output.step_exception = e.__class__.__name__
             failed_step = await self.update_step(
                 step=step,

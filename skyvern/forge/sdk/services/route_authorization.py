@@ -121,6 +121,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.browser_sessions.get_workflow_runs_for_browser_session": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.get_workflow_version_recording": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.process_recording": "browser_session.execute",
+    "skyvern.forge.sdk.routes.browser_sessions.register_external_browser_session": "browser_session.create",
     "skyvern.forge.sdk.routes.browser_sessions.update_browser_session": "browser_session.update",
     "skyvern.forge.sdk.routes.credentials.cancel_credential_test": "credential.cancel",
     "skyvern.forge.sdk.routes.credentials.clear_org_auth_credential": "vault_provider.delete",

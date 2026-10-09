@@ -1093,7 +1093,7 @@ async def create_workflow(
         ) from exc
     except WorkflowDefinitionValidationException as e:
         raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+    except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         raise e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
@@ -4412,7 +4412,9 @@ async def get_tasks(
         order_by_column=sort,
         application=application,
     )
-    return ORJSONResponse([(await app.agent.build_task_response(task=task)).model_dump() for task in tasks])
+    # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
+    # in a thread keeps it from stalling every other request on the event loop.
+    return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
 
 
 _RUN_IDENTIFIER_SEARCH_DESCRIPTION = (

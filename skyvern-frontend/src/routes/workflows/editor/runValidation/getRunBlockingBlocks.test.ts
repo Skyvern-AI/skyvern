@@ -54,12 +54,7 @@ function conditionalNode(
 }
 
 describe("getRunBlockingBlocks", () => {
-  // The editor resolves keys against workflow parameter definitions; these are
-  // the keys that name a real credential in these fixtures.
-  const isCredentialKey = (key: string) =>
-    key === "cred_param" || key === "cred";
-  const run = (nodes: Array<AppNode>) =>
-    getRunBlockingBlocks(nodes, isCredentialKey);
+  const run = (nodes: Array<AppNode>) => getRunBlockingBlocks(nodes);
 
   it("returns id + label + empty location for a top-level login with no credential", () => {
     expect(run([loginNode("n1", "block_2", [])])).toEqual([
@@ -81,10 +76,14 @@ describe("getRunBlockingBlocks", () => {
     expect(run(nodes).map((block) => block.id)).toEqual(["n1", "n3"]);
   });
 
-  it("flags a login whose credential was removed but kept another parameter", () => {
-    expect(run([loginNode("n1", "block_2", ["some_output"])])).toEqual([
-      { id: "n1", label: "block_2", ancestorIds: [], path: [] },
-    ]);
+  it("does not block a login that binds a plain workflow parameter", () => {
+    expect(run([loginNode("n1", "block_2", ["username"])])).toEqual([]);
+  });
+
+  it("does not count a URL parameter as a non-URL binding", () => {
+    expect(
+      run([loginNode("n1", "block_2", ["login_url"], { url: "login_url" })]),
+    ).toEqual([{ id: "n1", label: "block_2", ancestorIds: [], path: [] }]);
   });
 
   it("never flags non-login blocks", () => {

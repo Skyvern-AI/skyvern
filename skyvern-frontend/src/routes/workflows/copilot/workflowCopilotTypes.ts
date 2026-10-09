@@ -535,6 +535,7 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   message: string;
   login_page_urls: string[];
   credential_refs: string[];
+  named_credential_id?: string | null;
   timeout_seconds: number;
   expires_at: string;
   // The tool call whose activity row was newest when the pause was raised, so

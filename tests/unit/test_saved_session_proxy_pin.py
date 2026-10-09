@@ -809,7 +809,11 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         "get_persistent_browser_session",
         AsyncMock(
             return_value=SimpleNamespace(
-                browser_profile_id=None, status="running", completed_at=None, close_requested_at=None
+                browser_profile_id=None,
+                browser_vendor=None,
+                status="running",
+                completed_at=None,
+                close_requested_at=None,
             )
         ),
     )

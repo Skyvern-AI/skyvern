@@ -713,6 +713,42 @@ class ObserverRepository(BaseRepository):
             ).first()
             return RunEngine(engine) if engine else None
 
+    @db_operation("set_workflow_run_block_engine_by_task_id")
+    async def set_workflow_run_block_engine_by_task_id(
+        self,
+        task_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.task_id == task_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(engine=engine.value)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("workflow_run_has_block_on_engine")
+    async def workflow_run_has_block_on_engine(
+        self,
+        workflow_run_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            found = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel.workflow_run_block_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(engine=engine.value)
+                    .limit(1)
+                )
+            ).first()
+            return found is not None
+
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(
         self,

@@ -42,17 +42,16 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CredentialOriginRecovery,
     OriginRunRedactionRegistry,
-    browser_page_custody_lock,
     browser_session_recovery,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
     register_secret_scrub_value,
+    register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
@@ -67,10 +66,7 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import (
-    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
     make_copilot_ctx,
-    remove_sensitive_disclosure_prerequisite,
-    taint_by_terminal_run,
     wire_credential_vault,
 )
 
@@ -101,9 +97,11 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         request_policy=_policy(),
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         browser_session_id="pbs_1",
+        credential_pause_used=False,
         browser_session_recovery_lock=asyncio.Lock(),
         browser_session_recovery_owner=None,
         browser_session_recovery_depth=0,
+        browser_session_locks_by_session_id={},
         last_run_blocks_workflow_run_id=None,
         scouted_interactions=[],
         scout_trajectory=[],
@@ -111,7 +109,6 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         carried_trajectory_rebound_done=False,
         observed_browser_urls=[],
         pending_scout_source_url=None,
-        pending_taint_sources={},
         pending_scout_download_snapshot=None,
         pending_scout_download=False,
         pending_scout_download_detachers=[],
@@ -1347,61 +1344,6 @@ class TestCredentialFillInCallSubmit:
         assert page.click_calls == []
 
 
-@pytest.mark.asyncio
-async def test_in_flight_sensitive_taint_suppresses_fill_result_screenshot_and_recorded_page_facts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    page = _FakePage()
-    _wire_impl(monkeypatch, page)
-    ctx = _ctx()
-    existing_interaction = {"tool_name": "click", "selector": "#existing"}
-    existing_trajectory = {**existing_interaction, "trajectory_index": 0}
-    existing_flow = {"step": 1, "evidence": {"source_tool": "existing"}}
-    ctx.scouted_interactions = [existing_interaction]
-    ctx.scout_trajectory = [existing_trajectory]
-    ctx.flow_evidence = [existing_flow]
-    ctx.scouted_output_covered_paths = {"output.existing"}
-    ctx.scout_observation_contract = {"existing": True}
-    ctx.pending_browser_interaction_observation = SimpleNamespace(tool_name="click", url="https://existing.test")
-    unrelated_commit: asyncio.Task[None] | None = None
-
-    async def append_unrelated_evidence() -> None:
-        async with browser_page_custody_lock(ctx):
-            ctx.scouted_interactions.append({"tool_name": "click", "selector": "#parallel"})
-            ctx.scout_trajectory.append({"tool_name": "click", "selector": "#parallel", "trajectory_index": 1})
-            ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "parallel"}})
-
-    async def taint_before_screenshot(*_args: Any, **_kwargs: Any) -> bool:
-        nonlocal unrelated_commit
-        unrelated_commit = asyncio.create_task(append_unrelated_evidence())
-        await asyncio.sleep(0)
-        assert not unrelated_commit.done()
-        ctx.sensitive_origin_browser_session_ids = {"pbs_1"}
-        return False
-
-    screenshot = AsyncMock(side_effect=taint_before_screenshot)
-    monkeypatch.setattr(credential_fill_module, "_capture_post_interaction_screenshot", screenshot)
-
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
-    assert unrelated_commit is not None
-    await unrelated_commit
-
-    assert result["ok"] is False
-    assert "specific named URL" in result["error"]
-    screenshot.assert_awaited_once()
-    assert ctx.scouted_interactions == [existing_interaction, {"tool_name": "click", "selector": "#parallel"}]
-    assert ctx.scout_trajectory == [
-        existing_trajectory,
-        {"tool_name": "click", "selector": "#parallel", "trajectory_index": 1},
-    ]
-    assert ctx.flow_evidence == [existing_flow, {"step": 2, "evidence": {"source_tool": "parallel"}}]
-    assert ctx.scouted_output_covered_paths == {"output.existing"}
-    assert ctx.scout_observation_contract == {"existing": True}
-    assert ctx.pending_browser_interaction_observation == SimpleNamespace(
-        tool_name="click", url="https://existing.test"
-    )
-
-
 class TestPublicToolCall:
     @pytest.mark.asyncio
     async def test_the_public_tool_forwards_the_submit_selector_and_serializes_the_result(
@@ -1814,6 +1756,7 @@ class TestCredentialFillLivePageAdmission:
 
         assert result["ok"] is False
         assert "request_credential" in result["error"]
+        assert "already named" not in result["error"]
         assert page.fill_calls == []
 
     async def _unbound_grant(
@@ -1878,6 +1821,9 @@ class TestCredentialFillLivePageAdmission:
         assert grant is None
         assert error is not None
         assert "request_credential" in error
+        assert "already named" in error
+        # Passing the id opens the add-2FA update card instead of the confirm ask.
+        assert "without `credential_id`" in error
 
     @pytest.mark.asyncio
     async def test_a_lookalike_domain_does_not_match_the_user_site(self) -> None:
@@ -2659,13 +2605,13 @@ def _terminal_credential_run_ctx(**overrides: Any) -> SimpleNamespace:
     clear_session_scrub_values(ctx.browser_session_id)
     ctx.last_run_blocks_workflow_run_id = "wr_credential"
     ctx.last_run_blocks_browser_session_id = ctx.browser_session_id
-    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id=ctx.browser_session_id)
     ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_credential",
         parameters={"password": _RUN_PASSWORD, "totp": _RUN_OTP},
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
     return ctx
 
 
@@ -2710,24 +2656,6 @@ async def test_the_authorized_fill_and_submit_run_on_the_page_a_terminal_credent
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
-async def test_the_fill_is_refused_on_the_same_page_when_a_prerequisite_is_absent(
-    monkeypatch: pytest.MonkeyPatch, arm: str
-) -> None:
-    page = _FakePage()
-    _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
-    ctx = _terminal_credential_run_ctx()
-    remove_sensitive_disclosure_prerequisite(ctx, arm)
-
-    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_123", "totp", "#verifyButton")
-
-    assert result["ok"] is False
-    assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
-    assert page.fill_calls == []
-    assert page.click_calls == []
-
-
-@pytest.mark.asyncio
 async def test_a_terminal_credential_run_does_not_authorize_a_credential_without_an_origin_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2738,7 +2666,6 @@ async def test_a_terminal_credential_run_does_not_authorize_a_credential_without
     result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_unbound", "totp", "#verifyButton")
 
     assert result["ok"] is False
-    assert result["error"] != SENSITIVE_ORIGIN_PAGE_ERROR
     assert page.fill_calls == []
 
 

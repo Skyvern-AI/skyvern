@@ -1863,6 +1863,31 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class ExternalBrowserUnavailable(SkyvernHTTPException):
+    def __init__(self, cause: str) -> None:
+        super().__init__(
+            f"The registered browser's CDP endpoint is unavailable: {cause}.",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+
+class ExternalBrowserEndpointNotEncrypted(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            "The registered browser's CDP endpoint, and any websocket it advertises, must use https:// or wss:// "
+            "outside local development.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class ExternalBrowserSessionNotRunnable(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} is a registered external browser, which cannot host a run yet.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 class MissingOrganizationForBrowserSession(SkyvernException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(f"Cannot acquire browser session {browser_session_id} without an organization identity.")

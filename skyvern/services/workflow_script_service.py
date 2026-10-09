@@ -18,7 +18,10 @@ from skyvern.core.script_generations.generate_script import (
     ScriptBlockSource,
     generate_workflow_script_python_code,
 )
-from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
+from skyvern.core.script_generations.transform_workflow_run import (
+    TaskV3RunNotScriptableError,
+    transform_workflow_run_to_code_gen_input,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
@@ -1053,6 +1056,13 @@ async def generate_workflow_script(
             use_semantic_selectors=adaptive,
             adaptive_caching=adaptive,
         )
+    except TaskV3RunNotScriptableError:
+        LOG.info(
+            "Skipping script generation: this run executed a block on Task V3",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+        )
+        return
     except Exception:
         generation_duration_ms = (time.monotonic() - generation_start) * 1000
         LOG.error(

@@ -305,7 +305,8 @@ class SkyvernBrowserPageAgent:
         Args:
             prompt: Instructions for navigating to and downloading the file.
             url: URL to navigate to for file download. If not provided, uses the current page URL.
-            download_suffix: Suffix or complete filename for the downloaded file.
+            download_suffix: Complete filename for the downloaded file. Supports
+                {{ original_filename }} to keep the name the site gave the file.
             download_timeout: Timeout in seconds for the download operation.
             max_steps_per_run: Maximum number of steps to execute.
             webhook_url: URL to receive webhook notifications about download progress.

@@ -1101,7 +1101,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
         workflow_complete = False
         append_omission_notice(
             notices,
-            "canonical_workflow_yaml shortened at 30000 characters; "
+            f"canonical_workflow_yaml shortened at {_BUILD_TEST_WORKFLOW_MAX_CHARS} characters; "
             "use the persisted workflow readback for full bytes.",
         )
 

@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 WORKFLOW_TASK_V3_AB_FLAG = "WORKFLOW_TASK_V3_AB"
+WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG = "WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS"
+WOULD_BE_CODE_PROPERTY = "would_be_code"
 DISABLE_TASK_V3_FLAG = "DISABLE_TASK_V3"
 
 # Trigger kinds whose run executes a workflow the platform minted for that one request rather than
@@ -45,11 +47,19 @@ class WorkflowBlockEngineRouteReason(StrEnum):
 
     flag_bucket_treatment = "flag_bucket_treatment"
     flag_bucket_control = "flag_bucket_control"
+    # The same buckets for a run that intended code mode: its control runs cached code or the agent the
+    # code path falls back to, so it is a different comparison from the v3-vs-v1 cells above.
+    code_bucket_treatment = "code_bucket_treatment"
+    code_bucket_control = "code_bucket_control"
     new_self_serve_workflow_default = "new_self_serve_workflow_default"
     # A workflow born at or after TASK_V3_CHOSEN_ENGINE_CUTOFF, never randomized: at least one block
     # left its engine unset and runs on v3 (``new_workflow_v3_default``), or every block's engine was
     # chosen and is honored as written (``chosen_engine``).
     new_workflow_v3_default = "new_workflow_v3_default"
+    # The same workflows when WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS lists the run's org or workflow: its Default blocks
+    # are randomized per run, v3 in treatment and v1 in control.
+    new_workflow_ab_treatment = "new_workflow_ab_treatment"
+    new_workflow_ab_control = "new_workflow_ab_control"
     chosen_engine = "chosen_engine"
     # Before that cutoff, a block a person pinned to skyvern-1.0 keeps the run out of the A/B; labelled
     # apart from ``ineligible`` so reads can count and drop these runs by this value alone.
@@ -90,6 +100,9 @@ class WorkflowBlockEngineArmDecision:
     billing_tier: BillingTier | None = None
     # An explicit skyvern_v1 on a block is a pin, not a routable default (see Block.resolve_engine).
     honors_chosen_engine: bool = False
+    # The run intended code mode when the arm was resolved; control keeps that path. None when no arm was
+    # resolved, so a run whose attribution was lost never reads as an agent-mode run.
+    would_be_code: bool | None = None
 
 
 NO_ARM_DECISION = WorkflowBlockEngineArmDecision()
@@ -202,6 +215,7 @@ async def _ab_flag_puts_run_in_treatment(
     organization_id: str | None,
     workflow_permanent_id: str | None,
     billing_tier: BillingTier,
+    would_be_code: bool,
 ) -> bool | None:
     """Whether the percentage knob buckets this run into treatment, or ``None`` if it never answered.
 
@@ -221,8 +235,40 @@ async def _ab_flag_puts_run_in_treatment(
             "organization_id": organization_id,
             "workflow_permanent_id": workflow_permanent_id or "not_workflow",
             BILLING_TIER_PROPERTY: billing_tier.value,
+            # Sent for reads only. A condition on it would be inconclusive, so None (control), for any
+            # evaluation that omits it: posthog's local match raises on a property it was not given.
+            WOULD_BE_CODE_PROPERTY: "true" if would_be_code else "false",
         },
     )
+
+
+async def _new_workflow_ab_variant(
+    provider: BaseExperimentationProvider,
+    *,
+    workflow_run_id: str,
+    organization_id: str | None,
+    workflow_permanent_id: str | None,
+) -> str | None:
+    """The run's WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS variant, or None for a missing flag, an unlisted run or a raised
+    read. Only "v1" and "v3" move the run; the caller keeps v3 for anything else.
+    """
+    try:
+        variant = await provider.get_value_cached(
+            WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG,
+            workflow_run_id,
+            properties={
+                "organization_id": organization_id,
+                "workflow_permanent_id": workflow_permanent_id or "not_workflow",
+            },
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS; keeping v3",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    return variant
 
 
 async def resolve_workflow_block_engine_arm(
@@ -236,6 +282,7 @@ async def resolve_workflow_block_engine_arm(
     ineligibility_reason: V3AbIneligibleReason | None,
     takes_default_engine: bool | None,
     pinned_v1_blocks: int = 0,
+    would_be_code: bool = False,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -257,6 +304,8 @@ async def resolve_workflow_block_engine_arm(
     engine unset, or is None when the run has no engine to choose. The rule does not require A/B
     eligibility, since a pinned block no longer keeps the run's unset blocks on v1, and so covers a
     script run's uncached blocks and AI fallback.
+    ``WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS`` can randomize those unset blocks per run for a listed org or
+    workflow: variant ``v1`` leaves the override unset, ``v3`` sets it, and anything else keeps v3.
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
@@ -266,6 +315,12 @@ async def resolve_workflow_block_engine_arm(
 
     ``pinned_v1_blocks`` counts blocks a person pinned to skyvern-1.0 (see ``pinned_v1_block_count``);
     eligibility already keeps such a run out of the A/B, and this labels it ``pinned_v1_engine``.
+
+    ``would_be_code`` says the run intended code mode (a cached script, the no-script-yet code_generation
+    mode, or a code-rollout upgrade), whether or not a script ends up executing. An explicit ``code_gen``
+    request is not bucketed: it is ineligible. Only the percentage knob may move
+    such a run: a treatment bucket runs it as a v3 agent without its script (``code_mode_displaced``),
+    while every other route leaves it on the code path it had.
     """
     if context.workflow_block_engine_resolved_run_id == workflow_run_id:
         return
@@ -318,8 +373,22 @@ async def resolve_workflow_block_engine_arm(
                 elif chosen_engine_candidate and await born_at_or_after(settings.TASK_V3_CHOSEN_ENGINE_CUTOFF):
                     honors_chosen_engine = True
                     if takes_default_engine:
-                        override = RunEngine.skyvern_v3
-                        route_reason = WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                        variant = await _new_workflow_ab_variant(
+                            provider,
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                        )
+                        if variant == "v1":
+                            # Control leaves the override unset, so Default blocks run v1 and pins keep their engine.
+                            route_reason = WorkflowBlockEngineRouteReason.new_workflow_ab_control
+                        else:
+                            override = RunEngine.skyvern_v3
+                            route_reason = (
+                                WorkflowBlockEngineRouteReason.new_workflow_ab_treatment
+                                if variant == "v3"
+                                else WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                            )
                     else:
                         route_reason = WorkflowBlockEngineRouteReason.chosen_engine
                 elif run_is_eligible:
@@ -331,7 +400,8 @@ async def resolve_workflow_block_engine_arm(
                     # The tier, the status and the trigger are checked first, so anything that
                     # cannot use the rule pays for no workflow read.
                     takes_new_workflow_default = (
-                        billing_tier == BillingTier.SELF_SERVE
+                        not would_be_code
+                        and billing_tier == BillingTier.SELF_SERVE
                         and _is_kept_workflow_run(workflow_status, trigger_type)
                         and await born_at_or_after(settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF)
                     )
@@ -347,17 +417,26 @@ async def resolve_workflow_block_engine_arm(
                             organization_id=organization_id,
                             workflow_permanent_id=workflow_permanent_id,
                             billing_tier=billing_tier,
+                            would_be_code=would_be_code,
                         )
                         if in_treatment:
                             override = RunEngine.skyvern_v3
-                            route_reason = WorkflowBlockEngineRouteReason.flag_bucket_treatment
+                            route_reason = (
+                                WorkflowBlockEngineRouteReason.code_bucket_treatment
+                                if would_be_code
+                                else WorkflowBlockEngineRouteReason.flag_bucket_treatment
+                            )
                         elif in_treatment is None:
                             # The flag never answered, so this run is on control without having been
                             # randomized. Labelled apart from the bucket so the control cell every
                             # per-arm read builds out of flag_bucket_control stays a randomized one.
                             route_reason = WorkflowBlockEngineRouteReason.flag_undefined
                         else:
-                            route_reason = WorkflowBlockEngineRouteReason.flag_bucket_control
+                            route_reason = (
+                                WorkflowBlockEngineRouteReason.code_bucket_control
+                                if would_be_code
+                                else WorkflowBlockEngineRouteReason.flag_bucket_control
+                            )
         except Exception:
             LOG.warning(
                 "Failed to resolve the workflow-block engine arm; using control",
@@ -371,6 +450,7 @@ async def resolve_workflow_block_engine_arm(
             route_reason=route_reason,
             billing_tier=billing_tier,
             honors_chosen_engine=honors_chosen_engine,
+            would_be_code=would_be_code,
         )
         context.workflow_block_engine_override = override
         context.workflow_block_engine_arm_decision = decision
@@ -390,7 +470,20 @@ async def resolve_workflow_block_engine_arm(
             # doubles as "nobody looked".
             billing_tier=engine_arm_log_value(billing_tier),
             pinned_v1_blocks=pinned_v1_blocks,
+            would_be_code=would_be_code,
         )
+
+
+def code_mode_displaced(workflow_run_id: str | None) -> bool:
+    """Whether the A/B bucketed this run, headed for a cached script, into treatment: it then runs every
+    block as a v3 agent instead of the script."""
+    if not workflow_run_id:
+        return False
+    context = skyvern_context.current()
+    if context is None or context.workflow_block_engine_resolved_run_id != workflow_run_id:
+        return False
+    decision = context.workflow_block_engine_arm_decision
+    return bool(decision and decision.route_reason == WorkflowBlockEngineRouteReason.code_bucket_treatment)
 
 
 def workflow_block_engine_override(workflow_run_id: str | None) -> RunEngine | None:

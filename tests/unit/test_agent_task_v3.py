@@ -23,7 +23,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage
+from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage, StepTerminationError
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -72,7 +72,9 @@ from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
+    COMPLETION_GATE_REFUSAL,
     NAV_DEAD_END_GUARD,
     TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
@@ -1929,6 +1931,7 @@ async def _run_execute_step_gate(
     workflow_run: Any = None,
     workflow_owned_recovery: bool = False,
     recovery_code_progress: CodeProgressRecord | None = None,
+    observer: Any = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -1966,6 +1969,10 @@ async def _run_execute_step_gate(
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock()
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=workflow_run)
+            if observer is not None:
+                mock_app.DATABASE.observer = observer
+            else:
+                mock_app.DATABASE.observer.set_workflow_run_block_engine_by_task_id = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -2123,7 +2130,7 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     # The engine handed down is the one every later step of this task recurses with, so a v3 pin
     # here would re-read the flag next step and could restart the task on v3 mid-way.
     assert step_engine_mock.await_args.kwargs["engine"] == agent_module.RunEngine.skyvern_v1
-    # The run's persisted type and arm still read v3, so this line is what cohort reads exclude it by.
+    # The run's arm still reads v3, so this line is what cohort reads exclude it by.
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
@@ -2901,6 +2908,37 @@ async def test_execute_task_v3_atomic_block_ceiling_pinned_to_its_own_cap(monkey
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == 5
     assert loop_mock.await_args.kwargs["max_action_steps_ceiling"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pool", "reserve"),
+    [
+        (None, ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        ((40, 50), ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        ((49, 50), 1),
+        ((50, 50), 0),
+    ],
+    ids=["no_pool", "pool_funds_it", "pool_cuts_it", "pool_spent"],
+)
+async def test_execute_task_v3_action_block_target_reserve_answers_to_the_run_pool_not_the_pinned_ceiling(
+    monkeypatch: pytest.MonkeyPatch, pool: tuple[int, int] | None, reserve: int
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=pool))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ActionBlock, navigation_goal="Click Next"),
+        workflow_run_id="wr_action_reserve",
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    kwargs = loop_mock.await_args.kwargs
+    assert kwargs["max_action_steps"] == 1
+    assert kwargs["max_action_steps_ceiling"] == 1
+    assert kwargs["target_action_reserve"] == reserve
 
 
 class _AdvancingFormPage(_FakePage):
@@ -3906,9 +3944,14 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
             TaskStatus.terminated,
             "the site holds an earlier entry",
         ),
+        (
+            StepTerminationError("vetoed too often", step_id="step-v3"),
+            TaskStatus.failed,
+            "Termination error. Reason: Step step-v3 cannot be executed and task is failed. Reason: vetoed too often",
+        ),
         (RuntimeError("gate bug"), TaskStatus.completed, None),
     ],
-    ids=["termination", "generic_error_accepts"],
+    ids=["termination", "veto_budget_spent_fails", "generic_error_accepts"],
 )
 async def test_execute_task_v3_completion_gate_raise(
     monkeypatch: pytest.MonkeyPatch, gate_error: Exception, status: TaskStatus, failure_reason: str | None
@@ -3925,6 +3968,65 @@ async def test_execute_task_v3_completion_gate_raise(
     loop_mock.completion_gate.assert_awaited_once()
     assert task.status == status
     assert task.failure_reason == failure_reason
+
+
+@pytest.mark.asyncio
+async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(
+            status="completed",
+            reason="the judge found the goal met",
+            billable_actions=["click"],
+            converted_from="terminated",
+            converted_from_reason="the site offers no way to continue",
+        ),
+        task_block=_make_block(NavigationBlock, navigation_goal="Submit the application"),
+        completion_gate_raises=StepTerminationError("vetoed too often", step_id="step-v3"),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.terminated
+    assert task.failure_reason == "the site offers no way to continue"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gate_veto_is_refused_in_loop_and_the_approved_retry_skips_the_post_loop_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = _make_block(NavigationBlock, navigation_goal="Submit the application")
+    page = _AdvancingFormPage()
+    caller = _ScriptedCaller(
+        [
+            [("finish", {"status": "completed", "reason": "looks done"})],
+            [("observe", {})],
+            [("finish", {"status": "completed", "reason": "confirmed"})],
+        ]
+    )
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        return await run_task_v3_agent_loop(
+            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
+        )
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+        task_block=block,
+        loop_body=_real_loop,
+        working_page=page,
+        # A post-loop consult would draw the trailing veto and fail the task.
+        completion_gate_raises=[False, True, False],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+    assert loop_mock.completion_gate.await_args.kwargs["task_block"] is block
+    assert sum(COMPLETION_GATE_REFUSAL in str(m.get("content")) for m in caller.message_history) == 1
 
 
 @pytest.mark.asyncio
@@ -6191,6 +6293,10 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
             "https://portal.example.test/start",
             "Open {{ mail_output }}, then check https://portal.example.test/faq.",
         ),
+        navigation_payload={
+            "posting": {"note": "Apply at https://jobs.example.test/acme/42/apply\nthanks"},
+            "links": ["see\thttps://jobs.example.test/b/7\tnow", 'Open "https://jobs.example.test/c/9" now'],
+        },
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -6201,7 +6307,64 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
     assert kwargs["caller_known_urls"] == frozenset(
         {"https://portal.example.test/start", "https://portal.example.test/faq"}
     )
+    # The log-only provenance set counts the RENDERED fields and every payload string, each read as
+    # itself so a newline, tab or quote next to a URL is not glued onto it.
+    assert kwargs["task_target_urls"] >= {
+        "https://mail.example.test/reset/9f2c8a1b4d6e",
+        "https://jobs.example.test/acme/42/apply",
+        "https://jobs.example.test/b/7",
+        "https://jobs.example.test/c/9",
+    }
     assert off_the_page in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.asyncio
+async def test_execute_task_v3_logs_a_dead_task_url_with_a_query_as_task_supplied(
+    monkeypatch: pytest.MonkeyPatch, initial: bool
+) -> None:
+    # agent.py's task-target set and requested start URL, through the real engine and navigate tool: a
+    # task URL whose query names the page is the task's own target, whether the in-loop navigate or the
+    # setup navigation (redirected first) is the one that 404s.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    task_url = "https://jobs.example.test/portal.action?page=apply&id=42"
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.url = url
+        return SimpleNamespace(status=404, url=url)
+
+    page.goto = _goto  # type: ignore[method-assign]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        return await run_task_v3_agent_loop(
+            **{
+                **kwargs,
+                "page_provider": _fixed_page_provider(page),
+                "llm_caller": _ScriptedCaller(script),
+                "step": None,
+            }
+        )
+
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+            url=task_url,
+            navigation_goal="Apply.",
+            navigation_status=404 if initial else None,
+            landed_url="https://jobs.example.test/expired" if initial else None,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            loop_body=_real_loop,
+            working_page=page,
+        )
+
+    event = "taskv3 loop initial navigation dead end" if initial else "taskv3 loop navigation dead end"
+    assert [entry["provenance"] for entry in logs if entry["event"] == event] == ["task_supplied"]
 
 
 @pytest.mark.asyncio

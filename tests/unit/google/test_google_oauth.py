@@ -74,6 +74,11 @@ def test_google_oauth_scope_profiles_are_exact() -> None:
     assert google_oauth_service.GOOGLE_DRIVE_SCOPES == ("https://www.googleapis.com/auth/drive",)
 
 
+def test_gmail_send_scope_profile_is_separate_from_the_existing_profiles() -> None:
+    for profile in ("google_sheets", "gmail", "google_drive"):
+        assert google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE not in google_oauth_service.scopes_for_profile(profile)
+
+
 def test_sheets_credentials_granted_drive_file_still_satisfy_the_sheets_profile() -> None:
     """Credentials consented before drive.file left the profile must keep working without reconsent."""
     granted_with_drive_file = [
@@ -3963,6 +3968,7 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
         initiator_id="user_1",
         refresh_token="refresh-token",
         scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
+        identity=None,
     )
 
 

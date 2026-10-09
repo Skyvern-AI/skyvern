@@ -9,17 +9,16 @@ from playwright.async_api import Page
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserSessionUnavailable,
     _browser_session_acquisition_failure_result,
     replace_browser_session,
-    sensitive_origin_page_has_active_run,
 )
 from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, ChallengeStatus, solve_challenge
 
 from ._shared import browser_is_lost, on_working_page
+from .banned_blocks import CAPTCHA_IMAGE_ELEMENTS
 
 LOG = structlog.get_logger()
 
@@ -50,8 +49,8 @@ _IMAGE_OUTCOME_TEXT = {
         "submit, then look at the page again. If the page rejects it, load a new image before reading again."
     ),
     "unsolved": (
-        "Nothing was typed: the image yielded no text, the image selector does not name one <img>, <svg> or "
-        "<canvas> (or a container holding exactly one), or the input selector matched no fillable field."
+        f"Nothing was typed: the image yielded no text, the image selector does not name one {CAPTCHA_IMAGE_ELEMENTS} "
+        "(or a container holding exactly one), or the input selector matched no fillable field."
     ),
     "unavailable": "Image OCR is not enabled for this organization, so the image was not read.",
     "read_limit_reached": (
@@ -144,8 +143,6 @@ async def _read_image(ctx: AgentContext, page: Page, session_id: str, image: str
 
 
 async def start_fresh_browser(ctx: AgentContext) -> dict[str, Any]:
-    if sensitive_origin_page_has_active_run(ctx):
-        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     replacement = await replace_browser_session(ctx)
     if isinstance(replacement, BuildTestConnectFailure):
         failure = _browser_session_acquisition_failure_result(replacement)

@@ -16,7 +16,6 @@ import asyncio
 import calendar
 import contextlib
 import dataclasses
-import decimal
 import functools
 import io
 import json
@@ -27,13 +26,11 @@ import re
 import secrets
 import sys
 import time
-import unicodedata
 import weakref
 from collections import Counter, defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
-from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import urlparse
@@ -43,11 +40,6 @@ from PIL import Image, ImageDraw
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
-from skyvern.core.script_generations.fuzzy_matcher import (
-    match_option_exact_or_stem,
-    match_option_exact_or_stem_with_tier,
-    normalize_option_label,
-)
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
@@ -62,8 +54,34 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     release_target_url,
 )
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3.field_commit import (
+    _ZERO_WIDTH_RE,
+    OFFER_WHY,
+    CommitStatus,
+    EntryMatch,
+    Pick,
+    Refusal,
+    Tier,
+    _canon_label,
+    _classify_commit,
+    _exact_tier_key,
+    _lone_duplicate_candidate,
+    _row_identity,
+    _same_cell_value,
+    _typed_text_landed,
+    _without_nested_copies,
+    compare_text,
+    contender_texts,
+    entry_outcome,
+    match_choice,
+    nearest,
+    tier_of,
+    unconfirmed_ok,
+    with_tier_note,
+)
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
+    CLICK_DISPATCHED_DATA_KEY,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     PAGE_UNAVAILABLE_ERROR,
@@ -79,7 +97,10 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     current_tool_call_seq,
     mark_is_filler,
+    record_click_dispatched,
     record_covered_layer,
+    record_entry_enter_withheld,
+    record_entry_variant,
     record_hit_class,
     record_resolve_seconds,
     record_text_delta,
@@ -93,6 +114,7 @@ from skyvern.forge.taskv3.run_arms import (
 )
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS
@@ -516,21 +538,6 @@ def _with_selector_guard(handler: ToolHandler, diagnose_inert: InertTargetDiagno
     return wrapped
 
 
-# The observable-state vocabulary a readback compares — the same fields observe reports per element.
-# None means "not read"; the classifier treats absence as no-committable-state, never as a value.
-_COMMIT_STATE_KEYS = ("value", "checked", "selected", "pressed")
-
-
-class CommitStatus(str, Enum):
-    OK = "ok"  # state moved in the committing direction, read off exactly one element
-    DID_NOT_COMMIT = "did_not_commit"  # target readable, and it did NOT commit
-    UNVERIFIED = "unverified"  # no readable committable state, or committed but re-resolved to n != 1
-
-
-def _has_committable_state(state: dict[str, Any] | None) -> bool:
-    return isinstance(state, dict) and any(state.get(k) is not None for k in _COMMIT_STATE_KEYS)
-
-
 def _option_str_list(raw: Any) -> list[str] | None:
     """The string options of a declared array, or None when the caller declared no usable array.
 
@@ -550,6 +557,15 @@ SELECTION_REPORT_MAX_OPTIONS = 20
 SELECTION_REPORT_OPTION_WIDTH = 80
 
 
+def _selected_answers(readback: dict[str, Any], asked: str, by_label: bool) -> bool:
+    """Whether a selected option is the one asked for, matched the way the driver selected it: a label
+    whitespace-collapsed, and a `value=` request against an option's value OR its label (Playwright's valueOrLabel)."""
+    asked_label = " ".join(asked.split())
+    values = [v for v in (readback.get("selectedValues") or []) if isinstance(v, str)]
+    labels = [" ".join(lb.split()) for lb in (readback.get("selectedLabels") or []) if isinstance(lb, str)]
+    return asked_label in labels or (not by_label and asked in values)
+
+
 def _selection_report(options: list[str]) -> str:
     shown = [
         m[:SELECTION_REPORT_OPTION_WIDTH] + "…" if len(m) > SELECTION_REPORT_OPTION_WIDTH else m
@@ -558,30 +574,6 @@ def _selection_report(options: list[str]) -> str:
     if len(shown) < len(options):
         return f"{shown!r} (showing {len(shown)} of {len(options)})"
     return repr(shown)
-
-
-def _classify_commit(
-    pre: dict[str, Any] | None, post_matches: int, post: dict[str, Any] | None, *, committed_value: bool | None = None
-) -> CommitStatus:
-    """Classify a value-must-change action from a before/after observable-state readback.
-
-    Ranked fail-closed: a readable did-not-commit is reported whatever the target re-resolved to, because
-    an error halts the rest of a batched turn only when it moved the page -- otherwise the field is
-    reported unfilled and only its same-selector dependents and any later click or Enter are skipped
-    (INV-1 guards the confident ok, not the refusal). A commit read off
-    a target that re-resolved to n != 1 is `unverified` (INV-1); no readable committable state is
-    `unverified` (INV-2). `committed_value` hands in a caller's own value-dimension truth in place of the
-    generic any-field-changed rule.
-    """
-    if post is None or not _has_committable_state(post):
-        return CommitStatus.UNVERIFIED
-    if committed_value is None:
-        if pre is None or not _has_committable_state(pre):
-            return CommitStatus.UNVERIFIED
-        committed_value = any(pre.get(k) != post.get(k) for k in _COMMIT_STATE_KEYS)
-    if not committed_value:
-        return CommitStatus.DID_NOT_COMMIT
-    return CommitStatus.OK if post_matches == 1 else CommitStatus.UNVERIFIED
 
 
 _SURFACE_PUNCT_RE = re.compile(r"[()\[\]{},;\"'\u2018\u2019]")
@@ -618,16 +610,6 @@ def _short_surface_verdict(
     return CommitStatus.OK if len(hits) == 1 and pre is not None else CommitStatus.UNVERIFIED
 
 
-_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
-
-
-def _canon_label(text: str) -> str:
-    """One canonical form for option text: two labels that render alike compare equal (NFKC, zero-width
-    characters dropped, NBSP and runs of whitespace collapsed, casefolded)."""
-    folded = unicodedata.normalize("NFKC", _ZERO_WIDTH_RE.sub("", str(text or "")))
-    return " ".join(folded.replace("\u00a0", " ").split()).casefold()
-
-
 class _TypeaheadPick(NamedTuple):
     """What one type-and-pick attempt at a typeahead established.
 
@@ -655,6 +637,9 @@ class _TypeaheadPick(NamedTuple):
     shared_surface: str | None = None
     # The call's final result when pressing Enter to search settled it before any row was picked.
     verdict: ToolResult | None = None
+    # How the picked row names the value, and why no row was picked.
+    tier: Tier | None = None
+    refusal: Refusal | None = None
 
 
 # The smallest query many closed-vocabulary pickers need before they render candidates. Read by the
@@ -680,37 +665,6 @@ def _label_names_value(label: str, value: str) -> bool:
     return bool(inner) and "(" not in inner and ")" not in inner
 
 
-def _match_option_exact(value: str, options: list[dict[str, Any]]) -> int | None:
-    """Pick the row whose WHOLE label IS `value` after canonical cleanup (case/whitespace/apostrophes/
-    Unicode forms/zero-width). No stem, prefix, or other inferred tier is ever accepted here — anything
-    short of that exact match returns None so the caller hands the rows back instead of guessing.
-    """
-    rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
-    if not value or not rows:
-        return None
-    idx, tier = match_option_exact_or_stem_with_tier(_canon_label(value), [_canon_label(label) for _, label in rows])
-    return rows[idx][0] if idx is not None and tier == "exact" else None
-
-
-def _without_nested_copies(value: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop an exact-match row that holds another exact-match row: a wrapper and the element carrying its
-    label are one candidate, and the innermost stands for it. `inside` is a row's nearest tagged ancestor;
-    siblings never share a chain, so identical siblings stay separate and are refused."""
-    want = _exact_tier_key(value)
-    exact = {o.get("n") for o in rows if _exact_tier_key(str(o.get("text") or "")) == want}
-    by_n = {o.get("n"): o for o in rows}
-    wrappers: set[Any] = set()
-    for n in exact:
-        seen: set[Any] = set()
-        up = (by_n.get(n) or {}).get("inside")
-        while up is not None and up not in seen:
-            if up in exact:
-                wrappers.add(up)
-            seen.add(up)
-            up = (by_n.get(up) or {}).get("inside")
-    return [o for o in rows if o.get("n") not in wrappers]
-
-
 def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     """The labels of rows whose `inside` chain reaches row `n`."""
     by_n = {o.get("n"): o for o in rows}
@@ -727,17 +681,10 @@ def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     return nested
 
 
-def _exact_tier_key(text: str) -> str:
-    """The exact tier's own equality key — `_canon_label` plus the shared matcher's case/apostrophe fold —
-    for pre-filters asking "which rows did that tier see as this value". A plain `_canon_label` filter
-    folds less than the tier does and would disagree with it, so pre-filters must use this key instead.
-    """
-    return normalize_option_label(_canon_label(text))
-
-
-def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str) -> None:
+def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None) -> None:
     # Whether the clicked row IS the requested value, or the value plus one parenthesized decoration, so an
-    # inexact pick can be counted apart from an exact one. No form values and no selector.
+    # inexact pick can be counted apart from an exact one; `tier` is the matcher's decision, None where no tier
+    # decided the row. No form values and no selector.
     LOG.info(
         "taskv3 combobox pick verdict",
         tool_call_seq=current_tool_call_seq(),
@@ -745,74 +692,8 @@ def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str) 
         verdict=verdict.value,
         committed_matches_row=_exact_tier_key(row) == _exact_tier_key(value),
         row_names_value=_label_names_value(row, value),
+        tier=tier.value if tier is not None else None,
     )
-
-
-def _row_identity(o: dict[str, Any]) -> str:
-    """The row's identity as `_MENU_OPTION_TEXTS_JS`'s `rowIdentity` derived it. A row with no `identity` key
-    is a note entry, whose `text` is already that identity; an empty one (a row nothing could read) is absent."""
-    identity = o.get("identity")
-    return identity if isinstance(identity, str) and identity else str(o.get("text") or "")
-
-
-def _lone_duplicate_candidate(rows: list[dict[str, Any]]) -> int | None:
-    """Whether ≥2 matched rows are the SAME candidate rendered more than once: canonical row IDENTITY
-    agreement across every row is the load-bearing check, and a present aria-label, `val`, or other declared
-    value is a VETO on top of it — one disagreeing across otherwise-identical rows marks them distinct, an
-    absent one never does. Returns the FIRST row's `n` when the whole set collapses to one candidate, else
-    None so the caller keeps refusing.
-    """
-    if len(rows) < 2:
-        return None
-    if len({_canon_label(_row_identity(o)) for o in rows}) != 1:
-        return None
-    # The tagged leaf and its option ancestor are independent name surfaces: a shared leaf label
-    # ("Choose") must not mask ancestors that disagree, so each position vetoes on its own.
-    for surface in range(2):
-        names = {
-            _canon_label(str((o.get("labels") or [None, None])[surface]))
-            for o in rows
-            if (o.get("labels") or [None, None])[surface]
-        }
-        if len(names) >= 2:
-            return None
-    present_labels = {_canon_label(str(o.get("label"))) for o in rows if o.get("label")}
-    if len(present_labels) >= 2:
-        return None
-    # Vals are machine identifiers, not display text: compared byte-exact, never case/Unicode-folded,
-    # so "ID-A" and "id-a" stay two candidates. `vals` is the collapse's OWN read of the other value
-    # surfaces (data-code, data-key, name, title, ...) — unfiltered by the commit verifier's numeric/
-    # length drops, so "101" vs "202" is a real disagreement here. Non-empty sets must agree byte-exact;
-    # an empty set says nothing and cannot contradict.
-    present_vals = {str(o.get("val")) for o in rows if o.get("val") is not None}
-    if len(present_vals) >= 2:
-        return None
-    # Two-rule agreement over the surface+attribute-keyed entries. (1) A key present on BOTH rows
-    # must carry one value — crossed values across surfaces refuse, while a value carried on one
-    # row's surface only says nothing against the other row. (2) The depth-blind floor: one row's
-    # flattened attr=value pairs must nest inside the other's. Rows declaring identity on disjoint
-    # attributes cannot be confirmed the same, and an agreeing generic attribute (a shared title)
-    # beside disjoint identifiers is ordinary markup, not identity evidence — the pairs don't nest,
-    # so it refuses. A row declaring NOTHING still constrains nothing (its empty set nests, so an
-    # attribute-less a11y copy collapses).
-    val_maps: list[dict[str, str]] = []
-    for o in rows:
-        entries: dict[str, str] = {}
-        for raw in o.get("vals") or []:
-            key, _, val_part = str(raw).partition("=")
-            entries[key] = val_part
-        val_maps.append(entries)
-    for i, first in enumerate(val_maps):
-        for second in val_maps[i + 1 :]:
-            for shared in first.keys() & second.keys():
-                if first[shared] != second[shared]:
-                    return None
-            flat_first = {f"{k.partition(':')[2]}={v}" for k, v in first.items()}
-            flat_second = {f"{k.partition(':')[2]}={v}" for k, v in second.items()}
-            if not (flat_first <= flat_second or flat_second <= flat_first):
-                return None
-    n = rows[0].get("n")
-    return n if isinstance(n, int) else None
 
 
 _ORDINAL_CAP = 2**31 - 1
@@ -1098,136 +979,6 @@ def _lead_clause(text: str) -> str:
     return re.split(r"\s*[,;|(]\s*|\s+[-\u2013\u2014]\s+", norm)[0].strip()
 
 
-def _prefix_tokens(s: str) -> list[str]:
-    # Fold commas and apostrophes so a short value token-prefix-matches a punctuated label ("Yes" → "Yes, I
-    # consent"). A slash is left intact so a combined "Yes/No" option is not prefix-matched by "Yes".
-    return re.sub(r"[,'’]", " ", s).lower().split()
-
-
-def _is_forward_prefix(want: list[str], label: list[str]) -> bool:
-    return bool(want) and len(want) < len(label) and label[: len(want)] == want
-
-
-def _tier_for(want_canon: str, want_tokens: list[str], text: str) -> int | None:
-    _, tier = match_option_exact_or_stem_with_tier(want_canon, [_canon_label(text)])
-    if tier is not None:
-        return 0 if tier == "exact" else 1
-    return 2 if _is_forward_prefix(want_tokens, _prefix_tokens(text)) else None
-
-
-def _option_tier(value: str, text: str) -> int | None:
-    """The best `_match_menu_option` tier that accepts `text` for `value`: 0 exact, 1 singular/plural stem,
-    2 forward word-prefix; None when no tier would."""
-    return _tier_for(_canon_label(value), _prefix_tokens(value), text)
-
-
-def _match_menu_option(value: str, options: list[dict[str, Any]], *, collapse_duplicates: bool = False) -> int | None:
-    """Pick the enumerated menu row (its data-tv3-menu index) whose label matches the wanted value.
-
-    Deterministic and site-agnostic, precision-first. Exact/singular-plural-stem matching (apostrophe
-    folding, unique-or-None) is delegated to the shared `match_option_exact_or_stem` so this is not a
-    third copy of that logic. Failing that, a UNIQUE FORWARD token-prefix — the observed value is a whole-
-    token prefix of a fuller option label ("Decline" → "Decline to self-identify") — is accepted. The
-    REVERSE direction is deliberately NOT matched: committing a shorter, more-general option for a longer
-    value ("New York" → "New") is a silent wrong success, and on a virtualised window the fuller row may
-    simply be unrendered. A value that is only an incidental SUBSTRING of an option is never matched ("No"
-    inside "Prefer not to answer"). Ambiguity or no match returns None so the caller hands the options
-    back to the model. Uniqueness is only meaningful over the COMPLETE list — the caller must not pass a
-    truncated slice.
-
-    `collapse_duplicates` is for the one call site that reads the whole, non-overflowed menu: when the
-    exact/stem tier or the prefix tier finds more than one hit, it hands those rows to
-    `_lone_duplicate_candidate` before giving up — a value that matches several DOM rows wearing the
-    same candidate still resolves, while several genuinely distinct rows still refuse. Off by default so
-    a caller working from a partial or reconstructed row set (a virtualised scroll-search window) never
-    collapses on incomplete evidence.
-    """
-    rows = [(o.get("n"), str(o.get("text") or "")) for o in options if isinstance(o.get("n"), int)]
-    if not value or not rows:
-        return None
-
-    # Canonicalize before the exact/stem tier — the shared normalizer folds case and apostrophes but
-    # not internal spacing, Unicode forms or zero-width characters.
-    want_canon = _canon_label(value)
-    hit = match_option_exact_or_stem(want_canon, [_canon_label(label) for _, label in rows])
-    if hit is not None:
-        return rows[hit][0]
-    if collapse_duplicates:
-        want_key = _exact_tier_key(value)
-        exact_matched = [
-            o for o in options if isinstance(o.get("n"), int) and _exact_tier_key(str(o.get("text") or "")) == want_key
-        ]
-        if len(exact_matched) >= 2:
-            collapsed = _lone_duplicate_candidate(exact_matched)
-            if collapsed is not None:
-                return collapsed
-        elif not exact_matched:
-            # Mirror the shared matcher's stem tier (trailing-s stem, 3-char floor) so a duplicated row
-            # that would stem-commit as a lone row still collapses. Only when the exact tier saw
-            # NOTHING — the matcher never consults stems once exact matches exist.
-            want_stem = want_key.rstrip("s")
-            if len(want_stem) >= 3:
-                stem_matched = [
-                    o
-                    for o in options
-                    if isinstance(o.get("n"), int)
-                    and len(k := _exact_tier_key(str(o.get("text") or "")).rstrip("s")) >= 3
-                    and k == want_stem
-                ]
-                if len(stem_matched) >= 2:
-                    collapsed = _lone_duplicate_candidate(stem_matched)
-                    if collapsed is not None:
-                        return collapsed
-
-    want = _prefix_tokens(value)
-    if not want:
-        return None
-    prefixed = [n for n, label in rows if _is_forward_prefix(want, _prefix_tokens(label))]
-    if len(prefixed) == 1:
-        return prefixed[0]
-    if collapse_duplicates and len(prefixed) > 1:
-        prefixed_ns = set(prefixed)
-        prefixed_rows = [o for o in options if isinstance(o.get("n"), int) and o.get("n") in prefixed_ns]
-        return _lone_duplicate_candidate(prefixed_rows)
-    return None
-
-
-def _same_row(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """Two reads of ONE row: the same raw text and no value or name that tells them apart. Rows that only share an
-    identity key are distinct rows and stay two contenders."""
-    return str(a.get("text") or "") == str(b.get("text") or "") and _lone_duplicate_candidate([a, b]) is not None
-
-
-def _distinct_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        if not any(_same_row(row, o) for o in out):
-            out.append(row)
-    return out
-
-
-def _value_contenders(value: str, texts: list[str]) -> list[str]:
-    """The texts any tier of `_match_menu_option` would accept for `value`, one entry per row."""
-    want_canon, want_tokens = _canon_label(value), _prefix_tokens(value)
-    return [t for t in texts if _tier_for(want_canon, want_tokens, t) is not None]
-
-
-def _commit_gate(
-    hit_text: str, value: str, *, complete: bool, twins_seen: bool, contenders: list[str]
-) -> Literal["commit", "ambiguous", "incomplete"]:
-    """The one rule every open-observe-pick path applies before clicking a matched row: the rows judged are the
-    whole list, and nothing else the value names competes with the hit (the post-click read-back verifies it).
-    `contenders` holds one entry per distinct row, so a label listed twice is two rows wearing it."""
-    if twins_seen:
-        return "ambiguous"
-    tier = _option_tier(value, hit_text)
-    rank = 3 if tier is None else tier
-    # The hit is one of the contender rows; a second row at its tier or better competes with it.
-    if sum(1 for t in contenders if (r := _option_tier(value, t)) is not None and r <= rank) >= 2:
-        return "ambiguous"
-    return "commit" if complete else "incomplete"
-
-
 async def _read_list_window(page: Any, raw: Any, *, scroller: bool) -> _ListWindow:
     """One read of the rows `raw` against the scroller the finder tagged. A tagged scroller whose state cannot be
     read leaves an unbounded extent, so the read never proves the list whole."""
@@ -1253,6 +1004,67 @@ def _unproven_row_error(value: str, selector: str, seen: str, row: dict[str, Any
     )
 
 
+def _choice_tiers(*, typeahead: bool) -> frozenset[Tier]:
+    # The one read of the kill switch: off, a typeahead commits exact rows only and no path commits a main-label hit.
+    if not settings.TASK_V3_CHOICE_NONEXACT_COMMIT:
+        return frozenset({Tier.EXACT}) if typeahead else frozenset(Tier) - {Tier.PRIMARY}
+    # A typed search's row that only starts with the value is often one record of a hierarchy (an address lookup's
+    # top-k), so it is offered, never committed.
+    return frozenset(Tier) - {Tier.PREFIX} if typeahead else frozenset(Tier)
+
+
+def _same_row(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """Two reads of ONE row: the same raw text and no value or name that tells them apart."""
+    return str(a.get("text") or "") == str(b.get("text") or "") and _lone_duplicate_candidate([a, b]) is not None
+
+
+def _log_choice(path: str, choice: Pick | Refusal, rows: int, value: str, **facts: Any) -> None:
+    # No values and no selector. `tied` names the match kinds an ambiguous refusal weighed, so a main-label vs plural
+    # tie can be read apart from rows that merely share a label.
+    tied = (
+        sorted({t.value for o in choice.contenders if (t := tier_of(value, o)) is not None})
+        if isinstance(choice, Refusal) and choice.reason == "ambiguous"
+        else None
+    )
+    LOG.info(
+        "taskv3 choice match",
+        tool_call_seq=current_tool_call_seq(),
+        path=path,
+        tier=choice.tier.value if isinstance(choice, Pick) else None,
+        reason=choice.reason if isinstance(choice, Refusal) else None,
+        tied=tied,
+        rows=rows,
+        **facts,
+    )
+
+
+_NOT_PICKED = {
+    "incomplete": "the list may hold more rows",
+    "reduced_query": "the typed query was shortened",
+    "unsettled": "the list was still changing",
+    "held": "the field already shows the value",
+    "none": "a typed search commits only a row that is the value or its main label",
+}
+
+
+def _nearest_sentence(
+    value: str, rows: Sequence[Mapping[str, Any]], refusal: Refusal | None, sel: Callable[[Mapping[str, Any]], str]
+) -> str:
+    """The rows most like `value`, each with what it shares with it and why it was not picked; '' when none is near."""
+    offers = nearest(value, rows)
+    why_not = _NOT_PICKED.get(refusal.reason, "") if refusal is not None else ""
+    if refusal is not None and refusal.reason == "ambiguous":
+        why_not = f"{len(refusal.contenders)} rows match it equally"
+    parts = []
+    for offer in offers:
+        why = [OFFER_WHY[offer.tier]] if offer.tier is not None else []
+        if why and offer.tier is not Tier.EXACT and why_not:
+            why.append(f"not picked: {why_not}")
+        text = _model_text(offer.row.get("text") or "", 120)
+        parts.append(f"{sel(offer.row)}{text!r}" + (f" ({' — '.join(why)})" if why else ""))
+    return f"nearest: {'; '.join(parts)}" if parts else ""
+
+
 def _ambiguous_rows_error(
     selector: str,
     value: str,
@@ -1263,6 +1075,7 @@ def _ambiguous_rows_error(
     rows_unread: bool = False,
     live_token: str | None = None,
     live_search: str | None = None,
+    choice: Refusal | None = None,
 ) -> ToolResult:
     """The refusal owed a caller when rows reacted and none of them IS the requested value.
 
@@ -1281,8 +1094,17 @@ def _ambiguous_rows_error(
         }
         rows = [row for row in rows if id(row) not in copies]
     shown = rows[:15]
+    if len(rows) > 15:
+        # Past 15 rows the ones shown are the contenders and the nearest, still printed in list order.
+        ranked = [*(choice.contenders if choice else ()), *(o.row for o in nearest(value, rows, k=15)), *rows]
+        keep = list(dict.fromkeys(o.get("n") for o in ranked))[:15]
+        shown = [o for o in rows if o.get("n") in keep]
+
+    def _sel(o: Mapping[str, Any]) -> str:
+        return f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else ""
+
     listing = "; ".join(
-        (f'[data-tv3-sugg="{o.get("n")}"][data-tv3-pick="{live_token}"] ' if live_token is not None else "")
+        _sel(o)
         + repr(_model_text(o.get("text") or "", 60))
         + (_row_value_suffix(o, groups[_canon_label(str(o.get("text") or ""))]) if live_token is not None else "")
         for o in shown
@@ -1293,7 +1115,7 @@ def _ambiguous_rows_error(
         if several
         else f"{value!r} is not the one row showing in {selector}: "
     )
-    data = {"release_own_list": True}
+    data: dict[str, Any] = {"release_own_list": True}
     if live_token is not None:
         lead = (
             f"{value!r} is not exactly any of the {len(rows)} rows showing in {selector}: "
@@ -1317,6 +1139,8 @@ def _ambiguous_rows_error(
             note = note.removesuffix(" — type the option's full label")
     tail = f" ({note})" if note else ""
     message = f"{lead}{listing}{f'; +{more} more' if more > 0 else ''}{tail} — {next_step}; the field is NOT filled"
+    if choice is not None and (near := _nearest_sentence(value, rows, choice, _sel)):
+        message += f"; {near}"
     # Spelled as literal writes rather than one computed error_class: the source census can only read a
     # literal, and a single-file mypy run does not bind the annotation across the import either.
     if several:
@@ -1973,7 +1797,7 @@ _PRESNAPSHOT_JS = (
 # the field declares (rowSelFor: role=option, or a gridcell of a grid popup the field itself declares),
 # EVERY such row is promoted, tagged data-tv3-sugg="1..N" top-to-bottom and returned as
 # {count, options, declared: true} — geometry must never break a tie between real options, so the
-# caller's own precision matcher (_match_menu_option) picks, over the full text _MENU_OPTION_TEXTS_JS
+# caller's own precision matcher (match_choice) picks, over the full text _MENU_OPTION_TEXTS_JS
 # reads back. Where nothing declares a row, reconstructing one from geometry does not converge, so the
 # finder keeps the single-winner contract instead: highest score, innermost, refusing an ambiguous
 # leading-clause tie and a multi-row container, as {count: 1, options: [the row], declared: false}.
@@ -1982,7 +1806,8 @@ _PRESNAPSHOT_JS = (
 # snippet: two hand-copied predicates drifted once (menuitem listed as both option and nav, so
 # `<a role=menuitem href>` read as an option and was clicked off the form). Semantics resolve from the
 # closest declaring ANCESTOR, not the reduced leaf (`<a href><span>` reduces to the span).
-_ROW_SEMANTICS_JS = r"""
+_ROW_SEMANTICS_JS = (
+    r"""
   const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
   const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
@@ -2115,6 +1940,25 @@ _ROW_SEMANTICS_JS = r"""
       if (field && pContains(region, field)) return false;
       return !declaredTargets(field).some((t) => t === region || pContains(t, region) || pContains(region, t));
     } catch (e) { return false; }
+  };
+  // The one row admission both finders apply. 80 characters is the "row-sized text, not a paragraph" ceiling; a row
+  // the page declares an option may run to ROW_TEXT_MAX, and a searched row to what was searched plus 80.
+  const UNDECLARED_ROW_TEXT_MAX = 80;
+  const ROW_TEXT_MAX = """
+    + str(_MENU_ROW_TEXT_MAX)
+    + r""";
+  const declaresOption = (el) => {
+    try {
+      return el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
+        || !!composedClosest(el, '[role="listbox"],[role="menu"]');
+    } catch (e) { return false; }
+  };
+  const admitRow = (el, txt, o) => {
+    const cap = Math.max(UNDECLARED_ROW_TEXT_MAX, o.searchedCap || 0);
+    if (txt.length > cap && (txt.length > Math.max(ROW_TEXT_MAX, cap) || !o.declares(el))) return 'caption';
+    if (o.vetoNav && isNavRow(el)) return 'nav';
+    if (isAnnouncement(el, o.field)) return 'announcement';
+    return null;
   };
   // A control the row only WRAPS reaches the click just as the row's own box does -- but only while
   // it is rendered. A display:none or visibility:hidden action never receives that click, so it says
@@ -2282,6 +2126,7 @@ _ROW_SEMANTICS_JS = r"""
     return lists[0];
   };
 """
+)
 
 # The values a row declares for itself: the attributes on the row or on its option ancestor that NAME
 # a value. A widget that commits a code ("CA" for "California") commits one of these, and nothing else
@@ -2327,12 +2172,9 @@ _FIND_SUGGESTION_BODY_JS = (
   // appear, so no word of it gates a row, and which reacting node is the value is the caller's exact
   // matcher's decision, never this script's.
   const searched = typeof args.match === 'string';
-  // 80 is the shared "row-sized text, not a paragraph" ceiling (_FIND_MENU_JS uses the same one). It
-  // is a flat number everywhere else because no other finder knows what it is looking for -- this one
-  // does: on a searched path the caller named the value in args.match, and only a row whose whole text
-  // IS that value can ever be committed. So the ceiling is measured from it, keeping 80 as the
-  // allowance for the extra parts a declared row can render beside its label.
-  const txtCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 80;
+  // On a searched path the caller named the value in args.match, and only a row that is that value can ever be
+  // committed, so the caption ceiling is measured from it.
+  const searchedCap = searched ? String(args.match).replace(/\s+/g, ' ').trim().length + 80 : 0;
   pQSA('[data-tv3-sugg], [data-tv3-pick]').forEach((e) => {
     e.removeAttribute('data-tv3-sugg');
     e.removeAttribute('data-tv3-pick');
@@ -2398,11 +2240,9 @@ _FIND_SUGGESTION_BODY_JS = (
       if (!(ownPopup && pContains(ownPopup, el)) && (r.top < fr.top - 400 || r.top > fr.bottom + 500)) continue;
     }
     const txt = (el.innerText || '').trim();
-    if (!txt || txt.length > txtCap) continue;
-    // never click something navigational (would leave the form) unless it's explicitly an option;
-    // last of the gates because it is the only one that walks a subtree
-    if (isNavRow(el)) continue;
+    if (!txt) continue;
     let score = 0;
+    let stemOnly = false;
     const norm = txt.replace(/\s+/g, ' ').trim().toLowerCase();
     // Without the dropdown region to lean on, what is left to separate a suggestion from a segmented
     // control's own echo -- which is a node the widget REPLACES on input, so it reads as new -- is
@@ -2423,10 +2263,22 @@ _FIND_SUGGESTION_BODY_JS = (
       const have = toks(txt);
       for (const w of want) if (have.has(w)) score++;
       if (isExact && score > 0) score += 100;
+      // A singular/plural of a word ranks beside the main label in the caller's matcher, so the gate has to let that
+      // row through as a rival (the shared stem rule: trailing s stripped, 3+ characters left); it never wins alone.
+      if (score <= 0) {
+        const stem = (w) => w.replace(/s+$/, '');
+        const haveStems = new Set([...have].map(stem).filter((w) => w.length >= 3));
+        stemOnly = [...want].some((w) => haveStems.has(stem(w)));
+      }
     }
-    if (score <= 0) continue;
-    // Last, so a skipped node is one that scored (a wrapper around a region included).
-    if (isAnnouncement(el, field)) { announceSkipped++; skippedEls.push(el); continue; }
+    if (score <= 0 && !stemOnly) continue;
+    // Last, so a skipped node is one that scored (a wrapper around a region included). The nav veto keeps anything
+    // navigational (it would leave the form) from being clicked unless it is explicitly an option.
+    const skip = admitRow(el, txt, {
+      field, vetoNav: true, searchedCap, declares: (e) => declaresOption(e) || !!composedClosest(e, rowSel),
+    });
+    if (skip === 'announcement') { announceSkipped++; skippedEls.push(el); }
+    if (skip) continue;
     cands.push({ el, score, h: r.height, exactRow: isExact, r });
   }
   // A skipped node still takes part in containment: a wrapper whose scoring content is an announcement is no row.
@@ -2476,21 +2328,28 @@ _FIND_SUGGESTION_BODY_JS = (
     const units = rows.concat(bare.map((c) => ({ el: c.el, r: c.r, bare: true })));
     if (!units.length) return null;
     // Top-to-bottom order, same as _FIND_MENU_JS. This finder only says which rows reacted; the caller
-    // (via _match_menu_option, over the full untruncated text _MENU_OPTION_TEXTS_JS reads back) picks
+    // (via match_choice, over the full untruncated text _MENU_OPTION_TEXTS_JS reads back) picks
     // which one is the wanted value -- geometry never breaks a tie between them.
     units.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
     const options = [];
     // Which tagged units the widget declared NO row for. Same text is not the same option: the caller
     // needs the split to keep a bare node from standing in for a row the widget actually declared.
     const bareNs = [];
+    // Units sharing no whole word with the value got in as singular/plural rivals only: never a pick on their own, and
+    // a reaction made of nothing else is no reaction.
+    const stemNs = [];
+    const sharesWord = (c) => searched || exact !== null || [...toks(c.el.innerText || '')].some((w) => want.has(w));
+    if (!units.some(sharesWord)) return null;
     let n = 0;
     for (const c of units) {
       n++;
       c.el.setAttribute('data-tv3-sugg', String(n));
       if (c.bare) bareNs.push(n);
+      if (!sharesWord(c)) stemNs.push(n);
       if (options.length < 15) options.push({ n, text: (c.el.innerText || '').trim() });
     }
-    return { count: n, options, declared: true, bare: bareNs };
+    // `gate`: whether every row sharing a word with the value was a candidate, which a non-exact pick relies on.
+    return { count: n, options, declared: true, bare: bareNs, stemOnly: stemNs, gate: searched ? 'searched' : exact !== null ? 'exact' : 'overlap' };
   }
   // Nothing here declares a row, so there is no unit to name: take the highest score, breaking ties
   // toward the smallest (innermost) row.
@@ -2514,7 +2373,7 @@ _FIND_SUGGESTION_BODY_JS = (
   // An empty-state row is never the winner.
   const typedNorm = String(args.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const emptyState = (n) => emptyStateRow(n, typedNorm);
-  const live = pool.filter((c) => !emptyState(c.el));
+  const live = pool.filter((c) => !emptyState(c.el) && c.score > 0);
   // The exact row the widget will not take still names the answer, so no lesser row may stand in for it.
   const barred = pool.find((c) => c.exactRow && emptyState(c.el));
   if (barred && !live.some((c) => c.exactRow)) {
@@ -2548,7 +2407,7 @@ _FIND_SUGGESTION_JS = (
 )
 
 # Read back the row _FIND_SUGGESTION_JS tagged data-tv3-sugg="N" once the caller has picked `n` (via
-# _match_menu_option): its declared value/data-* attributes -- a widget that commits a code ("CA" for a
+# match_choice): its declared value/data-* attributes -- a widget that commits a code ("CA" for a
 # row displaying "California") commits one of these -- and whether it came from the FOCUS-opened list
 # rather than reacting to a keystroke (that pick is verified under the open->observe->pick contract, not
 # the typeahead's change-based one; see _VERIFY_COMMIT_JS's `noSuggestionList`).
@@ -2751,22 +2610,26 @@ _DECLARED_LIST_ANSWER_JS = (
   const ROW = DECLARED_ROW_SEL + ',[role="gridcell"]';
   // A natively disabled row is not an answer; a label drawn in a shadow root still is.
   const dead = (row) => emptyStateRow(row, typedNorm) || row.hasAttribute('disabled');
-  const label = (row) => ((row.innerText || '').trim() || composedRowText(row)).replace(/\s+/g, ' ').trim().toLowerCase();
+  // The owned list's live rows, hidden ones included: Python judges which one IS the typed text.
+  const labels = [];
   const owned = fieldOwnPopup(field, false);
   if (owned) {
     for (const row of pScopeAll()) {
       if (!pContains(owned, row) || !row.matches(ROW) || dead(row)) continue;
-      if (typedNorm && label(row) === typedNorm) return 'option';
+      labels.push((row.innerText || '').trim() || composedRowText(row));
     }
   }
-  const popup = fieldOwnPopup(field, true);
-  if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
-  for (const row of pScopeAll()) {
-    if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
-    const r = row.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
-  }
-  return 'none';
+  const state = (() => {
+    const popup = fieldOwnPopup(field, true);
+    if (!popup) return (field.getAttribute('aria-expanded') || '').toLowerCase() === 'false' ? 'none' : 'rows';
+    for (const row of pScopeAll()) {
+      if (!pContains(popup, row) || !row.matches(ROW) || dead(row)) continue;
+      const r = row.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') return 'rows';
+    }
+    return 'none';
+  })();
+  return { state, labels };
 }"""
 )
 
@@ -6359,18 +6222,23 @@ _Reach = Literal["click", "focus", "press"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
+_ISO_DATE_TEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_runtime_secret(text: str) -> bool:
+    ctx = skyvern_context.current()
+    return ctx is not None and text.strip() in ctx.runtime_secret_values
+
+
+# The input types a field-entry record names; any other page-chosen `type` value is logged as one bucket.
+_ENTRY_VARIANT_TYPES = frozenset(
+    {"text", "textarea", "email", "tel", "number", "url", "password", "date", "datetime-local", "month", "time", "week"}
+)
 
 # Same rule observe applies before it shows a field's value.
 _FIELD_VALUE_IS_SECRET_JS = (
     "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
 )
-
-
-def _typed_text_landed(read: str | None, typed: str) -> bool:
-    # Exact, whitespace included: a field that reformatted or trimmed the text ("3" -> "03", "abc " ->
-    # "abc") is refused rather than judged equivalent; a refusal costs one retry, a wrong equivalence is
-    # a false success.
-    return read is not None and read == typed
 
 
 # The element focus actually went to -- followed into shadow roots -- when it takes typed text and sits at
@@ -6451,28 +6319,6 @@ _GRID_CELL_AT_JS = r"""(grid, [rowAt, col, key, want]) => {
   if (want === 'mounted') return cell.querySelector('input,textarea,[contenteditable]:not([contenteditable="false" i])');
   return editable && cell.contains(a) ? a : null;
 }"""
-
-_PLAIN_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?", re.ASCII)
-# The only renderings a cell may show for a typed number, around whitespace: an optional leading minus, at most one
-# currency sign (Unicode Sc) before or after, comma grouping and decimal places. An allow-list: any other affix differs.
-_RENDERED_NUMBER_RE = re.compile(r"(-?)(\D?)\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(\D?)", re.ASCII)
-# A leading plus sign or zero belongs to an identifier (a phone number, a postal code), so only the exact text matches.
-_IDENTIFIER_NUMBER_RE = re.compile(r"\+|-?0\d")
-
-
-def _same_cell_value(shown: str, typed: str) -> bool:
-    typed = typed.strip()
-    if shown == typed:
-        return True
-    rendered = _RENDERED_NUMBER_RE.fullmatch(shown.strip())
-    if rendered is None or not _PLAIN_NUMBER_RE.fullmatch(typed) or _IDENTIFIER_NUMBER_RE.match(typed):
-        return False
-    sign, before, number, after = rendered.groups()
-    if (before and after) or any(c and unicodedata.category(c) != "Sc" for c in (before, after)):
-        return False
-    # Decimal, not float: long identifiers would round to the same binary value.
-    return decimal.Decimal(sign + number.replace(",", "")) == decimal.Decimal(typed)
-
 
 _APPEND_SETTLE_S = 0.3
 # The only cell editors this path commits: a numeric <input> declaring no list. Any other editor (text, a typeahead,
@@ -7214,8 +7060,32 @@ _CLICK_PRECHECK_JS = (
 )
 
 # Same-document token for the click retry: a navigation destroys window, a pushState does not.
-_CLICK_SAME_DOC_PLANT_JS = "() => { window.__tv3_click_same = 1; }"
+# Also arms a capture listener that records whether the document received a trusted press, so a click that
+# raised afterwards (its navigation not yet committed) is known to have been dispatched.
+_CLICK_SAME_DOC_PLANT_JS = """() => {
+  window.__tv3_click_same = 1;
+  window.__tv3_click_seen = 0;
+  if (!window.__tv3_click_hook) {
+    window.__tv3_click_hook = 1;
+    for (const type of ["pointerdown", "mousedown", "click"]) {
+      window.addEventListener(type, (event) => { if (event.isTrusted) window.__tv3_click_seen = 1; }, true);
+    }
+  }
+}"""
 _CLICK_SAME_DOC_CHECK_JS = "() => window.__tv3_click_same === 1"
+_CLICK_SEEN_CHECK_JS = "() => window.__tv3_click_seen === 1"
+
+
+async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
+    try:
+        # An unarmed marker cannot say the press never landed, so it reads as dispatched, the safe side.
+        seen = not marker_armed or await page.evaluate(_CLICK_SEEN_CHECK_JS)
+    except Exception:
+        # The document cannot be read (it may be navigating away): treated as dispatched, the safe side.
+        seen = True
+    if seen:
+        record_click_dispatched()
+
 
 # Planted on window before an option click; a navigation clears window, so its absence afterwards is
 # the page saying "different document" even when the post-click probe's own JS is what failed.
@@ -7344,6 +7214,21 @@ _LIST_BOX_JS = r"""
   };
 """
 
+# Tags the scroller of the rows the suggestion finder tagged, so `_list_coverage` judges a typeahead's rows as it
+# judges a menu's.
+_TAG_SUGG_SCROLLER_JS = (
+    r"""(arg) => {"""
+    + _PIERCED_QUERY_JS
+    + _ROW_SEMANTICS_JS
+    + _TAG_LIST_SCROLLER_JS
+    + r"""
+  pQSA('[data-tv3-menu-scroller]').forEach((e) => e.removeAttribute('data-tv3-menu-scroller'));
+  const g = pQSA('[data-tv3-sugg]').map((el) => ({ el, r: el.getBoundingClientRect() }));
+  g.sort((a, b) => a.r.top - b.r.top);
+  return g.length ? tagListScroller(g, g[0].el) : false;
+}"""
+)
+
 # Behavioral, site-agnostic menu finder: after a click (with the pre-snapshot taken first),
 # look for the option list the page rendered IN REACTION — a NEW container (not data-tv3-pre: a
 # pre-existing visible container whose rows merely changed, e.g. pagination refreshing a results list,
@@ -7364,12 +7249,6 @@ _FIND_MENU_JS = (
     + _MENU_ROW_ROLES_JS
     + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
-  // 80 is the shared "row-sized text, not a paragraph" ceiling. A row the page declares an option or
-  // menu item may run to ROW_TEXT_MAX, so a long option caption is listed whole.
-  const UNDECLARED_ROW_TEXT_MAX = 80;
-  const ROW_TEXT_MAX = """
-    + str(_MENU_ROW_TEXT_MAX)
-    + r""";
   // `cascade`: the caller just clicked a row that DETACHED (a category replacing the list with its
   // children). The trigger is gone, so trigger-anchored geometry/ARIA is waived — new rows in a
   // FLOATING container carry the claim instead (enforced below).
@@ -7445,17 +7324,12 @@ _FIND_MENU_JS = (
     const { r, txt } = box;
     // A long row is an option only where the page declares one on it, in it, around it, or by its list (a
     // listbox/menu, or the list a combobox controls): a pointer cursor alone makes every paragraph a row.
-    if (txt.length > UNDECLARED_ROW_TEXT_MAX) {
-      let declaresOption = false;
-      try {
-        declaresOption = el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
-          || !!composedClosest(el, '[role="listbox"],[role="menu"]')
-          || (controlledList && controlled !== el && pContains(controlled, el));
-      } catch (e) { declaresOption = false; }
-      if (!declaresOption) {
-        if (arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
-        continue;
-      }
+    const skip = admitRow(el, txt, {
+      field: trigger, declares: (e) => declaresOption(e) || (controlledList && controlled !== e && pContains(controlled, e)),
+    });
+    if (skip) {
+      if (skip === 'caption' && arg.saltUnlisted && ownClickable(el)) unreadLong.push(el);
+      continue;
     }
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
@@ -7865,6 +7739,8 @@ _MENU_OPTION_TEXTS_JS = (
       setsize_unknown: setsize === -1,
       group: grp ? accessibleName(grp) || grp.id || 'group' : '',
       lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      // The tag of the declared row's first leaf: leaves of one row are one option to the matcher.
+      unit: rowOf(el) ? num(leadOf.get(rowOf(el))) : null,
       box: box,
       after: after,
       line: Number.isFinite(line) && line > 0 ? line : null,
@@ -10836,14 +10712,16 @@ def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool =
         return (
             "This click opened a menu, but its options could not be read as whole rows, so they are not "
             f"listed here. Re-observe to read them before picking one; clicking {closer} again or elsewhere "
-            f"closes the menu, and {stale}"
+            f"closes the menu, and {stale} Opening a menu does not oblige a pick."
         )
     if isinstance(declared, int) and not isinstance(declared, bool) and declared > count:
         overflow += f" (the list declares {declared} options; {count} are listed)"
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
-        f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
-        f"and destroys these options. These numbers are freshly assigned: {stale}"
+        f'its [data-tv3-menu="N"] selector, as your next action if you mean to pick: clicking {closer} again or '
+        f"elsewhere, or a page change, closes the menu and destroys these options. Opening a menu does not oblige a "
+        f"pick: if none of them should be chosen, leave it without selecting. These numbers are freshly assigned: "
+        f"{stale}"
     )
 
 
@@ -14698,7 +14576,14 @@ def build_browser_tools(
                 skin_probe = None
             # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
             # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
-            if not (isinstance(skin_probe, dict) and "radio" in skin_probe) or await _engine_enabled(page, selector):
+            if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
+                break
+            if await _engine_enabled(page, selector):
+                # A page that enables a control can move it in the same step, so the label point is measured after
+                # the enabled read, never before it.
+                pre_click_arg = await _probe_arg(page, selector)
+                with contextlib.suppress(Exception):
+                    skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
                 break
             if time.monotonic() >= enable_deadline:
                 return ToolResult.error(
@@ -14818,10 +14703,11 @@ def build_browser_tools(
                 )
             base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
+            marker_armed = True
             try:
                 await page.evaluate(_CLICK_SAME_DOC_PLANT_JS)
             except Exception:
-                pass
+                marker_armed = False
             try:
                 if label_over_control:
                     # The probe already answered: the only thing "over" this control is its own label
@@ -14831,6 +14717,7 @@ def build_browser_tools(
                 else:
                     await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
             except Exception as e:
+                await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
                 try:
                     gone = not await page.evaluate(_SELECTOR_EXISTS_JS, await _probe_arg(page, selector))
@@ -14904,6 +14791,7 @@ def build_browser_tools(
                         await page.locator(selector).first.wait_for(state="visible", timeout=3000)
                         await input_dispatch.click(page, selector, timeout=5000, force=True)
                     except Exception:
+                        await _note_click_dispatch(page, marker_armed=marker_armed)
                         raise e from None
                 else:
                     raise
@@ -14925,6 +14813,7 @@ def build_browser_tools(
             "page_transitioned": bool(page_url_before and page_url_after and page_url_after != page_url_before),
             # The re-ask's URL rule reads where this click started: its result reports only where it landed.
             "url_before": page_url_before,
+            CLICK_DISPATCHED_DATA_KEY: True,
         }
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
@@ -14969,20 +14858,20 @@ def build_browser_tools(
                 verdict = _classify_commit({"checked": checked_before}, matches, post_state)
             if verdict is CommitStatus.UNVERIFIED:
                 if post_state is None and not skinned and not verify_toggle:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — its toggle could not be read back after the click (the control left the page "
                         "or is no longer the only one), so its state could not be verified; re-observe before "
                         "relying on it",
                         data=transition_data,
                     )
                 if post_state is None:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — the control left the page after the click, so its state could not be "
                         "verified; re-observe before relying on it",
                         data=transition_data,
                     )
                 if matches != 1:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"{base} — it re-resolved to {matches} elements after the click, so its state could "
                         "not be verified; re-observe before relying on it",
                         data=transition_data,
@@ -15630,6 +15519,7 @@ def build_browser_tools(
         # row before the results); the last reaction is returned when time runs out.
         found: dict[str, Any] | None = None
         refused_a_reaction = False
+        was_busy = False
         soft_deadline = time.monotonic() + 0.4 * rounds
         hard_deadline = time.monotonic() + 8.0
         while True:
@@ -15658,8 +15548,11 @@ def build_browser_tools(
                     busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
                 except Exception:
                     busy = False
-                if not busy:
+                # Rows that replace the indicator land between the read above and this probe, so a list that just
+                # stopped being busy gets one more read before the wait ends.
+                if not busy and not was_busy:
                     break
+                was_busy = busy
         return found
 
     async def _commit_typeahead(
@@ -15674,9 +15567,9 @@ def build_browser_tools(
         live_offer: tuple[str, list[dict[str, Any]]] | None = None,
     ) -> _TypeaheadPick:
         # Poll for the suggestion rows rendered IN REACTION to whatever is already typed into `selector`,
-        # pick among them, click, and verify the field committed. When the widget DECLARES its rows the
-        # commit is exact-only: a row is picked when its whole label IS `value`, never on a stem or
-        # prefix hit, so an ambiguous reaction is always handed back rather than guessed at. Where
+        # pick among them, click, and verify the field committed. When the widget DECLARES its rows,
+        # `match_choice` picks: a row whose whole label IS `value`, or a lone main-label or singular/plural
+        # hit on a whole, settled list the full value was typed into; anything else is handed back. Where
         # nothing declares a list, the finder returns the single winner it always did and the pick is
         # that row. `candidates` is the full-text reacting rows when a declared pick refused — the
         # caller reports these instead of guessing which one was meant; None when nothing reacted, when
@@ -15707,17 +15600,14 @@ def build_browser_tools(
             # floor under the pick, not the filter that does the work.
             return [o for o in raw if isinstance(o, dict) and isinstance(o.get("n"), int) and not o.get("nav")]
 
-        def _pick(rows: list[dict[str, Any]]) -> int | None:
-            # A declared row commits solely on an exact label match, never on inferred meaning — an
-            # unmatched row, lone or not, is refused like any other so the model chooses explicitly.
-            return _match_option_exact(value, rows)
-
         # Which tagged units the widget declared no row for, kept so verification can ask about the row
         # actually CHOSEN rather than about the mixed pool it came from.
         bare_tagged: set[int] = set()
+        choice: Pick | Refusal | None = None
+        choice_facts: dict[str, Any] = {}
 
         async def _resolve(found: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], int | None, int]:
-            # A widget that declares its rows hands the pick to the exact matcher over every row it
+            # A widget that declares its rows hands the pick to `match_choice` over every row it
             # tagged. Where nothing declares one, the finder already reduced the reaction to a single
             # winner and there is nothing left to choose between — except under a reduced query, whose
             # rows answer a broader question than the caller asked. The 4th value is the declared
@@ -15727,49 +15617,47 @@ def build_browser_tools(
             if not tagged:
                 return bool(found.get("declared")), [], None, 0
             if found.get("declared"):
+                # The scroller is tagged before the rows are read: a row's box is read against the tagged scroller.
+                try:
+                    scroller = await page.evaluate(_TAG_SUGG_SCROLLER_JS, {}) is True
+                except Exception:
+                    scroller = False
                 rows = await _full_rows()
-                nonlocal bare_tagged
+                nonlocal bare_tagged, choice, choice_facts
                 bare_ns = {x for x in (found.get("bare") or []) if isinstance(x, int)}
                 bare_tagged = bare_ns
                 # Only rows the widget DECLARED count against its own aria-setsize; a bare node padding
                 # the list would hide a genuinely truncated one.
                 declared_rendered = [o for o in rows if o.get("n") not in bare_ns]
                 overflow = _declared_shortfall([_list_row(o) for o in declared_rendered])
-                idx = _pick(rows)
-                if idx is None and overflow == 0:
-                    # No exact-label winner over the complete rendered list — but "several rows" may be
-                    # one candidate wearing more than one face (an a11y duplicate, a portal+inline
-                    # render). Collapse only over the FULL list (never a partial/overflowed one), and
-                    # only to a genuinely lone survivor; several distinct candidates still refuse below.
-                    want = _exact_tier_key(value)
-                    matched = [o for o in rows if _exact_tier_key(str(o.get("text") or "")) == want]
-                    if len(matched) >= 2:
-                        # A row the widget DECLARED outranks a bare node wearing the same label. Text
-                        # agreement is what the collapse reads, and these two agree on it while being
-                        # different options — the bare one can commit another record under an identical
-                        # label, which reads as success. Only the declared unit may stand for them.
-                        declared_matched = [o for o in matched if o.get("n") not in bare_ns]
-                        if declared_matched:
-                            idx = (
-                                _lone_duplicate_candidate(declared_matched)
-                                if len(declared_matched) >= 2
-                                else declared_matched[0].get("n")
-                            )
-                        else:
-                            # Every exact match is bare, so the text-agreement collapse cannot run:
-                            # bare rows carry no declared identity for it to veto on, and two distinct
-                            # records wearing one label would read as a single candidate. Only nesting
-                            # is decidable here — a wrapper and the node carrying its label are ONE
-                            # candidate, related by the `inside` chain, and the innermost stands for
-                            # them. Siblings never share that chain, so they survive as two and refuse.
-                            survivors = _without_nested_copies(value, matched)
-                            if len(survivors) == 1:
-                                idx = survivors[0].get("n")
-                return True, rows, idx, overflow
+                window = await _read_list_window(page, declared_rendered, scroller=scroller)
+                # A non-exact row is judged only where every row sharing a word with the value was a candidate.
+                choice_facts = {
+                    "gate": found.get("gate"),
+                    "complete": overflow == 0 and _list_coverage([window]) == "complete",
+                    "query_full": not exact_only,
+                }
+                choice = match_choice(
+                    value,
+                    rows,
+                    complete=bool(choice_facts["complete"]) and choice_facts["gate"] == "overlap",
+                    query_full=not exact_only,
+                    allow=_choice_tiers(typeahead=True),
+                    collapse=overflow == 0,
+                    bare=frozenset(bare_ns),
+                )
+                stem_only = {x for x in (found.get("stemOnly") or []) if isinstance(x, int)}
+                if isinstance(choice, Pick) and choice.n in stem_only:
+                    # A row that shares only a singular/plural with the value stands as a rival, never as the answer.
+                    choice = Refusal("none", tuple(o for o in rows if o.get("n") == choice.n))
+                return True, rows, choice.n if isinstance(choice, Pick) else None, overflow
             if exact_only:
                 # The tagger returns at most 15 rows; an exact match has to see every one.
                 rows = await _full_rows()
-                return False, rows, _match_option_exact(value, _without_nested_copies(value, rows)), 0
+                choice = match_choice(
+                    value, _without_nested_copies(value, rows), complete=False, allow=frozenset({Tier.EXACT})
+                )
+                return False, rows, choice.n if isinstance(choice, Pick) else None, 0
             return False, tagged, 1, 0
 
         async def _row_info(n: int) -> dict[str, Any]:
@@ -15778,6 +15666,43 @@ def build_browser_tools(
             except Exception:
                 info = None
             return info if isinstance(info, dict) else {}
+
+        async def _rows_hold(judged_rows: list[dict[str, Any]]) -> tuple[int, bool, list[dict[str, Any]]]:
+            # A top-k list still answering can swap a twin in under a non-exact hit: the rows judged must read back the
+            # same, with the list not busy, 0.6 s later, within 2.4 s. The rows last read come back too: re-running the finder
+            # renumbers the tags, so a refusal must list those, never the judged ones.
+            start = time.monotonic()
+
+            def sig(rows: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+                # Text alone misses a same-text row carrying another value and a list that grew its declared size.
+                return [
+                    (
+                        o.get("n"),
+                        o.get("text"),
+                        o.get("label"),
+                        o.get("val"),
+                        repr(o.get("vals")),
+                        o.get("setsize"),
+                        o.get("setsize_unknown"),
+                    )
+                    for o in rows
+                ]
+
+            want = sig(judged_rows)
+            last = judged_rows
+            while time.monotonic() - start < 2.4:
+                await asyncio.sleep(0.6)
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if busy:
+                    continue
+                # Re-run the finder so a row that arrived after the first read is tagged and counted.
+                last = await _full_rows() if await _find() is not None else []
+                if sig(last) == want:
+                    return round((time.monotonic() - start) * 1000), True, last
+            return round((time.monotonic() - start) * 1000), False, last
 
         judged: tuple[bool, list[dict[str, Any]], int | None, int] | None = None
 
@@ -15791,8 +15716,9 @@ def build_browser_tools(
         if live_offer is not None:
             token, rows = live_offer
             bare_tagged = {row["n"] for row in rows if row.get("bare")}
-            matched = [row for row in rows if _exact_tier_key(str(row.get("text") or "")) == _exact_tier_key(value)]
-            idx = matched[0]["n"] if len(matched) == 1 else _lone_duplicate_candidate(matched)
+            # A follow-up names a row by its exact label, so it commits only an exact row.
+            live = match_choice(value, rows, complete=False, allow=frozenset({Tier.EXACT}), collapse=True)
+            idx = live.n if isinstance(live, Pick) else None
             if idx is None:
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
             stamp = f'[data-tv3-sugg="{idx}"][data-tv3-pick="{token}"]'
@@ -15821,6 +15747,17 @@ def build_browser_tools(
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False, verdict=verdict)
             declared_rows, rows, idx, overflow = judged if judged is not None else await _resolve(found)
             stamp = f'[data-tv3-sugg="{idx}"]'
+            if isinstance(choice, Pick) and choice.tier is not Tier.EXACT:
+                held = bool(pre_own) and _exact_tier_key(pre_own or "") == _exact_tier_key(value)
+                settle_ms, settled, last = (0, False, rows) if held else await _rows_hold(rows)
+                choice_facts["settle_ms"] = settle_ms
+                if not settled:
+                    # A list that emptied leaves no tag behind, so the judged rows name nothing a click could reach.
+                    rows = last or rows
+                    hit = tuple(o for o in rows if tier_of(value, o) is not None)
+                    choice, idx = Refusal("held" if held else "unsettled", hit), None
+            if choice is not None:
+                _log_choice("typeahead", choice, len(rows), value, **choice_facts)
         if idx is None:
             declares = "its total unknown" if overflow < 0 else f"{overflow} rows"
             note = (
@@ -15837,6 +15774,7 @@ def build_browser_tools(
                 declared=declared_rows,
                 note=note,
                 overflow=overflow,
+                refusal=choice if isinstance(choice, Refusal) else None,
             )
         best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
         info = await _row_info(idx)
@@ -15882,11 +15820,15 @@ def build_browser_tools(
             if live_offer is not None:
                 LOG.debug("taskv3 live row click failed; retrying through typing", selector=selector, exc_info=True)
                 return _TypeaheadPick(None, None, False, None, clicked=False, declared=False)
+            # The re-resolve below sets `choice` only on the declared path, so an earlier decision must not stand in for it.
+            choice = None
             try:
                 refound = await _find()
                 if refound is not None:
                     declared_rows, rows, idx2, _overflow = await _resolve(refound)
-                    if idx2 is not None:
+                    # A list that re-rendered under the click is the case the settle exists for, so only an exact
+                    # row is re-picked here.
+                    if idx2 is not None and not (isinstance(choice, Pick) and choice.tier is not Tier.EXACT):
                         idx = idx2
                         best_txt = next((str(o.get("text") or "") for o in rows if o.get("n") == idx), value)
                         info = await _row_info(idx)
@@ -15969,7 +15911,25 @@ def build_browser_tools(
             declared=declared_rows,
             pre_surface_hit=pre_surface_hit,
             shared_surface=shared_surface,
+            tier=choice.tier if isinstance(choice, Pick) else None,
         )
+
+    async def _is_native_date_input(page: Any, selector: str) -> bool:
+        # Any element can carry type="date"; only an <input> the browser treats as a date stores year-month-day.
+        try:
+            return bool(
+                await page.locator(selector).first.evaluate(
+                    "el => el.tagName === 'INPUT' && el.type === 'date'", timeout=2000
+                )
+            )
+        except Exception:
+            return False
+
+    async def _field_placeholder(page: Any, selector: str) -> str | None:
+        try:
+            return await page.locator(selector).first.get_attribute("placeholder", timeout=2000)
+        except Exception:
+            return None
 
     async def _read_field_value(page: Any, selector: str) -> str | None:
         try:
@@ -16106,9 +16066,15 @@ def build_browser_tools(
         # Fail toward an answer: a list that could not be read is no evidence the text matched nothing.
         try:
             arg = {**(await _probe_arg(page, selector)), "typed": text}
-            return await page.evaluate(_DECLARED_LIST_ANSWER_JS, arg) != "none"
+            read = await page.evaluate(_DECLARED_LIST_ANSWER_JS, arg)
         except Exception:
             return True
+        if not isinstance(read, dict):
+            return True
+        want = _exact_tier_key(text)
+        return read.get("state") != "none" or (
+            bool(want) and any(isinstance(t, str) and _exact_tier_key(t) == want for t in read.get("labels") or [])
+        )
 
     async def _answers_as_search(page: Any, selector: str) -> bool:
         # Rows that reacted to the keystrokes, or aria-autocomplete list/both/inline, which also covers a combobox
@@ -16896,7 +16862,7 @@ def build_browser_tools(
             await asyncio.sleep(0.15)
 
     async def _settle_date_group(
-        page: Any, selector: str, digits: str, group: dict[str, Any] | None
+        page: Any, selector: str, digits: str, group: dict[str, Any] | None, *, echo: bool
     ) -> tuple[ToolResult | None, dict[str, Any] | None, int]:
         # (error, settled values, segments the page set) after a write into the group's `label` segment. The keys land
         # in earlier segments and a segment written alone is clean, so the group is re-read before each restore and the
@@ -16917,6 +16883,25 @@ def build_browser_tools(
             )
             if ref is None:
                 return unverified, None, 0
+
+            def moved(segments: list[str], held: dict[str, Any]) -> ToolResult:
+                # The group was just read, so the date is known wrong, not unreadable: name each moved segment, with its
+                # value unless the typed text was a secret. A restore's keys can also land in the segment just written.
+                segments = [*segments, *([label] if held[label] != want[label] and label not in segments else [])]
+                shown = "; ".join(
+                    f"the {o} holds {'nothing' if held[o] is None else held[o]}, not "
+                    f"{'empty' if want[o] is None else want[o]}"
+                    if echo
+                    else f"the {o} does not hold its value"
+                    for o in segments
+                )
+                return ToolResult.error(
+                    f"typed into {selector}, but the write moved a segment of the same date and it could not be put "
+                    f"back: {shown}. The date is NOT correct: re-type the {', then the '.join(segments)} one segment "
+                    "per call.",
+                    error_class="date_sibling_moved",
+                )
+
             labels = [*ref, label]
             want: dict[str, int | None] = {**ref, label: int(digits)}
             # Recorded while the segments are still tagged, so an exit that cannot read them leaves the retry a
@@ -16960,7 +16945,7 @@ def build_browser_tools(
                 with contextlib.suppress(Exception):
                     await locator.evaluate(_CARET_TO_END_JS, timeout=2000)
                 if not await _segment_focused(locator):
-                    return unverified, None, 0
+                    return moved(wrong, now), now, 0
                 await _clear_date_segment(page, f'[data-tv3-dateseg="{other}"]', locator)
                 cleared = ((await _date_segment_state(page, [other])) or {}).get(other, (1, None))[0] is None
                 if want[other] is not None:
@@ -16995,12 +16980,7 @@ def build_browser_tools(
                 return ToolResult.ok(f"typed into {selector}; the write moved and the tool {put_back}"), now, noted
             if not wrong:
                 return None, now, noted
-            error = ToolResult.error(
-                f"typed into {selector}, but the {' and '.join(wrong)} of the same date moved and could not be put "
-                f"back. The date is NOT correct: re-type the {', then the '.join(wrong)} one segment per call.",
-                error_class="date_sibling_moved",
-            )
-            return error, now, noted
+            return moved(wrong, now), now, noted
         finally:
             with contained_effect("date siblings settled log"):
                 LOG.info("taskv3 date siblings settled", segment=label, tool_call_seq=current_tool_call_seq(), **stats)
@@ -17466,7 +17446,7 @@ def build_browser_tools(
         if (navigated := await _commit_with_tab(page, selector)) is not None:
             return navigated
         date_error, now, noted = await _settle_date_group(
-            page, selector, digits, {"label": label, "ref": ref, "write": write}
+            page, selector, digits, {"label": label, "ref": ref, "write": write}, echo=not text_is_secret
         )
         if date_error is not None and committed and date_error.status != "ok":
             return date_error
@@ -17706,12 +17686,14 @@ def build_browser_tools(
         await _require_single_target(page, selector)
         selector = await _resolve_mirrored_host_control(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
+        # A secret source resolved the text, or it is a value a tool delivered as secret (a one-time code typed as is).
+        typed_secret = text != args.get("text", "") or _is_runtime_secret(text)
         press_enter = args.get("press_enter")
         # The tab's URL, like click's: the re-ask's URL rule reads where an Enter submission started.
         url_before = await _url(_current_page()) if press_enter else None
         clear = args.get("clear", True)
         if clear and not press_enter:
-            cell_result = await _type_into_grid_cell(page, selector, text, echo=text == args.get("text", ""))
+            cell_result = await _type_into_grid_cell(page, selector, text, echo=not typed_secret)
             if cell_result is not None:
                 return cell_result
         date_group: dict[str, Any] | None = None
@@ -17760,7 +17742,7 @@ def build_browser_tools(
                             target_label,
                             segment_digits,
                             labels,
-                            text_is_secret=text != args.get("text", ""),
+                            text_is_secret=typed_secret,
                             write=write,
                         )
                 # The plain path types a month/year or year-only segment, so its group is tagged here only to read
@@ -17839,7 +17821,7 @@ def build_browser_tools(
                 return await _open_observe_pick(page, selector, text)
             opened_by_typing = await _list_opened_on_an_empty_field(page, selector)
             result = await _type_typeahead_commit(
-                page, selector, text, text_is_secret=text != args.get("text", ""), date_group=date_group
+                page, selector, text, text_is_secret=typed_secret, date_group=date_group
             )
             return await _close_own_list_on_exit(page, selector, result, opened_by_typing=opened_by_typing)
         # The types that skip the typeahead probe still must not be typed into through an overlay.
@@ -17851,8 +17833,24 @@ def build_browser_tools(
             return _not_editable_error(exc)
         if not reachable:
             return _covered_error(selector, occluder)
+        written = text
         if clear:
-            await input_dispatch.fill(page, selector, text, timeout=_ACTION_TIMEOUT_MS)
+            if (
+                field_type == "date"
+                and text
+                and not _ISO_DATE_TEXT_RE.fullmatch(text.strip())
+                and await _is_native_date_input(page, selector)
+            ):
+                # A date input takes only YYYY-MM-DD; the order comes from its own mask or an unambiguous reading.
+                written = canonical_iso_date(text, await _field_placeholder(page, selector)) or ""
+                if not written:
+                    shown = "the text" if typed_secret else repr(_mask_refs(text))
+                    return ToolResult.error(
+                        f"{selector} is a date field that stores year-month-day, and {shown} is not a date or could "
+                        "be read as more than one date, so nothing was typed. Type it as YYYY-MM-DD.",
+                        error_class="date_format_refused",
+                    )
+            await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
                 return ToolResult.error(
                     f"typed into {selector}, but it takes one character and does not hold the typed text "
@@ -17889,9 +17887,7 @@ def build_browser_tools(
                     # page.type() would focus the field again, and a fresh focus puts the caret back at the start.
                     sent = await _type_keys_before_deadline(text, press_end=at_end == "end_key")
                     if sent < len(text):
-                        progress = (
-                            "partway" if text != args.get("text", "") else f"after {sent} of {len(text)} characters"
-                        )
+                        progress = "partway" if typed_secret else f"after {sent} of {len(text)} characters"
                         return ToolResult.error(
                             f"typing into {selector} stopped {progress} because the field took keys too slowly, "
                             "so the text is NOT confirmed. Check what the page shows before typing again, and "
@@ -17900,20 +17896,36 @@ def build_browser_tools(
                         )
                 else:
                     await input_dispatch.type_keys(page, selector, text, timeout=_typing_timeout_ms(text))
-                not_held = await _appended_text_not_held(
-                    field, selector, text, before, text_is_secret=text != args.get("text", "")
-                )
+                not_held = await _appended_text_not_held(field, selector, text, before, text_is_secret=typed_secret)
             finally:
                 if not hasattr(field, "first"):
                     await field.dispose()
             if not_held is not None:
                 return not_held
+        entry = (
+            await _entry_read_back(
+                page,
+                selector,
+                written,
+                variant=f"native_{field_type}" if field_type in _ENTRY_VARIANT_TYPES else "native_other",
+                echo=not typed_secret,
+            )
+            if clear and text and not box_text
+            else ToolResult.ok(f"typed into {selector}")
+        )
+        if entry.status == "error":
+            return entry
         if password_anchor is not None:
             input_dispatch.note_secret_fill(page, password_anchor)
-        if press_enter:
+        if press_enter and entry.ok_class == "held_differs":
+            # Enter would submit a value the field shows is not the one typed, before the batch rule could hold it back;
+            # an unreadable field is no such evidence, so Enter still goes there, as before.
+            entry.content += " Enter was not pressed: check the field, then press Enter once it holds the value."
+            record_entry_enter_withheld()
+        elif press_enter:
             await input_dispatch.press(page, selector, "Enter")
-            return ToolResult.ok(f"typed into {selector}", data={"url_before": url_before})
-        return ToolResult.ok(f"typed into {selector}")
+            entry.data = {**(entry.data or {}), "url_before": url_before}
+        return entry
 
     async def _field_evaluate(field: Any, js: str) -> Any:
         # `field` is a locator or an element handle; only a locator's evaluate takes a timeout.
@@ -18289,6 +18301,29 @@ def build_browser_tools(
             error_class="text_not_held",
         )
 
+    async def _entry_read_back(
+        page: Any, selector: str, text: str, *, variant: str, echo: bool, before: str | None = None
+    ) -> ToolResult:
+        # The one exit for a write no other check read: a single read, and one re-read only on a mismatch, since a
+        # page may finish formatting a beat after the write.
+        record_entry_variant(variant)
+        held = await _read_field_value(page, selector)
+        if held == text:
+            return entry_outcome(selector, EntryMatch.SAME, shown=None)
+        try:
+            secret_field = bool(await page.locator(selector).first.evaluate(_FIELD_VALUE_IS_SECRET_JS, timeout=2000))
+        except Exception:
+            secret_field = True
+        # A secret is opaque: a changed case or a dropped space is a different value, never a reformat.
+        exact = secret_field or not echo
+        match = compare_text(text, held, before, exact=exact)
+        if match is not None and match not in (EntryMatch.SAME, EntryMatch.REFORMATTED):
+            await asyncio.sleep(0.15)
+            held = await _read_field_value(page, selector)
+            match = compare_text(text, held, before, exact=exact)
+        shown = _masked_echo(held) if held is not None and not exact else None
+        return entry_outcome(selector, match, shown=shown)
+
     async def _value_changed_by_page_error(
         page: Any, selector: str, typed: str, held: str, *, echo: bool
     ) -> ToolResult:
@@ -18353,9 +18388,18 @@ def build_browser_tools(
             if not reacted:
                 if (navigated := await _commit_with_tab(page, selector)) is not None:
                     return navigated
-                date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+                date_error, settled, _ = await _settle_date_group(
+                    page, selector, text.strip(), date_group, echo=not text_is_secret
+                )
                 held = await _read_field_value(page, selector)
-                landed = _typed_text_landed(held, text)
+                # A segment shows its value padded ("9" as "09"); the settle already compared the group by integer,
+                # and a confirmed segment there is the write landing.
+                landed = _typed_text_landed(held, text) or (
+                    date_group is not None
+                    and (date_error is None or date_error.status == "ok")
+                    and settled is not None
+                    and settled.get(date_group["label"]) == int(text.strip())
+                )
                 siblings_moved = len(collateral)
                 LOG.info(
                     "taskv3 type focus fallback",
@@ -18450,12 +18494,13 @@ def build_browser_tools(
                 note=pick.note,
                 rows_unread=bool(pick.overflow),
                 live_token=live_token,
+                choice=pick.refusal,
             )
         if pick.suggestion:
             suggestion = _model_text(pick.suggestion, 60)
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
             if pick.clicked:
-                _log_committed_pick(pick.suggestion, text, verdict, "type")
+                _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -18463,14 +18508,18 @@ def build_browser_tools(
                     )
                     if closed is not None:
                         return closed
-                return ToolResult.ok(
-                    f"typed into {selector}; it is a typeahead — selected {suggestion!r} "
-                    f"(committed value: {pick.committed!r})"
+                return with_tier_note(
+                    ToolResult.ok(
+                        f"typed into {selector}; it is a typeahead — selected {suggestion!r} "
+                        f"(committed value: {pick.committed!r})"
+                    ),
+                    pick.tier,
+                    _model_text(text, 60),
                 )
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"typed into {selector}; it is a typeahead — selected {suggestion!r}, and the "
                     f"field now shows {pick.shared_surface!r}, which cannot be tied to this pick alone, "
                     "so the commit could not be verified — re-observe to confirm the value before "
@@ -18479,7 +18528,7 @@ def build_browser_tools(
             if verdict is CommitStatus.UNVERIFIED and matches != 1:
                 # INV-1: the field re-resolved to n≠1 after the click (remounted or now ambiguous), so
                 # there is no stable element to read the commit off — soft, not a false did-not-commit.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"clicked suggestion {suggestion!r} for {selector}, but it re-resolved to {matches} "
                     "elements so the commit could not be verified — re-observe to confirm the value "
                     "before relying on it"
@@ -18492,7 +18541,7 @@ def build_browser_tools(
                 # follows the read.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"clicked suggestion {suggestion!r} for {selector}; {why}, so the commit could not "
                         "be verified — re-observe to confirm the value before relying on it"
                     )
@@ -18512,7 +18561,7 @@ def build_browser_tools(
             # A segment the click reached is not exempt: its keys can still land in an earlier segment.
             if (navigated := await _commit_with_tab(page, selector)) is not None:
                 return navigated
-            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group)
+            date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group, echo=not text_is_secret)
             if date_error is not None:
                 return date_error
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
@@ -18522,7 +18571,7 @@ def build_browser_tools(
         # raw text it turns an honest failure into a confident wrong answer on a form we submit.
         why = await _unverifiable_because(page, selector)
         if why:
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"typed into {selector} — {why}, so the typeahead check could not see it and no "
                 "commit was verified; re-observe to confirm the value before relying on it"
             )
@@ -18531,7 +18580,12 @@ def build_browser_tools(
             refused := await _held_value_no_match(page, selector, text, pre_value, echo=not text_is_secret)
         ):
             return refused
-        return ToolResult.ok(f"typed into {selector}")
+        if date_group:
+            # The settle above already read the group back against its own segment values.
+            return ToolResult.ok(f"typed into {selector}")
+        return await _entry_read_back(
+            page, selector, text, variant="text", echo=not text_is_secret, before=pre_value or None
+        )
 
     async def _anchor_typeable(page: Any, selector: str) -> bool:
         # Fail-open on a probe error: a transient evaluate failure must not flip a valid typeahead into
@@ -18728,7 +18782,7 @@ def build_browser_tools(
             # after each step and matching over everything accumulated so far, keyed by TEXT: the
             # virtualiser recycles nodes and `data-tv3-menu` numbers are reassigned 1..N on every scan,
             # so a number from an earlier window is not an identity. Any hit, exact or forward-prefix ("United
-            # States" -> "United States Minor Outlying Islands"), commits only through `_commit_gate` once the walk
+            # States" -> "United States Minor Outlying Islands"), commits only through `match_choice` once the walk
             # has reached the end: a twin, or the exact row a prefix stands in for, may still be below. A label
             # read on two distinct rows (two boxes, or twice in one window) is two rows wearing one text and is
             # refused as ambiguous.
@@ -18806,13 +18860,12 @@ def build_browser_tools(
 
             def _match_seen() -> str | None:
                 twins = _twin_keys()
-                texts = list(
-                    dict.fromkeys(
-                        r.text for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins
-                    )
-                )
-                hit = _match_menu_option(value, [{"n": k, "text": t} for k, t in enumerate(texts)])
-                return texts[hit] if hit is not None else None
+                labels: dict[str, Any] = {}
+                for r in (r for w in log.windows for r in w.rows if r.text and not r.nav and r.key not in twins):
+                    labels.setdefault(r.text, r.read.get("label"))
+                rows = [{"n": k, "text": t, "label": label} for k, (t, label) in enumerate(labels.items())]
+                hit = match_choice(value, rows, complete=True, allow=_choice_tiers(typeahead=False))
+                return hit.text if isinstance(hit, Pick) else None
 
             def _row_n(current: list[dict[str, Any]], text: str) -> int | None:
                 fresh = next((o for o in current if str(o.get("text") or "") == text and not o.get("nav")), None)
@@ -18903,13 +18956,20 @@ def build_browser_tools(
 
             def _verdict(text: str) -> Literal["commit", "ambiguous", "incomplete"]:
                 twins = _twin_keys()
-                return _commit_gate(
-                    text,
-                    value,
-                    complete=complete,
-                    twins_seen=want in twins or _exact_tier_key(text) in twins,
-                    contenders=_value_contenders(value, [r.text for r in _log_rows(log.windows) if not r.nav]),
-                )
+                if want in twins or _exact_tier_key(text) in twins:
+                    return "ambiguous"
+                rows = [
+                    {"n": k, "text": r.text, "label": r.read.get("label")}
+                    for k, r in enumerate(_log_rows(log.windows))
+                    if not r.nav
+                ]
+                choice = match_choice(value, rows, complete=complete, allow=_choice_tiers(typeahead=False))
+                if isinstance(choice, Pick):
+                    # A walk that did not read the whole list may have missed an exact twin, so even EXACT waits.
+                    if choice.text != text:
+                        return "ambiguous"
+                    return "commit" if complete else "incomplete"
+                return "incomplete" if choice.reason == "incomplete" else "ambiguous"
 
             def _result(
                 current: list[dict[str, Any]],
@@ -18978,11 +19038,14 @@ def build_browser_tools(
                 },
             )
 
-        # collapse_duplicates only here: `options` is the COMPLETE, non-overflowed list this call just
-        # read in full, so "several rows matched" can safely be checked for one candidate wearing more
-        # than one face. The scroll-search's own `_match_seen` call below builds rows from an
-        # accumulated, possibly-partial scan and must never collapse on that incomplete evidence.
-        idx = None if overflowed else _match_menu_option(value, options, collapse_duplicates=True)
+        # Collapse only here: `options` is the COMPLETE, non-overflowed list this call just read in full, so
+        # "several rows matched" can safely be checked for one candidate wearing more than one face. The
+        # scroll-search's own `_match_seen` builds rows from an accumulated, possibly-partial scan and never collapses.
+        first = None
+        if not overflowed:
+            first = match_choice(value, options, complete=True, allow=_choice_tiers(typeahead=False), collapse=True)
+            _log_choice("open_pick", first, len(options), value, complete=True, query_full=True)
+        idx = first.n if isinstance(first, Pick) else None
         matched_from_scroll: str | None = None
         scanned_all = False
         if idx is None and overflowed:
@@ -19013,7 +19076,7 @@ def build_browser_tools(
             held = [t for t in row_texts if _exact_tier_key(t) == key]
             if held and n > len(held):
                 row_texts += [held[0]] * (n - len(held))
-        contenders = _value_contenders(value, row_texts)
+        contenders = contender_texts(value, row_texts)
 
         def _ambiguous_error() -> ToolResult:
             named = "; ".join(repr(_model_text(t, 60)) for t in contenders[:15])
@@ -19023,20 +19086,24 @@ def build_browser_tools(
                 error_class="list_ambiguous",
             )
 
-        if idx is not None and matched_from_scroll is None:
-            full_hit = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
-            if (
-                _commit_gate(
-                    full_hit,
-                    value,
-                    # `idx` is only matched over a read that did not overflow.
-                    complete=True,
-                    twins_seen=False,
-                    contenders=_value_contenders(value, [str(o.get("text") or "") for o in _distinct_rows(options)]),
-                )
-                != "commit"
-            ):
-                return _ambiguous_error()
+        if isinstance(first, Refusal) and first.reason == "ambiguous":
+            # The list was read whole and stays open, so each contender is named by its row tag, with what tells
+            # apart rows that share a label.
+            rivals = [dict(o) for o in first.contenders]
+            keys = Counter(_canon_label(str(o.get("text") or "")) for o in rivals)
+
+            def _rival(o: dict[str, Any]) -> str:
+                key = _canon_label(str(o.get("text") or ""))
+                same = [p for p in rivals if _canon_label(str(p.get("text") or "")) == key]
+                suffix = _row_value_suffix(o, same) if keys[key] >= 2 else ""
+                return f'[data-tv3-menu="{o.get("n")}"] {_model_text(o.get("text") or "", 60)!r}{suffix}'
+
+            return ToolResult.error(
+                f"{value!r} is ambiguous in {selector}'s list — it names more than one option "
+                f"({'; '.join(_rival(o) for o in rivals[:15])}); click the intended row by its listed selector, "
+                "or pass the one option's full text",
+                error_class="list_ambiguous",
+            )
 
         async def _popup_filter_pick() -> tuple[int, list[dict[str, Any]]] | ToolResult | None:
             # A list that renders only a fixed window of rows never shows one past it, however it is
@@ -19114,7 +19181,7 @@ def build_browser_tools(
                 except Exception:
                     raw = []
                 read_now = [o for o in raw or [] if isinstance(o, dict) and isinstance(o.get("n"), int)]
-                # The same rule as the unfiltered read. `_commit_gate` commits no row from an incomplete read.
+                # The same rule as the unfiltered read: `match_choice` commits no non-exact row from an incomplete read.
                 window = await _read_list_window(
                     page, read_now, scroller=isinstance(tagged, dict) and bool(tagged.get("scroller"))
                 )
@@ -19188,6 +19255,7 @@ def build_browser_tools(
             still_busy = False
             verdict: str | None = None
             unproven: str | None = None
+            rival_texts: list[str] = []
             # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
             # flight, so the wait ends only past the deadline on a settled, not-busy read.
             soft_deadline = time.monotonic() + 2.4
@@ -19212,27 +19280,36 @@ def build_browser_tools(
                         if [str(o.get("text") or "") for o in filtered] != texts:
                             last = [str(o.get("text") or "") for o in filtered]
                         else:
-                            hit = _match_menu_option(value, filtered, collapse_duplicates=complete) if reacted else None
-                            hit_text = next((str(o.get("text") or "") for o in filtered if o.get("n") == hit), None)
-                            if hit is not None and hit_text is not None:
-                                verdict = _commit_gate(
-                                    hit_text,
-                                    value,
-                                    complete=complete,
-                                    twins_seen=exact_twins,
-                                    contenders=contenders
-                                    + _value_contenders(
-                                        value,
-                                        [
-                                            str(o.get("text") or "")
-                                            for o in _distinct_rows(filtered)
-                                            if not any(_same_row(o, p) for p in evidence_rows)
-                                        ],
-                                    ),
-                                )
-                                if verdict == "commit":
-                                    return hit, filtered
-                                unproven = hit_text if verdict == "incomplete" else None
+                            # Rows read before the filter still compete, each with its own values so a twin is never
+                            # collapsed into a filtered row it is not; numbered below zero, none of them is clicked.
+                            rivals = [
+                                o
+                                for o in evidence_rows
+                                if tier_of(value, o) is not None and not any(_same_row(o, f) for f in filtered)
+                            ]
+                            pool = [
+                                *filtered,
+                                *({**o, "n": -1 - k, "unit": None, "inside": None} for k, o in enumerate(rivals)),
+                            ]
+                            # The filter only narrows the list this call opened, so the open list's tier rules hold.
+                            choice = match_choice(
+                                value,
+                                pool,
+                                complete=complete,
+                                allow=_choice_tiers(typeahead=False),
+                                collapse=complete,
+                            )
+                            _log_choice("popup_filter", choice, len(pool), value, complete=complete)
+                            if reacted and isinstance(choice, Pick) and choice.n >= 0:
+                                if complete:
+                                    return choice.n, filtered
+                                # A filtered list read only in part may hide an exact twin, as on the walk.
+                                verdict, unproven = "incomplete", choice.text
+                                break
+                            if reacted and isinstance(choice, Refusal) and choice.reason != "none":
+                                verdict = "ambiguous" if choice.reason in ("ambiguous", "identical") else "incomplete"
+                                unproven = choice.contenders[0].get("text") if verdict == "incomplete" else None
+                                rival_texts = [str(o.get("text") or "") for o in choice.contenders]
                             break
                 if time.monotonic() >= hard_deadline:
                     break
@@ -19254,9 +19331,10 @@ def build_browser_tools(
                     "the field is NOT filled — pass one option's exact text, or look() and click the option",
                     error_class="filter_not_found",
                 )
-            several = _value_contenders(value, [str(o.get("text") or "") for o in filtered])
+            several = contender_texts(value, [str(o.get("text") or "") for o in filtered])
             if verdict == "ambiguous":
-                several = list(dict.fromkeys(contenders + several))
+                # One entry per contending row: two rows wearing one label are two contenders.
+                several = rival_texts
             if len(several) < 2 or verdict == "incomplete":
                 several = []
             listed = "; ".join(
@@ -19332,9 +19410,11 @@ def build_browser_tools(
                     )
                 vocab = "; ".join(repr(_model_text(o.get("text") or "", 60)) for o in shown)
                 more = f"; +{len(options) - len(shown)} more" if len(options) > len(shown) else ""
+                # Row numbers from earlier windows are not identities, so the nearest rows are named by text only.
+                near = _nearest_sentence(value, options, None, lambda o: "")
                 return ToolResult.error(
                     f"{value!r} matched no option in {selector}'s list — scrolled through all "
-                    f"{len(options)} options ({vocab}{more}); pass one option's exact text",
+                    f"{len(options)} options ({vocab}{more}); pass one option's exact text{f'; {near}' if near else ''}",
                     error_class="list_no_match",
                 )
             listing = "; ".join(
@@ -19369,17 +19449,19 @@ def build_browser_tools(
                 return _identical_text_rows_error(selector, value, same_as_value, menu_open=True)
             listing = "; ".join(_listed_row(o, t) for o, t in zip(shown, shown_canon_texts))
             not_shown = len(options) - len(shown)
+            near = _nearest_sentence(value, options, None, lambda o: f'[data-tv3-menu="{o.get("n")}"] ')
+            near = f"; {near}" if near else ""
             if not_shown > 0:
                 # The match ran over every row the list rendered; only the listing is cut to 15.
                 return ToolResult.error(
                     f"opened {selector} but none of the {len(options)} options the list rendered matched "
                     f"{value!r} (the first {len(shown)}: {listing}) — pick the right one by its "
-                    '[data-tv3-menu="N"] selector, or pass one option\'s exact text',
+                    f'[data-tv3-menu="N"] selector, or pass one option\'s exact text{near}',
                     error_class="list_no_match",
                 )
             return ToolResult.error(
                 f"opened {selector} but no option matched {value!r}; the list shows {listing} — "
-                'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu',
+                f'pick the right one by its [data-tv3-menu="N"] selector, or look() to see the full menu{near}',
                 error_class="list_no_match",
             )
         matched = next((str(o.get("text") or "") for o in options if o.get("n") == idx), value)
@@ -19489,18 +19571,32 @@ def build_browser_tools(
             pre_surface_hit,
         )
         verdict, matches = await _typeahead_commit_verdict(page, selector, committed or None, readable)
-        _log_committed_pick(matched, value, verdict, "open_pick")
+        # The matcher's own decision where it made one; a walk or filter pick is graded under the same switch.
+        tier = (
+            first.tier
+            if isinstance(first, Pick) and first.n == idx
+            else tier_of(
+                value,
+                next((o for o in options if o.get("n") == idx), {"text": matched}),
+                _choice_tiers(typeahead=False),
+            )
+        )
+        _log_committed_pick(matched, value, verdict, "open_pick", tier)
         if verdict is CommitStatus.OK:
-            return ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})")
+            return with_tier_note(
+                ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})"),
+                tier,
+                _model_text(value, 60),
+            )
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
                 "commit could not be verified — re-observe to confirm the value before relying on it"
             )
         if verdict is CommitStatus.UNVERIFIED:
             why = await _unverifiable_because(page, selector)
             if why:
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {matched!r} for {selector}; {why}, so the commit could not be verified — "
                     "re-observe to confirm the value before relying on it"
                 )
@@ -19594,10 +19690,11 @@ def build_browser_tools(
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
             clicked: bool,
+            tier: Tier | None = None,
         ) -> ToolResult:
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
             if clicked:
-                _log_committed_pick(opt_txt, value, verdict, "typeahead")
+                _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -19610,14 +19707,14 @@ def build_browser_tools(
             if not committed and shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {opt_txt!r} for {selector}; the field now shows {shared_surface!r}, which "
                     "cannot be tied to this pick alone, so the commit could not be verified — re-observe "
                     "to confirm the value before relying on it"
                 )
             if verdict is CommitStatus.UNVERIFIED and matches != 1:
                 # INV-1: re-resolved to n≠1 after the click — no stable element to read the commit off.
-                return ToolResult.ok(
+                return unconfirmed_ok(
                     f"selected {opt_txt!r} for {selector}, but it re-resolved to {matches} elements so the "
                     "commit could not be verified — re-observe to confirm the value before relying on it"
                 )
@@ -19626,7 +19723,7 @@ def build_browser_tools(
                 # beyond the verifier, so the read returning nothing is not evidence the value did not commit.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
                         "re-observe to confirm the value before relying on it"
                     )
@@ -19653,6 +19750,7 @@ def build_browser_tools(
                     surface_vouched_pre_click=live_pick.pre_surface_hit,
                     shared_surface=live_pick.shared_surface,
                     clicked=True,
+                    tier=live_pick.tier,
                 )
 
         def _reduced_queries() -> list[str]:
@@ -19723,6 +19821,7 @@ def build_browser_tools(
                         surface_vouched_pre_click=rung_pick.pre_surface_hit,
                         shared_surface=rung_pick.shared_surface,
                         clicked=rung_pick.clicked,
+                        tier=rung_pick.tier,
                     )
                 if rung_pick.candidates:
                     ladder_rung = rung
@@ -19738,6 +19837,7 @@ def build_browser_tools(
                                 rows_unread=bool(rung_pick.overflow),
                                 live_token=live_token,
                                 live_search=rung,
+                                choice=rung_pick.refusal,
                             )
                     return rung_pick.candidates
             return []
@@ -19839,6 +19939,7 @@ def build_browser_tools(
                         note=pick.note,
                         rows_unread=bool(pick.overflow),
                         live_token=live_token,
+                        choice=pick.refusal,
                     )
                     # The field's own text may be uncommitted (an earlier type()), so it is never reported
                     # as a fill — only named, so the caller can judge it.
@@ -19857,7 +19958,7 @@ def build_browser_tools(
                 # note for that reach case first.
                 why = await _unverifiable_because(page, selector)
                 if why:
-                    return ToolResult.ok(
+                    return unconfirmed_ok(
                         f"typed {query or value!r} into {selector}; {why}, so the suggestion list could not be seen "
                         "and no selection was verified — re-observe to confirm the value committed before "
                         "relying on it"
@@ -19939,9 +20040,12 @@ def build_browser_tools(
                         )
                     else:
                         offered_note = ""
+                    near = _nearest_sentence(
+                        value, [{"n": k, "text": t} for k, t in enumerate(offered)], None, lambda o: ""
+                    )
                     message = (
                         f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
-                        f"— do not assume success or move on as if it were{offered_note}"
+                        f"— do not assume success or move on as if it were{offered_note}{f'; {near}' if near else ''}"
                     )
                     if offered:
                         return ToolResult.error(
@@ -19967,14 +20071,19 @@ def build_browser_tools(
                 ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
-            verdict = await _typeahead_verdict_result(
-                pick.suggestion,
-                pick.committed,
-                pick.readable,
-                declared=pick.declared,
-                surface_vouched_pre_click=pick.pre_surface_hit,
-                shared_surface=pick.shared_surface,
-                clicked=pick.clicked,
+            verdict = with_tier_note(
+                await _typeahead_verdict_result(
+                    pick.suggestion,
+                    pick.committed,
+                    pick.readable,
+                    declared=pick.declared,
+                    surface_vouched_pre_click=pick.pre_surface_hit,
+                    shared_surface=pick.shared_surface,
+                    clicked=pick.clicked,
+                    tier=pick.tier,
+                ),
+                pick.tier,
+                _model_text(value, 60),
             )
             # A click the widget ignored leaves the caller's search in the field, which is text the
             # widget never accepted as a value.
@@ -20054,12 +20163,11 @@ def build_browser_tools(
             by_label, asked = True, [label]
             await input_dispatch.select_option(page, selector, label=label, timeout=_ACTION_TIMEOUT_MS, force=force)
         else:
-            by_label, asked = False, ([value] if isinstance(value, str) else [])
+            by_label, asked = False, ([str(value)] if value is not None else [])
             await input_dispatch.select_option(page, selector, value=value, timeout=_ACTION_TIMEOUT_MS, force=force)
-        # A set-valued control is read back whether or not it was forced: without it a call that
-        # discarded every prior selection reports the same bare success as one that added to them.
-        if not force and not is_multi:
-            return ToolResult.ok(f"selected on {selector}")
+        # Every select is read back: a page handler can refuse or reset a choice, and a set-valued control's call
+        # that discarded every prior selection otherwise reports the same bare success as one that added to them.
+        record_entry_variant("select_native_multiple" if is_multi else "select_native")
         try:
             readback = await page.evaluate(_SELECT_READBACK_JS, await _probe_arg(page, selector))
         except Exception:
@@ -20082,10 +20190,12 @@ def build_browser_tools(
                 # selects a duplicate-valued sibling leaves the control holding two options the form
                 # will submit twice, and comparing two sets reports that exact. Asking for the same
                 # option twice is still one request, so the ask is deduped rather than both sides.
-                committed_value = sorted(held) == sorted(set(expected))
+                committed_value = len(held) == len(set(expected)) and all(
+                    _selected_answers(readback, e, by_label) for e in set(expected)
+                )
             else:
                 post = {"value": value_read}
-                committed_value = readback.get("selectedLabel") == label if label is not None else value_read == value
+                committed_value = bool(asked) and _selected_answers(readback, asked[0], by_label)
         matches = await _post_match_count(page, selector)
         verdict = _classify_commit(None, matches, post, committed_value=committed_value)
         if verdict is CommitStatus.DID_NOT_COMMIT:
@@ -20094,11 +20204,19 @@ def build_browser_tools(
                     f"select on {selector} did NOT commit the requested set: asked for "
                     f"{_selection_report(expected)}, it now holds {_selection_report(held)} — one call "
                     "REPLACES the whole selection, so pass every option "
-                    "you want held in a single call via `values` or `labels`"
+                    "you want held in a single call via `values` or `labels`",
+                    error_class="did_not_commit",
+                )
+            if force:
+                return ToolResult.error(
+                    f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
+                    "widget may not sync from its hidden control; re-observe and act on the visible proxy instead",
+                    error_class="did_not_commit",
                 )
             return ToolResult.error(
-                f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
-                "widget may not sync from its hidden control; re-observe and act on the visible proxy instead"
+                f"select on {selector} did NOT commit: it reads {value_read!r} afterwards, not the option asked "
+                "for — the page may have refused or reset the choice; re-observe before retrying",
+                error_class="did_not_commit",
             )
         if verdict is CommitStatus.UNVERIFIED:
             reason = (
@@ -20106,7 +20224,7 @@ def build_browser_tools(
                 if post is None
                 else f"it re-resolved to {matches} elements afterwards"
             )
-            return ToolResult.ok(
+            return unconfirmed_ok(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
             )
@@ -20114,7 +20232,9 @@ def build_browser_tools(
             return ToolResult.ok(
                 f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
             )
-        return ToolResult.ok(f"selected on {selector} (hidden native select, set directly)")
+        return ToolResult.ok(
+            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}"
+        )
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()

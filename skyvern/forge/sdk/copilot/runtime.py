@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -54,11 +54,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotEntry,
     ViewportFrame,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
-    origin_runs_bound_to_scrubber,
-    register_matching_origin_run_redaction_values,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
@@ -146,7 +142,6 @@ class OriginRunRedactionRegistry:
     parameters: Mapping[str, Any]
     contains_sensitive_values: bool
     contains_all_sensitive_values: bool
-    contains_all_static_sensitive_values: bool = True
     awaiting_runtime_secret_values: bool = False
     artifact_parameters: Mapping[str, Any] = field(default_factory=dict)
 
@@ -431,11 +426,6 @@ class AttachedBrowserDriver:
     browser_state: BrowserState
 
 
-class PendingTaintSource(NamedTuple):
-    page: Page
-    url: str
-
-
 @dataclass
 class AgentContext:
     organization_id: str
@@ -465,6 +455,7 @@ class AgentContext:
     # True only while a card is on screen. credential_pause_used stays true for the rest of the
     # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
     credential_ask_in_flight: bool = False
+    credential_pause_used: bool = False
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
@@ -693,15 +684,13 @@ class AgentContext:
     scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
     credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_code_host: BrowserCodeHost = field(default_factory=BrowserCodeHost)
-    # Serializes model-visible browser evidence commits with sensitive-run custody changes. Raw
-    # browser work may overlap, but a post-hook or native credential fill owns this lock while it
-    # decides whether its facts are admissible, so rollback cannot erase another call's evidence.
-    browser_page_custody_locks_by_session_id: dict[str, asyncio.Lock] = field(default_factory=dict)
+    # One lock per browser session: the model can issue parallel tool calls, and two of them acting on
+    # the same page at once interleave their clicks, reads and evidence.
+    browser_session_locks_by_session_id: dict[str, asyncio.Lock] = field(default_factory=dict)
+    # Serializes model-visible browser evidence commits. Raw browser work may overlap, but a post-hook
+    # or native credential fill owns this lock while it commits, so rollback cannot erase another
+    # call's evidence.
     browser_evidence_commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # A tainted page cannot be released by fresh navigation while its sensitive workflow run still
-    # owns the same browser. Paused runs retain this lease until a terminal result is observed.
-    active_sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
-    active_sensitive_origin_run_sessions: dict[str, str] = field(default_factory=dict)
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
     vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
@@ -727,10 +716,6 @@ class AgentContext:
     frontier_origin_output_refusal: OriginOutputRefusalDetail | None = None
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
-    # The withheld page's URL, read before a navigation meant to leave it, keyed by the browser the
-    # call acts in so concurrent calls on different browsers cannot read each other's. Compared to
-    # the result to tell a fresh document from a fragment hop; never recorded or returned.
-    pending_taint_sources: dict[str, PendingTaintSource] = field(default_factory=dict)
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
     pending_scout_input_value: str | None = None
     # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
@@ -793,15 +778,12 @@ class AgentContext:
     secret_scrub_values: list[str] = field(default_factory=list)
     codeblock_redaction_parameters: dict[str, Any] = field(default_factory=dict)
     origin_run_redaction_registry: OriginRunRedactionRegistry | None = None
-    # Browser session whose current page may contain values entered by a sensitive inline run.
-    # This is mutable page custody, separate from the immutable run redaction registry: only a
-    # successful fresh navigation of this exact session clears it.
-    sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
-    # Which run tainted which session, and which runs have had their complete registry bound to
-    # the scrubber. A session's facts are disclosed only when every run that tainted it is bound,
-    # because the registry describes one run while a page can hold values from several.
-    sensitive_origin_run_sessions: dict[str, str] = field(default_factory=dict)
-    origin_runs_bound_to_scrubber: set[str] = field(default_factory=set)
+    # Browsers a run carrying secrets executed in this turn. Only run_browser_code reads it, to keep
+    # screenshots, scripts and fetches (ways to carry a value off the page) out of its cells there.
+    secret_run_browser_session_ids: set[str] = field(default_factory=set)
+    # Keyed by (browser session, run): how to fetch the secrets that run has not handed over yet. A run
+    # that paused or was stopped at the ceiling returns before the worker publishes them.
+    awaited_run_secret_handoffs: dict[tuple[str, str], Callable[[], Awaitable[None]]] = field(default_factory=dict)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -996,41 +978,47 @@ def raw_secret_browser_denied(ctx: AgentContext) -> bool:
     return ctx.request_policy is not None and ctx.request_policy.raw_secret_detected
 
 
-SENSITIVE_ORIGIN_PAGE_ERROR = (
-    "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
-    "a successful fresh navigation makes browser inspection available again."
-)
-SENSITIVE_ORIGIN_MULTI_TAB_ERROR = (
-    "This browser is unavailable after a run with sensitive inputs: the navigation replaced this tab's page, but "
-    "{open_tabs} are open and the other tabs may still show that run's page. skyvern_tab_close works while "
-    "the browser is unavailable; close the other tabs{other_tabs}, highest index first since indexes shift "
-    "after each close, then navigate this tab to a URL other than the one it now shows."
-)
-SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR = (
-    "This browser page is unavailable while a run with sensitive inputs is active. Wait for that run to finish and "
-    "call get_run_results; then navigate to a specific named URL to make browser inspection available again."
-)
-
-
-def sensitive_origin_page_is_tainted(ctx: AgentContext) -> bool:
-    tainted_session_ids: set[str] = getattr(ctx, "sensitive_origin_browser_session_ids", set())
-    if not tainted_session_ids:
-        return False
-    return effective_browser_session_id(ctx) in tainted_session_ids
-
-
-def browser_page_custody_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
-    """Return the per-turn lock that makes sensitive-page custody and evidence commits atomic."""
+def browser_session_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
     lock_key = session_id or effective_browser_session_id(ctx) or "__unbound_browser_session__"
-    locks = getattr(ctx, "browser_page_custody_locks_by_session_id", None)
+    locks = getattr(ctx, "browser_session_locks_by_session_id", None)
     if not isinstance(locks, dict):
         locks = {}
-        ctx.browser_page_custody_locks_by_session_id = locks
+        ctx.browser_session_locks_by_session_id = locks
     lock = locks.get(lock_key)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         locks[lock_key] = lock
     return lock
+
+
+class RunSecretsNotRegistered(RuntimeError):
+    def __init__(self, workflow_run_id: str) -> None:
+        self.workflow_run_id = workflow_run_id
+        super().__init__(
+            f"Test run {workflow_run_id} used a one-time code or a secret resolved only inside the run in this "
+            "browser, and has not handed those values over yet, so this browser cannot be read or driven without "
+            "risking them. Nothing was done. The run hands them over when it reaches a final status "
+            "(`get_run_results` shows it); this call works after that. If the run has already finished and this "
+            "keeps failing, the handoff was lost: this browser stays withheld for the rest of the turn, and other "
+            "browsers are not affected."
+        )
+
+
+@asynccontextmanager
+async def browser_session_turn(ctx: AgentContext, *, session_id: str | None = None) -> AsyncIterator[None]:
+    """Hold a browser for one tool call, first registering any secrets its runs still owed so the
+    call's result is scrubbed of them. A run that still owes them after that retry withholds the call."""
+    async with browser_session_lock(ctx, session_id=session_id):
+        handoffs = getattr(ctx, "awaited_run_secret_handoffs", None)
+        if isinstance(handoffs, dict):
+            held_session_id = session_id or effective_browser_session_id(ctx) or ""
+            for owed, settle in list(handoffs.items()):
+                if owed[0] != held_session_id:
+                    continue
+                await settle()
+                if owed in handoffs:
+                    raise RunSecretsNotRegistered(owed[1])
+        yield
 
 
 def browser_evidence_commit_lock(ctx: AgentContext) -> asyncio.Lock:
@@ -1039,111 +1027,6 @@ def browser_evidence_commit_lock(ctx: AgentContext) -> asyncio.Lock:
         lock = asyncio.Lock()
         ctx.browser_evidence_commit_lock = lock
     return lock
-
-
-def active_sensitive_origin_page_sessions(ctx: AgentContext) -> set[str]:
-    active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
-    if not isinstance(active_session_ids, set):
-        active_session_ids = set()
-        ctx.active_sensitive_origin_browser_session_ids = active_session_ids
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        active_run_sessions = {}
-        ctx.active_sensitive_origin_run_sessions = active_run_sessions
-    active_session_ids.update(session_id for session_id in active_run_sessions.values() if session_id)
-    return active_session_ids
-
-
-def register_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str, session_id: str) -> None:
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        active_run_sessions = {}
-        ctx.active_sensitive_origin_run_sessions = active_run_sessions
-    active_run_sessions[workflow_run_id] = session_id
-    active_sensitive_origin_page_sessions(ctx).add(session_id)
-
-
-def release_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str) -> None:
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        return
-    released_session_id = active_run_sessions.pop(workflow_run_id, None)
-    if released_session_id and released_session_id not in active_run_sessions.values():
-        active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
-        if isinstance(active_session_ids, set):
-            active_session_ids.discard(released_session_id)
-
-
-def sensitive_origin_page_has_active_run(ctx: AgentContext) -> bool:
-    active_session_ids = active_sensitive_origin_page_sessions(ctx)
-    if not active_session_ids:
-        return False
-    return effective_browser_session_id(ctx) in active_session_ids
-
-
-def record_sensitive_origin_run_taint(ctx: AgentContext, *, workflow_run_id: str, session_id: str) -> None:
-    tainted_session_ids = getattr(ctx, "sensitive_origin_browser_session_ids", None)
-    if not isinstance(tainted_session_ids, set):
-        tainted_session_ids = set()
-        ctx.sensitive_origin_browser_session_ids = tainted_session_ids
-    tainted_session_ids.add(session_id)
-    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
-    if not isinstance(run_sessions, dict):
-        run_sessions = {}
-        ctx.sensitive_origin_run_sessions = run_sessions
-    run_sessions[workflow_run_id] = session_id
-    # The page this run left is the one the next navigation must be judged against, not one an
-    # earlier hold on the same browser read.
-    ctx.pending_taint_sources.pop(session_id, None)
-
-
-def sensitive_origin_runs_for_session(ctx: AgentContext, session_id: str | None) -> set[str]:
-    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
-    if not isinstance(run_sessions, dict) or session_id is None:
-        return set()
-    return {run_id for run_id, tainted_session_id in run_sessions.items() if tainted_session_id == session_id}
-
-
-def sensitive_origin_page_facts_withheld(ctx: AgentContext, run_id: str | None) -> bool:
-    """Whether a tainted page's structured facts stay withheld.
-
-    Disclosure needs no run active on the page, the claimed run's complete registry bound to the
-    scrubber, and the same for every other run that tainted this page: a run that ended without
-    completing its registry may have left values the scrubber never saw.
-    Answering False binds the claimed run's values to the scrubber as a side effect, which is what
-    lets the caller scrub the facts it is about to return; do not skip or reorder the call.
-    Frames are never licensed by this: pixels cannot be exact-value scrubbed.
-    """
-    if sensitive_origin_page_has_active_run(ctx):
-        return True
-    if not sensitive_origin_page_is_tainted(ctx):
-        return False
-    if not run_id or not register_matching_origin_run_redaction_values(ctx, run_id):
-        return True
-    tainting_run_ids = sensitive_origin_runs_for_session(ctx, effective_browser_session_id(ctx))
-    return not tainting_run_ids <= origin_runs_bound_to_scrubber(ctx)
-
-
-def navigation_document(url: str) -> str:
-    """The URL without its fragment: a fragment-only change is a same-document navigation."""
-    return urlsplit(url)._replace(fragment="").geturl()
-
-
-def navigation_replaced_document(source_url: str | None, result_url: str | None) -> bool:
-    """Whether a navigation left the document it started on. Unknown URLs never count as leaving."""
-    if not isinstance(source_url, str) or not isinstance(result_url, str) or not source_url or not result_url:
-        return False
-    return navigation_document(result_url) != navigation_document(source_url)
-
-
-async def clear_sensitive_origin_page_taint_after_navigation(
-    ctx: AgentContext, *, source_url: str | None, result_url: str | None
-) -> bool:
-    """Lift the withholding only when the navigation replaced the sensitive document; fragment hops
-    and unknown URLs keep it, since the DOM that must not be read is still up."""
-    if not navigation_replaced_document(source_url, result_url):
-        return False
-    return await clear_sensitive_origin_page_taint(ctx)
 
 
 async def live_working_page(ctx: AgentContext) -> Page | None:
@@ -1158,66 +1041,6 @@ async def live_working_page(ctx: AgentContext) -> Page | None:
         return await browser_state.get_working_page(prune_excess_pages=False)
     except Exception:
         return None
-
-
-async def live_working_page_url(ctx: AgentContext) -> str | None:
-    page = await live_working_page(ctx)
-    return page.url if page is not None and isinstance(page.url, str) else None
-
-
-async def stage_pending_taint_source(ctx: AgentContext) -> None:
-    """Before a navigation on a withheld browser, keep the working page's URL as what the result is
-    judged against; a source read from another page (since closed or left) is replaced."""
-    session_id = effective_browser_session_id(ctx)
-    if not session_id:
-        return
-    page = await live_working_page(ctx)
-    if page is None or not isinstance(page.url, str):
-        # An unreadable page must not leave a source read from another tab to judge this navigation.
-        ctx.pending_taint_sources.pop(session_id, None)
-        return
-    staged = ctx.pending_taint_sources.get(session_id)
-    if staged is None or staged.page is not page:
-        ctx.pending_taint_sources[session_id] = PendingTaintSource(page=page, url=page.url)
-
-
-def pending_taint_source_url(ctx: AgentContext) -> str | None:
-    staged = ctx.pending_taint_sources.get(effective_browser_session_id(ctx) or "")
-    return None if staged is None else staged.url
-
-
-@dataclass(frozen=True, slots=True)
-class BrowserTabInventory:
-    open_tabs: int
-    # Positions in the browser's own page list, the index space skyvern_tab_close accepts, highest
-    # first: the list compacts on every close, so closing in this order keeps the rest valid.
-    other_tab_indexes: tuple[int, ...]
-
-
-async def browser_tab_inventory(ctx: AgentContext) -> BrowserTabInventory | None:
-    """Every open page of the browser context, blank and non-web tabs included since the tab tools can
-    switch to them, or None when the browser cannot be read."""
-    session_id = effective_browser_session_id(ctx)
-    if not session_id:
-        return None
-    try:
-        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
-        if browser_state is None or browser_state.browser_context is None:
-            return None
-        active = await browser_state.get_working_page(prune_excess_pages=False)
-        pages = list(browser_state.browser_context.pages)
-        open_indexes = [index for index, page in enumerate(pages) if not page.is_closed()]
-        return BrowserTabInventory(
-            open_tabs=len(open_indexes),
-            other_tab_indexes=tuple(index for index in reversed(open_indexes) if pages[index] is not active),
-        )
-    except Exception:
-        return None
-
-
-async def browser_open_tab_count(ctx: AgentContext) -> int | None:
-    inventory = await browser_tab_inventory(ctx)
-    return None if inventory is None else inventory.open_tabs
 
 
 async def tab_switch_refusal(ctx: AgentContext, *, tab_id: str | None, index: int | None) -> str | None:
@@ -1260,35 +1083,6 @@ async def browser_valid_tab_count(ctx: AgentContext) -> int | None:
         return len(await browser_state.list_valid_pages(0))
     except Exception:
         return None
-
-
-async def sensitive_origin_multi_tab_error(ctx: AgentContext) -> str:
-    inventory = await browser_tab_inventory(ctx)
-    if inventory is None:
-        return SENSITIVE_ORIGIN_MULTI_TAB_ERROR.format(open_tabs="an unknown number of tabs", other_tabs="")
-    indexes = ", ".join(str(index) for index in inventory.other_tab_indexes)
-    return SENSITIVE_ORIGIN_MULTI_TAB_ERROR.format(
-        open_tabs=f"{inventory.open_tabs} tabs", other_tabs=f" (index {indexes})" if indexes else ""
-    )
-
-
-async def clear_sensitive_origin_page_taint(ctx: AgentContext) -> bool:
-    """The taint is session-wide but one navigation replaces one tab's document, so it lifts only
-    once the browser is down to that single tab; an unreadable browser keeps it (fail closed)."""
-    session_id = effective_browser_session_id(ctx)
-    active_session_ids = active_sensitive_origin_page_sessions(ctx)
-    if session_id is None or session_id in active_session_ids:
-        return False
-    open_tabs = await browser_open_tab_count(ctx)
-    if open_tabs != 1:
-        return False
-    ctx.sensitive_origin_browser_session_ids.discard(session_id)
-    run_sessions = getattr(ctx, "sensitive_origin_run_sessions", None)
-    if isinstance(run_sessions, dict):
-        for run_id in sensitive_origin_runs_for_session(ctx, session_id):
-            run_sessions.pop(run_id, None)
-    ctx.pending_taint_sources.pop(session_id, None)
-    return True
 
 
 async def resolve_browser_state_for_context(
@@ -2205,7 +1999,7 @@ async def _browser_session_is_studio_pane(ctx: AgentContext, session_id: str) ->
 async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacement | BuildTestConnectFailure:
     """Retire the chat's browser and provision a new one, keeping the old one when the new one cannot start."""
     async with (
-        browser_page_custody_lock(ctx, session_id=ctx.browser_session_id),
+        browser_session_lock(ctx, session_id=ctx.browser_session_id),
         browser_evidence_commit_lock(ctx),
         browser_session_recovery(ctx),
     ):

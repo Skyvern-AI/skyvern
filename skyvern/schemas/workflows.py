@@ -37,7 +37,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
@@ -1232,12 +1232,35 @@ class SendEmailBlockYAML(BlockYAML):
     custom_smtp_port: int | None = Field(default=None, ge=1, le=65535)
     custom_smtp_username: str | None = None
     custom_smtp_password: str | None = None
-    sender: str
+    sender: str = Field(default="", description="From address. Required unless transport is 'gmail'.")
     recipients: list[str]
     subject: str
     body: str
     body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] | None = None
+    transport: EmailTransport | None = Field(
+        default=None,
+        description="How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named "
+        "by credential_id; sender and the SMTP settings are then unused.",
+    )
+    credential_id: str | None = Field(
+        default=None,
+        description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+    )
+    cc: list[str] = Field(default_factory=list, description="Cc recipients. Only with transport 'gmail'.")
+    bcc: list[str] = Field(default_factory=list, description="Bcc recipients. Only with transport 'gmail'.")
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> "SendEmailBlockYAML":
+        if self.transport == EmailTransport.GMAIL:
+            custom_smtp_text = (self.custom_smtp_host, self.custom_smtp_username, self.custom_smtp_password)
+            if self.custom_smtp_port is not None or any(value and value.strip() for value in custom_smtp_text):
+                raise ValueError("custom SMTP settings cannot be combined with the gmail transport")
+        elif "sender" not in self.model_fields_set:
+            raise ValueError("sender is required unless the transport is gmail")
+        elif any(entry.strip() for entry in (*self.cc, *self.bcc)):
+            raise ValueError("cc and bcc are only supported with the gmail transport")
+        return self
 
 
 class FileParserBlockYAML(BlockYAML):

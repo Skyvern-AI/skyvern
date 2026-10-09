@@ -13,8 +13,10 @@ import structlog
 import yaml
 from pydantic import JsonValue
 
+from skyvern.cli.core.guards import VALID_WAIT_UNTIL
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
-from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS
+from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFAULT_DIRECT_ACTION_TIMEOUT_MS
+from skyvern.cli.mcp_tools.blocks import CODE_BLOCK_RUNTIME_TOPIC, WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
@@ -60,27 +62,15 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_path
 from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     browser_valid_tab_count,
-    clear_sensitive_origin_page_taint_after_navigation,
-    live_working_page_url,
-    navigation_replaced_document,
-    pending_taint_source_url,
-    sensitive_origin_multi_tab_error,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
-    stage_pending_taint_source,
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    register_matching_origin_run_redaction_values,
     registered_scrub_values,
     scrub_secrets_from_structure,
 )
@@ -90,6 +80,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     OPEN_PAGE_HELPER_CONTRACT,
     open_page_cap_reached,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.schemas.workflows import TaskBlockYAML
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
@@ -173,33 +165,10 @@ from .scouting import (
 LOG = structlog.get_logger()
 
 
-def _sensitive_origin_page_refusal(ctx: AgentContext) -> dict[str, Any] | None:
-    if not sensitive_origin_page_is_tainted(ctx):
-        return None
-    return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-
-
-def _sensitive_origin_page_action_refusal(ctx: AgentContext) -> dict[str, Any] | None:
-    """Refuse an action only while the page's facts cannot be scrubbed on the terminal-run route."""
-    if not sensitive_origin_page_facts_withheld(ctx, getattr(ctx, "last_run_blocks_workflow_run_id", None)):
-        return None
-    return _sensitive_origin_page_refusal(ctx)
-
-
-async def _sensitive_origin_page_pre_hook(
-    _params: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any] | None:
-    return _sensitive_origin_page_refusal(ctx)
-
-
 async def _tab_new_pre_hook(
     _params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    refusal = _sensitive_origin_page_refusal(ctx)
-    if refusal is not None:
-        return refusal
     open_tabs = await browser_valid_tab_count(ctx)
     if open_tabs is not None and open_page_cap_reached(open_tabs):
         return {
@@ -212,20 +181,10 @@ async def _tab_new_pre_hook(
     return None
 
 
-async def _sensitive_origin_page_action_pre_hook(
-    _params: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any] | None:
-    return _sensitive_origin_page_action_refusal(ctx)
-
-
 async def _tab_switch_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    refusal = _sensitive_origin_page_refusal(ctx)
-    if refusal is not None:
-        return refusal
     raw_index = params.get("index")
     index: int | None = None
     if isinstance(raw_index, int):
@@ -235,23 +194,6 @@ async def _tab_switch_pre_hook(
     raw_tab_id = params.get("tab_id")
     error = await tab_switch_refusal(ctx, tab_id=raw_tab_id if isinstance(raw_tab_id, str) else None, index=index)
     return {"ok": False, "error": error} if error else None
-
-
-async def _tab_close_pre_hook(
-    _params: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any] | None:
-    if sensitive_origin_page_has_active_run(ctx):
-        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-    return None
-
-
-async def _sensitive_origin_page_post_hook(
-    result: dict[str, Any],
-    _raw: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any]:
-    return _sensitive_origin_page_refusal(ctx) or result
 
 
 def _selector_from_tool_data(data: dict[str, Any], *, prefer_resolved_when_empty: bool = False) -> str:
@@ -444,7 +386,7 @@ async def _get_block_schema_pre_hook(
             "ok": True,
             "data": {
                 "block_type": "task",
-                "summary": "Run a general browser task with the Task V3 engine.",
+                "summary": AGENT_FAMILY_BLOCK_SUMMARIES["task"],
                 "schema": _task_v3_pure_schema(TaskBlockYAML.model_json_schema()),
                 "agent_block_guidance": _agent_block_schema_guidance(),
             },
@@ -518,6 +460,18 @@ async def _validate_block_pre_hook(
         "error": _authoring_violation_reject_message(violations, ctx),
         "data": {"violations": [violation.as_dict() for violation in violations]},
     }
+
+
+async def _validate_block_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    # A valid `task` block's only server warning calls the type deprecated, which is false where it is authorable.
+    if isinstance(data, dict) and data.get("block_type") == "task" and "task" not in _copilot_banned_block_types(ctx):
+        result.pop("warnings", None)
+    return result
 
 
 PUBLISH_FILE_HELPER_CONTRACT: dict[str, Any] = {
@@ -756,9 +710,34 @@ def _agent_block_schema_guidance() -> list[str]:
     return [
         _ENGINE_FIELD_DESCRIPTION,
         "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
-        "Use `loop_over_parameter_key` for for_loop input and explicit `jinja2_template` criteria for conditional or while_loop control flow.",
+        "Use explicit `jinja2_template` criteria for conditional or while_loop control flow.",
         "task_v2, free-form for_loop inputs, prompt control-flow criteria, and download-gated validation are unavailable.",
     ]
+
+
+# The shared section bans `task` and points at navigation/extraction. Every authoring capability either
+# allows `task` or bans those two, so the section is false on every Copilot turn.
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+
+
+async def _get_workflow_knowledge_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    topics = params.get("topics")
+    if not isinstance(topics, list):
+        return None
+    kept = [
+        topic
+        for topic in topics
+        if not (isinstance(topic, str) and topic.strip().lower() == _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
+    ]
+    if kept:
+        params["topics"] = kept
+    elif topics:
+        # The server lists the catalog when topics is absent, which beats an empty sections object.
+        del params["topics"]
+    return None
 
 
 async def _get_workflow_knowledge_post_hook(
@@ -768,6 +747,11 @@ async def _get_workflow_knowledge_post_hook(
 ) -> dict[str, Any]:
     capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
+    if isinstance(data, dict):
+        catalog = data.get("topics")
+        if isinstance(catalog, list) and _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC in catalog:
+            catalog.remove(_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
+            data["count"] = len(catalog)
     sections = data.get("sections") if isinstance(data, dict) else None
     if not isinstance(sections, dict):
         return result
@@ -889,9 +873,6 @@ async def _evaluate_pre_hook(
     # call's post-hook to consume.
     ctx.pending_scout_read_expression = None
     ctx.pending_scout_read_output_path = None
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     raw_expression = params.get("expression")
     if isinstance(raw_expression, str) and raw_expression.strip():
         ctx.pending_scout_read_expression = raw_expression
@@ -904,14 +885,14 @@ async def _evaluate_pre_hook(
 async def _screenshot_pre_hook(_params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     if ctx.codeblock_redaction_parameters:
         return {"ok": False, "error": "Screenshots are unavailable during the code block AI fallback."}
-    return _sensitive_origin_page_refusal(ctx)
+    return None
 
 
 async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
     intent = params.get("intent")
     if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
         return {"ok": False, "error": "AI-assisted scrolling is unavailable during the code block AI fallback."}
-    return _sensitive_origin_page_action_refusal(ctx)
+    return None
 
 
 def _code_only_has_target_page_evidence(data: object) -> bool:
@@ -950,9 +931,6 @@ async def _click_pre_hook(
     ctx.pending_scout_click_records = []
     ctx.pending_scout_click_pre_frame = None
     _release_scout_challenge_listeners(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
     await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
@@ -978,9 +956,6 @@ async def _type_text_pre_hook(
 ) -> dict[str, Any] | None:
     _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     text = params.get("text")
     selector = str(params.get("selector") or "")
@@ -1007,9 +982,6 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     await _capture_scout_pre_action(ctx, params.get("selector", ""))
     return None
@@ -1019,9 +991,6 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     await _capture_scout_source_url(ctx)
     await _capture_scout_pre_action(ctx, params.get("selector"))
     return None
@@ -1112,27 +1081,10 @@ async def _navigate_post_hook_body(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_origin_page_was_tainted = sensitive_origin_page_is_tainted(ctx)
-    captured_source_url = _consume_scout_source_url(ctx)
-    source_url = None if sensitive_origin_page_was_tainted else captured_source_url
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
-        # Raw against raw: `result["url"]` is already secret-scrubbed, so against the raw before-URL a
-        # fragment hop on a page whose URL holds a registered value would differ only by the redaction.
-        if sensitive_origin_page_was_tainted:
-            # The staged source outlives a hold: the sensitive document stays what the next navigation
-            # is judged against, or re-navigating to this page after closing the tabs never lifts.
-            taint_source_url = pending_taint_source_url(ctx)
-            live_url = await live_working_page_url(ctx)
-            if not await clear_sensitive_origin_page_taint_after_navigation(
-                ctx, source_url=taint_source_url, result_url=live_url
-            ):
-                # Still withheld, so not even the URL goes back; the code tool and the navigating
-                # inspection refuse the same way. Which hold it is decides what the model can do next.
-                if navigation_replaced_document(taint_source_url, live_url):
-                    return {"ok": False, "error": await sensitive_origin_multi_tab_error(ctx)}
-                return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         _record_scouted_interaction(
             ctx,
             tool_name="navigate_browser",
@@ -1152,7 +1104,7 @@ async def _navigate_post_hook_body(
         )
         read_guidance = _NAVIGATE_READ_GUIDANCE.format(readers=readers) if readers else ""
         result["next_step"] = f"Page loaded.{attached}{read_guidance}"
-    elif not sensitive_origin_page_was_tainted:
+    else:
         await _capture_post_interaction_screenshot(
             ctx,
             source_tool="navigate_browser",
@@ -1165,13 +1117,6 @@ async def _navigate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    if sensitive_origin_page_has_active_run(ctx):
-        ctx.pending_scout_source_url = None
-        return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-    if sensitive_origin_page_is_tainted(ctx):
-        ctx.pending_scout_source_url = None
-        await stage_pending_taint_source(ctx)
-        return None
     await _capture_scout_source_url(ctx)
     await _arm_scout_challenge_listener(ctx)
     return None
@@ -1182,9 +1127,6 @@ async def _wait_for_either_state_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     data = result.get("data")
     if not isinstance(data, dict):
         return result
@@ -1212,9 +1154,6 @@ async def _screenshot_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
@@ -1256,9 +1195,6 @@ async def _click_post_hook_body(
     failed_with_selector = False
     success_summary_evidence: dict[str, Any] | None = None
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
     ctx.pending_scout_role_name = None
@@ -1599,10 +1535,6 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        ctx.pending_scout_input_value = None
-        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -1848,14 +1780,8 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     ctx.scout_observation_contract = None
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    matching_registry_is_scrubbable = register_matching_origin_run_redaction_values(ctx)
-    if sensitive_page_refusal is not None:
-        ctx.pending_scout_read_expression = None
-        ctx.pending_scout_read_output_path = None
-        return sensitive_page_refusal
-    if matching_registry_is_scrubbable:
-        result = scrub_secrets_from_structure(ctx, result)
+    # Scrubbed before anything below records the read into the scout trajectory.
+    result = scrub_secrets_from_structure(ctx, result)
     data = result.get("data")
     if not result.get("ok") or not isinstance(data, dict) or not data:
         return result
@@ -1952,9 +1878,6 @@ async def _scroll_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -1972,9 +1895,6 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -2055,9 +1975,6 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    sensitive_page_refusal = _sensitive_origin_page_action_refusal(ctx)
-    if sensitive_page_refusal is not None:
-        return sensitive_page_refusal
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = getattr(ctx, "pending_scout_role_name", None)
     ctx.pending_scout_role_name = None
@@ -2312,12 +2229,14 @@ def _workflow_schedule_overlay(
     description: str,
     *,
     hide_params: frozenset[str] = frozenset(),
+    param_patches: dict[str, dict[str, Any]] | None = None,
     pre_hook: PreHook | None = None,
     mutates: bool = True,
 ) -> SchemaOverlay:
     return SchemaOverlay(
         description=description,
         hide_params=hide_params | {"workflow_permanent_id"},
+        param_patches=param_patches or {},
         binds_chat_workflow=True,
         requires_run_authority=mutates,
         pre_hook=pre_hook,
@@ -2340,19 +2259,28 @@ _CREATE_BROWSER_PROFILE_DESCRIPTION = (
 )
 _EVALUATE_DESCRIPTION = (
     "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
-    "values. JavaScript run here can also change the page, but only click, type_text, select_option "
-    "and press_key record a scouted interaction, so a change made through this tool leaves nothing to "
-    "author from -- act with those tools and read with this one."
+    "values. JavaScript run here can also change the page, but this tool records no scouted interaction, "
+    "so a change made through it leaves nothing to author from -- act with the browser action tools and "
+    "read with this one."
 )
-_WORKFLOW_KNOWLEDGE_DESCRIPTION = (
-    "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
-    "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
-    "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
-    "choosing_a_block, common_patterns, best_practices, and code_block_runtime (the builtins, module "
-    "shims, and helpers a code block's Python may use); omit topics to list every available ID. "
-    "Request only the relevant sections. For exact fields of a specific block type, use "
-    "get_block_schema instead."
-)
+_WORKFLOW_KNOWLEDGE_TOPIC_IDS = [
+    *(topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC),
+    CODE_BLOCK_RUNTIME_TOPIC,
+]
+_WORKFLOW_KNOWLEDGE_TOPICS_PATCH: dict[str, Any] = {
+    "anyOf": [
+        {"type": "array", "items": {"type": "string", "enum": _WORKFLOW_KNOWLEDGE_TOPIC_IDS}},
+        {"type": "null"},
+    ],
+    "description": "Knowledge topic IDs to retrieve. Omit to list every topic.",
+}
+_ACTION_TIMEOUT_PATCH: dict[str, Any] = {
+    "description": (
+        "Max time to wait for the element in ms. "
+        f"Defaults to {DEFAULT_DIRECT_ACTION_TIMEOUT_MS} for deterministic selector-only/direct calls and "
+        f"{DEFAULT_ACTION_TIMEOUT_MS} for AI/fallback paths."
+    )
+}
 
 _EVALUATE_OVERLAY_TIMEOUT_SECONDS = outer_cap_seconds(DEFAULT_ACTION_TIMEOUT_MS)
 
@@ -2363,6 +2291,21 @@ def _normalized_authoring_capability(
     if isinstance(capability, AuthoringCapability):
         return capability
     return authoring_capability_from_policy(capability)
+
+
+def _workflow_knowledge_description(capability: AuthoringCapability) -> str:
+    topics_lead = (
+        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, and helpers a code block's Python may "
+        "use; omit"
+        if capability.code_blocks
+        else "Omit"
+    )
+    return (
+        "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
+        "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
+        f"{topics_lead} topics to list every available ID. Request only the relevant sections. For exact fields of a "
+        "specific block type, use get_block_schema instead."
+    )
 
 
 def _block_schema_banned_types_note(
@@ -2379,8 +2322,10 @@ def _build_skyvern_mcp_overlays(
 ) -> dict[str, SchemaOverlay]:
     overlays = {
         "get_workflow_knowledge": SchemaOverlay(
-            description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
+            description=_workflow_knowledge_description(_normalized_authoring_capability(capability)),
             description_suffix=_block_schema_banned_types_note(capability),
+            param_patches={"topics": _WORKFLOW_KNOWLEDGE_TOPICS_PATCH},
+            pre_hook=_get_workflow_knowledge_pre_hook,
             post_hook=_get_workflow_knowledge_post_hook,
         ),
         "get_block_schema": SchemaOverlay(
@@ -2396,15 +2341,16 @@ def _build_skyvern_mcp_overlays(
                 "Check one workflow block definition, passed as a JSON string in block_json, against its block "
                 "type's schema. It does not run the block. Returns field-level errors."
             ),
+            hide_params=frozenset({"code_only"}),
             pre_hook=_validate_block_pre_hook,
+            post_hook=_validate_block_post_hook,
         ),
         "list_org_workflows": SchemaOverlay(
             description=(
                 "Search this organization's saved workflows by title, folder, or parameter name. Reach for it "
                 "when the user refers to one of their existing workflows, or before building for a site the "
-                "org may already automate. Each match carries "
-                "workflow_permanent_id (wpid_...), workflow_id, title, version, status and description. Pass "
-                "the workflow_permanent_id -- not workflow_id -- to get_org_workflow for the full definition."
+                "org may already automate. Pass the workflow_permanent_id -- not workflow_id -- to "
+                "get_org_workflow for the full definition."
             ),
             hide_params=frozenset({"query"}),
         ),
@@ -2418,10 +2364,16 @@ def _build_skyvern_mcp_overlays(
         ),
         "navigate_browser": SchemaOverlay(
             description=(
-                "Navigate the debug browser to a URL. "
+                "Navigate the browser to a URL. "
                 "Use this to reset browser state or navigate to a starting page before running blocks."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
+            param_patches={
+                "wait_until": {
+                    "anyOf": [{"type": "string", "enum": list(VALID_WAIT_UNTIL)}, {"type": "null"}],
+                    "description": "Wait condition. Use networkidle for JS-heavy pages",
+                }
+            },
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_navigate_pre_hook,
@@ -2429,7 +2381,7 @@ def _build_skyvern_mcp_overlays(
         ),
         "get_browser_screenshot": SchemaOverlay(
             description=(
-                "Take a screenshot of the current debug browser session. "
+                "Take a screenshot of the current browser session. "
                 "Returns a base64-encoded PNG image. "
                 "Use this to see what the browser looks like after running blocks."
             ),
@@ -2459,47 +2411,44 @@ def _build_skyvern_mcp_overlays(
                 BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM,
             },
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             timeout=_EVALUATE_OVERLAY_TIMEOUT_SECONDS,
             pre_hook=_evaluate_pre_hook,
             post_hook=_evaluate_post_hook,
         ),
         "click": SchemaOverlay(
             description=(
-                "Click an element in the browser by CSS selector. The click is instant and "
+                "Click an element in the browser by CSS selector or XPath, or by x/y coordinates. The click is instant and "
                 "deterministic. Derive the selector from page evidence. When a shared "
                 "class matches many elements (e.g. one button per result row), scope the "
                 "selector to the specific item (its container or a unique attribute). If a "
                 "selector does not resolve, inspect the page again and derive a better one."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count", "intent"}),
+            param_patches={"timeout": _ACTION_TIMEOUT_PATCH},
             forced_args={"selector_mode": "direct"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             pre_hook=_click_pre_hook,
             post_hook=_click_post_hook,
         ),
         "type_text": SchemaOverlay(
             description=(
                 "Type text into an input element with Skyvern's active input event strategy while "
-                "targeting the supplied CSS selector directly. Derive the selector from page evidence; "
+                "targeting the supplied selector directly. Derive the selector from page evidence; "
                 "if it does not resolve, "
                 "inspect the page again and derive a better one. "
                 "Optionally clear the field first. Use this for form filling. "
-                "NEVER type a raw secret value (for example, a password) received in "
-                "chat. Ask the user to store the value as a saved credential and "
-                "reply with its name; do not type or submit the raw value."
+                "NEVER type a raw secret value (for example, a password) received in chat."
             ),
             # input_method is the Chrome-extension fill; its description names clear, intent and delay,
             # none of which this surface exposes under those names.
             hide_params=frozenset({"session_id", "cdp_url", "delay", "intent", "input_method"}),
+            param_patches={"timeout": _ACTION_TIMEOUT_PATCH},
             forced_args={"selector_mode": "direct"},
             required_overrides=["text"],
             arg_transforms={"clear_first": "clear"},
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
         ),
@@ -2512,7 +2461,6 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
         ),
@@ -2525,8 +2473,6 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "select_option": SchemaOverlay(
             description=(
@@ -2539,7 +2485,6 @@ def _build_skyvern_mcp_overlays(
             required_overrides=["value"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,
         ),
@@ -2550,10 +2495,10 @@ def _build_skyvern_mcp_overlays(
                 "Use for form submission, tab navigation, or closing dialogs."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "intent"}),
+            param_patches={"timeout": _ACTION_TIMEOUT_PATCH},
             required_overrides=["key"],
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
         ),
@@ -2567,8 +2512,6 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            redacts_sensitive_origin_structured_result=True,
-            pre_hook=_sensitive_origin_page_action_pre_hook,
             post_hook=_wait_for_either_state_post_hook,
         ),
         "skyvern_frame_list": SchemaOverlay(
@@ -2576,8 +2519,6 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_frame_switch": SchemaOverlay(
             description=(
@@ -2589,8 +2530,6 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_frame_main": SchemaOverlay(
             description=(
@@ -2600,31 +2539,23 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_tab_list": SchemaOverlay(
-            description=(
-                "List the open browser tabs: each entry carries tab_id, index, url, title and is_active, "
-                "and the result names active_tab_id. Listing changes nothing."
-            ),
+            description="List the open browser tabs. Listing changes nothing.",
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_sensitive_origin_page_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_tab_new": SchemaOverlay(
             description=(
-                "Open a new browser tab, navigating it to url when one is given, and make it the active tab; "
-                "the result carries the new tab's tab_id, url and title. Other tabs stay open. The browser "
-                f"holds at most {settings.BROWSER_MAX_PAGES_NUMBER} tabs; at that count the call fails and says so."
+                "Open a new browser tab, navigating it to url when one is given, and make it the active tab. "
+                f"Other tabs stay open. The browser holds at most {settings.BROWSER_MAX_PAGES_NUMBER} tabs; at "
+                "that count the call fails and says so."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_tab_new_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
         "skyvern_tab_switch": SchemaOverlay(
             description=(
@@ -2635,30 +2566,33 @@ def _build_skyvern_mcp_overlays(
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
             pre_hook=_tab_switch_pre_hook,
-            post_hook=_sensitive_origin_page_post_hook,
         ),
-        # Only an active sensitive run refuses: the result carries no page fact, and closing tabs is
-        # how a withheld multi-tab browser gets back to the one tab a fresh navigation can clear.
         "skyvern_tab_close": SchemaOverlay(
             description=(
                 "Close one browser tab, the one named by tab_id (from skyvern_tab_list) or index, or the active "
-                "tab when neither is given; the result carries closed_tab_id and remaining_tabs, and "
-                "skyvern_tab_list reports which tab is active afterwards."
+                "tab when neither is given. skyvern_tab_list reports which tab is active afterwards."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
             requires_browser=True,
-            pre_hook=_tab_close_pre_hook,
         ),
         "list_workflow_runs": SchemaOverlay(
             description=(
                 "List the saved runs of the workflow open in this chat, newest first. Copilot chat runs are "
                 "left out, and so are child runs unless include_child_runs=true. Filter by status, e.g. "
-                'status=["terminated"]. Each run carries run_id, status, created_at and trigger_type. Read '
+                'status=["terminated"]. Read '
                 "one run's blocks and failure with get_run_results(workflow_run_id=<run_id>)."
             ),
             # search_key and error_code match stored run values, so matching run IDs would confirm guessed secrets.
             hide_params=frozenset({"workflow_id", "search_key", "error_code"}),
+            param_patches={
+                "status": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string", "enum": [s.value for s in WorkflowRunStatus]}},
+                        {"type": "null"},
+                    ]
+                }
+            },
             binds_chat_workflow=True,
             binds_chat_workflow_param="workflow_id",
             post_hook=_workflow_run_list_post_hook,
@@ -2681,15 +2615,32 @@ def _build_skyvern_mcp_overlays(
             "or run_at to run once at the user's instant, given as ISO 8601 with the "
             "user's UTC offset. The result carries the saved schedule: its wfs_ ID, timezone, enabled state and "
             "next run, and for a one-time schedule its run_at and dispatch_status.",
+            param_patches={
+                "interval_seconds": {
+                    "description": (
+                        f"Run every N seconds (minimum {MIN_SCHEDULE_INTERVAL_SECONDS}), e.g. 259200 for every 72 "
+                        "hours. Set exactly one of this, cron_expression or run_at."
+                    )
+                }
+            },
             pre_hook=_create_workflow_schedule_pre_hook,
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(
             "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
             "state are kept. Send name or clear_name only when the user asks to rename it, even if the name "
-            "mentions the old time. Parameter values read back as ***; send *** for a key to keep its stored "
+            f"mentions the old time. Parameter values read back as {SECRET_HEADER_MASK}; send "
+            f"{SECRET_HEADER_MASK} for a key to keep its stored "
             "value. A one-time schedule keeps run_at as its cadence and can change only until it fires. Ask which "
             "one when several could match.",
             hide_params=frozenset({"exact"}),
+            param_patches={
+                "interval_seconds": {
+                    "description": (
+                        f"New fixed interval in seconds (minimum {MIN_SCHEDULE_INTERVAL_SECONDS}); switches a cron "
+                        "schedule."
+                    )
+                }
+            },
             pre_hook=_schedule_parameters_credential_pre_hook,
         ),
         "enable_workflow_schedule": _workflow_schedule_overlay(
@@ -2709,13 +2660,12 @@ def _build_skyvern_mcp_overlays(
         ),
         "list_browser_profiles": SchemaOverlay(
             description=(
-                "List this organization's saved browser profiles, each with its bp_ ID, name and created_at. "
-                "search_key matches a substring of the name or description. Profile names are unique in the "
-                "organization. Listing changes nothing."
+                "List this organization's saved browser profiles. search_key matches a substring of the name "
+                "or description. Profile names are unique in the organization. Listing changes nothing."
             ),
         ),
         "get_browser_profile": SchemaOverlay(
-            description="Read one saved browser profile by bp_ ID: its name, description and timestamps.",
+            description="Read one saved browser profile by bp_ ID.",
         ),
         "create_browser_profile": SchemaOverlay(
             description=_CREATE_BROWSER_PROFILE_DESCRIPTION,

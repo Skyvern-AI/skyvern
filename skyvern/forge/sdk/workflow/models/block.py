@@ -32,6 +32,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
+from email.policy import SMTP as SMTP_EMAIL_POLICY
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -130,7 +131,9 @@ from skyvern.forge.sdk.api.files import (
     download_file,
     get_download_dir,
     get_path_for_workflow_download_directory,
+    get_run_temp_dir,
     is_remote_url,
+    is_uploaded_file_id,
     observe_download_dir,
     parse_uri_to_path,
     resolve_local_or_download_file,
@@ -165,6 +168,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
     code_is_download_intent,
+    without_generated_file_stamp,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
@@ -176,6 +180,7 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
+from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -297,7 +302,7 @@ from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_url
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -321,6 +326,7 @@ from skyvern.schemas.workflows import (
     normalize_error_code_description,
 )
 from skyvern.services import otp_email, otp_service, planner_levers
+from skyvern.services.email.gmail import GMAIL_MAX_MESSAGE_BYTES, GmailSendResult, send_raw_message
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
@@ -331,7 +337,7 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables
+from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -346,7 +352,12 @@ from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
-from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    normalize_download_filename,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.navigation import (
     default_navigation_settle,
     driver_nav_error_code,
@@ -944,6 +955,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
@@ -959,6 +971,7 @@ class Block(BaseModel, abc.ABC):
                 env=env,
                 skip_missing_variable_preflight=skip_missing_variable_preflight,
                 page_derived_capture=page_derived_capture,
+                extra_template_data=extra_template_data,
             )
         except Exception as exc:
             if field not in ("totp_identifier", "totp_verification_url"):
@@ -1406,6 +1419,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -1425,6 +1439,10 @@ class Block(BaseModel, abc.ABC):
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
         )
+        if extra_template_data:
+            # A field-specific binding only fills a gap: a workflow that already has a parameter
+            # under the same key keeps rendering its own value.
+            template_data = {**extra_template_data, **template_data}
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
@@ -1591,6 +1609,9 @@ class Block(BaseModel, abc.ABC):
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
         if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
+            return
+        # The description prompt carries the block's recipients, subject and body to an LLM and into its logs.
+        if isinstance(self, SendEmailBlock) and self.transport == EmailTransport.GMAIL:
             return
         description = None
         try:
@@ -2058,11 +2079,11 @@ class BaseTaskBlock(Block):
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
 
-        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
-        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
-        engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine or on a block whose skyvern_v1 a person pinned.
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this; when the
+        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A
+        block pinned to a non-default engine is honored as-authored, and a block the eligibility check
+        never saw is left alone; neither is ever rerouted. An unset engine routes like skyvern_v1, except
+        in a run that honors the chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
@@ -2122,8 +2143,17 @@ class BaseTaskBlock(Block):
             )
 
         if self.download_suffix:
+            if ORIGINAL_FILENAME_TEMPLATE_VARIABLE not in workflow_run_context.values:
+                reject_jinja_transformations_on_variable(
+                    self.download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
             self.download_suffix = self.render_templatable_field(
-                "download_suffix", self.download_suffix, workflow_run_context
+                "download_suffix",
+                self.download_suffix,
+                workflow_run_context,
+                extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
@@ -2433,6 +2463,8 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
+                # A retry reuses this row, which a step-engine fallback on the previous attempt relabeled.
+                engine=self.resolve_engine(workflow_run_id).value,
             )
             current_running_task = task
             organization = await app.DATABASE.organizations.get_organization(
@@ -8155,6 +8187,8 @@ async def wrapper({default_args}):
                 attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
+                # Dispatched on v3 below; script generation reads this column to keep v3 actions out.
+                engine=RunEngine.skyvern_v3,
             )
             recovery_block_id = recovery_block.workflow_run_block_id
 
@@ -8246,7 +8280,9 @@ async def wrapper({default_args}):
             if updated_task.status == TaskStatus.completed:
                 # The block's value is what its own return would have been; downloads are bound by
                 # the recorder (_finalize_heal_result), the same as the inline success exit.
-                output_parameter_value = workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                output_parameter_value = without_generated_file_stamp(
+                    workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                )
                 if record_output_parameter:
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
@@ -10344,7 +10380,7 @@ async def wrapper({default_args}):
             # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
             # reach captured locals, the persisted output, or the logged value. Mirrors
             # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
-            result = workflow_run_context.mask_secrets_in_data(result)
+            result = without_generated_file_stamp(workflow_run_context.mask_secrets_in_data(result))
 
             try:
                 downloaded_files, skipped_file_names = await self._register_downloaded_files(
@@ -12679,6 +12715,149 @@ def _send_via_custom_smtp(
                 LOG.warning("SendEmailBlock Failed to close custom SMTP connection", exc_info=True)
 
 
+GMAIL_MAX_ATTACHMENT_TOTAL_MB = 25
+_GMAIL_EXECUTION_PATH_MAX_DEPTH = 32
+_GMAIL_RETRY_CHAIN_MAX_DEPTH = 32
+
+GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
+    GmailSendErrorCode.CONFIGURATION: (
+        "No Gmail account is selected for this block, or the selected account no longer exists. "
+        "Choose a connected Gmail account that can send."
+    ),
+    GmailSendErrorCode.MISSING_SCOPE: (
+        "The selected Google account has not granted permission to send email. "
+        "Enable sending for it on the Integrations page."
+    ),
+    GmailSendErrorCode.RECONNECT: (
+        "The selected Google account must be reconnected on the Integrations page before it can send email."
+    ),
+    GmailSendErrorCode.NO_RECIPIENTS: "The email has no recipients. Add at least one To, Cc or Bcc address.",
+    GmailSendErrorCode.INVALID_RECIPIENT: "A recipient is not a valid email address.",
+    GmailSendErrorCode.INVALID_HEADER: (
+        "The subject or a recipient contains characters that are not allowed in an email header."
+    ),
+    GmailSendErrorCode.ATTACHMENT_INVALID: (
+        "An attachment could not be used. With Gmail each attachment must be one file from this run or one file "
+        "URL; folders and the download directory are not attached."
+    ),
+    GmailSendErrorCode.ATTACHMENT_TOO_LARGE: (
+        f"The attachments are larger than the {GMAIL_MAX_ATTACHMENT_TOTAL_MB} MB limit for Gmail."
+    ),
+    GmailSendErrorCode.TEMPLATE_ERROR: (
+        "A template in the email could not be rendered. Check the parameter names used in the recipients, "
+        "subject, body and attachments."
+    ),
+    GmailSendErrorCode.PROVIDER_REJECTED: "Gmail rejected the message. Nothing was sent.",
+    GmailSendErrorCode.RATE_LIMITED: (
+        "Gmail refused the message because the account reached a sending limit. Nothing was sent."
+    ),
+    GmailSendErrorCode.OUTCOME_UNKNOWN: (
+        "Gmail did not confirm whether the message was sent, and it was not retried. "
+        "Check the account's Sent folder before running this again."
+    ),
+    GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
+}
+
+_GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
+    google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
+    google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE: GmailSendErrorCode.MISSING_SCOPE,
+    google_oauth_service.GmailSendAuthorizationStatus.RECONNECT: GmailSendErrorCode.RECONNECT,
+    google_oauth_service.GmailSendAuthorizationStatus.UNAVAILABLE: GmailSendErrorCode.INTERNAL_ERROR,
+}
+
+
+class _GmailSendRefused(Exception):
+    def __init__(self, error_code: GmailSendErrorCode) -> None:
+        super().__init__(error_code.value)
+        self.error_code = error_code
+
+
+class _GmailSendStateUnreadable(Exception):
+    pass
+
+
+_GmailSendStateT = TypeVar("_GmailSendStateT")
+
+
+async def _gmail_send_state(operation: Awaitable[_GmailSendStateT]) -> _GmailSendStateT:
+    """Run one read or write of the send-once row; a failure leaves it unknown whether a message went out."""
+    try:
+        return await operation
+    except Exception as exc:
+        LOG.warning("SendEmailBlock could not read or write the Gmail send record", error_type=type(exc).__name__)
+        raise _GmailSendStateUnreadable from None
+
+
+def _add_file_attachment(msg: EmailMessage, path: str) -> None:
+    kind = filetype.guess(path)
+    if kind:
+        ctype = kind.mime
+        extension = kind.extension
+    else:
+        ctype = "application/octet-stream"
+        extension = None
+
+    maintype, subtype = ctype.split("/", 1)
+    attachment_path = Path(path)
+    attachment_filename = attachment_path.name
+    if not attachment_path.suffix and extension:
+        attachment_filename += f".{extension}"
+
+    LOG.info(
+        "SendEmailBlock Adding attachment",
+        filename=attachment_filename,
+        maintype=maintype,
+        subtype=subtype,
+    )
+    with open(path, "rb") as fp:
+        msg.add_attachment(
+            fp.read(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment_filename,
+        )
+
+
+def _build_gmail_message_bytes(
+    *,
+    from_address: str,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str,
+    body: str,
+    body_format: EmailBodyFormat,
+    attachment_paths: list[str],
+) -> bytes:
+    msg = EmailMessage()
+    msg["From"] = from_address
+    for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
+        if addresses:
+            msg[header] = ", ".join(addresses)
+    msg["Subject"] = subject
+    email.set_body(msg, body, body_format)
+    for path in attachment_paths:
+        try:
+            _add_file_attachment(msg, path)
+        except (OSError, ValueError):
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+    return msg.as_bytes(policy=SMTP_EMAIL_POLICY)
+
+
+def _gmail_result_from_dispatch(dispatch: GmailSendDispatch) -> GmailSendResult:
+    if dispatch.status == DISPATCH_ACCEPTED:
+        return GmailSendResult(GmailSendOutcome.ACCEPTED, provider_message_id=dispatch.provider_message_id)
+    if dispatch.status == DISPATCH_FAILED:
+        return GmailSendResult(
+            GmailSendOutcome.FAILED,
+            error_code=dispatch.error_code or GmailSendErrorCode.PROVIDER_REJECTED,
+            provider_status=dispatch.provider_status,
+            provider_reason=dispatch.provider_reason,
+        )
+    # A claim with no recorded outcome means an earlier attempt may have reached Gmail.
+    return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+
+
 class SendEmailBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -12703,10 +12882,18 @@ class SendEmailBlock(Block):
     # Encrypted at rest in the workflow definition (see secret_encryption.py); may also
     # reference a workflow secret parameter.
     custom_smtp_password: str | None = None
+    # Absent means SMTP. With gmail the message is sent from the connected Google account named by
+    # credential_id; sender and the smtp_* settings are not used.
+    transport: EmailTransport | None = None
+    credential_id: str | None = None
+    cc: list[str] = []
+    bcc: list[str] = []
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
+            "bcc",
             "body",
+            "cc",
             "custom_smtp_host",
             "custom_smtp_username",
             "file_attachments",
@@ -12749,7 +12936,8 @@ class SendEmailBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
+        if self.transport != EmailTransport.GMAIL:
+            self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
         self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
         self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
@@ -12759,6 +12947,8 @@ class SendEmailBlock(Block):
             formatted_recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
             formatted_recipients.append(formatted_recipient)
         self.recipients = formatted_recipients
+        self.cc = [self.render_templatable_field("cc", entry, workflow_run_context) for entry in self.cc]
+        self.bcc = [self.render_templatable_field("bcc", entry, workflow_run_context) for entry in self.bcc]
 
         if self.custom_smtp_host:
             self.custom_smtp_host = self.render_templatable_field(
@@ -12923,15 +13113,18 @@ class SendEmailBlock(Block):
 
         return file_paths
 
-    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+    @staticmethod
+    def _resolve_recipient_entries(entries: list[str], workflow_run_context: WorkflowRunContext) -> list[str]:
         resolved: list[str] = []
-        for recipient in self.recipients:
+        for recipient in entries:
             if workflow_run_context.has_parameter(recipient):
                 resolved.append(str(workflow_run_context.get_value(recipient)))
             else:
                 resolved.append(recipient)
+        return email.normalize_recipients(resolved)
 
-        recipients = email.normalize_recipients(resolved)
+    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+        recipients = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         if not recipients:
             raise NoValidEmailRecipient()
         # An invalid entry fails the block: dropping it would deliver to a subset of the intended
@@ -12981,44 +13174,9 @@ class SendEmailBlock(Block):
             if not path:
                 raise FileNotFoundError(f"File not found: {filename}")
 
-            # Guess the content type based on the file's extension.  Encoding
-            # will be ignored, although we should check for simple things like
-            # gzip'd or compressed files.
-            kind = filetype.guess(path)
-            if kind:
-                ctype = kind.mime
-                extension = kind.extension
-            else:
-                # No guess could be made, or the file is encoded (compressed), so
-                # use a generic bag-of-bits type.
-                ctype = "application/octet-stream"
-                extension = None
-
-            maintype, subtype = ctype.split("/", 1)
-            attachment_path = Path(path)
-            attachment_filename = attachment_path.name
-
-            # Check if the filename has an extension
-            if not attachment_path.suffix:
-                # If no extension, guess it based on the MIME type
-                if extension:
-                    attachment_filename += f".{extension}"
-
-            LOG.info(
-                "SendEmailBlock Adding attachment",
-                filename=attachment_filename,
-                maintype=maintype,
-                subtype=subtype,
-            )
-            with open(path, "rb") as fp:
-                msg.add_attachment(
-                    fp.read(),
-                    maintype=maintype,
-                    subtype=subtype,
-                    filename=attachment_filename,
-                )
-                file_hash = calculate_sha256_for_file(path)
-                file_names_by_hash[file_hash].append(path)
+            _add_file_attachment(msg, path)
+            file_hash = calculate_sha256_for_file(path)
+            file_names_by_hash[file_hash].append(path)
 
         # Calculate file stats based on content hashes
         total_files = sum(len(files) for files in file_names_by_hash.values())
@@ -13035,6 +13193,285 @@ class SendEmailBlock(Block):
 
         return msg
 
+    async def _gmail_execution_key(self, workflow_run_block_id: str, organization_id: str) -> str:
+        """Identify this logical execution by its label and the iteration of every enclosing loop."""
+        # Only loop rows count: the engine nests a branch target under its conditional's row and cached code does not.
+        loop_path: list[tuple[str | None, int | None]] = []
+        child_index: int | None = None
+        block_id: str | None = workflow_run_block_id
+        for depth in range(_GMAIL_EXECUTION_PATH_MAX_DEPTH):
+            if block_id is None:
+                break
+            row = await app.DATABASE.observer.get_workflow_run_block(block_id, organization_id=organization_id)
+            if depth and row.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
+                loop_path.append((row.label, child_index))
+            child_index = row.current_index
+            block_id = row.parent_workflow_run_block_id
+        if block_id is not None:
+            raise RuntimeError("workflow run block nesting is deeper than the supported limit")
+        return hashlib.sha256(json.dumps([self.label, loop_path]).encode()).hexdigest()
+
+    @staticmethod
+    async def _gmail_root_run_id(workflow_run_id: str, organization_id: str) -> str | None:
+        """The first run of this run's credential-fallback retry chain, or None when the chain is too long."""
+        run_id = workflow_run_id
+        for _ in range(_GMAIL_RETRY_CHAIN_MAX_DEPTH):
+            run = await app.DATABASE.workflow_runs.get_workflow_run(run_id, organization_id=organization_id)
+            if run is None:
+                raise RuntimeError("a workflow run in the retry chain was not found")
+            if not run.retried_from_workflow_run_id:
+                return run_id
+            run_id = run.retried_from_workflow_run_id
+        return None
+
+    async def _resolve_gmail_attachments(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        organization_id: str,
+        staging_dir: str,
+    ) -> list[str]:
+        """Resolve each listed entry to exactly one local file, checking sizes before any bytes are read."""
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
+        max_total_bytes = GMAIL_MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+        total_bytes = 0
+        paths: list[str] = []
+        for entry in self.file_attachments:
+            if not entry.strip():
+                continue
+            if workflow_run_context.has_parameter(entry):
+                value = workflow_run_context.get_value(entry)
+                value = workflow_run_context.get_original_secret_value_or_none(value) or value
+                if not isinstance(value, str):
+                    raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+                entry = value
+            try:
+                entry = self.render_templatable_field("file_attachments", entry, workflow_run_context)
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+            if not entry.strip() or entry == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            try:
+                if is_remote_url(entry) or is_uploaded_file_id(entry):
+                    # Its own folder, so two entries with one file name both keep that name.
+                    entry_dir = tempfile.mkdtemp(dir=staging_dir)
+                    path = await download_file(
+                        entry,
+                        max_size_mb=GMAIL_MAX_ATTACHMENT_TOTAL_MB,
+                        output_dir=entry_dir,
+                        organization_id=organization_id,
+                        preserve_existing_files=True,
+                        staging_dir=entry_dir,
+                        limit_managed_file_size=True,
+                    )
+                else:
+                    path = validate_local_file_path(entry, run_id)
+            except DownloadFileMaxSizeExceeded:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE) from None
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+            if not os.path.isfile(path):
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            total_bytes += os.path.getsize(path)
+            if total_bytes > max_total_bytes:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+            paths.append(path)
+        return paths
+
+    async def _send_via_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+    ) -> tuple[GmailSendResult, bool]:
+        # Read first, before anything that can fail differently on a re-run, so a replay always reports what happened.
+        # The record is kept under the retry chain's first run: a credential-fallback retry is a new run that
+        # repeats the same logical sends.
+        record_run_id = await _gmail_send_state(self._gmail_root_run_id(workflow_run_id, organization_id))
+        if record_run_id is None:
+            raise _GmailSendRefused(GmailSendErrorCode.INTERNAL_ERROR)
+        execution_key = await _gmail_send_state(self._gmail_execution_key(workflow_run_block_id, organization_id))
+        existing = await _gmail_send_state(
+            app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+        )
+        # Gmail rejected a failed row's message outright, so only that state may be attempted again.
+        if existing is not None and existing.status != DISPATCH_FAILED:
+            return _gmail_result_from_dispatch(existing), True
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception:
+            raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+
+        credential_id = (self.credential_id or "").strip()
+        if not credential_id:
+            raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+        to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
+        cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
+        bcc = self._resolve_recipient_entries(self.bcc, workflow_run_context)
+        if not (to or cc or bcc):
+            raise _GmailSendRefused(GmailSendErrorCode.NO_RECIPIENTS)
+        try:
+            email.validate_recipients([*to, *cc, *bcc])
+        except ValueError:
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT) from None
+        # The header encoder would split a non-ASCII address into an encoded word that is no longer an address.
+        if not all(address.isascii() for address in (*to, *cc, *bcc)):
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT)
+        # Downloaded attachments are staged where only this send writes: the shared temp folder names a file by
+        # its base name alone, so another entry or another run could replace it before it is read.
+        with tempfile.TemporaryDirectory(
+            prefix="gmail_send_",
+            dir=get_run_temp_dir(organization_id, workflow_run_id),
+            ignore_cleanup_errors=True,
+        ) as staging_dir:
+            attachment_paths = await self._resolve_gmail_attachments(
+                workflow_run_context, workflow_run_id, organization_id, staging_dir
+            )
+
+            authorization = await google_oauth_service.resolve_gmail_send_authorization(organization_id, credential_id)
+            if (
+                authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                or not authorization.access_token
+                or not authorization.from_address
+            ):
+                raise _GmailSendRefused(
+                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                )
+
+            body = self.body
+            if body and workflow_run_context.has_parameter(body) and workflow_run_context.has_value(body):
+                body = str(workflow_run_context.get_value(body))
+            try:
+                mime_bytes = await asyncio.to_thread(
+                    _build_gmail_message_bytes,
+                    from_address=authorization.from_address,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=self.subject.strip().replace("\n", "").replace("\r", ""),
+                    body=body,
+                    body_format=self.body_format,
+                    attachment_paths=attachment_paths,
+                )
+            except ValueError:
+                raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER) from None
+        if len(mime_bytes) > GMAIL_MAX_MESSAGE_BYTES:
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+
+        if existing is None:
+            claim = await _gmail_send_state(
+                app.DATABASE.google_oauth.claim_gmail_send_dispatch(
+                    organization_id=organization_id,
+                    workflow_run_id=record_run_id,
+                    execution_key=execution_key,
+                    block_label=self.label,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = claim.gmail_send_dispatch_id if claim else None
+        else:
+            reclaimed = await _gmail_send_state(
+                app.DATABASE.google_oauth.reclaim_failed_gmail_send_dispatch(
+                    gmail_send_dispatch_id=existing.gmail_send_dispatch_id,
+                    observed_modified_at=existing.modified_at,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = existing.gmail_send_dispatch_id if reclaimed else None
+        if dispatch_id is None:
+            winner = await _gmail_send_state(
+                app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+            )
+            if winner is None:
+                return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN), True
+            return _gmail_result_from_dispatch(winner), True
+
+        # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
+        try:
+            result = await send_raw_message(authorization.access_token, mime_bytes)
+        except Exception:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        try:
+            await app.DATABASE.google_oauth.finalize_gmail_send_dispatch(
+                gmail_send_dispatch_id=dispatch_id,
+                status=result.outcome.value,
+                provider_message_id=result.provider_message_id,
+                error_code=result.error_code,
+                provider_status=result.provider_status,
+                provider_reason=result.provider_reason,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "SendEmailBlock failed to record the Gmail send outcome",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                outcome=result.outcome.value,
+                error_type=type(exc).__name__,
+            )
+        return result, False
+
+    async def _execute_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        replayed = False
+        try:
+            if not organization_id:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+            result, replayed = await self._send_via_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
+        except _GmailSendRefused as refusal:
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
+        except _GmailSendStateUnreadable:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        except Exception as exc:
+            # No exception text or traceback: both can carry recipients, message text or provider responses.
+            LOG.warning(
+                "SendEmailBlock Gmail send could not be prepared",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                error_type=type(exc).__name__,
+            )
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.INTERNAL_ERROR)
+
+        accepted = result.outcome == GmailSendOutcome.ACCEPTED
+        LOG.info(
+            "SendEmailBlock Gmail send finished",
+            workflow_run_id=workflow_run_id,
+            block_label=self.label,
+            outcome=result.outcome.value,
+            error_code=result.error_code.value if result.error_code else None,
+            provider_status=result.provider_status,
+            provider_reason=result.provider_reason,
+            replayed=replayed,
+        )
+        result_dict = {
+            "success": accepted,
+            "transport": EmailTransport.GMAIL.value,
+            "outcome": result.outcome.value,
+            "provider_message_id": result.provider_message_id,
+            "error_code": result.error_code.value if result.error_code else None,
+            "replayed": replayed,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+        return await self.build_block_result(
+            success=accepted,
+            failure_reason=None
+            if accepted
+            else GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
+            output_parameter_value=result_dict,
+            status=BlockStatus.completed if accepted else BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -13044,6 +13481,10 @@ class SendEmailBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if self.transport == EmailTransport.GMAIL:
+            return await self._execute_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
         await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
@@ -19390,13 +19831,14 @@ class V3AbIneligibleReason(StrEnum):
     eligible" but not "why not."
     """
 
-    script_run = "script_run"
     pinned_engine = "pinned_engine"
+    # An explicit request to generate code from this run; v3 actions cannot produce a usable script.
+    code_generation_requested = "code_generation_requested"
     unsupported_block = "unsupported_block"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
-def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReason | None:
     """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
@@ -19413,12 +19855,9 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
     full run in the cohort anyway.
 
-    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
-    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
-    execution.
+    A run headed for a cached script is eligible: treatment runs it as a v3 agent without the script
+    (see ``code_mode_displaced``), so the arm covers every block rather than only the ai_fallback ones.
     """
-    if is_script_run:
-        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if isinstance(block, ConditionalBlock):
@@ -19485,9 +19924,9 @@ def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
     return False if has_engine_block else None
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar]) -> bool:
     """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
-    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
+    return v3_ab_ineligibility_reason(blocks) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

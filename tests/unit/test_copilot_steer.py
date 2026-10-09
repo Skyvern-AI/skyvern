@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from agents import Agent, Model, RunConfig, SQLiteSession, function_tool
@@ -432,3 +432,73 @@ async def test_messages_keep_their_send_order_when_screens_finish_out_of_order(s
 
     steers = await repo.take_copilot_steer_messages("org", ctx.workflow_copilot_chat_id, "turn")
     assert [steer.text for steer in steers] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_message_sent_during_a_rejected_response_joins_the_call_that_follows_it(sqlite_engine, monkeypatch):
+    _repo, client, ctx, _frames = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", LocalCache())
+    # The watcher never wakes within this test, so only the loop itself can hand the message over.
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.steer.STEER_POLL_SECONDS", 60)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", _consume_sdk_stream)
+    model_inputs: list[list[Any]] = []
+    working = asyncio.Event()
+    release_model = asyncio.Event()
+
+    class MadeUpToolModel(Model):
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            raise AssertionError("The production runner must stream")
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            model_inputs.append(kwargs["input"] if "input" in kwargs else args[1])
+            call = len(model_inputs)
+            if call > 1:
+                yield _completed(call, [_reply("Built it, and it extracts the title.")])
+                return
+            working.set()
+            await release_model.wait()
+            made_up = ResponseFunctionToolCall(
+                type="function_call", name="REPLY", call_id="call_made_up", arguments="{}"
+            )
+            yield _completed(call, [made_up])
+
+    session = SQLiteSession("steer-after-rejected-response")
+    async with client:
+        turn = asyncio.create_task(
+            run_with_enforcement(
+                agent=Agent(name="steer-test", model=MadeUpToolModel(), tools=[]),
+                initial_input="Build the workflow",
+                ctx=ctx,
+                stream=SimpleNamespace(send=ctx.stream.send, is_disconnected=AsyncMock(return_value=False)),
+                session=session,
+                hooks=CopilotRunHooks(ctx),
+                run_config=RunConfig(tracing_disabled=True),
+            )
+        )
+        try:
+            await asyncio.wait_for(working.wait(), 5)
+            sent = await client.post(
+                "/steer",
+                json={
+                    "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+                    "cancel_token": "stop",
+                    "steer_id": "steer-1",
+                    "message": STEER_TEXT,
+                },
+            )
+            assert sent.status_code == 200, sent.text
+            release_model.set()
+            result = await asyncio.wait_for(turn, 5)
+
+            assert result.final_output == "Built it, and it extracts the title."
+            assert len(model_inputs) == 2
+            assert model_inputs[1][-1] == {"role": "user", "content": STEER_TEXT}
+            assert [item["call_id"] for item in model_inputs[1] if item.get("type") == "function_call_output"] == [
+                "call_made_up"
+            ]
+        finally:
+            release_model.set()
+            if not turn.done():
+                turn.cancel()
+                await asyncio.gather(turn, return_exceptions=True)
+            session.close()

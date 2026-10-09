@@ -1,5 +1,6 @@
 """Fixtures shared by every suite."""
 
+import gc
 import inspect
 import io
 import logging
@@ -20,6 +21,13 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services import organization_log_scope
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    # Every full GC would re-scan the objects imports and collection leave, a main-thread pause long enough to fail
+    # short-deadline tests late in a CI shard. Freezing them hides them from the GC and from gc.get_objects().
+    gc.collect()
+    gc.freeze()
 
 
 @pytest.fixture(autouse=True, scope="session")
