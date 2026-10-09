@@ -1724,12 +1724,16 @@ def _make_three_tier_router_config(
     fallback_groups: list[str],
     redis_max_connections: int | None = None,
     litellm_models: dict[str, str] | None = None,
+    content_filter_fallback_model_group: str | None = None,
 ) -> LLMRouterConfig:
     """Synthetic 3+ tier router config that doesn't depend on the cloud
     `LLMConfigRegistry` registration that's conditional on prod env vars.
     `litellm_models` overrides the per-group litellm model string (flex-style
-    routers point two groups at the same underlying model)."""
+    routers point two groups at the same underlying model).
+    `content_filter_fallback_model_group` adds a deployment that is reachable but
+    deliberately absent from the fallback chain, like the flex routers' escape hatch."""
     litellm_models = litellm_models or {}
+    escape_groups = [content_filter_fallback_model_group] if content_filter_fallback_model_group else []
     deployments = [
         LLMRouterModelConfig(
             model_name="primary-group",
@@ -1740,7 +1744,7 @@ def _make_three_tier_router_config(
             model_name=group,
             litellm_params={"model": litellm_models.get(group, f"openai/{group}"), "timeout": 60},
         )
-        for group in fallback_groups
+        for group in [*fallback_groups, *escape_groups]
     ]
     return LLMRouterConfig(
         model_name="test-router",
@@ -1754,6 +1758,7 @@ def _make_three_tier_router_config(
         redis_max_connections=redis_max_connections,
         main_model_group="primary-group",
         fallback_model_group=fallback_groups,
+        content_filter_fallback_model_group=content_filter_fallback_model_group,
         routing_strategy="simple-shuffle",
         num_retries=0,
         disable_cooldowns=True,
@@ -2048,6 +2053,69 @@ async def test_router_does_not_retry_content_filter_without_non_gemini_fallback(
         await handler(prompt='{"actions": []}', prompt_name="extract-actions")
 
     assert calls == ["primary-group"], f"must not retry when there is no non-Gemini fallback; got calls={calls}"
+
+
+@pytest.mark.asyncio
+async def test_router_retries_content_filter_on_dedicated_escape_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two-tier Gemini flex routers fall back flex -> standard, both Gemini, so a content_filter
+    block has no filter-free tier in the chain and used to surface as a parse failure. They now name
+    a non-Gemini escape group that stays OUT of the chain — litellm's ordinary failover and the flex
+    cost profile are untouched, and only this retry reaches it (SKY-18083)."""
+
+    calls: list[str] = []
+
+    class _FilterThenEscapeRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            if len(calls) == 1:
+                return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
+            return FakeLLMResponse("gpt-5", content='{"actions": []}')
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterThenEscapeRouter)
+
+    config = _make_three_tier_router_config(
+        fallback_groups=["vertex-gemini-standard-fallback"],
+        content_filter_fallback_model_group="gpt-5-fallback",
+    )
+    _stub_for_router_test(monkeypatch, llm_key="TEST_CONTENT_FILTER_ESCAPE_GROUP", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_CONTENT_FILTER_ESCAPE_GROUP")
+    result = await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert calls == ["primary-group", "gpt-5-fallback"], (
+        f"handler must retry the escape group named by the config, skipping the Gemini tier; got calls={calls}"
+    )
+    assert result == {"actions": []}
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_names_the_llm_key_and_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A response-shape failure is raised deep in parsing, so callers that only catch the exception
+    (the complete verification logs it as `Failed to verify the complete action`) could not say which
+    route produced it. The handler stamps the attribution on the way out (SKY-18083)."""
+    from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError
+
+    class _UnparseableContentRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _UnparseableContentRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=[])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_PARSE_FAILURE_ATTRIBUTION", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_PARSE_FAILURE_ATTRIBUTION")
+    with pytest.raises(BaseLLMError) as excinfo:
+        await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert excinfo.value.llm_key == "TEST_PARSE_FAILURE_ATTRIBUTION"
+    assert excinfo.value.prompt_name == "check-user-goal"
 
 
 @pytest.mark.asyncio
