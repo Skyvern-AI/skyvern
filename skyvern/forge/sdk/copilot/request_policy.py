@@ -138,6 +138,9 @@ RawSecretSafetyFailureKind = Literal[
     "invalid_citation",
 ]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
+# The value-over-label sentence released labelled passwords on other model settings, so it is
+# served only where it was measured; add a key here only with a replay of the secret controls.
+_VALUE_OVER_LABEL_WORDING_LLM_KEYS = frozenset({"AZURE_OPENAI_GPT6_LUNA_WITH_OPENAI_FALLBACK"})
 _RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 
@@ -402,6 +405,7 @@ async def _screen_raw_secret_safety(
         prompt = prompt_engine.load_prompt(
             template=_RAW_SECRET_SAFETY_PROMPT_NAME,
             user_message=escape_code_fences(deterministic_safe_message),
+            read_value_not_label=getattr(handler, "llm_key", None) in _VALUE_OVER_LABEL_WORDING_LLM_KEYS,
         )
     except Exception:
         return _screen_unavailable("malformed_output")
