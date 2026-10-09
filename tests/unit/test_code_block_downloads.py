@@ -45,6 +45,7 @@ from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgres
 from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
+    generated_file_artifact_ids,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
@@ -1734,6 +1735,38 @@ async def test_authored_registration_keys_are_dropped_without_host_evidence(
     assert "downloaded_file_artifact_ids" not in persisted
     assert block_output_has_registered_download(persisted) is False
     assert downloaded_file_count_from_output(result.output_parameter_value) is None
+
+
+@pytest.mark.asyncio
+async def test_in_process_block_cannot_stamp_a_site_download_as_a_published_file(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """Only the secure worker writes the published-file key, so a block naming a real download under it earns nothing."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    site_download = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_site/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        artifact_id="a_site",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [site_download]]))
+    _wire_block_runtime(monkeypatch)
+
+    block = CodeBlock(
+        label="code_download",
+        code="rows = 3\ngenerated_file_artifact_ids = ['a_site']",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    for output in (_persisted_output(), result.output_parameter_value):
+        assert output["rows"] == 3
+        assert output["downloaded_file_artifact_ids"] == ["a_site"]
+        assert "generated_file_artifact_ids" not in output
+        assert generated_file_artifact_ids([output]) == frozenset()
 
 
 @pytest.mark.asyncio
