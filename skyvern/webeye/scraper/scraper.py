@@ -552,7 +552,6 @@ async def scrape_web_unsafe(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
-    page: Page | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -561,15 +560,12 @@ async def scrape_web_unsafe(
 
     :param browser_context: BrowserContext instance used for scraping.
     :param url: URL of the web page to be scraped. Used only when creating a new page.
-    :param page: Optional Page instance to scrape directly. When provided, the global working page is NOT
-        reacquired, so a page opened concurrently (e.g. a popup) cannot become the scrape target.
     :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
     :note: This function does not handle exceptions. Ensure proper error handling in the calling context.
     """
 
     # browser state must have the page instance, otherwise we should not do scraping
-    if page is None:
-        page = await browser_state.must_get_working_page()
+    page = await browser_state.must_get_working_page()
     # Take screenshots of the page with the bounding boxes. We will remove the bounding boxes later.
     # Scroll to the top of the page and take a screenshot.
     # Scroll to the next page and take a screenshot until we reach the end of the page.
