@@ -160,6 +160,12 @@ class LLMRouterConfig(LLMConfigBase):
     # Gemini and Anthropic still apply their own thinking-budget shapes.
     # Appended last so no existing field's positional slot shifts.
     pin_reasoning_effort: bool = False
+    # A model group that only the handler's Gemini content-filter escape hatch dispatches to.
+    # Deliberately outside fallback_model_group: a Gemini-only chain cannot recover a
+    # content_filter block (every tier reproduces it), but adding a non-Gemini group to the
+    # chain would also change ordinary error failover and cost. Set it to name a filter-free
+    # group reachable only on that one path.
+    content_filter_fallback_model_group: str | None = None
 
     def __post_init__(self) -> None:
         _resolve_generation_defaults(self, self.max_tokens, self.temperature)

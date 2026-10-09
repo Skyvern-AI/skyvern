@@ -76,8 +76,6 @@ function WorkflowRunOverviewAttempt() {
     useWorkflowRunTimelineQuery();
 
   const workflowRunId = workflowRun?.workflow_run_id;
-  const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
 
   const browserSessionId = workflowRun?.browser_session_id;
   const { streamTransport } = useStreamTransport(browserSessionId);
@@ -85,7 +83,7 @@ function WorkflowRunOverviewAttempt() {
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {
       queryClient.invalidateQueries({
-        queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+        queryKey: ["workflowRun", workflowRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
       queryClient.invalidateQueries({
@@ -93,7 +91,7 @@ function WorkflowRunOverviewAttempt() {
       });
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     }
-  }, [queryClient, workflowPermanentId, workflowRunId]);
+  }, [queryClient, workflowRunId]);
 
   const handleVncClose = useCallback(() => {
     setVncFailed(true);

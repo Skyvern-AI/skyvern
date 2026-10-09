@@ -949,6 +949,45 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+class DriverReplyProbe:
+    """A driver call that keeps its protocol reply the way playwright and patchright do.
+
+    The pending reply is abandoned from a done-callback on the task that issued the call, and only if
+    that task ends cancelled (``_impl/_connection.py::ProtocolCallback``). A caller that is cancelled
+    without its task ending therefore leaves the reply live, and the driver's late error lands on it
+    with nobody left to retrieve it."""
+
+    def __init__(self, error: BaseException, answers_after_seconds: float = 0.05) -> None:
+        self._error = error
+        self._answers_after_seconds = answers_after_seconds
+        self.called = asyncio.Event()
+        self.reply: asyncio.Future[Any] | None = None
+
+    async def __call__(self, *args: object, **kwargs: object) -> Any:
+        loop = asyncio.get_running_loop()
+        reply: asyncio.Future[Any] = loop.create_future()
+        self.reply = reply
+        self.called.set()
+        issuing_task = asyncio.current_task()
+        assert issuing_task is not None
+
+        def abandon_reply(task: asyncio.Task[Any]) -> None:
+            if task.cancelled():
+                reply.cancel()
+
+        issuing_task.add_done_callback(abandon_reply)
+        loop.call_later(self._answers_after_seconds, lambda: reply.done() or reply.set_exception(self._error))
+        # The driver abandons an unanswered reply on the line after this await, which cancellation skips.
+        await asyncio.wait({reply}, return_when=asyncio.FIRST_COMPLETED)
+        return reply.result()
+
+    async def orphaned_reply(self, wait_seconds: float = 2.0) -> bool:
+        """Whether the late reply carries an error nobody retrieved -- asyncio's never-retrieved line."""
+        assert self.reply is not None, "the driver was never called"
+        await asyncio.wait({self.reply}, timeout=wait_seconds)
+        return self.reply.done() and not self.reply.cancelled() and self.reply.exception() is not None
+
+
 def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
     """A ``take_fullpage_screenshot`` stand-in that drives the real ``take_scrolling_screenshot`` with a stalled
     stitched-capture helper, so a caller test exercises the primitive's own deadline."""

@@ -28,7 +28,7 @@ from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext, brow
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
-from tests.unit.conftest import stalling_async_mock
+from tests.unit.conftest import DriverReplyProbe, stalling_async_mock
 from tests.unit.forge_log_capture import capture_runtime_logs
 
 
@@ -174,6 +174,30 @@ async def test_owned_deadline_emits_timeout_after_local_conversion(
     assert len(events) == 1 and events[0]["outcome"] == "timeout"
     assert events[0]["timeout_ms"] == 25
     assert events[0]["elapsed_ms"] >= 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["owned_deadline", "caller_deadline", "external_cancel"])
+async def test_an_abandoned_capture_leaves_the_driver_no_unretrieved_reply(page: MagicMock, stop: str) -> None:
+    probe = DriverReplyProbe(PlaywrightTimeoutError("Timeout 25ms exceeded.\nCall log:\ntaking page screenshot"))
+    page.screenshot = probe
+    capture = functools.partial(
+        SkyvernFrame.take_scrolling_screenshot, page, mode=ScreenshotMode.LITE, scrolling_number=1
+    )
+    if stop == "external_cancel":
+        task = asyncio.create_task(capture(timeout=5000))
+        await asyncio.wait_for(probe.called.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif stop == "caller_deadline":
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.025):
+                await capture(timeout=5000)
+    else:
+        with pytest.raises(TimeoutError):
+            await capture(timeout=25)
+    assert not await probe.orphaned_reply()
 
 
 @pytest.mark.asyncio
@@ -497,12 +521,14 @@ async def test_foreign_cancellation_never_becomes_a_partial_screenshot(page: Mag
     frame.scroll_to_next_page.side_effect = [30, 60, 90]
     entered = asyncio.Event()
     png = page.screenshot.return_value
+    capturing: list[asyncio.Task[bytes]] = []
     if stop == "deadline_cancel_collision":
 
         async def collide(**kwargs: Any) -> bytes:
-            # Block past the own deadline without yielding, then request an external cancel: both land together.
+            # Block past the own deadline without yielding, then cancel the capture the way a foreign
+            # canceller does: both land together.
             time.sleep(0.06)
-            asyncio.current_task().cancel()  # type: ignore[union-attr]
+            capturing[0].cancel()
             return await _stall(entered)(**kwargs)
 
         page.screenshot.side_effect = _viewport_capture(png, frames=1, then=collide)
@@ -521,6 +547,7 @@ async def test_foreign_cancellation_never_becomes_a_partial_screenshot(page: Mag
                 await capture(timeout=5000)
     else:
         task = asyncio.create_task(capture(timeout=20 if stop == "deadline_cancel_collision" else 5000))
+        capturing.append(task)
         await asyncio.wait_for(entered.wait(), timeout=2)
         if stop == "external_cancel":
             task.cancel()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any, TypeVar
 
 from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge.sdk.core import skyvern_context
@@ -11,6 +13,9 @@ from skyvern.webeye.browser_health import BrowserOperation
 
 ACTION_DEADLINE_HEADROOM_MS = 5000
 DEADLINE_REARM_INTERVAL_SECONDS = 1.0
+
+T = TypeVar("T")
+_UNSET = object()
 
 
 def cancellation_pending() -> bool:
@@ -35,6 +40,51 @@ def record_browser_timeout(operation: BrowserOperation = BrowserOperation.EVALUA
     """Tally a strike for a call the caller bounded itself, so ``record_unreported_timeout`` does not
     mistake the synthesized timeout for one the engine tallied."""
     skyvern_context.record_browser_timeout(operation)
+
+
+def _retrieve_outcome(call: asyncio.Task[Any]) -> None:
+    # A call cancelled too late to stop can still end in an error, and by then nobody is awaiting it.
+    if not call.cancelled():
+        call.exception()
+
+
+def _publish_context_writes(context: contextvars.Context) -> None:
+    for var in context:
+        if var.get(_UNSET) is not context[var]:
+            var.set(context[var])
+
+
+async def cancellable_driver_call(call: Callable[[], Awaitable[T]]) -> T:
+    """Issue a driver call in a task of its own, so cancelling the caller reaches the driver's cleanup.
+
+    playwright and patchright abandon a pending protocol reply from a done-callback on the task that
+    issued the call, and only when that task ends cancelled (``_impl/_connection.py::ProtocolCallback``).
+    A deadline cancels the coroutine that awaits the call inside a task which carries on, so a call
+    awaited directly keeps its reply pending and the driver's late error lands on a future nobody
+    retrieves -- which asyncio reports at error level as an exception that was never retrieved."""
+    # A cancellation request lives on the task that received it, and the task below is a fresh one, so
+    # a guard inside the call (``cancel_aware``) can no longer see one the caller already carries.
+    # Issuing the call at all is what that guard is there to prevent, so answer it here instead.
+    raise_if_cancelled()
+
+    async def issue() -> T:
+        return await call()
+
+    context = contextvars.copy_context()
+    call_task = asyncio.create_task(issue(), context=context)
+    call_task.add_done_callback(_retrieve_outcome)
+    try:
+        return await call_task
+    except asyncio.CancelledError:
+        # A cancellation that arrives after the call has answered never reached the task.
+        call_task.cancel()
+        raise
+    finally:
+        # The task ran in a copy of this context, so a write inside the call would otherwise be lost.
+        # A cancelled call may still be unwinding, and publishing a binding it is about to restore
+        # would outlive the call, so only a finished one is published.
+        if call_task.done() and not call_task.cancelled():
+            _publish_context_writes(context)
 
 
 @asynccontextmanager

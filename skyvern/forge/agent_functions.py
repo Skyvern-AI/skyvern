@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import DocumentFailureReceipt, RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.forge.taskv3.answer_basis_audit import AnswerBasisAudit
     from skyvern.forge.taskv3.loop import ToolSpec
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
@@ -1011,6 +1012,12 @@ class AgentFunction:
 
     # Same contract as task_v3_age_default, for the job-application availability, experience and disclosure defaults.
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
+        return None
+
+    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
+    def task_v3_answer_basis_audit(
+        self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
+    ) -> AnswerBasisAudit | None:
         return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.

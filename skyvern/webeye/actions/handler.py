@@ -114,7 +114,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
 )
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
@@ -10950,6 +10950,8 @@ async def handle_complete_action(
         LOG.exception(
             "Failed to verify the complete action",
             workflow_run_id=task.workflow_run_id,
+            llm_key=e.llm_key if isinstance(e, BaseLLMError) else None,
+            prompt_name=e.prompt_name if isinstance(e, BaseLLMError) else None,
         )
         return [ActionFailure(exception=e)]
 

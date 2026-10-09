@@ -1601,6 +1601,42 @@ async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system
 
 
 @pytest.mark.asyncio
+async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    hook_calls: list[dict[str, Any]] = []
+    applied: list[tuple[list[str], object]] = []
+    audit = object()
+
+    def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
+        hook_calls.append({"parameters": parameters, "goal": goal})
+        return audit
+
+    def spy(tools: list[Any], answer_audit: Any) -> None:
+        applied.append(([t.name for t in tools], answer_audit))
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    for page_free in (False, True):
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+            goal="Apply.",
+            goal_instructions="Answer citizenship from the resume.",
+            parameters={"resume": "text", "file": signed},
+            page_free=page_free,
+        )
+
+    # Only the run with a page is audited, and its judge reads the instructions beside the goal and the data with
+    # signed URLs masked: a raw one would hand its token to the judge's model.
+    assert len(hook_calls) == 1
+    assert hook_calls[0]["parameters"] == mask_opaque_urls({"resume": "text", "file": signed}).masked
+    assert "eyJhbGci" not in str(hook_calls[0]["parameters"]) and "text" in str(hook_calls[0]["parameters"])
+    assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
+    assert "click" in applied[0][0] and applied[0][1] is audit
+    assert applied[1][1] is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
