@@ -643,6 +643,14 @@ def _bounded_error_codes(codes: Any) -> list[str]:
     return [str(c)[:64] for c in codes if isinstance(c, str)][:_PACKET_LIST_CAP]
 
 
+def _bounded_scalars(fact: dict[str, Any]) -> dict[str, bool | int | float | str]:
+    return {
+        str(key)[:64]: item if isinstance(item, (bool, int, float)) else item[:_PACKET_NOTICE_CAP]
+        for key, item in list(fact.items())[:_PACKET_LIST_CAP]
+        if isinstance(item, (bool, int, float, str))
+    }
+
+
 def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
     """The packet's identity and failure scalars, bounded. Lists are tails, so they yield first."""
     if not isinstance(packet, dict):
@@ -656,6 +664,12 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
         run_id = run.get("workflow_run_id")
         status = run.get("status")
         bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
+        # A later test selection reads an older run by which browser ran it and how that browser
+        # started; reduced to an id and a status, the run reads as having left its page for the next.
+        for key in ("browser", "browser_start"):
+            browser_fact = run.get(key)
+            if isinstance(browser_fact, dict) and (scalars := _bounded_scalars(browser_fact)):
+                bounded_run[key] = scalars
         if bounded_run:
             kept["run"] = bounded_run
     challenge = packet.get("challenge")

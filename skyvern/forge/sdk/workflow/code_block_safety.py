@@ -213,6 +213,14 @@ SANDBOX_ONLY_BUILTINS: frozenset[str] = frozenset(
 )
 
 
+def json_safe_default(item: object) -> str:
+    # isinstance falls back to reading item.__class__, which runs a block-defined __getattribute__.
+    # A datetime is a date subclass and keeps the placeholder rather than losing its time.
+    if issubclass(type(item), datetime.date) and not issubclass(type(item), datetime.datetime):
+        return datetime.date.isoformat(item)  # type: ignore[arg-type]
+    return f"Object '{type(item)}' is not JSON serializable"
+
+
 def safe_builtins() -> dict[str, Any]:
     """Builtins a CodeBlock may use while sharing the worker process; dunders drop out via the underscore filter."""
     denied = ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS
