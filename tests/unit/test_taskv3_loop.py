@@ -5241,6 +5241,36 @@ async def test_action_loop_terminates_with_bounded_verdict_on_resubmit_signature
     assert caller.calls <= 15
 
 
+@pytest.mark.parametrize(
+    ("fingerprint_mode", "says_unchanged"),
+    [("never_moves", True), ("moves", False), ("not_sampled", False)],
+)
+@pytest.mark.asyncio
+async def test_action_loop_verdict_says_the_page_did_not_change_only_when_its_fingerprint_never_moved(
+    fingerprint_mode: str, says_unchanged: bool
+) -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    samples = {"n": 0}
+
+    async def fingerprint() -> str:
+        samples["n"] += 1
+        return f"dom-{samples['n']}" if fingerprint_mode == "moves" else "rejected"
+
+    outcome, _ = await _run(
+        _resubmit_script(12),
+        tools,
+        max_turns=200,
+        max_tool_calls=500,
+        page_fingerprint=None if fingerprint_mode == "not_sampled" else fingerprint,
+    )
+
+    assert outcome.guard == ACTION_LOOP_GUARD
+    assert outcome.reason.startswith("The run repeated the same action")
+    assert ("did not change" in outcome.reason) is says_unchanged
+    assert ("without making progress" in outcome.reason) is not says_unchanged
+
+
 @pytest.mark.asyncio
 async def test_action_loop_warns_once_naming_action_count_and_unchanged_state() -> None:
     # Compaction elides superseded observes, so the model cannot see its own repetition in the
