@@ -258,9 +258,6 @@ function WorkflowRunStream({
               queryKey: ["workflowRuns"],
             });
             queryClient.invalidateQueries({
-              queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
-            });
-            queryClient.invalidateQueries({
               queryKey: ["workflowRun", workflowRunId],
             });
             queryClient.invalidateQueries({

@@ -813,7 +813,7 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
     pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
     rounds: list[list[RoundAction]] = []
 
-    async def _capture(actions: list[RoundAction], _text: str | None) -> None:
+    async def _capture(actions: list[RoundAction], _text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     try:

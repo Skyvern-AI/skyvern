@@ -3230,7 +3230,7 @@ async def _atomic_block_run(
     clicks: list[tuple[str, dict[str, Any]]] = []
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(round_actions: list[RoundAction], _text: str | None) -> None:
+    async def _on_round(round_actions: list[RoundAction], _text: str | None, *, round_done: bool) -> None:
         rounds.append(list(round_actions))
 
     script = [
@@ -4516,39 +4516,44 @@ def test_budget_extension_gate_credits_the_headroom_the_grant_itself_creates() -
 
 
 @pytest.mark.asyncio
-async def test_on_action_round_fires_once_per_action_round() -> None:
-    # The callback fires once per action ROUND (a turn with >=1 successful billable action), not per
-    # tool and not on perception-only turns, and receives that round's (name, args) list plus the
-    # assistant text the SAME turn produced.
-    rounds: list[list[tuple[str, dict[str, Any]]]] = []
+async def test_on_action_round_hands_each_action_over_before_the_next_one_dispatches() -> None:
+    # A batch's actions reach the caller as they are dispatched, so rows land while the batch is
+    # still running: handing the whole batch over at the end left a run's five actions executing over
+    # ~16s and then published all five rows at once, hiding the progress (SKY-18164). Perception-only
+    # turns still hand over nothing, and every call carries the SAME turn's assistant text.
+    log: list[Any] = []
     round_texts: list[str | None] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any]]], turn_text: str | None) -> None:
-        rounds.append(actions)
+    async def _on_round(actions: list[RoundAction], turn_text: str | None, *, round_done: bool) -> None:
+        log.append(("handed", [action.tool for action in actions], round_done))
         round_texts.append(turn_text)
 
-    obs, clk, typ = [], [], []
-    observe = _recording_tool("observe", obs)  # perception, not billable
-    click = _recording_tool("click", clk)
+    observe = _recording_tool("observe", log)  # perception, not billable
+    click = _recording_tool("click", log)
     click.billable = True
-    type_ = _recording_tool("type", typ)
+    type_ = _recording_tool("type", log)
     type_.billable = True
     script = [
         [("observe", {})],  # perception-only -> no callback
-        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],  # 1 round, 2 tools -> 1 call
+        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
     texts = ["looking around", "clicking the field and typing into it", "done"]
     outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round, texts=texts)
     assert outcome.status == "completed"
-    assert len(rounds) == 1
-    assert rounds[0] == [
-        RoundAction("click", {"selector": "#a"}, True, billable=True),
-        RoundAction("type", {"selector": "#b", "text": "x"}, True, billable=True),
+    assert log == [
+        ("observe", {}),
+        ("click", {"selector": "#a"}),
+        # The click is published BEFORE the type below runs — the page still shows what the click
+        # did, which is the frame a caller's post-action screenshot needs.
+        ("handed", ["click"], False),
+        ("type", {"selector": "#b", "text": "x"}),
+        # Closing the round flushes the batch's last action and advances the caller's round index once.
+        ("handed", ["type"], True),
     ]
-    # The action round's text is the SECOND turn's ("clicking the field..."), not the first
-    # (perception-only) or third (finish) turn's text.
-    assert round_texts == [texts[1]]
+    # Both hand-offs carry the SECOND turn's text, not the first (perception-only) or third
+    # (finish) turn's.
+    assert round_texts == [texts[1], texts[1]]
 
 
 @pytest.mark.asyncio
@@ -4557,7 +4562,9 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
     # reasoning summary (message.reasoning_content) is the only readable turn text available.
     round_texts: list[str | None] = []
 
-    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+    async def _on_round(
+        _actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None, *, round_done: bool
+    ) -> None:
         round_texts.append(turn_text)
 
     clk = []
@@ -4582,7 +4589,9 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
 async def test_on_action_round_prefers_content_over_reasoning_summary() -> None:
     round_texts: list[str | None] = []
 
-    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+    async def _on_round(
+        _actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None, *, round_done: bool
+    ) -> None:
         round_texts.append(turn_text)
 
     clk = []
@@ -4631,7 +4640,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     # callback (flagged unsuccessful) so the round persists into the workflow-run step budget.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -4646,7 +4655,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
 
 @pytest.mark.asyncio
 async def test_on_action_round_failure_does_not_abort_run() -> None:
-    async def _boom(actions: list[tuple[str, dict[str, Any]]], _turn_text: str | None) -> None:
+    async def _boom(actions: list[tuple[str, dict[str, Any]]], _turn_text: str | None, *, round_done: bool) -> None:
         raise RuntimeError("persist boom")
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -6112,7 +6121,7 @@ _NAV_URL = "https://forms.example.test/contact-us"
 
 def _recordable_navigate(sink: list[tuple[str, dict[str, Any]]], *, outcome: dict[str, Any] | None = None) -> ToolSpec:
     """The production navigate shape (SKY-16374): recordable so the navigation persists as an action
-    row with the round's screenshot, never billable, and carrying the outcome the caller writes onto
+    row with its own screenshot, never billable, and carrying the outcome the caller writes onto
     that row."""
 
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -6142,7 +6151,7 @@ async def test_a_navigation_reaches_the_round_with_its_outcome_and_costs_no_budg
     # a navigation is not a page-mutating step, and a recorded row must never start metering.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -6164,7 +6173,7 @@ async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_
     # to read as a failed one there, or a run that died on a 404 shows a terminate out of nowhere.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -6189,7 +6198,7 @@ async def test_a_recorded_call_that_failed_carries_its_error_text_to_the_round()
     # nothing reads as a navigation that broke for no reason.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -6214,7 +6223,7 @@ async def test_repeated_navigations_to_one_url_are_recorded_without_arming_the_a
     # Recording a row must not change what ends a run.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -8259,7 +8268,7 @@ async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
     script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
     recorded_rounds: list[list[RoundAction]] = []
 
-    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         recorded_rounds.append(round_actions)
 
     outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
@@ -9869,7 +9878,7 @@ async def test_refresh_reload_is_recorded_in_the_action_round() -> None:
 
     rounds: list[list[RoundAction]] = []
 
-    async def on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(list(actions))
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -11740,7 +11749,7 @@ async def test_a_round_carries_billability_from_the_spec_not_from_a_name_list() 
     """
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], reasoning: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], reasoning: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     async def handler(args: dict[str, Any]) -> ToolResult:

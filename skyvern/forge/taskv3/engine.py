@@ -37,6 +37,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
+from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_TIMEOUT_SECONDS,
@@ -58,12 +59,12 @@ from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     PERCEPTION_RETAIN_CHARS_HIGH,
+    ActionRoundSink,
     ActivityRecency,
     CompletionBlocker,
     CompletionGate,
     CompletionProbe,
     LoopOutcome,
-    RoundAction,
     SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
@@ -262,7 +263,7 @@ async def run_task_v3_agent_loop(
     prompt_name: str = "taskv3-agent-loop",
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
+    on_action_round: ActionRoundSink | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
@@ -581,6 +582,18 @@ async def run_task_v3_agent_loop(
     application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
     application_defaults_text, application_defaults_reason = application_defaults or (None, None)
     defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
+    # The judge sees the data and the customer's instructions as the model does.
+    answer_audit = (
+        None
+        if page_free
+        else app.AGENT_FUNCTION.task_v3_answer_basis_audit(
+            refs.masked,
+            goal="\n\n".join(part for part in (model_goal, goal_instructions) if part),
+            organization_id=organization_id,
+            step=step,
+        )
+    )
+    apply_answer_basis_audit(tools, answer_audit)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal

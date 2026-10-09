@@ -218,7 +218,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -10374,9 +10374,7 @@ async def wrapper({default_args}):
             # would either crash registration or, via the default= fallback, replace the value with a
             # useless placeholder — normalize the wrapper family to its selector/marker first.
             result = json_safe_recorder_output(result)
-            result = json.loads(
-                json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
-            )
+            result = json.loads(json.dumps(result, default=json_safe_default))
             # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
             # reach captured locals, the persisted output, or the logged value. Mirrors
             # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.

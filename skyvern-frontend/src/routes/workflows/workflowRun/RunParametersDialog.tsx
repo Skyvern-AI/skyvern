@@ -1,17 +1,8 @@
 import { ParametersDialogBase } from "../components/ParametersDialogBase";
-import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getClient } from "@/api/AxiosClient";
-import { useQuery } from "@tanstack/react-query";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import { WorkflowRunStatusApiResponse } from "@/api/types";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { Parameter } from "../types/workflowTypes";
 import { getOrderedRunParameters } from "../utils";
-import {
-  getActiveOrgQueryKeyScope,
-  getOrgScopedQueryKey,
-  useActiveOrgId,
-} from "@/store/ActiveOrgContext";
 
 type Props = {
   open: boolean;
@@ -26,33 +17,12 @@ export function RunParametersDialog({
   workflowPermanentId,
   workflowRunId,
 }: Props) {
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  const credentialGetter = useCredentialGetter();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
-  const activeOrgId = useActiveOrgId();
-  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
-  const { data: run } = useQuery<WorkflowRunStatusApiResponse>({
-    queryKey: getOrgScopedQueryKey(
-      ["workflowRun", workflowPermanentId, workflowRunId, "dialog"],
-      activeOrgQueryKeyScope,
-    ),
-    queryFn: async ({ signal }) => {
-      const client = await getClient(credentialGetter);
-      const params = new URLSearchParams();
-      const isGlobalWorkflow = globalWorkflows?.some(
-        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
-      );
-      if (isGlobalWorkflow) {
-        params.set("template", "true");
-      }
-      return client
-        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
-          params,
-          signal,
-        })
-        .then((r) => r.data);
-    },
-    enabled: !!workflowPermanentId && !!workflowRunId && !!globalWorkflows,
+  // Reads the run through the shared by-run-id entry, so opening the dialog
+  // reuses whatever the run surfaces already fetched instead of building the
+  // whole run response again under a key of its own.
+  const { data: run } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: workflowRunId ?? undefined,
   });
 
   const defByKey = new Map(

@@ -57,6 +57,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
@@ -67,7 +68,9 @@ from skyvern.forge.taskv3.field_commit import Tier
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
+    PICKED_OPTION_DATA_KEY,
     SemanticCommitStats,
+    ToolRefusal,
     ToolResult,
     ToolSpec,
     _navigate_record_fields,
@@ -602,6 +605,9 @@ _DISABLED_CLICK_HTML = """
   <button id="soon-on" disabled>Soon on</button>
   <button id="swap-off" disabled>Swap off</button>
   <button id="blink-on" disabled>Blink on</button>
+  <button id="aria-off" aria-disabled="true">Aria off</button>
+  <button id="aria-soon-on" aria-disabled="true">Aria soon on</button>
+  <div aria-disabled="true"><button id="aria-under-wrapper">Aria under wrapper</button></div>
   <div id="declared-off" aria-disabled="true" style="cursor:pointer;width:120px">Declared off</div>
 </body></html>
 """
@@ -636,8 +642,21 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
             " b.textContent = 'Blink on'; document.body.append(b); }, 500); }"
         )
         blinked = await click({"selector": "#blink-on"})
-        # Playwright ignores aria-disabled on a role-less element and clicks it, so the tool must too.
-        declared = await click({"selector": "#declared-off"})
+        # The gate stands in for the driver's own enabled check, so the contract is agreement with it,
+        # asserted against `is_enabled` rather than against a hardcoded rule. Which shapes the driver
+        # refuses is version-dependent (`aria-disabled` on an ANCESTOR is refused by 1.61 and clicked
+        # by 1.58), and a test naming the shapes pins the gate to whichever driver it was written on.
+        aria: dict[str, tuple[bool, str | None, str, float]] = {}
+        for selector in ("#aria-off", "#aria-under-wrapper", "#declared-off"):
+            driver_refuses = not await page.locator(selector).is_enabled()
+            start = time.monotonic()
+            r = await click({"selector": selector})
+            aria[selector] = (driver_refuses, r.error_class, r.status, time.monotonic() - start)
+        # The grace waits out a declared-disabled control the page releases, as it does a native one.
+        await page.evaluate(
+            "() => setTimeout(() => document.getElementById('aria-soon-on').removeAttribute('aria-disabled'), 500)"
+        )
+        aria_soon = await click({"selector": "#aria-soon-on"})
         downs = await page.evaluate("() => window.downs")
     assert off.error_class == "disabled", off.content
     assert "is disabled — it cannot be clicked until the page enables it" in off.content
@@ -647,8 +666,17 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
     assert swapped.error_class == "stale_selector", swapped.content
     assert swapped_seconds < 5, swapped_seconds
     assert blinked.status == "ok", blinked.content
-    assert declared.status == "ok", declared.content
-    assert downs == {"submit-on": 1, "soon-on": 1, "blink-on": 1, "declared-off": 1}, downs
+    # Refused exactly when the driver would refuse, told apart from every other failure by its own
+    # error class, and never at the cost of the full actionability wait.
+    for selector, (driver_refuses, error_class, status, seconds) in aria.items():
+        assert (status == "error") is driver_refuses, (selector, aria)
+        assert (error_class == "disabled") is driver_refuses, (selector, aria)
+        assert seconds < 5, (selector, aria)
+    # At least one shape must land on each side, or the agreement above is vacuous.
+    assert len({driver_refuses for driver_refuses, *_ in aria.values()}) == 2, aria
+    assert aria_soon.status == "ok", aria_soon.content
+    clicked_aria = {sel.lstrip("#"): 1 for sel, (refuses, *_) in aria.items() if not refuses}
+    assert downs == {"submit-on": 1, "soon-on": 1, "blink-on": 1, "aria-soon-on": 1, **clicked_aria}, (downs, aria)
 
 
 @_skip_no_browser
@@ -6978,7 +7006,7 @@ async def test_navigate_is_recordable_and_reports_the_outcome_of_the_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # SKY-16374: a URL the model typed itself is an action the customer must see, so navigate is
-    # recordable (one action row + that round's screenshot) while staying out of billing and the
+    # recordable (one action row + its own screenshot) while staying out of billing and the
     # action-step budget. The row is only worth having if it says what HAPPENED, so the handler
     # reports where it asked to go, where it landed, what the page answered, and whether the page
     # moved -- the facts the caller persists on the row.
@@ -8725,7 +8753,7 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
     ]
     rounds: list[list[Any]] = []
 
-    async def _on_round(round_actions: list[Any], _turn_text: str | None) -> None:
+    async def _on_round(round_actions: list[Any], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(round_actions)
 
     outcome = await run_agent_tool_loop(
@@ -8951,6 +8979,7 @@ async def test_click_option_commit_verified_by_menu_close() -> None:
     assert r.status == "ok"
     assert "Selected option 'Most popular'" in r.content
     assert "menu closed" in r.content
+    assert (r.data or {}).get(PICKED_OPTION_DATA_KEY) == "Most popular"
     # commit judged against the POST-hover baseline: the handler hovered before clicking
     assert ("hover", '[data-tv3-menu="3"]') in page.calls
 
@@ -9322,6 +9351,7 @@ async def test_click_option_that_is_marked_and_also_grows_reports_both(monkeypat
     assert "Selected option 'Referral' — its state changed." in r.content
     assert "the menu stayed open" not in r.content
     assert "opened a menu of 2 options" in r.content
+    assert (r.data or {}).get(PICKED_OPTION_DATA_KEY) == "Referral"
 
 
 @pytest.mark.asyncio
@@ -9995,6 +10025,53 @@ async def test_dom_a_menu_note_lists_each_multi_element_option_row_whole() -> No
         assert "'Contoso Group' matches 2 rows" in r.content, r.content
         assert "200300400" in r.content and "400500600" in r.content, r.content
         assert await page.evaluate("() => window.__picked") is None
+
+
+class _FlagAnswers:
+    def __init__(self, flag: str) -> None:
+        self.flag = flag
+
+    async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+        return [a for a in answers if a.value == self.flag]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_held_answer_is_repaired_by_ref_while_a_submit_by_ref_stays_held() -> None:
+    # The hold compares a click with the field as recorded, after the ref resolver rewrote it to CSS.
+    html = (
+        _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(["Yes", "No", "I prefer not to answer"]))
+        .replace("__ROWS__", _PLAIN_OPTION_ROW_JS)
+        .replace('<button id="trigger"', '<button id="trigger" aria-label="Excluded from a federal program?"')
+        .replace(
+            "<script>",
+            '<button id="submit" style="position:absolute;top:400px;left:40px" '
+            'onclick="window.__submitted = true">Submit</button><script>',
+            1,
+        )
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        apply_answer_basis_audit(tools, _FlagAnswers("No"))
+        click = _tool(tools, "click").handler
+        seen = await _tool(tools, "observe").handler({})
+        opener, submit = _ref_line(seen.content, "federal program"), _ref_line(seen.content, "Submit")
+        opened = await click({"selector": opener})
+        row = {text: n for n, text in _menu_note_entries(opened.content)}["No"]
+        await click({"selector": f'[data-tv3-menu="{row}"]'})
+
+        with pytest.raises(ToolRefusal, match="Excluded from a federal program"):
+            await click({"selector": submit})
+        assert await page.evaluate("() => window.__submitted") is None
+        reopened = await click({"selector": opener})
+        assert "opened a menu of 3 options" in reopened.content, reopened.content
+        with pytest.raises(ToolRefusal):
+            await click({"selector": submit})
+        decline = _ref_line((await _tool(tools, "observe").handler({})).content, "option 'I prefer not to answer'")
+        await click({"selector": decline})
+        assert await page.evaluate("() => window.__picked") == "I prefer not to answer"
+        await click({"selector": submit})
+        assert await page.evaluate("() => window.__submitted") is True
 
 
 @_skip_no_browser
@@ -12364,7 +12441,7 @@ async def test_every_uncharged_refusal_is_issued_before_the_page_is_touched(
         before = (page.url, await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS))
         rounds: list[list[taskv3_loop.RoundAction]] = []
 
-        async def _on_round(actions: list[taskv3_loop.RoundAction], _text: str | None) -> None:
+        async def _on_round(actions: list[taskv3_loop.RoundAction], _text: str | None, *, round_done: bool) -> None:
             rounds.append(list(actions))
 
         outcome = await taskv3_loop.run_agent_tool_loop(
@@ -15488,6 +15565,67 @@ async def test_type_says_a_disabled_field_is_disabled_instead_of_waiting_for_it(
         assert r.status == "error", r.content
         assert "disabled" in r.content
         assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_says_an_aria_disabled_field_is_disabled_instead_of_waiting_for_it() -> None:
+    # fill() waits on the driver's own rule, which is wider than `:disabled`, so a gate reading
+    # `:disabled` alone pays the full timeout on a field the driver was never going to fill. Asserted
+    # as agreement with `is_enabled` rather than per shape: which shapes it refuses moves between
+    # driver versions (`aria-disabled` on an ANCESTOR is refused by 1.61 and filled by 1.58).
+    html = (
+        '<input id="own" type="text" aria-disabled="true" style="width:200px;height:30px">'
+        '<div aria-disabled="true"><input id="under" type="text" style="width:200px;height:30px"></div>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        typed = {}
+        for name in ("own", "under"):
+            driver_refuses = not await page.locator(f"#{name}").is_enabled()
+            start = time.monotonic()
+            r = await _tool(tools, "type").handler({"selector": f"#{name}", "text": "Iowa City"})
+            typed[name] = (driver_refuses, r.status, "disabled" in r.content, time.monotonic() - start)
+    for name, (driver_refuses, status, says_disabled, elapsed) in typed.items():
+        assert (status == "error") is driver_refuses, (name, typed)
+        assert says_disabled is driver_refuses, (name, typed)
+        assert elapsed < 10, (name, typed)
+    # The own-attribute field is refused by every driver version we run, so this test always has a leg
+    # that exercises the gate rather than only agreeing with a driver that refuses nothing.
+    assert typed["own"][0] is True, typed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_waits_out_an_aria_disabled_field_the_page_releases() -> None:
+    # fill()'s own wait used to cover this, so asking the driver up front must hold the same grace the
+    # click gate does -- otherwise consulting it turns a fill that succeeded into an instant refusal.
+    html = '<input id="soon" type="text" aria-disabled="true" style="width:200px;height:30px">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate(
+            "() => setTimeout(() => document.getElementById('soon').removeAttribute('aria-disabled'), 500)"
+        )
+        r = await _tool(tools, "type").handler({"selector": "#soon", "text": "Iowa City"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#soon", "el => el.value") == "Iowa City"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reports_readonly_when_the_page_locks_the_field_during_the_grace() -> None:
+    # A page that answers the grace by making the field readonly has made it un-typable for a different
+    # reason, so the grace must re-read rather than only poll the driver's enabled answer.
+    html = '<input id="soon" type="text" aria-disabled="true" style="width:200px;height:30px">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate(
+            "() => setTimeout(() => { const f = document.getElementById('soon');"
+            " f.readOnly = true; f.removeAttribute('aria-disabled'); }, 300)"
+        )
+        r = await _tool(tools, "type").handler({"selector": "#soon", "text": "Iowa City"})
+    assert r.error_class == "not_editable", r.content
+    assert "is readonly" in r.content, r.content
 
 
 # The skin is a link. Forcing the click follows it, and the selector may well match something on the

@@ -3629,6 +3629,8 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -3644,6 +3646,8 @@ def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=None,
     )
@@ -3659,6 +3663,8 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=True,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )

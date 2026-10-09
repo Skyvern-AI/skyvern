@@ -21,6 +21,8 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
     OriginExecutionSettings,
+    OriginOutputRefusal,
+    OriginOutputRefusalDetail,
     OriginOutputSnapshot,
     SelectedOutputSource,
 )
@@ -602,6 +604,7 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
     assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"]["kind"] == "separate_context_continued_from_earlier_test"
     harness["cancel_run_task"].assert_awaited_once()
     harness["clear"].assert_awaited_once()
     assert _adopted_detached_tasks(before) == []
@@ -615,6 +618,96 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
         assert contains_internal_machinery_leak(relayed) is False
         assert_clean_user_facing_text(relayed)
     assert "Run ID:" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_session_id", "resume_session_id", "acquired_session_id", "kind", "inherited_browser_state"),
+    [
+        ("pbs_chat", None, "pbs_chat", "chat_browser_context", True),
+        ("pbs_chat", "pbs_chat", "pbs_chat", "chat_browser_context_continued_from_earlier_test", True),
+        (None, None, "pbs_chat", "chat_browser_context_opened_for_this_run", False),
+        ("pbs_chat", "pbs_chat", "pbs_chat_replacement", "chat_browser_context_opened_for_this_run", False),
+    ],
+)
+async def test_a_chat_browser_run_at_the_ceiling_says_which_browser_it_started_in(
+    monkeypatch: pytest.MonkeyPatch,
+    chat_session_id: str | None,
+    resume_session_id: str | None,
+    acquired_session_id: str,
+    kind: str,
+    inherited_browser_state: bool,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+
+    async def _acquire(ctx: CopilotContext, **_kwargs: object) -> None:
+        ctx.browser_session_id = acquired_session_id
+
+    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
+    ctx = make_copilot_ctx(browser_session_id=chat_session_id)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = resume_session_id
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"] == {
+        "kind": kind,
+        "restored_saved_profile": False,
+        "inherited_browser_state": inherited_browser_state,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_a_refused_earlier_output_keeps_the_chat_browser_it_opened_as_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+
+    async def _acquire(ctx: CopilotContext, **_kwargs: object) -> None:
+        ctx.browser_session_id = ctx.browser_session_id or "pbs_chat"
+
+    refusals = [
+        OriginOutputRefusalDetail(
+            reason=OriginOutputRefusal.CHANGED_PRODUCER, block_label="run_search", origin_workflow_run_id="wr_origin"
+        )
+    ]
+
+    def _refuse_once_after_persistence(*_args: object, check_settings: bool = True, **_kwargs: object) -> object:
+        return refusals.pop() if check_settings and refusals else None
+
+    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
+    monkeypatch.setattr(run_execution, "selected_output_run_refusal", _refuse_once_after_persistence)
+    ctx = make_copilot_ctx(browser_session_id=None)
+    ctx.staged_workflow = harness["workflow"]
+    origin = OriginOutputSnapshot(
+        definition=harness["workflow"].workflow_definition,
+        outputs={
+            "run_search": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"results": []}
+            )
+        },
+        settings=OriginExecutionSettings.of(harness["workflow"]),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "run_search": SelectedOutputSource("run_search", "wr_origin", "origin", origin)
+    }
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert refusals == []
+    assert result["data"]["browser_start"] == {
+        "kind": "chat_browser_context_opened_for_this_run",
+        "restored_saved_profile": False,
+        "inherited_browser_state": False,
+    }
 
 
 @pytest.mark.asyncio

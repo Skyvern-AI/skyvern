@@ -24,7 +24,7 @@ from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Collection, Iterator, Literal, NamedTuple, Protocol, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 import structlog
@@ -130,6 +130,8 @@ ToolErrorClass = Literal[
     "unsupported_argument",
     "list_not_opened",
     "rows_are_navigation",
+    # A click that may move the form on was held: answers entered this run have no basis in the data.
+    "answer_without_basis",
     "rows_under_categories",
     "list_unread",
     "list_ambiguous",
@@ -309,6 +311,10 @@ class ToolRefusal(Exception):
 # tokens. The label composition itself -- the floor vocabulary, the shape filter, the secret matcher --
 # lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
 TARGET_LABEL_DATA_KEY = "target_label"
+# The option text a click on a menu row committed (page text: never on the call record).
+PICKED_OPTION_DATA_KEY = "picked_option"
+# A list the control opened but could not settle a row in: the list stays open for a pick.
+OPENED_LIST_ERROR_CLASSES = frozenset({"list_no_match", "list_unread", "list_ambiguous", "identical_rows"})
 TARGET_KIND_DATA_KEY = "target_kind"
 # The tool-result `data` key a recorded action's outcome rides on: the machine facts about what the
 # call achieved (`requested_url`, `url`, `http_status`, `page_transitioned`, `navigation_dead_end`),
@@ -563,6 +569,21 @@ class RoundAction(NamedTuple):
     error: str | None = None
 
 
+class ActionRoundSink(Protocol):
+    """Receives dispatched actions as they happen, in dispatch order.
+
+    Each call carries only what was recorded since the previous one, so a batch arrives in pieces
+    while it is still running. `round_done` marks the batch's last call — the only one whose list may
+    be empty, and where a caller advances per-round bookkeeping.
+    """
+
+    # Positional-only: the loop passes both by position, and binding their names here would force
+    # every implementation to spell them the same way.
+    async def __call__(
+        self, actions: list[RoundAction], turn_reasoning: str | None, /, *, round_done: bool
+    ) -> None: ...
+
+
 # A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
 # completed with that reason, without the model ever calling finish. A blocker consulted from
 # finish(completed) itself; a truthy return rejects that verdict with the message as the reason. Both
@@ -610,6 +631,9 @@ class ToolSpec:
     # Whether a call's target carries the toggle state observe prints (checked/pressed). Consulted only
     # to exempt a click from the post-failure submit skip; set by the browser tools on click alone.
     toggle_probe: Callable[[dict[str, Any]], Awaitable[bool]] | None = None
+    # The selector a click's arguments resolve to as the call's record keeps it after dispatch (a ref's durable
+    # selector, a mark's act tag), and whether it names a row of an open list; set on click alone.
+    address_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, bool]]] | None = None
 
     @property
     def touches_page(self) -> bool:
@@ -3285,7 +3309,7 @@ async def run_agent_tool_loop(
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[RoundAction], str | None], Awaitable[None]] | None = None,
+    on_action_round: ActionRoundSink | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     # The fixed input re-sent on every call is charged against max_tokens only up to this size, so a large task
@@ -4061,6 +4085,30 @@ async def run_agent_tool_loop(
         st.reload_failed_nudge_due = False
         action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
         round_actions: list[RoundAction] = []
+        # How much of `round_actions` the caller has already been handed. Waiting for the whole batch
+        # before handing anything over hid a long batch's progress and then published it at once
+        # (SKY-18164).
+        handed_off = 0
+
+        async def _hand_off_actions(*, round_done: bool) -> None:
+            """Hand the caller everything recorded since the last call so it can persist as we go.
+
+            A persistence hiccup must not abort an otherwise-good run, so failures are contained here.
+            """
+            nonlocal handed_off
+            if on_action_round is None or not round_actions:
+                return
+            fresh = round_actions[handed_off:]
+            # The closing call fires even with nothing fresh left: a batch whose last recorded action
+            # was already handed over mid-flight still has to be told its round ended.
+            if not fresh and not round_done:
+                return
+            handed_off = len(round_actions)
+            try:
+                await on_action_round(fresh, text or reasoning_summary or None, round_done=round_done)
+            except Exception:
+                LOG.warning("taskv3 on_action_round callback failed", turn=st.turns, exc_info=True)
+
         # A hard 404/410 from an in-loop navigate, applied only AFTER the batch so a same-turn fallback
         # navigate can clear it — the model is told to batch aggressively, and terminating on the first
         # of a batched [navigate(dead), navigate(live)] would discard the recovery it planned.
@@ -4106,6 +4154,10 @@ async def run_agent_tool_loop(
                 st.canonical.progress(_ProgressEvidence.CROSS_BATCH_MOVEMENT)
         batch_fp_after: str | None = None
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
+            # Publish the previous call's action before this one runs, while the page still holds
+            # what that action left behind. At the top because every exit below is a `break` or a
+            # pre-dispatch `continue`; the closing hand-off flushes the last iteration's work.
+            await _hand_off_actions(round_done=False)
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
             # this call nor the rest of the batch executes, so answer them as skipped.
@@ -5388,14 +5440,9 @@ async def run_agent_tool_loop(
         # under-counts equivalent work.
         if turn_charged:
             st.action_steps += 1
-        # Hand the round's executed actions to the caller so it can persist per-action artifacts
-        # (screenshot, DB rows) — kept out of this transport-agnostic core, like should_cancel. A
-        # persistence hiccup must not abort an otherwise-good run, so failures are contained here.
-        if round_actions and on_action_round is not None:
-            try:
-                await on_action_round(round_actions, text or reasoning_summary or None)
-            except Exception:
-                LOG.warning("taskv3 on_action_round callback failed", turn=st.turns, exc_info=True)
+        # Close the round: flush whatever the batch's last call recorded and tell the caller the
+        # round ended, so its per-round bookkeeping (the action row's round index) advances once.
+        await _hand_off_actions(round_done=True)
 
     if st.outcome is None:
         st.outcome = LoopOutcome("loop_error", "loop exited without an outcome")

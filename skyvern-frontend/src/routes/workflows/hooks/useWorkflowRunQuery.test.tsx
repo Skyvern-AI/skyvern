@@ -225,7 +225,6 @@ function harness(client: QueryClient, path: string) {
 // key of the run now being requested, which is what keepPreviousData hands over.
 function seedRetained(client: QueryClient, requestedId: string, run: unknown) {
   client.setQueryData(["workflowRun", requestedId], run);
-  client.setQueryData(["workflowRun", "wpid_1", requestedId], run);
 }
 
 beforeEach(() => {
@@ -267,6 +266,33 @@ describe("run read path", () => {
     );
     expect(getClientMock).toHaveBeenCalledWith(undefined, "sans-api-v1");
     expect(get.mock.calls[0]?.[0]).toBe(`/workflows/runs/${RUN_A_ID}`);
+  });
+
+  // Both hooks read this route, and the run page mounts both. Separate keys made
+  // the server build the whole run response twice per view and poll it twice over.
+  test("both run hooks share one cache entry, so a run is read once", async () => {
+    const get = vi.fn((url: string) =>
+      url.includes(RUN_A_ID)
+        ? Promise.resolve({ data: buildRun(RUN_A_ID, Status.Completed) })
+        : new Promise(() => {}),
+    );
+    getClientMock.mockResolvedValue({ get, post: vi.fn() });
+    const client = makeClient();
+    const { result } = renderHook(
+      () => ({
+        plain: useWorkflowRunQuery({ workflowRunId: RUN_A_ID }),
+        withWorkflow: useWorkflowRunWithWorkflowQuery({
+          workflowRunId: RUN_A_ID,
+        }),
+      }),
+      { wrapper: harness(client, "/agents/wpid_1/studio") },
+    );
+
+    await waitFor(() => {
+      expect(result.current.plain.data?.workflow_run_id).toBe(RUN_A_ID);
+      expect(result.current.withWorkflow.data?.workflow_run_id).toBe(RUN_A_ID);
+    });
+    expect(get.mock.calls).toHaveLength(1);
   });
 });
 

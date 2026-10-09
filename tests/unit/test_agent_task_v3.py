@@ -198,7 +198,10 @@ async def _run_execute_task_v3(
         if cb is not None and action_rounds:
             for i, round_actions in enumerate(action_rounds):
                 turn_text = action_round_texts[i] if action_round_texts and i < len(action_round_texts) else None
-                await cb(round_actions, turn_text)
+                # Mirrors the real loop: each dispatched action is handed over on its own as the
+                # batch runs, and the round's last hand-off closes it.
+                for position, round_action in enumerate(round_actions):
+                    await cb([round_action], turn_text, round_done=position == len(round_actions) - 1)
         if on_loop is not None:
             on_loop(kwargs)
         if on_loop_async is not None:
@@ -1156,9 +1159,9 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
 
 @pytest.mark.asyncio
 async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The loop reports two successful action rounds; the closure must capture one screenshot per
-    # round and persist one actions-table row per action (FK'ing the round's screenshot), so the
-    # Task API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3.
+    # The loop reports three successful actions across two rounds; the closure must capture one
+    # screenshot per ACTION and persist one actions-table row per action (FK'ing that screenshot), so
+    # the Task API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3.
     from skyvern.forge import agent as agent_mod
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
@@ -1180,9 +1183,10 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
         extracted_information_schema=None,
     )
     assert step.status == StepStatus.completed
-    # One SCREENSHOT_ACTION artifact per action round plus one for the terminal decision row;
-    # one actions-table row per action plus the decision row itself.
-    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 3
+    # One SCREENSHOT_ACTION artifact per ACTION plus one for the terminal decision row: rows publish
+    # as each action is dispatched, so each one is shot on the page it left behind rather than
+    # sharing the frame the batch ended on. One actions-table row per action plus the decision row.
+    assert agent_mod.app.ARTIFACT_MANAGER.create_artifact.await_count == 4
     assert agent_mod.app.DATABASE.workflow_params.create_action.await_count == 4
     persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[:-1]]
     # organization_id/task_id/step_id must be set, or GET /tasks/{id}/actions filters the rows out;
@@ -1236,7 +1240,7 @@ async def test_execute_task_v3_persists_a_navigation_as_a_goto_url_row(monkeypat
     assert navigation.status == ActionStatus.completed
     assert navigation.intention == f"Navigated to {_GOTO_OUTCOME['requested_url']}"
     assert navigation.reasoning == "the contact link 404s, typing the contact URL instead"
-    assert navigation.screenshot_artifact_id == "artifact-1"  # the round's own screenshot
+    assert navigation.screenshot_artifact_id == "artifact-1"  # the action's own screenshot
     assert navigation.response is not None
     assert _GOTO_OUTCOME["url"] in navigation.response and "HTTP 200" in navigation.response
     # Recorded, never metered: the navigation round leaves the step index where it was, so the click
@@ -4915,6 +4919,37 @@ async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
         # distinct pair for the budget to count, charging the run a step nothing billable claimed.
         (ActionType.SCROLL, 0),
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_mixed_round_opens_one_budget_pair_per_charged_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A row publishes before the rest of its batch has run, so a navigation sitting AHEAD of a click
+    # in the same round cannot see that the click will bill, and it stamps the previous round's index
+    # instead of the one the click goes on to claim. What has to hold is the budget's own unit — the
+    # count of distinct (task_id, step_order) pairs, one per charged round — not which of the two
+    # indices a non-billable row rides.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "click"])
+    nav = RoundAction("navigate", {"url": _GOTO_OUTCOME["requested_url"]}, True, None, None, False, _GOTO_OUTCOME)
+    click = RoundAction("click", {"selector": "#send"}, True, billable=True)
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[nav, click], [nav, click]],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    calls = agent_module.app.DATABASE.workflow_params.create_action.await_args_list
+    stamped = [(c.kwargs["action"].action_type, c.kwargs["action"].step_order) for c in calls]
+    assert stamped == [
+        (ActionType.GOTO_URL, 0),
+        (ActionType.CLICK, 0),
+        (ActionType.GOTO_URL, 0),
+        (ActionType.CLICK, 1),
+        (ActionType.COMPLETE, 1),
+    ]
+    assert len({step_order for _action_type, step_order in stamped}) == 2  # two charged rounds
 
 
 @pytest.mark.asyncio

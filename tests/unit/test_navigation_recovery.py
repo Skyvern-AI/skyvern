@@ -16,6 +16,7 @@ from skyvern.webeye.utils.page import (
     _wait_for_navigation_settle,
     with_dom_utils,
 )
+from tests.unit.conftest import DriverReplyProbe
 
 
 class TestIsNavigationContextLost:
@@ -135,6 +136,19 @@ class TestEvaluateWithNavigationRecovery:
 
         result = await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=30000)
         assert result == 42
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("message", ["Execution context was destroyed", "Frame has been detached."])
+    async def test_an_abandoned_evaluate_leaves_the_driver_no_unretrieved_reply(self, message: str) -> None:
+        """A navigation that destroys the context answers an evaluate the deadline already gave up on."""
+        probe = DriverReplyProbe(PlaywrightError(f"Page.evaluate: {message}"))
+        frame = AsyncMock()
+        frame.evaluate = probe
+
+        with pytest.raises(SkyvernPageAnalysisTimeout):
+            await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=25)
+
+        assert not await probe.orphaned_reply()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_type", [PlaywrightError, RuntimeError])
