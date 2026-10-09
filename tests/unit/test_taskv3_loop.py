@@ -641,6 +641,74 @@ async def test_initial_navigation_dead_end_yields_canceled_when_cancelling() -> 
     assert caller.calls == 0
 
 
+_PORTAL = "https://jobs.example.test/portal.action"
+
+
+@pytest.mark.parametrize(
+    ("targets", "requested", "landed", "revisit", "expected"),
+    [
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (True, False)),
+        # A redirect: the task named the URL asked for, not the one the 404 came back on.
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", _PORTAL + "?gone=1", False, (True, False)),
+        (set(), _PORTAL, None, True, (False, True)),
+        # Both hold: the logged provenance prefers the task's own URL, the flags stay independent.
+        ({_PORTAL}, _PORTAL, None, True, (True, True)),
+        # Same page, different query: on query-routed sites that is a different page, not the task's.
+        ({_PORTAL + "?page=intro&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (False, False)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_navigate_dead_end_logs_its_provenance_without_a_url(
+    targets: set[str], requested: str, landed: str | None, revisit: bool, expected: tuple[bool, bool]
+) -> None:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        data = {
+            "page_state_changed": True,
+            "navigation_dead_end": 404,
+            "navigation_dead_end_url": landed or args["url"],
+        }
+        return ToolResult.ok("navigated", data={**data, "nav_revisit": True} if revisit else data)
+
+    tools = [ToolSpec(name="navigate", description="n", parameters={}, handler=handler), make_finish_tool()]
+    script = [[("navigate", {"url": requested})], [("finish", {"status": "completed", "reason": "never"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, task_target_urls=caller_known_published_urls(*targets, keep_query=True))
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"]) == expected
+    assert line["provenance"] == (
+        "task_supplied" if expected[0] else "previously_visited" if expected[1] else "undecided"
+    )
+    assert not any("http" in str(value) for value in line.values())
+
+
+@pytest.mark.parametrize(
+    ("requested", "landed"),
+    [
+        ("http://jobs.example.test/acme/42", "https://jobs.example.test/acme/42"),
+        ("https://jobs.example.test/acme/42", "https://jobs.example.test/acme/expired"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_after_a_redirect_is_logged_task_supplied(
+    requested: str, landed: str
+) -> None:
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[("finish", {"status": "completed", "reason": "never"})]],
+            [make_finish_tool()],
+            initial_navigation_status=404,
+            initial_navigation_url=landed,
+            initial_navigation_requested_url=requested,
+            task_target_urls=caller_known_published_urls(requested, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop initial navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"], line["provenance"]) == (True, False, "task_supplied")
+
+
 @pytest.mark.asyncio
 async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
     async def _blocked(status: str) -> str | None:
