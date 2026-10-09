@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 WORKFLOW_TASK_V3_AB_FLAG = "WORKFLOW_TASK_V3_AB"
+WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG = "WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS"
 WOULD_BE_CODE_PROPERTY = "would_be_code"
 DISABLE_TASK_V3_FLAG = "DISABLE_TASK_V3"
 
@@ -55,6 +56,10 @@ class WorkflowBlockEngineRouteReason(StrEnum):
     # left its engine unset and runs on v3 (``new_workflow_v3_default``), or every block's engine was
     # chosen and is honored as written (``chosen_engine``).
     new_workflow_v3_default = "new_workflow_v3_default"
+    # The same workflows when WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS lists the run's org or workflow: its Default blocks
+    # are randomized per run, v3 in treatment and v1 in control.
+    new_workflow_ab_treatment = "new_workflow_ab_treatment"
+    new_workflow_ab_control = "new_workflow_ab_control"
     chosen_engine = "chosen_engine"
     # Before that cutoff, a block a person pinned to skyvern-1.0 keeps the run out of the A/B; labelled
     # apart from ``ineligible`` so reads can count and drop these runs by this value alone.
@@ -237,6 +242,35 @@ async def _ab_flag_puts_run_in_treatment(
     )
 
 
+async def _new_workflow_ab_variant(
+    provider: BaseExperimentationProvider,
+    *,
+    workflow_run_id: str,
+    organization_id: str | None,
+    workflow_permanent_id: str | None,
+) -> str | None:
+    """The run's WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS variant, or None for a missing flag, an unlisted run or a raised
+    read. Only "v1" and "v3" move the run; the caller keeps v3 for anything else.
+    """
+    try:
+        variant = await provider.get_value_cached(
+            WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG,
+            workflow_run_id,
+            properties={
+                "organization_id": organization_id,
+                "workflow_permanent_id": workflow_permanent_id or "not_workflow",
+            },
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS; keeping v3",
+            workflow_run_id=workflow_run_id,
+            exc_info=True,
+        )
+        return None
+    return variant
+
+
 async def resolve_workflow_block_engine_arm(
     context: skyvern_context.SkyvernContext,
     *,
@@ -270,6 +304,8 @@ async def resolve_workflow_block_engine_arm(
     engine unset, or is None when the run has no engine to choose. The rule does not require A/B
     eligibility, since a pinned block no longer keeps the run's unset blocks on v1, and so covers a
     script run's uncached blocks and AI fallback.
+    ``WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS`` can randomize those unset blocks per run for a listed org or
+    workflow: variant ``v1`` leaves the override unset, ``v3`` sets it, and anything else keeps v3.
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
@@ -337,8 +373,22 @@ async def resolve_workflow_block_engine_arm(
                 elif chosen_engine_candidate and await born_at_or_after(settings.TASK_V3_CHOSEN_ENGINE_CUTOFF):
                     honors_chosen_engine = True
                     if takes_default_engine:
-                        override = RunEngine.skyvern_v3
-                        route_reason = WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                        variant = await _new_workflow_ab_variant(
+                            provider,
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                        )
+                        if variant == "v1":
+                            # Control leaves the override unset, so Default blocks run v1 and pins keep their engine.
+                            route_reason = WorkflowBlockEngineRouteReason.new_workflow_ab_control
+                        else:
+                            override = RunEngine.skyvern_v3
+                            route_reason = (
+                                WorkflowBlockEngineRouteReason.new_workflow_ab_treatment
+                                if variant == "v3"
+                                else WorkflowBlockEngineRouteReason.new_workflow_v3_default
+                            )
                     else:
                         route_reason = WorkflowBlockEngineRouteReason.chosen_engine
                 elif run_is_eligible:
