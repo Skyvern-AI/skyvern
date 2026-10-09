@@ -25,6 +25,7 @@ from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvi
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     DISABLE_TASK_V3_FLAG,
     WORKFLOW_TASK_V3_AB_FLAG,
+    WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG,
     WOULD_BE_CODE_PROPERTY,
     WorkflowBlockEngineRouteReason,
     _as_utc,
@@ -1479,11 +1480,17 @@ async def _resolve_chosen_engine_run(
     born_at: datetime,
     flags: dict[str, bool] | None = None,
     workflow_status: WorkflowStatus = WorkflowStatus.published,
+    values: dict[str, str] | None = None,
+    strict_error_flags: set[str] | None = None,
 ) -> tuple[FakeExperimentationProvider, Any]:
     # Eligibility and the unset-engine fact are computed from the blocks by the same helpers the
     # workflow service calls, so a block-level regression in either reaches these assertions.
     monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
-    provider = FakeExperimentationProvider(flags if flags is not None else {WORKFLOW_TASK_V3_AB_FLAG: True})
+    provider = FakeExperimentationProvider(
+        flags if flags is not None else {WORKFLOW_TASK_V3_AB_FLAG: True},
+        values=values,
+        strict_error_flags=strict_error_flags,
+    )
     resolution = await resolve_arm(
         context,
         provider,
@@ -1540,8 +1547,9 @@ async def test_chosen_engine_cutoff_matrix(
     assert block.resolve_engine("wr_matrix") == expected_engine
     assert resolution.log["route_reason"] == expected_reason
     if expected_reason in (_R.new_workflow_v3_default, _R.chosen_engine):
-        # Every tier, with no A/B draw and no billing-tier lookup.
-        assert consulted_flags(provider) == [DISABLE_TASK_V3_FLAG]
+        # Every tier, with no A/B draw and no billing-tier lookup; only an unset block asks the new-workflow split.
+        new_split = [WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG] if expected_reason == _R.new_workflow_v3_default else []
+        assert consulted_flags(provider) == [DISABLE_TASK_V3_FLAG, *new_split]
         assert resolution.log["billing_tier"] is None
 
 
@@ -1567,6 +1575,87 @@ async def test_a_post_cutoff_run_honors_each_block_on_its_own(
         RunEngine.skyvern_v1,
     ]
     assert resolution.log["route_reason"] == _R.new_workflow_v3_default
+
+
+@pytest.mark.parametrize(
+    ("values", "strict_error_flags", "expected_engine", "expected_reason"),
+    [
+        ({}, None, RunEngine.skyvern_v3, _R.new_workflow_v3_default),
+        ({"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS": "v3"}, None, RunEngine.skyvern_v3, _R.new_workflow_ab_treatment),
+        ({"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS": "v1"}, None, RunEngine.skyvern_v1, _R.new_workflow_ab_control),
+        ({"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS": "50"}, None, RunEngine.skyvern_v3, _R.new_workflow_v3_default),
+        ({}, {"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS"}, RunEngine.skyvern_v3, _R.new_workflow_v3_default),
+    ],
+    ids=["not-listed", "treatment", "control", "unknown-variant", "raised-read"],
+)
+@pytest.mark.asyncio
+async def test_the_new_workflow_split_moves_only_unset_blocks(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    values: dict[str, str],
+    strict_error_flags: set[str] | None,
+    expected_engine: RunEngine,
+    expected_reason: WorkflowBlockEngineRouteReason,
+) -> None:
+    # Only a listed run's control variant moves its unset blocks to v1; a v3 pin stays v3 in every cell, and anything
+    # that is not a listed variant keeps today's v3 default.
+    unset = _make_block(NavigationBlock, label="unset", navigation_goal="Apply to the job")
+    chose_v3 = _make_block(TaskBlock, label="chose_v3", engine=RunEngine.skyvern_v3)
+    provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        [unset, chose_v3],
+        run_id="wr_new_split",
+        cutoff=CHOSEN_ENGINE_CUTOFF,
+        born_at=_AFTER,
+        values=values,
+        strict_error_flags=strict_error_flags,
+    )
+
+    assert [unset.resolve_engine("wr_new_split"), chose_v3.resolve_engine("wr_new_split")] == [
+        expected_engine,
+        RunEngine.skyvern_v3,
+    ]
+    assert resolution.log["route_reason"] == expected_reason
+    assert WORKFLOW_TASK_V3_AB_FLAG not in consulted_flags(provider)
+    (call,) = (c for c in provider.calls if c[0] == WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG)
+    # Both properties are what a release condition can list; a segment listed by organization never matches without it.
+    assert call[1:] == ("wr_new_split", {"organization_id": "org_1", "workflow_permanent_id": "wpid_1"})
+
+
+@pytest.mark.asyncio
+async def test_the_new_workflow_split_never_reaches_a_pre_cutoff_or_killed_run(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = {"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS": "v1"}
+    before = _make_block(TaskBlock, label="before")
+    provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        [before],
+        run_id="wr_pre",
+        cutoff=CHOSEN_ENGINE_CUTOFF,
+        born_at=_BEFORE,
+        values=control,
+    )
+    assert before.resolve_engine("wr_pre") == RunEngine.skyvern_v3
+    assert resolution.log["route_reason"] == _R.flag_bucket_treatment
+    assert WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG not in consulted_flags(provider)
+
+    killed = _make_block(TaskBlock, label="killed")
+    provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        [killed],
+        run_id="wr_killed_split",
+        cutoff=CHOSEN_ENGINE_CUTOFF,
+        born_at=_AFTER,
+        flags={WORKFLOW_TASK_V3_AB_FLAG: True, DISABLE_TASK_V3_FLAG: True},
+        values={"WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS": "v3"},
+    )
+    assert killed.resolve_engine("wr_killed_split") == RunEngine.skyvern_v1
+    assert resolution.log["route_reason"] == _R.disabled
+    assert WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG not in consulted_flags(provider)
 
 
 @pytest.mark.parametrize("chosen", [None, RunEngine.skyvern_v3])
@@ -1827,6 +1916,27 @@ async def test_the_new_workflow_defaults_never_take_a_code_mode_run_off_its_scri
     assert chosen.log["route_reason"] == WorkflowBlockEngineRouteReason.new_workflow_v3_default
     assert code_mode_displaced("wr_self_serve_code") is False
     assert code_mode_displaced("wr_chosen_code") is False
+
+
+@pytest.mark.asyncio
+async def test_a_new_workflow_code_mode_run_on_control_falls_back_to_v1_and_keeps_its_script(
+    scoped_context: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A script run's uncached blocks and AI fallback resolve through the block, so they follow the split's arm.
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", CHOSEN_ENGINE_CUTOFF)
+    resolution = await resolve_arm(
+        scoped_context,
+        FakeExperimentationProvider(
+            {WORKFLOW_TASK_V3_AB_FLAG: True}, values={WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS_FLAG: "v1"}
+        ),
+        workflow_run_id="wr_new_code_control",
+        ineligibility_reason=None,
+        first_version_created_at=_AFTER,
+        would_be_code=True,
+    )
+    assert resolution.log["route_reason"] == _R.new_workflow_ab_control
+    assert _make_block(TaskBlock, label="uncached").resolve_engine("wr_new_code_control") == RunEngine.skyvern_v1
+    assert code_mode_displaced("wr_new_code_control") is False
 
 
 @pytest.mark.asyncio
