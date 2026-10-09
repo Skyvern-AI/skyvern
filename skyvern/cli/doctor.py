@@ -538,6 +538,32 @@ def _check_llm_config() -> CheckResult:
     )
 
 
+def _check_copilot_safety_config() -> CheckResult:
+    """Check the local Copilot safety model without requiring a cloud override lookup."""
+    from dotenv import load_dotenv
+
+    from skyvern.utils.env_paths import resolve_backend_env_path
+
+    load_dotenv(resolve_backend_env_path(), override=False)
+    safety_model = os.environ.get("WORKFLOW_COPILOT_LITE_LLM_KEY")
+    if not safety_model:
+        return CheckResult(
+            name="Copilot Safety Model",
+            status="warn",
+            detail="No local safety model configured; Copilot requires this or a PostHog override",
+            hint=(
+                "Run `skyvern init llm` or set WORKFLOW_COPILOT_LITE_LLM_KEY to a model "
+                "from an enabled provider in the backend .env, then restart the backend "
+                "(recreate the container for Docker Compose)"
+            ),
+        )
+    return CheckResult(
+        name="Copilot Safety Model",
+        status="ok",
+        detail=f"WORKFLOW_COPILOT_LITE_LLM_KEY={safety_model}",
+    )
+
+
 def _read_credential_file(path: Path) -> str:
     if not path.exists():
         return ""
@@ -1270,6 +1296,7 @@ _CHECKS = [
     _check_database,
     _check_docker,
     _check_llm_config,
+    _check_copilot_safety_config,
     _check_api_key_consistency,
     _check_legacy_streamlit_secrets,
     _check_local_streaming_mode,

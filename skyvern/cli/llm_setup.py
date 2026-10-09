@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv, set_key
+from dotenv import dotenv_values, load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
@@ -65,6 +65,7 @@ def update_or_add_env_var(
             "GEMINI_API_KEY": "",
             "LLM_KEY": "",
             "SECONDARY_LLM_KEY": "",
+            "WORKFLOW_COPILOT_LITE_LLM_KEY": "",
             "BROWSER_STREAMING_MODE": "cdp",
             "BROWSER_TYPE": "chromium-headful",
             "MAX_SCRAPING_RETRIES": "0",
@@ -218,11 +219,11 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
         if not yutori_api_key:
             console.print("[red]Error: Yutori API key is required. Yutori Navigator will not be enabled.[/red]")
         else:
-            update_or_add_env_var("YUTORI_API_KEY", yutori_api_key)
-            update_or_add_env_var("ENABLE_YUTORI", "true")
+            set_env_var("YUTORI_API_KEY", yutori_api_key)
+            set_env_var("ENABLE_YUTORI", "true")
             enabled_providers.append("yutori_navigator")
     else:
-        update_or_add_env_var("ENABLE_YUTORI", "false")
+        set_env_var("ENABLE_YUTORI", "false")
 
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
     console.print("Use any locally-running model via Ollama (e.g. gemma4, qwen3, deepseek-r1).")
@@ -277,6 +278,26 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
         chosen_model = model_options[int(chosen_model_idx) - 1]
         console.print(f"🎉 [bold green]Chosen LLM Model: {chosen_model}[/bold green]")
         set_env_var("LLM_KEY", chosen_model)
+        console.print("\n[bold blue]--- Workflow Copilot Safety Model ---[/bold blue]")
+        console.print(
+            "Copilot requires an explicitly configured model to screen messages for secrets. "
+            "You can select the same model as your main model."
+        )
+        if env_path is None:
+            backend_env_path = resolve_backend_env_path(for_write=True)
+        else:
+            backend_env_path = Path(env_path).expanduser()
+        safety_model_default = (
+            dotenv_values(backend_env_path).get("WORKFLOW_COPILOT_LITE_LLM_KEY")
+            or os.environ.get("WORKFLOW_COPILOT_LITE_LLM_KEY")
+            or chosen_model
+        )
+        safety_model = Prompt.ask(
+            "Choose a Copilot safety model by model key",
+            choices=list(dict.fromkeys([*model_options, safety_model_default])),
+            default=safety_model_default,
+        )
+        set_env_var("WORKFLOW_COPILOT_LITE_LLM_KEY", safety_model)
         capture_setup_event(
             "llm-complete",
             success=True,

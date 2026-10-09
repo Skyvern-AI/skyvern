@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -121,6 +123,47 @@ def test_llm_config_check_flags_incomplete_openai_compatible_provider(
 
 def test_credential_placeholder_set_is_stable() -> None:
     assert CREDENTIAL_PLACEHOLDERS == ("", "PLACEHOLDER", "YOUR_API_KEY")
+
+
+@pytest.mark.parametrize("model", [None, "", "GEMINI_3_PRO"])
+def test_copilot_safety_check_reads_backend_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> None:
+    env_path = tmp_path / "backend.env"
+    if model is not None:
+        env_path.write_text(f"WORKFLOW_COPILOT_LITE_LLM_KEY={model}\n")
+    monkeypatch.setattr("skyvern.utils.env_paths.resolve_backend_env_path", lambda: env_path)
+    monkeypatch.delenv("WORKFLOW_COPILOT_LITE_LLM_KEY", raising=False)
+    monkeypatch.setenv("LLM_KEY", "GEMINI_3_PRO")
+    monkeypatch.setenv("SECONDARY_LLM_KEY", "GEMINI_3_PRO")
+
+    with patch.dict(os.environ):
+        result = doctor._check_copilot_safety_config()
+
+    assert doctor._check_copilot_safety_config in doctor._CHECKS
+    if model:
+        assert result.status == "ok"
+        assert model in result.detail
+    else:
+        assert result.status == "warn"
+        assert "PostHog override" in result.detail
+        assert "WORKFLOW_COPILOT_LITE_LLM_KEY" in result.hint
+        assert "recreate" in result.hint
+
+
+def test_copilot_safety_check_honors_runtime_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_path = tmp_path / "backend.env"
+    env_path.write_text("WORKFLOW_COPILOT_LITE_LLM_KEY=GEMINI_3_PRO\n")
+    monkeypatch.setattr("skyvern.utils.env_paths.resolve_backend_env_path", lambda: env_path)
+    monkeypatch.setenv("WORKFLOW_COPILOT_LITE_LLM_KEY", "OPENAI_GPT5_4")
+
+    result = doctor._check_copilot_safety_config()
+
+    assert result.status == "ok"
+    assert "OPENAI_GPT5_4" in result.detail
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,8 @@ A task that runs for 10 steps makes roughly 30+ LLM calls. Choose your provider 
 
 For most deployments, configure a single provider using `LLM_KEY`. Skyvern also supports a `SECONDARY_LLM_KEY` for lighter tasks to reduce costs.
 
+Workflow Copilot additionally requires an explicit safety-model setting. See [Workflow Copilot safety model](#workflow-copilot-safety-model).
+
 ---
 
 ## Quick Start Recommendations
@@ -595,7 +597,38 @@ Most deployments don't need task-specific models. Start with `LLM_KEY` and `SECO
 
 ---
 
+## Workflow Copilot safety model
+
+Workflow Copilot screens every message for pasted secrets before the acting model, browser setup, or tools can use it. Configure `WORKFLOW_COPILOT_LITE_LLM_KEY` in the backend's `.env`, or run `skyvern init llm` and select a Copilot safety model when prompted. Setup keeps your existing safety-model selection as the default.
+
+For example, when using Gemini:
+
+```bash .env
+ENABLE_GEMINI=true
+GEMINI_API_KEY=your-gemini-api-key
+LLM_KEY=GEMINI_3_PRO
+WORKFLOW_COPILOT_LITE_LLM_KEY=GEMINI_3_PRO
+```
+
+The safety setting can explicitly select the same model as `LLM_KEY`, or another model from an enabled provider. It does **not** fall back to `LLM_KEY`, `SECONDARY_LLM_KEY`, or the other Copilot model settings. The selected model must support the safety prompt's JSON response; use a vision-capable model when attaching videos.
+
+If you manage prompt models through PostHog, a `workflow-copilot-raw-secret-safety` entry in `LLM_CONFIG_BY_PROMPT_TYPE` takes precedence over this local setting. Otherwise the local setting is required for Copilot. Other backend features can run without it.
+
+After editing `.env`, restart the backend. For Docker Compose, recreate the backend container to load the updated environment:
+
+```bash
+docker compose up -d --force-recreate skyvern
+```
+
+Changing the runtime setting does not require an image rebuild. Run `skyvern doctor` to check whether a local safety model is configured; its warning does not check for a PostHog override.
+
 ## Troubleshooting
+
+### Copilot reports `missing_handler` or asks you to resend every message
+
+If even a simple message such as "Open https://google.com and tell me the title" is blocked with `missing_handler`, configure the [Copilot safety model](#workflow-copilot-safety-model). Retrying cannot fix a missing setting. Copilot withholds the message until safety screening is available.
+
+For other safety-screen failures, check the backend logs: `provider_error` indicates a failed model call, `timeout` indicates the safety-screen deadline was exceeded, and `malformed_output` or `invalid_citation` indicates an unusable model response. Setting the model key only resolves a missing handler; it does not bypass screening or guarantee the provider will respond successfully.
 
 ### "To enable svg shape conversion, please set the Secondary LLM key"
 
