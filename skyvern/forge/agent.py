@@ -2216,6 +2216,7 @@ class ForgeAgent:
             caller_known_published_urls,
             mask_signed_urls_in_text,
             sanitize_handoff_url,
+            string_leaves,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
@@ -2400,6 +2401,10 @@ class ForgeAgent:
                 workflow_run_id=task.workflow_run_id,
                 block_label=task_block.label if task_block is not None else None,
             )
+        )
+        payload_strings = string_leaves(coerce_v3_parameters(task.navigation_payload))
+        task_target_urls = caller_known_published_urls(
+            task.url, task.navigation_goal, *payload_strings, keep_query=True
         )
 
         def _label_secret_values() -> Collection[str]:
@@ -3079,7 +3084,9 @@ class ForgeAgent:
                     browser_state.last_navigation_status if task_block is None and not workflow_owned_recovery else None
                 ),
                 initial_navigation_url=initial_navigation_url,
+                initial_navigation_requested_url=task.url,
                 caller_known_urls=verdict_known_urls,
+                task_target_urls=task_target_urls,
                 label_secret_values=_label_secret_values,
                 login_identifier_tokens=_login_identifier_tokens,
                 single_action_block=single_action_block,
