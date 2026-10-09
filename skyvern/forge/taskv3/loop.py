@@ -2043,14 +2043,17 @@ def _verdict_target(
     return describe_target(tool, name, kind, secret_values)
 
 
-def _action_loop_reason(target: str | None) -> str:
+def _action_loop_reason(target: str | None, *, page_unchanged: bool) -> str:
     """`target` is the control the run kept acting on, or None when the repeated call reported no name
-    (a failed call reports none) — then the verdict names no place rather than guessing one."""
+    (a failed call reports none) — then the verdict names no place rather than guessing one.
+    `page_unchanged` is True only when the streak's page fingerprint was sampled and never moved."""
     where = f" on {target}" if target else ""
-    return (
-        f"The run repeated the same action{where} and the page did not change in response, so the task "
-        "could not make progress — commonly the site rejecting the action and showing the same page again."
-    )
+    if page_unchanged:
+        return (
+            f"The run repeated the same action{where} and the page did not change in response, so the task "
+            "could not make progress — commonly the site rejecting the action and showing the same page again."
+        )
+    return f"The run repeated the same action{where} without making progress, so the task was stopped."
 
 
 def _budget_exhausted_reason(cap_trip: str) -> str:
@@ -4973,7 +4976,10 @@ async def run_agent_tool_loop(
                         label_secret_values,
                         skyvern_ctx,
                     )
-                    st.outcome = _guard_verdict(ACTION_LOOP_GUARD, _action_loop_reason(named_target))
+                    page_unchanged = streak_fp is not None and batch_fp_before is not None and not streak_moved
+                    st.outcome = _guard_verdict(
+                        ACTION_LOOP_GUARD, _action_loop_reason(named_target, page_unchanged=page_unchanged)
+                    )
                     _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "action loop")
                     break
                 if (
