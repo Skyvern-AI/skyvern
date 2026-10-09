@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
 import { getCredentialParam } from "@/util/env";
+import { copyText } from "@/util/copyText";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   mouseButtonName,
@@ -61,6 +62,56 @@ const NAVIGATE_ERROR_MESSAGES: Record<string, string> = {
   blocked: "That destination isn't allowed.",
   invalid_url: "Enter a valid http(s) URL.",
 };
+
+function isShortcut(e: React.KeyboardEvent, key: string): boolean {
+  return (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === key;
+}
+
+function editingCommandsFor(e: React.KeyboardEvent): string[] {
+  if (isShortcut(e, "a")) {
+    return ["selectAll"];
+  }
+  if (e.altKey && !e.metaKey && !e.ctrlKey) {
+    if (e.key === "Enter") {
+      return ["insertNewline"];
+    }
+    if (e.key === "ArrowLeft") {
+      return [e.shiftKey ? "moveWordLeftAndModifySelection" : "moveWordLeft"];
+    }
+    if (e.key === "ArrowRight") {
+      return [e.shiftKey ? "moveWordRightAndModifySelection" : "moveWordRight"];
+    }
+  }
+  if (e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key === "ArrowLeft") {
+      return [
+        e.shiftKey
+          ? "moveToLeftEndOfLineAndModifySelection"
+          : "moveToLeftEndOfLine",
+      ];
+    }
+    if (e.key === "ArrowRight") {
+      return [
+        e.shiftKey
+          ? "moveToRightEndOfLineAndModifySelection"
+          : "moveToRightEndOfLine",
+      ];
+    }
+  }
+  if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key === "Backspace") return ["deleteBackward"];
+    if (e.key === "Delete") return ["deleteForward"];
+    if (e.key === "Enter") return ["insertNewline"];
+  }
+  return [];
+}
+
+function mouseButtonNameForButtons(buttons: number): string {
+  if (buttons & 1) return "left";
+  if (buttons & 2) return "right";
+  if (buttons & 4) return "middle";
+  return "none";
+}
 
 function isEditableTarget(target: EventTarget | null) {
   return (
@@ -202,6 +253,13 @@ export function useCdpInput({
               NAVIGATE_ERROR_MESSAGES[msg.reason] ??
                 "Couldn't navigate to that URL.",
             );
+          }
+          if (
+            msg.kind === "copied-text" &&
+            typeof msg.text === "string" &&
+            msg.text
+          ) {
+            void copyText(msg.text);
           }
         } catch {
           if (!parseFailureLoggedRef.current) {
@@ -424,7 +482,8 @@ export function useCdpInput({
         x: coords.x,
         y: coords.y,
         button: mouseButtonName(e.button),
-        clickCount: 1,
+        buttons: e.buttons,
+        clickCount: Math.max(1, Math.min(e.detail || 1, 3)),
         modifiers: getModifiers(e),
       });
     },
@@ -449,7 +508,8 @@ export function useCdpInput({
         x: coords.x,
         y: coords.y,
         button: mouseButtonName(e.button),
-        clickCount: 1,
+        buttons: e.buttons,
+        clickCount: Math.max(1, Math.min(e.detail || 1, 3)),
         modifiers: getModifiers(e),
       });
     },
@@ -472,7 +532,8 @@ export function useCdpInput({
         eventType: "mouseMoved",
         x: coords.x,
         y: coords.y,
-        button: "none",
+        button: mouseButtonNameForButtons(e.buttons),
+        buttons: e.buttons,
         clickCount: 0,
         modifiers: getModifiers(e),
       };
@@ -504,23 +565,40 @@ export function useCdpInput({
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
-      e.preventDefault();
-      const clipboardModifier = e.metaKey || e.ctrlKey;
-      const key = e.key.toLowerCase();
-      if (clipboardModifier && key === "v" && onClipboardPasteRef.current) {
+
+      if (isShortcut(e, "v")) {
         interceptedClipboardKeysRef.current.add(e.code);
+        e.stopPropagation();
+        if (!onClipboardPasteRef.current) {
+          // Keep the native paste event alive for the direct CDP fallback.
+          return;
+        }
+        e.preventDefault();
         pasteClipboard();
         return;
       }
-      if (clipboardModifier && key === "c" && onClipboardCopyRef.current) {
-        onClipboardCopyRef.current();
-        if (!forwardCopyShortcutRef.current) {
+
+      if (isShortcut(e, "c")) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (onClipboardCopyRef.current) {
+          onClipboardCopyRef.current();
+          if (!forwardCopyShortcutRef.current) {
+            interceptedClipboardKeysRef.current.add(e.code);
+            return;
+          }
+        } else {
           interceptedClipboardKeysRef.current.add(e.code);
+          sendInputEvent({ type: "copySelectedText" });
           return;
         }
       }
-      const isPrintable = e.key.length === 1;
+
+      e.preventDefault();
+      const isPrintable =
+        e.key.length === 1 && !e.metaKey && (!e.ctrlKey || e.altKey);
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
+      const commands = editingCommandsFor(e);
       const payload: Record<string, unknown> = {
         type: "keyEvent",
         eventType: isPrintable ? "keyDown" : "rawKeyDown",
@@ -532,22 +610,29 @@ export function useCdpInput({
       if (windowsVirtualKeyCode !== undefined) {
         payload.windowsVirtualKeyCode = windowsVirtualKeyCode;
       }
+      if (commands.length) {
+        payload.commands = commands;
+      }
       sendInputEvent(payload);
     },
     [interactive, userIsControlling, sendInputEvent, pasteClipboard],
   );
 
-  // Menu-driven pastes arrive only as a paste event; Cmd/Ctrl+V never does,
-  // because handleKeyDown prevents its default.
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
-      if (!interactive || !userIsControlling) return;
-      // The URL bar input lives inside the container; its own paste must stay local.
-      if (!onClipboardPasteRef.current || isEditableTarget(e.target)) return;
+      if (!interactive || !userIsControlling || isEditableTarget(e.target))
+        return;
+      const text = e.clipboardData.getData("text/plain");
+      if (!text) return;
       e.preventDefault();
-      onClipboardPasteRef.current(e.clipboardData.getData("text/plain"));
+      e.stopPropagation();
+      if (onClipboardPasteRef.current) {
+        onClipboardPasteRef.current(text);
+      } else {
+        sendInputEvent({ type: "insertText", text });
+      }
     },
-    [interactive, userIsControlling],
+    [interactive, userIsControlling, sendInputEvent],
   );
 
   const handleKeyUp = useCallback(
