@@ -50,6 +50,11 @@ async def test_resolve_raw_secret_safety_handler_uses_dedicated_posthog_lane(
         return dedicated
 
     monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
+    monkeypatch.setattr(
+        copilot_llm_config,
+        "app",
+        SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=object()),
+    )
     assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is dedicated
 
 
@@ -59,8 +64,38 @@ async def test_resolve_raw_secret_safety_handler_has_no_main_fallback(monkeypatc
         return None
 
     monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
-    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=None))
+    monkeypatch.setattr(
+        copilot_llm_config,
+        "app",
+        SimpleNamespace(
+            WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=None,
+            LLM_API_HANDLER=object(),
+            SECONDARY_LLM_API_HANDLER=object(),
+            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=object(),
+        ),
+    )
     assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_fails", [False, True])
+async def test_resolve_raw_secret_safety_handler_uses_local_setting(
+    monkeypatch: pytest.MonkeyPatch, lookup_fails: bool
+) -> None:
+    local_handler = object()
+
+    async def _lookup(*_args: object) -> None:
+        if lookup_fails:
+            raise RuntimeError("PostHog unavailable")
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
+    monkeypatch.setattr(
+        copilot_llm_config,
+        "app",
+        SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=local_handler),
+    )
+    resolved_handler = await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1")
+    assert resolved_handler is local_handler
 
 
 class _AppHolderStub:

@@ -4,7 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _request_policy_agent_inputs,
     _rewrite_failed_test_response,
     _store_request_policy_on_context,
+    run_copilot_agent,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
+    SAFETY_MODEL_NOT_CONFIGURED_QUESTION,
     SAFETY_SCREEN_UNAVAILABLE_QUESTION,
     RequestPolicy,
     _seed_prior_approved_credentials,
@@ -39,8 +41,11 @@ from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _within_grant,
 )
 from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error, _update_and_run_requires_skipped_run
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatRequest,
+    WorkflowCopilotStreamMessageType,
+)
+from tests.unit.copilot_test_helpers import make_copilot_ctx, stub_copilot_agent_loop
 from tests.unit.test_copilot_credential_pause import (
     _answered_cache,
     _make_credential,
@@ -682,9 +687,10 @@ async def test_screening_failure_is_not_reported_as_a_credential_paste(failure_k
 
 
 @pytest.mark.asyncio
-async def test_missing_dedicated_handler_blocks() -> None:
+@pytest.mark.parametrize("message", ["Hello", "Open https://google.com and tell me the title"])
+async def test_missing_dedicated_handler_blocks(message: str) -> None:
     policy = await build_request_policy_trust_floor(
-        user_message="Hello",
+        user_message=message,
         workflow_yaml="",
         chat_history=[],
         global_llm_context="",
@@ -696,6 +702,51 @@ async def test_missing_dedicated_handler_blocks() -> None:
     assert policy.raw_secret_safety_status == "blocked"
     assert policy.raw_secret_safety_failure_kind == "missing_handler"
     assert policy.clarification_reason == "safety_screen_unavailable"
+    assert policy.clarification_question == SAFETY_MODEL_NOT_CONFIGURED_QUESTION
+    assert "WORKFLOW_COPILOT_LITE_LLM_KEY" in policy.clarification_question
+    assert "send it again" not in policy.clarification_question
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+    assert policy.raw_secret_detected is False
+    assert policy.allow_update_workflow is False
+    assert policy.allow_run_blocks is False
+
+
+@pytest.mark.asyncio
+async def test_missing_safety_model_returns_configuration_error_before_acting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acting_loop = AsyncMock()
+    stub_copilot_agent_loop(monkeypatch, acting_loop)
+    browser_setup = AsyncMock()
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
+        browser_setup,
+    )
+    persist_message = AsyncMock()
+
+    result = await run_copilot_agent(
+        stream=MagicMock(send=AsyncMock()),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            workflow_permanent_id="wfp-1",
+            workflow_id="wf-1",
+            workflow_copilot_chat_id="chat-1",
+            message="Open https://google.com and tell me the title",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=None,
+        api_key="sk-test",
+        persist_canonical_user_message=persist_message,
+    )
+
+    assert result.user_response == SAFETY_MODEL_NOT_CONFIGURED_QUESTION
+    assert result.updated_workflow is None
+    persist_message.assert_awaited_once_with(_SCREEN_UNAVAILABLE_TURN)
+    acting_loop.assert_not_awaited()
+    browser_setup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

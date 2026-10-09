@@ -513,6 +513,12 @@ SAFETY_SCREEN_UNAVAILABLE_QUESTION = (
     "I couldn't finish safety screening on that message, so I never read it. "
     "That's a problem on my side, not something wrong with what you sent — please send it again."
 )
+SAFETY_MODEL_NOT_CONFIGURED_QUESTION = (
+    "Workflow Copilot's safety model is not configured, so I couldn't screen your message. "
+    "Ask your Skyvern administrator to set WORKFLOW_COPILOT_LITE_LLM_KEY to a model "
+    "from an enabled provider and restart the backend "
+    "(recreate the backend container for Docker Compose)."
+)
 _AMBIGUOUS_URL_CREDENTIAL_QUESTION = "I found multiple stored credentials for that login page. Which one should I use?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
@@ -4894,7 +4900,13 @@ async def build_request_policy_trust_floor(
         allow_run_blocks=not safety_blocked,
         user_response_policy="ask_clarification" if safety_blocked else "proceed",
         clarification_reason="safety_screen_unavailable" if safety_blocked else "none",
-        clarification_question=SAFETY_SCREEN_UNAVAILABLE_QUESTION if safety_blocked else None,
+        clarification_question=(
+            SAFETY_MODEL_NOT_CONFIGURED_QUESTION
+            if safety.failure_kind == "missing_handler"
+            else SAFETY_SCREEN_UNAVAILABLE_QUESTION
+            if safety_blocked
+            else None
+        ),
         classifier_status="not_run",
         completion_contract_status="absent",
         canonical_user_message=safety.canonical_user_message,

@@ -85,6 +85,10 @@ services:
     #       LLM Settings - Use `skyvern init llm` for interactive setup
     # =========================
     # Docs: https://www.skyvern.com/docs/self-hosted/llm-configuration
+    # Workflow Copilot also requires WORKFLOW_COPILOT_LITE_LLM_KEY in .env.
+    # Set it explicitly to a model from an enabled provider; it has no LLM_KEY fallback.
+    # For the Gemini example below: WORKFLOW_COPILOT_LITE_LLM_KEY=GEMINI_3_PRO
+    # After changing .env: docker compose up -d --force-recreate skyvern
     #
     # OpenAI:
     # - ENABLE_OPENAI=true
