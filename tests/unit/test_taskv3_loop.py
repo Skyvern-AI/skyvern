@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import functools
 import hashlib
 import json
 import random
@@ -25,7 +26,7 @@ from typing import Any, Awaitable, Callable, Collection
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -46,6 +47,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
+    COMPLETION_GATE_REFUSAL,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -8343,6 +8345,176 @@ async def test_completion_blocker_gates_completed_status_only() -> None:
     outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
     assert outcome2.status == "failed"
     assert outcome2.reason == "blocked reason"
+
+
+def _gate_refusals(outcome: LoopOutcome) -> int:
+    return sum(
+        1 for m in outcome.messages if m.get("role") == "tool" and COMPLETION_GATE_REFUSAL in m.get("content", "")
+    )
+
+
+async def _async_value(value: Any) -> Any:
+    return value
+
+
+class _CountingGate:
+    """A completion gate that answers `verdict` and counts the vetoes it handed out."""
+
+    def __init__(self, verdict: bool = False) -> None:
+        self.verdict = verdict
+        self.calls = 0
+
+    async def __call__(self) -> bool:
+        self.calls += 1
+        return self.verdict
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_veto_refuses_the_finish_and_a_later_approved_finish_completes() -> None:
+    verdicts = iter([False, True])
+
+    async def gate() -> bool:
+        return next(verdicts)
+
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
+    script = [
+        [("finish", {"status": "completed", "reason": "looks done"})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", True)
+    assert click_calls == [("click", {"selector": "#submit"})]
+    assert _gate_refusals(outcome) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raised, status, reason",
+    [
+        (StepTerminationError("vetoed too often", step_id="stp_1"), "failed", "vetoed too often"),
+        (CompletionGateTerminationError("an earlier entry exists"), "terminated", "an earlier entry exists"),
+    ],
+    ids=["veto_budget_spent", "already_applied"],
+)
+async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
+    raised: Exception, status: str, reason: str
+) -> None:
+    async def gate() -> bool:
+        raise raised
+
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "done"})]], [make_finish_tool(completion_gate=gate)]
+    )
+
+    assert outcome.status == status
+    assert reason in outcome.reason
+    assert not outcome.gate_passed
+    assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [{"max_turns": 2}, {"max_action_steps": 1}], ids=["no_turns_left", "no_steps_left"])
+async def test_completion_gate_without_headroom_leaves_the_verdict_to_the_caller(budget: dict[str, int]) -> None:
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=_CountingGate(), activity=activity)]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, **budget)
+
+    assert (outcome.status, outcome.gate_passed) == ("completed", False)
+    assert _gate_refusals(outcome) == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_is_skipped_when_a_click_earlier_in_the_turn_spent_the_last_action_step() -> None:
+    gate = _CountingGate()
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
+    script = [[("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "submitted"})]]
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=1)
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", False)
+    assert gate.calls == 0
+
+
+async def _never_answers() -> bool:
+    await asyncio.Event().wait()
+    return True
+
+
+async def _errors() -> bool:
+    raise RuntimeError("gate bug")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [_errors, _never_answers], ids=["gate_errors", "gate_outlives_the_deadline"])
+async def test_a_gate_that_cannot_answer_lets_the_finish_through_for_the_caller_to_decide(
+    monkeypatch: pytest.MonkeyPatch, gate: Callable[[], Awaitable[bool]]
+) -> None:
+    # The headroom floor is a minute; drop it so a sub-second deadline still lets the gate run.
+    monkeypatch.setattr(
+        loop_module,
+        "_has_hold_headroom",
+        functools.partial(loop_module._has_hold_headroom, min_deadline_headroom_seconds=0.0),
+    )
+    finish = make_finish_tool(completion_gate=gate, deadline_at=time.monotonic() + 0.3)
+    started = time.monotonic()
+    async with asyncio.timeout(5):
+        outcome, caller = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "done", False)
+    assert caller.calls == 1
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "terminated"])
+async def test_completion_gate_never_holds_a_non_completed_finish(status: str) -> None:
+    gate = _CountingGate()
+    outcome, _ = await _run(
+        [[("finish", {"status": status, "reason": "the site offers no way on"})]],
+        [make_finish_tool(completion_gate=gate)],
+    )
+
+    assert (outcome.status, outcome.reason) == (status, "the site offers no way on")
+    assert gate.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_kwargs, held_with",
+    [
+        (
+            {"completion_blocker": lambda _downloads: _async_value("the download has not landed")},
+            "the download has not landed",
+        ),
+        (
+            {"page_fingerprint": lambda: _async_value(str(time.monotonic_ns())), "settle_wait_seconds": 0},
+            "still rendering",
+        ),
+    ],
+    ids=["completion_blocker", "unsettled_page"],
+)
+async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent(
+    finish_kwargs: dict[str, Any], held_with: str
+) -> None:
+    gate = _CountingGate()
+    outcome, _ = await _run(
+        [[("finish", {"status": "completed", "reason": "done"})]],
+        [make_finish_tool(completion_gate=gate, **finish_kwargs)],
+    )
+
+    first_finish_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert held_with in first_finish_result
+    assert gate.calls == 0
 
 
 @pytest.mark.asyncio

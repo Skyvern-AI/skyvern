@@ -553,6 +553,9 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
+    # Kill switch for committing a list row that names the value without being it exactly (its main label, a
+    # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
+    TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).

@@ -23,7 +23,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage
+from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage, StepTerminationError
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -74,6 +74,7 @@ from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_url
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
+    COMPLETION_GATE_REFUSAL,
     NAV_DEAD_END_GUARD,
     TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
@@ -3943,9 +3944,14 @@ async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: 
             TaskStatus.terminated,
             "the site holds an earlier entry",
         ),
+        (
+            StepTerminationError("vetoed too often", step_id="step-v3"),
+            TaskStatus.failed,
+            "Termination error. Reason: Step step-v3 cannot be executed and task is failed. Reason: vetoed too often",
+        ),
         (RuntimeError("gate bug"), TaskStatus.completed, None),
     ],
-    ids=["termination", "generic_error_accepts"],
+    ids=["termination", "veto_budget_spent_fails", "generic_error_accepts"],
 )
 async def test_execute_task_v3_completion_gate_raise(
     monkeypatch: pytest.MonkeyPatch, gate_error: Exception, status: TaskStatus, failure_reason: str | None
@@ -3962,6 +3968,65 @@ async def test_execute_task_v3_completion_gate_raise(
     loop_mock.completion_gate.assert_awaited_once()
     assert task.status == status
     assert task.failure_reason == failure_reason
+
+
+@pytest.mark.asyncio
+async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(
+            status="completed",
+            reason="the judge found the goal met",
+            billable_actions=["click"],
+            converted_from="terminated",
+            converted_from_reason="the site offers no way to continue",
+        ),
+        task_block=_make_block(NavigationBlock, navigation_goal="Submit the application"),
+        completion_gate_raises=StepTerminationError("vetoed too often", step_id="step-v3"),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.terminated
+    assert task.failure_reason == "the site offers no way to continue"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gate_veto_is_refused_in_loop_and_the_approved_retry_skips_the_post_loop_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = _make_block(NavigationBlock, navigation_goal="Submit the application")
+    page = _AdvancingFormPage()
+    caller = _ScriptedCaller(
+        [
+            [("finish", {"status": "completed", "reason": "looks done"})],
+            [("observe", {})],
+            [("finish", {"status": "completed", "reason": "confirmed"})],
+        ]
+    )
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        return await run_task_v3_agent_loop(
+            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
+        )
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+        task_block=block,
+        loop_body=_real_loop,
+        working_page=page,
+        # A post-loop consult would draw the trailing veto and fail the task.
+        completion_gate_raises=[False, True, False],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+    assert loop_mock.completion_gate.await_args.kwargs["task_block"] is block
+    assert sum(COMPLETION_GATE_REFUSAL in str(m.get("content")) for m in caller.message_history) == 1
 
 
 @pytest.mark.asyncio

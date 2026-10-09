@@ -2995,6 +2995,16 @@ class ForgeAgent:
                         peek_page=_fingerprint_page,
                         prompt_name=BLOCK_COMPLETION_CHECK_PROMPT_NAME,
                     )
+
+            async def _completion_gate() -> bool:
+                return await app.AGENT_FUNCTION.gate_step_completion(
+                    task=task,
+                    step=step,
+                    task_block=task_block,
+                    page=await browser_state.get_working_page(),
+                    browser_state=browser_state,
+                )
+
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
@@ -3057,6 +3067,7 @@ class ForgeAgent:
                 ),
                 completion_probe=completion_probe,
                 completion_blocker=completion_blocker,
+                completion_gate=_completion_gate,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
                 verification_blocker=verification_state.block_finish,
@@ -3096,13 +3107,12 @@ class ForgeAgent:
         )
         completion_rejection: str | None = None
         if outcome.status == "completed":
-            # Same deployment gate the step engine applies before accepting a completion verdict
-            # (e.g. a submit block that must show a deterministic confirmation). The loop has already
-            # returned, so a veto fails safe instead of falsely completing.
+            # The deployment gate for a completion the finish tool could not put to it (no headroom left to
+            # act on a refusal, a re-ask conversion, or a gate error). The loop has returned, so a veto fails.
             gate_page = None
             try:
                 gate_page = await browser_state.get_working_page()
-                if not await app.AGENT_FUNCTION.gate_step_completion(
+                if not outcome.gate_passed and not await app.AGENT_FUNCTION.gate_step_completion(
                     task=task,
                     step=step,
                     task_block=task_block,
@@ -3112,12 +3122,20 @@ class ForgeAgent:
                     completion_rejection = "the deployment completion gate rejected it"
             except CompletionGateTerminationError as termination:
                 outcome = replace(outcome, status="terminated", reason=termination.reason)
+            except StepTerminationError as exhausted:
+                if outcome.converted_from is not None:
+                    # A vetoed re-ask conversion restores the model's own verdict below, whatever the veto count.
+                    completion_rejection = exhausted.message or "the deployment completion gate rejected it"
+                else:
+                    outcome = replace(outcome, status="failed", reason=exhausted.message or "")
             except Exception:
                 LOG.warning(
                     "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
                 )
             if outcome.status == "terminated":
                 LOG.info("task_v3 completion terminated by completion gate", task_id=task.task_id)
+            elif outcome.status == "failed":
+                LOG.info("task_v3 completion failed by completion gate", task_id=task.task_id)
             elif completion_rejection is not None:
                 LOG.info("task_v3 completion vetoed by completion gate", task_id=task.task_id)
             # A page-bound goal cannot have been met on a tab with no document, and reporting it

@@ -474,11 +474,18 @@ async def test_engine_defers_completion_while_delayed_render_settles(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_page_free_mode_finishes_without_settle_probe() -> None:
-    # Page-free runs have no page to settle: finish(completed) is immediate and the provider is
-    # never consulted.
+async def test_page_free_mode_finishes_without_settle_probe_or_completion_gate() -> None:
+    # Page-free runs have no page to settle or to gate: finish(completed) is immediate and the
+    # provider is never consulted.
     async def no_page() -> Any:
         raise AssertionError("provider must not be consulted in page-free mode")
+
+    gate_calls = 0
+
+    async def refusing_gate() -> bool:
+        nonlocal gate_calls
+        gate_calls += 1
+        return False
 
     script = [[("finish", {"status": "completed", "reason": "criteria hold"})]]
     caller = _ScriptedCaller(script)
@@ -487,10 +494,12 @@ async def test_page_free_mode_finishes_without_settle_probe() -> None:
         llm_caller=caller,
         goal="assess",
         page_free=True,
+        completion_gate=refusing_gate,
         max_action_steps=2,
-        max_turns=4,
+        max_turns=8,
     )
-    assert outcome.status == "completed"
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "criteria hold", False)
+    assert gate_calls == 0
 
 
 @pytest.mark.asyncio
