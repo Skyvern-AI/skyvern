@@ -2317,6 +2317,8 @@ def _attach_run_session_facts(
     *,
     used_fresh_run_session: bool,
     run_detached_from_chat: bool,
+    chat_browser_opened_for_run: bool,
+    continued_earlier_test: bool,
     run_ok: bool,
     page_evidence: Mapping[str, Any] | None,
 ) -> None:
@@ -2327,13 +2329,26 @@ def _attach_run_session_facts(
     # A carried resume browser is also not the chat's, so detachment is the honest fact for
     # "can I look at this run's page from here", not whether the session was minted.
     data["run_detached_from_chat"] = run_detached_from_chat
+    # Say which browser the run started in, so code that needed a signed-in state reads as started
+    # somewhere else rather than as broken, and the next request can bring the blocks it needs.
     if used_fresh_run_session:
-        # Say that the page was blank, so code that needed a signed-in state reads as started
-        # somewhere else rather than as broken, and the next request can bring the blocks it needs.
-        data.setdefault(
-            "browser_start",
-            {"kind": "separate_blank_context", "restored_saved_profile": False, "inherited_browser_state": False},
-        )
+        browser_start_kind = "separate_blank_context"
+    elif run_detached_from_chat:
+        browser_start_kind = "separate_context_continued_from_earlier_test"
+    elif chat_browser_opened_for_run:
+        browser_start_kind = "chat_browser_context_opened_for_this_run"
+    elif continued_earlier_test:
+        browser_start_kind = "chat_browser_context_continued_from_earlier_test"
+    else:
+        browser_start_kind = "chat_browser_context"
+    data.setdefault(
+        "browser_start",
+        {
+            "kind": browser_start_kind,
+            "restored_saved_profile": False,
+            "inherited_browser_state": not (used_fresh_run_session or chat_browser_opened_for_run),
+        },
+    )
     if not isinstance(page_evidence, Mapping):
         return
     data["challenge_stalled_fresh_session"] = (
@@ -3464,6 +3479,8 @@ async def _attach_post_run_browser_enrichment(
     run_ok: bool,
     used_fresh_run_session: bool,
     run_detached_from_chat: bool,
+    chat_browser_opened_for_run: bool,
+    continued_earlier_test: bool,
     origin_registry: OriginRunRedactionRegistry | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Probe the browser for post-run facts and stamp them onto an already-recorded run result.
@@ -3586,6 +3603,8 @@ async def _attach_post_run_browser_enrichment(
         result_data,
         used_fresh_run_session=used_fresh_run_session,
         run_detached_from_chat=run_detached_from_chat,
+        chat_browser_opened_for_run=chat_browser_opened_for_run,
+        continued_earlier_test=continued_earlier_test,
         run_ok=run_ok,
         page_evidence=post_run_page_evidence,
     )
@@ -3646,6 +3665,7 @@ async def _run_blocks_and_collect_debug(
     use_ephemeral_inputs: bool = True,
     new_exit: bool = False,
     verified_new_exit: FreshExitReceipt | None = None,
+    chat_browser_opened_before_retry: bool = False,
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
@@ -4081,6 +4101,8 @@ async def _run_blocks_and_collect_debug(
     # Whether the run executed outside the chat's browser at all, by either route. This is what
     # gates the post-run rebind and the pane association, neither of which cares which route.
     run_detached_from_chat = False
+    # The chat held no usable browser, so acquiring one opened it blank for this run.
+    chat_browser_opened_for_run = False
     debug_session_id: str | None = None
     run_session_id: str | None
     new_exit_receipt: FreshExitReceipt | None = None
@@ -4164,10 +4186,14 @@ async def _run_blocks_and_collect_debug(
     else:
         # This id is dispatched into a workflow run without ever being attached here, so an
         # unverified session cannot be discovered later and must fail now instead.
+        chat_session_id_before_acquisition = ctx.browser_session_id
         session_err = await acquire_build_test_browser_session(ctx, fresh=False)
         if session_err is not None:
             return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
         run_session_id = ctx.browser_session_id
+        chat_browser_opened_for_run = (
+            chat_browser_opened_before_retry or run_session_id != chat_session_id_before_acquisition
+        )
 
     dispatch_draft_workflow_id: str | None = None
     # run_task is the in-process inline execution task, only ever set on the dev-only inline path.
@@ -4321,6 +4347,7 @@ async def _run_blocks_and_collect_debug(
                 use_ephemeral_inputs=use_ephemeral_inputs,
                 new_exit=new_exit,
                 verified_new_exit=new_exit_receipt,
+                chat_browser_opened_before_retry=chat_browser_opened_for_run,
             )
 
         execution.dispatched_input_values = copy.deepcopy(data)
@@ -4792,6 +4819,8 @@ async def _run_blocks_and_collect_debug(
                     result["data"],
                     used_fresh_run_session=used_fresh_run_session,
                     run_detached_from_chat=run_detached_from_chat,
+                    chat_browser_opened_for_run=chat_browser_opened_for_run,
+                    continued_earlier_test=resume_session_id is not None,
                     run_ok=False,
                     page_evidence=_same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id),
                 )
@@ -5063,6 +5092,8 @@ async def _run_blocks_and_collect_debug(
             run_ok=run_ok,
             used_fresh_run_session=used_fresh_run_session,
             run_detached_from_chat=run_detached_from_chat,
+            chat_browser_opened_for_run=chat_browser_opened_for_run,
+            continued_earlier_test=resume_session_id is not None,
             origin_registry=origin_registry,
         )
         settle_terminal_challenge_after_enrichment(ctx, response)
