@@ -168,6 +168,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
     code_is_download_intent,
+    without_generated_file_stamp,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
@@ -8279,7 +8280,9 @@ async def wrapper({default_args}):
             if updated_task.status == TaskStatus.completed:
                 # The block's value is what its own return would have been; downloads are bound by
                 # the recorder (_finalize_heal_result), the same as the inline success exit.
-                output_parameter_value = workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                output_parameter_value = without_generated_file_stamp(
+                    workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                )
                 if record_output_parameter:
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
@@ -10377,7 +10380,7 @@ async def wrapper({default_args}):
             # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
             # reach captured locals, the persisted output, or the logged value. Mirrors
             # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
-            result = workflow_run_context.mask_secrets_in_data(result)
+            result = without_generated_file_stamp(workflow_run_context.mask_secrets_in_data(result))
 
             try:
                 downloaded_files, skipped_file_names = await self._register_downloaded_files(

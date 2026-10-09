@@ -273,9 +273,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
-from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_criteria
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
-from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.self_heal import HealEpisodeDetail, HealStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -1520,24 +1518,6 @@ def _selected_code_security_inputs(
                 )
             )
     return code_blocks
-
-
-def _requested_completion_contract(
-    ctx: CopilotContext,
-    runtime_workflow: Workflow,
-    labels_to_execute: list[str],
-) -> dict[str, object] | None:
-    """The turn's own deliverable obligation, for a test run that executes the whole workflow.
-
-    The obligation attaches to the workflow only when a proposal is accepted, which is after the
-    test run this grades; a selection that runs only part of the workflow stays ungraded."""
-    if ctx.request_policy is None:
-        return None
-    if not runtime_workflow.workflow_definition.blocks:
-        return None
-    if run_selection_is_partial(runtime_workflow, labels_to_execute):
-        return None
-    return contract_from_request_criteria(ctx.request_policy.graded_completion_criteria())
 
 
 def _selected_blocks_require_sandbox(
@@ -4214,16 +4194,6 @@ async def _run_blocks_and_collect_debug(
         runtime_frontier_starter_url_seeded = seeded_runtime_workflow is not runtime_workflow
         runtime_workflow = seeded_runtime_workflow
 
-        requested_completion_contract = _requested_completion_contract(ctx, runtime_workflow, labels_to_execute)
-        if requested_completion_contract is not None:
-            runtime_workflow = runtime_workflow.model_copy(
-                update={
-                    "workflow_definition": runtime_workflow.workflow_definition.model_copy(
-                        update={"completion_contract": requested_completion_contract}
-                    )
-                }
-            )
-
         # Snapshot version persisted for a worker-dispatched run or an inline run of a definition that
         # was never persisted. The run is created against its exact workflow_id so prepare_workflow
         # reads parameter rows from the same definition execute_workflow receives. Without the inline
@@ -4601,7 +4571,6 @@ async def _run_blocks_and_collect_debug(
                     # the in-memory runtime copy instead registers block outputs against ids that
                     # were never persisted, and every consumer keyed on the definition drops them.
                     workflow_override=snapshot.workflow if dispatch_workflow is not None else runtime_workflow,
-                    requested_completion_contract=requested_completion_contract,
                 )
             )
     except BaseException:

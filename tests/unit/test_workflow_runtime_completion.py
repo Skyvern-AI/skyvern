@@ -6,12 +6,15 @@ verdict does not depend on which engine ran the blocks or how generated code des
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.exceptions import WorkflowNotFound
+from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompletionCriterion
+from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -19,12 +22,13 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     CompletionCriterion,
     carried_contract,
     contract_from_code_artifact_metadata,
-    contract_from_request_criteria,
     grade_completion_contract,
     parse_completion_contract,
     with_contract,
 )
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
+from skyvern.schemas.workflows import BlockType
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 
 _DOWNLOAD_CONTRACT = {
     "completion_contract": {
@@ -106,7 +110,7 @@ def _downloaded_file(name: str, *, artifact_id: str | None = None):
     return SimpleNamespace(artifact_id=artifact_id, filename=name, checksum=None, file_size=None)
 
 
-def _wire_finalize(monkeypatch, *, contract, downloaded):
+def _wire_finalize(monkeypatch, *, contract, downloaded, run_blocks=(), attempts=None):
     """A WorkflowService with just enough wired to exercise the finalize status decision."""
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -144,6 +148,19 @@ def _wire_finalize(monkeypatch, *, contract, downloaded):
             )
         ),
     )
+    monkeypatch.setattr(
+        service_module.app.DATABASE.observer, "get_workflow_run_blocks", AsyncMock(return_value=list(run_blocks))
+    )
+    if attempts is not None:
+        run.failure_reason = None
+        run.started_at = attempts[-1].started_at
+        run.finished_at = None
+        monkeypatch.setattr(
+            service_module.app.DATABASE, "workflow_run_attempts", FakeWorkflowRunAttemptsRepository(attempts)
+        )
+        monkeypatch.setattr(
+            service_module.app.DATABASE.artifacts, "list_download_artifacts_for_attempt", AsyncMock(return_value=[])
+        )
     return service, run, statuses
 
 
@@ -298,27 +315,6 @@ async def test_finalize_grades_the_version_execution_loaded_when_it_is_soft_dele
     assert statuses == [WorkflowRunStatus.terminated]
 
 
-def test_contract_comes_from_the_request_not_the_code() -> None:
-    """The obligation is what the user asked for, never the shape of the generated code."""
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-    from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion as RequestCriterion
-
-    assert contract_from_request_criteria([registered_download_completion_criterion()]) is not None
-    assert contract_from_request_criteria([RequestCriterion(id="c0", outcome="something else")]) is None
-    assert contract_from_request_criteria([]) is None
-    assert contract_from_request_criteria(None) is None
-
-
-def test_requested_contract_round_trips_through_the_parser() -> None:
-    from skyvern.forge.sdk.copilot.completion_verification import registered_download_completion_criterion
-
-    contract = contract_from_request_criteria([registered_download_completion_criterion()])
-    criteria = parse_completion_contract({"completion_contract": contract})
-    assert [c.kind for c in criteria] == ["registered_download"]
-    assert grade_completion_contract(criteria, registered_download_count=0).satisfied is False
-    assert grade_completion_contract(criteria, registered_download_count=1).satisfied is True
-
-
 def test_download_contract_comes_from_model_declared_artifact_metadata() -> None:
     metadata = {
         "download_statement": {
@@ -354,6 +350,31 @@ def test_ordinary_artifact_criterion_does_not_create_a_download_contract() -> No
     }
 
     assert contract_from_code_artifact_metadata(metadata) is None
+
+
+@pytest.mark.parametrize(
+    ("published", "unmet"),
+    [(0, ("pdf", "xlsx", "zip")), (1, ("xlsx", "zip")), (2, ("zip",)), (3, ())],
+)
+def test_each_generated_promise_needs_its_own_published_file(published: int, unmet: tuple[str, ...]) -> None:
+    contract = contract_from_code_artifact_metadata(
+        {
+            "build_report": {
+                "completion_criteria": [
+                    {"id": criterion_id, "deliverable_kind": "generated_file"}
+                    for criterion_id in ("pdf", "xlsx", "zip")
+                ]
+            }
+        }
+    )
+
+    verdict = grade_completion_contract(
+        parse_completion_contract({"completion_contract": contract}),
+        registered_download_count=0,
+        generated_file_count=published,
+    )
+
+    assert (verdict.satisfied, verdict.unmet_criterion_ids) == (not unmet, unmet)
 
 
 @pytest.mark.asyncio
@@ -535,6 +556,213 @@ async def test_one_file_reported_by_both_download_sources_does_not_satisfy_a_two
     assert statuses == [WorkflowRunStatus.terminated]
 
 
+_T0 = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+_EARLIER_ATTEMPT_THEN_CURRENT = (
+    (1, _T0 - timedelta(minutes=20), _T0 - timedelta(minutes=5)),
+    (2, _T0 - timedelta(minutes=1), None),
+)
+_ONE_ATTEMPT = ((1, _T0 - timedelta(minutes=1), None),)
+
+
+def _declared_contract(*kinds: str) -> dict[str, object] | None:
+    """What the real producer carries when each kind is declared by its own block under one shared criterion id."""
+    return contract_from_code_artifact_metadata(
+        {
+            f"block_{index}": {
+                "completion_criteria": [
+                    CodeArtifactCompletionCriterion.model_validate(
+                        {"id": "capture", "deliverable_kind": kind}
+                    ).model_dump(mode="json")
+                ]
+            }
+            for index, kind in enumerate(kinds)
+        }
+    )
+
+
+def _registered(artifact_id: str, *, minutes_from_t0: int = 0) -> FileInfo:
+    return FileInfo(
+        url=f"s3://b/{artifact_id}", artifact_id=artifact_id, modified_at=_T0 + timedelta(minutes=minutes_from_t0)
+    )
+
+
+def _block_row(output: dict[str, object], block_type: BlockType = BlockType.CODE) -> SimpleNamespace:
+    return SimpleNamespace(block_type=block_type, output=output)
+
+
+def _attempt_row(number: int, started_at: datetime, finished_at: datetime | None) -> WorkflowRunAttemptModel:
+    return WorkflowRunAttemptModel(
+        workflow_run_id="wr_1",
+        attempt_number=number,
+        organization_id="o_1",
+        status="running",
+        started_at=started_at,
+        created_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+_STAMPED = {"generated_file_artifact_ids": ["a_gen"]}
+
+
+@pytest.mark.parametrize(
+    ("kinds", "downloaded", "run_blocks", "attempts", "expected_status", "unmet_promise"),
+    [
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_gen")],
+            [_block_row(_STAMPED)],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.completed,
+            None,
+            id="generated-promise-met-by-a-same-attempt-published-file",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_gen")],
+            [_block_row(_STAMPED)],
+            _EARLIER_ATTEMPT_THEN_CURRENT,
+            WorkflowRunStatus.completed,
+            None,
+            id="generated-promise-met-by-a-current-attempt-published-file-after-a-retry",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [],
+            [],
+            None,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="generated-promise-with-nothing-registered",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_site")],
+            [_block_row({"rows": 3, "downloaded_file_artifact_ids": ["a_site"]})],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="generated-promise-not-met-by-a-site-download-bound-to-an-in-process-code-row",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_gen")],
+            [],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="generated-promise-not-met-by-an-unstamped-site-download",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_gen")],
+            [_block_row(_STAMPED, BlockType.TEXT_PROMPT)],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="generated-promise-not-met-by-a-stamp-on-a-non-code-row",
+        ),
+        pytest.param(
+            ("generated_file",),
+            [_registered("a_gen", minutes_from_t0=-10)],
+            [_block_row(_STAMPED)],
+            _EARLIER_ATTEMPT_THEN_CURRENT,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="generated-promise-not-met-by-an-earlier-attempt-published-file",
+        ),
+        pytest.param(
+            ("registered_download",),
+            [_registered("a_gen")],
+            [_block_row(_STAMPED)],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.terminated,
+            "download",
+            id="download-promise-not-met-by-a-published-file",
+        ),
+        pytest.param(
+            ("registered_download",),
+            [_registered("a_site", minutes_from_t0=-10)],
+            [],
+            _EARLIER_ATTEMPT_THEN_CURRENT,
+            WorkflowRunStatus.terminated,
+            "download",
+            id="download-promise-not-met-by-an-earlier-attempt-download",
+        ),
+        pytest.param(
+            ("registered_download",),
+            [_registered("a_site")],
+            [],
+            _EARLIER_ATTEMPT_THEN_CURRENT,
+            WorkflowRunStatus.completed,
+            None,
+            id="download-promise-met-by-a-current-attempt-download",
+        ),
+        pytest.param(
+            ("registered_download",),
+            [],
+            [_block_row({"downloaded_files": [{"file_name": "statement.pdf"}]})],
+            None,
+            WorkflowRunStatus.terminated,
+            "download",
+            id="download-promise-not-met-by-an-authored-filename",
+        ),
+        pytest.param(
+            ("registered_download",),
+            [],
+            [_block_row({"downloaded_file_urls": ["https://files.example/statement.pdf"]})],
+            None,
+            WorkflowRunStatus.terminated,
+            "download",
+            id="download-promise-not-met-by-an-authored-url",
+        ),
+        pytest.param(
+            ("registered_download", "generated_file"),
+            [_registered("a_site")],
+            [],
+            _ONE_ATTEMPT,
+            WorkflowRunStatus.terminated,
+            "generate",
+            id="both-promises-declared-and-only-a-site-download-registered",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_each_declared_deliverable_kind_is_met_only_by_its_own_registered_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    kinds: tuple[str, ...],
+    downloaded: list[FileInfo],
+    run_blocks: list[SimpleNamespace],
+    attempts: tuple[tuple[int, datetime, datetime | None], ...] | None,
+    expected_status: WorkflowRunStatus,
+    unmet_promise: str | None,
+) -> None:
+    contract = _declared_contract(*kinds)
+    assert contract is not None
+    assert [criterion["kind"] for criterion in contract["criteria"]] == list(kinds)
+    service, run, statuses = _wire_finalize(
+        monkeypatch,
+        contract=contract,
+        downloaded=downloaded,
+        run_blocks=run_blocks,
+        attempts=None if attempts is None else [_attempt_row(*attempt) for attempt in attempts],
+    )
+
+    # `completed` is also what a swallowed grading error writes, so the verdict is read directly too.
+    verdict = await service._grade_completion_contract(run)
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+
+    assert verdict is not None
+    assert verdict.satisfied is (unmet_promise is None)
+    assert unmet_promise is None or (verdict.reason is not None and verdict.reason.endswith(f"to {unmet_promise}."))
+    assert statuses == [expected_status]
+
+
 def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -> None:
     from skyvern.forge.sdk.routes import workflow_copilot as route
 
@@ -552,24 +780,3 @@ def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
     routes = [r for r in base_router.routes if getattr(r, "path", "") == "/workflow/copilot/apply-proposed-workflow"]
     assert routes, "route not registered"
     assert routes[0].endpoint.__name__ == "workflow_copilot_apply_proposed_workflow"
-
-
-def test_a_request_criterion_is_recognized_by_its_typed_deliverable_fields() -> None:
-    """The persisted criterion carries deliverable_kind/output_path; the synthetic id is the
-    copilot's separate internal marker, and keying on it alone misses every real request."""
-    requested = SimpleNamespace(
-        id="c0",
-        outcome="the current electricity statement is downloaded as a PDF",
-        deliverable_kind="registered_download",
-        declared_deliverable_kind="registered_download",
-        output_path="output.downloaded_files",
-    )
-    unrelated = SimpleNamespace(id="c1", outcome="a summary", deliverable_kind=None, output_path=None)
-
-    assert contract_from_request_criteria([unrelated, requested]) is not None
-    assert contract_from_request_criteria([unrelated]) is None
-
-
-def test_output_path_alone_identifies_a_requested_download() -> None:
-    by_path = SimpleNamespace(id="c0", deliverable_kind=None, output_path="output.downloaded_files")
-    assert contract_from_request_criteria([by_path]) is not None

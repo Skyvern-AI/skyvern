@@ -201,6 +201,13 @@ def generated_file_artifact_ids(outputs: Iterable[Any]) -> frozenset[str]:
     )
 
 
+def without_generated_file_stamp(output: Any) -> Any:
+    """``output`` without the worker-owned key, for a code block row whose output the secure worker did not write."""
+    if not isinstance(output, dict) or GENERATED_FILE_ARTIFACT_IDS_KEY not in output:
+        return output
+    return {key: value for key, value in output.items() if key != GENERATED_FILE_ARTIFACT_IDS_KEY}
+
+
 def registered_download_proof_view(output: Any, generated: frozenset[str]) -> Any:
     """``output`` with the rows of ``generated`` removed from its registration keys."""
     if not isinstance(output, dict) or not generated:

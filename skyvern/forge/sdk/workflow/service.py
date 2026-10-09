@@ -13753,7 +13753,7 @@ class WorkflowService:
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
             )
-            # A file the run's own code generated is a real download but not a delivered one.
+            # A file the run's own code generated is left out of the download count only.
             run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
@@ -13767,7 +13767,15 @@ class WorkflowService:
             # downloads), so they are separate files and both count.
             registered_ids = {file.artifact_id for file in registered if file.artifact_id}
             download_count = len(registered) + len(session_download_ids - registered_ids)
-            verdict = grade_completion_contract(criteria, registered_download_count=download_count)
+            # A CODE row carries this key only from the secure worker: the in-process executor and the AI
+            # fallback drop it. On any other block type it is authored data.
+            worker_generated = generated_file_artifact_ids(
+                block.output for block in run_blocks if block.block_type == BlockType.CODE
+            )
+            generated_file_count = len({file.artifact_id for file in files if file.artifact_id in worker_generated})
+            verdict = grade_completion_contract(
+                criteria, registered_download_count=download_count, generated_file_count=generated_file_count
+            )
             LOG.info(
                 "workflow_completion_contract_graded",
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -13776,6 +13784,7 @@ class WorkflowService:
                 registered_download_count=len(registered),
                 session_download_count=len(session_download_ids),
                 graded_download_count=download_count,
+                generated_file_count=generated_file_count,
             )
             return verdict
         except Exception:
