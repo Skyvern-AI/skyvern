@@ -14576,7 +14576,14 @@ def build_browser_tools(
                 skin_probe = None
             # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
             # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
-            if not (isinstance(skin_probe, dict) and "radio" in skin_probe) or await _engine_enabled(page, selector):
+            if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
+                break
+            if await _engine_enabled(page, selector):
+                # A page that enables a control can move it in the same step, so the label point is measured after
+                # the enabled read, never before it.
+                pre_click_arg = await _probe_arg(page, selector)
+                with contextlib.suppress(Exception):
+                    skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
                 break
             if time.monotonic() >= enable_deadline:
                 return ToolResult.error(

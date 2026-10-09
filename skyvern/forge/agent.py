@@ -3768,9 +3768,14 @@ class ForgeAgent:
                 # The block row was labeled v3 before dispatch, and script generation skips a run with a
                 # v3 row, so a fallback left labeled v3 would lose a script the run was asked to generate.
                 try:
-                    await app.DATABASE.observer.set_workflow_run_block_engine_by_task_id(
+                    if not await app.DATABASE.observer.set_workflow_run_block_engine_by_task_id(
                         task.task_id, RunEngine.skyvern_v1, organization_id=task.organization_id
-                    )
+                    ):
+                        LOG.warning(
+                            "No block row matched the step-engine fallback relabel",
+                            task_id=task.task_id,
+                            workflow_run_id=task.workflow_run_id,
+                        )
                 except Exception:
                     LOG.warning(
                         "Could not record the step-engine fallback on the block row",

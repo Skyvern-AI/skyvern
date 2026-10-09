@@ -263,8 +263,8 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     workflow_run_blocks.sort(key=lambda x: x.created_at)
-    # Checked on the same snapshot the actions are read through: a block row records its engine before any of
-    # its actions exist, so an in-flight mint cannot read a v3 task's actions without also reading its v3 row.
+    # Both this check and the re-read after the actions are needed: actions are fetched for the task ids read
+    # here, and a retry can move a v3 row to a new task and relabel it v1 before the re-read.
     if any(block.engine == RunEngine.skyvern_v3 for block in workflow_run_blocks):
         raise TaskV3RunNotScriptableError(workflow_run_id)
 
@@ -306,6 +306,13 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
             workflow_run_id=workflow_run_id,
             action_count=len(all_actions),
         )
+
+    # Read after the actions: a block row is labeled v3 before any v3 action exists (the cached-script fallback
+    # stamps an existing row), so an in-flight mint that read a v3 action always sees the label here.
+    if await app.DATABASE.observer.workflow_run_has_block_on_engine(
+        workflow_run_id=workflow_run_id, engine=RunEngine.skyvern_v3, organization_id=organization_id
+    ):
+        raise TaskV3RunNotScriptableError(workflow_run_id)
 
     workflow_block_dump = []
     actions_by_task: dict[str, list[dict[str, Any]]] = {}

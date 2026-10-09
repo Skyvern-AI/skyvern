@@ -337,6 +337,7 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
+        mock_app.DATABASE.observer.workflow_run_has_block_on_engine = AsyncMock(return_value=False)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
             return_value=[
                 mock_forloop_run_block,
