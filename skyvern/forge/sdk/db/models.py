@@ -42,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_folder_id,
+    generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
@@ -855,6 +856,7 @@ class WorkflowRunGroupItemModel(Base):
     __table_args__ = (
         UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
         UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+        Index("ix_workflow_run_group_items_item_key_created_at", "item_key", "created_at"),
     )
 
     workflow_run_group_id = Column(String, primary_key=True)
@@ -931,6 +933,13 @@ class WorkflowRunModel(Base):
             postgresql_where=text("status IN ('queued', 'running', 'paused')"),
         ),
         Index(
+            "ix_workflow_runs_job_recipe_listing",
+            "organization_id",
+            text("created_at DESC"),
+            text("workflow_run_id DESC"),
+            postgresql_where=text("trigger_type IN ('job_recipe_apply', 'job_recipe_extract')"),
+        ),
+        Index(
             "ix_workflow_runs_retried_from_workflow_run_id",
             "retried_from_workflow_run_id",
             unique=True,
@@ -952,6 +961,7 @@ class WorkflowRunModel(Base):
     start_fresh_browser = Column(Boolean, nullable=True)
     reuse_browser_session = Column(Boolean, nullable=True)
     reuse_bound_key = Column(String, nullable=True)
+    workflow_definition_sha256 = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -976,6 +986,8 @@ class WorkflowRunModel(Base):
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
@@ -1696,6 +1708,9 @@ class PersistentBrowserSessionModel(Base):
     browser_profile_id = Column(String, nullable=True, index=True)
     bound_workflow_permanent_id = Column(String, nullable=True)
     bound_key = Column(String, nullable=True)
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
+    created_for_workflow_run_id = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -1928,6 +1943,15 @@ class CredentialModel(Base):
 
 class DebugSessionModel(Base):
     __tablename__ = "debug_sessions"
+    __table_args__ = (
+        Index(
+            "ix_debug_sessions_org_wpid_user_created_at",
+            "organization_id",
+            "workflow_permanent_id",
+            "user_id",
+            "created_at",
+        ),
+    )
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)
@@ -2306,6 +2330,7 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     email_address = Column(String, nullable=True)
+    google_subject = Column(String, nullable=True)
     provider = Column(String, nullable=False, default="google")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
@@ -2318,6 +2343,38 @@ class GoogleOAuthCredentialModel(Base):
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
     client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class GmailSendDispatchModel(Base):
+    """One row per logical send_email execution that reached the Gmail send call."""
+
+    __tablename__ = "gmail_send_dispatches"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "execution_key", name="uq_gmail_send_dispatches_execution"),
+        CheckConstraint(
+            "status IN ('dispatching', 'accepted', 'failed', 'unknown')",
+            name="ck_gmail_send_dispatches_status",
+        ),
+    )
+
+    gmail_send_dispatch_id = Column(String, primary_key=True, default=generate_gmail_send_dispatch_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    execution_key = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="dispatching")
+    provider_message_id = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    provider_status = Column(Integer, nullable=True)
+    provider_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

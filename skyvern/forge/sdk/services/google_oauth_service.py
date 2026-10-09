@@ -14,12 +14,14 @@ import datetime
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from urllib.parse import urlparse
 
 import httpx
 import structlog
 from google.auth.exceptions import GoogleAuthError, RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
@@ -37,18 +39,21 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (  # noqa: F401
     STATE_ERROR,
     STATE_PENDING_CONSENT,
     STATE_REVOKED,
+    GmailSendUpgradeUnavailableError,
     InvalidConsentNonceError,
     PendingConsentContext,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.google_oauth import (
+    GOOGLE_GMAIL_SEND_SCOPE,
     GoogleOAuthClientConfig,
     GoogleOAuthClientConfigSafe,
     GoogleOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import oauth_consent
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.email_validation import normalize_email_address
 
 LOG = structlog.get_logger()
 
@@ -70,13 +75,27 @@ GOOGLE_GMAIL_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_READONLY_SCOPE,)
 # arbitrary existing folders unless the app created or Picker-selected them, so
 # this profile intentionally uses full Drive scope until a Picker flow exists.
 GOOGLE_DRIVE_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/drive",)
+# openid and email make Google return an ID token, which is the only server-verified account identity.
+GOOGLE_GMAIL_SEND_SCOPES: tuple[str, ...] = (GOOGLE_GMAIL_SEND_SCOPE, "openid", "email")
 GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS = "google_sheets"
 GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL = "gmail"
 GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE = "google_drive"
+GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND = "gmail_send"
+GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND = "gmail_read_send"
 GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
     GOOGLE_OAUTH_SCOPE_PROFILE_SHEETS: GOOGLE_SHEETS_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL: GOOGLE_GMAIL_SCOPES,
     GOOGLE_OAUTH_SCOPE_PROFILE_DRIVE: GOOGLE_DRIVE_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND: GOOGLE_GMAIL_SEND_SCOPES,
+    GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND: (*GOOGLE_GMAIL_SCOPES, *GOOGLE_GMAIL_SEND_SCOPES),
+}
+_SEND_UPGRADE_SCOPE_PROFILES = frozenset(
+    {GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND, GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND}
+)
+# Google reports the short OIDC scope names back as their full URLs.
+_GOOGLE_SCOPE_ALIASES = {
+    "email": "https://www.googleapis.com/auth/userinfo.email",
+    "profile": "https://www.googleapis.com/auth/userinfo.profile",
 }
 
 CONSENT_TTL_SECONDS = 600
@@ -159,6 +178,54 @@ class ClientConfigMismatchError(ValueError):
 
 class OrganizationClientConfigUnavailableError(RuntimeError):
     """Raised when a stored org OAuth client config exists (or cannot be ruled out) but cannot be loaded."""
+
+
+class GmailSendConsentRejection(StrEnum):
+    IDENTITY_UNVERIFIED = "identity_unverified"
+    SCOPES_NOT_GRANTED = "scopes_not_granted"
+    ACCOUNT_MISMATCH = "account_mismatch"
+
+
+GMAIL_SEND_CONSENT_REJECTION_MESSAGES: dict[GmailSendConsentRejection, str] = {
+    GmailSendConsentRejection.IDENTITY_UNVERIFIED: (
+        "Google did not return a verified account identity, so sending was not enabled. "
+        "The previous connection is unchanged."
+    ),
+    GmailSendConsentRejection.SCOPES_NOT_GRANTED: (
+        "Not every requested permission was granted, so sending was not enabled. The previous connection is unchanged."
+    ),
+    GmailSendConsentRejection.ACCOUNT_MISMATCH: (
+        "A different Google account was used than the one this connection belongs to. "
+        "The previous connection is unchanged."
+    ),
+}
+
+
+class GmailSendConsentRejectedError(ValueError):
+    def __init__(self, rejection: GmailSendConsentRejection) -> None:
+        super().__init__(GMAIL_SEND_CONSENT_REJECTION_MESSAGES[rejection])
+        self.rejection = rejection
+
+
+@dataclass(frozen=True)
+class GoogleIdentity:
+    subject: str
+    email: str
+
+
+class GmailSendAuthorizationStatus(StrEnum):
+    READY = "ready"
+    CONFIGURATION = "configuration"
+    RECONNECT = "reconnect"
+    MISSING_SCOPE = "missing_scope"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class GmailSendAuthorization:
+    status: GmailSendAuthorizationStatus
+    access_token: str | None = field(default=None, repr=False)
+    from_address: str | None = field(default=None, repr=False)
 
 
 def _is_invalid_grant(exc: RefreshError) -> bool:
@@ -358,6 +425,14 @@ def scopes_for_profile(scope_profile: str | None) -> list[str]:
     return list(GOOGLE_OAUTH_SCOPE_PROFILES[scope_profile])
 
 
+def _normalized_scopes(scopes: Sequence[str]) -> set[str]:
+    return {_GOOGLE_SCOPE_ALIASES.get(scope, scope) for scope in scopes}
+
+
+def _merge_scopes(*scope_lists: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(scope for scopes in scope_lists for scope in scopes))
+
+
 def has_required_scopes(
     granted_scopes: list[str] | tuple[str, ...] | None,
     required_scopes: list[str] | tuple[str, ...],
@@ -555,6 +630,26 @@ async def start_authorization(
             requested_scopes_override = _coerce_scopes(scopes_requested)
         else:
             requested_scopes_override = None
+        is_send_upgrade = scope_profile in _SEND_UPGRADE_SCOPE_PROFILES
+        is_plain_reconnect = requested_scopes_override is None
+
+        def adjust_scopes(row: GoogleOAuthCredentialBase, scopes: list[str]) -> list[str]:
+            if is_send_upgrade:
+                if not (row.google_subject or row.email_address):
+                    raise GmailSendUpgradeUnavailableError(
+                        "This connection has no recorded Google account, so sending cannot be added to it. "
+                        "Create a new Gmail connection for sending."
+                    )
+                return _merge_scopes(row.scopes_granted, scopes)
+            if GOOGLE_GMAIL_SEND_SCOPE in row.scopes_granted:
+                return _merge_scopes(scopes, GOOGLE_GMAIL_SEND_SCOPES)
+            if is_plain_reconnect:
+                # A cancelled send upgrade leaves its scopes in scopes_requested; a reconnect must not ask for them.
+                ungranted = _normalized_scopes(GOOGLE_GMAIL_SEND_SCOPES) - _normalized_scopes(row.scopes_granted)
+                kept = [scope for scope in scopes if not _normalized_scopes([scope]) & ungranted]
+                return kept or list(row.scopes_granted)
+            return scopes
+
         reauth = await app.DATABASE.google_oauth.begin_reauthorization(
             credential_id=credential_id,
             organization_id=organization_id,
@@ -567,6 +662,7 @@ async def start_authorization(
             client_id=resolved_config.config.client_id,
             requested_scopes=requested_scopes_override,
             fallback_scopes=list(GOOGLE_SHEETS_SCOPES),
+            adjust_scopes=adjust_scopes,
         )
         if reauth is None:
             raise CredentialNotReauthorizableError("Google OAuth credential not found or not in a reconnectable state")
@@ -606,6 +702,7 @@ async def promote_pending_credential(
     initiator_id: str | None,
     refresh_token: str,
     scopes_granted: str | list[str] | tuple[str, ...] | None,
+    identity: GoogleIdentity | None = None,
 ) -> GoogleOAuthCredentialBase:
     """Encrypt the refresh token and promote the matching pending row to active."""
     nonce = oauth_consent.consent_nonce(state, initiator_id)
@@ -619,6 +716,8 @@ async def promote_pending_credential(
         encrypted_method=EncryptMethod.AES,
         scopes_granted=_coerce_scopes(scopes_granted),
         now=now,
+        google_subject=identity.subject if identity else None,
+        email_address=identity.email if identity else None,
     )
     # On a re-auth the credential id is reused, so serialize invalidation with token refreshes before
     # dropping the cached token. The next call then mints from the freshly stored refresh token.
@@ -720,12 +819,106 @@ async def exchange_code_for_tokens(
     granted = creds.granted_scopes or flow.oauth2session.token.get("scope") or ""
     if isinstance(granted, (list, tuple)):
         granted = " ".join(granted)
-    return {
+    token_data = {
         "access_token": creds.token,
         "refresh_token": creds.refresh_token,
         "scope": granted,
         "expiry": creds.expiry.isoformat() if creds.expiry else None,
     }
+    if id_token := flow.oauth2session.token.get("id_token"):
+        token_data["id_token"] = id_token
+    return token_data
+
+
+async def verify_google_identity(id_token: str | None, client_id: str) -> GoogleIdentity | None:
+    """The account behind an ID token, or None unless its signature, audience and email_verified all hold."""
+    if not id_token:
+        return None
+    try:
+        # verify_oauth2_token is synchronous and fetches Google's signing certificates over the network.
+        claims = await asyncio.to_thread(
+            google_id_token.verify_oauth2_token, id_token, GoogleAuthRequest(), client_id, clock_skew_in_seconds=10
+        )
+    except Exception as exc:
+        LOG.warning("Google ID token verification failed", error_type=type(exc).__name__)
+        return None
+    subject = claims.get("sub")
+    email = claims.get("email")
+    if not isinstance(subject, str) or not subject or not isinstance(email, str) or not email:
+        return None
+    if claims.get("email_verified") is not True:
+        return None
+    return GoogleIdentity(subject=subject, email=normalize_email_address(email))
+
+
+async def verify_gmail_send_consent(
+    context: PendingConsentContext,
+    scopes_granted: Sequence[str],
+    id_token: str | None,
+    client_id: str,
+) -> GoogleIdentity:
+    """Check a consent that asked for gmail.send before anything is written to the connection."""
+    identity = await verify_google_identity(id_token, client_id)
+    if identity is None:
+        raise GmailSendConsentRejectedError(GmailSendConsentRejection.IDENTITY_UNVERIFIED)
+    if not _normalized_scopes(context.scopes_requested) <= _normalized_scopes(scopes_granted):
+        raise GmailSendConsentRejectedError(GmailSendConsentRejection.SCOPES_NOT_GRANTED)
+    if context.google_subject:
+        same_account = identity.subject == context.google_subject
+    elif context.email_address:
+        same_account = identity.email == normalize_email_address(context.email_address)
+    else:
+        same_account = True
+    if not same_account:
+        raise GmailSendConsentRejectedError(GmailSendConsentRejection.ACCOUNT_MISMATCH)
+    return identity
+
+
+async def resolve_gmail_send_authorization(organization_id: str, credential_id: str | None) -> GmailSendAuthorization:
+    """Mint a send token for exactly this connection, or say why it cannot send."""
+    credential_id = (credential_id or "").strip()
+    if not credential_id:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.CONFIGURATION)
+    row = await app.DATABASE.google_oauth.get_credential(organization_id, credential_id)
+    if row is None:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.CONFIGURATION)
+    if row.state == STATE_ERROR:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.RECONNECT)
+    if row.state != STATE_ACTIVE:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.CONFIGURATION)
+    if GOOGLE_GMAIL_SEND_SCOPE not in row.scopes_granted:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.MISSING_SCOPE)
+    if not row.google_subject or not row.email_address:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.RECONNECT)
+    try:
+        credential_secrets = await load_credential_secrets(organization_id, credential_id)
+        # The token must belong to the row whose identity and scopes were just checked.
+        if credential_secrets.credential_version != row.modified_at:
+            return GmailSendAuthorization(GmailSendAuthorizationStatus.RECONNECT)
+        # One token refresh per send; reuse the access-token cache if send volume makes this slow.
+        refreshed = await refresh_and_rotate(
+            organization_id=organization_id,
+            credential_id=credential_id,
+            credential_secrets=credential_secrets,
+        )
+    except ExpiredRefreshTokenError:
+        await mark_credential_expired(organization_id, credential_id, expected_version=row.modified_at)
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.RECONNECT)
+    except ClientConfigMismatchError:
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.RECONNECT)
+    except Exception as exc:
+        LOG.warning(
+            "Gmail send authorization failed",
+            organization_id=organization_id,
+            credential_id=credential_id,
+            error_type=type(exc).__name__,
+        )
+        return GmailSendAuthorization(GmailSendAuthorizationStatus.UNAVAILABLE)
+    return GmailSendAuthorization(
+        GmailSendAuthorizationStatus.READY,
+        access_token=refreshed.access_token,
+        from_address=row.email_address,
+    )
 
 
 async def refresh_access_token(

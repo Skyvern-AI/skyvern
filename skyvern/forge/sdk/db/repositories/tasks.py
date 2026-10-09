@@ -24,7 +24,13 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
-from skyvern.forge.sdk.db.utils import convert_to_step, convert_to_task, hydrate_action, serialize_proxy_location
+from skyvern.forge.sdk.db.utils import (
+    as_stored_json,
+    convert_to_step,
+    convert_to_task,
+    hydrate_action,
+    serialize_proxy_location,
+)
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
@@ -89,6 +95,14 @@ class TasksRepository(BaseRepository):
         complete_criterion = _sanitize(complete_criterion)
         terminate_criterion = _sanitize(terminate_criterion)
         workflow_system_prompt = _sanitize(workflow_system_prompt)
+        # Workflow blocks pass datetimes and NULs in these. Normalizing them to their stored JSON form lets the
+        # returned Task match the row without a re-read.
+        navigation_payload = as_stored_json(navigation_payload)
+        extracted_information_schema = as_stored_json(extracted_information_schema)
+        error_code_mapping = as_stored_json(error_code_mapping)
+        model = as_stored_json(model)
+        extra_http_headers = as_stored_json(extra_http_headers)
+        cdp_connect_headers = as_stored_json(cdp_connect_headers)
 
         # created_at is passed so an already-running task cannot start before it was created; None
         # falls through to the column default.
@@ -132,9 +146,11 @@ class TasksRepository(BaseRepository):
                 attempt_number=attempt_number,
             )
             session.add(new_task)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            task = convert_to_task(new_task, self.debug_enabled)
             await session.commit()
-            await session.refresh(new_task)
-            return convert_to_task(new_task, self.debug_enabled)
+            return task
 
     @db_operation("create_step")
     async def create_step(
@@ -265,38 +281,19 @@ class TasksRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
-    @db_operation("get_workflow_run_progress_timestamps")
-    async def get_workflow_run_progress_timestamps(
+    @db_operation("get_workflow_run_block_progress_timestamp")
+    async def get_workflow_run_block_progress_timestamp(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
-    ) -> tuple[datetime | None, datetime | None]:
-        """Return ``(max(step.modified_at), max(workflow_run_block.modified_at))``
-        for a given workflow run. Both values are scalar aggregates — no row
-        hydration — and are designed for the copilot watchdog poll path where
-        the only question is "has anything changed since the last poll?".
-
-        Step updates are the per-LLM-call heartbeat (status transitions plus
-        incremental token/cost accumulators — every ``update_step`` call bumps
-        ``StepModel.modified_at``). Block updates cover non-task block types
-        (CODE, TEXT_PROMPT) that never create a task row. Together the two
-        aggregates cover every kind of block the copilot can run.
-        """
+    ) -> datetime | None:
         async with self.Session() as session:
-            step_stmt = (
-                select(func.max(StepModel.modified_at))
-                .join(TaskModel, StepModel.task_id == TaskModel.task_id)
-                .where(TaskModel.workflow_run_id == workflow_run_id)
-                .where(StepModel.organization_id == organization_id)
-            )
             block_stmt = (
                 select(func.max(WorkflowRunBlockModel.modified_at))
                 .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
                 .where(WorkflowRunBlockModel.organization_id == organization_id)
             )
-            step_ts = (await session.execute(step_stmt)).scalar_one_or_none()
-            block_ts = (await session.execute(block_stmt)).scalar_one_or_none()
-            return step_ts, block_ts
+            return (await session.execute(block_stmt)).scalar_one_or_none()
 
     @db_operation("get_total_unique_step_order_count_by_task_ids")
     async def get_total_unique_step_order_count_by_task_ids(
@@ -963,10 +960,14 @@ class TasksRepository(BaseRepository):
 
             results = (await session.execute(query)).all()
 
-            return [
+        # A large page is seconds of pure-Python model building; on the event loop it stalls every other request.
+        # The query loads every column, so the thread only reads loaded attributes and never uses the session.
+        return await asyncio.to_thread(
+            lambda: [
                 convert_to_task(task, debug_enabled=self.debug_enabled, workflow_permanent_id=workflow_permanent_id)
                 for task, workflow_permanent_id in results
             ]
+        )
 
     @db_operation("get_tasks_count")
     async def get_tasks_count(
@@ -1194,9 +1195,12 @@ class TasksRepository(BaseRepository):
                 searchable_text=searchable_text or None,
             )
             session.add(task_run)
+            # The flush already holds what a post-commit refresh would reread: Python defaults are set at flush and
+            # any server default returns through the INSERT. Only a trigger could differ; add a refresh if one lands.
+            await session.flush()
+            run = Run.model_validate(task_run)
             await session.commit()
-            await session.refresh(task_run)
-            return Run.model_validate(task_run)
+            return run
 
     @db_operation("update_task_run")
     async def update_task_run(

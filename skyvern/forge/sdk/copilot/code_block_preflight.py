@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_synthesis import is_root_locator_selector
 from skyvern.forge.sdk.workflow.models._jinja import _json_finalize, _json_type_filter
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.utils.strings import join_phrases
 from skyvern.utils.templating import get_missing_variables
 
 RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
@@ -104,12 +105,13 @@ class WrapperScopeFacts:
 _render_check_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
 _render_check_env.filters["json"] = _json_type_filter
 
+_CURRENT_DATE_BINDING = "current_date"
 _RENDER_SYSTEM_BINDING_NAMES = (
     "workflow_title",
     "workflow_id",
     "workflow_permanent_id",
     "workflow_run_id",
-    "current_date",
+    _CURRENT_DATE_BINDING,
     "browser_session_id",
     "workflow_run_outputs",
     "workflow_run_summary",
@@ -208,7 +210,7 @@ def code_block_render_diagnostic(code: str, bound_names: Iterable[str]) -> CodeB
             if suggestion
             else (
                 " Only declared parameter keys, block labels, `<label>_output` values, and workflow "
-                "system names (e.g. `current_date`) are available as top-level template names."
+                f"system names (e.g. `{_CURRENT_DATE_BINDING}`) are available as top-level template names."
             )
         )
         return CodeBlockRenderDiagnostic(
@@ -245,7 +247,7 @@ _BROAD_BODY_TEXT_WAIT_NEEDLES = (
     "document.documentelement.textcontent",
 )
 _BROAD_TABLE_RECORD_KEYS = frozenset(("items", "locations", "records", "rows"))
-_BROAD_TABLE_SCAN_SELECTORS = frozenset({"article", "section", ".card", "li"})
+_BROAD_TABLE_SCAN_SELECTORS = ("section", ".card", "article", "li")
 _BROAD_TABLE_SELECTOR_METHODS = frozenset(("locator", "query_selector", "query_selector_all"))
 _LONE_LIST_ITEM_SELECTOR_EXEMPTION = frozenset({"li"})
 _GET_BY_TEXT_NARROWING_ATTRIBUTES = frozenset({"first", "last"})
@@ -558,10 +560,6 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        wizard_step_diagnostic = _wizard_step_selector_diagnostic(node)
-        if wizard_step_diagnostic is not None:
-            diagnostics.append(wizard_step_diagnostic)
-            continue
         evaluate_diagnostic = _page_evaluate_diagnostic(node)
         if evaluate_diagnostic is not None:
             diagnostics.append(evaluate_diagnostic)
@@ -749,31 +747,6 @@ def _assignment_value_and_targets(node: ast.Assign | ast.AnnAssign) -> tuple[ast
     if isinstance(node, ast.Assign):
         return node.value, list(node.targets)
     return node.value, [node.target]
-
-
-def _wizard_step_selector_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "locator" or not node.args:
-        return None
-
-    selector = node.args[0]
-    if not isinstance(selector, ast.Constant) or not isinstance(selector.value, str):
-        return None
-    normalized_selector = selector.value.lower()
-    if "data-next-step" not in normalized_selector and "data-step" not in normalized_selector:
-        return None
-    if "button" not in normalized_selector:
-        return None
-
-    return CodeBlockPreflightDiagnostic(
-        code="AMBIGUOUS_WIZARD_STEP_SELECTOR",
-        message=(
-            "Code block targets a wizard step button by metadata selector only. Step metadata can match "
-            "both forward and back controls under Playwright strict mode. Target the visible semantic control "
-            "instead, such as `page.get_by_role('button', name='Continue')`, or narrow the locator to visible "
-            "button text before clicking."
-        ),
-    )
 
 
 def _page_evaluate_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
@@ -1052,11 +1025,11 @@ def _broad_table_record_scan_diagnostic(tree: ast.AST) -> CodeBlockPreflightDiag
     return CodeBlockPreflightDiagnostic(
         code="BROAD_TABLE_RECORD_SCAN",
         message=(
-            "Code block appears to extract row-like records by scanning broad containers such as `section`, "
-            "`.card`, `article`, or `li`. For table-like or list-like records, iterate the actual row/item "
+            "Code block appears to extract row-like records by scanning broad containers such as "
+            f"{join_phrases([f'`{selector}`' for selector in _BROAD_TABLE_SCAN_SELECTORS], 'or')}. "
+            "For table-like or list-like records, iterate the actual row/item "
             'elements (`tr`, `[role="row"]`, or equivalent repeated item containers) and read fields from '
-            "the same row so fields from separate records cannot be mixed. Derive summary status fields only "
-            "from parsed row objects."
+            "the same row so fields from separate records cannot be mixed."
         ),
     )
 

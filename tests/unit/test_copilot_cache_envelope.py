@@ -14,10 +14,17 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
+    item_parts_key,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
 _CODE_ONLY_HEADER = "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE"
 
@@ -51,6 +58,7 @@ def _cache_body(
         model_settings=ModelSettings(),
         tools=tools or [_first_tool],
         handoffs=[],
+        reasoning_effort="medium",
     )
     assert result is not None
     return result
@@ -91,22 +99,39 @@ def test_responses_envelope_marks_only_the_stable_system_prefix() -> None:
     assert result.prompt_cache_key.startswith("copilot:")
 
 
-def test_explicit_cache_opts_out_when_litellm_fallbacks_are_configured() -> None:
+_ASSISTANT_TEXT_THEN_CALL: list[Any] = [
+    {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x", "annotations": []}]},
+    {"type": "function_call", "call_id": "call_1", "name": "_first_tool", "arguments": "{}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "done"}]},
+]
+
+
+@pytest.mark.parametrize(("anchor", "keyed_roles"), [(0, ["system", "user"]), (1, ["system"]), (3, ["system", None])])
+def test_rolling_breakpoint_lands_only_on_an_anchor_whose_items_prefix_the_request(
+    anchor: int, keyed_roles: list[str | None]
+) -> None:
     result = build_explicit_cache_envelope(
         model="gpt-5.6-sol",
         base_url=None,
-        system_instructions=CacheableSystemInstructions(
-            "stable",
-            "dynamic",
-            cache_namespace="wcc_one",
-        ),
-        input=[{"role": "user", "content": "hello"}],
-        model_settings=ModelSettings(extra_args={"fallbacks": ["gpt-5.6-sol"]}),
+        system_instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc_one"),
+        input=_ASSISTANT_TEXT_THEN_CALL,
+        model_settings=ModelSettings(),
         tools=[_first_tool],
         handoffs=[],
+        reasoning_effort="medium",
+        anchors=[anchor],
     )
 
-    assert result is None
+    assert result is not None
+    keyed = [
+        item.get("role")
+        for item in result.responses_input
+        for part in item.get(item_parts_key(item)) or []
+        if isinstance(part, dict) and "prompt_cache_breakpoint" in part
+    ]
+    assert keyed == keyed_roles
+    assert result.breakpoint_count == len(keyed_roles)
 
 
 def test_system_prompt_text_is_identical_to_direct_template_render(
@@ -126,6 +151,8 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
         current_datetime=fixed_now.isoformat(),
         tool_usage_guide="tool guide",
         security_rules=config.security_rules,
+        model_written_context_fields=model_written_context_fields(),
+        tool_recorded_context_fields=tool_recorded_context_fields(),
     )
 
     actual = agent_module._build_system_prompt(tool_usage_guide="tool guide", config=config)

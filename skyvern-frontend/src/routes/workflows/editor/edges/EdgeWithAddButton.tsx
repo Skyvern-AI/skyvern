@@ -20,6 +20,10 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import {
+  requestRecordingStart,
+  useIsMountedRef,
+} from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
+import {
   runWorkflowAuthoringAction,
   refuseMutationDuringYamlCommit,
   refuseMutationDuringAuthoring,
@@ -153,17 +157,23 @@ function EdgeWithAddButton({
     updateWorkflowPanelState(true, branchContext);
   };
 
+  const mountedRef = useIsMountedRef();
   const onRecord = () => {
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      void runWorkflowAuthoringAction(() => {
-        recordingStore.setIsRecording(true, {
-          workflowPermanentId: workflowPermanentId ?? null,
-          browserSessionId: settingsStore.browserSessionId,
-        });
-        updateWorkflowPanelState(false);
-      });
+      requestRecordingStart(
+        () =>
+          void runWorkflowAuthoringAction(() => {
+            recordingStore.setIsRecording(true, {
+              workflowPermanentId: workflowPermanentId ?? null,
+              browserSessionId: settingsStore.browserSessionId,
+            });
+            updateWorkflowPanelState(false);
+          }),
+        "edge",
+        { isStillValid: () => mountedRef.current, recordsAfterDiscard: false },
+      );
     }
   };
 

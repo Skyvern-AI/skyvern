@@ -60,6 +60,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_RETAIN_CHARS_HIGH,
     ActivityRecency,
     CompletionBlocker,
+    CompletionGate,
     CompletionProbe,
     LoopOutcome,
     RoundAction,
@@ -116,6 +117,10 @@ MAX_TOKENS_PER_ACTION_STEP = DEFAULT_MAX_TOKENS // MIN_ACTION_STEPS
 # turn, the per-step sizing can bind before the step cap on long forms; the loop's progress-gated token grant
 # may then raise it, never past this ceiling. Turns/tool-calls scale unbounded (they cost loop iterations).
 MAX_TOKENS_CEILING = 4 * DEFAULT_MAX_TOKENS
+# The token guards charge the prefix re-sent on every call only up to this; 99.5% of v3 tasks' prefixes are below it.
+PREFIX_REF_TOKENS = 20_000
+# Never-extended spend cap on all tokens sent: 30 of 36 token deaths at a 60K+ prefix reach 67 turns under it (6M: 15).
+MAX_RAW_TOKENS = 2 * MAX_TOKENS_CEILING
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
 
@@ -273,11 +278,14 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
     completion_blocker: CompletionBlocker | None = None,
+    completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     initial_navigation_status: int | None = None,
     initial_navigation_url: str | None = None,
+    initial_navigation_requested_url: str | None = None,
     caller_known_urls: frozenset[str] = frozenset(),
+    task_target_urls: frozenset[str] = frozenset(),
     label_secret_values: Callable[[], Collection[str]] | None = None,
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
@@ -287,17 +295,12 @@ async def run_task_v3_agent_loop(
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
     has_navigation_goal: bool = False,
-    goal_judge: GoalJudge | None = None,
-    goal_check_enforce: bool = False,
     extraction_requested: bool = False,
     # Customer instructions that can redefine what "done" means, shown to the goal judge with the goal.
     goal_instructions: str = "",
     # Called once per goal check; the redactor it returns is applied to every judge input before
     # truncation. The caller owns the run's secret set.
     goal_check_redactor: Callable[[], Redactor] | None = None,
-    # A secret may already be on the page from before this loop (an earlier block, a self-healing
-    # script): the goal check then never captures a screenshot.
-    secret_on_page_at_start: bool = False,
     # (complete_criterion, terminate_criterion) for a block whose failed or terminated finish may be re-asked
     # once; None means the block is not eligible.
     unlisted_reask_criteria: tuple[str, str | None] | None = None,
@@ -306,6 +309,10 @@ async def run_task_v3_agent_loop(
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
     single_action_block: bool = False,
+    # Extra action rounds a single-action block may spend before its own action lands; see the loop.
+    target_action_reserve: int = 0,
+    # Asked before a single-action block completes on its step cap.
+    block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
 ) -> LoopOutcome:
@@ -437,28 +444,24 @@ async def run_task_v3_agent_loop(
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
-    goal_check_on = goal_judge is not None and goal_check_eligible(
+    # A block with its own completion verifier is left to it, by every judge.
+    judge_eligible = goal_check_eligible(
         page_free=page_free,
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    # Same eligibility as the goal check: a block with its own completion verifier is left to it.
-    reask_on = unlisted_reask_criteria is not None and goal_check_eligible(
-        page_free=page_free,
-        completion_blocker_present=completion_blocker is not None,
-        extraction_requested=extraction_requested,
-    )
-    tool_trail = ToolTrail(secret_entered=secret_on_page_at_start) if goal_check_on or reask_on else None
-    goal_verdicts: list[GoalVerdict] = []
+    reask_on = unlisted_reask_criteria is not None and judge_eligible
+    block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
+    tool_trail = ToolTrail() if reask_on or block_check_on else None
     reasks: list[UnlistedReask] = []
 
-    async def _goal_check() -> GoalVerdict:
-        assert goal_judge is not None and tool_trail is not None
+    async def _judge_goal(judge: GoalJudge, *, secret_entered: bool, failure_log: str) -> GoalVerdict:
+        assert tool_trail is not None
         timeout = GOAL_CHECK_TIMEOUT_SECONDS
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
-        if tool_trail.secret_entered:
+        if secret_entered:
             verdict = GoalVerdict("achieved", "", "", "secret_entered", 0.0)
         elif timeout <= 0:
             verdict = GoalVerdict("achieved", "", "", "deadline", 0.0)
@@ -470,13 +473,22 @@ async def run_task_v3_agent_loop(
             verdict = await run_goal_check(
                 goal=model_goal,
                 trail=tool_trail,
-                judge=goal_judge,
+                judge=judge,
                 timeout_seconds=timeout,
                 instructions=goal_instructions,
                 redact=redact,
+                failure_log=failure_log,
             )
-        goal_verdicts.append(verdict)
         return verdict
+
+    async def _block_completion_check() -> GoalVerdict:
+        assert block_completion_judge is not None and tool_trail is not None
+        # A secret typed before this block does not skip it: every block after a sign-in would then be refused.
+        return await _judge_goal(
+            block_completion_judge,
+            secret_entered=tool_trail.secret_entered_in_loop,
+            failure_log="taskv3 block completion judge failed",
+        )
 
     async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
         # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
@@ -543,10 +555,9 @@ async def run_task_v3_agent_loop(
         completion_blocker=completion_blocker,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
-        goal_check=_goal_check if goal_check_on else None,
-        goal_check_enforce=goal_check_enforce,
         unlisted_reask=_unlisted_reask if reask_on else None,
         document_identity=None if page_free else document_identity,
+        completion_gate=None if page_free else completion_gate,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -567,6 +578,9 @@ async def run_task_v3_agent_loop(
         system_prompt += OPAQUE_URL_GUIDANCE
     age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
     age_default_text, age_default_reason = age_default or (None, None)
+    application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
+    application_defaults_text, application_defaults_reason = application_defaults or (None, None)
+    defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -574,7 +588,7 @@ async def run_task_v3_agent_loop(
         # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
         # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
         # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
-        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{age_default_text or ''}"
+        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{defaults_text}"
         budget = (
             (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
             - count_tokens(system_prompt)
@@ -585,8 +599,8 @@ async def run_task_v3_agent_loop(
         prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
     user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
-    if age_default_text:
-        user_prompt += f"\n\n{age_default_text}"
+    if defaults_text:
+        user_prompt += f"\n\n{defaults_text}"
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
@@ -604,6 +618,8 @@ async def run_task_v3_agent_loop(
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,
             max_tokens=max_tokens,
+            prefix_ref_tokens=PREFIX_REF_TOKENS,
+            max_raw_tokens=MAX_RAW_TOKENS,
             deadline_seconds=deadline_seconds,
             retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
             max_call_retries=DEFAULT_MAX_CALL_RETRIES,
@@ -615,7 +631,9 @@ async def run_task_v3_agent_loop(
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
             initial_navigation_url=initial_navigation_url,
+            initial_navigation_requested_url=initial_navigation_requested_url,
             caller_known_urls=caller_known_urls,
+            task_target_urls=task_target_urls,
             label_secret_values=label_secret_values,
             login_identifier_tokens=login_identifier_tokens,
             page_probe=None if page_free else page_probe,
@@ -627,6 +645,8 @@ async def run_task_v3_agent_loop(
             refuse_input_entry=refuse_input_entry,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
+            target_action_reserve=target_action_reserve,
+            block_completion_check=_block_completion_check if block_check_on else None,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -650,23 +670,6 @@ async def run_task_v3_agent_loop(
             if not _cancelled:
                 # The guard bounds itself by `_deadline_remaining`; no second computation here.
                 await blank_page_guard.ensure_live()
-    if goal_check_on:
-        gate_verdicts = [v for v in goal_verdicts if not v.recheck]
-        last = gate_verdicts[-1] if gate_verdicts else None
-        held = sum(1 for v in gate_verdicts if v.action == "hold" and not v.no_headroom)
-        outcome.goal_check = {
-            "mode": "enforce" if goal_check_enforce else "shadow",
-            "checks": len(gate_verdicts),
-            "judged": sum(1 for v in gate_verdicts if v.skipped_reason is None),
-            "rechecks": len(goal_verdicts) - len(gate_verdicts),
-            "holds": held if goal_check_enforce else 0,
-            "would_holds": 0 if goal_check_enforce else held,
-            "would_fails": sum(1 for v in gate_verdicts if v.would_fail),
-            "no_headroom": sum(1 for v in gate_verdicts if v.no_headroom),
-            "last_verdict": last.verdict if last else None,
-            "last_action": last.action if last else None,
-            "last_skipped_reason": last.skipped_reason if last else None,
-        }
     if reask_on:
         # Present on every eligible block, so exposure is the share of loops carrying it, asked or not.
         last_reask = reasks[-1] if reasks else None
@@ -696,8 +699,6 @@ async def run_task_v3_agent_loop(
         tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
-        tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,
-        tool_choice_in_effect=outcome.tool_choice_in_effect,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
         # State at the run's first failed/terminated finish that got past the failure-evidence gate, next to the
@@ -709,6 +710,8 @@ async def run_task_v3_agent_loop(
         has_navigation_goal=has_navigation_goal,
         age_default_rendered=bool(age_default_text),
         age_default_reason=age_default_reason,
+        application_defaults_rendered=bool(application_defaults_text),
+        application_defaults_reason=application_defaults_reason,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

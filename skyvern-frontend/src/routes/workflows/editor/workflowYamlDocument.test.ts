@@ -2086,8 +2086,8 @@ describe("YAML persistence callbacks", () => {
       let resolveSave!: () => void;
       put.mockImplementation(
         () =>
-          new Promise<void>((resolve) => {
-            resolveSave = resolve;
+          new Promise((resolve) => {
+            resolveSave = () => resolve({ data: workflow });
           }),
       );
       const revision = useWorkflowYamlEditorStore.getState().revision;

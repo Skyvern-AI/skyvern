@@ -17,7 +17,6 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
-        pending_taint_sources={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -45,7 +44,6 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
-        pending_taint_sources={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -287,13 +285,3 @@ async def test_publish_file_contract_is_advertised_only_when_test_runs_reach_the
     assert (contract is None) is inline_opt_in
     if contract is not None:
         assert contract["call"].startswith("await publish_file(")
-
-
-def test_code_only_evaluate_guidance_supports_grounded_download_authoring() -> None:
-    from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_overlay_description
-
-    description = _evaluate_overlay_description(BlockAuthoringPolicy.CODE_ONLY_BROWSER)
-
-    assert "rather than authoring the download yourself" not in description
-    assert "capture a stable selector" in description
-    assert "author the terminal download step from the code-block schema contract" in description

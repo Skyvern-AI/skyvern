@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import re
 from collections.abc import Callable
 from functools import lru_cache
 from types import SimpleNamespace
@@ -8,9 +10,15 @@ from typing import Any
 
 import pytest
 
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_tool_usage_guide
+from skyvern.forge.sdk.copilot.code_block_security import (
+    CodeBlockSecurityInput,
+    author_time_code_security_errors,
+    runtime_code_security_errors,
+)
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -197,12 +205,15 @@ def test_rendered_prompt_keeps_security_ask_telemetry_and_workflow_wide_edit_sco
     assert "AUTHORING POLICY" not in new_workflow_prompt
 
 
-def test_verbatim_synthesized_code_is_scoped_to_the_code_block_schema() -> None:
-    guidance = "\n".join(_code_only_browser_schema_guidance())
+def test_every_page_member_the_code_block_guidance_forbids_is_refused_by_both_security_checks() -> None:
+    rule = next(entry for entry in _code_only_browser_schema_guidance() if "must not use" in entry)
+    forbidden = re.findall(r"page\.\w+", rule)
 
-    assert "SYNTHESIZED CODE BLOCK" in guidance
-    assert "must not use page.evaluate" in guidance
-    assert "SYNTHESIZED CODE BLOCK" not in _render_production_prompt()
+    assert forbidden
+    for member in forbidden:
+        code = f"value = {member}"
+        assert author_time_code_security_errors(label="read", code=code), member
+        assert runtime_code_security_errors([CodeBlockSecurityInput(label="read", code=code)]), member
 
 
 def test_ask_carve_out_gates_money_and_destruction_and_never_a_site_sent_message() -> None:
@@ -214,3 +225,16 @@ def test_ask_carve_out_gates_money_and_destruction_and_never_a_site_sent_message
     # A page click that makes the site email its own account holder is not the workflow
     # sending anything, and no permission clause may read it as one.
     assert "message or email" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_block_type_list_drops_the_mcp_servers_hint() -> None:
+    listed = await skyvern_block_schema()
+    assert "hint" in listed["data"]
+
+    # The server returns its module-level catalog and the hook edits what it is given in place.
+    payload = copy.deepcopy(listed["data"])
+    rendered = await _get_block_schema_post_hook({"ok": True, "data": payload}, {}, _code_only_ctx())
+
+    assert rendered["data"]["block_types"]
+    assert "hint" not in rendered["data"]

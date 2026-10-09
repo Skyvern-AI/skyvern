@@ -6,7 +6,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, nullcontext
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlparse, urlsplit
 
@@ -77,9 +77,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     live_working_page,
     raw_secret_browser_denied,
     resolve_browser_state_for_context,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -541,8 +538,6 @@ async def _capture_post_interaction_screenshot(
     """
     if ctx.codeblock_redaction_parameters:
         return False
-    if sensitive_origin_page_is_tainted(ctx):
-        return False
     if not ctx.supports_vision:
         return False
     if frame is None:
@@ -569,10 +564,8 @@ async def _capture_post_interaction_screenshot(
 
 
 async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> ViewportFrame | None:
-    """Read the viewport without staging it; withheld during self-heal or on a sensitive-origin page."""
+    """Read the viewport without staging it; withheld during self-heal."""
     if ctx.codeblock_redaction_parameters:
-        return None
-    if sensitive_origin_page_is_tainted(ctx):
         return None
     server = ctx.discovery_mcp_server
     if server is None:
@@ -590,7 +583,7 @@ async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> 
     if not isinstance(result, dict) or not result.get("ok"):
         return None
     png = consume_screenshot_artifact(result)
-    if png is None or sensitive_origin_page_is_tainted(ctx):
+    if png is None:
         return None
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
         result, dispatch_url=None, dispatch_browser_session_id=dispatch_session_id
@@ -1258,9 +1251,6 @@ async def _register_scout_interaction_observation(
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    origin_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
-        return None, None
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
@@ -1297,10 +1287,6 @@ async def _register_scout_interaction_observation(
             observed_after_interaction=True,
             prior_page_evidence=prior_page_evidence,
         )
-        if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
-            ctx.last_scout_act_observe_outcome = None
-            ctx.last_scout_act_observe_packet = None
-            return None, None
         if parsed is not None:
             scrubbed_parsed = scrub_secrets_from_structure(ctx, parsed)
             parsed = scrubbed_parsed if isinstance(scrubbed_parsed, dict) else None
@@ -2273,13 +2259,7 @@ class PageState(TypedDict):
 
 
 def unread_page_state(ctx: AgentContext) -> PageState:
-    if _page_location_withheld(ctx):
-        return {"read": "failed", "challenge_vendor": None}
     return {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
-
-
-def _page_location_withheld(ctx: AgentContext) -> bool:
-    return sensitive_origin_page_is_tainted(ctx) or sensitive_origin_page_has_active_run(ctx)
 
 
 _PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
@@ -2292,7 +2272,6 @@ def page_state_probe_allowed(
         (binding is not None and binding.unavailable_reason)
         or raw_secret_browser_denied(ctx)
         or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
-        or sensitive_origin_page_has_active_run(ctx)
     )
 
 
@@ -2304,7 +2283,7 @@ async def read_page_state(
     binding: BrowserSessionBinding | None,
     probe: bool = True,
     settle: bool = False,
-    custody_lock: asyncio.Lock | None = None,
+    custody_lock: AbstractAsyncContextManager[None] | None = None,
 ) -> PageState:
     """What the call's browser shows now, scrubbed for the model, or the unread state without touching a browser
     the call may not probe. A vendor frame that could not be measured makes the read fail rather than report no
@@ -2326,8 +2305,6 @@ async def read_page_state(
     else:
         if isinstance(reading, str):
             failure = reading
-        elif _page_location_withheld(ctx):
-            return {"read": "ok", "challenge_vendor": reading.vendor}
         else:
             url = screened_recorded_url(reading.url)[0]
             state: PageState = {

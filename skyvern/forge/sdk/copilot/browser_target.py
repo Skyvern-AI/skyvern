@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.utils.strings import join_phrases
 
 BROWSER_TARGET_PARAM_NAME = "target"
 
@@ -26,12 +27,10 @@ BROWSER_TARGET_PARAM: dict[str, Any] = {
     "type": "string",
     "enum": [target.value for target in BrowserTarget],
     "description": (
-        "Which browser to act in. 'debug' (default) is the scouting browser this chat drives. "
-        "'last_run' is the browser the most recent test run executed in, which is a different "
-        "browser whenever that run minted its own session — it is the only way to observe the page "
-        "a run actually failed on. Acting rather than observing in 'last_run' changes that page: it "
-        "can lose the state you are diagnosing, and any submit, purchase, or message it triggers is "
-        "real. A run's recorded outcome is never changed by what you do afterwards."
+        "Which browser to act in. 'debug' (default) is the one this chat drives. 'last_run' is the one "
+        "the most recent test run used, a separate browser when that run started its own, and the only "
+        "way to observe the page that run failed on. Acting in 'last_run' changes that page, and any "
+        "submit there is real."
     ),
 }
 
@@ -97,7 +96,10 @@ def resolve_browser_session_binding(copilot_ctx: AgentContext, arguments: dict[s
             session_id_override=None,
             workflow_run_id=None,
             source_matches_target=False,
-            unavailable_reason=f"Unknown browser target {requested!r}. Name 'debug' or 'last_run'.",
+            unavailable_reason=(
+                f"Unknown browser target {requested!r}. "
+                f"Name {join_phrases([repr(target.value) for target in BrowserTarget], 'or')}."
+            ),
         )
     if target is BrowserTarget.DEBUG:
         return BrowserSessionBinding(

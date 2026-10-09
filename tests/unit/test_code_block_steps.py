@@ -1,3 +1,4 @@
+import math
 import textwrap
 import time
 import timeit
@@ -513,9 +514,17 @@ def test_goto_address_that_is_not_a_plain_http_address_names_the_variable(addres
 
 
 def _derive_seconds(code: str) -> float:
-    # Thread CPU time, not wall time: a busy neighbour thread stalls a long run at every GIL switch while a
-    # run shorter than the switch interval escapes it, which doubles the ratio. timeit pauses the garbage collector.
-    return min(timeit.repeat(lambda: derive_code_block_steps(code), number=1, repeat=3, timer=time.thread_time))
+    # Thread CPU time, so a busy neighbour thread cannot stall one run; timeit pauses the garbage collector.
+    return timeit.timeit(lambda: derive_code_block_steps(code), number=1, timer=time.thread_time)
+
+
+def _derive_growth(small: str, large: str) -> float:
+    # A busy core still slows CPU time, so the runs alternate and the best of each is compared.
+    small_best = large_best = math.inf
+    for _ in range(5):
+        small_best = min(small_best, _derive_seconds(small))
+        large_best = min(large_best, _derive_seconds(large))
+    return large_best / small_best
 
 
 def test_many_gotos_on_variables_derive_in_linear_time():
@@ -523,8 +532,8 @@ def test_many_gotos_on_variables_derive_in_linear_time():
         return "".join(f"url_{i} = 'https://example.com/{i}'\nawait page.goto(url_{i})\n" for i in range(count))
 
     assert derive_code_block_steps(gotos(2000))[-1]["description"] == "Open https://example.com/1999"
-    # Quadratic growth makes 4x the gotos take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(gotos(2000)) < 8 * _derive_seconds(gotos(500))
+    # Quadratic growth makes 8x the gotos take ~64x as long; linear stays near 8x.
+    assert _derive_growth(gotos(250), gotos(2000)) < 24
 
 
 def test_unclosed_template_openers_derive_in_linear_time():
@@ -532,8 +541,8 @@ def test_unclosed_template_openers_derive_in_linear_time():
         return "await page.goto('https://example.com/a')\n" + "x = 1  # {# note {% here\n" * count
 
     assert derive_code_block_steps(commented(2000))[0]["description"] == "Open https://example.com/a"
-    # Quadratic growth makes 4x the lines take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(commented(2000)) < 8 * _derive_seconds(commented(500))
+    # Quadratic growth makes 8x the lines take ~64x as long; linear stays near 8x.
+    assert _derive_growth(commented(250), commented(2000)) < 24
 
 
 def test_reads_chained_in_one_expression_derive_in_linear_time():
@@ -542,8 +551,8 @@ def test_reads_chained_in_one_expression_derive_in_linear_time():
 
     # Python 3.11's parser rejects much longer chains, which would return [] and pass vacuously.
     assert derive_code_block_steps(chained(2000))[0]["description"] == "Extract total"
-    # Quadratic growth makes 4x the reads take ~16x as long; linear stays near 4x.
-    assert _derive_seconds(chained(2000)) < 8 * _derive_seconds(chained(500))
+    # Quadratic growth makes 8x the reads take ~64x as long; linear stays near 8x.
+    assert _derive_growth(chained(250), chained(2000)) < 24
 
 
 def test_code_too_deep_for_the_parser_derives_no_steps():

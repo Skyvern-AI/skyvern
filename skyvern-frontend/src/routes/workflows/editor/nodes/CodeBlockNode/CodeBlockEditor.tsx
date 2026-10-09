@@ -118,6 +118,9 @@ function CodeBlockEditorBody({
 
   const requestBuild = useCopilotActionStore((state) => state.requestBuild);
   const requestCancel = useCopilotActionStore((state) => state.requestCancel);
+  const stopBlockedReason = useCopilotActionStore(
+    (state) => state.stopBlockedReason,
+  );
   const generatingBlockLabel = useCopilotActionStore(
     (state) => state.generatingBlockLabel,
   );
@@ -619,6 +622,7 @@ function CodeBlockEditorBody({
               steps={steps}
               generating={isGenerating}
               onStop={requestCancel}
+              stopBlockedReason={stopBlockedReason}
             />
           </div>
           {errorCodeMappingField}

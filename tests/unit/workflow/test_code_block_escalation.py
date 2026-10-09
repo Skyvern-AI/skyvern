@@ -31,7 +31,10 @@ from skyvern.forge.sdk.copilot.nav_attribution import (
     proxy_owns_nav_codes,
     target_owns_nav_codes,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    GENERATED_FILE_ARTIFACT_IDS_KEY,
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
@@ -39,6 +42,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
+    _OPERATION_ATTRIBUTION_ALLOWLIST,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -2418,6 +2422,45 @@ async def test_completed_heal_records_extracted_information(
     assert "empty object" not in goal
 
 
+@pytest.mark.asyncio
+async def test_completed_heal_drops_the_published_file_key_from_extracted_information(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    """The fallback's answer is not the secure worker's, so it cannot carry the worker's published-file list."""
+    ai_fallback_flag("o_test")
+    record = AsyncMock(return_value=None)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record)
+    state = _install_db_fakes(
+        monkeypatch,
+        final_status=TaskStatus.completed,
+        extracted_information={"order_total": "42.50", GENERATED_FILE_ARTIFACT_IDS_KEY: ["a_site"]},
+    )
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="read the order total", line_start=1, line_end=1)],
+        prompt="Read the order total",
+        data_schema={
+            "type": "object",
+            "properties": {
+                "order_total": {"type": "string"},
+                GENERATED_FILE_ARTIFACT_IDS_KEY: {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    )
+    exc = RuntimeError("rotted selector")
+
+    result = await _heal(block, _make_context(), exc, _recording_page(exc))
+
+    assert result is not None and result.success is True
+    code_row_outputs = [
+        update["output"]
+        for update in state["workflow_run_block_updates"]
+        if update["workflow_run_block_id"] == "wrb_test"
+    ]
+    assert code_row_outputs == [{"order_total": "42.50"}]
+    assert result.output_parameter_value == {"order_total": "42.50"}
+    assert record.await_args.args[2] == {"order_total": "42.50"}
+
+
 @pytest.mark.parametrize("extracted", [{"total": "1"}, "oops", 3])
 @pytest.mark.asyncio
 async def test_a_non_list_answer_to_an_array_schema_fails_the_block(
@@ -3939,6 +3982,74 @@ async def test_secure_heal_declined_writes_failed_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("error_code", "receiver_url", "worker_saw_sign_in_form", "expected"),
+    [
+        pytest.param("user_code_error", None, None, True, id="block_page_checked_here"),
+        pytest.param("user_code_error", None, False, False, id="worker_answer_wins"),
+        pytest.param(
+            "user_code_error", "https://example.com/detail", True, True, id="opened_tab_checked_by_the_worker"
+        ),
+        pytest.param("user_code_error", "https://example.com/detail", None, False, id="opened_tab_already_closed"),
+        # The runner's own budget timeout names no operation, so the tab the code waited on is unknown.
+        pytest.param("timeout", None, None, False, id="timeout_tab_unknown"),
+    ],
+)
+async def test_secure_failure_records_a_sign_in_form_only_on_the_page_it_failed_on(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    error_code: str,
+    receiver_url: str | None,
+    worker_saw_sign_in_form: bool | None,
+    expected: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    fake_page = MagicMock()
+    fake_page.evaluate = AsyncMock(return_value=True)
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=_make_context(), fake_browser_state=fake_browser_state, use_codeblock_runner=True
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code=error_code,
+                    safe_message=None,
+                    failure_reason="CodeBlock failed while running user code.",
+                    exception_class="playwright._impl._errors.TimeoutError",
+                    failing_line=2,
+                    healability_hint=True,
+                    receiver_url=receiver_url,
+                    sign_in_form_visible=worker_saw_sign_in_form,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    assert result.sign_in_form_visible is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("runner_code", "recorder_code", "healability_hint", "expected_episodes"),
     [
         pytest.param(
@@ -4040,6 +4151,91 @@ async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
     assert [(episode["status"], episode["skip_reason"]) for episode in state["heal_episodes"]] == expected_episodes
     if expected_episodes == [(HealStatus.skipped, HealSkipReason.proxy_transport)]:
         assert result.error_codes == ["browser_operation_failed", "net::ERR_TUNNEL_CONNECTION_FAILED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probe_status", "native_exception_class", "match_count", "emit_raises", "expected"),
+    [
+        pytest.param("counted", "TimeoutError", 2, False, ("TimeoutError", 2), id="emits_secure_envelope"),
+        pytest.param("counted", None, 2, False, (None, 2), id="missing_native_class_is_not_the_wrapper"),
+        pytest.param("counted", "Error: " + "x" * 200, -1, False, (None, None), id="out_of_shape_values_dropped"),
+        pytest.param("not-a-probe-status", "TimeoutError", 2, False, None, id="unknown_status_dropped"),
+        pytest.param("counted", "TimeoutError", 2, True, None, id="emit_failure_is_fail_open"),
+    ],
+)
+async def test_secure_failure_emits_operation_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+    probe_status: str,
+    native_exception_class: str | None,
+    match_count: int,
+    emit_raises: bool,
+    expected: tuple[str | None, int | None] | None,
+) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block()
+    context = _make_context()
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=True,
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="browser_operation_failed",
+                    safe_message=None,
+                    failure_reason='Locator.click: Timeout 30000ms exceeded waiting for locator("#SENTINEL")',
+                    exception_class="codeblock.page_operation_broker.BrowserOperationError",
+                    failing_line=1,
+                    healability_hint=False,
+                    locator_match_count=match_count,
+                    locator_probe_status=probe_status,
+                    native_exception_class=native_exception_class,
+                ),
+            )
+        ),
+    )
+    FakeRecorder.reset()
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    if emit_raises:
+
+        def _raise_emit(self: CodeBlock, **_kwargs: Any) -> None:
+            raise RuntimeError("attribution emit must never surface")
+
+        monkeypatch.setattr(CodeBlock, "_emit_operation_attribution_failure", _raise_emit)
+
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert result.success is False
+    assert "browser_operation_failed" in (result.error_codes or [])
+    events = [entry for entry in logs if entry.get("event") == "codeblock.locator_probe"]
+    if expected is None:
+        assert events == []
+        return
+    assert len(events) == 1
+    envelope = events[0]["operation_attribution"]
+    assert set(envelope) == set(_OPERATION_ATTRIBUTION_ALLOWLIST)
+    assert envelope["engine"] == "secure"
+    assert (envelope["exception_class"], envelope["probe_match_count"]) == expected
+    assert envelope["probe_status"] == "counted"
+    assert "SENTINEL" not in json.dumps(envelope)
 
 
 @pytest.mark.asyncio

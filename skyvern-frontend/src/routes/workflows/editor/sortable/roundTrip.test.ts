@@ -111,6 +111,62 @@ describe("send email SMTP round trip", () => {
   });
 });
 
+describe("send email Gmail round trip", () => {
+  test("the editor and the definition save the same Gmail fields and keep a template with commas as one entry", () => {
+    const placeholder = (name: string): AWSSecretParameter => ({
+      parameter_type: "aws_secret",
+      key: `gmail-unused-${name}`,
+      description: null,
+      aws_key: "UNUSED_CUSTOM_SMTP_PLACEHOLDER",
+      aws_secret_parameter_id: `placeholder_${name}`,
+      workflow_id: "",
+      created_at: "2026-04-20T00:00:00Z",
+      modified_at: "2026-04-20T00:00:00Z",
+      deleted_at: null,
+    });
+    const entries = [
+      "{{ addresses | join(',') }}",
+      "{% for address in [primary, backup] %}{{ address }};{% endfor %}",
+      "second@example.com",
+    ];
+    const gmailFields = {
+      block_type: "send_email" as const,
+      transport: "gmail" as const,
+      credential_id: "goac_send",
+      sender: "",
+      recipients: entries,
+      cc: entries,
+      bcc: ["bcc@example.com"],
+      subject: "Report {{ current_value }}",
+      body: "<p>Done</p>",
+      body_format: "html" as const,
+      file_attachments: ["{{ reports | join(',') }}"],
+    };
+    const block: SendEmailBlock = {
+      ...gmailFields,
+      label: "send_email",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("send_email"),
+      smtp_host: placeholder("smtp_host"),
+      smtp_port: placeholder("smtp_port"),
+      smtp_username: placeholder("smtp_username"),
+      smtp_password: placeholder("smtp_password"),
+    };
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const [savedFromEditor] = getWorkflowBlocks(nodes, edges);
+    const [savedFromDefinition] = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [block] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+
+    for (const saved of [savedFromEditor, savedFromDefinition]) {
+      expect(saved).toMatchObject(gmailFields);
+    }
+  });
+});
+
 /**
  * M1 round-trip regression: mirrors the full reorder → save → reload path
  * that ships in FlowRenderer. The goal is to catch regressions anywhere

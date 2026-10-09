@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -152,7 +152,9 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.date_values import canonical_iso_date as _canonical_iso_date
 from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
@@ -162,7 +164,8 @@ from skyvern.utils.prompt_engine import (
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds, validate_fetch_url
-from skyvern.webeye.actions import actions, handler_utils
+from skyvern.webeye.actions import action_phase, actions, handler_utils
+from skyvern.webeye.actions.action_phase import ActionPhase
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -270,9 +273,6 @@ from skyvern.webeye.utils.page import (
     take_element_screenshot,
     teardown_blob_url_retention,
 )
-
-if TYPE_CHECKING:
-    from skyvern.forge.agent_functions import DownloadRecoveryHook
 
 LOG = structlog.get_logger()
 _DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
@@ -400,10 +400,6 @@ class CustomSelectFamilyOutcome(StrEnum):
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
-# Fire the one-shot download-recovery retry this many seconds before the no-signal grace expires, so a
-# slow-but-real download has the whole grace to arrive on its own before we spend the single retry.
-# Clamped to the grace, so a short grace still fires the retry inside the existing wait.
-DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS = 15.0
 LARGE_DOWNLOAD_LOG_THRESHOLD_BYTES = 100 * 1024 * 1024
 # Synchronous FileDownloadBlock false-click start-signal detection window: how long to wait for a first local
 # download signal (a new .crdownload/final file) before giving up, so a legitimate non-download popup is not
@@ -417,6 +413,10 @@ PROVIDER_DOWNLOAD_BASELINE_TIMEOUT_SECONDS = 10.0
 # on timeout the save_as + fan-out fallback still gets its chance.
 EAGER_BLOB_READ_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
+# Pass bound on the dropdown option-loading scroll loop for deployments that raise OPTION_LOADING_TIMEOUT_MS;
+# every pass waits at least 1s, so at the default timeout the clock binds first.
+MAX_OPTION_LOADING_SCROLL_ITERATIONS = 100
+RUN_STOPPED_BEFORE_SELECTING_REASON = "the run stopped before a dropdown option was selected"
 SELECT_SHADOW_MATCH_APOSTROPHE_RE = re.compile(r"['`‘’]")
 SELECT_SHADOW_MATCH_WORD_RE = re.compile(r"\w+")
 
@@ -1242,7 +1242,9 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
         # Name the file by the block-configured download_suffix so the watcher syncs the
         # request-based name instead of the site's suggested name.
         existing = {p.name for p in download_dir.iterdir()} if download_dir.exists() else set()
-        target_name = download_filename_from_suffix(download_suffix, suffix, existing)
+        target_name = download_filename_from_suffix(download_suffix, suffix, existing, original_filename=filename)
+        if context:
+            context.download_suffix_applied_files[target_name] = (filename, download_suffix)
         LOG.info(
             "download_suffix_target_named",
             context_task_id=context.task_id if context else None,
@@ -3414,61 +3416,6 @@ def _exact_value_input_type(input_type: str | None) -> str:
     return (input_type or "").strip().lower()
 
 
-_DATE_VALUE_SEPARATORS = re.compile(r"[^0-9]+")
-_DATE_MASK_SEPARATORS = re.compile(r"[^a-z]+")
-
-
-def _strict_date_mask_order(placeholder: str | None) -> tuple[str, ...] | None:
-    # The day/month/year order a strict placeholder mask declares ("mm/dd/yyyy" -> ("m","d","y")), or None
-    # when it is not a fully-specified mask: each separator-delimited token must be a pure run of one date
-    # letter (d/dd, m/mm, yyyy), so prose, first-letter lookalikes, and partial years never define an order.
-    if not placeholder:
-        return None
-    tokens = [token for token in _DATE_MASK_SEPARATORS.split(placeholder.strip().lower()) if token]
-    if len(tokens) != 3:
-        return None
-    order: list[str] = []
-    for token in tokens:
-        if re.fullmatch(r"d{1,2}", token):
-            order.append("d")
-        elif re.fullmatch(r"m{1,2}", token):
-            order.append("m")
-        elif re.fullmatch(r"y{4}", token):
-            order.append("y")
-        else:
-            return None
-    if sorted(order) != ["d", "m", "y"]:
-        return None
-    return tuple(order)
-
-
-def _canonical_iso_date(text: str, placeholder: str | None) -> str | None:
-    # ``text`` as the YYYY-MM-DD an <input type=date> accepts, or None when it is not a date or the order
-    # cannot be trusted. Order comes from the field's own strict mask; without a mask only an unambiguous
-    # reading (four-digit year first, or a component above 12 pinning the day) is taken, and datetime()
-    # rejects impossible calendar dates -- so an ambiguous value is refused, never written as a wrong date.
-    parts = [part for part in _DATE_VALUE_SEPARATORS.split(text.strip()) if part]
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        return None
-    order = _strict_date_mask_order(placeholder)
-    if order is None:
-        if len(parts[0]) == 4:
-            order = ("y", "m", "d")
-        elif len(parts[2]) == 4 and int(parts[0]) > 12:
-            order = ("d", "m", "y")
-        elif len(parts[2]) == 4 and int(parts[1]) > 12:
-            order = ("m", "d", "y")
-        else:
-            return None
-    fields = dict(zip(order, parts))
-    if len(fields) != 3 or len(fields["y"]) != 4:
-        return None
-    try:
-        return datetime(int(fields["y"]), int(fields["m"]), int(fields["d"])).strftime("%Y-%m-%d")
-    except ValueError:
-        return None
-
-
 def _is_malformed_value_error(exc: BaseException) -> bool:
     # locator.fill() raises "Malformed value" when the live node is a structured input (a date input takes
     # only YYYY-MM-DD) and the value is not canonical; it validates before committing, so the field is left
@@ -3591,6 +3538,7 @@ async def _fill_secret_with_readback(
     maxlength: str | None,
     engine_selection: BrowserEngineSelection | None = None,
     sequential_first: bool = False,
+    readback_ignores_grouping: bool = False,
 ) -> ActionFailure | None:
     # A credential entered across the fill/type seam can race a hardened field's caret restore and rotate the
     # value, or be dropped by a controlled field and truncate it, submitting a wrong/empty credential with no
@@ -3650,13 +3598,18 @@ async def _fill_secret_with_readback(
                 return None, True
             raise
 
+    def _comparable(value: str | None) -> str | None:
+        # A field can group a code for display ("123 456"); it still holds the intended characters in order. Only
+        # grouping separators are dropped, so a reordered, truncated or otherwise altered value still mismatches.
+        return _SECRET_MASK_SEPARATORS.sub("", value) if readback_ignores_grouping and value is not None else value
+
     actual_value, navigated = await _read_back()
     if navigated:
         LOG.info("Credential field navigated after fill; treating as submitted", element_id=skyvern_element.get_id())
         return None
     # Exact equality first: a value that round-trips exactly is confirmed, even one made only of mask-like
     # characters -- so an all-"*" secret is a match, never misclassified as an unreadable mask.
-    if not _secret_readback_is_mismatch(readback_expected, actual_value):
+    if not _secret_readback_is_mismatch(readback_expected, _comparable(actual_value)):
         return None
 
     if _secret_readback_is_unreadable_mask(actual_value, is_password=is_password):
@@ -3686,7 +3639,7 @@ async def _fill_secret_with_readback(
             element_id=skyvern_element.get_id(),
         )
         return None
-    if _secret_readback_matches(readback_expected, actual_value):
+    if _secret_readback_matches(readback_expected, _comparable(actual_value)):
         return None
 
     LOG.warning(
@@ -4369,8 +4322,6 @@ class ScopedXhrDownloadCapture:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._page = page
-        self.recovery_hook: "DownloadRecoveryHook | None" = None
-        self.recovery_requested = False
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
         self._monotonic = monotonic
@@ -4517,15 +4468,6 @@ class ScopedXhrDownloadCapture:
         self._accept_new_requests = False
         self._status_observation_deadline = self._monotonic() + _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS
 
-    def resume_in_flight_requests(self) -> None:
-        self._accept_new_requests = True
-        # Reopen the status-observation window for the one resumed retry so its own request (and the
-        # retry's exact 500/200-class response) is observable again. The window was sealed after the
-        # original action; without this the late retry's requests would start past the deadline and be
-        # dropped. The window is re-sealed by the caller's seal_in_flight_requests() after the retry
-        # click, still bounded by the original download-wait hard deadline.
-        self._status_observation_deadline = None
-
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
 
@@ -4571,8 +4513,6 @@ class ScopedXhrDownloadCapture:
             if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
                 return
             self._observed_download_failure_status = status
-            if self.recovery_hook is not None and self.recovery_hook.matches_failure(response):
-                self.recovery_requested = True
         except Exception:
             return
 
@@ -4713,6 +4653,22 @@ class ScopedXhrDownloadCapture:
 # Terminate and complete are how a task ends, so a navigation failure before one of them is the
 # failure the task reports rather than something it moved past.
 _TASK_ENDING_ACTION_TYPES = frozenset({ActionType.TERMINATE, ActionType.COMPLETE})
+
+
+def _action_phase_run_ids(task: Task) -> tuple[str, ...]:
+    """The immediate run first (the phase-store key), then the identities its activity may tear down under.
+
+    Read defensively: phase tracking is telemetry and must never fail an action on a partial task object.
+    """
+    context = skyvern_context.current()
+    candidates = (
+        context.workflow_run_id if context else None,
+        getattr(task, "workflow_run_id", None),
+        context.task_v2_id if context else None,
+        getattr(task, "task_id", None),
+        context.root_workflow_run_id if context else None,
+    )
+    return tuple(dict.fromkeys(c for c in candidates if isinstance(c, str) and c))
 
 
 class ActionHandler:
@@ -5375,12 +5331,6 @@ class ActionHandler:
         staging_dir = Path(
             tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
         )
-        try:
-            recovery_hook = app.AGENT_FUNCTION.build_download_recovery(
-                action=action, scraped_page=scraped_page, page=page
-            )
-        except Exception:
-            recovery_hook = None
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
@@ -5388,7 +5338,6 @@ class ActionHandler:
             if task.download_timeout is not None
             else BROWSER_DOWNLOAD_TIMEOUT,
         )
-        xhr_capture.recovery_hook = recovery_hook
         download_triggered = False
         working_page_recovery_attempted = False
         working_page_replaced_after_close = False
@@ -5470,10 +5419,6 @@ class ActionHandler:
                 download_wait_hard_timeout_seconds = no_signal_grace_seconds + DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS
             download_wait_started_at = time.monotonic()
             download_wait_deadline = download_wait_started_at + download_wait_hard_timeout_seconds
-            # Late-fire the one-shot recovery retry near the end of the no-signal grace (clamped to the
-            # grace so a short timeout still fires inside the existing wait), giving a slow real download
-            # the whole grace to land on its own before the single retry is spent.
-            recovery_fire_after_seconds = max(0.0, no_signal_grace_seconds - DOWNLOAD_RECOVERY_LATE_FIRE_LEAD_SECONDS)
 
             def _remaining_download_wait_seconds() -> float:
                 return max(0.0, download_wait_deadline - time.monotonic())
@@ -5689,106 +5634,6 @@ class ActionHandler:
                                 )
                                 download_event_fallback_failed = True
                                 break
-                            recovery_elapsed_seconds = time.monotonic() - download_wait_started_at
-                            if (
-                                recovery_hook is not None
-                                and xhr_capture.recovery_requested
-                                and recovery_elapsed_seconds >= recovery_fire_after_seconds
-                            ):
-                                # Consume the one-shot only now that a real attempt is about to begin: an
-                                # earlier poll where the fire time had not arrived leaves the still-eligible
-                                # hook untouched. Every branch below emits exactly one structured
-                                # "Download recovery click" receipt with a bounded sub-outcome.
-                                hook, recovery_hook = recovery_hook, None
-                                if download_event.done():
-                                    LOG.info(
-                                        "Download recovery click",
-                                        attempt=1,
-                                        result="not_attempted",
-                                        reason="event_done",
-                                        elapsed_seconds=recovery_elapsed_seconds,
-                                    )
-                                elif any(staging_dir.iterdir()):
-                                    LOG.info(
-                                        "Download recovery click",
-                                        attempt=1,
-                                        result="not_attempted",
-                                        reason="staging_nonempty",
-                                        elapsed_seconds=recovery_elapsed_seconds,
-                                    )
-                                elif _remaining_download_wait_seconds() <= 0:
-                                    LOG.info(
-                                        "Download recovery click",
-                                        attempt=1,
-                                        result="not_attempted",
-                                        reason="budget_exhausted",
-                                        elapsed_seconds=recovery_elapsed_seconds,
-                                    )
-                                else:
-                                    phase = "remap"
-                                    try:
-                                        remap = await hook.remap(page)
-                                        if remap.locator is None:
-                                            LOG.info(
-                                                "Download recovery click",
-                                                attempt=1,
-                                                result="remap_none",
-                                                reason=remap.reason,
-                                                elapsed_seconds=recovery_elapsed_seconds,
-                                            )
-                                        else:
-                                            phase = "recheck"
-                                            files = await _list_download_signal_files()
-                                            if (
-                                                download_event.done()
-                                                or any(staging_dir.iterdir())
-                                                or (
-                                                    {_download_signal_identity(file) for file in files}
-                                                    - signal_file_identities_before
-                                                )
-                                            ):
-                                                LOG.info(
-                                                    "Download recovery click",
-                                                    attempt=1,
-                                                    result="stale_signal",
-                                                    resolution=remap.resolution,
-                                                    elapsed_seconds=recovery_elapsed_seconds,
-                                                )
-                                            elif _remaining_download_wait_seconds() <= 0:
-                                                LOG.info(
-                                                    "Download recovery click",
-                                                    attempt=1,
-                                                    result="no_budget_at_click",
-                                                    resolution=remap.resolution,
-                                                    elapsed_seconds=recovery_elapsed_seconds,
-                                                )
-                                            else:
-                                                phase = "click"
-                                                remaining = _remaining_download_wait_seconds()
-                                                xhr_capture.resume_in_flight_requests()
-                                                try:
-                                                    await remap.locator.click(timeout=remaining * 1000)
-                                                    LOG.info(
-                                                        "Download recovery click",
-                                                        attempt=1,
-                                                        result="clicked",
-                                                        resolution=remap.resolution,
-                                                        elapsed_seconds=recovery_elapsed_seconds,
-                                                    )
-                                                    await asyncio.sleep(0)
-                                                finally:
-                                                    xhr_capture.seal_in_flight_requests()
-                                                continue
-                                    except Exception as recovery_exc:
-                                        LOG.info(
-                                            "Download recovery click",
-                                            attempt=1,
-                                            result="failed",
-                                            phase=phase,
-                                            error_type=type(recovery_exc).__name__,
-                                            elapsed_seconds=recovery_elapsed_seconds,
-                                        )
-
                             elapsed_since_action = time.monotonic() - download_wait_started_at
                             if elapsed_since_action >= download_wait_hard_timeout_seconds:
                                 raise asyncio.TimeoutError
@@ -6164,6 +6009,12 @@ class ActionHandler:
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
         execution_timeout_seconds = _resolve_action_execution_timeout(action)
         execution_timeout_scope: asyncio.Timeout | None = None
+        phase_run_ids = _action_phase_run_ids(task)
+        phase_token = (
+            action_phase.begin_action(phase_run_ids[0], str(action.action_type), page, aliases=phase_run_ids[1:])
+            if phase_run_ids
+            else None
+        )
         try:
             async with asyncio.timeout(execution_timeout_seconds) as execution_timeout_scope:
                 if action.action_type in ActionHandler._handled_action_types:
@@ -6212,6 +6063,7 @@ class ActionHandler:
                     _browser_dispatch_committed.set(True)
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
+                        action_phase.mark_action_phase(ActionPhase.SETUP)
                         results = await setup(action, page, scraped_page, task, step)
                         actions_result.extend(results)
                         if results and results[-1] != ActionSuccess:
@@ -6223,12 +6075,14 @@ class ActionHandler:
 
                     # do the handler
                     handler = ActionHandler._handled_action_types[action.action_type]
+                    action_phase.mark_action_phase(ActionPhase.HANDLER)
                     results = await handler(action, page, scraped_page, task, step)
                     actions_result.extend(results)
                     await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                     # do the teardown
                     teardown = ActionHandler._teardown_action_types.get(action.action_type)
                     if teardown:
+                        action_phase.mark_action_phase(ActionPhase.TEARDOWN)
                         results = await teardown(action, page, scraped_page, task, step)
                         actions_result.extend(results)
 
@@ -6251,9 +6105,10 @@ class ActionHandler:
             )
             actions_result.append(ActionFailure(e))
         except MultipleElementsFound as e:
-            LOG.exception(
+            LOG.warning(
                 "Cannot handle multiple elements with the same selector in one action.",
                 action=action,
+                exc_info=True,
             )
             actions_result.append(ActionFailure(e))
         except LLMProviderError as e:
@@ -6293,6 +6148,15 @@ class ActionHandler:
                 exception_message=str(e),
             )
             actions_result.append(ActionFailure(e))
+        except InvalidElementForTextInput as e:
+            # The planner picked an element that cannot take text. The typed rejection is the failure
+            # reason the run records, so the traceback adds nothing.
+            LOG.warning(
+                "Text input target does not support text input",
+                action=action,
+                exception_message=str(e),
+            )
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             if is_driver_timeout_error(e):
                 LOG.warning("Browser timeout while handling action", action=action, exc_info=True)
@@ -6300,6 +6164,7 @@ class ActionHandler:
                 LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
+            action_phase.end_action(phase_token)
             tool_result_content = ""
             action.status = _terminal_action_status(actions_result)
 
@@ -7470,7 +7335,9 @@ async def handle_click_action(
 
         return [ActionSuccess()]
 
+    action_phase.mark_action_phase(ActionPhase.RESOLVE_ELEMENT)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    action_phase.mark_action_phase(ActionPhase.PRE_CLICK_CHECKS)
 
     # Wait after getting element to allow any dynamic changes
     await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
@@ -7558,6 +7425,7 @@ async def handle_click_action(
         remove_download_probe: Callable[[], None] | None = None
         try:
             engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+            action_phase.mark_action_phase(ActionPhase.FRAME_CREATE)
             skyvern_frame = await SkyvernFrame.create_instance(
                 skyvern_element.get_frame(), engine_selection=engine_selection
             )
@@ -7570,6 +7438,7 @@ async def handle_click_action(
                 remove_download_probe = _register_false_click_download_probe(page, false_click_download_observed)
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
+            action_phase.mark_action_phase(ActionPhase.CLICK)
             results = await chain_click(
                 task,
                 scraped_page,
@@ -7580,6 +7449,7 @@ async def handle_click_action(
                 incremental_scraped=incremental_scraped,
                 skyvern_frame=skyvern_frame,
             )
+            action_phase.mark_action_phase(ActionPhase.POST_CLICK)
             if page.url != original_url:
                 return results
 
@@ -8670,19 +8540,79 @@ def _has_exact_class_token(class_attr: str | None, token: str) -> bool:
     return class_attr is not None and token in str(class_attr).split()
 
 
-# Owner-scoped ui-select state read before and after Enter (`owned` reachable for a ui-select nested in another's
+# Owner-scoped ui-select state read before and after the commit (`owned` reachable for a ui-select nested in another's
 # dropdown). Disabled = stock 0.19.8 forms only: `disabled` attr/class, `select2-disabled`, non-"false" `aria-disabled`.
+# `ownerKey` is the committed key read from this container's OWN ngModel via `.data('$ngModelController')` -- not
+# `.controller()`, so an ancestor can't be bound. It is type-tagged (`"<type>:<value>"`, so numeric `1` and string
+# `"1"` stay distinct) and null unless a non-empty primitive is readable, so verification fails closed otherwise.
 _UI_SELECT_STATE_JS = """
 (el) => {
   const container = el.closest('.ui-select-container');
   if (container === null) { return null; }
   const owned = (n) => n.closest('.ui-select-container') === container;
+  let ownerKey = null;
+  try {
+    const ctrl = window.angular ? window.angular.element(container).data('$ngModelController') : null;
+    if (ctrl) {
+      const mv = ctrl.$modelValue;
+      const t = typeof mv;
+      if ((t === 'string' && mv !== '') || t === 'number' || t === 'boolean') { ownerKey = t + ':' + String(mv); }
+    }
+  } catch (e) { ownerKey = null; }
   const rows = [...container.querySelectorAll('.ui-select-choices-row')].filter((r) => owned(r) && r.getClientRects().length > 0);
   const isDisabled = (r) => r.hasAttribute('disabled') || r.classList.contains('disabled') || r.classList.contains('select2-disabled') || (r.hasAttribute('aria-disabled') && (r.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'false');
   const ownedMatches = [...container.querySelectorAll('.ui-select-match-text, .select2-chosen, .ui-select-match-item, .ui-select-match')].filter((m) => owned(m));
   const matches = ownedMatches.filter((m) => m.getClientRects().length > 0).slice(0, 20).map((m) => (m.textContent || '').trim());
   const latentMatches = ownedMatches.map((m) => (m.textContent || '').trim());
-  return { enabledRowCount: rows.filter((r) => !isDisabled(r)).length, firstVisibleEnabled: rows.length > 0 && !isDisabled(rows[0]), firstVisibleLabel: rows.length > 0 ? (rows[0].textContent || '').trim() : '', choicesOpen: rows.length > 0 || [...container.querySelectorAll('.ui-select-choices')].some((c) => owned(c) && c.getClientRects().length > 0), matchTexts: matches, latentMatchTexts: latentMatches, searchValue: typeof el.value === 'string' ? el.value : '' };
+  return { enabledRowCount: rows.filter((r) => !isDisabled(r)).length, firstVisibleEnabled: rows.length > 0 && !isDisabled(rows[0]), firstVisibleLabel: rows.length > 0 ? (rows[0].textContent || '').trim() : '', choicesOpen: rows.length > 0 || [...container.querySelectorAll('.ui-select-choices')].some((c) => owned(c) && c.getClientRects().length > 0), matchTexts: matches, latentMatchTexts: latentMatches, searchValue: typeof el.value === 'string' ? el.value : '', ownerKey: ownerKey };
+}
+"""
+
+# Commit the concrete filtered option row by clicking it (its own click/ng-click selects that exact row object),
+# rather than pressing Enter -- which AngularJS ui-select routes through its internal activeIndex and can land on a
+# stale/different row. Fail-closed: click only when there is one unambiguous target -- the unique enabled visible
+# row the widget filtered to, or (when the widget left several rows rendered) the single visible row whose full
+# visible label exactly equals the entered value -- never a row chosen merely for being first/visible, by a
+# substring, or by hidden helper text. Returns {clicked, clickedLabel}.
+_UI_SELECT_COMMIT_JS = """
+([el, text]) => {
+  const container = el.closest('.ui-select-container');
+  if (container === null) { return { clicked: false }; }
+  const owned = (n) => n.closest('.ui-select-container') === container;
+  const rows = [...container.querySelectorAll('.ui-select-choices-row')].filter((r) => owned(r) && r.getClientRects().length > 0);
+  const isDisabled = (r) => r.hasAttribute('disabled') || r.classList.contains('disabled') || r.classList.contains('select2-disabled') || (r.hasAttribute('aria-disabled') && (r.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'false');
+  const enabled = rows.filter((r) => !isDisabled(r));
+  let target = null;
+  let targetLabel = null;
+  if (enabled.length === 1 && rows.length > 0 && !isDisabled(rows[0])) {
+    target = enabled[0];
+  } else {
+    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const visibleText = (node) => {
+      let out = '';
+      const walk = (n) => {
+        for (const c of n.childNodes) {
+          if (c.nodeType === 3) { out += c.textContent; }
+          else if (c.nodeType === 1 && c.getClientRects().length > 0) { walk(c); }
+        }
+      };
+      walk(node);
+      return out;
+    };
+    const needle = norm(text);
+    if (needle) {
+      const matches = rows.filter((r) => norm(visibleText(r)) === needle);
+      if (matches.length === 1 && !isDisabled(matches[0])) {
+        target = matches[0];
+        targetLabel = visibleText(matches[0]).trim();
+      }
+    }
+  }
+  if (target === null) { return { clicked: false }; }
+  const label = targetLabel !== null ? targetLabel : (target.textContent || '').trim();
+  if (!label) { return { clicked: false }; }
+  target.click();
+  return { clicked: true, clickedLabel: label };
 }
 """
 
@@ -8695,8 +8625,9 @@ def _ui_select_commit_result(
     text: str,
 ) -> ActionResult | None:
     """On a commit-shaped close (choices closed + search emptied) return ``ActionSuccess`` when a visible owner match
-    equals the candidate label (arm 1) or is genuinely new versus the pre-Enter latent baseline (arm 2); return
-    ``None`` on a byte-identical clean no-op, else ``NoAvailableOptionFoundForCustomSelection``."""
+    equals the candidate label (arm 1), a match is genuinely new versus the pre-commit latent baseline (arm 2), or the
+    strictly owner-scoped ngModel key changed (arm 3, the gate for a same-visible-name commit); return ``None`` on a
+    byte-identical clean no-op, else ``NoAvailableOptionFoundForCustomSelection``."""
     if isinstance(post, dict) and not post.get("choicesOpen") and post.get("searchValue") == "":
 
         def _accept(observed: object) -> ActionResult:
@@ -8719,6 +8650,14 @@ def _ui_select_commit_result(
             normalized_observed = _normalize_select_shadow_text(observed)
             if normalized_observed and normalized_observed not in latent:
                 return _accept(observed)
+        # arm 3 (gate): the text arms could not confirm a shared visible name, but the strictly owner-scoped ngModel
+        # key changed from the pre-commit baseline, so the concretely-clicked row committed a new key -- record the
+        # observed display text, not the key. An unreadable/unchanged key (object/multi-select models read null) fails closed.
+        post_owner_key = post.get("ownerKey")
+        if post_owner_key is None:
+            LOG.debug("ui-select commit: owner ngModel key unreadable; display-text arms did not confirm the commit")
+        elif post_owner_key != pre.get("ownerKey"):
+            return _accept(observed_matches[0] if observed_matches else candidate)
     if (
         isinstance(post, dict)
         and post.get("choicesOpen")
@@ -8728,7 +8667,7 @@ def _ui_select_commit_result(
         return None
     return ActionFailure(
         NoAvailableOptionFoundForCustomSelection(
-            reason="ui-select Enter commit could not be verified", target_value=candidate
+            reason="ui-select option commit could not be verified", target_value=candidate
         )
     )
 
@@ -8745,6 +8684,70 @@ async def _is_combobox_or_typeahead(skyvern_element: SkyvernElement) -> bool:
         "both",
         "inline",
     )
+
+
+# Whether a field's aria-controls/aria-owns name a list, and whether that list shows an enabled, visible row. A list
+# that opened on focus and filters its rows in place adds no incremental elements, so the incremental tree alone
+# cannot say it answered with nothing.
+_DECLARED_LIST_ROWS_JS = """(el) => {
+  const LIST = '[role="listbox"],[role="grid"],[role="menu"],[role="tree"]';
+  const ROW = '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="gridcell"]';
+  let declared = false;
+  let shows = false;
+  const root = el.getRootNode();
+  const ids = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`.split(/\\s+/).filter(Boolean);
+  for (const id of ids) {
+    const t = (root.getElementById && root.getElementById(id)) || document.getElementById(id);
+    if (!t) continue;
+    for (const list of t.matches(LIST) ? [t] : t.querySelectorAll(LIST)) {
+      declared = true;
+      // A list still loading has not answered yet.
+      if (list.getAttribute('aria-busy') === 'true') shows = true;
+      for (const row of list.querySelectorAll(ROW)) {
+        if (row.getAttribute('aria-disabled') === 'true' || row.hasAttribute('disabled')) continue;
+        const r = row.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && getComputedStyle(row).visibility !== 'hidden') { shows = true; break; }
+      }
+    }
+  }
+  // The field itself saying the value it now holds is valid ends the question.
+  return { declared, shows, valid: el.getAttribute('aria-invalid') === 'false' };
+}"""
+
+
+async def _held_value_lost_to_unmatched_text(
+    skyvern_element: SkyvernElement,
+    held: str,
+    text: str,
+    incremental_element: list[dict],
+    input_or_select_context: InputOrSelectContext | None,
+) -> bool:
+    # Task V3's `type` no-match rule: text a declared autocomplete list answers with no row is not a value, and the
+    # next blur would commit it over the value the field held. Search and location inputs take free text, and so do
+    # the "both"/"inline" widgets seen to accept custom values, so only aria-autocomplete="list" qualifies.
+    if not held.strip() or held.strip().casefold() == text.strip().casefold():
+        return False
+    if input_or_select_context is not None and (
+        input_or_select_context.is_search_bar or input_or_select_context.is_location_input
+    ):
+        return False
+    # The scraped attribute: a live read after the write can hit a remounted node (see structural_autocomplete).
+    aria_autocomplete = await skyvern_element.get_attr("aria-autocomplete", mode="static")
+    if str(aria_autocomplete or "").strip().casefold() != "list":
+        return False
+    if _incremental_tree_has_enabled_selectable_option(incremental_element):
+        return False
+    for wait in (0.0, 0.5, 0.5, 1.0):
+        # Late looks over 2s: a debounced, network-backed list can render its rows well after the incremental read.
+        await asyncio.sleep(wait)
+        try:
+            probe = await skyvern_element.get_locator().evaluate(_DECLARED_LIST_ROWS_JS, timeout=2000)
+        except Exception:
+            LOG.debug("Declared autocomplete list probe failed", exc_info=True)
+            return False
+        if not isinstance(probe, dict) or not probe.get("declared") or probe.get("shows") or probe.get("valid"):
+            return False
+    return True
 
 
 async def _is_commit_required_combobox(skyvern_element: SkyvernElement) -> bool:
@@ -8978,6 +8981,7 @@ async def _handle_input_text_action(
         return [await _fill_multi_field_totp_group(page, scraped_page, task, attempt, code)]
 
     dom = DomUtil(scraped_page, page)
+    action_phase.mark_action_phase(ActionPhase.RESOLVE_ELEMENT)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
 
     # Normalize a wrapper target -- a visible <div>/<iframe> whose real editable <input> is nested one
@@ -8998,8 +9002,10 @@ async def _handle_input_text_action(
                 can_input_text = True
 
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
+    action_phase.mark_action_phase(ActionPhase.FRAME_CREATE)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
+    action_phase.mark_action_phase(ActionPhase.INPUT)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
     is_tel = await skyvern_element.get_attr("type") == "tel"
@@ -9024,6 +9030,7 @@ async def _handle_input_text_action(
         )
         action.tel_input_outcome = tel_outcome
 
+    held_element_id = skyvern_element.get_id()
     try:
         current_text = await get_input_value(
             skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
@@ -9136,9 +9143,11 @@ async def _handle_input_text_action(
             )
         ]
 
-    # ui-select (AngularJS) resets activeIndex to the first visible row per keystroke, so Enter commits rows[0].
-    # Press it only when that first visible row is the unique enabled one, then prove the commit landed before
-    # recording it (see _ui_select_commit_result). Run before the generic probe.
+    # AngularJS ui-select routes an Enter commit through its internal activeIndex, which production shows can commit a
+    # different row than the concrete one Skyvern probed after filtering (the activeIndex is pinned to a stale
+    # pre-existing selection; the widget's refreshDelay is a likely contributor, not proven), so Enter commits the
+    # wrong account while verification correctly rejects it. Commit the concrete filtered row by clicking it instead,
+    # then prove the commit landed before recording it (see _ui_select_commit_result). Run before the generic probe.
     if (
         text
         and tag_name == InteractiveElement.INPUT
@@ -9165,23 +9174,22 @@ async def _handle_input_text_action(
                     pre = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
             except Exception:
                 LOG.info("Failed to filter/probe ui-select rows, falling back", element_id=skyvern_element.get_id())
-            if (
-                isinstance(pre, dict)
-                and pre.get("enabledRowCount") == 1
-                and pre.get("firstVisibleEnabled")
-                and pre.get("firstVisibleLabel")
-            ):
-                candidate = str(pre["firstVisibleLabel"])
-                await skyvern_element.press_key("Enter")
-                post: Any = None
-                try:
-                    await _wait_custom_select_render_settle(skyvern_element)
-                    post = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
-                except Exception:
-                    LOG.info("Failed to read ui-select state after Enter", element_id=skyvern_element.get_id())
-                commit_result = _ui_select_commit_result(action, pre, post, candidate, text)
-                if commit_result is not None:
-                    return [commit_result]  # None → proven clean no-op: fall through to the generic path
+            if isinstance(pre, dict) and pre.get("choicesOpen"):
+                committed_click = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_COMMIT_JS, text)
+                if isinstance(committed_click, dict) and committed_click.get("clicked"):
+                    candidate = str(committed_click.get("clickedLabel") or "")
+                    post: Any = None
+                    try:
+                        await _wait_custom_select_render_settle(skyvern_element)
+                        post = await _evaluate_element_scoped(skyvern_element, _UI_SELECT_STATE_JS)
+                    except Exception:
+                        LOG.info(
+                            "Failed to read ui-select state after committing the row",
+                            element_id=skyvern_element.get_id(),
+                        )
+                    commit_result = _ui_select_commit_result(action, pre, post, candidate, text)
+                    if commit_result is not None:
+                        return [commit_result]  # None → proven clean no-op: fall through to the generic path
         finally:
             await incremental_scraped.stop_listen_dom_increment()
         # Not commit-ready or a proven no-op: clear the probe so the ordinary path does not double the typed value.
@@ -9648,6 +9656,7 @@ async def _handle_input_text_action(
                 input_type=totp_input_type,
                 maxlength=totp_maxlength,
                 engine_selection=engine_selection,
+                readback_ignores_grouping=True,
             )
             if totp_failure is not None:
                 return [totp_failure]
@@ -9905,6 +9914,35 @@ async def _handle_input_text_action(
             ):
                 await _wait_custom_select_render_settle(skyvern_element)
                 incremental_element = await incremental_scraped.get_incremental_element_tree(incremental_cleanup)
+            if (
+                not is_secret_value
+                and current_text is not None
+                and skyvern_element.get_id() == held_element_id
+                and await _held_value_lost_to_unmatched_text(
+                    skyvern_element, current_text, text, incremental_element, input_or_select_context
+                )
+            ):
+                # The Tab in the outer finally would commit whatever row the restore's input event highlights.
+                auto_complete_hacky_flag = False
+                await skyvern_element.input_fill(current_text)
+                restored = (
+                    await get_input_value(tag_name, skyvern_element.get_locator(), engine_selection=engine_selection)
+                    == current_text
+                )
+                LOG.info("Input text matched no option of a held autocomplete value", restored=restored)
+                return [
+                    ActionFailure(
+                        NoSuitableAutoCompleteOption(
+                            reasoning="no option of the field's list matched the typed text; "
+                            + (
+                                "its previous text was put back"
+                                if restored
+                                else "its previous text could not be put back"
+                            ),
+                            target_value=text,
+                        )
+                    )
+                ]
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
                 if (
@@ -12231,6 +12269,7 @@ async def choose_auto_completion_dropdown(
     skyvern_frame = await SkyvernFrame.create_instance(current_frame, engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
+    action_phase.mark_action_phase(ActionPhase.AUTOCOMPLETE)
 
     try:
         await skyvern_element.press_fill(text)
@@ -12612,6 +12651,7 @@ async def input_or_auto_complete_input(
     *,
     is_secret_value: bool,
 ) -> ActionResult | None:
+    action_phase.mark_action_phase(ActionPhase.AUTOCOMPLETE)
     LOG.info(
         "Trigger auto completion",
         element_id=skyvern_element.get_id(),
@@ -13194,12 +13234,16 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     Native ``<select>`` options live on the element's ``options`` field
     (``[{text, value, optionIndex}, ...]``); the scraper skips their child
     ``<option>`` nodes, so this walker must inspect that field directly.
-    Radio/checkbox-based custom selects (e.g. ``role="radiogroup"``) have no
-    ``<option>``/``<li>`` nodes either; they're recognized the same way
-    ``_custom_select_candidates_from_elements`` recognizes them so a
-    radio-group miss doesn't misreport zero observed options.
+
+    An empty result routes a miss to the transient
+    ``NoIncrementalElementFoundForCustomSelection`` instead of
+    ``OPTION_NOT_AVAILABLE``, so this walker must recognize every option shape
+    ``_custom_select_candidates_from_elements`` recognizes — radio/checkbox
+    groups, ``menuitem``/``treeitem`` items, and bare interactable rows inside a
+    choice surface. Anything it misses is reported as a dropdown that opened
+    empty, which it did not.
     """
-    queue: deque[dict] = deque(elements)
+    queue: deque[tuple[dict, bool]] = deque((element, False) for element in elements)
     seen: set[str] = set()
     out: list[str] = []
     # Mirrors _custom_select_candidates_from_elements' covered_choice_input_ids: a <label>
@@ -13214,7 +13258,7 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
             out.append(text)
 
     while queue:
-        node = queue.popleft()
+        node, in_choice_surface = queue.popleft()
         if not isinstance(node, dict):
             continue
         attrs = node.get("attributes") or {}
@@ -13225,17 +13269,25 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
         is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
         # Only compute the descendant walk for <label> nodes (its one consumer below) — calling
         # it unconditionally for every queued node makes this walker quadratic on large DOMs.
-        if role == "option" or tag in ("li", "option"):
-            _record(str(node.get("text") or "").strip())
-        elif is_choice_input and element_id in covered_choice_input_ids:
+        if is_choice_input and element_id in covered_choice_input_ids:
             pass
         elif is_choice_input or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES:
             _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
-        elif tag == "label":
-            choice_input_ids, contains_choice_input = _custom_select_descendant_choice_inputs(node)
-            if contains_choice_input:
-                _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
-                covered_choice_input_ids.update(choice_input_ids)
+        elif tag == "label" and (label_choice_inputs := _custom_select_descendant_choice_inputs(node))[1]:
+            # Before the role branch: a `<label role="menuitem">` wrapping a radio often has no text
+            # of its own, only an aria-label, and a text-only read would report zero options.
+            _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+            covered_choice_input_ids.update(label_choice_inputs[0])
+        elif role in _CUSTOM_SELECT_CHOICE_ROLES or tag in ("li", "option"):
+            _record(str(node.get("text") or "").strip())
+        elif (
+            node.get("interactable")
+            and (in_choice_surface or "aria-selected" in attrs or "aria-checked" in attrs)
+            and role not in _CUSTOM_SELECT_CONTAINER_ROLES
+            and tag not in ("input", "select", "textarea")
+            and not (tag == "a" and attrs.get("href"))
+        ):
+            _record(_select_shadow_label_from_node(node) or "")
         for option in node.get("options") or []:
             if not isinstance(option, dict):
                 continue
@@ -13245,8 +13297,9 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
             if not option_text:
                 option_text = str(option.get("value") or "").strip()
             _record(option_text)
+        child_in_choice_surface = in_choice_surface or _is_custom_select_choice_surface(role)
         for child in node.get("children") or []:
-            queue.append(child)
+            queue.append((child, child_in_choice_surface))
     return out
 
 
@@ -13849,12 +13902,12 @@ async def _anchor_is_combobox_input(element: SkyvernElement | None) -> bool:
 
 
 def _terminal_custom_select_failure(
-    *, target_value: str, matched_label: str | None
+    *,
+    target_value: str,
+    matched_label: str | None,
+    reason: str = "Deterministic custom-select click could not be verified by matched element read-back",
 ) -> tuple[ActionFailure, str | None]:
-    action_failure = _no_element_matched_failure(
-        target_value,
-        "Deterministic custom-select click could not be verified by matched element read-back",
-    )
+    action_failure = _no_element_matched_failure(target_value, reason)
     action_failure.skip_remaining_actions = True
     action_failure.data = {"_terminal_custom_select_failure": True}
     return action_failure, matched_label
@@ -14767,6 +14820,13 @@ async def select_from_dropdown(
     select_history = [] if select_history is None else select_history
     single_select_result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
 
+    def _canceled_result() -> CustomSingleSelectResult:
+        # Terminal, so no caller falls back to another way of selecting for a canceled run.
+        single_select_result.action_result, _ = _terminal_custom_select_failure(
+            target_value=target_value, matched_label=None, reason=RUN_STOPPED_BEFORE_SELECTING_REASON
+        )
+        return single_select_result
+
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
     if dropdown_menu_element is None:
@@ -14790,7 +14850,7 @@ async def select_from_dropdown(
         )
 
         if await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
-            await scroll_down_to_load_all_options(
+            cancellation = await scroll_down_to_load_all_options(
                 scrollable_element=potential_scrollable_element,
                 skyvern_frame=skyvern_frame,
                 page=page,
@@ -14798,6 +14858,8 @@ async def select_from_dropdown(
                 step=step,
                 task=task,
             )
+            if cancellation is not None:
+                return _canceled_result()
 
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(
@@ -14843,6 +14905,10 @@ async def select_from_dropdown(
     def _proceeded_post_reset_fallback_result() -> CustomSingleSelectResult:
         _emit_post_reset_fallback_outcome(CustomSelectFamilyOutcome.llm_fallback_reset_verified)
         return single_select_result
+
+    # The scroll back, the option-tree build and, further down, the LLM call can each outlast the last poll.
+    if await read_run_cancellation(task) is not None:
+        return _canceled_result()
 
     deterministic_result = await _select_deterministic_custom_option(
         execute=entry_action_type in _EXECUTABLE_CUSTOM_SELECT_ENTRIES,
@@ -14895,6 +14961,8 @@ async def select_from_dropdown(
             step=step,
             prompt_name="custom-select",
         )
+        if await read_run_cancellation(task) is not None:
+            return _canceled_result()
 
         if post_reset_fallback and not isinstance(json_response, dict):
             raise TypeError("Custom-select LLM response must be a dictionary")
@@ -15133,6 +15201,7 @@ async def select_from_dropdown_by_value(
         )
 
     selected: bool = False
+    click_cancellation: RunCancellation | None = None
 
     async def continue_callback(incre_scraped: IncrementalScrapePage) -> bool:
         await incre_scraped.get_incremental_element_tree(
@@ -15146,14 +15215,17 @@ async def select_from_dropdown_by_value(
 
         element_locator = await incre_scraped.select_one_element_by_value(value=value)
         if element_locator is not None:
-            await element_locator.click(timeout=timeout)
-            nonlocal selected
-            selected = True
+            nonlocal selected, click_cancellation
+            # The lookups above can outlast the loop's poll, so recheck right before clicking.
+            click_cancellation = await read_run_cancellation(task)
+            if click_cancellation is None:
+                await element_locator.click(timeout=timeout)
+                selected = True
             return False
 
         return True
 
-    await scroll_down_to_load_all_options(
+    cancellation = await scroll_down_to_load_all_options(
         scrollable_element=potential_scrollable_element,
         page=page,
         skyvern_frame=skyvern_frame,
@@ -15163,6 +15235,10 @@ async def select_from_dropdown_by_value(
         page_by_page=True,
         is_continue=continue_callback,
     )
+    if cancellation is not None or click_cancellation is not None:
+        return _terminal_custom_select_failure(
+            target_value=value, matched_label=None, reason=RUN_STOPPED_BEFORE_SELECTING_REASON
+        )[0]
 
     if selected:
         return ActionSuccess()
@@ -15343,7 +15419,7 @@ async def scroll_down_to_load_all_options(
     task: Task | None = None,
     page_by_page: bool = False,
     is_continue: Callable[[IncrementalScrapePage], Awaitable[bool]] | None = None,
-) -> None:
+) -> RunCancellation | None:
     LOG.info("Scroll down the dropdown menu to load all options")
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
 
@@ -15372,9 +15448,17 @@ async def scroll_down_to_load_all_options(
 
     scroll_pace = 0
     previous_num = await incremental_scraped.get_incremental_elements_num()
+    previous_metrics = (
+        None
+        if dropdown_menu_element_handle is None
+        else await skyvern_frame.safe_get_element_scroll_metrics(dropdown_menu_element_handle)
+    )
 
+    iterations = 0
+    settled_passes = 0
     deadline = datetime.now(timezone.utc) + timedelta(milliseconds=settings.OPTION_LOADING_TIMEOUT_MS)
-    while datetime.now(timezone.utc) < deadline:
+    while datetime.now(timezone.utc) < deadline and iterations < MAX_OPTION_LOADING_SCROLL_ITERATIONS:
+        iterations += 1
         # make sure we can scroll to the bottom
         scroll_interval = settings.BROWSER_HEIGHT * 5
         if dropdown_menu_element_handle is None:
@@ -15398,14 +15482,55 @@ async def scroll_down_to_load_all_options(
             num=current_num,
         )
 
+        # Polled each pass right before is_continue, which can click a matching option.
+        cancellation = await read_run_cancellation(task) if task is not None else None
+        if cancellation is not None:
+            LOG.info(
+                "Run is no longer active, stopping the option-loading scroll",
+                element_id=scrollable_element.get_id(),
+                iterations=iterations,
+            )
+            return cancellation
+
         if is_continue is not None and not await is_continue(incremental_scraped):
-            return
+            return None
+
+        current_metrics = (
+            None
+            if dropdown_menu_element_handle is None
+            else await skyvern_frame.safe_get_element_scroll_metrics(dropdown_menu_element_handle)
+        )
+        if (
+            current_metrics is not None
+            and previous_metrics is not None
+            and current_metrics.at_bottom
+            and current_metrics.scroll_height <= previous_metrics.scroll_height
+        ):
+            settled_passes += 1
+            # A lazy menu can sit flat at the bottom behind a loading row and append the next page only after
+            # this pass's waits, so one flat pass is not proof it finished loading.
+            if settled_passes >= 2:
+                LOG.info(
+                    "Dropdown menu is scrolled to the bottom and stopped growing, all options should be loaded",
+                    element_id=scrollable_element.get_id(),
+                    iterations=iterations,
+                    scroll_height=current_metrics.scroll_height,
+                )
+                break
+        else:
+            settled_passes = 0
+        previous_metrics = current_metrics
 
         if previous_num == current_num:
             break
         previous_num = current_num
     else:
-        LOG.warning("Timeout to load all options, maybe some options will be missed")
+        LOG.warning(
+            "Timeout to load all options, maybe some options will be missed",
+            element_id=scrollable_element.get_id(),
+            iterations=iterations,
+            exhausted_iteration_cap=iterations >= MAX_OPTION_LOADING_SCROLL_ITERATIONS,
+        )
 
     # scroll back to the start point and wait for a while to make all options invisible on the page
     if dropdown_menu_element_handle is None:
@@ -15414,6 +15539,7 @@ async def scroll_down_to_load_all_options(
     else:
         await skyvern_frame.scroll_to_element_top(dropdown_menu_element_handle)
     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.top")
+    return None
 
 
 async def normal_select(

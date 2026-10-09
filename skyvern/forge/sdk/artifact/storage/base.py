@@ -621,6 +621,10 @@ class BaseStorage(ABC):
     async def download_managed_file(self, uri: str, organization_id: str) -> bytes | None:
         pass
 
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        """Size in bytes of a managed file read from metadata alone, or None when the backend cannot tell."""
+        return None
+
     @abstractmethod
     async def file_exists(self, uri: str) -> bool:
         pass

@@ -93,10 +93,12 @@ from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
+from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
+    SendEmailBlockYAML,
     WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
 )
@@ -150,12 +152,24 @@ def convert_workflow_definition(
     # We're going to process context parameters after other parameters since they depend on the other parameters
     context_parameter_yamls = []
 
+    send_email_blocks = _collect_send_email_blocks(workflow_definition_yaml.blocks)
+    sends_only_via_gmail = bool(send_email_blocks) and all(
+        block_yaml.transport == EmailTransport.GMAIL for block_yaml in send_email_blocks
+    )
+
     for parameter in workflow_definition_yaml.parameters:
         if parameter.key in parameters:
             LOG.error(f"Duplicate parameter key {parameter.key}")
             duplicate_parameter_keys.add(parameter.key)
             continue
         now = datetime.now(UTC)
+        # A run resolves every saved secret when it starts, and a workflow that sends only through Gmail uses none.
+        if (
+            sends_only_via_gmail
+            and parameter.parameter_type == ParameterType.AWS_SECRET
+            and parameter.aws_key in PLATFORM_SMTP_AWS_KEYS.values()
+        ):
+            continue
         if parameter.parameter_type == ParameterType.AWS_SECRET:
             parameters[parameter.key] = AWSSecretParameter(
                 aws_secret_parameter_id=generate_aws_secret_parameter_id(),
@@ -351,6 +365,11 @@ def convert_workflow_definition(
         retry_policy=workflow_definition_yaml.retry_policy,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
         completion_contract=workflow_definition_yaml.completion_contract,
+        **(
+            {"browser_settings": workflow_definition_yaml.browser_settings}
+            if "browser_settings" in workflow_definition_yaml.model_fields_set
+            else {}
+        ),
     )
 
     LOG.info(
@@ -371,6 +390,16 @@ def _collect_all_block_labels(block_yamls: list[BLOCK_YAML_TYPES]) -> list[str]:
         if isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block_yaml.loop_blocks:
             labels.extend(_collect_all_block_labels(block_yaml.loop_blocks))
     return labels
+
+
+def _collect_send_email_blocks(block_yamls: list[BLOCK_YAML_TYPES]) -> list[SendEmailBlockYAML]:
+    send_email_blocks: list[SendEmailBlockYAML] = []
+    for block_yaml in block_yamls:
+        if isinstance(block_yaml, SendEmailBlockYAML):
+            send_email_blocks.append(block_yaml)
+        elif isinstance(block_yaml, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block_yaml.loop_blocks:
+            send_email_blocks.extend(_collect_send_email_blocks(block_yaml.loop_blocks))
+    return send_email_blocks
 
 
 def _create_all_output_parameters_for_workflow(
@@ -602,8 +631,11 @@ def block_yaml_to_block(
             "smtp_password": block_yaml.smtp_password_secret_parameter_key,
         }
         has_custom_smtp_host = bool(block_yaml.custom_smtp_host and block_yaml.custom_smtp_host.strip())
+        is_gmail = block_yaml.transport == EmailTransport.GMAIL
         missing_smtp_keys = [
-            key for key in smtp_parameter_keys.values() if key and key not in parameters and not has_custom_smtp_host
+            key
+            for key in smtp_parameter_keys.values()
+            if key and key not in parameters and not has_custom_smtp_host and not is_gmail
         ]
         if missing_smtp_keys:
             raise InvalidWorkflowDefinition(
@@ -615,16 +647,21 @@ def block_yaml_to_block(
         def _smtp_parameter(name: str) -> AWSSecretParameter:
             key = smtp_parameter_keys[name] or name
             declared = parameters.get(key)
-            if isinstance(declared, AWSSecretParameter):
+            # A Gmail block never carries the workflow's real SMTP secrets, even when another block declares them.
+            if isinstance(declared, AWSSecretParameter) and not is_gmail:
                 return declared
             now = datetime.now(UTC)
-            if has_custom_smtp_host:
+            if has_custom_smtp_host or is_gmail:
                 # The custom path never reads the platform-sender secrets, but the model
                 # requires them structurally, so this stub stays out of `parameters`.
                 return AWSSecretParameter(
                     parameter_type=ParameterType.AWS_SECRET,
-                    key=name,
-                    description="Unused placeholder; this block sends via custom SMTP.",
+                    # Code without the Gmail transport reads this block as SMTP and looks its secrets up by key,
+                    # so a Gmail placeholder gets a key no workflow parameter can have.
+                    key=f"gmail-unused-{name}" if is_gmail else name,
+                    description="Unused placeholder; this block sends via Gmail."
+                    if is_gmail
+                    else "Unused placeholder; this block sends via custom SMTP.",
                     aws_key=UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
                     aws_secret_parameter_id=f"placeholder_{name}",
                     workflow_id="",
@@ -666,6 +703,10 @@ def block_yaml_to_block(
             body=block_yaml.body,
             body_format=block_yaml.body_format,
             file_attachments=block_yaml.file_attachments or [],
+            transport=block_yaml.transport,
+            credential_id=block_yaml.credential_id,
+            cc=block_yaml.cc,
+            bcc=block_yaml.bcc,
         )
     elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
         return FileParserBlock(

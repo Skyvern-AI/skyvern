@@ -60,6 +60,15 @@ export const CREDENTIAL_REQUIRED_FRAME_BY_REASON = {
     message: "The site rejected the saved one-time code.",
     credential_refs: ["cred_hn"],
   }),
+  credential_registration: buildCredentialRequiredFrame({
+    reason: "credential_registration",
+    message: "Create the test account you asked for.",
+    login_page_urls: ["https://portal.example.com/signup"],
+    registration: {
+      username: "tester@example.com",
+      credential_name: "Portal test account",
+    },
+  }),
 } as const;
 
 // No dynamic ask text; only a richer, timed pause signal supplies one.

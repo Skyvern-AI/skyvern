@@ -50,13 +50,17 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
     "POST /v1/recipes/jobs/apply",
+    "POST /v1/browser_sessions/external",
     # Copilot messages may contain credentials before the route's semantic
     # safety screen runs. The request audit keeps endpoint metadata while the
     # body stays opaque; the route persists only its canonical redacted form.
     "POST /v1/workflow/copilot/chat-post",
     "POST /v1/workflow/copilot/question-response",
+    "POST /v1/workflow/copilot/steer",
     "POST /v1/workflow/copilot/credential-response",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
+    # Payment-provider events carry customer billing details (name, email, address, card metadata).
+    "POST /api/v1/stripe_webhook",
 }
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
@@ -97,6 +101,7 @@ class _RequestIdentity:
     principal_resolution_conflict: bool = False
     bearer_identity_status: str | None = None
     principal_resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    load_shed: bool = False
 
 
 _request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
@@ -129,6 +134,13 @@ def set_request_organization(
         identity.organization_name = organization_name
     if org_age is not None:
         identity.org_age = org_age
+
+
+def mark_request_load_shed() -> None:
+    """Log this request's 503 at warning level: the server shed it on purpose under load, before doing any work."""
+    identity = _request_identity.get()
+    if identity is not None:
+        identity.load_shed = True
 
 
 def set_request_principal(
@@ -188,10 +200,17 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
     return first_hop or None
 
 
+def _is_fixture_endpoint(request: Request) -> bool:
+    return request.url.path.rstrip("/") == "/api/v1/eval-fixtures" or request.url.path.startswith(
+        "/api/v1/eval-fixtures/"
+    )
+
+
 def _is_sensitive_endpoint(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return (
-        endpoint in _SENSITIVE_ENDPOINTS
+        _is_fixture_endpoint(request)
+        or endpoint in _SENSITIVE_ENDPOINTS
         or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
         or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
@@ -307,7 +326,10 @@ def _log_request(
     headers: dict[str, str],
     start_time: float,
 ) -> None:
-    if status_code >= 500:
+    identity = _request_identity.get()
+    if status_code == 503 and identity is not None and identity.load_shed:
+        log_method = LOG.warning
+    elif status_code >= 500:
         log_method = LOG.error
     elif status_code >= 400 and status_code not in _ROUTINE_CLIENT_ERROR_STATUSES:
         log_method = LOG.warning
@@ -348,7 +370,18 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     start_time = time.monotonic()
     try:
-        body_bytes = await request.body()
+        if _is_fixture_endpoint(request):
+            bounded = bytearray()
+            async with asyncio.timeout(2):
+                async for chunk in request.stream():
+                    if len(bounded) + len(chunk) > 4096:
+                        return Response(status_code=413)
+                    bounded.extend(chunk)
+            body_bytes = bytes(bounded)
+        else:
+            body_bytes = await request.body()
+    except TimeoutError:
+        return Response(status_code=408)
     except ClientDisconnect:
         # The client closed the connection before the body finished streaming, so no
         # response will reach it. Short-circuit with a benign 499 instead of letting

@@ -7,17 +7,17 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import structlog
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
-from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_st
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.strings import join_phrases
 
 LOG = structlog.get_logger()
 
@@ -71,13 +72,12 @@ class NarrativeDraft(TypedDict):
     summary: str | None
 
 
+REPLY_TOOL_NAME = "reply"
 USER_FACING_REASON_PARAM = "user_facing_reason"
 USER_FACING_REASON_SCHEMA = {
     "type": ["string", "null"],
     "description": (
-        "A short user-facing sentence explaining what this action is intended to accomplish. "
-        "This is displayed above this action while it runs; write it with the ordinary action arguments, "
-        "in product language without secrets. Null or absence is accepted when no useful explanation is available."
+        "One short sentence displayed above this action while it runs, saying what it is for. Null is accepted."
     ),
 }
 
@@ -256,6 +256,12 @@ class NarrativeWorkPlan(TypedDict):
     items: list[str]
 
 
+class NarrativeScreenshot(TypedDict):
+    artifactId: str
+    capturedAt: str
+    toolCallId: str | None
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -265,7 +271,8 @@ class TurnNarrativePayload(TypedDict):
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
     questionInteractions: NotRequired[list[dict[str, Any]]]
-    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    steerMessages: NotRequired[list[dict[str, Any]]]
+    # {"reason": <token>}, set when this turn surfaces a typed credential need.
     credentialPrompt: NotRequired[dict[str, str]]
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
@@ -289,6 +296,7 @@ class TurnNarrativePayload(TypedDict):
     # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
     # can trim the call's row in a long turn.
     workPlan: NotRequired[NarrativeWorkPlan]
+    screenshots: NotRequired[list[NarrativeScreenshot]]
     startedAt: str | None
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
@@ -298,6 +306,8 @@ class TurnNarrativePayload(TypedDict):
 
 
 if TYPE_CHECKING:
+    from agents.items import ModelResponse
+
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
@@ -378,9 +388,6 @@ _TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_valu
 _RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
 
 
-OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
-
-
 class PageObstructionSelectorCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -449,7 +456,6 @@ class CodeAuthoringRepairContext(BaseModel):
     available_parameter_keys: list[str] = Field(default_factory=list)
     binding_candidates: list[str] = Field(default_factory=list)
     selector: str | None = None
-    source_url: str | None = None
     refiner_selector: str | None = None
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
@@ -478,12 +484,7 @@ class CodeAuthoringRepairContext(BaseModel):
     page_obstruction_summaries: list[str] = Field(default_factory=list)
     page_obstructions: list[PageObstruction] = Field(default_factory=list)
     page_obstruction_omission_notices: list[str] = Field(default_factory=list)
-    required_block_structure: str = ""
-    spine_stage_count: int | None = None
-    spine_split_blockers: list[str] = Field(default_factory=list)
-    output_owner_candidate_labels: list[str] = Field(default_factory=list)
-    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
-    repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
+    repair_instruction: str = ""
 
 
 class StructuredContext(BaseModel):
@@ -1073,6 +1074,39 @@ def clear_proposed_credential(raw_context: str | None) -> str | None:
     return sc.to_json_str()
 
 
+# Turn-end writers: adopt_model_authored_context restores the first group, merge_turn_summary adds to the third.
+# finalize_observation_context recomputes only page_inspection_calls_made and builds the rest on what it was given.
+TRUSTED_CONTEXT_FIELDS = ("approved_credentials", "approved_connections", "proposed_credential", "carried_trajectory")
+OBSERVED_CONTEXT_FIELDS = ("entrypoint_url", "page_inspection_calls_made", "observed_acted_pages", "carried_trajectory")
+TOOL_ACTIVITY_CONTEXT_FIELDS = (
+    "urls_visited",
+    "fields_filled",
+    "credentials_checked",
+    "decisions_made",
+    "workflow_state",
+)
+_CONTEXT_FIELD_NOTES = {
+    "urls_visited": "append, don't repeat",
+    "decisions_made": "concise",
+    "workflow_state": "what blocks exist now",
+}
+
+
+def _context_field_phrases(names: Iterable[str]) -> list[str]:
+    return [f"{name} ({_CONTEXT_FIELD_NOTES[name]})" if name in _CONTEXT_FIELD_NOTES else name for name in names]
+
+
+def model_written_context_fields() -> str:
+    server_written = {*TRUSTED_CONTEXT_FIELDS, *OBSERVED_CONTEXT_FIELDS, *TOOL_ACTIVITY_CONTEXT_FIELDS}
+    return join_phrases(
+        _context_field_phrases(name for name in StructuredContext.model_fields if name not in server_written), "and"
+    )
+
+
+def tool_recorded_context_fields() -> str:
+    return join_phrases(_context_field_phrases(TOOL_ACTIVITY_CONTEXT_FIELDS), "and", serial_comma=False)
+
+
 def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
     """Take the model's context but keep the server-owned fields server-owned.
 
@@ -1093,14 +1127,20 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     if isinstance(model_raw, dict):
         try:
             structured = StructuredContext.model_validate(model_raw)
-        except Exception:
+        except Exception as exc:
+            # The whole update is dropped, user_goal included, so a silent hit here hides lost model context.
+            LOG.warning(
+                "structured_context_model_update_rejected",
+                error_type=type(exc).__name__,
+                rejected_fields=sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+                if isinstance(exc, ValidationError)
+                else [],
+            )
             structured = trusted
     elif isinstance(model_raw, str):
         structured = StructuredContext.from_json_str(model_raw)
-    structured.approved_credentials = list(trusted.approved_credentials)
-    structured.approved_connections = list(trusted.approved_connections)
-    structured.proposed_credential = trusted.proposed_credential
-    structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
+    for field_name in TRUSTED_CONTEXT_FIELDS:
+        setattr(structured, field_name, deepcopy(getattr(trusted, field_name)))
     return structured
 
 
@@ -1199,6 +1239,7 @@ class CopilotContext(AgentContext):
 
     workflow_copilot_chat_id: str | None = None
     copilot_cancel_token: str | None = None
+    handled_steer_ids: set[str] = field(default_factory=set)
     copilot_question_pause_seconds: float = 0.0
     human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
@@ -1222,6 +1263,8 @@ class CopilotContext(AgentContext):
     budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
     check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
+    # The latest model response this turn, or None while a model call is in flight.
+    last_model_response: ModelResponse | None = field(default=None, repr=False)
     tool_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
@@ -1247,9 +1290,9 @@ class CopilotContext(AgentContext):
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
     client_supports_credential_pause_recovery: bool = False
+    client_supports_credential_generation: bool = False
     credential_recovery_token_digest: str | None = field(default=None, repr=False)
     credential_recovery_armed: bool = False
-    credential_pause_used: bool = False
     # One update card (add an authenticator, or replace values a site refused) may follow an answered
     # card per turn: it asks to fix the credential the user already chose, not to choose again.
     credential_totp_update_asked: bool = False
@@ -1259,6 +1302,9 @@ class CopilotContext(AgentContext):
     credential_pause_reaskable_by_run: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_registration_outcome: Literal["rejected", "unknown"] | None = None
+    # Generate and save created, or may have created, a credential; a second generate card could mint a duplicate.
+    credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
@@ -1433,6 +1479,9 @@ class CopilotContext(AgentContext):
     proposal_revision: int | None = None
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
+    # for what a test under this token would run, so binding a run to it is refused.
+    settings_diverged_proposal_token: tuple[str, int] | None = None
     # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
     # staged draft at turn end. None on entrypoints that load no chat row.
     auto_accept: bool | None = None
@@ -1502,3 +1551,8 @@ class CopilotContext(AgentContext):
             "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
             "ctx_last_workflow_present": self.last_workflow is not None,
         }
+
+
+def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
+    # A context that never resolved a tool surface advertises nothing.
+    return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)

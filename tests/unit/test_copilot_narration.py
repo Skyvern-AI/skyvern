@@ -94,13 +94,12 @@ async def test_actual_run_polling_bridge_emits_progress_while_action_is_pending(
         nonlocal reads
         reads += 1
         if reads == 1:
-            return SimpleNamespace(status="running", modified_at=stamp), stamp, stamp
+            return SimpleNamespace(status="running", modified_at=stamp), stamp
         if reads == 2:
-            return SimpleNamespace(status="running", modified_at=stamp), stamp, stamp + timedelta(seconds=1)
+            return SimpleNamespace(status="running", modified_at=stamp), stamp + timedelta(seconds=1)
         await release.wait()
         return (
             SimpleNamespace(status="completed", modified_at=stamp, failure_reason=None),
-            stamp,
             stamp + timedelta(seconds=2),
         )
 

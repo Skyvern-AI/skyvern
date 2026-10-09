@@ -32,6 +32,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
+from email.policy import SMTP as SMTP_EMAIL_POLICY
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -119,7 +120,7 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import OUTPUT_ONLY_ANTI_BOT_REASON_CODES, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -130,7 +131,9 @@ from skyvern.forge.sdk.api.files import (
     download_file,
     get_download_dir,
     get_path_for_workflow_download_directory,
+    get_run_temp_dir,
     is_remote_url,
+    is_uploaded_file_id,
     observe_download_dir,
     parse_uri_to_path,
     resolve_local_or_download_file,
@@ -165,6 +168,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
     code_is_download_intent,
+    without_generated_file_stamp,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
@@ -175,7 +179,8 @@ from skyvern.forge.sdk.credential_site_policy import describe_release_scope, ori
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.db.id import generate_action_id
+from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
+from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -208,16 +213,18 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     inline_authorized_file_path,
+    pin_file_chooser,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
     BlockMetadata,
     WorkflowRunContext,
+    register_secret_derived_output,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     CodeBlockTemplateSyntaxError,
@@ -257,7 +264,9 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     DocumentFailureReceipt,
     RecordingPage,
+    is_element_handle,
     json_safe_recorder_output,
+    page_shows_sign_in_form,
     user_code_line_from_exception,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
@@ -291,7 +300,9 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_settings import requested_timezone_id
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -315,6 +326,7 @@ from skyvern.schemas.workflows import (
     normalize_error_code_description,
 )
 from skyvern.services import otp_email, otp_service, planner_levers
+from skyvern.services.email.gmail import GMAIL_MAX_MESSAGE_BYTES, GmailSendResult, send_raw_message
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
@@ -325,7 +337,7 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables
+from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -340,7 +352,12 @@ from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
-from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    normalize_download_filename,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.navigation import (
     default_navigation_settle,
     driver_nav_error_code,
@@ -938,6 +955,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
@@ -953,6 +971,7 @@ class Block(BaseModel, abc.ABC):
                 env=env,
                 skip_missing_variable_preflight=skip_missing_variable_preflight,
                 page_derived_capture=page_derived_capture,
+                extra_template_data=extra_template_data,
             )
         except Exception as exc:
             if field not in ("totp_identifier", "totp_verification_url"):
@@ -1400,6 +1419,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -1419,6 +1439,10 @@ class Block(BaseModel, abc.ABC):
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
         )
+        if extra_template_data:
+            # A field-specific binding only fills a gap: a workflow that already has a parameter
+            # under the same key keeps rendering its own value.
+            template_data = {**extra_template_data, **template_data}
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
@@ -1439,6 +1463,9 @@ class Block(BaseModel, abc.ABC):
                 str(exc),
                 available_keys=get_available_keys(potential_template, template_data),
             ) from exc
+        register_secret_derived_output(
+            workflow_run_context.secrets, template, potential_template, template_data, rendered
+        )
         if page_derived_capture is not None:
             page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
         return rendered
@@ -1582,6 +1609,9 @@ class Block(BaseModel, abc.ABC):
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
         if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
+            return
+        # The description prompt carries the block's recipients, subject and body to an LLM and into its logs.
+        if isinstance(self, SendEmailBlock) and self.transport == EmailTransport.GMAIL:
             return
         description = None
         try:
@@ -1924,14 +1954,21 @@ class Block(BaseModel, abc.ABC):
         pass
 
 
+def _is_retry_blocking_anti_bot_entry(category: dict) -> bool:
+    return (
+        category.get("category") == "ANTI_BOT_DETECTION"
+        and category.get("reason_code") not in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
+    )
+
+
 def _should_skip_retry_on_anti_bot_detection(task: Task) -> bool:
     categories = task.failure_category
     if categories:
-        return any(c.get("category") == "ANTI_BOT_DETECTION" for c in categories)
+        return any(_is_retry_blocking_anti_bot_entry(c) for c in categories)
 
     if task.failure_reason:
         result = classify_from_failure_reason(task.failure_reason)
-        if result and any(c.get("category") == "ANTI_BOT_DETECTION" for c in result):
+        if result and any(_is_retry_blocking_anti_bot_entry(c) for c in result):
             return True
 
     return False
@@ -2042,11 +2079,11 @@ class BaseTaskBlock(Block):
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
 
-        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
-        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
-        engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine or on a block whose skyvern_v1 a person pinned.
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this; when the
+        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A
+        block pinned to a non-default engine is honored as-authored, and a block the eligibility check
+        never saw is left alone; neither is ever rerouted. An unset engine routes like skyvern_v1, except
+        in a run that honors the chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
@@ -2106,8 +2143,17 @@ class BaseTaskBlock(Block):
             )
 
         if self.download_suffix:
+            if ORIGINAL_FILENAME_TEMPLATE_VARIABLE not in workflow_run_context.values:
+                reject_jinja_transformations_on_variable(
+                    self.download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
             self.download_suffix = self.render_templatable_field(
-                "download_suffix", self.download_suffix, workflow_run_context
+                "download_suffix",
+                self.download_suffix,
+                workflow_run_context,
+                extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
@@ -2417,6 +2463,8 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
+                # A retry reuses this row, which a step-engine fallback on the previous attempt relabeled.
+                engine=self.resolve_engine(workflow_run_id).value,
             )
             current_running_task = task
             organization = await app.DATABASE.organizations.get_organization(
@@ -3005,6 +3053,9 @@ class LoopBlockExecutedResult(BaseModel):
 
     def can_continue_after_failure(self) -> bool:
         return not self.block_outputs or self.block_outputs[-1].can_continue_after_failure
+
+    def last_block_failed_on_sign_in_form(self) -> bool:
+        return bool(self.block_outputs) and self.block_outputs[-1].sign_in_form_visible
 
     def is_completed(self) -> bool:
         if len(self.block_outputs) == 0:
@@ -4237,7 +4288,7 @@ class ForLoopBlock(Block):
 
         block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
-        return await self.build_block_result(
+        loop_result = await self.build_block_result(
             success=success,
             failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
@@ -4246,6 +4297,9 @@ class ForLoopBlock(Block):
             organization_id=organization_id,
             can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
+        if not success and loop_executed_result.last_block_failed_on_sign_in_form():
+            return replace(loop_result, sign_in_form_visible=True)
+        return loop_result
 
 
 class WhileLoopBlock(Block):
@@ -4925,7 +4979,7 @@ class WhileLoopBlock(Block):
 
         block_status, success, failure_reason = loop_executed_result.resolve_status(self.next_loop_on_failure)
 
-        return await self.build_block_result(
+        loop_result = await self.build_block_result(
             success=success,
             failure_reason=failure_reason,
             output_parameter_value=loop_executed_result.outputs_with_loop_values,
@@ -4934,6 +4988,9 @@ class WhileLoopBlock(Block):
             organization_id=organization_id,
             can_continue_after_failure=loop_executed_result.can_continue_after_failure(),
         )
+        if not success and loop_executed_result.last_block_failed_on_sign_in_form():
+            return replace(loop_result, sign_in_form_visible=True)
+        return loop_result
 
 
 class Credential(SimpleNamespace):
@@ -5013,6 +5070,39 @@ CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 # An exception can carry a whole page's text. Bound the persisted reason below the parameter
 # scrubber's disclosure budget, past which it fails closed and returns nothing at all.
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
+
+# Diagnostic operation-attribution probe. Bounded and fail-open: it runs on the code-block
+# locator-failure path only (when the failure is bound to a recorded locator), never replaces the
+# original exception/result, and adds no wait to the success path.
+CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS = 0.2
+_OPERATION_ATTRIBUTION_SCHEMA_VERSION = 1
+# Frozen privacy allowlist for the internal operation_attribution envelope; enforced by test.
+_OPERATION_ATTRIBUTION_ALLOWLIST = (
+    "schema_version",
+    "organization_id",
+    "workflow_permanent_id",
+    "workflow_id",
+    "workflow_run_id",
+    "workflow_run_block_id",
+    "block_label",
+    "engine",
+    "code_line",
+    "matched_step_index",
+    "probe_match_count",
+    "probe_status",
+    "exception_class",
+)
+# The secure runner reports probe_status as a free string over gRPC; only these reach the envelope.
+_LOCATOR_PROBE_STATUSES = frozenset({"counted", "timeout", "error"})
+_NATIVE_EXCEPTION_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _consume_probe_result(task: asyncio.Future[Any]) -> None:
+    # Retrieve a late locator-count result/exception so a driver reply that lands after the bounded
+    # wait (e.g. a navigation that destroys the execution context) is consumed rather than surfacing
+    # as an unretrieved-future error -- the very signal this telemetry exists to measure.
+    if not task.cancelled():
+        task.exception()
 
 
 MACHINERY_STACK_MAX_FRAMES = 40
@@ -6779,6 +6869,13 @@ class CodeBlock(Block):
             download_log=download_log,
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
+            file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
+            deadline=(
+                monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+                if settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+                else None
+            ),
         )
         safe_vars["open_page"] = _bind_code_block_open_page(
             page, opened_pages if opened_pages is not None else [], browser_state
@@ -7587,6 +7684,73 @@ async def wrapper({default_args}):
                 return idx
         return None
 
+    async def _probe_failed_locator_count(self, locator: Any) -> tuple[int | None, str]:
+        """Probe-time (not attempt-time) non-strict match count of the exact failed locator.
+
+        Fail-open and separately bounded: a timeout or error yields ``(None, status)`` and never
+        alters the original exception, result, or evidence. The count runs as a detached task bounded
+        by a wait (mirroring the secure arm) so a late driver reply after a navigation is consumed,
+        not left as an unretrieved future; cancellation of the caller still propagates.
+        """
+        task = asyncio.ensure_future(locator.count())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=CODE_BLOCK_LOCATOR_PROBE_TIMEOUT_SECONDS)
+            if not done:
+                return None, "timeout"
+            count = task.result()
+        except Exception:
+            return None, "error"
+        finally:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_probe_result)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return None, "error"
+        # Exact, uncapped: query-time aggregation may bucket later, but emission must not lose the value.
+        return count, "counted"
+
+    def _emit_operation_attribution_failure(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        failing_line: int | None,
+        exception_class: str | None,
+        probe_match_count: int | None,
+        probe_status: str,
+        engine: str = "inline",
+    ) -> None:
+        """Emit the internal, privacy-safe operation-attribution failure event.
+
+        Every field is inside the ``operation_attribution`` envelope, which the log processor pops
+        before the downloadable ``context.log`` artifact. Only bounded IDs/enums/ints/bools and the
+        exception's type name are recorded -- never selector text, code, DOM, URLs, or messages.
+
+        Operation ambiguity is intentionally not emitted: on the secure arm the recorder rows carry no
+        authored ``code_line`` (always-false, misleading), and it is derivable at query time by
+        grouping the persisted recorded-action rows on ``code_line``.
+        """
+        LOG.info(
+            "codeblock.locator_probe",
+            operation_attribution={
+                "schema_version": _OPERATION_ATTRIBUTION_SCHEMA_VERSION,
+                "organization_id": organization_id,
+                "workflow_permanent_id": workflow_run_context.workflow_permanent_id,
+                "workflow_id": workflow_run_context.workflow_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "block_label": self.label,
+                "engine": engine,
+                "code_line": failing_line,
+                "matched_step_index": self._matched_step_index_for_failing_line(failing_line),
+                "probe_match_count": probe_match_count,
+                "probe_status": probe_status,
+                "exception_class": exception_class,
+            },
+        )
+
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
         return workflow_run_context.mask_secrets_in_data(self.prompt or "")
 
@@ -8023,6 +8187,8 @@ async def wrapper({default_args}):
                 attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
+                # Dispatched on v3 below; script generation reads this column to keep v3 actions out.
+                engine=RunEngine.skyvern_v3,
             )
             recovery_block_id = recovery_block.workflow_run_block_id
 
@@ -8114,7 +8280,9 @@ async def wrapper({default_args}):
             if updated_task.status == TaskStatus.completed:
                 # The block's value is what its own return would have been; downloads are bound by
                 # the recorder (_finalize_heal_result), the same as the inline success exit.
-                output_parameter_value = workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                output_parameter_value = without_generated_file_stamp(
+                    workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                )
                 if record_output_parameter:
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
@@ -8592,10 +8760,14 @@ async def wrapper({default_args}):
             return "".join(char for char in redacted if unicodedata.category(char)[0] != "C").strip()[:1000] or None
 
         state: dict[str, str] = {}
+        first_url: str | None = None
+        later_url: str | None = None
+        page_title: str | None = None
         try:
             async with asyncio.timeout(0.5):
                 try:
-                    final_url = mask_fact(page.url)
+                    first_url = page.url
+                    final_url = mask_fact(first_url)
                     if final_url:
                         state["final_url"] = final_url
                 except asyncio.CancelledError:
@@ -8604,12 +8776,15 @@ async def wrapper({default_args}):
                     pass
                 try:
                     page_title = mask_fact(await page.title())
-                    if page_title:
-                        state["page_title"] = page_title
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - failure evidence is best effort.
                     pass
+                finally:
+                    with contextlib.suppress(Exception):
+                        later_url = page.url
+                        if later_url != first_url and (later_final_url := mask_fact(later_url)):
+                            state["final_url"] = later_final_url
                 try:
                     receiver_url = mask_fact(receiver.url) if receiver is not None else None
                     if receiver_url:
@@ -8631,6 +8806,9 @@ async def wrapper({default_args}):
             raise
         except TimeoutError:
             pass
+        # A document committed after the first url read would pair one document's URL with another's title.
+        if page_title and first_url is not None and later_url == first_url:
+            state["page_title"] = page_title
         return state
 
     async def _persist_captured_failure_final_url(
@@ -8735,6 +8913,8 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any] | None = None,
         download_claim_outcome: DownloadClaimOutcome | None = None,
         failed_nav_error_code: str | None = None,
+        # Read by the caller before this runs, since AI fallback can navigate away from the failing tab.
+        sign_in_form_visible: bool = False,
         authored_code: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
@@ -8743,6 +8923,9 @@ async def wrapper({default_args}):
 
         def scrub_failure_value(value: str | None, fallback: str = CODE_BLOCK_GENERIC_FAILURE_REASON) -> str | None:
             return _redact_codeblock_failure_text(value, resolved_redaction_parameters, fallback)
+
+        def with_sign_in_fact(result: BlockResult) -> BlockResult:
+            return replace(result, sign_in_form_visible=True) if sign_in_form_visible else result
 
         if (
             organization_id
@@ -8874,7 +9057,7 @@ async def wrapper({default_args}):
                     return result
 
                 async def return_committed_final_failure() -> BlockResult:
-                    return result
+                    return with_sign_in_fact(result)
 
                 return await self._publish_failure_result_with_evidence(
                     build_failure_result=return_committed_final_failure,
@@ -8891,7 +9074,7 @@ async def wrapper({default_args}):
 
             async def persist_unhealed_failure() -> BlockResult:
                 result = await build_failure_result()
-                return _redact_codeblock_result(result, resolved_redaction_parameters)
+                return with_sign_in_fact(_redact_codeblock_result(result, resolved_redaction_parameters))
 
             return await self._publish_failure_result_with_evidence(
                 build_failure_result=persist_unhealed_failure,
@@ -9437,6 +9620,37 @@ async def wrapper({default_args}):
                         )
                     await recorder.persist(recorded)
                     if secure_failure is not None:
+                        # The worker measured the failed locator's match count; emitting it here must never
+                        # alter the classified secure failure below.
+                        if secure_failure.locator_probe_status in _LOCATOR_PROBE_STATUSES:
+                            try:
+                                self._emit_operation_attribution_failure(
+                                    organization_id=organization_id,
+                                    workflow_run_context=workflow_run_context,
+                                    workflow_run_id=workflow_run_id,
+                                    workflow_run_block_id=workflow_run_block_id,
+                                    failing_line=secure_failure.failing_line,
+                                    # Never the broker wrapper class: it would not group with inline events.
+                                    exception_class=(
+                                        secure_failure.native_exception_class
+                                        if secure_failure.native_exception_class is not None
+                                        and _NATIVE_EXCEPTION_CLASS.fullmatch(secure_failure.native_exception_class)
+                                        else None
+                                    ),
+                                    probe_match_count=(
+                                        secure_failure.locator_match_count
+                                        if secure_failure.locator_match_count is not None
+                                        and secure_failure.locator_match_count >= 0
+                                        else None
+                                    ),
+                                    probe_status=secure_failure.locator_probe_status,
+                                    engine="secure",
+                                )
+                            except Exception:
+                                LOG.debug(
+                                    "codeblock.locator_probe failed open; original failure preserved",
+                                    exc_info=True,
+                                )
                         # The runner's code is uncorroborated; the worker recorder resolved the host, so a dead
                         # site behind the proxy (reported there as the sentinel) keeps healing.
                         secure_nav_code = (
@@ -9539,6 +9753,15 @@ async def wrapper({default_args}):
                                 or None,
                             )
 
+                        # The worker checks the failing tab before it closes the runner's opened tabs. Without its answer
+                        # the block's own page is checked, except after a failure on an opened tab or a timeout, whose
+                        # tab is unknown.
+                        if secure_failure.sign_in_form_visible is not None:
+                            secure_sign_in_form_visible = secure_failure.sign_in_form_visible
+                        elif secure_failure.receiver_url is not None or secure_failure.error_code == "timeout":
+                            secure_sign_in_form_visible = False
+                        else:
+                            secure_sign_in_form_visible = await page_shows_sign_in_form(page)
                         return await self._resolve_failure_with_heal(
                             authored_code=authored_code,
                             exception=None,
@@ -9546,6 +9769,7 @@ async def wrapper({default_args}):
                             build_failure_result=build_secure_failure_result,
                             classification=secure_classification,
                             failed_nav_error_code=recovery_nav_code,
+                            sign_in_form_visible=secure_sign_in_form_visible,
                             recorder=recorder,
                             workflow_run_context=workflow_run_context,
                             workflow_run_id=workflow_run_id,
@@ -9839,7 +10063,10 @@ async def wrapper({default_args}):
             timeout_navigation = _context_navigation_output(
                 recording_page.failure_document_receipt(e), workflow_run_context, serialized_parameter_values
             )
-            return await self._failed_result_with_evidence(
+            # wait_for raises the timeout from the cancellation of the call in flight, which names the tab it ran on.
+            timeout_failure_page = recording_page.failing_tab(e.__cause__) if e.__cause__ is not None else None
+            timeout_on_sign_in_form = await page_shows_sign_in_form(timeout_failure_page or page)
+            timeout_result = await self._failed_result_with_evidence(
                 failure_reason=timeout_failure_reason,
                 output_parameter_value=(
                     {**build_block_failure_output(timeout_failure_reason, []), **timeout_navigation}
@@ -9858,6 +10085,7 @@ async def wrapper({default_args}):
                 download_dir_before=download_dir_before,
                 attempt_started_at=attempt_started_at,
             )
+            return replace(timeout_result, sign_in_form_visible=True) if timeout_on_sign_in_form else timeout_result
         except Exception as e:
             # Exact type, not isinstance: the IllegitCompleteScriptTermination subclass means the
             # complete-verifier rejected the block, which is a failure to heal, not an intentional stop.
@@ -9879,6 +10107,7 @@ async def wrapper({default_args}):
                     attempt_started_at=attempt_started_at,
                 )
             failing_line = user_code_line_from_exception(e)
+            failing_tab = recording_page.failing_tab(e)
             declared_error = self._extract_declared_error(e, workflow_run_context)
             if declared_error is not None:
                 await recorder.persist(recorder.recorded_actions())
@@ -9940,6 +10169,7 @@ async def wrapper({default_args}):
                     attempt_started_at=attempt_started_at,
                     redaction_parameters=serialized_parameter_values,
                     download_claim_outcome=inline_download_claim_outcome.outcome,
+                    sign_in_form_visible=await page_shows_sign_in_form(failing_tab or page),
                 )
             if (
                 type(e) is ErrorCode
@@ -9988,12 +10218,40 @@ async def wrapper({default_args}):
                     failure_page=failed_page,
                     workflow_run_context=workflow_run_context,
                     redaction_parameters=serialized_parameter_values,
-                    opened_pages=opened_pages,
+                    opened_pages=[*opened_pages, *recording_page._claimed_popups()],
                 )
             if inline_failure_page_state:
                 from skyvern.forge.sdk.workflow.models.code_block_recorder import append_failure_page_state
 
                 failure_reason = append_failure_page_state(failure_reason, **inline_failure_page_state)
+            # Diagnostic operation-attribution probe: after the existing higher-priority failure
+            # evidence and before outcome construction. The structural gate is the only gate --
+            # it fires whenever the failure is bound to a recorded locator (incl. strict-mode),
+            # separate from the customer-visible PlaywrightTimeoutError capture gate above.
+            # Fully fail-open: any failure in locator identification, probe, attribute assembly, or
+            # emission must leave the original classified failure/result unchanged, so the whole
+            # block is guarded (cancellation still propagates). Touches no failure_reason/output/
+            # action row/error code.
+            try:
+                probe_locator = recording_page.failure_locator(e)
+                # An ElementHandle was already resolved, so there is no selector left to count; the
+                # secure arm skips element handles too.
+                if probe_locator is not None and not is_element_handle(probe_locator):
+                    probe_match_count, probe_status = await self._probe_failed_locator_count(probe_locator)
+                    self._emit_operation_attribution_failure(
+                        organization_id=organization_id,
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        failing_line=failing_line,
+                        exception_class=type(e).__name__,
+                        probe_match_count=probe_match_count,
+                        probe_status=probe_status,
+                    )
+            except Exception:
+                # CancelledError is a BaseException on the supported Python (>=3.11) and is not caught
+                # here, so cancellation still propagates while every other failure stays fail-open.
+                LOG.debug("codeblock.locator_probe failed open; original failure preserved", exc_info=True)
             recorded = recorder.recorded_actions()
             if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
@@ -10094,6 +10352,7 @@ async def wrapper({default_args}):
                 build_failure_result=build_legacy_failure_result,
                 classification=legacy_classification,
                 failed_nav_error_code=inline_nav_code,
+                sign_in_form_visible=await page_shows_sign_in_form(failing_tab or page),
                 recorder=recorder,
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
@@ -10115,13 +10374,11 @@ async def wrapper({default_args}):
             # would either crash registration or, via the default= fallback, replace the value with a
             # useless placeholder — normalize the wrapper family to its selector/marker first.
             result = json_safe_recorder_output(result)
-            result = json.loads(
-                json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
-            )
+            result = json.loads(json.dumps(result, default=json_safe_default))
             # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
             # reach captured locals, the persisted output, or the logged value. Mirrors
             # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
-            result = workflow_run_context.mask_secrets_in_data(result)
+            result = without_generated_file_stamp(workflow_run_context.mask_secrets_in_data(result))
 
             try:
                 downloaded_files, skipped_file_names = await self._register_downloaded_files(
@@ -12456,6 +12713,149 @@ def _send_via_custom_smtp(
                 LOG.warning("SendEmailBlock Failed to close custom SMTP connection", exc_info=True)
 
 
+GMAIL_MAX_ATTACHMENT_TOTAL_MB = 25
+_GMAIL_EXECUTION_PATH_MAX_DEPTH = 32
+_GMAIL_RETRY_CHAIN_MAX_DEPTH = 32
+
+GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
+    GmailSendErrorCode.CONFIGURATION: (
+        "No Gmail account is selected for this block, or the selected account no longer exists. "
+        "Choose a connected Gmail account that can send."
+    ),
+    GmailSendErrorCode.MISSING_SCOPE: (
+        "The selected Google account has not granted permission to send email. "
+        "Enable sending for it on the Integrations page."
+    ),
+    GmailSendErrorCode.RECONNECT: (
+        "The selected Google account must be reconnected on the Integrations page before it can send email."
+    ),
+    GmailSendErrorCode.NO_RECIPIENTS: "The email has no recipients. Add at least one To, Cc or Bcc address.",
+    GmailSendErrorCode.INVALID_RECIPIENT: "A recipient is not a valid email address.",
+    GmailSendErrorCode.INVALID_HEADER: (
+        "The subject or a recipient contains characters that are not allowed in an email header."
+    ),
+    GmailSendErrorCode.ATTACHMENT_INVALID: (
+        "An attachment could not be used. With Gmail each attachment must be one file from this run or one file "
+        "URL; folders and the download directory are not attached."
+    ),
+    GmailSendErrorCode.ATTACHMENT_TOO_LARGE: (
+        f"The attachments are larger than the {GMAIL_MAX_ATTACHMENT_TOTAL_MB} MB limit for Gmail."
+    ),
+    GmailSendErrorCode.TEMPLATE_ERROR: (
+        "A template in the email could not be rendered. Check the parameter names used in the recipients, "
+        "subject, body and attachments."
+    ),
+    GmailSendErrorCode.PROVIDER_REJECTED: "Gmail rejected the message. Nothing was sent.",
+    GmailSendErrorCode.RATE_LIMITED: (
+        "Gmail refused the message because the account reached a sending limit. Nothing was sent."
+    ),
+    GmailSendErrorCode.OUTCOME_UNKNOWN: (
+        "Gmail did not confirm whether the message was sent, and it was not retried. "
+        "Check the account's Sent folder before running this again."
+    ),
+    GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
+}
+
+_GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
+    google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
+    google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE: GmailSendErrorCode.MISSING_SCOPE,
+    google_oauth_service.GmailSendAuthorizationStatus.RECONNECT: GmailSendErrorCode.RECONNECT,
+    google_oauth_service.GmailSendAuthorizationStatus.UNAVAILABLE: GmailSendErrorCode.INTERNAL_ERROR,
+}
+
+
+class _GmailSendRefused(Exception):
+    def __init__(self, error_code: GmailSendErrorCode) -> None:
+        super().__init__(error_code.value)
+        self.error_code = error_code
+
+
+class _GmailSendStateUnreadable(Exception):
+    pass
+
+
+_GmailSendStateT = TypeVar("_GmailSendStateT")
+
+
+async def _gmail_send_state(operation: Awaitable[_GmailSendStateT]) -> _GmailSendStateT:
+    """Run one read or write of the send-once row; a failure leaves it unknown whether a message went out."""
+    try:
+        return await operation
+    except Exception as exc:
+        LOG.warning("SendEmailBlock could not read or write the Gmail send record", error_type=type(exc).__name__)
+        raise _GmailSendStateUnreadable from None
+
+
+def _add_file_attachment(msg: EmailMessage, path: str) -> None:
+    kind = filetype.guess(path)
+    if kind:
+        ctype = kind.mime
+        extension = kind.extension
+    else:
+        ctype = "application/octet-stream"
+        extension = None
+
+    maintype, subtype = ctype.split("/", 1)
+    attachment_path = Path(path)
+    attachment_filename = attachment_path.name
+    if not attachment_path.suffix and extension:
+        attachment_filename += f".{extension}"
+
+    LOG.info(
+        "SendEmailBlock Adding attachment",
+        filename=attachment_filename,
+        maintype=maintype,
+        subtype=subtype,
+    )
+    with open(path, "rb") as fp:
+        msg.add_attachment(
+            fp.read(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment_filename,
+        )
+
+
+def _build_gmail_message_bytes(
+    *,
+    from_address: str,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str,
+    body: str,
+    body_format: EmailBodyFormat,
+    attachment_paths: list[str],
+) -> bytes:
+    msg = EmailMessage()
+    msg["From"] = from_address
+    for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
+        if addresses:
+            msg[header] = ", ".join(addresses)
+    msg["Subject"] = subject
+    email.set_body(msg, body, body_format)
+    for path in attachment_paths:
+        try:
+            _add_file_attachment(msg, path)
+        except (OSError, ValueError):
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+    return msg.as_bytes(policy=SMTP_EMAIL_POLICY)
+
+
+def _gmail_result_from_dispatch(dispatch: GmailSendDispatch) -> GmailSendResult:
+    if dispatch.status == DISPATCH_ACCEPTED:
+        return GmailSendResult(GmailSendOutcome.ACCEPTED, provider_message_id=dispatch.provider_message_id)
+    if dispatch.status == DISPATCH_FAILED:
+        return GmailSendResult(
+            GmailSendOutcome.FAILED,
+            error_code=dispatch.error_code or GmailSendErrorCode.PROVIDER_REJECTED,
+            provider_status=dispatch.provider_status,
+            provider_reason=dispatch.provider_reason,
+        )
+    # A claim with no recorded outcome means an earlier attempt may have reached Gmail.
+    return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+
+
 class SendEmailBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -12480,10 +12880,18 @@ class SendEmailBlock(Block):
     # Encrypted at rest in the workflow definition (see secret_encryption.py); may also
     # reference a workflow secret parameter.
     custom_smtp_password: str | None = None
+    # Absent means SMTP. With gmail the message is sent from the connected Google account named by
+    # credential_id; sender and the smtp_* settings are not used.
+    transport: EmailTransport | None = None
+    credential_id: str | None = None
+    cc: list[str] = []
+    bcc: list[str] = []
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
+            "bcc",
             "body",
+            "cc",
             "custom_smtp_host",
             "custom_smtp_username",
             "file_attachments",
@@ -12526,7 +12934,8 @@ class SendEmailBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
+        if self.transport != EmailTransport.GMAIL:
+            self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
         self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
         self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
@@ -12536,6 +12945,8 @@ class SendEmailBlock(Block):
             formatted_recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
             formatted_recipients.append(formatted_recipient)
         self.recipients = formatted_recipients
+        self.cc = [self.render_templatable_field("cc", entry, workflow_run_context) for entry in self.cc]
+        self.bcc = [self.render_templatable_field("bcc", entry, workflow_run_context) for entry in self.bcc]
 
         if self.custom_smtp_host:
             self.custom_smtp_host = self.render_templatable_field(
@@ -12649,6 +13060,10 @@ class SendEmailBlock(Block):
         context = skyvern_context.current()
         run_id = context.run_id if context and context.run_id else workflow_run_id
         for path in self.file_attachments:
+            # Only an entry blank as written is skipped; one that resolves or renders to empty still fails,
+            # since that usually means an upstream file is missing.
+            if not path.strip():
+                continue
             # if the file path is a parameter, get the value from the workflow run context first
             if workflow_run_context.has_parameter(path):
                 file_path_parameter_value = workflow_run_context.get_value(path)
@@ -12696,15 +13111,18 @@ class SendEmailBlock(Block):
 
         return file_paths
 
-    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+    @staticmethod
+    def _resolve_recipient_entries(entries: list[str], workflow_run_context: WorkflowRunContext) -> list[str]:
         resolved: list[str] = []
-        for recipient in self.recipients:
+        for recipient in entries:
             if workflow_run_context.has_parameter(recipient):
                 resolved.append(str(workflow_run_context.get_value(recipient)))
             else:
                 resolved.append(recipient)
+        return email.normalize_recipients(resolved)
 
-        recipients = email.normalize_recipients(resolved)
+    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+        recipients = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         if not recipients:
             raise NoValidEmailRecipient()
         # An invalid entry fails the block: dropping it would deliver to a subset of the intended
@@ -12754,44 +13172,9 @@ class SendEmailBlock(Block):
             if not path:
                 raise FileNotFoundError(f"File not found: {filename}")
 
-            # Guess the content type based on the file's extension.  Encoding
-            # will be ignored, although we should check for simple things like
-            # gzip'd or compressed files.
-            kind = filetype.guess(path)
-            if kind:
-                ctype = kind.mime
-                extension = kind.extension
-            else:
-                # No guess could be made, or the file is encoded (compressed), so
-                # use a generic bag-of-bits type.
-                ctype = "application/octet-stream"
-                extension = None
-
-            maintype, subtype = ctype.split("/", 1)
-            attachment_path = Path(path)
-            attachment_filename = attachment_path.name
-
-            # Check if the filename has an extension
-            if not attachment_path.suffix:
-                # If no extension, guess it based on the MIME type
-                if extension:
-                    attachment_filename += f".{extension}"
-
-            LOG.info(
-                "SendEmailBlock Adding attachment",
-                filename=attachment_filename,
-                maintype=maintype,
-                subtype=subtype,
-            )
-            with open(path, "rb") as fp:
-                msg.add_attachment(
-                    fp.read(),
-                    maintype=maintype,
-                    subtype=subtype,
-                    filename=attachment_filename,
-                )
-                file_hash = calculate_sha256_for_file(path)
-                file_names_by_hash[file_hash].append(path)
+            _add_file_attachment(msg, path)
+            file_hash = calculate_sha256_for_file(path)
+            file_names_by_hash[file_hash].append(path)
 
         # Calculate file stats based on content hashes
         total_files = sum(len(files) for files in file_names_by_hash.values())
@@ -12808,6 +13191,285 @@ class SendEmailBlock(Block):
 
         return msg
 
+    async def _gmail_execution_key(self, workflow_run_block_id: str, organization_id: str) -> str:
+        """Identify this logical execution by its label and the iteration of every enclosing loop."""
+        # Only loop rows count: the engine nests a branch target under its conditional's row and cached code does not.
+        loop_path: list[tuple[str | None, int | None]] = []
+        child_index: int | None = None
+        block_id: str | None = workflow_run_block_id
+        for depth in range(_GMAIL_EXECUTION_PATH_MAX_DEPTH):
+            if block_id is None:
+                break
+            row = await app.DATABASE.observer.get_workflow_run_block(block_id, organization_id=organization_id)
+            if depth and row.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
+                loop_path.append((row.label, child_index))
+            child_index = row.current_index
+            block_id = row.parent_workflow_run_block_id
+        if block_id is not None:
+            raise RuntimeError("workflow run block nesting is deeper than the supported limit")
+        return hashlib.sha256(json.dumps([self.label, loop_path]).encode()).hexdigest()
+
+    @staticmethod
+    async def _gmail_root_run_id(workflow_run_id: str, organization_id: str) -> str | None:
+        """The first run of this run's credential-fallback retry chain, or None when the chain is too long."""
+        run_id = workflow_run_id
+        for _ in range(_GMAIL_RETRY_CHAIN_MAX_DEPTH):
+            run = await app.DATABASE.workflow_runs.get_workflow_run(run_id, organization_id=organization_id)
+            if run is None:
+                raise RuntimeError("a workflow run in the retry chain was not found")
+            if not run.retried_from_workflow_run_id:
+                return run_id
+            run_id = run.retried_from_workflow_run_id
+        return None
+
+    async def _resolve_gmail_attachments(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        organization_id: str,
+        staging_dir: str,
+    ) -> list[str]:
+        """Resolve each listed entry to exactly one local file, checking sizes before any bytes are read."""
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
+        max_total_bytes = GMAIL_MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+        total_bytes = 0
+        paths: list[str] = []
+        for entry in self.file_attachments:
+            if not entry.strip():
+                continue
+            if workflow_run_context.has_parameter(entry):
+                value = workflow_run_context.get_value(entry)
+                value = workflow_run_context.get_original_secret_value_or_none(value) or value
+                if not isinstance(value, str):
+                    raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+                entry = value
+            try:
+                entry = self.render_templatable_field("file_attachments", entry, workflow_run_context)
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+            if not entry.strip() or entry == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            try:
+                if is_remote_url(entry) or is_uploaded_file_id(entry):
+                    # Its own folder, so two entries with one file name both keep that name.
+                    entry_dir = tempfile.mkdtemp(dir=staging_dir)
+                    path = await download_file(
+                        entry,
+                        max_size_mb=GMAIL_MAX_ATTACHMENT_TOTAL_MB,
+                        output_dir=entry_dir,
+                        organization_id=organization_id,
+                        preserve_existing_files=True,
+                        staging_dir=entry_dir,
+                        limit_managed_file_size=True,
+                    )
+                else:
+                    path = validate_local_file_path(entry, run_id)
+            except DownloadFileMaxSizeExceeded:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE) from None
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+            if not os.path.isfile(path):
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            total_bytes += os.path.getsize(path)
+            if total_bytes > max_total_bytes:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+            paths.append(path)
+        return paths
+
+    async def _send_via_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+    ) -> tuple[GmailSendResult, bool]:
+        # Read first, before anything that can fail differently on a re-run, so a replay always reports what happened.
+        # The record is kept under the retry chain's first run: a credential-fallback retry is a new run that
+        # repeats the same logical sends.
+        record_run_id = await _gmail_send_state(self._gmail_root_run_id(workflow_run_id, organization_id))
+        if record_run_id is None:
+            raise _GmailSendRefused(GmailSendErrorCode.INTERNAL_ERROR)
+        execution_key = await _gmail_send_state(self._gmail_execution_key(workflow_run_block_id, organization_id))
+        existing = await _gmail_send_state(
+            app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+        )
+        # Gmail rejected a failed row's message outright, so only that state may be attempted again.
+        if existing is not None and existing.status != DISPATCH_FAILED:
+            return _gmail_result_from_dispatch(existing), True
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception:
+            raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+
+        credential_id = (self.credential_id or "").strip()
+        if not credential_id:
+            raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+        to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
+        cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
+        bcc = self._resolve_recipient_entries(self.bcc, workflow_run_context)
+        if not (to or cc or bcc):
+            raise _GmailSendRefused(GmailSendErrorCode.NO_RECIPIENTS)
+        try:
+            email.validate_recipients([*to, *cc, *bcc])
+        except ValueError:
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT) from None
+        # The header encoder would split a non-ASCII address into an encoded word that is no longer an address.
+        if not all(address.isascii() for address in (*to, *cc, *bcc)):
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT)
+        # Downloaded attachments are staged where only this send writes: the shared temp folder names a file by
+        # its base name alone, so another entry or another run could replace it before it is read.
+        with tempfile.TemporaryDirectory(
+            prefix="gmail_send_",
+            dir=get_run_temp_dir(organization_id, workflow_run_id),
+            ignore_cleanup_errors=True,
+        ) as staging_dir:
+            attachment_paths = await self._resolve_gmail_attachments(
+                workflow_run_context, workflow_run_id, organization_id, staging_dir
+            )
+
+            authorization = await google_oauth_service.resolve_gmail_send_authorization(organization_id, credential_id)
+            if (
+                authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                or not authorization.access_token
+                or not authorization.from_address
+            ):
+                raise _GmailSendRefused(
+                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                )
+
+            body = self.body
+            if body and workflow_run_context.has_parameter(body) and workflow_run_context.has_value(body):
+                body = str(workflow_run_context.get_value(body))
+            try:
+                mime_bytes = await asyncio.to_thread(
+                    _build_gmail_message_bytes,
+                    from_address=authorization.from_address,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=self.subject.strip().replace("\n", "").replace("\r", ""),
+                    body=body,
+                    body_format=self.body_format,
+                    attachment_paths=attachment_paths,
+                )
+            except ValueError:
+                raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER) from None
+        if len(mime_bytes) > GMAIL_MAX_MESSAGE_BYTES:
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+
+        if existing is None:
+            claim = await _gmail_send_state(
+                app.DATABASE.google_oauth.claim_gmail_send_dispatch(
+                    organization_id=organization_id,
+                    workflow_run_id=record_run_id,
+                    execution_key=execution_key,
+                    block_label=self.label,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = claim.gmail_send_dispatch_id if claim else None
+        else:
+            reclaimed = await _gmail_send_state(
+                app.DATABASE.google_oauth.reclaim_failed_gmail_send_dispatch(
+                    gmail_send_dispatch_id=existing.gmail_send_dispatch_id,
+                    observed_modified_at=existing.modified_at,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = existing.gmail_send_dispatch_id if reclaimed else None
+        if dispatch_id is None:
+            winner = await _gmail_send_state(
+                app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+            )
+            if winner is None:
+                return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN), True
+            return _gmail_result_from_dispatch(winner), True
+
+        # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
+        try:
+            result = await send_raw_message(authorization.access_token, mime_bytes)
+        except Exception:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        try:
+            await app.DATABASE.google_oauth.finalize_gmail_send_dispatch(
+                gmail_send_dispatch_id=dispatch_id,
+                status=result.outcome.value,
+                provider_message_id=result.provider_message_id,
+                error_code=result.error_code,
+                provider_status=result.provider_status,
+                provider_reason=result.provider_reason,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "SendEmailBlock failed to record the Gmail send outcome",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                outcome=result.outcome.value,
+                error_type=type(exc).__name__,
+            )
+        return result, False
+
+    async def _execute_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        replayed = False
+        try:
+            if not organization_id:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+            result, replayed = await self._send_via_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
+        except _GmailSendRefused as refusal:
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
+        except _GmailSendStateUnreadable:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        except Exception as exc:
+            # No exception text or traceback: both can carry recipients, message text or provider responses.
+            LOG.warning(
+                "SendEmailBlock Gmail send could not be prepared",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                error_type=type(exc).__name__,
+            )
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.INTERNAL_ERROR)
+
+        accepted = result.outcome == GmailSendOutcome.ACCEPTED
+        LOG.info(
+            "SendEmailBlock Gmail send finished",
+            workflow_run_id=workflow_run_id,
+            block_label=self.label,
+            outcome=result.outcome.value,
+            error_code=result.error_code.value if result.error_code else None,
+            provider_status=result.provider_status,
+            provider_reason=result.provider_reason,
+            replayed=replayed,
+        )
+        result_dict = {
+            "success": accepted,
+            "transport": EmailTransport.GMAIL.value,
+            "outcome": result.outcome.value,
+            "provider_message_id": result.provider_message_id,
+            "error_code": result.error_code.value if result.error_code else None,
+            "replayed": replayed,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+        return await self.build_block_result(
+            success=accepted,
+            failure_reason=None
+            if accepted
+            else GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
+            output_parameter_value=result_dict,
+            status=BlockStatus.completed if accepted else BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -12817,6 +13479,10 @@ class SendEmailBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if self.transport == EmailTransport.GMAIL:
+            return await self._execute_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
         await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
@@ -18840,6 +19506,7 @@ class WorkflowTriggerBlock(Block):
         # setup_workflow_run so the child run persists that engine despite carrying a browser_session_id;
         # stays None for caller-supplied sessions and parent-shared browsers.
         child_effective_browser_type: str | None = None
+        child_workflow_run_id: str | None = None
         if self.browser_session_id:
             resolved_browser_session_id = self.browser_session_id
         elif self.use_parent_browser_session and browser_session_id:
@@ -18882,6 +19549,11 @@ class WorkflowTriggerBlock(Block):
                     if child_mapped_browser_type is not None:
                         child_session_kwargs["browser_type"] = child_mapped_browser_type
                         child_session_kwargs["workflow_run_id"] = workflow_run_id
+                    target_browser_settings = target_workflow.workflow_definition.browser_settings
+                    if requested_timezone_id(target_browser_settings) is not None:
+                        child_workflow_run_id = generate_workflow_run_id()
+                        child_session_kwargs["browser_settings"] = target_browser_settings
+                        child_session_kwargs["created_for_workflow_run_id"] = child_workflow_run_id
             except (WorkflowNotFound, SQLAlchemyError) as e:
                 return await _fail(f"Failed to resolve triggered workflow: {get_user_facing_exception_message(e)}")
             try:
@@ -18889,6 +19561,7 @@ class WorkflowTriggerBlock(Block):
                     organization_id=organization_id,
                     proxy_location=proxy_location,
                     timeout_minutes=30,
+                    session_kind=BrowserSessionKind.workflow_run,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id
@@ -18951,6 +19624,7 @@ class WorkflowTriggerBlock(Block):
                             # though it carries a browser_session_id. None for caller-supplied/parent-shared.
                             server_owned_browser_type=child_effective_browser_type if created_fresh_session else None,
                             reject_empty_workflow=True,
+                            workflow_run_id=child_workflow_run_id,
                         )
                     except Exception as e:
                         error_msg = get_user_facing_exception_message(e)
@@ -19155,13 +19829,14 @@ class V3AbIneligibleReason(StrEnum):
     eligible" but not "why not."
     """
 
-    script_run = "script_run"
     pinned_engine = "pinned_engine"
+    # An explicit request to generate code from this run; v3 actions cannot produce a usable script.
+    code_generation_requested = "code_generation_requested"
     unsupported_block = "unsupported_block"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
-def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReason | None:
     """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
@@ -19178,12 +19853,9 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
     full run in the cohort anyway.
 
-    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
-    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
-    execution.
+    A run headed for a cached script is eligible: treatment runs it as a v3 agent without the script
+    (see ``code_mode_displaced``), so the arm covers every block rather than only the ai_fallback ones.
     """
-    if is_script_run:
-        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if isinstance(block, ConditionalBlock):
@@ -19250,9 +19922,9 @@ def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
     return False if has_engine_block else None
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar]) -> bool:
     """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
-    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
+    return v3_ab_ineligibility_reason(blocks) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

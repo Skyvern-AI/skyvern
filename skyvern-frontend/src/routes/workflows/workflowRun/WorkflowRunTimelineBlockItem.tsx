@@ -32,6 +32,8 @@ import {
   isThoughtItem,
   isWorkflowRunBlock,
   ObserverThought,
+  gmailSendOutcomeSummary,
+  readGmailSendOutput,
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
@@ -1118,7 +1120,13 @@ function WorkflowRunTimelineBlockItem({
     : [];
   const blockName = block.label ?? blockTypeTitle;
   const descriptor = getTimelineDescriptor(block);
-  const resultSummary = getWebSearchResultSummary(block);
+  const gmailSendOutput =
+    block.block_type === WorkflowBlockTypes.SendEmail
+      ? readGmailSendOutput(block.output)
+      : null;
+  const resultSummary = gmailSendOutput
+    ? gmailSendOutcomeSummary(gmailSendOutput)
+    : getWebSearchResultSummary(block);
   const evaluationError = getConditionalEvaluationError(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -8,6 +9,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import type { ParametersState } from "../../editor/types";
 import { TemplateInputsCard } from "./TemplateInputsCard";
@@ -40,7 +42,12 @@ describe("TemplateInputsCard", () => {
   beforeEach(() => {
     onSave.mockReset().mockResolvedValue(undefined);
   });
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+  });
 
   it("blocks an invalid number and saves a cleared number as null", async () => {
     seed([
@@ -111,5 +118,37 @@ describe("TemplateInputsCard", () => {
     fireEvent.click(saveButton());
 
     expect(await screen.findByText("Not saved")).toBeTruthy();
+  });
+
+  it("holds Save inputs under a save hold and keeps its reason reachable", () => {
+    const reason = "Copilot is saving your accepted changes.";
+    useWorkflowHasChangesStore.getState().setSaveBlockedReason(reason);
+    seed([
+      {
+        key: "url",
+        parameterType: "workflow",
+        dataType: "string",
+        defaultValue: "",
+      },
+    ]);
+    render(<TemplateInputsCard />);
+    fireEvent.change(screen.getByLabelText("url"), {
+      target: { value: "https://example.com" },
+    });
+
+    // The name stays the action; the reason is the description, not part of the name.
+    const held = screen.getByRole("button", {
+      name: "Save inputs (paused)",
+      description: reason,
+    }) as HTMLButtonElement;
+    expect(held.disabled).toBe(true);
+    // A disabled button swallows its own tooltip trigger's events.
+    const wrapper = held.closest<HTMLElement>("[tabindex='0']");
+    expect(wrapper?.getAttribute("aria-describedby")).toBe(
+      held.getAttribute("aria-describedby"),
+    );
+
+    act(() => useWorkflowHasChangesStore.getState().setSaveBlockedReason(null));
+    expect(saveButton().disabled).toBe(false);
   });
 });

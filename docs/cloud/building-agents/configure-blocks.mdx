@@ -432,7 +432,7 @@ Additional fields in **Advanced Settings:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **File Name** | text | Custom filename for the download |
+| **File Name** | text | Custom filename for the download. Replaces the site's filename, keeping the extension. Reference `{{ original_filename }}` to keep the site's name instead — `{{ fund }}_{{ original_filename }}` prefixes it, which separates documents that several pages name identically. |
 
 *Plus [common browser fields](#common-fields).*
 

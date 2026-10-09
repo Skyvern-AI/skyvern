@@ -4,6 +4,7 @@ import re
 import string
 import unicodedata
 import uuid
+from collections.abc import Sequence
 
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
 
@@ -56,6 +57,12 @@ def sanitize_identifier(value: str, default: str = "identifier") -> str:
         sanitized = default
 
     return sanitized
+
+
+def join_phrases(items: Sequence[str], conjunction: str, *, serial_comma: bool = True) -> str:
+    if len(items) <= 2:
+        return f" {conjunction} ".join(items)
+    return f"{', '.join(items[:-1])}{',' if serial_comma else ''} {conjunction} {items[-1]}"
 
 
 def escape_code_fences(text: str | None, escape_quotes: bool = False) -> str:

@@ -384,10 +384,14 @@ class TestRunCreatedHookWiring:
         checker.check = AsyncMock()
         mock_app = MagicMock()
         mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
-        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=MagicMock(title="Test"))
 
         with (
             patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
+            patch.object(
+                agent_protocol.workflow_service,
+                "run_workflow_returning_owned_workflow",
+                AsyncMock(return_value=(workflow_run, MagicMock(title="Test"))),
+            ),
             patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=workflow_run)),
             patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),

@@ -168,6 +168,7 @@ export type FailureCategory = {
   category: string;
   confidence_float: number;
   reasoning: string;
+  reason_code?: string | null;
 };
 
 export type TaskApiResponse = {
@@ -385,6 +386,8 @@ export interface GoogleOAuthCredential {
   scopes_granted?: string[] | string | null;
   scopes?: string[] | string | null;
   valid?: boolean | null;
+  // Decided by the server: active, send permission granted, and a verified account identity on record.
+  gmail_send_ready?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -419,10 +422,17 @@ export interface UpdateGoogleOAuthClientConfigRequest {
   app_origins: string[];
 }
 
+export type GoogleOAuthScopeProfile =
+  | "google_sheets"
+  | "gmail"
+  | "google_drive"
+  | "gmail_send"
+  | "gmail_read_send";
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: string;
+  scope_profile?: GoogleOAuthScopeProfile;
   app_origin?: string;
   // Existing credential to re-authenticate in place, preserving its id so
   // workflows referencing it keep working without edits.
@@ -1254,7 +1264,10 @@ export type PylonEmailHash = {
   hash: string;
 };
 
-export type RunFeedbackTargetType = "workflow_run" | "task";
+export type RunFeedbackTargetType =
+  | "workflow_run"
+  | "task"
+  | "browser_recording";
 export type FeedbackRating = "up" | "down";
 
 export type RunFeedbackApiResponse = {

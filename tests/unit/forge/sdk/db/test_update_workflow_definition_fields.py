@@ -32,6 +32,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.schemas.browser_settings import BrowserSettings
 from skyvern.schemas.runs import ProxyLocation
 
 pytestmark = pytest.mark.asyncio
@@ -140,6 +141,38 @@ async def test_only_explicit_completion_contract_clear_skips_repository_carry(ag
     )
     assert updated is not None
     assert updated.workflow_definition.completion_contract is None
+
+
+async def test_an_absent_browser_settings_key_carries_even_on_a_contract_clearing_write(agent_db: AgentDB) -> None:
+    org = await agent_db.organizations.create_organization(
+        organization_name="Browser Settings Carry Org",
+        domain="browser-settings-carry.test",
+    )
+    workflow = await agent_db.workflows.create_workflow(
+        title="export",
+        workflow_definition={"parameters": [], "blocks": [], "browser_settings": {"timezone_id": "Africa/Kampala"}},
+        organization_id=org.organization_id,
+    )
+    ids = {"workflow_id": workflow.workflow_id, "organization_id": org.organization_id}
+
+    # A Copilot commit that clears a completion contract rebuilds the definition from YAML without this key.
+    await agent_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        preserve_completion_contract=False,
+    )
+    assert (await _get(agent_db, ids)).workflow_definition.browser_settings == BrowserSettings(
+        timezone_id="Africa/Kampala"
+    )
+
+    await agent_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[], browser_settings=None),
+        preserve_completion_contract=False,
+    )
+    assert (await _get(agent_db, ids)).workflow_definition.browser_settings is None
 
 
 async def test_update_workflow_dispatch_state_if_latest_updates_current_version(agent_db: AgentDB) -> None:

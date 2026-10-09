@@ -64,14 +64,15 @@ Send the key in the `x-api-key` header on every request. The three job endpoints
 
 ### Extract a job posting
 
-[Extract a job application posting](/api-reference/recipes/extract-a-job-application-posting) accepts a JSON body with `job_url`:
+[Extract a job application posting](/api-reference/recipes/extract-a-job-application-posting) accepts a JSON body with `job_url`. Optional `webhook_url` and `proxy_location` fields configure completion notifications and the proxy:
 
 ```bash
 curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/extract' \
   --header "x-api-key: $SKYVERN_API_KEY" \
   --header 'Content-Type: application/json' \
   --data '{
-    "job_url": "https://jobs.example.com/openings/software-engineer"
+    "job_url": "https://jobs.example.com/openings/software-engineer",
+    "webhook_url": "https://your-server.example.com/webhooks/skyvern"
   }'
 ```
 
@@ -83,7 +84,7 @@ The response contains the new run ID:
 }
 ```
 
-The run executes asynchronously. This response confirms that the run started; poll its status to get the extraction output.
+The run executes asynchronously. This response confirms that the run started; receive a webhook or poll its status to get the extraction output.
 
 Extract can complete for a closed posting when its details remain readable. The normal `extract_output.extracted_information` object includes `availability`: `closed` for explicit closure, `open` for evidence that applications are accepted, or `unknown` when the page is ambiguous. Readable details remain in that object. Closure does not itself make Extract fail.
 
@@ -99,6 +100,7 @@ curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/apply' \
     "job_url": "https://jobs.example.com/openings/software-engineer",
     "resume_url": "https://files.example.com/resume.pdf",
     "custom_prompt": "",
+    "webhook_url": "https://your-server.example.com/webhooks/skyvern",
     "other_information": {
       "location": "New York, NY",
       "work_authorization": "Authorized to work in the United States"
@@ -106,11 +108,11 @@ curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/apply' \
   }'
 ```
 
-Replace the example URLs and applicant facts with your own. Both URLs must use public HTTP or HTTPS addresses. Skyvern must be able to download the resume without an interactive login.
+Replace the example URLs and applicant facts with your own. The job and resume URLs must use public HTTP or HTTPS addresses. Skyvern must be able to download the resume without an interactive login.
 
 ### Apply with a file upload
 
-Use `multipart/form-data` to upload a local resume. Supply `resume_file` instead of `resume_url`:
+Use `multipart/form-data` to upload a local resume. Supply `resume_file` instead of `resume_url`. Send optional `webhook_url` and `proxy_location` values as text parts:
 
 ```bash
 curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/apply' \
@@ -118,6 +120,7 @@ curl --request POST 'https://api.skyvern.com/v1/recipes/jobs/apply' \
   --form 'job_url=https://jobs.example.com/openings/software-engineer' \
   --form 'custom_prompt=' \
   --form 'resume_file=@resume.pdf' \
+  --form 'webhook_url=https://your-server.example.com/webhooks/skyvern' \
   --form 'other_information={"location":"New York, NY"}'
 ```
 
@@ -126,6 +129,42 @@ Let curl set the multipart `Content-Type` header and boundary. Send each field o
 The API supports PDF, DOCX, and image resumes. The default upload limit is 30 MiB. Skyvern uses OCR when a PDF has no extractable text. If resume parsing fails, the application continues using the remaining inputs.
 
 Both Apply request formats return only `workflow_run_id`. Check the run result to determine whether the application was submitted.
+
+### Get notified when a run finishes
+
+Set `webhook_url` on Apply or Extract to receive the final workflow status: `completed`, `failed`, `terminated`, `canceled`, or `timed_out`.
+
+A recipe request without `webhook_url` sends no webhook. Omitted, null, or blank values count as absent.
+
+Webhook URLs must use HTTP or HTTPS. Skyvern rejects localhost, private IP addresses, and AWS load-balancer hostnames.
+Invalid URLs return `422` with `loc: ["webhook_url"]`.
+The organization needs a valid API key to sign and send the webhook.
+See the [webhooks guide](/developers/going-to-production/webhooks) for the workflow payload, signature checks, and delivery retries.
+
+### Choose a proxy
+
+Apply and Extract accept the same `proxy_location` values as other run APIs: a `ProxyLocation` name, a GeoTarget object, or a custom proxy object.
+For example, use `"proxy_location": "RESIDENTIAL_GB"` or this GeoTarget:
+
+```json
+{
+  "proxy_location": {
+    "country": "US",
+    "subdivision": "CA",
+    "city": "San Francisco"
+  }
+}
+```
+
+A custom proxy uses `"proxy_location": {"url": "http://user:password@proxy.example.com:8080"}`.
+Omit `proxy_location` or send null to use the default; Skyvern Cloud uses `RESIDENTIAL`.
+For multipart Apply, send a name as text or an object as JSON text. A blank part counts as absent:
+
+```bash
+-F 'proxy_location={"country":"US","subdivision":"CA","city":"San Francisco"}'
+```
+
+Retries through `POST /v1/workflows/runs/{id}/retry` keep the original run's `webhook_url` and `proxy_location`.
 
 ### Configure termination and error codes
 
@@ -193,7 +232,7 @@ curl 'https://api.skyvern.com/v1/runs/wr_123' \
   --header "x-api-key: $SKYVERN_API_KEY"
 ```
 
-Poll this endpoint while the run is active. When it finishes, inspect its status and output. A successful launch response alone does not confirm extraction or application completion.
+As an alternative to webhooks, poll this endpoint while the run is active. When it finishes, inspect its status and output. A successful launch response alone does not confirm extraction or application completion.
 
 With the default Apply settings, an explicitly closed posting terminates the run. Inspect the standard `status`, `failure_reason`, and `errors` fields. A classified expiry has `error_code: "job_expired"`, with `reasoning` and `confidence_float`, in `errors`. The same fields use the normal workflow webhook payload. Classification only returns configured codes when it can identify a match; an empty `errors` list is not proof that a posting is open. Extract availability appears in the normal workflow `outputs`, not in the recipe run list.
 
@@ -205,6 +244,21 @@ curl 'https://api.skyvern.com/v1/recipes/jobs/runs?page=1&page_size=25' \
 ```
 
 Each entry includes the run ID, recipe (`apply` or `extract`), status, creation time, job URL, and failure reason when available. The response also includes `page`, `page_size`, and `has_next`. Increment `page` while `has_next` is `true`. Page size must be between 1 and 100.
+
+Each entry also has an `outcome` and a `next_step`. `outcome` is `null` until the run finishes. `next_step` says what to do about an unsuccessful outcome and is `null` otherwise.
+
+| `outcome`              | Meaning                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `completed`            | The run finished successfully.                                                  |
+| `canceled`             | The run was canceled.                                                           |
+| `job_unavailable`      | Skyvern found the posting closed, or could not find it at this URL.             |
+| `login_required`       | The site needed an account, a sign-in, or a verification code, or rejected the sign-in. |
+| `application_refused`  | The site refused the application, for example as a duplicate.                   |
+| `blocked_by_site`      | Bot protection, a CAPTCHA, a rate limit, or a locked account blocked the run.   |
+| `invalid_input`        | A request value could not be used, so the run stopped before opening the site.  |
+| `insufficient_credits` | The organization ran out of credits.                                            |
+| `incomplete`           | The run ran out of steps or its execution budget before it could submit the application. |
+| `failed`               | Any other failure. Read `failure_reason`. An unsuccessful Extract run is `failed` unless it ran out of credits. |
 
 <Note>
   Each Apply API request creates a new run. Repeating a request can submit another application, so check the original run before retrying.
@@ -235,6 +289,6 @@ The range depends on the execution path selected for the job site and your input
 |    422 | Check URLs, required fields, resume source, and credential pairing.  |
 |    429 | Wait before sending more launch requests.                           |
 
-Request validation rejects unknown fields. JSON credentials require the boolean `true` for `persist_credentials`; multipart credentials require the text `true`.
+Unknown multipart parts return `400`; unknown JSON fields return `422`. JSON credentials require the boolean `true` for `persist_credentials`; multipart credentials require the text `true`.
 
 Use the [Recipes API reference](/api-reference/recipes/apply-to-a-job) for the full request and response schemas.

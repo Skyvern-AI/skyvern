@@ -53,6 +53,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
+from skyvern.forge.sdk.services.google_oauth_service import GoogleConnectionResolution
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -915,6 +916,7 @@ async def test_ambiguous_cited_name_admits_no_account_and_fails_closed(monkeypat
 
     assert canonical_yaml == draft
     assert facts[0]["status"] == "ambiguous"
+    assert facts[0]["detail"]
     assert [candidate["connection_id"] for candidate in facts[0]["candidates"]] == [
         AMBIGUOUS_ACCOUNT_ID,
         "goac_ambiguous_twin",
@@ -982,6 +984,7 @@ async def test_unresolved_connection_reference_reports_facts_and_fails_closed(
     assert canonical_yaml == draft
     assert facts[0]["status"] == expected_status
     assert facts[0]["canonicalized"] is False
+    assert facts[0]["detail"]
     assert [row["connection_id"] for row in facts[0]["eligible_connections"]] == [CITED_ACCOUNT_ID]
 
     blocker = _credential_run_approval_blocker_signal(
@@ -1075,6 +1078,7 @@ async def test_connection_lookup_failure_keeps_the_draft_and_fails_closed(monkey
 
     assert canonical_yaml == draft
     assert facts[0]["status"] == "lookup_failed"
+    assert facts[0]["detail"]
 
     blocker = _credential_run_approval_blocker_signal(
         _dispatch_credential_ids(canonical_yaml),
@@ -1086,6 +1090,25 @@ async def test_connection_lookup_failure_keeps_the_draft_and_fails_closed(monkey
 
     assert blocker is not None
     assert blocker.blocker_kind == "authority_denied"
+
+
+@pytest.mark.asyncio
+async def test_a_resolver_status_with_no_explanation_still_reports_the_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_visible_credentials(monkeypatch, [_google(CITED_ACCOUNT_ID, CITED_ACCOUNT_NAME)])
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.credentials.google_oauth_service.resolve_connection_reference",
+        lambda credentials, reference: GoogleConnectionResolution(
+            status="suspended", reference=reference, credential=None, candidates=(), matches=()
+        ),
+    )
+    draft = _named_sheets_yaml(CITED_ACCOUNT_NAME)
+    ctx = _canonicalization_ctx(draft, f'use the "{CITED_ACCOUNT_NAME}" account')
+
+    canonical_yaml, facts = await canonicalize_named_google_sheet_bindings(draft, ctx)
+
+    assert canonical_yaml == draft
+    assert (facts[0]["status"], facts[0]["canonicalized"]) == ("suspended", False)
+    assert facts[0]["detail"]
 
 
 @pytest.mark.asyncio

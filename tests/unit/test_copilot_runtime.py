@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
@@ -109,8 +110,31 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
-            {"ok": False, "error": "boom. retry later", "error_code": "E1"},
-            id="error_with_hint_joins_message_and_hint",
+            {"ok": False, "error": "boom", "error_code": "E1"},
+            id="error_with_hint_forwards_the_message_only",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "error": {
+                    "code": "ACTION_FAILED",
+                    "message": "No unambiguous option matched 'Blue'",
+                    "hint": "Retry with one of the observed options: Navy, Teal",
+                    "details": {
+                        "element_state": "no_unambiguous_match",
+                        "selector": "#color",
+                        "observed_options": ["Navy", "Teal"],
+                    },
+                },
+            },
+            {
+                "ok": False,
+                "error": "No unambiguous option matched 'Blue'",
+                "error_code": "ACTION_FAILED",
+                "element_state": "no_unambiguous_match",
+                "observed_options": ["Navy", "Teal"],
+            },
+            id="select_mismatch_lifts_the_observed_options_without_the_hint",
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom"}},
@@ -391,7 +415,13 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
     assert ctx.attached_browser_drivers == {"bs_1": runtime.AttachedBrowserDriver("bs_1", ready_state)}
-    assert mock_manager.create_session.call_args.kwargs.keys() == {"organization_id", "timeout_minutes", "created_by"}
+    assert mock_manager.create_session.call_args.kwargs.keys() == {
+        "organization_id",
+        "timeout_minutes",
+        "created_by",
+        "session_kind",
+    }
+    assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
 
 @pytest.mark.asyncio
@@ -968,6 +998,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         "organization_id": ctx.organization_id,
         "timeout_minutes": 30,
         "created_by": "copilot",
+        "session_kind": BrowserSessionKind.copilot,
         "browser_profile_id": "bp_saved",
         "profile_read_only": True,
         "generate_browser_profile": True,
@@ -2912,36 +2943,6 @@ async def test_a_call_on_a_browser_past_the_page_cap_closes_nothing_and_tab_new_
 
 
 @pytest.mark.asyncio
-async def test_the_multi_tab_hold_counts_every_open_tab_and_names_the_others_by_index(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A blob: export tab is not a valid working page, but the tab tools can switch to it, so the hold
-    counts it and names it by the index skyvern_tab_close accepts; a closed page still listed is not counted."""
-    ctx, browser_state, context = _install_tabbed_session(
-        monkeypatch, "https://a.test", "blob:https://a.test/export", "https://c.test", "https://d.test"
-    )
-    first, blob, third, fourth = context.pages
-    ctx.sensitive_origin_browser_session_ids = {ctx.browser_session_id}
-
-    async with mcp_browser_context(ctx):
-        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(third)))
-    fourth.is_closed.return_value = True
-    message = await runtime.sensitive_origin_multi_tab_error(ctx)
-    assert await runtime.browser_open_tab_count(ctx) == 3
-    assert "3 tabs" in message and "(index 1, 0)" in message
-    assert "a.test" not in message and "c.test" not in message
-    assert await runtime.clear_sensitive_origin_page_taint(ctx) is False
-
-    fourth.is_closed.return_value = False
-    await first.close()
-    await blob.close()
-    await fourth.close()
-    assert await runtime.browser_open_tab_count(ctx) == 1
-    assert await runtime.clear_sensitive_origin_page_taint(ctx) is True
-    assert await browser_state.get_working_page() is third
-
-
-@pytest.mark.asyncio
 async def test_a_popup_opened_by_a_call_that_kept_its_tab_takes_focus_on_the_next_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2962,30 +2963,6 @@ async def test_a_popup_opened_by_a_call_that_kept_its_tab_takes_focus_on_the_nex
 
 
 @pytest.mark.asyncio
-async def test_the_hold_names_the_other_tabs_highest_index_first_so_two_closes_land(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The page list compacts on every close, so closing the named indexes in the order given must
-    remove exactly the other tabs and leave the selected one."""
-    ctx, _, context = _install_tabbed_session(monkeypatch, "https://a.test", "https://b.test", "https://c.test")
-    first, middle, last = context.pages
-    ctx.sensitive_origin_browser_session_ids = {ctx.browser_session_id}
-    async with mcp_browser_context(ctx):
-        await mcp_tabs.skyvern_tab_switch(session_id=ctx.browser_session_id, tab_id=str(id(middle)))
-
-    message = await runtime.sensitive_origin_multi_tab_error(ctx)
-    assert "(index 2, 0)" in message and "highest index first" in message
-    for index in (2, 0):
-        async with mcp_browser_context(ctx):
-            closed = await mcp_tabs.skyvern_tab_close(session_id=ctx.browser_session_id, index=index)
-        assert closed["ok"] is True, closed
-
-    assert context.pages == [middle]
-    assert first.is_closed() and last.is_closed() and not middle.is_closed()
-    assert await runtime.clear_sensitive_origin_page_taint(ctx) is True
-
-
-@pytest.mark.asyncio
 async def test_the_tab_cap_counts_the_pages_the_browser_state_counts(monkeypatch: pytest.MonkeyPatch) -> None:
     """A blob: export tab is not a valid page, so it neither fills the cap nor is culled by it."""
     cap = settings.BROWSER_MAX_PAGES_NUMBER
@@ -2996,7 +2973,6 @@ async def test_the_tab_cap_counts_the_pages_the_browser_state_counts(monkeypatch
         refusal = await mcp_hooks._tab_new_pre_hook({}, ctx)
 
     assert refusal is None
-    assert await runtime.browser_open_tab_count(ctx) == cap
     assert await runtime.browser_valid_tab_count(ctx) == cap - 1
     assert len(context.pages) == cap
 

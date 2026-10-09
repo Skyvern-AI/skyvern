@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import time
+import timeit
 from typing import Any, Callable
 
 import pytest
@@ -724,13 +726,20 @@ def test_mask_canonical_match_handles_thousands_of_quote_glued_copies_iterativel
     token = next(iter(refs.refs))
     echoed = "https://example.test/f?token=abcdefghijklmnop0123"
 
-    def timed(copies: int) -> float:
-        started = time.perf_counter()
+    def mask(copies: int) -> None:
         assert refs.mask("'".join([echoed] * copies)) == "'".join([token] * copies)
-        return time.perf_counter() - started
 
-    # Linear, not quadratic: four times the copies costs well under sixteen times the work.
-    assert timed(4000) < 6 * max(timed(1000), 0.005)
+    def timed(copies: int) -> float:
+        return timeit.timeit(lambda: mask(copies), number=1, timer=time.thread_time)
+
+    # Thread CPU time with the garbage collector paused, alternating sizes and keeping the best of each, so a busy
+    # runner slows both alike.
+    small_best = large_best = math.inf
+    for _ in range(5):
+        small_best = min(small_best, timed(500))
+        large_best = min(large_best, timed(4000))
+    # Linear, not quadratic: eight times the copies costs ~8x the work, where quadratic would cost ~64x.
+    assert large_best < 16 * small_best
 
 
 def test_mask_canonical_match_is_still_by_membership() -> None:

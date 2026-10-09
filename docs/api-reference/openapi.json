@@ -193,6 +193,17 @@
           "400": {
             "description": "Invalid agent run request"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -4772,10 +4783,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -6628,6 +6639,17 @@
           "404": {
             "description": "Workflow run not found"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -7834,6 +7856,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7899,6 +7956,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -8019,6 +8111,31 @@
                     "type": "string",
                     "format": "binary",
                     "title": "Resume File"
+                  },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
                   },
                   "other_information": {
                     "anyOf": [
@@ -8223,6 +8340,149 @@
           }
         },
         "x-fern-sdk-method-name": "list_job_recipe_runs"
+      }
+    },
+    "/v1/audit-events/export": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Export organization audit events",
+        "description": "Export audit events for the authenticated organization as JSON or CSV. Only organization admins and full API keys may export. The default window is the last 90 days, with timezone-aware since/until bounds, newest-first keyset pagination, and a maximum page size of 500. CSV output uses fixed columns and is protected from spreadsheet formula execution.",
+        "operationId": "export_audit_events_v1_audit_events_export_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of audit events as JSON, or a CSV download when format=csv.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditEventExportResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller must be an organization admin or use a full API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDenialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "export_audit_events"
       }
     }
   },
@@ -9690,6 +9950,192 @@
         ],
         "title": "ArtifactType"
       },
+      "AuditEventExportResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventExportRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "next": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "next"
+        ],
+        "title": "AuditEventExportResponse"
+      },
+      "AuditEventExportRow": {
+        "properties": {
+          "audit_event_id": {
+            "type": "string",
+            "title": "Audit Event Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "actor_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor User Id"
+          },
+          "auth_kind": {
+            "type": "string",
+            "title": "Auth Kind"
+          },
+          "org_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Role"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "resource_type": {
+            "type": "string",
+            "title": "Resource Type"
+          },
+          "resource_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource Id"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audit_event_id",
+          "created_at",
+          "organization_id",
+          "actor_user_id",
+          "auth_kind",
+          "org_role",
+          "action",
+          "resource_type",
+          "resource_id",
+          "request_id",
+          "details"
+        ],
+        "title": "AuditEventExportRow"
+      },
+      "AuditExportDenialDetail": {
+        "properties": {
+          "error_code": {
+            "type": "string",
+            "const": "organization_admin_required",
+            "title": "Error Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "reason_kind": {
+            "type": "string",
+            "const": "role",
+            "title": "Reason Kind"
+          },
+          "required": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Required"
+          },
+          "caller_has": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Caller Has"
+          },
+          "next_action": {
+            "type": "string",
+            "title": "Next Action"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error_code",
+          "message",
+          "reason_kind",
+          "required",
+          "caller_has",
+          "next_action"
+        ],
+        "title": "AuditExportDenialDetail"
+      },
+      "AuditExportDenialResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/AuditExportDenialDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "AuditExportDenialResponse"
+      },
       "AzureSecretParameter": {
         "properties": {
           "parameter_type": {
@@ -11011,6 +11457,28 @@
             "description": "Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
             "default": false
           },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings requested when the session was created."
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the browser reported after launch for the requested settings. Null until it is measured, and always null when no settings were requested."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -11160,6 +11628,93 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "BrowserSettings": {
+        "properties": {
+          "timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone Id",
+            "description": "IANA timezone the browser reports to pages, for example `America/New_York`. Applied when a browser is created and takes precedence over any timezone implied by the proxy location. Offsets such as `+03:00` are rejected. Omit or set to null to keep the default behavior.",
+            "examples": [
+              "America/New_York"
+            ]
+          }
+        },
+        "type": "object",
+        "title": "BrowserSettings"
+      },
+      "BrowserSettingsReceipt": {
+        "properties": {
+          "requested_timezone_id": {
+            "type": "string",
+            "title": "Requested Timezone Id",
+            "description": "The timezone that was requested."
+          },
+          "actual_timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Timezone Id",
+            "description": "The timezone the browser reported when measured, or null when it could not be measured."
+          },
+          "source": {
+            "$ref": "#/components/schemas/BrowserSettingsSource",
+            "description": "Where the requested setting came from."
+          },
+          "status": {
+            "$ref": "#/components/schemas/BrowserSettingsStatus",
+            "description": "`verified` when the browser reported the requested timezone or an IANA alias of it (Chromium reports `Asia/Calcutta` for `Asia/Kolkata`), `mismatch` when it reported another zone, `unapplied` when the browser already existed and was left unchanged, `unknown` when it could not be measured."
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "type": "object",
+        "required": [
+          "requested_timezone_id",
+          "source",
+          "status"
+        ],
+        "title": "BrowserSettingsReceipt"
+      },
+      "BrowserSettingsSource": {
+        "type": "string",
+        "enum": [
+          "workflow_version",
+          "session_request",
+          "existing_session"
+        ],
+        "title": "BrowserSettingsSource"
+      },
+      "BrowserSettingsStatus": {
+        "type": "string",
+        "enum": [
+          "verified",
+          "mismatch",
+          "unapplied",
+          "unknown"
+        ],
+        "title": "BrowserSettingsStatus"
       },
       "BrowserTypeOption": {
         "properties": {
@@ -12276,6 +12831,17 @@
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
             "default": false
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied when the session's browser is created. A timezone_id here takes precedence over the timezone implied by proxy_location."
           },
           "needs_live_view": {
             "type": "boolean",
@@ -13771,7 +14337,7 @@
               }
             ],
             "title": "Download Suffix",
-            "description": "Suffix or complete filename for the downloaded file"
+            "description": "Complete filename for the downloaded file. Supports {{ original_filename }}, which keeps the name the site gave the file, so {{ original_filename }} alone preserves it and prefix_{{ original_filename }} prefixes it. The source extension is used unless the configured filename includes an extension, which overrides it. {{ original_filename }} must be a standalone interpolation without filters or other transformations."
           },
           "download_timeout": {
             "anyOf": [
@@ -14317,6 +14883,14 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -19339,6 +19913,22 @@
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
+      "JobRecipeOutcome": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "canceled",
+          "job_unavailable",
+          "login_required",
+          "application_refused",
+          "blocked_by_site",
+          "invalid_input",
+          "insufficient_credits",
+          "incomplete",
+          "failed"
+        ],
+        "title": "JobRecipeOutcome"
+      },
       "JobRecipeRunListResponse": {
         "properties": {
           "runs": {
@@ -19435,6 +20025,29 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobRecipeOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed result of a finished run; null while it is still running. Apply failures name their cause (job_unavailable, login_required, application_refused, blocked_by_site, invalid_input, insufficient_credits, incomplete); a cause Skyvern cannot classify is failed, and so is every Extract failure except one Skyvern itself reports, such as running out of credits."
+          },
+          "next_step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Step",
+            "description": "What to do about an unsuccessful outcome; null for completed, canceled, and running runs."
           }
         },
         "additionalProperties": false,
@@ -19446,7 +20059,9 @@
           "status",
           "created_at",
           "job_url",
-          "failure_reason"
+          "failure_reason",
+          "outcome",
+          "next_step"
         ],
         "title": "JobRecipeRunSummary"
       },
@@ -23242,6 +23857,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -23403,7 +24055,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -23437,12 +24091,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
@@ -30458,6 +31150,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates."
           }
         },
         "type": "object",
@@ -30737,6 +31440,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates. Omit to keep the previous version's settings; set to null to clear them."
           }
         },
         "type": "object",
@@ -31371,6 +32085,27 @@
               }
             ],
             "title": "Browser Type"
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings copied from the workflow version when the run was created"
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "script_run": {
             "anyOf": [
@@ -33141,6 +33876,17 @@
               "own_memory",
               "fresh"
             ]
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The timezone the run's browser reported against the one its workflow version requested. Null when the version requests no browser settings or the browser has not been measured yet."
           },
           "run_request": {
             "anyOf": [

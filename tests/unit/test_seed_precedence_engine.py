@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -7,9 +8,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import select, update
 
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason, derive_failure_attribution
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.models import BrowserProfileModel, CredentialModel, WorkflowModel, WorkflowRunModel
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.browser_profile_key import build_browser_profile_key_digest
@@ -21,11 +25,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.services.workflow_service import workflow_request_body_from_existing_run
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from tests.unit.conftest import RUN_GROUP_ORG, RUN_GROUP_WPID, GroupEnv, run_group_task_block
 
 
 def _workflow(*, persist: bool = False, pick: str | None = None, key: str | None = None) -> SimpleNamespace:
@@ -2095,3 +2100,194 @@ async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
         if call.args[0] == "Saved browser profile failed to load, falling back to normal login"
     )
     assert unexpected_log.kwargs["exc_info"] is True
+
+
+# --- a failed run from a saved profile no credential backs -------------------
+
+
+_CODE_BLOCK_SIGN_IN = {"category": "WRONG_PAGE_STATE", "confidence_float": 0.9, "reason_code": "sign_in_form_visible"}
+_MODEL_AUTH_FAILURE = {"category": "AUTH_FAILURE", "confidence_float": 0.9, "reasoning": "login failed"}
+_UNEXPECTED_PAGE = {"category": "WRONG_PAGE_STATE", "confidence_float": 0.9, "reasoning": "Keywords matched"}
+_VAULT_LOOKUP_FAILURE = {"category": "CREDENTIAL_ERROR", "confidence_float": 0.8, "reasoning": "Exception: Bitwarden"}
+_ELEMENT_TIMEOUT = {"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}
+# A send-email block's own error, classified as it is in production.
+[_SMTP_PASSWORD_FAILURE] = classify_from_failure_reason("Missing SMTP password")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "seed_source",
+        "applied_profile_id",
+        "credential_owns_profile",
+        "credential_parameter",
+        "version_deleted",
+        "first_entry",
+        "tagged",
+    ),
+    [
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.override, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _MODEL_AUTH_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, True, _CODE_BLOCK_SIGN_IN, True),
+        (BrowserSeedSource.picked, None, False, False, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _UNEXPECTED_PAGE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _VAULT_LOOKUP_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", False, False, False, _SMTP_PASSWORD_FAILURE, False),
+        (BrowserSeedSource.picked, "bp_1", True, False, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.picked, "bp_1", False, True, False, _CODE_BLOCK_SIGN_IN, False),
+        (BrowserSeedSource.own_memory, "bp_1", False, False, False, _CODE_BLOCK_SIGN_IN, False),
+    ],
+)
+async def test_sign_in_failure_from_a_saved_profile_with_no_credential_is_tagged_signed_out(
+    run_group_env: GroupEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_source: BrowserSeedSource,
+    applied_profile_id: str | None,
+    credential_owns_profile: bool,
+    credential_parameter: bool,
+    version_deleted: bool,
+    first_entry: dict,
+    tagged: bool,
+) -> None:
+    open_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(applied_browser_profile_id=applied_profile_id))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: open_state)
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    parameters = [_credential_parameter("login", "cred_1")] if credential_parameter else []
+    async with run_group_env.database.Session() as session:
+        session.add(BrowserProfileModel(browser_profile_id="bp_1", organization_id=RUN_GROUP_ORG, name="Sign-in"))
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_profile",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                title="Workflow",
+                version=2,
+                workflow_definition=WorkflowDefinition(
+                    parameters=parameters, blocks=[run_group_task_block()]
+                ).model_dump(mode="json"),
+                deleted_at=datetime.now(timezone.utc) if version_deleted else None,
+            )
+        )
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_profile",
+                workflow_id="wf_profile",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                status=WorkflowRunStatus.running.value,
+                browser_profile_id="bp_1",
+                browser_seed_source=seed_source.value,
+            )
+        )
+        if credential_owns_profile:
+            await session.execute(
+                update(CredentialModel)
+                .where(CredentialModel.credential_id == "cred_1")
+                .values(browser_profile_id="bp_1")
+            )
+        await session.commit()
+
+    # execute_workflow records this from the run's own version, before its elapsed-time guard.
+    started_run = await run_group_env.database.workflow_runs.get_workflow_run("wr_profile")
+    assert started_run is not None
+    await WorkflowService._record_saved_profile_without_credential(
+        await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id("wr_profile", filter_deleted=False),
+        started_run,
+        object(),
+    )
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+        workflow_run_id="wr_profile",
+        failure_reason="code block failed",
+        # The sign-in entry is appended after the run's own classification, as the code block path writes it.
+        failure_category=[_ELEMENT_TIMEOUT, first_entry],
+    )
+
+    run = await run_group_env.database.workflow_runs.get_workflow_run("wr_profile")
+    assert run is not None and run.status == WorkflowRunStatus.failed
+    assert run.failure_category is not None
+    assert [entry["category"] for entry in run.failure_category] == ["ELEMENT_STATE_TIMEOUT", first_entry["category"]]
+    assert (run.failure_category[1].get("reason_code") == "saved_profile_signed_out") is tagged
+    # Attribution follows the primary entry, which the tag never touches.
+    async with run_group_env.database.Session() as session:
+        attribution = await session.scalar(
+            select(WorkflowRunModel.failure_attribution).where(WorkflowRunModel.workflow_run_id == "wr_profile")
+        )
+    assert attribution == derive_failure_attribution([_ELEMENT_TIMEOUT])
+
+
+@pytest.mark.asyncio
+async def test_an_older_execution_ending_keeps_a_reset_runs_saved_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    older_looking_up, release_older = asyncio.Event(), asyncio.Event()
+
+    async def credentials_for_profile(**_kwargs: object) -> list[object]:
+        if not older_looking_up.is_set():
+            older_looking_up.set()
+            await release_older.wait()
+        return []
+
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", credentials_for_profile)
+    workflow = cast(Workflow, SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])))
+    run = cast(
+        WorkflowRun,
+        SimpleNamespace(
+            workflow_run_id="wr_reset",
+            organization_id=RUN_GROUP_ORG,
+            browser_profile_id="bp_1",
+            browser_seed_source=BrowserSeedSource.picked,
+            parent_workflow_run_id=None,
+        ),
+    )
+
+    # The older execution is still looking up credentials when the reset's execution records and finishes.
+    older, newer = object(), object()
+    older_recording = asyncio.create_task(
+        WorkflowService._record_saved_profile_without_credential(workflow, run, older)
+    )
+    await older_looking_up.wait()
+    await WorkflowService._record_saved_profile_without_credential(workflow, run, newer)
+    release_older.set()
+    await older_recording
+
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL["wr_reset"].owner is newer
+    WorkflowService._forget_saved_profile_without_credential("wr_reset", older)
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL["wr_reset"].profile_id == "bp_1"
+    WorkflowService._forget_saved_profile_without_credential("wr_reset", newer)
+    assert "wr_reset" not in service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL
+
+
+@pytest.mark.asyncio
+async def test_an_execution_cancelled_while_recording_leaves_no_saved_profile_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service_module, "_SAVED_PROFILE_WITHOUT_CREDENTIAL", {})
+    looking_up = asyncio.Event()
+
+    async def credentials_for_profile(**_kwargs: object) -> list[object]:
+        looking_up.set()
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credentials_by_browser_profile_id", credentials_for_profile)
+    workflow = cast(Workflow, SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[])))
+    run = cast(
+        WorkflowRun,
+        SimpleNamespace(
+            workflow_run_id="wr_cancelled",
+            organization_id=RUN_GROUP_ORG,
+            browser_profile_id="bp_1",
+            browser_seed_source=BrowserSeedSource.picked,
+            parent_workflow_run_id=None,
+        ),
+    )
+    owner = object()
+
+    recording = asyncio.create_task(WorkflowService._record_saved_profile_without_credential(workflow, run, owner))
+    await looking_up.wait()
+    recording.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recording
+    WorkflowService._forget_saved_profile_without_credential("wr_cancelled", owner)
+
+    assert service_module._SAVED_PROFILE_WITHOUT_CREDENTIAL == {}

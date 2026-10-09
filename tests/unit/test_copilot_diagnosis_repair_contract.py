@@ -79,7 +79,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     OriginRunRedactionRegistry,
     bound_call_browser_session,
     effective_browser_session_id,
-    record_sensitive_origin_run_taint,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
@@ -87,6 +86,10 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
+)
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
+    register_secret_scrub_values_from_structure,
 )
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -343,7 +346,7 @@ def test_non_paused_watchdog_exit_still_classifies_as_a_failed_run() -> None:
         source_tool="run_blocks_and_collect_debug",
         result={
             "ok": False,
-            "error": "The run exceeded the 600s absolute ceiling while still showing progress.",
+            "error": "The run did not reach a terminal status within the 600s absolute ceiling.",
             "data": {
                 "workflow_run_id": "wr_ceiling",
                 "overall_status": "running",
@@ -2867,6 +2870,7 @@ async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_stru
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
 
     async def fake_read(
         _ctx: CopilotContext, *, run_session_id: str, current_url: str
@@ -2892,33 +2896,6 @@ async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_stru
     assert "private-pass" not in json.dumps(stored)
     assert "654321" not in json.dumps(stored)
     assert "[REDACTED_SECRET]" in json.dumps(stored)
-
-
-@pytest.mark.asyncio
-async def test_sensitive_post_run_capture_stays_withheld_when_registry_is_incomplete(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _ctx()
-    ctx.composition_page_evidence = _bounded_failure_page_evidence()
-    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-        "wr_sensitive",
-        {"credential": {"username": "private-user"}},
-        contains_sensitive_values=True,
-        contains_all_sensitive_values=False,
-    )
-    read = AsyncMock()
-    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
-
-    capture = await run_execution_module._capture_and_store_post_run_page(
-        ctx,
-        run_session_id="run_session",
-        run_id="wr_sensitive",
-        current_url="https://example.test/otp",
-    )
-
-    assert capture.status == "unavailable"
-    assert ctx.composition_page_evidence is None
-    read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3127,11 +3104,14 @@ async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
-    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
     evidence = _bounded_failure_page_evidence()
     evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
 
-    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence, browser_session_id="run_session")
+    try:
+        result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence, browser_session_id="run_session")
+    finally:
+        clear_session_scrub_values("run_session")
 
     assert result["ok"] is True
     assert result["data"]["forms"][0]["fields"][0]["label"] == "Verification code"
@@ -3139,33 +3119,6 @@ async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_
     assert "private-pass" not in json.dumps(result)
     assert "654321" not in json.dumps(result)
     assert "[REDACTED_SECRET]" in json.dumps(result)
-
-
-@pytest.mark.asyncio
-async def test_sensitive_current_page_inspect_stays_withheld_while_origin_run_is_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _post_run_inspect_ctx()
-    ctx.browser_session_id = "run_session"
-    ctx.last_run_blocks_browser_session_id = "run_session"
-    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-        "wr_failed",
-        {"credential": {"username": "private-user", "password": "private-pass"}},
-        contains_sensitive_values=True,
-        contains_all_sensitive_values=True,
-    )
-    ctx.sensitive_origin_browser_session_ids = {"run_session"}
-    ctx.active_sensitive_origin_browser_session_ids = {"run_session"}
-
-    result = await _drive_inspect_page(
-        monkeypatch,
-        ctx,
-        captured=_bounded_failure_page_evidence(),
-        browser_session_id="run_session",
-    )
-
-    assert result["ok"] is False
-    assert "specific named URL" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -3474,6 +3427,9 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         modified_at=now,
     )
     run_workflow = SimpleNamespace(
+        workflow_id="wf_run_snapshot",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
         organization_id=ctx.organization_id,
         created_by=None,
         modified_at=datetime(2026, 4, 21, 12, 0),
@@ -3484,12 +3440,14 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
     )
     run = SimpleNamespace(
         workflow_run_id="wr_completed_missing_output",
+        workflow_id="wf_run_snapshot",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_completed_missing_output",
         status="completed",
         failure_reason=None,
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
+        workflow_definition_sha256=None,
     )
     block = WorkflowRunBlock(
         workflow_run_block_id="wrb_completed_missing_output",
@@ -3671,6 +3629,8 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -3686,6 +3646,8 @@ def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=None,
     )
@@ -3701,6 +3663,8 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=True,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -4124,11 +4088,6 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     assert "#terms-overlay" not in obstruction_line
     assert "#btn-continue" not in obstruction_line
 
-    ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
-    selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
-    assert "selector: #btn-continue" in selector_prompt_lines
-    assert obstruction_line in selector_prompt_lines
-
 
 def test_overlay_selectors_do_not_reach_the_repair_prompt() -> None:
     ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
@@ -4316,15 +4275,15 @@ async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("complete", [False, True])
-async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces_context(monkeypatch, complete):
+async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces_context(monkeypatch):
     ctx = _ctx()
     registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_secret",
         parameters={"password": "inline-secret-sentinel"},
         contains_sensitive_values=True,
-        contains_all_sensitive_values=complete,
+        contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, registry.parameters)
     ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_sibling",
         parameters={},
@@ -4333,23 +4292,16 @@ async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces
     )
     packet = _obstruction_only_page_evidence()
     packet["title"] = "inline-secret-sentinel"
-    read = AsyncMock(return_value=(packet, "pbs_run", None, SimpleNamespace(b64="secret-pixels")))
-    enqueue = MagicMock()
+    read = AsyncMock(return_value=(packet, "pbs_run", None, None))
     monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
-    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", enqueue)
     await run_execution_module._capture_and_store_post_run_page(
         ctx,
         run_session_id="pbs_run",
         run_id="wr_secret",
         current_url="https://example.test/statements",
-        origin_redaction_registry=registry,
     )
-    enqueue.assert_not_called()
-    if complete:
-        assert ctx.composition_page_evidence is not None
-        assert "inline-secret-sentinel" not in str(ctx.composition_page_evidence)
-    else:
-        read.assert_not_called()
+    assert ctx.composition_page_evidence is not None
+    assert "inline-secret-sentinel" not in str(ctx.composition_page_evidence)
     assert ctx.origin_run_redaction_registry.workflow_run_id == "wr_sibling"
 
 
@@ -5869,114 +5821,6 @@ def test_a_run_that_fails_many_blocks_cannot_grow_the_contract_row_list() -> Non
     )
     assert len(contract.diagnosis_input.failed_block_labels) <= _MAX_ITEMS
     assert contract.diagnosis_input.failed_block_labels
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("browser_signed_in_by_an_earlier_run", [False, True])
-async def test_a_post_run_frame_is_withheld_when_the_run_browser_carries_a_sign_in(
-    monkeypatch: pytest.MonkeyPatch, browser_signed_in_by_an_earlier_run: bool
-) -> None:
-    # This run fills no credential, so its own blocks say nothing is sensitive. A frame's pixels
-    # cannot be scrubbed, so what decides is whether the browser it read was signed in by any run.
-    # The clean case is the control: without it a withheld frame could not be told from a stub
-    # that never reached the queue.
-    ctx = _ctx()
-    if browser_signed_in_by_an_earlier_run:
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id="run_session")
-
-    frame = SimpleNamespace(
-        b64="cGl4ZWxz",
-        captured_url="https://example.test/account",
-        browser_session_id="run_session",
-        dispatch_url=None,
-        dispatch_browser_session_id=None,
-        producer_browser_session_id=None,
-        session_binding=None,
-        captured_at=None,
-    )
-    evidence = {"workflow_run_id": "wr_suffix", "observed_after_workflow_run": True}
-
-    async def read_page(_ctx: CopilotContext, *, run_session_id: str, current_url: str) -> tuple:
-        return evidence, run_session_id, None, frame
-
-    enqueued: list[str] = []
-    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read_page)
-    monkeypatch.setattr(run_execution_module, "repair_page_evidence_is_admissible", lambda _e: True)
-    monkeypatch.setattr(run_execution_module, "store_post_run_page_evidence", lambda *_a, **_k: (None, False))
-    monkeypatch.setattr(run_execution_module, "_same_run_page_evidence_for_result", lambda *_a: evidence)
-    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", lambda _ctx, b64, **_k: enqueued.append(b64))
-
-    await run_execution_module._capture_and_store_post_run_page(
-        ctx, run_session_id="run_session", run_id="wr_suffix", current_url="https://example.test/account"
-    )
-
-    assert enqueued == ([] if browser_signed_in_by_an_earlier_run else ["cGl4ZWxz"])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("browser_signed_in_by_an_earlier_run", [False, True])
-async def test_a_dispatched_run_frame_is_withheld_when_the_run_browser_carries_a_sign_in(
-    monkeypatch: pytest.MonkeyPatch, browser_signed_in_by_an_earlier_run: bool
-) -> None:
-    # The worker-dispatch path applies the same rule as the inline capture. The clean case is the
-    # control that shows the frame would otherwise reach the queue.
-    ctx = _ctx()
-    if browser_signed_in_by_an_earlier_run:
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id="run_session")
-
-    frame = SimpleNamespace(
-        b64="cGl4ZWxz",
-        captured_url="https://example.test/account",
-        browser_session_id="run_session",
-        dispatch_url=None,
-        dispatch_browser_session_id=None,
-        producer_browser_session_id=None,
-        session_binding=None,
-        captured_at=None,
-    )
-    evidence = {"workflow_run_id": "wr_suffix", "observed_after_workflow_run": True}
-
-    async def read_page(_ctx: CopilotContext, *, run_session_id: str, current_url: str) -> tuple:
-        return evidence, run_session_id, None, frame
-
-    enqueued: list[str] = []
-    monkeypatch.setattr(run_execution_module, "_pre_run_baseline_is_provenance_valid", lambda _e: False)
-    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read_page)
-    monkeypatch.setattr(run_execution_module, "_dispatched_terminal_page_evidence_is_usable", lambda _e: True)
-    monkeypatch.setattr(run_execution_module, "store_post_run_page_evidence", lambda *_a, **_k: (None, False))
-    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", lambda _ctx, b64, **_k: enqueued.append(b64))
-
-    await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx,
-        run_id="wr_suffix",
-        run_session_id="run_session",
-        organization_id="o",
-        current_url="https://example.test/account",
-    )
-
-    assert enqueued == ([] if browser_signed_in_by_an_earlier_run else ["cGl4ZWxz"])
-
-
-@pytest.mark.parametrize(
-    ("tainted_session", "run_session_id", "chat_session", "withheld"),
-    [
-        # The run's own browser carries a sign-in: withhold.
-        ("pbs_run", "pbs_run", "pbs_chat", True),
-        # The chat's browser is signed in but this run used a clean one of its own: keep the
-        # diagnostics. Checking the chat's browser here stripped every clean run's evidence.
-        ("pbs_chat", "pbs_run", "pbs_chat", False),
-        # No browser named for the run: fall back to the browser the call acts in.
-        ("pbs_chat", None, "pbs_chat", True),
-    ],
-)
-def test_sign_in_taint_is_read_from_the_browser_the_run_used(
-    tainted_session: str, run_session_id: str | None, chat_session: str, withheld: bool
-) -> None:
-    ctx = _ctx()
-    ctx.browser_session_id = chat_session
-    record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_signin", session_id=tainted_session)
-
-    assert run_execution_module._run_browser_carries_a_sign_in(ctx, run_session_id) is withheld
 
 
 def _completed_run_result() -> dict[str, Any]:

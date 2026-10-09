@@ -160,6 +160,12 @@ class _FakeWorkflow:
         return copy.deepcopy(self) if deep else _FakeWorkflow(self.workflow_definition)
 
 
+async def _restore_the_offered_proposal(ctx: CopilotContext, **_: object) -> None:
+    # The route only admits the Test action over a pending proposal, which restore stages.
+    ctx.staged_workflow = _FakeWorkflow(_wf_def())
+    ctx.staged_workflow_yaml = ctx.workflow_yaml
+
+
 class _FakeStream:
     async def is_disconnected(self) -> bool:
         return False
@@ -4523,6 +4529,7 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
         else AsyncMock(return_value=run_result)
     )
     monkeypatch.setattr(agent_module, "run_workflow_end_to_end", run)
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", _restore_the_offered_proposal)
     monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr(
@@ -4827,6 +4834,7 @@ async def test_completed_test_result_handoff_uses_ordinary_acting_agent_surface(
         return result
 
     monkeypatch.setattr(agent_module, "run_workflow_end_to_end", fake_run)
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", _restore_the_offered_proposal)
     monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
     monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
     monkeypatch.setattr(

@@ -1,12 +1,15 @@
 from skyvern.services.browser_recording.evidence import RecordedPointerEvidence, build_recording_evidence
+from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.state_machines.click import StateMachineClick
-from skyvern.services.browser_recording.types import Action, ActionKind, Mouse
-from tests.unit.services.test_browser_recording import make_console_event
+from skyvern.services.browser_recording.types import Action, ActionKind, IncompleteCaptureReason, Mouse
+from tests.unit.services.test_browser_recording import make_cdp_event, make_click_event, make_console_event
 from tests.unit.services.test_browser_recording_code_first import (
     PBS_ID,
     WP_ID,
     draft_for,
     make_click,
+    make_dialog,
+    make_drag,
     make_input,
     make_url_change,
 )
@@ -41,6 +44,38 @@ def test_typed_values_never_enter_evidence_packet() -> None:
     assert packet.actions[2].input is None
     assert packet.actions[3].target is not None
     assert packet.actions[3].target.visible_texts == []
+
+
+def test_iframe_target_marks_evidence_as_incomplete() -> None:
+    iframe_click = make_click(1000, tag_name="iframe", selector="#embedded")
+
+    packet = build_recording_evidence(
+        [iframe_click],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert iframe_click.incomplete_capture_reason == IncompleteCaptureReason.UNATTACHED_FRAME
+    assert packet.actions[0].incomplete_capture_reason == IncompleteCaptureReason.UNATTACHED_FRAME
+
+
+def test_dialog_and_drag_drop_evidence_preserves_outcomes() -> None:
+    packet = build_recording_evidence(
+        [make_dialog(1000), make_drag(2000)],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert packet.actions[0].dialog is not None
+    assert packet.actions[0].dialog.dialog_type == "confirm"
+    assert packet.actions[0].dialog.response == "accept"
+    assert packet.actions[1].drag_drop is not None
+    assert packet.actions[1].drag_drop.source.selector_candidates == ["#card"]
+    assert packet.actions[1].drag_drop.destination.selector_candidates == ["#column"]
 
 
 def test_typed_values_are_redacted_from_recorded_urls() -> None:
@@ -168,6 +203,47 @@ def test_navigation_attribution_and_action_order() -> None:
     assert packet.actions[0].navigated_to == "https://example.com/next"
     assert packet.actions[2].observed_effects == []
     assert packet.actions[2].navigated_to is None
+
+
+def test_recorded_navigation_takes_precedence_in_evidence() -> None:
+    click = make_click(1000, selector="#next")
+    click.navigated_to = "https://example.com/final"
+    competing_navigation = make_url_change(1500, "https://example.com/inferred")
+
+    packet = build_recording_evidence(
+        [click, competing_navigation],
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert packet.actions[0].navigated_to == "https://example.com/final"
+    assert packet.actions[0].observed_effects == ["navigation"]
+
+
+def test_cdp_navigation_seconds_share_the_click_millisecond_clock() -> None:
+    events = [
+        make_cdp_event("nav:frame_started_navigating", 1_700_000_000.0, {"url": "https://example.com"}),
+        make_click_event({"id": "next", "skyId": "sky-next", "tagName": "BUTTON"}, 1_700_000_002_000.0),
+        make_cdp_event("nav:frame_started_navigating", 1_700_000_002.5, {"url": "https://example.com/next"}),
+    ]
+    actions = Processor(PBS_ID, "org_123", WP_ID).events_to_actions(events)
+
+    packet = build_recording_evidence(
+        actions,
+        None,
+        browser_session_id=PBS_ID,
+        workflow_permanent_id=WP_ID,
+        recording_attempt_id="rra_test",
+    )
+
+    assert [action.kind for action in packet.actions] == [
+        ActionKind.URL_CHANGE,
+        ActionKind.CLICK,
+        ActionKind.URL_CHANGE,
+    ]
+    assert packet.actions[1].navigated_to == "https://example.com/next"
 
 
 def test_focus_click_credential_transfers_to_fill() -> None:

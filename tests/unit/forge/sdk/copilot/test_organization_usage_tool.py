@@ -77,6 +77,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "start_fresh_browser",
     "extend_browser_session",
     "upload_attached_file",
+    "reply",
 ]
 
 
@@ -91,6 +92,7 @@ def test_the_tool_joins_every_catalog_combination_without_displacing_one(
         for tool in copilot_native_tools(
             supports_question_tool=supports_question_tool,
             browser_code_available=browser_code_available,
+            run_tools_available=True,
         )
     ]
 

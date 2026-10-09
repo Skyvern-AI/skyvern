@@ -10,6 +10,8 @@ from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.types import (
     Action,
     ActionClick,
+    ActionDialog,
+    ActionDragDrop,
     ActionHover,
     ActionInputText,
     ActionKind,
@@ -95,6 +97,29 @@ def make_hover(ts: float, url: str = START_URL, **target_kwargs) -> ActionHover:
     )
 
 
+def make_dialog(ts: float, response: str = "accept", dialog_type: str = "confirm") -> ActionDialog:
+    return ActionDialog(
+        kind=ActionKind.DIALOG,
+        target=make_target(),
+        timestamp_start=ts,
+        timestamp_end=ts + 1,
+        url=START_URL,
+        dialog_type=dialog_type,
+        response=response,
+    )
+
+
+def make_drag(ts: float) -> ActionDragDrop:
+    return ActionDragDrop(
+        kind=ActionKind.DRAG_DROP,
+        source=make_target(selector="#card", accessible_name="Card"),
+        target=make_target(selector="#column", accessible_name="Column"),
+        timestamp_start=ts,
+        timestamp_end=ts + 100,
+        url=START_URL,
+    )
+
+
 def draft_for(action: Action, **overrides) -> RecordingDraftStep:
     block_type = {
         ActionKind.URL_CHANGE: "goto_url",
@@ -136,6 +161,57 @@ def test_click_and_type_synthesize_single_code_block() -> None:
     assert parameters[0].default_value == ""
     assert parameters[0].workflow_parameter_type == "string"
     assert "widgets" not in block.code
+
+
+def test_dialog_policy_is_armed_before_triggering_click() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#remove", accessible_name="Remove"),
+        make_dialog(1010),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    code = blocks[0].code
+    policy = 'await set_dialog_policy(page, "accept")'
+    click = 'await page.locator("#remove").click()'
+    assert policy in code
+    assert code.index(policy) < code.index(click)
+
+
+def test_drag_drop_synthesizes_drag_to() -> None:
+    result = actions_to_code_first_blocks([make_drag(1000)], None)
+
+    assert result is not None
+    blocks, _ = result
+    assert 'await page.locator("#card").drag_to(page.locator("#column"))' in blocks[0].code
+    assert [step.action_type for step in blocks[0].steps or []] == ["goto_url", "drag"]
+
+
+def test_incomplete_iframe_click_emits_repair_instead_of_false_replay() -> None:
+    result = actions_to_code_first_blocks([make_click(1000, tag_name="iframe", selector="#embedded")], None)
+
+    assert result is not None
+    blocks, _ = result
+    assert 'page.locator("#embedded").click()' not in blocks[0].code
+    assert "incomplete_capture_unattached_frame" in blocks[0].code
+
+
+def test_chained_dialog_emits_repair_before_triggering_click() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#open", accessible_name="Open"),
+        make_dialog(1010, response="accept"),
+        make_dialog(1020, response="dismiss"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    code = blocks[0].code
+    assert "chained_dialog" in code
+    assert code.index("chained_dialog") < code.index('page.locator("#open").click()')
 
 
 def test_recorded_code_blocks_use_the_code_first_editor_shape() -> None:

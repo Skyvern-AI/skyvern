@@ -17,22 +17,34 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
+import logging
 import os
 import pickle
 import re
 import smtplib
 import ssl
 import traceback
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email import message_from_bytes
+from email import policy as email_policy
 from email.message import EmailMessage
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import libcst as cst
 import pytest
+import pytest_asyncio
 from email_validator import EmailUndeliverableError, validate_email
+from pydantic import ValidationError
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_send_email_statement
@@ -40,7 +52,19 @@ from skyvern.exceptions import BlockedHost, UnresolvableHost
 from skyvern.forge import app
 from skyvern.forge.sdk.api import email as email_api
 from skyvern.forge.sdk.api.email import InvalidEmailRecipient, send, validate_recipients
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import (
+    Base,
+    GmailSendDispatchModel,
+    GoogleOAuthCredentialModel,
+    WorkflowModel,
+    WorkflowRunBlockModel,
+    WorkflowRunModel,
+    WorkflowRunOutputParameterModel,
+)
+from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomSMTPAuthenticationFailed,
     CustomSMTPConnectionFailed,
@@ -48,23 +72,37 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     NoValidEmailRecipient,
 )
-from skyvern.forge.sdk.workflow.models.block import HumanInteractionBlock, SendEmailBlock, _send_via_custom_smtp
+from skyvern.forge.sdk.workflow.models.block import (
+    ForLoopBlock,
+    HumanInteractionBlock,
+    SendEmailBlock,
+    _send_via_custom_smtp,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     PLATFORM_SMTP_AWS_KEYS,
     UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
     AWSSecretParameter,
     OutputParameter,
     ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.workflows import (
+    AWSSecretParameterYAML,
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    ForLoopBlockYAML,
     HumanInteractionBlockYAML,
     SendEmailBlockYAML,
     WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
 )
+from skyvern.services import script_service
+from skyvern.services.email import gmail as gmail_service
 
 
 def _output_parameter(label: str) -> OutputParameter:
@@ -1166,3 +1204,605 @@ async def test_email_download_directory_ignores_previous_attempt_files(
 
     assert [part.get_filename() for part in message.iter_attachments()] == ["fresh.txt"]
     assert (download_dir / "old.txt").read_text() == "old.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", ["", "  "])
+async def test_a_blank_attachment_entry_is_skipped_and_the_email_still_builds(
+    blank: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    report = tmp_path / "wr_1" / "report.txt"
+    report.parent.mkdir()
+    report.write_text("report")
+    context = _workflow_run_context({})
+
+    with patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None):
+        only_blank = await _send_email_block(file_attachments=[blank])._build_email_message(context, "wr_1")
+        mixed = await _send_email_block(file_attachments=[blank, str(report), blank])._build_email_message(
+            context, "wr_1"
+        )
+
+    assert list(only_blank.iter_attachments()) == []
+    assert [part.get_filename() for part in mixed.iter_attachments()] == ["report.txt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["{{ report_path }}", "report_path"])
+async def test_an_attachment_that_resolves_to_an_empty_path_still_fails(
+    entry: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    context = _workflow_run_context({"report_path": ""})
+    now = datetime.now(UTC)
+    context.parameters["report_path"] = WorkflowParameter(
+        key="report_path",
+        workflow_parameter_id="wp_1",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+    with patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None):
+        with pytest.raises(PermissionError, match="path must not be empty"):
+            await _send_email_block(file_attachments=[entry])._build_email_message(context, "wr_1")
+
+
+GMAIL_ORG = "o_gmail"
+GMAIL_RUN = "wr_gmail"
+GMAIL_CREDENTIAL = "goac_gmail"
+GMAIL_SENDER = "verified.sender@example.com"
+SENTINEL_TOKEN = "ya29.sentinel-access-token"
+SENTINEL_RECIPIENT = "sentinel.recipient@example.com"
+SENTINEL_SUBJECT = "Sentinel subject 7f3a"
+SENTINEL_BODY = "Sentinel body 9c1e"
+SENTINELS = (SENTINEL_TOKEN, SENTINEL_RECIPIENT, SENTINEL_SUBJECT, SENTINEL_BODY)
+GMAIL_TOKEN = google_oauth_service.GoogleRefreshResult(SENTINEL_TOKEN, None)
+GmailResponder = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
+ACCEPTED_OUTPUT = {
+    "success": True,
+    "transport": "gmail",
+    "outcome": "accepted",
+    "provider_message_id": "msg-1",
+    "error_code": None,
+}
+
+
+def _accepted(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"id": "msg-1", "threadId": "thread-1"})
+
+
+def _rejected(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(400, json={"error": {"status": "INVALID_ARGUMENT", "message": " ".join(SENTINELS)}})
+
+
+async def _time_out(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+@dataclass
+class GmailEnv:
+    database: AgentDB
+    token_mints: AsyncMock
+    respond: GmailResponder = _accepted
+    requests: list[httpx.Request] = field(default_factory=list)
+
+    def sent(self) -> list[EmailMessage]:
+        return [message_from_bytes(request.content, policy=email_policy.default) for request in self.requests]
+
+    async def rows(self, model: type[Base]) -> list[Base]:
+        async with self.database.Session() as session:
+            return list((await session.scalars(select(model))).all())
+
+    async def add_run(
+        self, workflow_run_id: str, retried_from: str | None = None, organization_id: str = GMAIL_ORG, **values: object
+    ) -> None:
+        async with self.database.Session() as session:
+            session.add(
+                WorkflowRunModel(
+                    workflow_run_id=workflow_run_id,
+                    workflow_id="w_1",
+                    workflow_permanent_id="wpid_1",
+                    organization_id=organization_id,
+                    status="running",
+                    retried_from_workflow_run_id=retried_from,
+                )
+            )
+            await session.commit()
+        context = _workflow_run_context(values)
+        context.workflow_run_id, context.organization_id = workflow_run_id, GMAIL_ORG
+        app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[workflow_run_id] = context
+
+    async def set_connection(self, **values: object) -> None:
+        async with self.database.Session() as session:
+            await session.execute(
+                update(GoogleOAuthCredentialModel)
+                .where(GoogleOAuthCredentialModel.id == GMAIL_CREDENTIAL)
+                .values(modified_at=GoogleOAuthCredentialModel.modified_at, **values)
+            )
+            await session.commit()
+
+    def run_during_the_next_token_mint(self, block: SendEmailBlock, workflow_run_id: str = GMAIL_RUN) -> None:
+        """Run another execution to completion once the next one has read the send record but not yet claimed it."""
+        overtaken_mint = self.token_mints.await_count + 1
+
+        async def mint(**_: object) -> google_oauth_service.GoogleRefreshResult:
+            if self.token_mints.await_count == overtaken_mint:
+                await _run_gmail(block, workflow_run_id)
+            return GMAIL_TOKEN
+
+        self.token_mints.side_effect = mint
+
+
+@pytest_asyncio.fixture
+async def gmail_env(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, offline_address_validation: None, tmp_path: Path
+) -> AsyncIterator[GmailEnv]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", WorkflowContextManager())
+    monkeypatch.setattr(app, "SECONDARY_LLM_API_HANDLER", AsyncMock(return_value={"summary": "description"}))
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path / "downloads"))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    async with database.Session() as session:
+        session.add(
+            GoogleOAuthCredentialModel(
+                id=GMAIL_CREDENTIAL,
+                organization_id=GMAIL_ORG,
+                credential_name="Mail",
+                state="active",
+                scopes_granted=[google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE, "openid"],
+                email_address=GMAIL_SENDER,
+                google_subject="subject-1",
+                encrypted_refresh_token="enc-refresh",
+                encrypted_method="aes",
+            )
+        )
+        await session.commit()
+    env = GmailEnv(database=database, token_mints=AsyncMock(return_value=GMAIL_TOKEN))
+    await env.add_run(GMAIL_RUN)
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        env.requests.append(request)
+        response = env.respond(request)
+        return await response if isinstance(response, Awaitable) else response
+
+    monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(decrypt=AsyncMock(return_value="refresh")))
+    monkeypatch.setattr(google_oauth_service, "refresh_and_rotate", env.token_mints)
+    monkeypatch.setattr(smtplib, "SMTP", MagicMock(side_effect=AssertionError("a Gmail block opened SMTP")))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as gmail_client:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.send_raw_message",
+            partial(gmail_service.send_raw_message, client=gmail_client),
+        )
+        yield env
+    skyvern_context.reset()
+
+
+def _gmail_block(label: str = "send_email", **overrides: object) -> SendEmailBlock:
+    fields = {
+        "credential_id": GMAIL_CREDENTIAL,
+        "recipients": [SENTINEL_RECIPIENT],
+        "subject": SENTINEL_SUBJECT,
+        "body": SENTINEL_BODY,
+        **overrides,
+    }
+    block = block_yaml_to_block(
+        SendEmailBlockYAML(label=label, transport="gmail", **fields), {f"{label}_output": _output_parameter(label)}
+    )
+    assert isinstance(block, SendEmailBlock)
+    return block
+
+
+async def _run_gmail(block: SendEmailBlock, workflow_run_id: str = GMAIL_RUN) -> BlockResult:
+    return await block.execute_safe(workflow_run_id=workflow_run_id, organization_id=GMAIL_ORG)
+
+
+def _outcome(result: BlockResult) -> tuple[str, str | None, bool]:
+    output = result.output_parameter_value
+    return output["outcome"], output["error_code"], output["replayed"]
+
+
+def _attachments(message: EmailMessage) -> list[tuple[str | None, bytes]]:
+    return [(part.get_filename(), part.get_content()) for part in message.iter_attachments()]
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_builds_one_message_from_the_verified_account(gmail_env: GmailEnv, tmp_path: Path) -> None:
+    run_dir = tmp_path / "downloads" / GMAIL_RUN
+    run_dir.mkdir(parents=True)
+    report_bytes = bytes(range(256)) * 4
+    (run_dir / "report.bin").write_bytes(report_bytes)
+    (run_dir / "unrequested.txt").write_text("not asked for")
+
+    result = await _run_gmail(
+        _gmail_block(
+            sender="someone.else@example.com",
+            recipients=["to.one@example.com, to.two@example.com"],
+            cc=["cc@example.com"],
+            bcc=["bcc@example.com"],
+            subject="Rapport d'activité ✓\r\nX-Injected: yes",
+            body="<p>Résumé — <b>terminé</b></p>",
+            body_format="html",
+            file_attachments=[str(run_dir / "report.bin")],
+        )
+    )
+
+    (request,) = gmail_env.requests
+    (message,) = gmail_env.sent()
+    assert (request.url.params["uploadType"], request.headers["content-type"]) == ("media", "message/rfc822")
+    assert request.headers["authorization"] == f"Bearer {SENTINEL_TOKEN}"
+    assert (message["From"], message["To"]) == (GMAIL_SENDER, "to.one@example.com, to.two@example.com")
+    assert (message["Cc"], message["Bcc"], message["X-Injected"]) == ("cc@example.com", "bcc@example.com", None)
+    assert message["Subject"] == "Rapport d'activité ✓X-Injected: yes"
+    assert "Résumé — <b>terminé</b>" in message.get_body(preferencelist=("html",)).get_content()
+    assert _attachments(message) == [("report.bin", report_bytes)]
+    assert result.status == BlockStatus.completed
+    assert result.output_parameter_value == {**ACCEPTED_OUTPUT, "replayed": False}
+    (dispatch,) = await gmail_env.rows(GmailSendDispatchModel)
+    assert (dispatch.status, dispatch.provider_message_id) == ("accepted", "msg-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "connection", "expected"),
+    [
+        pytest.param({"credential_id": None}, {}, "configuration", id="no-connection"),
+        pytest.param({"credential_id": "goac_missing"}, {}, "configuration", id="stale-connection-id"),
+        pytest.param({}, {"organization_id": "o_other"}, "configuration", id="another-organizations-connection"),
+        pytest.param(
+            {},
+            {"scopes_granted": [google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE]},
+            "missing_scope",
+            id="read-only-connection",
+        ),
+        pytest.param({}, {"state": "revoked"}, "configuration", id="revoked"),
+        pytest.param({}, {"google_subject": None}, "reconnect", id="no-verified-identity"),
+        pytest.param({"recipients": [], "cc": [""]}, {}, "no_recipients", id="no-recipients"),
+        pytest.param(
+            {"recipients": ["to@example.com\r\nBcc: injected@example.com"]},
+            {},
+            "invalid_recipient",
+            id="injected-recipient",
+        ),
+        pytest.param(
+            {"file_attachments": ["SKYVERN_DOWNLOAD_DIRECTORY"]}, {}, "attachment_invalid", id="download-directory"
+        ),
+    ],
+)
+async def test_gmail_send_refusals_make_no_token_or_provider_call(
+    gmail_env: GmailEnv, overrides: dict[str, object], connection: dict[str, object], expected: str
+) -> None:
+    if connection:
+        await gmail_env.set_connection(**connection)
+
+    result = await _run_gmail(_gmail_block(**overrides))
+
+    assert result.status == BlockStatus.failed
+    assert _outcome(result) == ("failed", expected, False)
+    assert gmail_env.requests == []
+    gmail_env.token_mints.assert_not_awaited()
+    assert await gmail_env.rows(GmailSendDispatchModel) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "respond",
+    [
+        pytest.param(_time_out, id="timeout"),
+        pytest.param(lambda _: httpx.Response(200, json={"threadId": "t"}), id="no-message-id"),
+        pytest.param(lambda _: httpx.Response(503, text="unavailable"), id="503"),
+        pytest.param(lambda _: httpx.Response(422, json={"error": {}}), id="unlisted-4xx"),
+    ],
+)
+async def test_gmail_send_unconfirmed_attempt_is_unknown_and_never_sent_again(
+    gmail_env: GmailEnv, respond: GmailResponder
+) -> None:
+    gmail_env.respond = respond
+
+    first = await _run_gmail(_gmail_block())
+    gmail_env.respond = _accepted
+    replay = await _run_gmail(_gmail_block())
+
+    assert len(gmail_env.requests) == 1
+    assert first.status == replay.status == BlockStatus.failed
+    assert _outcome(first) == ("unknown", "outcome_unknown", False)
+    assert _outcome(replay) == ("unknown", "outcome_unknown", True)
+    assert [row.status for row in await gmail_env.rows(GmailSendDispatchModel)] == ["unknown"]
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_interrupted_dispatch_is_unknown_and_not_sent_again(gmail_env: GmailEnv) -> None:
+    reached_gmail = asyncio.Event()
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        reached_gmail.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    gmail_env.respond = hang
+    interrupted = asyncio.create_task(_run_gmail(_gmail_block()))
+    await asyncio.wait_for(reached_gmail.wait(), timeout=10)
+    interrupted.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(interrupted, timeout=10)
+
+    gmail_env.respond = _accepted
+    recovery = await _run_gmail(_gmail_block())
+
+    assert len(gmail_env.requests) == 1
+    assert recovery.status == BlockStatus.failed
+    assert _outcome(recovery) == ("unknown", "outcome_unknown", True)
+    assert [row.status for row in await gmail_env.rows(GmailSendDispatchModel)] == ["dispatching"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_a_rejected_attempt", [False, True], ids=["first-attempt", "after-a-rejected-attempt"])
+async def test_gmail_send_concurrent_duplicate_execution_dispatches_once_and_reuses_the_receipt(
+    gmail_env: GmailEnv, after_a_rejected_attempt: bool
+) -> None:
+    if after_a_rejected_attempt:
+        gmail_env.respond = _rejected
+        await _run_gmail(_gmail_block())
+        gmail_env.respond = _accepted
+    earlier_requests = len(gmail_env.requests)
+
+    gmail_env.run_during_the_next_token_mint(_gmail_block())
+    overtaken = await _run_gmail(_gmail_block())
+
+    assert len(gmail_env.requests) == earlier_requests + 1
+    assert overtaken.output_parameter_value == {**ACCEPTED_OUTPUT, "replayed": True}
+    assert [row.status for row in await gmail_env.rows(GmailSendDispatchModel)] == ["accepted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("respond", "retry_requests", "retry_outcome"),
+    [
+        pytest.param(_accepted, 0, "accepted", id="accepted-is-replayed"),
+        pytest.param(_time_out, 0, "unknown", id="unknown-is-not-sent-again"),
+        pytest.param(_rejected, 1, "accepted", id="rejected-is-attempted-once-more"),
+    ],
+)
+async def test_gmail_send_credential_fallback_retry_follows_the_outcome_the_original_run_recorded(
+    gmail_env: GmailEnv, respond: GmailResponder, retry_requests: int, retry_outcome: str
+) -> None:
+    await gmail_env.add_run("wr_retry", retried_from=GMAIL_RUN)
+    await gmail_env.add_run("wr_second_retry", retried_from="wr_retry")
+    await gmail_env.add_run("wr_unrelated")
+    gmail_env.respond = respond
+
+    await _run_gmail(_gmail_block())
+    gmail_env.respond = _accepted
+    retry = await _run_gmail(_gmail_block(), "wr_retry")
+    second_retry = await _run_gmail(_gmail_block(), "wr_second_retry")
+    retry_chain_requests = len(gmail_env.requests)
+    unrelated = await _run_gmail(_gmail_block(), "wr_unrelated")
+
+    assert retry_chain_requests == 1 + retry_requests
+    assert (_outcome(retry)[0], _outcome(retry)[2]) == (retry_outcome, retry_requests == 0)
+    assert (_outcome(second_retry)[0], _outcome(second_retry)[2]) == (retry_outcome, True)
+    assert _outcome(unrelated) == ("accepted", None, False)
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_does_not_follow_a_retry_link_into_another_organization(gmail_env: GmailEnv) -> None:
+    await gmail_env.add_run("wr_other_org", organization_id="o_other")
+    await gmail_env.add_run("wr_retry", retried_from="wr_other_org")
+
+    result = await _run_gmail(_gmail_block(), "wr_retry")
+
+    assert result.output_parameter_value["outcome"] == "unknown"
+    assert gmail_env.requests == []
+    assert await gmail_env.rows(GmailSendDispatchModel) == []
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_keeps_tokens_recipients_and_message_text_out_of_logs_and_stored_rows(
+    gmail_env: GmailEnv, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="skyvern")
+    await gmail_env.add_run("wr_rejected")
+    await gmail_env.add_run("wr_template", note=SENTINEL_BODY)
+    await gmail_env.add_run("wr_unknown")
+
+    accepted = await _run_gmail(_gmail_block())
+    gmail_env.respond = _rejected
+    rejected = await _run_gmail(_gmail_block(), "wr_rejected")
+    malformed = await _run_gmail(
+        _gmail_block(subject=f"{SENTINEL_SUBJECT} {{{{ note | no_such_filter }}}}", body="{{ note + 1 }}"),
+        "wr_template",
+    )
+    gmail_env.respond = _time_out
+    unknown = await _run_gmail(_gmail_block(), "wr_unknown")
+
+    outcomes = [accepted, rejected, malformed, unknown]
+    assert [_outcome(outcome)[1] for outcome in outcomes] == [
+        None,
+        "provider_rejected",
+        "template_error",
+        "outcome_unknown",
+    ]
+    rows = [
+        row
+        for model in (WorkflowRunBlockModel, GmailSendDispatchModel, WorkflowRunOutputParameterModel)
+        for row in await gmail_env.rows(model)
+    ]
+    stored = repr([[getattr(row, column.name) for column in row.__table__.columns] for row in rows])
+    for sentinel in SENTINELS:
+        assert sentinel not in caplog.text + stored + repr(outcomes)
+    assert "INVALID_ARGUMENT" in stored
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_attaches_its_own_copy_of_each_same_named_stored_file_and_leaves_none_on_disk(
+    gmail_env: GmailEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await gmail_env.add_run("wr_other")
+    files = {
+        f"s3://uploads/o_gmail/{folder}/report.pdf": folder.encode() for folder in ("january", "february", "other")
+    }
+    january, february, other = files
+    storage = SimpleNamespace(
+        assert_managed_file_access=MagicMock(),
+        managed_file_size=AsyncMock(side_effect=lambda uri, _: len(files[uri])),
+        download_managed_file=AsyncMock(side_effect=lambda uri, _: files[uri]),
+    )
+    monkeypatch.setattr(app, "STORAGE", storage)
+
+    gmail_env.run_during_the_next_token_mint(_gmail_block(subject="other", file_attachments=[other]), "wr_other")
+    await _run_gmail(_gmail_block(subject="first", file_attachments=[january, february]))
+
+    assert {message["Subject"]: _attachments(message) for message in gmail_env.sent()} == {
+        "other": [("report.pdf", b"other")],
+        "first": [("report.pdf", b"january"), ("report.pdf", b"february")],
+    }
+    assert [path for path in (tmp_path / "temp").rglob("*") if not path.is_dir()] == []
+
+
+def _loop_of(label: str, *children: ForLoopBlock | SendEmailBlock, values: str = "{{ items }}") -> ForLoopBlock:
+    return ForLoopBlock(
+        label=label,
+        output_parameter=_output_parameter(label),
+        loop_variable_reference=values,
+        loop_blocks=list(children),
+    )
+
+
+async def _cached_run(gmail_env: GmailEnv, workflow_run_id: str, *blocks: ForLoopBlock, **values: object) -> None:
+    await gmail_env.add_run(workflow_run_id, **values)
+    async with gmail_env.database.Session() as session:
+        await session.merge(
+            WorkflowModel(
+                workflow_id="w_1",
+                workflow_permanent_id="wpid_1",
+                organization_id=GMAIL_ORG,
+                title="Workflow",
+                version=1,
+                workflow_definition=WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json"),
+            )
+        )
+        await session.commit()
+    skyvern_context.set(
+        skyvern_context.SkyvernContext(
+            organization_id=GMAIL_ORG, workflow_id="w_1", workflow_run_id=workflow_run_id, script_mode=True
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_cached_loops_send_once_per_iteration_and_an_engine_rerun_sends_nothing(
+    gmail_env: GmailEnv,
+) -> None:
+    outer = _loop_of(
+        "outer",
+        _loop_of("inner", _gmail_block("inner_send", subject="{{ current_value }}"), values="{{ inner_items }}"),
+        _gmail_block(subject="{{ current_value }}"),
+    )
+    await _cached_run(gmail_env, "wr_loops", outer, items=["one", "two"], inner_items=["x", "y"])
+    # The engine nests a block under its conditional's row and cached code does not; both must name one execution.
+    conditional_row = await gmail_env.database.observer.create_workflow_run_block(
+        workflow_run_id="wr_loops", organization_id=GMAIL_ORG, block_type=BlockType.CONDITIONAL, label="branch"
+    )
+
+    async for _ in script_service.loop(["one", "two"], label="outer"):
+        async for _ in script_service.loop(["x", "y"], label="inner"):
+            await script_service.send_email(transport="gmail", credential_id=GMAIL_CREDENTIAL, label="inner_send")
+        await script_service.send_email(transport="gmail", credential_id=GMAIL_CREDENTIAL, label="send_email")
+    skyvern_context.reset()
+    rerun = await outer.execute_safe(
+        workflow_run_id="wr_loops",
+        organization_id=GMAIL_ORG,
+        parent_workflow_run_block_id=conditional_row.workflow_run_block_id,
+    )
+
+    assert [message["Subject"] for message in gmail_env.sent()] == ["x", "y", "one", "x", "y", "two"]
+    assert rerun.status == BlockStatus.completed
+    dispatches = await gmail_env.rows(GmailSendDispatchModel)
+    assert len({dispatch.execution_key for dispatch in dispatches}) == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inner_items", [["x", "y"], []], ids=["inner-loop-with-values", "empty-inner-loop"])
+async def test_cached_nested_loop_records_the_inner_loop_in_each_outer_iteration(
+    gmail_env: GmailEnv, inner_items: list[str]
+) -> None:
+    outer = _loop_of("outer", _loop_of("inner", values="{{ inner_items }}"))
+    await _cached_run(gmail_env, "wr_plain_nested", outer, items=["one", "two"], inner_items=inner_items)
+
+    async for _ in script_service.loop(["one", "two"], label="outer"):
+        async for item in script_service.loop("{{ inner_items }}", complete_if_empty=True, label="inner"):
+            script_service._append_to_loop_output({"row": item.current_value}, "step")
+
+    (outer_row,) = [row for row in await gmail_env.rows(WorkflowRunBlockModel) if row.label == "outer"]
+    assert [
+        [(entry["output_parameter"]["key"], entry["loop_value"], len(entry["output_value"])) for entry in iteration]
+        for iteration in outer_row.output
+    ] == [[("inner_output", "one", len(inner_items))], [("inner_output", "two", len(inner_items))]]
+
+
+def test_gmail_send_block_carries_the_same_fields_through_yaml_conversion_reload_and_codegen() -> None:
+    authored = {
+        "transport": "gmail",
+        "credential_id": GMAIL_CREDENTIAL,
+        "recipients": [SENTINEL_RECIPIENT],
+        "cc": ["cc@example.com"],
+        "bcc": ["bcc@example.com"],
+        "subject": SENTINEL_SUBJECT,
+        "body": SENTINEL_BODY,
+        "body_format": "html",
+        "file_attachments": ["report.pdf"],
+    }
+
+    block = block_yaml_to_block(_send_email_block_yaml(sender="", **authored), _default_parameters())
+    stored = block.model_dump(mode="json")
+    reloaded = SendEmailBlock.model_validate(stored)
+    call = ast.parse(cst.Module(body=[_build_send_email_statement(stored)]).code).body[0].value.value
+
+    assert {name: stored[name] for name in authored} == authored
+    assert reloaded.model_dump(mode="json") == stored
+    assert {reloaded.smtp_host.aws_key, reloaded.smtp_password.aws_key} == {UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY}
+    assert call.args == []
+    assert {keyword.arg: ast.literal_eval(keyword.value) for keyword in call.keywords} == {
+        "transport": "gmail",
+        "credential_id": GMAIL_CREDENTIAL,
+        "label": "send_email",
+    }
+
+
+def test_gmail_send_workflow_saves_the_platform_smtp_parameters_only_while_an_smtp_block_uses_them() -> None:
+    gmail = SendEmailBlockYAML(label="gmail", transport="gmail", recipients=[], subject="", body="")
+    looped_gmail = ForLoopBlockYAML(label="each", loop_variable_reference="{{ items }}", loop_blocks=[gmail])
+    declared = [
+        *(AWSSecretParameterYAML(key=key, aws_key=aws_key) for key, aws_key in PLATFORM_SMTP_AWS_KEYS.items()),
+        AWSSecretParameterYAML(key="api_key", aws_key="UNRELATED_SECRET"),
+    ]
+
+    def convert(*blocks: SendEmailBlockYAML | ForLoopBlockYAML) -> tuple[dict[str, str], list]:
+        definition = convert_workflow_definition(
+            WorkflowDefinitionYAML(parameters=declared, blocks=list(blocks)), workflow_id="w_1"
+        )
+        secrets = {p.key: p.aws_key for p in definition.parameters if isinstance(p, AWSSecretParameter)}
+        return secrets, definition.blocks
+
+    gmail_only, _ = convert(looped_gmail)
+    with_smtp, (_, gmail_block) = convert(_send_email_block_yaml(label="smtp"), gmail)
+    placeholders = (gmail_block.smtp_host, gmail_block.smtp_port, gmail_block.smtp_username, gmail_block.smtp_password)
+
+    assert gmail_only == {"api_key": "UNRELATED_SECRET"}
+    assert with_smtp == {**PLATFORM_SMTP_AWS_KEYS, "api_key": "UNRELATED_SECRET"}
+    # A rollback must not find a Gmail block keyed to the workflow's real SMTP secrets.
+    assert len({placeholder.key for placeholder in placeholders}) == 4
+    assert {placeholder.key for placeholder in placeholders}.isdisjoint(with_smtp)
+
+
+def test_gmail_send_yaml_keeps_a_blank_draft_and_rejects_the_other_transports_fields() -> None:
+    draft = SendEmailBlockYAML(label="send_email", transport="gmail", recipients=[], subject="", body="")
+
+    assert (draft.sender, draft.credential_id, draft.recipients, draft.cc, draft.bcc) == ("", None, [], [], [])
+    assert _send_email_block_yaml().transport is None
+    with pytest.raises(ValidationError, match="sender is required unless the transport is gmail"):
+        SendEmailBlockYAML(label="send_email", recipients=["to@example.com"], subject="s", body="b")
+    with pytest.raises(ValidationError, match="cannot be combined with the gmail transport"):
+        _send_email_block_yaml(transport="gmail", custom_smtp_host="smtp.example.com")

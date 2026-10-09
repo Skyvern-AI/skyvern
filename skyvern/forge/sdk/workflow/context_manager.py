@@ -1,6 +1,11 @@
 import asyncio
 import copy
+import difflib
+import json
+import os
 import re
+import string
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -8,6 +13,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import structlog
+from jinja2 import Template
 from jinja2 import meta as jinja2_meta
 from jinja2.sandbox import SandboxedEnvironment
 from onepassword import ItemFieldType
@@ -15,7 +21,7 @@ from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT
+from skyvern.constants import BROWSER_CLOSE_TIMEOUT, SCRUBBED_VALUE
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
@@ -35,6 +41,7 @@ from skyvern.exceptions import (
     sanitize_credential_for_error,
 )
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.core import skyvern_context
@@ -53,6 +60,7 @@ from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepass
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -73,7 +81,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
-from skyvern.utils.secret_redaction import collect_redactable_secret_values, is_redactable_secret_value
+from skyvern.utils.secret_redaction import (
+    MIN_NUMERIC_SECRET_LENGTH,
+    MIN_UNANCHORED_SECRET_LENGTH,
+    collect_redactable_secret_values,
+    is_redactable_secret_value,
+)
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 
@@ -159,6 +172,256 @@ def resolve_credential_parameter_binding(
     return credential_id
 
 
+_BROAD_DERIVED_SPAN_CHARS = 1024
+_RESYNC_ANCHOR_CHARS = 8
+# A derived value is a transform of one secret; four times its length covers urlencode-style growth.
+_RESYNC_WINDOW_PER_SECRET_CHAR = 4
+
+
+def _canaries(secret: str) -> list[str]:
+    """Two same-length canaries sharing no character with the secret, so a transform of one cannot match a
+    transform of the other; digits for an all-digit secret so `| int` still renders."""
+    folded = secret.casefold()
+    pool = string.digits + string.ascii_lowercase if secret.isdigit() else string.ascii_lowercase + string.digits
+    return [char * len(secret) for char in ([char for char in pool if char not in folded] + ["~", "#"])[:2]]
+
+
+def _shaped_canary(secret: str) -> str:
+    folded = secret.casefold()
+    letter = next((char for char in string.ascii_lowercase if char not in folded), "q")
+    digit = next((char for char in string.digits if char not in secret), "0")
+
+    def shape(char: str) -> str:
+        if char.isdigit():
+            return digit
+        if char.isalpha():
+            return letter.upper() if char.isupper() else letter
+        return char
+
+    return "".join(map(shape, secret))
+
+
+def _render_swapped(
+    template: Template, template_data: Mapping[str, Any], referenced: set[str], secret: str, canary: str
+) -> str:
+    swapped = {name: _swap_secret(template_data[name], secret, canary) for name in referenced}
+    return template.render({**template_data, **swapped})
+
+
+def _diff_spans(rendered: str, alternate: str, window: int) -> tuple[tuple[int, int], list[tuple[int, int]]] | None:
+    """The covering span where `alternate` departs from `rendered`, and the changed segments inside it."""
+    if alternate == rendered:
+        return None
+    prefix = len(os.path.commonprefix([rendered, alternate]))
+    suffix = len(os.path.commonprefix([rendered[prefix:][::-1], alternate[prefix:][::-1]]))
+    end = len(rendered) - suffix
+    return (prefix, end), _changed_segments(
+        rendered[prefix:end], alternate[prefix : len(alternate) - suffix], prefix, window
+    )
+
+
+def _swap_secret(value: Any, secret: str, canary: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(secret, canary)
+    if isinstance(value, Mapping):
+        return {_swap_secret(key, secret, canary): _swap_secret(item, secret, canary) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_swap_secret(item, secret, canary) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and str(value) == secret:
+        return canary
+    return value
+
+
+def register_secret_derived_output(
+    secrets: dict[str, Any],
+    template: Template,
+    source: str,
+    template_data: Mapping[str, Any],
+    rendered: str,
+) -> None:
+    """Register the span of `rendered` that changes when each secret is swapped for a canary, so redactors
+    fed from the `secrets` registry also match a secret a Jinja filter transformed (`{{ token|reverse }}`)."""
+    present = collect_redactable_secret_values(secrets)
+    if not present or not rendered:
+        return
+    parsed = template.environment.parse(source)
+    referenced = jinja2_meta.find_undeclared_variables(parsed) & template_data.keys()
+    if not referenced:
+        return
+    try:
+        # One serialization pass; JSON escapes per character, so a secret's escaped form is in the blob
+        # exactly when the secret is in the data.
+        blob = json.dumps([template_data[name] for name in referenced], default=str, ensure_ascii=False)
+        present = {secret for secret in present if json.dumps(secret, ensure_ascii=False)[1:-1] in blob}
+    except (TypeError, ValueError):
+        pass  # Unserializable data: check every secret.
+    if not present:
+        return
+    for secret in present:
+        canaries = _canaries(secret)
+        coverings: list[tuple[int, int]] = []
+        segments: list[tuple[int, int]] = []
+        alternates: list[str] = []
+        canary_error: str | None = None
+        window = _RESYNC_WINDOW_PER_SECRET_CHAR * len(secret) + _RESYNC_ANCHOR_CHARS
+        for canary in canaries:
+            try:
+                alternate = _render_swapped(template, template_data, referenced, secret, canary)
+            except Exception as exc:
+                canary_error = type(exc).__name__
+                continue
+            alternates.append(alternate)
+            if diff := _diff_spans(rendered, alternate, window):
+                coverings.append(diff[0])
+                segments += diff[1]
+        canary_render_failed = False
+        if canary_error is not None:
+            # A uniform canary loses the secret's punctuation (`split(':')` then raises); one that keeps it still
+            # observes which parts of the output the secret's letters and digits produced.
+            try:
+                shaped = _render_swapped(template, template_data, referenced, secret, _shaped_canary(secret))
+            except Exception:
+                # Nothing rendered without the real secret: fail closed.
+                canary_render_failed = True
+            else:
+                alternates.append(shaped)
+                if diff := _diff_spans(rendered, shaped, window):
+                    coverings.append(diff[0])
+                    segments += diff[1]
+        # A `| json` value reaches its consumer decoded, so its leaves are registered as whole values.
+        real_leaves = _json_leaves(rendered)
+        if real_leaves:
+            # Counted, not set membership: a derived leaf can equal an unrelated literal leaf.
+            derived_leaves = (
+                set(real_leaves)
+                if canary_render_failed
+                else {
+                    leaf
+                    for alternate in alternates
+                    for leaf in Counter(real_leaves) - Counter(_json_leaves(alternate) or ())
+                }
+            )
+            for leaf in derived_leaves:
+                _register_secret_value(secrets, leaf)
+        if canary_render_failed:
+            coverings = [(0, len(rendered))]
+        if not coverings:
+            continue
+        start, end = min(span[0] for span in coverings), max(span[1] for span in coverings)
+        if canary_render_failed or end - start > _BROAD_DERIVED_SPAN_CHARS:
+            # Every redactor re-encodes registered values per call, so a broad span costs the rest of the run.
+            LOG.warning(
+                "Registering a broad secret-derived template span",
+                span_length=end - start,
+                canary_render_failed=canary_render_failed,
+                canary_error=canary_error,
+            )
+        # Each changed segment protects the pieces a consumer may split out (a decoded `| json` list). The covering
+        # span is registered too when failing closed or a segment is too short to register (`token|list|join('-')`).
+        protected = [_register_derived_span(secrets, rendered, *segment) for segment in set(segments)]
+        if canary_render_failed or not segments or not all(protected):
+            _register_derived_span(secrets, rendered, start, end)
+
+
+def _changed_segments(region: str, other: str, offset: int, window: int) -> list[tuple[int, int]]:
+    if len(region) == len(other):
+        runs: list[tuple[int, int]] = []
+        run_start: int | None = None
+        for index, (left, right) in enumerate(zip(region, other)):
+            if left != right and run_start is None:
+                run_start = index
+            elif left == right and run_start is not None:
+                runs.append((offset + run_start, offset + index))
+                run_start = None
+        if run_start is not None:
+            runs.append((offset + run_start, offset + len(region)))
+        return runs
+    # Lengths differ: walk both renders together and, at each divergence, find the nearest point where they agree
+    # again on a stretch of static text. Derived text is short, so each search stays within `window` and the walk
+    # is linear.
+    segments: list[tuple[int, int]] = []
+    i = j = 0
+    while i < len(region):
+        if j < len(other) and region[i] == other[j]:
+            i += 1
+            j += 1
+            continue
+        resync: tuple[int, int] | None = None
+        for skip in range(window + 1):
+            if resync is not None and skip >= resync[0] - i + resync[1] - j:
+                break
+            anchor = region[i + skip : i + skip + _RESYNC_ANCHOR_CHARS]
+            if len(anchor) < _RESYNC_ANCHOR_CHARS:
+                break
+            found = other.find(anchor, j, j + window + _RESYNC_ANCHOR_CHARS)
+            if found >= 0 and (resync is None or skip + found - j < resync[0] - i + resync[1] - j):
+                resync = (i + skip, found)
+        if resync is None:
+            if len(region) - i > window:
+                # ponytail: a derived stretch longer than the window keeps only the covering span.
+                return []
+            resync = (len(region), len(other))
+        # The chunk between divergence and re-sync is bounded by the window, so a character diff inside it is cheap and
+        # still splits copies joined by static text shorter than the anchor (`{{ a|upper }} or {{ a|reverse }}`).
+        matcher = difflib.SequenceMatcher(None, region[i : resync[0]], other[j : resync[1]], False)
+        segments += [
+            (offset + i + i1, offset + i + i2)
+            for tag, i1, i2, _, _ in matcher.get_opcodes()
+            if tag != "equal" and i1 < i2
+        ]
+        i, j = resync
+    return segments
+
+
+def _register_derived_span(secrets: dict[str, Any], rendered: str, start: int, end: int) -> bool:
+    """Register `rendered[start:end]`; False when it is too short to register."""
+    if start >= end:
+        return True
+    if end - start < MIN_UNANCHORED_SECRET_LENGTH:
+        # A short fragment inside a word (`AUTH{{ token[:4] }}CODE`) would never match on its own.
+        while start > 0 and rendered[start - 1].isalnum():
+            start -= 1
+        while end < len(rendered) and rendered[end].isalnum():
+            end += 1
+    return _register_secret_value(secrets, rendered[start:end])
+
+
+def _register_secret_value(secrets: dict[str, Any], value: str) -> bool:
+    """Register `value`; False when it is too short to register."""
+    if not is_redactable_secret_value(value, secrets):
+        return False
+    if value not in secrets.values():
+        secret_id = WorkflowRunContext.generate_random_secret_id()
+        while secret_id in secrets:
+            secret_id = WorkflowRunContext.generate_random_secret_id()
+        secrets[secret_id] = value
+    return True
+
+
+def _json_leaves(rendered: str) -> list[str] | None:
+    if not (rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER)):
+        return None
+    try:
+        value = json.loads(rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)])
+    except ValueError:
+        return None
+    leaves: list[str] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                leaves.append(key)
+                collect(item)
+        elif isinstance(node, list):
+            for item in node:
+                collect(item)
+        elif node is not None and not isinstance(node, bool):
+            leaves.append(str(node))
+
+    collect(value)
+    return leaves
+
+
 class WorkflowRunContext:
     attempt_number: int = 1
 
@@ -207,6 +470,9 @@ class WorkflowRunContext:
         workflow_run_context.organization_id = organization.organization_id
 
         for parameter, run_parameter in workflow_parameter_tuples:
+            # The read path returns SCRUBBED_VALUE unconverted for display; execution must still reject it by type.
+            if run_parameter.value == SCRUBBED_VALUE:
+                parameter.workflow_parameter_type.convert_value(run_parameter.value)
             if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                 await workflow_run_context.register_secret_workflow_parameter_value(
                     parameter, run_parameter.value, organization
@@ -511,7 +777,8 @@ class WorkflowRunContext:
         if label in self.blocks_metadata:
             self.blocks_metadata[label].update(metadata)
             return
-        self.blocks_metadata[label] = metadata
+        # Stored as a copy: a caller's dict kept by reference would be rewritten by a later update for this label.
+        self.blocks_metadata[label] = metadata.copy()
 
     def get_block_metadata(self, label: str | None) -> BlockMetadata:
         if label is None:
@@ -642,7 +909,10 @@ class WorkflowRunContext:
                 workflow_permanent_id=self.workflow_permanent_id,
             )
 
-        return jinja_sandbox_env.from_string(raw_template).render(template_data)
+        template = jinja_sandbox_env.from_string(raw_template)
+        rendered = template.render(template_data)
+        register_secret_derived_output(self.secrets, template, raw_template, template_data, rendered)
+        return rendered
 
     async def _should_include_secrets_in_templates(self) -> bool:
         """
@@ -851,7 +1121,8 @@ class WorkflowRunContext:
             if data in secret_values:
                 return mask
             result = data
-            for secret in secret_values:
+            # Longest first: a registered slice of a secret masked before it would leave the rest behind.
+            for secret in sorted(secret_values, key=len, reverse=True):
                 if len(secret) >= SECRET_SUBSTRING_MIN_LENGTH:
                     result = result.replace(secret, mask)
             return result
@@ -862,6 +1133,12 @@ class WorkflowRunContext:
             return {self.mask_secrets_in_data(k, mask): self.mask_secrets_in_data(v, mask) for k, v in data.items()}
         elif isinstance(data, list):
             return [self.mask_secrets_in_data(item, mask) for item in data]
+        elif isinstance(data, (int, float)) and not isinstance(data, bool):
+            # A numeric secret decoded from `| json` arrives as a number; the redactor's floor keeps counts and years.
+            text = str(data)
+            digits = text.lstrip("-").replace(".", "")
+            if text in secret_values and len(digits) >= MIN_NUMERIC_SECRET_LENGTH:
+                return mask
         return data
 
     def build_workflow_run_summary(self) -> dict[str, Any]:
@@ -1014,6 +1291,7 @@ class WorkflowRunContext:
         )
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
+        fetch.credential_id = credential_id
         if db_credential.run_sequentially is True:
             workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
                 self.workflow_run_id,
@@ -1814,6 +2092,8 @@ class WorkflowRunContext:
         if parameter.key in self.values:
             LOG.debug(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
+        # Later blocks template from this value; the persisted output keeps the full label.
+        value = without_output_only_labels(value)
         self.values[parameter.key] = value
         self.register_block_reference_variable_from_output_parameter(parameter, value)
 
@@ -2263,6 +2543,21 @@ class WorkflowContextManager:
         if current_context is None:
             return set()
         return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
+    def registered_placeholder_ids_for_run(self, workflow_run_id: str | None) -> frozenset[str]:
+        """The run's resolvable placeholder ids, so redaction can exempt them by exact value.
+
+        Redaction only ever receives secret values, so without this it has to guess from shape, and
+        anything shaped like an id survives — including a secret rendered right after the literal
+        prefix (SKY-17864).
+        """
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return frozenset()
+        return frozenset(
+            secret_id
+            for secret_id in self.workflow_run_contexts[workflow_run_id].secrets
+            if isinstance(secret_id, str) and secret_id.startswith(RANDOM_SECRET_ID_PREFIX)
+        )
 
     def login_identifier_secret_ids_for_run(self, workflow_run_id: str | None) -> frozenset[str]:
         if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:

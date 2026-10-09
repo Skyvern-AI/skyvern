@@ -41,6 +41,7 @@ from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_requ
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
@@ -80,6 +81,10 @@ LOG = structlog.get_logger()
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
 async def db_unavailable_handler(
     request: Request, exc: OperationalError | DatabaseConnectionUnavailableError
 ) -> JSONResponse:
@@ -110,7 +115,14 @@ SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
 }
+
+
+def security_headers() -> dict[str, str]:
+    if settings.STRICT_TRANSPORT_SECURITY:
+        return {**SECURITY_HEADERS, "Strict-Transport-Security": settings.STRICT_TRANSPORT_SECURITY}
+    return SECURITY_HEADERS
 
 
 class SecurityHeadersMiddleware:
@@ -127,8 +139,9 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                for key, value in SECURITY_HEADERS.items():
-                    headers[key] = value
+                for key, value in security_headers().items():
+                    # A route-set header (e.g. a stricter per-response CSP) must win over the default.
+                    headers.setdefault(key, value)
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -269,6 +282,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "slug", "VARCHAR"),
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("google_oauth_credentials", "google_subject", "VARCHAR"),
 )
 
 
@@ -496,6 +510,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize Laminar tracing", error=str(e))
 
+    assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
 
     add_credentialed_cors_middleware(fastapi_app)
@@ -600,9 +615,7 @@ def create_api_app() -> FastAPI:
     async def handle_not_found_error(request: Request, exc: NotFoundError) -> Response:
         return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-    @fastapi_app.exception_handler(SkyvernHTTPException)
-    async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     register_db_unavailable_handlers(fastapi_app)
 
@@ -620,8 +633,8 @@ def create_api_app() -> FastAPI:
         if path == "/api/v1/users/me/onboarding":
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
-        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+        sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(
@@ -645,7 +658,7 @@ def create_api_app() -> FastAPI:
         response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
-            headers=SECURITY_HEADERS,
+            headers=security_headers(),
         )
         log_raw_request_exception(response.status_code)
         return response

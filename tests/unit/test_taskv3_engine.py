@@ -49,6 +49,7 @@ from skyvern.forge.taskv3.engine import (
 )
 from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
+from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
@@ -258,9 +259,81 @@ async def test_engine_forwards_single_action_block_to_the_loop(
         llm_caller=_ScriptedCaller([]),
         goal="x",
         single_action_block=single_action_block,
+        block_completion_judge=_achieving_judge([]),
     )
 
     assert captured["single_action_block"] is single_action_block
+    assert (captured["block_completion_check"] is not None) is single_action_block
+
+
+def _achieving_judge(prompts: list[str]):
+    async def judge(prompt: str) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    return judge
+
+
+async def _run_then_judge_block(
+    monkeypatch: pytest.MonkeyPatch,
+    judge: Any,
+    *,
+    script: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    **kwargs: Any,
+) -> tuple[Any, list[Any]]:
+    """Run the real loop on a single-action block, then ask its completion judge once, as the step cap would."""
+    real_loop = engine_mod.run_agent_tool_loop
+    verdicts: list[Any] = []
+
+    async def _loop_then_judge(**loop_kwargs: Any) -> Any:
+        outcome = await real_loop(**loop_kwargs)
+        if loop_kwargs["block_completion_check"] is not None:
+            verdicts.append(await loop_kwargs["block_completion_check"]())
+        return outcome
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loop_then_judge)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller(script or [[("finish", {"status": "completed", "reason": "done"})]]),
+        single_action_block=True,
+        block_completion_judge=judge,
+        **kwargs,
+    )
+    return outcome, verdicts
+
+
+@pytest.mark.asyncio
+async def test_engine_block_completion_judge_skips_after_a_secret_typed_in_this_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The secret's field can still be on screen and pixels cannot be redacted.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.goal_check import TrailEntry
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    prompts: list[str] = []
+    verdicts: list[Any] = []
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        kwargs["tool_trail"].record(
+            TrailEntry(
+                tool="type", status="ok", content="typed", perception=False, page_changing=True, secret_entered=True
+            )
+        )
+        verdicts.append(await kwargs["block_completion_check"]())
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=True,
+        block_completion_judge=_achieving_judge(prompts),
+    )
+
+    [verdict] = verdicts
+    assert verdict.skipped_reason == "secret_entered" and not prompts
 
 
 def test_runaway_backstops_scale_with_action_step_budget() -> None:
@@ -402,11 +475,18 @@ async def test_engine_defers_completion_while_delayed_render_settles(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_page_free_mode_finishes_without_settle_probe() -> None:
-    # Page-free runs have no page to settle: finish(completed) is immediate and the provider is
-    # never consulted.
+async def test_page_free_mode_finishes_without_settle_probe_or_completion_gate() -> None:
+    # Page-free runs have no page to settle or to gate: finish(completed) is immediate and the
+    # provider is never consulted.
     async def no_page() -> Any:
         raise AssertionError("provider must not be consulted in page-free mode")
+
+    gate_calls = 0
+
+    async def refusing_gate() -> bool:
+        nonlocal gate_calls
+        gate_calls += 1
+        return False
 
     script = [[("finish", {"status": "completed", "reason": "criteria hold"})]]
     caller = _ScriptedCaller(script)
@@ -415,10 +495,12 @@ async def test_page_free_mode_finishes_without_settle_probe() -> None:
         llm_caller=caller,
         goal="assess",
         page_free=True,
+        completion_gate=refusing_gate,
         max_action_steps=2,
-        max_turns=4,
+        max_turns=8,
     )
-    assert outcome.status == "completed"
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "criteria hold", False)
+    assert gate_calls == 0
 
 
 @pytest.mark.asyncio
@@ -445,7 +527,7 @@ async def test_bare_run_finishes_without_settle_probe() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_engine_call_kwargs_carry_only_the_step_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
@@ -456,13 +538,11 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
         return LoopOutcome(status="completed", reason="ok")
 
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", False)
 
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
     )
-    # None, not {} -- the loop splats **(call_kwargs or {}), so preserving None keeps the
-    # default (lever-off) path byte-identical to before this lever existed.
+    # None, not {} -- the loop splats **(call_kwargs or {}).
     assert captured["call_kwargs"] is None
 
     step = object()
@@ -470,41 +550,6 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
     )
-    assert captured["call_kwargs"] == {"step": step}
-
-
-@pytest.mark.asyncio
-async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    captured: dict[str, object] = {}
-
-    async def _capture(**kwargs: object) -> LoopOutcome:
-        captured.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", True)
-
-    step = object()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
-    )
-
-    assert captured["call_kwargs"] == {"step": step, "tool_choice": "required"}
-
-    # The engine asking the caller is what keeps tool_choice_in_effect honest rather than
-    # aspirational: a model that cannot take the parameter must not have it added at all.
-    class _UnsupportedCaller(_ScriptedCaller):
-        def supports_tool_choice(self) -> bool:
-            return False
-
-    captured.clear()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_UnsupportedCaller([]), goal="x", step=step
-    )
-
     assert captured["call_kwargs"] == {"step": step}
 
 
@@ -1515,11 +1560,14 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
 
 
 @pytest.mark.asyncio
-async def test_age_default_rides_the_task_message_only_and_leaves_the_system_prompt_alone(
+async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system_prompt_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def run(hook_result: tuple[str | None, str] | None) -> tuple[str, str, dict[str, Any]]:
-        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: hook_result)
+    Hook = tuple[str | None, str] | None
+
+    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
                 page_provider=_fixed_page_provider(_FakePage()),
@@ -1531,15 +1579,25 @@ async def test_age_default_rides_the_task_message_only_and_leaves_the_system_pro
         terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
         return by_role["system"], by_role["user"], terminal
 
-    base_system, base_user, base_log = await run(None)
-    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"))
-    rendered_system, rendered_user, rendered_log = await run(("AGE DEFAULT TEXT", "rendered"))
+    base_system, base_user, base_log = await run(None, None)
+    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"), None)
+    age_system, age_user, age_log = await run(("AGE DEFAULT TEXT", "rendered"), None)
+    both_system, both_user, both_log = await run((None, "age_field_present"), ("APPLICATION DEFAULTS TEXT", "rendered"))
+    all_system, all_user, all_log = await run(
+        ("AGE DEFAULT TEXT", "rendered"), ("APPLICATION DEFAULTS TEXT", "rendered")
+    )
 
-    assert base_system.startswith(SYSTEM_PROMPT) and base_system == withheld_system == rendered_system
-    assert base_user == withheld_user and rendered_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert base_system.startswith(SYSTEM_PROMPT)
+    assert base_system == withheld_system == age_system == both_system == all_system
+    assert base_user == withheld_user and age_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert both_user == base_user + "\n\nAPPLICATION DEFAULTS TEXT"
+    assert all_user == base_user + "\n\nAGE DEFAULT TEXT\n\nAPPLICATION DEFAULTS TEXT"
     assert (base_log["age_default_rendered"], base_log["age_default_reason"]) == (False, None)
     assert (withheld_log["age_default_rendered"], withheld_log["age_default_reason"]) == (False, "age_field_present")
-    assert (rendered_log["age_default_rendered"], rendered_log["age_default_reason"]) == (True, "rendered")
+    assert (age_log["age_default_rendered"], age_log["age_default_reason"]) == (True, "rendered")
+    # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
+    assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
+    assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
 
 
 @pytest.mark.asyncio
@@ -2147,30 +2205,26 @@ async def _no_download_pending(_staged: frozenset[str]) -> str | None:
     ],
     ids=["navigation", "download_gated", "extraction", "page_free"],
 )
-async def test_goal_check_skips_blocks_that_verify_their_own_completion(scope: dict[str, Any], judged: int) -> None:
+async def test_block_completion_judge_skips_blocks_that_verify_their_own_completion(
+    monkeypatch: pytest.MonkeyPatch, scope: dict[str, Any], judged: int
+) -> None:
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]),
+    outcome, verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
         goal="Open the settings page.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         **scope,
     )
 
     assert outcome.status == "completed"
     assert len(prompts) == judged
-    assert (outcome.goal_check is not None) == bool(judged)
+    assert len(verdicts) == judged
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("deadline_seconds", "judged"), [(10.0, True), (1.0, False)])
-async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
+async def test_block_completion_judge_timeout_is_bounded_by_the_runs_deadline(
     monkeypatch: pytest.MonkeyPatch, deadline_seconds: float, judged: bool
 ) -> None:
     timeouts: list[float] = []
@@ -2182,22 +2236,11 @@ async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
 
     monkeypatch.setattr(engine_mod, "run_goal_check", recording_run_goal_check)
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
-        goal="Open the settings page.",
-        goal_judge=judge,
-        goal_check_enforce=True,
-        deadline_seconds=deadline_seconds,
+    outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch, _achieving_judge(prompts), goal="Open the settings page.", deadline_seconds=deadline_seconds
     )
 
     assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     if judged:
         (timeout,) = timeouts
         assert 0 < timeout <= deadline_seconds - engine_mod.GOAL_CHECK_DEADLINE_MARGIN_SECONDS
@@ -2206,72 +2249,26 @@ async def test_goal_check_timeout_is_bounded_by_the_runs_deadline(
         # One second left is inside the margin: the judge is never called, and the check says why.
         assert timeouts == []
         assert prompts == []
-        assert outcome.goal_check["last_skipped_reason"] == "deadline"
+        assert verdict.skipped_reason == "deadline"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("enforce", "second", "holds", "would_holds", "would_fails"),
-    [
-        (True, "achieved", 1, 0, 0),
-        (False, "achieved", 0, 1, 0),
-        (False, "not_achieved", 0, 1, 1),
-    ],
-)
-async def test_goal_check_summary_separates_real_holds_from_shadow_ones(
-    enforce: bool, second: str, holds: int, would_holds: int, would_fails: int
+async def test_block_completion_judge_prompt_is_redacted_and_carries_the_instructions(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verdicts = iter(["not_achieved", second])
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": next(verdicts), "quote": "SCREENSHOT: an empty form", "missing": "nothing saved"}
-
-    finish = ("finish", {"status": "completed", "reason": "done"})
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[finish], [finish]]),
-        goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=enforce,
-        goal_instructions="If the form is already saved, finish completed.",
-    )
-
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
-    assert outcome.goal_check["holds"] == holds
-    assert outcome.goal_check["would_holds"] == would_holds
-    assert outcome.goal_check["would_fails"] == would_fails
-    assert len(prompts) == 2
-    # The summary describes the finish gate's decisions; the shadow re-check is counted apart.
-    assert outcome.goal_check["checks"] == (2 if enforce else 1)
-    assert outcome.goal_check["judged"] == (2 if enforce else 1)
-    assert outcome.goal_check["rechecks"] == (0 if enforce else 1)
-    assert outcome.goal_check["last_verdict"] == ("achieved" if enforce else "not_achieved")
-    assert outcome.goal_check["last_action"] == ("accept" if enforce else "hold")
-    assert "If the form is already saved, finish completed." in prompts[0]
-
-
-@pytest.mark.asyncio
-async def test_goal_check_redactor_reaches_the_judge_prompt() -> None:
-    prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Enter the code Qz7Wk2Pm9Rt4.",
-        goal_judge=judge,
+        goal_instructions="If the form is already saved, finish completed.",
         goal_check_redactor=lambda: lambda text: text.replace("Qz7Wk2Pm9Rt4", "[REDACTED_SECRET]"),
     )
 
     (prompt,) = prompts
     assert "Enter the code [REDACTED_SECRET]." in prompt
     assert "Qz7Wk2Pm9Rt4" not in prompt
+    assert "If the form is already saved, finish completed." in prompt
 
 
 def _code_delivering_tool() -> ToolSpec:
@@ -2288,99 +2285,74 @@ def _code_delivering_tool() -> ToolSpec:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("step", "on_page_at_start", "judged"),
+    ("step", "judged"),
     [
-        (("type", {"selector": "#first", "text": "John"}), False, True),
-        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False, False),
-        (("fetch_code", {}), False, False),
-        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False, False),
-        (("type", {"selector": "#first", "text": "John"}), True, False),
+        (("type", {"selector": "#first", "text": "John"}), True),
+        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False),
+        (("fetch_code", {}), False),
+        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False),
     ],
-    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder", "already_on_page"],
+    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder"],
 )
-async def test_goal_check_never_judges_a_run_that_entered_a_secret(
-    step: tuple[str, Any], on_page_at_start: bool, judged: bool
+async def test_block_completion_judge_never_judges_a_block_that_entered_a_secret(
+    monkeypatch: pytest.MonkeyPatch, step: tuple[str, Any], judged: bool
 ) -> None:
-    # The finish screenshot could show the secret, and v3 tools apply no visual secret mask.
+    # The judge's screenshot could show the secret, and v3 tools apply no visual secret mask.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
     skyvern_context.set(SkyvernContext())
     try:
-        outcome = await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
+        outcome, (verdict,) = await _run_then_judge_block(
+            monkeypatch,
+            _achieving_judge(prompts),
             # An observe after the secret: the flag must outlive the entry that set it.
-            llm_caller=_ScriptedCaller(
-                [[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]
-            ),
+            script=[[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
             goal="Sign in.",
             extra_tools=[_code_delivering_tool()],
-            goal_judge=judge,
-            goal_check_enforce=True,
-            secret_on_page_at_start=on_page_at_start,
         )
     finally:
         skyvern_context.reset()
 
     assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     assert len(prompts) == (1 if judged else 0)
-    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "secret_entered")
+    assert verdict.skipped_reason == (None if judged else "secret_entered")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("extra_chars", "judged"), [(0, True), (1, False)], ids=["at_cap", "over_cap"])
-async def test_goal_check_never_judges_against_truncated_instructions(extra_chars: int, judged: bool) -> None:
+async def test_block_completion_judge_never_judges_against_truncated_instructions(
+    monkeypatch: pytest.MonkeyPatch, extra_chars: int, judged: bool
+) -> None:
     # A rule that decides "done" can sit past the cap; judging against a prefix could fail a correct completion.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS + extra_chars),
     )
 
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
     assert len(prompts) == (1 if judged else 0)
-    assert outcome.goal_check["last_skipped_reason"] == (None if judged else "instructions_too_long")
+    assert verdict.skipped_reason == (None if judged else "instructions_too_long")
 
 
 @pytest.mark.asyncio
-async def test_goal_check_measures_instructions_after_redaction() -> None:
+async def test_block_completion_judge_measures_instructions_after_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
     # Redaction can lengthen text (a short secret becomes a longer marker), and the judge sees the redacted text.
     prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
 
     def redactor() -> Callable[[str], str]:
         return lambda text: text.replace("PIN", "[REDACTED_SECRET]")
 
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
         goal="Save the form.",
-        goal_judge=judge,
-        goal_check_enforce=True,
         goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS - 3) + "PIN",
         goal_check_redactor=redactor,
     )
 
-    assert outcome.goal_check is not None
     assert prompts == []
-    assert outcome.goal_check["last_skipped_reason"] == "instructions_too_long"
+    assert verdict.skipped_reason == "instructions_too_long"
 
 
 class _ReaskAnsweringCaller(_ScriptedCaller):
@@ -2693,35 +2665,6 @@ async def test_the_reask_runs_on_the_non_flex_twin_of_the_runs_key(
     assert (line["llm_key"], line["reask_llm_key"]) == (run_key, reask_key)
 
 
-@pytest.mark.asyncio
-async def test_a_flex_runs_goal_check_stays_on_the_judge_it_was_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Only the re-ask moves to the standard tier; the goal check's model and timeout are its own.
-    built = _route_reask_to_standard_tier(monkeypatch, registered=True)
-    prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    caller = _ReaskAnsweringCaller(
-        [[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]], answer=_NOT_COMPLETED_REASK
-    )
-    caller.llm_key = "SCRIPTED_FLEX_KEY"
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=caller,
-        goal="Create the account.",
-        goal_judge=judge,
-        goal_check_enforce=True,
-        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
-    )
-
-    assert outcome.status == "completed"
-    assert outcome.goal_check is not None
-    assert len(prompts) == 1
-    assert built == []
-
-
 async def _captured_request(
     monkeypatch: pytest.MonkeyPatch, caller: _ScriptedCaller, values: tuple[CodeTypedValue, ...]
 ) -> dict[str, Any]:
@@ -2773,20 +2716,13 @@ def test_an_unknown_router_model_counts_as_the_one_request_ceiling_not_the_known
 
 
 @pytest.mark.asyncio
-async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge() -> None:
+async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge(monkeypatch: pytest.MonkeyPatch) -> None:
     judge_prompts: list[str] = []
-
-    async def judge(prompt: str) -> dict[str, Any]:
-        judge_prompts.append(prompt)
-        return {"verdict": "achieved", "quote": "", "missing": ""}
-
-    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=caller,
+    outcome, _verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(judge_prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
         goal="Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):",
-        goal_judge=judge,
-        goal_check_enforce=True,
         code_typed_values=(CodeTypedValue(line=2, target="#name", value="Zephyrine Quill"),),
     )
 
@@ -2846,3 +2782,42 @@ async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limi
     assert all(row.endswith(f'into "#f{n}"') and json.dumps(chunk) in row for n, row in enumerate(rows, start=1))
     assert f"- {len(values) - len(rows)} more typed values not listed" in user_prompt
     assert sent <= limit
+
+
+@pytest.mark.parametrize("via_click", [False, True])
+@pytest.mark.asyncio
+async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
+    monkeypatch: pytest.MonkeyPatch, via_click: bool
+) -> None:
+    # The real navigate tool behind the engine: a task URL redirected to a missing page is the task's own
+    # target; a page a click reached earlier, navigated back to and found missing, is a revisit.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    task_url = "https://jobs.example.test/acme/42"
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        dead = url == task_url
+        page.url = "https://jobs.example.test/acme/expired" if dead and not via_click else url
+        return SimpleNamespace(status=404 if dead else 200, url=page.url)
+
+    async def _click(selector: str, timeout: int | None = None) -> None:
+        page.url = task_url
+
+    page.goto = _goto  # type: ignore[method-assign]
+    page.click = _click  # type: ignore[method-assign]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+    if via_click:
+        script[:0] = [[("click", {"selector": "#go"})], [("navigate", {"url": "https://example.test/other"})]]
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=_ScriptedCaller(script),
+            goal="Apply.",
+            task_target_urls=frozenset() if via_click else caller_known_published_urls(task_url, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")

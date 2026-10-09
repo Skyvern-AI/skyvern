@@ -146,6 +146,8 @@ async def google_oauth_authorize(
         )
     except google_oauth_service.CredentialNotReauthorizableError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except google_oauth_service.GmailSendUpgradeUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except InvalidAppOriginError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except google_oauth_service.UnsupportedScopeProfileError as exc:
@@ -230,6 +232,24 @@ async def google_oauth_callback(
         )
     scopes_granted = _require_scopes_from_token(token_data)
 
+    identity = None
+    if google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE in context.scopes_requested:
+        try:
+            identity = await google_oauth_service.verify_gmail_send_consent(
+                context,
+                scopes_granted,
+                token_data.get("id_token"),
+                resolved.config.client_id if resolved.config else "",
+            )
+        except google_oauth_service.GmailSendConsentRejectedError as exc:
+            LOG.info(
+                "Rejected a Google consent that asked for send permission",
+                organization_id=current_org.organization_id,
+                credential_id=context.credential_id,
+                rejection=exc.rejection.value,
+            )
+            raise HTTPException(status_code=409, detail=str(exc))
+
     prior_state = None
     prior_state_known = False
     try:
@@ -251,6 +271,7 @@ async def google_oauth_callback(
             initiator_id=current_user_id,
             refresh_token=refresh_token,
             scopes_granted=scopes_granted,
+            identity=identity,
         )
     except google_oauth_service.InvalidConsentNonceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -297,7 +318,8 @@ async def google_oauth_callback(
             )
 
     try:
-        if google_oauth_service.has_required_scopes(
+        # A send connection's address comes from the verified ID token and is never replaced by a profile lookup.
+        if identity is None and google_oauth_service.has_required_scopes(
             scopes_granted,
             google_oauth_service.GOOGLE_GMAIL_SCOPES,
         ):

@@ -11,6 +11,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { RunEngine } from "@/api/types";
+import { placeholders } from "../../helpContent";
 import type { FileDownloadNode } from "../../nodes/FileDownloadNode/types";
 import type * as WorkflowEditorUtilsModule from "../../workflowEditorUtils";
 import type {
@@ -661,7 +662,7 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     render(<FileDownloadBlockForm blockId="d1" />);
 
     const suffixInput = screen.getByTestId(
-      "wbi-ph-Enter the complete filename (without extension)",
+      `wbi-ph-${placeholders["download"]["downloadSuffix"]}`,
     );
     fireEvent.change(suffixInput, { target: { value: "invoice-2024" } });
 

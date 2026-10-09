@@ -455,24 +455,31 @@ describe("SaveButton confirmation gating", () => {
     },
   );
 
-  test("saves directly with no confirmation when the draft matches the baseline", () => {
-    const clean = saveData([block("a", { url: "x" })]);
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () => clean,
-      saveIsPending: false,
-    });
-    useWorkflowSnapshotStore.setState({
-      snapshot: snapshotOf(clean),
-      contentDirty: false,
-      userHasEdited: false,
-    });
+  test.each([
+    [true, 1],
+    [false, 0],
+  ])(
+    "a draft matching the baseline saves with no confirmation only when the editor has changes (hasChanges %s)",
+    (hasChanges, saves) => {
+      const clean = saveData([block("a", { url: "x" })]);
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () => clean,
+        saveIsPending: false,
+        hasChanges,
+      });
+      useWorkflowSnapshotStore.setState({
+        snapshot: snapshotOf(clean),
+        contentDirty: false,
+        userHasEdited: false,
+      });
 
-    renderSaveButton();
-    fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
+      renderSaveButton();
+      fireEvent.click(screen.getByRole("button", { name: "Save workflow" }));
 
-    expect(screen.queryByText("Saving Changes")).toBeNull();
-    expect(saveWorkflowSpy).toHaveBeenCalledTimes(1);
-  });
+      expect(screen.queryByText("Saving Changes")).toBeNull();
+      expect(saveWorkflowSpy).toHaveBeenCalledTimes(saves);
+    },
+  );
 
   test("confirms an uncommitted YAML-draft edit the canvas hasn't caught up to", () => {
     const canvas = saveData([block("a", { block_type: "code", code: "# a" })]);
@@ -523,17 +530,18 @@ describe("SaveButton confirmation gating", () => {
 
     renderSaveButton();
     const save = screen.getByRole("button", {
-      name: "Save workflow (paused): This workflow changed after Copilot staged its proposal.",
+      name: "Save workflow (paused)",
+      description: "This workflow changed after Copilot staged its proposal.",
     });
     expect(save.matches(":disabled")).toBe(false);
     fireEvent.click(save);
 
-    expect(screen.queryByText("Save is paused")).not.toBeNull();
     expect(
-      screen.queryByText(
-        "This workflow changed after Copilot staged its proposal.",
-      ),
-    ).not.toBeNull();
+      screen.getByRole("dialog", {
+        name: "Save is paused",
+        description: "This workflow changed after Copilot staged its proposal.",
+      }),
+    ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: "Reload and discard my edits" }),
     ).not.toBeNull();
@@ -549,9 +557,11 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
 
   beforeEach(() => {
     const data = clean();
+    // A pending Goal change is an unsaved edit.
     useWorkflowHasChangesStore.setState({
       getSaveData: () => data,
       saveIsPending: false,
+      hasChanges: true,
     });
     useWorkflowSnapshotStore.setState({
       snapshot: snapshotOf(data),

@@ -11,8 +11,19 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 
+from skyvern.forge.sdk.copilot.ask_user import (
+    ACCOUNT_GROUP_CANCEL_TOOL_NAME,
+    ACCOUNT_GROUP_STATUS_TOOL_NAME,
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    CREDENTIAL_DELETE_TOOL_NAME,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ActivityBucket, NarrativeBlockAttempt, upsert_narrative_block_attempt
+from skyvern.forge.sdk.copilot.context import (
+    REPLY_TOOL_NAME,
+    ActivityBucket,
+    NarrativeBlockAttempt,
+    upsert_narrative_block_attempt,
+)
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
@@ -20,14 +31,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeWorkPlan
+    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeScreenshot, NarrativeWorkPlan
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
 MIN_BLOCK_STATUS_POLL_GAP_SECONDS = 1.0
 MAX_BLOCK_ACTIVITY_ENTRIES = 30
 MAX_DESIGN_ACTIVITY_ENTRIES = 50
-ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"})
+ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot", REPLY_TOOL_NAME})
 CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
 CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
 
@@ -91,6 +102,10 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "delete_block": "Deleting block",
     "request_credential": "Requesting a credential",
     "ask_user": "Asking you",
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME: "Reviewing the accounts with you",
+    ACCOUNT_GROUP_STATUS_TOOL_NAME: "Checking the account runs",
+    ACCOUNT_GROUP_CANCEL_TOOL_NAME: "Reviewing a cancel with you",
+    CREDENTIAL_DELETE_TOOL_NAME: "Reviewing a credential deletion with you",
     "set_work_plan": "Updating its plan",
 }
 
@@ -207,6 +222,7 @@ class NarratorState:
     emitted_progress_texts: set[str] = field(default_factory=set)
     last_tool_call_id: str | None = None
     work_plan: NarrativeWorkPlan | None = None
+    screenshots: list[NarrativeScreenshot] = field(default_factory=list)
 
     def activity_bucket(self) -> ActivityBucket:
         if self.running_block_id is not None:

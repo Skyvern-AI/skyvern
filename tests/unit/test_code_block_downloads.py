@@ -45,6 +45,7 @@ from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgres
 from skyvern.forge.sdk.copilot.reached_download_target import (
     block_output_has_registered_download,
     code_is_download_intent,
+    generated_file_artifact_ids,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
@@ -1737,6 +1738,38 @@ async def test_authored_registration_keys_are_dropped_without_host_evidence(
 
 
 @pytest.mark.asyncio
+async def test_in_process_block_cannot_stamp_a_site_download_as_a_published_file(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
+) -> None:
+    """Only the secure worker writes the published-file key, so a block naming a real download under it earns nothing."""
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+
+    site_download = FileInfo(
+        url="https://api.example.com/v1/artifacts/a_site/content?artifact_name=invoice.pdf",
+        filename="invoice.pdf",
+        checksum="deadbeef",
+        artifact_id="a_site",
+        modified_at=datetime(2026, 6, 14, 12, 0, tzinfo=UTC),
+    )
+    _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(side_effect=[[], [site_download]]))
+    _wire_block_runtime(monkeypatch)
+
+    block = CodeBlock(
+        label="code_download",
+        code="rows = 3\ngenerated_file_artifact_ids = ['a_site']",
+        output_parameter=_output_parameter("code_out"),
+    )
+    result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
+
+    assert result.success is True
+    for output in (_persisted_output(), result.output_parameter_value):
+        assert output["rows"] == 3
+        assert output["downloaded_file_artifact_ids"] == ["a_site"]
+        assert "generated_file_artifact_ids" not in output
+        assert generated_file_artifact_ids([output]) == frozenset()
+
+
+@pytest.mark.asyncio
 async def test_registration_timeout_does_not_fail_a_block_that_downloaded(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
@@ -3379,7 +3412,6 @@ async def test_downloads_empty_read_reports_unresolvable_rows(monkeypatch: pytes
 async def test_downloads_empty_read_reports_listing_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], False)))
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=True))
     listing = AsyncMock(return_value=[])
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", listing)
 
@@ -3403,7 +3435,6 @@ async def test_downloads_empty_read_reports_failed_row_lookup_as_unknown_count(
         "list_artifacts_for_run_by_type",
         AsyncMock(side_effect=RuntimeError("database unavailable")),
     )
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", AsyncMock(return_value=False))
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=[]))
 
     with _capture_empty_read_logs() as logs:
@@ -3570,18 +3601,15 @@ async def test_failed_row_lookup_still_lists_instead_of_reporting_no_downloads(
 ) -> None:
     """A DB blip must not be answered with an empty download list.
 
-    The cutover skip exists to avoid listing when a run provably has no rows; a lookup that
-    failed proves nothing, so the legitimate case has to keep its route through the listing.
+    Rows are trusted only when the lookup succeeds; a lookup that failed proves nothing, so the
+    read keeps its route through the listing.
     """
     listed = [FileInfo(url="https://example.test/real")]
     storage = _artifact_row_storage(monkeypatch, keyring="k1:secret", file_infos=[])
     monkeypatch.setattr(storage, "_list_download_artifacts_safe", AsyncMock(return_value=([], True)))
-    skip = AsyncMock(return_value=True)
-    monkeypatch.setattr(storage, "_skip_empty_downloads_listing", skip)
     monkeypatch.setattr(storage, "_get_downloaded_files_via_s3_listing", AsyncMock(return_value=listed))
 
     assert await storage.get_downloaded_files("o_1", "wr_blip") == listed
-    skip.assert_not_awaited()
 
 
 @pytest.mark.asyncio

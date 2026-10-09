@@ -429,6 +429,69 @@ describe("CredentialCard sign in myself", () => {
   });
 });
 
+describe("CredentialCard registration", () => {
+  const registrationFrame =
+    CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_registration;
+
+  it("shows the exact sign-up page, username and saved name, and Generate and save answers it", () => {
+    const onGenerate = vi.fn();
+    const onSkip = vi.fn();
+    render(
+      <CredentialCard
+        frame={registrationFrame}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={onSkip}
+        onGenerate={onGenerate}
+      />,
+    );
+    expect(
+      screen.getByText("Create a login for https://portal.example.com"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("Sign-up page: https://portal.example.com/signup"),
+    ).toBeTruthy();
+    expect(screen.getByText("Username: tester@example.com")).toBeTruthy();
+    expect(screen.getByText("Saved as: Portal test account")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Generate and save" }));
+    expect(onGenerate).toHaveBeenCalledTimes(1);
+    expect(onSkip).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["rejected", /Nothing was saved/],
+    ["unknown", /The vault didn't confirm the save/],
+    ["created_not_connected", /Saved as Portal test account, not connected/],
+  ] as const)(
+    "after a %s attempt, hides Generate and says what happened",
+    (outcome, message) => {
+      render(
+        <CredentialCard
+          frame={{
+            ...registrationFrame,
+            registration: {
+              ...registrationFrame.registration!,
+              attempted: true,
+              outcome,
+            },
+          }}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+          onGenerate={vi.fn()}
+        />,
+      );
+      expect(
+        screen.queryByRole("button", { name: "Generate and save" }),
+      ).toBeNull();
+      expect(screen.getAllByText(message)).not.toHaveLength(0);
+      expect(
+        screen.getByRole("button", { name: "Connect credential" }),
+      ).toBeTruthy();
+    },
+  );
+});
+
 describe("CredentialCard terminal org-credential picker", () => {
   it("fetches the org credentials and renders them as a picker, in API order", async () => {
     credsData.current = [
@@ -444,8 +507,8 @@ describe("CredentialCard terminal org-credential picker", () => {
       />,
     );
     // Most-recent-first is the API's order (created_at desc); the card renders it as-is.
-    const newest = await screen.findByRole("button", { name: "Newest" });
-    const oldest = screen.getByRole("button", { name: "Oldest" });
+    const newest = await screen.findByRole("button", { name: /^Newest/ });
+    const oldest = screen.getByRole("button", { name: /^Oldest/ });
     expect(
       newest.compareDocumentPosition(oldest) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -463,7 +526,7 @@ describe("CredentialCard terminal org-credential picker", () => {
         onSkip={vi.fn()}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     expect(onConnect).toHaveBeenCalledWith("cred_hn", "HN login");
   });
 
@@ -480,7 +543,7 @@ describe("CredentialCard terminal org-credential picker", () => {
     expect(screen.getByRole("status").textContent).toContain(
       "Loading saved logins",
     );
-    expect(screen.queryByRole("button", { name: "Login A" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Login A/ })).toBeNull();
     expect(
       screen
         .getByRole("button", { name: "Connect credential" })
@@ -582,7 +645,7 @@ describe("CredentialCard terminal org-credential picker", () => {
       { credential_id: "cred_recovered", name: "Recovered" },
     ];
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Recovered" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Recovered/ }));
     expect(onConnect).toHaveBeenCalledWith("cred_recovered", "Recovered");
     expect(screen.queryByText(/Couldn't load your saved logins/)).toBeNull();
   });
@@ -622,7 +685,7 @@ describe("CredentialCard terminal org-credential picker", () => {
       />,
     );
     fireEvent.click(
-      await screen.findByRole("button", { name: "Listed login" }),
+      await screen.findByRole("button", { name: /^Listed login/ }),
     );
     expect(onConnect).toHaveBeenCalledWith("cred_listed", "Listed login");
   });
@@ -638,7 +701,7 @@ describe("CredentialCard terminal org-credential picker", () => {
         onSkip={vi.fn()}
       />,
     );
-    await screen.findByRole("button", { name: "Only login" });
+    await screen.findByRole("button", { name: /^Only login/ });
     expect(onConnect).not.toHaveBeenCalled();
   });
 
@@ -863,7 +926,7 @@ describe("CredentialCard terminal org-credential picker", () => {
       />,
     );
     expect(
-      await screen.findByRole("button", { name: "Other login" }),
+      await screen.findByRole("button", { name: /^Other login/ }),
     ).toBeTruthy();
     fireEvent.change(screen.getByPlaceholderText("Search credentials..."), {
       target: { value: "nothing-matches-this" },
@@ -874,7 +937,7 @@ describe("CredentialCard terminal org-credential picker", () => {
     // hides both the remaining logins and the only route to the add-credential modal and Retry.
     fireEvent.click(screen.getByRole("button", { name: "close-popover" }));
     expect(
-      await screen.findByRole("button", { name: "Other login" }),
+      await screen.findByRole("button", { name: /^Other login/ }),
     ).toBeTruthy();
     expect(
       (screen.getByPlaceholderText("Search credentials...") as HTMLInputElement)
@@ -914,7 +977,7 @@ describe("CredentialCard terminal org-credential picker", () => {
       }),
     ).toBeTruthy();
     expect(screen.getByPlaceholderText("Search credentials...")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Acme login" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Acme login/ })).toBeNull();
 
     credsFail.current = false;
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -979,11 +1042,11 @@ describe("CredentialCard terminal org-credential picker", () => {
       target: { value: "acme" },
     });
     expect(screen.getByText("Searching…")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Other login" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Other login/ })).toBeNull();
     expect(onConnect).not.toHaveBeenCalled();
 
     credsData.current = [{ credential_id: "cred_acme", name: "Acme login" }];
-    fireEvent.click(await screen.findByRole("button", { name: "Acme login" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Acme login/ }));
     expect(onConnect).toHaveBeenCalledWith("cred_acme", "Acme login");
     expect(screen.queryByText("Searching…")).toBeNull();
   });
@@ -1047,10 +1110,10 @@ describe("CredentialCard terminal org-credential picker", () => {
     expect(screen.getByText("All credentials")).toBeTruthy();
     // Every credential is still present (the suggestion is pinned, not a filter).
     expect(
-      screen.getByRole("button", { name: "Suggested login" }),
+      screen.getByRole("button", { name: /^Suggested login/ }),
     ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Other A" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Other B" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Other A/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Other B/ })).toBeTruthy();
   });
 
   it("sends the suggested credential's id when it is picked", async () => {
@@ -1068,9 +1131,114 @@ describe("CredentialCard terminal org-credential picker", () => {
       />,
     );
     fireEvent.click(
-      await screen.findByRole("button", { name: "Suggested login" }),
+      await screen.findByRole("button", { name: /^Suggested login/ }),
     );
     expect(onConnect).toHaveBeenCalledWith("cred_sug", "Suggested login");
+  });
+
+  it("offers the one named login as the primary action, with its id and the site", async () => {
+    const onConnect = vi.fn();
+    credsData.current = [
+      {
+        credential_id: "cred_named",
+        name: "a1b2c3",
+        credential_type: "password",
+      },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          named_credential_id: "cred_named",
+          login_page_urls: ["https://example.com/login"],
+        })}
+        mode="inline-pause"
+        onConnect={onConnect}
+        onSkip={vi.fn()}
+      />,
+    );
+    const use = await screen.findByRole("button", {
+      name: "Use 'a1b2c3' on https://example.com",
+    });
+    expect(screen.getAllByText("cred_named").length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(
+        /You named this login \(cred_named\)\. Copilot wants to use it on https:\/\/example\.com\./,
+      ),
+    ).toBeTruthy();
+    fireEvent.click(use);
+    expect(onConnect).toHaveBeenCalledWith("cred_named", "a1b2c3");
+  });
+
+  it("renders the plain ask when the named login cannot be loaded", async () => {
+    credsFail.current = true;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          named_credential_id: "cred_named",
+        })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(clientGet).toHaveBeenCalledWith("/credentials/cred_named"),
+    );
+    expect(
+      (await screen.findAllByText(/Couldn't load your saved logins/)).length,
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Use / })).toBeNull();
+    expect(screen.queryByText(/You named this login/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    errSpy.mockRestore();
+  });
+
+  it("offers no Use action for a named credential that is not a password login", async () => {
+    credsData.current = [
+      {
+        credential_id: "cred_named",
+        name: "Card",
+        credential_type: "credit_card",
+      },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          named_credential_id: "cred_named",
+        })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(clientGet).toHaveBeenCalledWith("/credentials/cred_named"),
+    );
+    await screen.findByRole("button", { name: "Connect credential" });
+    expect(screen.queryByRole("button", { name: /^Use / })).toBeNull();
+    expect(screen.queryByText(/You named this login/)).toBeNull();
+  });
+
+  it("makes no by-id lookup and offers no Use action for a suggested login the server did not mark as named", async () => {
+    credsData.current = [
+      { credential_id: "cred_a", name: "Login A", credential_type: "password" },
+    ];
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({ credential_refs: ["cred_a"] })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+    await screen.findByRole("button", { name: /Login A/ });
+    expect(screen.queryByRole("button", { name: /^Use / })).toBeNull();
+    expect(
+      clientGet.mock.calls.filter(([path]) => path.startsWith("/credentials/")),
+    ).toEqual([]);
   });
 
   it("renders a plain list with no Suggested group when the frame has no credential_refs", async () => {
@@ -1086,8 +1254,10 @@ describe("CredentialCard terminal org-credential picker", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(await screen.findByRole("button", { name: "Login A" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Login B" })).toBeTruthy();
+    expect(
+      await screen.findByRole("button", { name: /^Login A/ }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Login B/ })).toBeTruthy();
     expect(screen.queryByText("Suggested")).toBeNull();
     expect(screen.queryByText("All credentials")).toBeNull();
   });
@@ -1107,7 +1277,7 @@ describe("CredentialCard terminal org-credential picker", () => {
     );
     // The row still renders (the always-open popover mock ignores `open`), but the expiry guard
     // blocks the pick so no already-rejected resume token is submitted.
-    fireEvent.click(await screen.findByRole("button", { name: "Login A" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Login A/ }));
     expect(onConnect).not.toHaveBeenCalled();
   });
 });
@@ -1521,7 +1691,7 @@ describe("CredentialCard auto-bound receipt", () => {
       />,
     );
     fireEvent.click(
-      await screen.findByRole("button", { name: "Personal login" }),
+      await screen.findByRole("button", { name: /^Personal login/ }),
     );
     expect(onConnect).toHaveBeenCalledWith("cred_personal", "Personal login");
   });
@@ -1666,7 +1836,9 @@ describe("CredentialCard auto-bound receipt", () => {
     credsFail.current = false;
     fireEvent.click(retry);
     fireEvent.click(await screen.findByRole("button", { name: "Change" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Other login" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^Other login/ }),
+    );
     expect(onConnect).toHaveBeenCalledWith("cred_other", "Other login");
   });
 });

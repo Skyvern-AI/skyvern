@@ -729,7 +729,7 @@ def test_video_message_preserves_observation_order_and_labels_timeline_as_untrus
     assert content[0]["type"] == "input_text"
     assert "timestamped" in content[0]["text"]
     assert "untrusted evidence" in content[0]["text"]
-    assert "credentials" in content[0]["text"]
+    assert "raw secret value" in content[0]["text"]
     assert [part["type"] for part in content] == ["input_text"]
     assert content[0]["text"].index("0.500s") < content[0]["text"].index("1.500s")
 
@@ -1050,7 +1050,7 @@ async def test_overlength_video_status_is_persisted_and_reported_once(monkeypatc
     )
 
     persist_too_long.assert_awaited_once_with(frozenset({"file_1"}))
-    assert "exceeded the five-minute limit" in json.dumps(captured["initial_input"])
+    assert "-minute limit; ask the user to trim or split them" in json.dumps(captured["initial_input"])
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1091,7 @@ async def test_persisted_overlength_video_is_not_reprocessed(monkeypatch: pytest
     )
 
     load_evidence.assert_not_awaited()
-    assert "exceeded the five-minute limit" in json.dumps(captured["initial_input"])
+    assert "-minute limit; ask the user to trim or split them" in json.dumps(captured["initial_input"])
 
 
 @pytest.mark.asyncio

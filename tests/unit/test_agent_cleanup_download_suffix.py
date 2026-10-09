@@ -17,7 +17,9 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
+from skyvern.webeye.actions.handler import _download_target_path
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
+from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
 from tests.unit._fingerprint_expectations import expected_fingerprint
 
 
@@ -73,6 +75,60 @@ async def test_finalize_downloaded_files_renames_with_download_suffix(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_finalize_recovers_extension_from_original_name_with_dotted_prefix(tmp_path) -> None:
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    suffix = f"Acme.L.P._{ORIGINAL_FILENAME_MARKER}"
+    target_name = "Acme.L.P._export"
+    (download_dir / target_name).write_bytes(b"workbook")
+    context = SkyvernContext(download_suffix=suffix)
+    context.download_suffix_applied_files[target_name] = ("export", suffix)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.recover_download_extension", return_value=".xlsx") as recover_extension,
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            _make_task(),
+            organization_id="org-1",
+            download_suffix=suffix,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    recover_extension.assert_called_once_with(str(download_dir / target_name), suffix)
+    assert (download_dir / f"{target_name}.xlsx").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_preserves_explicit_suffix_extension(tmp_path) -> None:
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    target_name = "custom.txt"
+    (download_dir / target_name).write_bytes(b"report")
+    context = SkyvernContext(download_suffix=target_name)
+    context.download_suffix_applied_files[target_name] = ("report.pdf", target_name)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            _make_task(),
+            organization_id="org-1",
+            download_suffix=target_name,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert (download_dir / target_name).exists()
+    assert not (download_dir / "custom.txt.pdf").exists()
+
+
+@pytest.mark.asyncio
 async def test_finalize_excludes_incomplete_file_created_during_discovery(tmp_path) -> None:
     agent = ForgeAgent()
     task = _make_task()
@@ -119,7 +175,12 @@ async def test_finalize_skips_rename_for_session_file_already_named_by_suffix(tm
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
         patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
         patch("skyvern.forge.agent.rename_file", rename_mock),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.forge.agent.skyvern_context.current",
+            return_value=SkyvernContext(
+                download_suffix="req-123", download_suffix_applied_files={"req-123.pdf": ("site.pdf", "req-123")}
+            ),
+        ),
         patch("skyvern.forge.agent.app") as mock_app,
     ):
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
@@ -188,7 +249,12 @@ async def test_finalize_skips_rename_for_local_file_already_named_by_suffix(tmp_
     with (
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
         patch("skyvern.forge.agent.rename_file", rename_mock),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch(
+            "skyvern.forge.agent.skyvern_context.current",
+            return_value=SkyvernContext(
+                download_suffix="req-123", download_suffix_applied_files={"req-123.pdf": ("site.pdf", "req-123")}
+            ),
+        ),
     ):
         await agent._finalize_downloaded_files_for_task(
             task,
@@ -201,6 +267,101 @@ async def test_finalize_skips_rename_for_local_file_already_named_by_suffix(tmp_
     rename_mock.assert_not_called()
     assert (download_dir / "req-123.pdf").exists()
     assert not (download_dir / "req-123_1.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_appends_recovered_extension_to_already_named_file(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    rename_mock = MagicMock()
+    file_path = str(download_dir / "ACME_export")
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=[file_path]),
+        patch("skyvern.forge.agent.recover_download_extension", return_value=".xlsx"),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch(
+            "skyvern.forge.agent.skyvern_context.current",
+            return_value=SkyvernContext(
+                download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}",
+                download_suffix_applied_files={"ACME_export": ("export", f"ACME_{ORIGINAL_FILENAME_MARKER}")},
+            ),
+        ),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_called_once_with(file_path, "ACME_export.xlsx")
+
+
+@pytest.mark.asyncio
+async def test_finalize_prefixes_site_name_that_matches_template_affixes(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    file_path = str(download_dir / "ACME_report.pdf")
+    rename_mock = MagicMock()
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=[file_path]),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch(
+            "skyvern.forge.agent.skyvern_context.current",
+            return_value=SkyvernContext(download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}"),
+        ),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_called_once_with(file_path, "ACME_ACME_report.pdf")
+
+
+@pytest.mark.asyncio
+async def test_finalize_recovered_extension_dedupes_before_rename(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    extensionless_path = str(download_dir / "ACME_export")
+    existing_path = str(download_dir / "ACME_export.xlsx")
+    (download_dir / "ACME_export").write_bytes(b"new")
+    (download_dir / "ACME_export.xlsx").write_bytes(b"existing")
+    context = SkyvernContext(
+        download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}",
+        download_suffix_applied_files={"ACME_export": ("export", f"ACME_{ORIGINAL_FILENAME_MARKER}")},
+    )
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=[extensionless_path, existing_path]),
+        patch("skyvern.forge.agent.recover_download_extension", return_value=".xlsx"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=f"ACME_{ORIGINAL_FILENAME_MARKER}",
+            list_files_before=[existing_path],
+            randomize_if_missing=False,
+        )
+
+    assert (download_dir / "ACME_export_1.xlsx").read_bytes() == b"new"
+    assert (download_dir / "ACME_export.xlsx").read_bytes() == b"existing"
 
 
 @pytest.mark.asyncio
@@ -475,15 +636,16 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
     task_block = MagicMock()
     task_block.complete_on_download = False
     task_block.download_timeout = None
-    task_block.download_suffix = "req-123"
+    task_block.download_suffix = f"Fund_{ORIGINAL_FILENAME_MARKER}"
 
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
+    context = SkyvernContext(task_id=task.task_id, download_suffix=task_block.download_suffix)
 
     async def agent_step_side_effect(*args, **kwargs):
         current_step = args[1]
         if current_step.step_id == "step-1":
-            (download_dir / "uuid-file.zip").write_text("dummy")
+            _download_target_path(download_dir, "report.pdf").write_text("dummy")
             step1.status = "completed"
             return step1, DetailedAgentStepOutput(
                 scraped_page=None,
@@ -520,8 +682,8 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=MagicMock()),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=context),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
         patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=[]),
         patch.object(
@@ -562,8 +724,8 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
             engine=RunEngine.skyvern_v1,
         )
 
-    assert (download_dir / "req-123.zip").exists()
-    assert not (download_dir / "uuid-file.zip").exists()
+    assert (download_dir / "Fund_report.pdf").exists()
+    assert not (download_dir / "Fund_Fund_report.pdf").exists()
 
 
 @pytest.mark.asyncio

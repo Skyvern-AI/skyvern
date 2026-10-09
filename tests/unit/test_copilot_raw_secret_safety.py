@@ -943,7 +943,7 @@ async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_
     assert policy.allow_run_blocks is False
     assert policy.allow_missing_credentials_in_draft is True
     assert ctx.test_after_update_done is True
-    assert credential_prompt_reason(policy, None) is None
+    assert credential_prompt_reason(policy) is None
     assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is True
     for tool_name in (
         "run_blocks_and_collect_debug",
@@ -990,7 +990,7 @@ async def test_a_user_url_carrying_userinfo_authorizes_no_card_on_a_redacted_sec
     ("user_url", "card_can_open", "expected"),
     [
         ("https://portal.example.com/login?pw=" + _CARD_SECRET, True, "request_credential"),
-        ("", True, "ask_user"),
+        ("", True, "ask the user for it"),
         ("https://portal.example.com/login", False, "Credentials UI"),
     ],
     ids=["user_site", "no_site", "card_unavailable"],
@@ -1010,3 +1010,33 @@ def test_a_redacted_secret_draft_result_points_at_the_card_while_it_can_open(
     assert expected in message
     assert _CARD_SECRET not in message
     assert ("Credentials UI" in message) is not card_can_open
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("llm_key", "serves_value_over_label"),
+    [("AZURE_OPENAI_GPT6_LUNA_WITH_OPENAI_FALLBACK", True), ("OPENAI_GPT5_4_MINI", False), (None, False)],
+)
+async def test_value_over_label_sentence_is_served_only_on_the_measured_model_setting(
+    llm_key: str | None, serves_value_over_label: bool
+) -> None:
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "citations": []})
+    if llm_key is None:
+        # A wrapper that drops the key must get the earlier sentence, never the measured-only one.
+        handler = AsyncMock(spec=["__call__"], return_value=handler.return_value)
+        assert not hasattr(handler, "llm_key")
+    else:
+        handler.llm_key = llm_key
+
+    await build_request_policy_trust_floor(
+        user_message="try again",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+    prompt = handler.await_args.kwargs["prompt"]
+    assert ("What the turn calls a value never decides this" in prompt) is serves_value_over_label
+    assert ("A saved-credential name, identifier, placeholder" in prompt) is not serves_value_over_label

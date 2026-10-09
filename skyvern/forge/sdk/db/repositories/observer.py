@@ -629,6 +629,7 @@ class ObserverRepository(BaseRepository):
         new_status: str,
         only_if_status_in: list[str],
         failure_reason: str | None = None,
+        organization_id: str | None = None,
     ) -> int:
         if not only_if_status_in:
             return 0
@@ -638,12 +639,13 @@ class ObserverRepository(BaseRepository):
             if failure_reason is not None:
                 update_values["failure_reason"] = failure_reason
 
-            stmt = (
-                update(WorkflowRunBlockModel)
-                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
-                .where(WorkflowRunBlockModel.status.in_(only_if_status_in))
-                .values(**update_values)
-            )
+            stmt = update(WorkflowRunBlockModel).where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+            # No index leads with workflow_run_id; the run lookup index is (organization_id, workflow_run_id).
+            # An unknown organization still has to match every block of the run, so None adds no predicate
+            # rather than the `IS NULL` a filter_by would generate.
+            if organization_id is not None:
+                stmt = stmt.where(WorkflowRunBlockModel.organization_id == organization_id)
+            stmt = stmt.where(WorkflowRunBlockModel.status.in_(only_if_status_in)).values(**update_values)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount or 0
@@ -710,6 +712,42 @@ class ObserverRepository(BaseRepository):
                 )
             ).first()
             return RunEngine(engine) if engine else None
+
+    @db_operation("set_workflow_run_block_engine_by_task_id")
+    async def set_workflow_run_block_engine_by_task_id(
+        self,
+        task_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.task_id == task_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(engine=engine.value)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("workflow_run_has_block_on_engine")
+    async def workflow_run_has_block_on_engine(
+        self,
+        workflow_run_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            found = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel.workflow_run_block_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(engine=engine.value)
+                    .limit(1)
+                )
+            ).first()
+            return found is not None
 
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(

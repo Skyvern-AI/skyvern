@@ -154,6 +154,7 @@ async def test_close_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
 
     monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
     monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CONTEXT_CLOSE_TIMEOUT", 0.05)
     monkeypatch.setattr(interceptor, "_handle_browser_download", suspended_handler)
     interceptor._schedule_browser_download_handler({"url": "https://example.test/download"})
     await started.wait()
@@ -265,6 +266,7 @@ async def test_close_true_context_close_hang_does_not_suppress_remote_cleanup(
     # A hung context close must not starve the remote browser cleanup: the context-teardown phase is
     # bounded independently, so cleanup still runs exactly once after the teardown budget elapses.
     monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CONTEXT_CLOSE_TIMEOUT", 0.05)
     pw = _pw_stub()
     context = _context_stub()
     context.cookies = AsyncMock(return_value=[])

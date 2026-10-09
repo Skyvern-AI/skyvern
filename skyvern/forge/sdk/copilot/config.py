@@ -116,6 +116,9 @@ class CopilotConfig:
     max_turns: int = DEFAULT_MAX_TURNS
     token_budget: int = field(default_factory=_default_token_budget)
     security_rules: str = ""
+    # Rendered after the user's message on every turn: from there it holds even when earlier turns or the
+    # saved workflow went along with an out-of-scope request, which the same text in the system prompt does not.
+    scope_check: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
     # Wire and persisted-metadata spelling of authoring_capability; read it only through that

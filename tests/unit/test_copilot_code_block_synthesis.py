@@ -17,14 +17,8 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
-    _SELECTION_MATCH_BASES,
-    AuthoringParameterBindingCandidate,
     AuthoringParameterFieldBinding,
     AuthoringParameterTerminalBinding,
-    authored_selection_parameter_bindings,
-    authored_selector_parameter_bindings,
-    authoring_parameter_binding_directive_consumed,
-    build_authoring_parameter_binding_directive,
     build_authoring_parameter_binding_snapshot,
 )
 from skyvern.forge.sdk.copilot.code_block_preflight import (
@@ -271,56 +265,6 @@ def test_authoring_parameter_snapshot_recovers_missing_fill_before_enter() -> No
     assert result.parameters == [{"key": "search_location"}]
 
 
-def test_authoring_parameter_directive_consumption_requires_structural_and_final_code_evidence() -> None:
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="search_location",
-                field_selector="#location",
-                field_trajectory_index=0,
-                match_basis="exact_authored_selector",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(
-            tool_name="click",
-            trajectory_index=1,
-            selector="#submit",
-        ),
-    )
-    directive = build_authoring_parameter_binding_directive(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        candidates=[
-            AuthoringParameterBindingCandidate(
-                declared_key="search_location",
-                field_selector="#location",
-            )
-        ],
-    )
-    code = 'await page.locator("#location").fill(str(search_location))'
-
-    assert authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code=code,
-        parameter_keys=["search_location"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive.model_copy(update={"structural_key": "stale"}),
-        snapshot,
-        code=code,
-        parameter_keys=["search_location"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#other").fill(str(search_location))',
-        parameter_keys=["search_location"],
-    )
-
-
 def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_changes() -> None:
     trajectory = [_interaction("press_key", selector="#location", key="Tab", source_url="https://example.com/form")]
     snapshot = build_authoring_parameter_binding_snapshot(
@@ -342,56 +286,6 @@ def test_authoring_parameter_snapshot_fails_closed_when_terminal_identity_change
     )
 
     assert synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot) is None
-
-
-def test_authored_selection_bindings_recognizes_templated_click_and_select_option() -> None:
-    code = (
-        'await page.locator(f"[data-account=\\"{account_number}\\"]").click()\n'
-        'await page.locator("#plan").select_option(str(plan_tier))\n'
-    )
-    bindings = authored_selection_parameter_bindings(code, {"account_number", "plan_tier"})
-    assert bindings is not None
-    assert bindings.get("#plan") == {"plan_tier"}
-    assert {key for keys in bindings.values() for key in keys} == {"account_number", "plan_tier"}
-    assert authored_selector_parameter_bindings(code, {"account_number", "plan_tier"}) == {}
-
-
-def test_authored_selection_bindings_ignores_literal_only_click() -> None:
-    code = 'await page.locator("#row-account-AC12345").click()\n'
-    assert authored_selection_parameter_bindings(code, {"account_number"}) == {}
-
-
-def test_authoring_parameter_directive_consumed_via_select_option_value_argument() -> None:
-    snapshot = build_authoring_parameter_binding_snapshot(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        field_bindings=[
-            AuthoringParameterFieldBinding(
-                declared_key="plan_tier",
-                field_selector="#plan",
-                field_trajectory_index=0,
-                match_basis="scouted_option_value",
-            )
-        ],
-        terminal=AuthoringParameterTerminalBinding(tool_name="select_option", trajectory_index=0, selector="#plan"),
-    )
-    directive = build_authoring_parameter_binding_directive(
-        structural_key="definition-reject",
-        source_origin="https://example.com",
-        candidates=[AuthoringParameterBindingCandidate(declared_key="plan_tier", field_selector="#plan")],
-    )
-    assert authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#plan").select_option(str(plan_tier))',
-        parameter_keys=["plan_tier"],
-    )
-    assert not authoring_parameter_binding_directive_consumed(
-        directive,
-        snapshot,
-        code='await page.locator("#plan").select_option("premium")',
-        parameter_keys=["plan_tier"],
-    )
 
 
 def test_selection_snapshot_select_option_binds_value_argument() -> None:
@@ -439,7 +333,6 @@ def test_fill_snapshot_never_emits_select_option_value_binding() -> None:
     result = synthesize_code_block(trajectory, strict_selectors=True, parameter_binding_snapshot=snapshot)
     assert result is not None
     assert ".select_option(" not in result.code
-    assert snapshot.terminal.tool_name not in _SELECTION_MATCH_BASES
 
 
 def _extraction_plan() -> RequestedOutputExtractionPlan:
@@ -964,6 +857,24 @@ class TestLocatorSynthesis:
         assert "_read_value_0 = await page.evaluate(" in result.code
         assert '"error_count"' in result.code
         assert [d["selector"] for d in _dropped_root_targets(result)] == ["body"]
+
+    def test_a_synthesized_read_passes_both_code_security_checks(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/report", trajectory_index=0),
+                _interaction(
+                    "read_value",
+                    read_expression="document.querySelector('#count').textContent",
+                    read_output_path="output.error_count",
+                    trajectory_index=1,
+                ),
+            ]
+        )
+        assert result is not None
+        block_code = textwrap.dedent(result.code)
+        assert "await page.evaluate(" in block_code
+        assert author_time_code_security_errors(label="read_count", code=block_code) == []
+        assert runtime_code_security_errors([CodeBlockSecurityInput(label="read_count", code=block_code)]) == []
 
     def test_strict_dynamic_row_gate_outranks_the_root_container_role_retarget(self) -> None:
         interaction = _interaction(

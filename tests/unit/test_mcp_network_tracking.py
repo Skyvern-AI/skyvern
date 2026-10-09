@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -231,6 +232,38 @@ class TestOnResponseHook:
             on_response(response)
 
         assert [e["request_id"] for e in state.network_requests] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
+    async def test_json_body_is_fetched_only_when_a_tool_can_read_it(
+        self, monkeypatch: pytest.MonkeyPatch, stateless: bool
+    ) -> None:
+        """Stateless HTTP (hosted MCP inside the API process) disables every body reader, so a CDP body fetch there
+        is only event-loop work; API stall dumps caught the loop inside these fetches."""
+        monkeypatch.setattr("skyvern.cli.core.session_manager._stateless_http_mode", stateless)
+        state = _make_state()
+        raw = MagicMock()
+        raw.on = MagicMock()
+        raw.url = "https://example.com"
+        _register_hooks_on_page(state, raw)
+        on_response = next(call.args[1] for call in raw.on.call_args_list if call.args[0] == "response")
+
+        response = MagicMock()
+        response.url = "https://api.com/data"
+        response.request.method = "GET"
+        response.request.resource_type = "xhr"
+        response.request.timing = {}
+        response.status = 200
+        response.headers = {"content-type": "application/json"}
+        response.body = AsyncMock(return_value=b'{"ok": true}')
+        on_response(response)
+        await asyncio.gather(*state._pending_tasks)
+
+        assert len(state.network_requests) == 1
+        if stateless:
+            response.body.assert_not_awaited()
+        else:
+            assert state.get_response_body(0) == '{"ok": true}'
 
 
 # --- do_network_requests (browser_ops) ---

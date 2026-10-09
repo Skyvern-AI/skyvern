@@ -11,6 +11,7 @@ from enum import StrEnum
 from typing import Any, Protocol, TypedDict, TypeVar
 
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME
 
 
 class CopilotEvalMode(StrEnum):
@@ -77,6 +78,7 @@ BROWSER_ABLATION_NATIVE_TOOLS = (
     "inspect_locator_matches",
     "fill_credential_field",
     "request_credential",
+    "reply",
 )
 # Browser ablation keeps the production Copilot browser aliases, then projects the missing
 # multi-page capabilities from the app registry. This avoids both a second handwritten browser
@@ -89,7 +91,7 @@ BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS = frozenset({"skyvern_open_tabs"})
 
 
 # The browser-bound aliases that survive when mutations must go through code: page and console reads, observe-only
-# waits, frame and tab enumeration, and tab close (no page fact; the multi-tab hold's route out). Every alias that
+# waits, frame and tab enumeration, and tab close (no page fact). Every alias that
 # needs no browser survives too, so a later tool is withdrawn only if it acts on the page.
 REQUIRED_CODE_BROWSER_ALIASES = frozenset(
     {
@@ -168,6 +170,7 @@ def _overlay_fingerprint(overlay: Any) -> dict[str, Any]:
         "arg_transforms": getattr(overlay, "arg_transforms", {}),
         "forced_args": getattr(overlay, "forced_args", {}),
         "copilot_params": getattr(overlay, "copilot_params", {}),
+        "param_patches": getattr(overlay, "param_patches", {}),
         "requires_browser": getattr(overlay, "requires_browser", False),
         "timeout": getattr(overlay, "timeout", None),
         "pre_hook": _callable_identity(getattr(overlay, "pre_hook", None)),
@@ -298,10 +301,7 @@ def _required_code_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
 ) -> CopilotToolSurface:
-    from skyvern.forge.sdk.copilot.tools.composition_capture import (
-        COMPOSITION_INSPECTION_TOOL_NAME,
-        current_page_inspection_tool,
-    )
+    from skyvern.forge.sdk.copilot.tools.composition_capture import current_page_inspection_tool
 
     missing_aliases = sorted(REQUIRED_CODE_BROWSER_ALIASES.difference(alias_map.keys() & overlays.keys()))
     if missing_aliases:
@@ -324,6 +324,11 @@ def _required_code_surface(
         ordered_mcp_names=tuple(selected_aliases),
         identity=CopilotToolSurfaceIdentity.REQUIRED_CODE,
     )
+
+
+def surface_runs_blocks(*, mode: CopilotEvalMode | None, browser_tools_available: bool) -> bool:
+    # Mirrors which surfaces resolve_copilot_tool_surface leaves the block-running tools on.
+    return browser_tools_available and mode != CopilotEvalMode.BROWSER_ABLATION
 
 
 def resolve_copilot_tool_surface(

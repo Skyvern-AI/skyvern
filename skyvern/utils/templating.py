@@ -115,6 +115,26 @@ def get_missing_variables(template_source: str, template_data: dict) -> set[str]
     return missing_vars
 
 
+def reject_jinja_transformations_on_variable(
+    template_source: str,
+    variable_name: str,
+    env: SandboxedEnvironment | None = None,
+) -> None:
+    """Require a delayed placeholder to be emitted as a standalone interpolation."""
+    ast = (env or SandboxedEnvironment()).parse(template_source)
+    direct_interpolations = {
+        id(expression)
+        for output in ast.find_all(nodes.Output)
+        for expression in output.nodes
+        if isinstance(expression, nodes.Name) and expression.name == variable_name
+    }
+    if any(
+        variable.name == variable_name and id(variable) not in direct_interpolations
+        for variable in ast.find_all(nodes.Name)
+    ):
+        raise ValueError(f"The {variable_name} placeholder must be used without Jinja transformations")
+
+
 MAX_AVAILABLE_KEYS = 200
 MAX_AVAILABLE_KEY_LENGTH = 128
 MAX_AVAILABLE_PATH_LENGTH = 512

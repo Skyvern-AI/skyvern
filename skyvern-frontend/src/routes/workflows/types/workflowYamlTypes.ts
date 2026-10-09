@@ -5,6 +5,7 @@ import {
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   EmailBodyFormat,
+  EmailTransport,
   WorkflowBlockType,
   WorkflowModel,
   WorkflowRetryPolicy,
@@ -461,6 +462,10 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   body: string;
   body_format?: EmailBodyFormat;
   file_attachments?: Array<string> | null;
+  transport?: EmailTransport | null;
+  credential_id?: string | null;
+  cc?: Array<string>;
+  bcc?: Array<string>;
 };
 
 export type FileUrlParserBlockYAML = BlockYAMLBase & {

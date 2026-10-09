@@ -104,7 +104,11 @@ def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tu
             "tool_name": tool_name,
             "arguments": arguments[:_DEFERRED_ARGUMENTS_MAX_CHARS] if isinstance(arguments, str) else None,
         }
-        items[index] = replace_agent_message_field(items[index], "output", json.dumps(notice))
+        replaced = replace_agent_message_field(items[index], "output", json.dumps(notice))
+        # A notice that costs as much frees no room, and a result this small can be one saying its call never ran.
+        if estimate_tokens([replaced]) >= estimate_tokens([items[index]]):
+            continue
+        items[index] = replaced
         deferred.append(tool_name or "unknown")
     return items, deferred
 
@@ -141,9 +145,9 @@ def copilot_session_input_callback(
     payloads in the middle region.
 
     Keeps the original goal (first item) at full fidelity and preserves the
-    last ``RECENT_REAL_TURNS`` real user turns — in production every injected
-    copilot message is synthetic, so the whole post-goal history is the middle
-    region. Within it, older ``function_call_output`` / ``function_call`` items
+    last ``RECENT_REAL_TURNS`` real user turns — besides the goal, only messages
+    the user sent into the running turn are real, so the post-goal history is
+    usually all middle region. Within it, older ``function_call_output`` / ``function_call`` items
     are compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
     ``enforcement._prune_input_list`` uses in the non-session path, and the
     newest screenshot survives unless a newer one rides in recent/new items.

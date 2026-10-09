@@ -25,10 +25,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
@@ -338,6 +340,12 @@ async def _resolve_oauth_subject_to_org(
 
         api_token = await org_auth_token_service.create_org_api_token(org_id)
         LOG.info("MCP OAuth: auto-created API key for org", organization_id=org_id)
+        await app.AGENT_FUNCTION.record_audit_event(
+            RequestPrincipal(organization_id=org_id, auth_kind=AuthKind.bearer, user_id=subject),
+            AuditEvent(
+                organization_id=org_id, action="api_key.create", resource_type="api_key", resource_id=api_token.id
+            ),
+        )
 
     validation = MCPAPIKeyValidation(organization_id=org_id, token_type=OrganizationAuthTokenType.api)
     return _OAuthResolution(api_key=api_token.token, validation=validation)

@@ -69,7 +69,8 @@ _TRANSIENT_RESULT_TEXT_PATTERNS = (
     ),
 )
 _MAX_MEANINGFUL_DATA_DEPTH = 10
-_SCOUT_OBSERVATION_SOURCE_TOOL = "evaluate"
+EVALUATE_TOOL_NAME = "evaluate"
+COMPOSITION_INSPECTION_TOOL_NAME = "inspect_page_for_composition"
 _SCOUT_INTERACTION_SOURCE_TOOL = "scout_interaction"
 _SCOUT_WITNESS_KEY_VALUE = "capture_nonempty_value"
 _SCOUT_WITNESS_TABLE = "cell_text_present"
@@ -217,7 +218,7 @@ def _scout_observation_structure_signature(
     return _structure_signature(
         {
             "bindings": [_scout_binding_signature_payload(binding) for binding in bindings],
-            "source_tool": _SCOUT_OBSERVATION_SOURCE_TOOL,
+            "source_tool": EVALUATE_TOOL_NAME,
             "source_url": source_url,
             "workflow_run_id": workflow_run_id,
             "observed_after_workflow_run": observed_after_workflow_run,
@@ -226,7 +227,7 @@ def _scout_observation_structure_signature(
 
 
 def scout_observation_contract_valid(contract: ScoutObservationContract | None) -> bool:
-    if contract is None or contract.source_tool != _SCOUT_OBSERVATION_SOURCE_TOOL or not contract.source_url.strip():
+    if contract is None or contract.source_tool != EVALUATE_TOOL_NAME or not contract.source_url.strip():
         return False
     if not contract.bindings:
         return False
@@ -418,7 +419,7 @@ def mint_scout_observation_contract(
     frozen_bindings = tuple(bindings)
     return ScoutObservationContract(
         bindings=frozen_bindings,
-        source_tool=_SCOUT_OBSERVATION_SOURCE_TOOL,
+        source_tool=EVALUATE_TOOL_NAME,
         source_url=url,
         has_bounded_page_schema=has_bounded_page_schema,
         structure_signature=_scout_observation_structure_signature(

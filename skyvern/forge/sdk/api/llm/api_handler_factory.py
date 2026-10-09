@@ -7,6 +7,7 @@ import re
 import time
 import warnings
 from asyncio import CancelledError
+from collections.abc import Collection
 from json import JSONDecodeError
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
@@ -337,6 +338,19 @@ _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
 _OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
+# litellm 1.89.1 drops `*_above_100k_tokens` price keys, so a long Haiku 5.5 prompt prices at the base rate.
+# Every Haiku 5.5 rate above 100k prompt tokens is 5x its base rate.
+_CLAUDE_HAIKU_5_5_MODEL_SUFFIX = "claude-haiku-5-5"
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
+_CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER = 5.0
+
+
+def _long_prompt_cost_multiplier(model_name: str | None, prompt_tokens: int | None) -> float:
+    if model_name and model_name.endswith(_CLAUDE_HAIKU_5_5_MODEL_SUFFIX):
+        if prompt_tokens and prompt_tokens > _CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD:
+            return _CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER
+    return 1.0
+
 
 # Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
 # model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
@@ -416,36 +430,58 @@ def _current_secret_values_for_redaction() -> set[str]:
     return secret_values
 
 
-def _redact_prompt_text(text: str | None, secret_values: set[str]) -> str | None:
+def _current_placeholder_ids_for_redaction() -> frozenset[str]:
+    """The run's registered placeholder ids, exempted from the scrub below.
+
+    Both directions of the model boundary carry these tokens: the prompt offers them in place of
+    credential values, and the model types them back for the run to resolve. Redacting one would
+    break that round trip, so they are named here rather than matched by shape.
+    """
+    try:
+        context = skyvern_context.current()
+        return app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(
+            context.workflow_run_id if context else None
+        )
+    except Exception:
+        return frozenset()
+
+
+def _redact_prompt_text(text: str | None, secret_values: set[str], placeholder_ids: Collection[str] = ()) -> str | None:
     if text is None:
         return None
 
     if not secret_values:
         return text
 
-    return redact_secrets_from_text(text, secret_values)
+    return redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
 
 
-def _redact_content_blocks(blocks: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_content_blocks(
+    blocks: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_blocks: list[Any] = []
     changed = False
     for block in blocks:
-        redacted_block, block_changed = _redact_content_block(block, secret_values)
+        redacted_block, block_changed = _redact_content_block(block, secret_values, placeholder_ids)
         redacted_blocks.append(redacted_block)
         changed = changed or block_changed
     return (redacted_blocks, True) if changed else (blocks, False)
 
 
-def _redact_content_value(content: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_value(
+    content: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if isinstance(content, str):
-        redacted_content = redact_secrets_from_text(content, secret_values)
+        redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
         return redacted_content, redacted_content != content
     if isinstance(content, list):
-        return _redact_content_blocks(content, secret_values)
+        return _redact_content_blocks(content, secret_values, placeholder_ids)
     return content, False
 
 
-def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, bool]:
+def _redact_content_block(
+    block: Any, secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[Any, bool]:
     if not isinstance(block, dict):
         return block, False
 
@@ -454,14 +490,14 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
         text = block.get("text")
         if not isinstance(text, str):
             return block, False
-        redacted_text = redact_secrets_from_text(text, secret_values)
+        redacted_text = redact_secrets_from_text(text, secret_values, placeholder_ids=placeholder_ids)
         if redacted_text == text:
             return block, False
         return {**block, "text": redacted_text}, True
 
     if block_type == "tool_result":
         content = block.get("content")
-        redacted_content, content_changed = _redact_content_value(content, secret_values)
+        redacted_content, content_changed = _redact_content_value(content, secret_values, placeholder_ids)
         if not content_changed:
             return block, False
         return {**block, "content": redacted_content}, True
@@ -469,7 +505,9 @@ def _redact_content_block(block: Any, secret_values: set[str]) -> tuple[Any, boo
     return block, False
 
 
-def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[list[Any], bool]:
+def _redact_tool_calls(
+    tool_calls: list[Any], secret_values: set[str], placeholder_ids: Collection[str] = ()
+) -> tuple[list[Any], bool]:
     redacted_tool_calls: list[Any] = []
     changed = False
     for tool_call in tool_calls:
@@ -484,7 +522,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
         if not isinstance(arguments, str):
             redacted_tool_calls.append(tool_call)
             continue
-        redacted_arguments = redact_secrets_from_text(arguments, secret_values)
+        redacted_arguments = redact_secrets_from_text(arguments, secret_values, placeholder_ids=placeholder_ids)
         if redacted_arguments == arguments:
             redacted_tool_calls.append(tool_call)
             continue
@@ -497,6 +535,7 @@ def _redact_tool_calls(tool_calls: list[Any], secret_values: set[str]) -> tuple[
 def _redact_message_text_content(
     messages: list[dict[str, Any]] | None,
     secret_values: set[str],
+    placeholder_ids: Collection[str] = (),
 ) -> list[dict[str, Any]] | None:
     if messages is None or not secret_values:
         return messages
@@ -507,18 +546,18 @@ def _redact_message_text_content(
         redacted_message = message
         content = message.get("content")
         if isinstance(content, str):
-            redacted_content = redact_secrets_from_text(content, secret_values)
+            redacted_content = redact_secrets_from_text(content, secret_values, placeholder_ids=placeholder_ids)
             if redacted_content != content:
                 redacted_message = {**redacted_message, "content": redacted_content}
                 changed = True
         elif isinstance(content, list):
-            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values)
+            redacted_content_blocks, content_changed = _redact_content_blocks(content, secret_values, placeholder_ids)
             if content_changed:
                 redacted_message = {**redacted_message, "content": redacted_content_blocks}
                 changed = True
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
-            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values)
+            redacted_tool_calls, tool_calls_changed = _redact_tool_calls(tool_calls, secret_values, placeholder_ids)
             if tool_calls_changed:
                 redacted_message = {**redacted_message, "tool_calls": redacted_tool_calls}
                 changed = True
@@ -1354,7 +1393,7 @@ class LLMAPIHandlerFactory:
     @staticmethod
     def _get_cost_model_override(requested_model: str | None) -> tuple[str, str] | None:
         # Bedrock returns the bare Claude name, which otherwise selects direct Anthropic prices.
-        if requested_model == "bedrock/us.anthropic.claude-opus-5-5":
+        if requested_model in {"bedrock/us.anthropic.claude-opus-5-5", "bedrock/us.anthropic.claude-haiku-5-5"}:
             return requested_model, "bedrock"
         return None
 
@@ -1385,14 +1424,13 @@ class LLMAPIHandlerFactory:
         try:
             if cost_model_override := LLMAPIHandlerFactory._get_cost_model_override(requested_model):
                 model, provider = cost_model_override
-                return litellm.completion_cost(
+                cost = litellm.completion_cost(
                     completion_response=response, base_model=model, custom_llm_provider=provider
                 )
-            cost = (
-                litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
-                if recovered_tier is not None
-                else litellm.completion_cost(completion_response=response)
-            )
+            elif recovered_tier is not None:
+                cost = litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
+            else:
+                cost = litellm.completion_cost(completion_response=response)
         except Exception as e:
             LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
             return None
@@ -1401,7 +1439,10 @@ class LLMAPIHandlerFactory:
             return cost * _VERTEX_FLEX_COST_MULTIPLIER
         if LLMAPIHandlerFactory._is_openai_direct_gpt5_6_long_context_flex(response, hidden_params):
             return cost * _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER
-        return cost
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        model_name = requested_model if isinstance(requested_model, str) else None
+        return cost * _long_prompt_cost_multiplier(model_name, prompt_tokens)
 
     @staticmethod
     def _is_openai_direct_gpt5_6_long_context_flex(
@@ -1525,6 +1566,8 @@ class LLMAPIHandlerFactory:
             "bedrock/us.anthropic.claude-opus-5-5",
             "anthropic/claude-sonnet-5-5",
             "bedrock/global.anthropic.claude-sonnet-5-5",
+            "anthropic/claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
             "anthropic-claude-opus-4-8",
             "anthropic-claude-fable-5",
             "anthropic-claude-fable-5-1",
@@ -1954,10 +1997,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -2808,10 +2852,11 @@ class LLMAPIHandlerFactory:
 
             context = skyvern_context.current()
             secret_values = _current_secret_values_for_redaction()
-            prompt = _redact_prompt_text(prompt, secret_values) or ""
-            system_prompt = _redact_prompt_text(system_prompt, secret_values)
+            placeholder_ids = _current_placeholder_ids_for_redaction()
+            prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids) or ""
+            system_prompt = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
             redacted_cached_static_prompt = (
-                _redact_prompt_text(context.cached_static_prompt, secret_values) if context else None
+                _redact_prompt_text(context.cached_static_prompt, secret_values, placeholder_ids) if context else None
             )
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
@@ -3720,8 +3765,9 @@ class LLMCaller:
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
+        placeholder_ids = _current_placeholder_ids_for_redaction()
         original_prompt = prompt
-        prompt = _redact_prompt_text(prompt, secret_values)
+        prompt = _redact_prompt_text(prompt, secret_values, placeholder_ids)
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -3808,11 +3854,15 @@ class LLMCaller:
             _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
-            if "ANTHROPIC" in self.llm_key:
+            # Only the raw Anthropic SDK branch of _dispatch takes Anthropic-native image blocks; router
+            # keys reach litellm, which rejects them, whatever the key's name.
+            if self._router is None and "ANTHROPIC" in self.llm_key:
                 message_pattern = "anthropic"
 
             if use_message_history:
-                redacted_message_history = _redact_message_text_content(self.message_history, secret_values)
+                redacted_message_history = _redact_message_text_content(
+                    self.message_history, secret_values, placeholder_ids
+                )
                 messages = await llm_messages_builder_with_history(
                     prompt,
                     screenshots,
@@ -4509,16 +4559,17 @@ class LLMCaller:
                 pricing = litellm.model_cost.get(model_info.get("key"), {})
                 if pricing.get("input_cost_per_token") is not None and pricing.get("output_cost_per_token") is not None:
                     cache_creation_tokens = usage.cache_creation_input_tokens or 0
+                    # LiteLLM's prompt total includes both cache reads and writes.
+                    prompt_tokens = usage.input_tokens + cached_tokens + cache_creation_tokens
                     input_cost, output_cost = litellm.cost_per_token(
                         model=model,
                         custom_llm_provider=provider,
-                        # LiteLLM's prompt total includes both cache reads and writes.
-                        prompt_tokens=usage.input_tokens + cached_tokens + cache_creation_tokens,
+                        prompt_tokens=prompt_tokens,
                         completion_tokens=usage.output_tokens,
                         cache_read_input_tokens=cached_tokens,
                         cache_creation_input_tokens=cache_creation_tokens,
                     )
-                    llm_cost = input_cost + output_cost
+                    llm_cost = (input_cost + output_cost) * _long_prompt_cost_multiplier(model, prompt_tokens)
             except Exception as exc:
                 # LiteLLM 1.89.1 wraps its missing-model ValueError in a plain Exception.
                 if isinstance(exc.__context__, ValueError) and str(exc.__context__).startswith(

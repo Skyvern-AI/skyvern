@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.services import otp_service
 from skyvern.services.otp_service import (
+    MagicLinkSurfacing,
     OTPValue,
     _clean_url,
     _get_otp_value_from_db,
@@ -1202,6 +1203,63 @@ class TestParseOtpLogin:
         result = await parse_otp_login(content="Your code is AB12CD - it expires soon.", organization_id="o_test")
 
         assert result is None  # no digit-run candidate to recover from; better than storing a short code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("code", "next_word"),
+        [("482913", "This"), ("202613", "Note"), ("551207", "Enter")],
+    )
+    async def test_code_glued_to_the_next_word_is_recovered_not_the_footer_year(
+        self, monkeypatch: pytest.MonkeyPatch, code: str, next_word: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=code)
+        content = (
+            f"Your verification code is {code}{next_word} code expires in 10 minutes. "
+            "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+        )
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "llm_value", "expected"),
+        [
+            (
+                (
+                    "Your verification code is 482913This code expires in 10 minutes. "
+                    "(c)2026 Example Co, 1 Example Way, Exampletown 99999"
+                ),
+                "48291",
+                "482913",
+            ),
+            ("Your verification code is 202613This code expires in 10 minutes. (c)2026Example Co", "2026", "202613"),
+            ("Your verification code is 482913. Order 48291377Shipped today. (c)2026Example Co", "48291", "482913"),
+        ],
+        ids=["glued_code", "glued_code_read_as_glued_year", "separate_code_beside_glued_number"],
+    )
+    async def test_truncated_read_recovers_the_whole_code_not_a_glued_number(
+        self, monkeypatch: pytest.MonkeyPatch, content: str, llm_value: str, expected: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("llm_value", ["482913ab56", "48291356"], ids=["case_misread", "letters_dropped"])
+    async def test_case_misread_or_letter_dropped_alphanumeric_code_is_not_cut_to_its_digits(
+        self, monkeypatch: pytest.MonkeyPatch, llm_value: str
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content="Your code: 482913Ab56 (c)2026 Example Co", organization_id="o_test")
+
+        assert result is None or result.value == "482913Ab56"  # never the fragment "482913" or the year
 
     @pytest.mark.asyncio
     async def test_does_not_charge_when_llm_call_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2487,6 +2545,7 @@ def _parsed_otp_row(
     otp_type: OTPType,
     created_at: datetime = datetime(2026, 7, 30, 12, 0, 0),
     workflow_run_id: str | None = None,
+    task_id: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         totp_code_id=totp_code_id,
@@ -2496,7 +2555,7 @@ def _parsed_otp_row(
         created_at=created_at,
         workflow_run_id=workflow_run_id,
         workflow_id=None,
-        task_id=None,
+        task_id=task_id,
         expired_at=None,
     )
 
@@ -2725,6 +2784,203 @@ async def test_get_otp_value_from_db_retries_unchecked_newer_content_after_attem
     assert parse.await_count == 4
     assert context.misses == {(f"otp_totp_{index}", OTPType.MAGIC_LINK) for index in range(3)}
     assert mock_app.DATABASE.otp.get_raw_otp_codes.await_count == 2
+
+
+_POLL_STARTED = datetime(2026, 7, 30, 12, 0, 0)
+_STORED_LINK = "https://example.test/careers/activate/synthetictoken4567/"
+_RESENT_LINK = "https://example.test/careers/activate/synthetictoken8901/"
+# A bare link the store cleaned: an HTML-escaped query separator decoded, a trailing period dropped.
+_ESCAPED_LINK_CONTENT = "https://example.test/careers/activate?u=alex&amp;t=synthetictoken4567."
+_CLEANED_LINK = "https://example.test/careers/activate?u=alex&t=synthetictoken4567"
+_SURFACE_LINKS = MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset())
+# 07:00 at UTC-5 is 12:00 UTC: an aware anchor must be compared in UTC, not by its wall-clock digits.
+_UTC_MINUS_5 = timezone(timedelta(hours=-5))
+
+
+def _stored_link(
+    *,
+    seconds: int = 5,
+    link: str = _STORED_LINK,
+    content: str | None = None,
+    workflow_run_id: str | None = "wr_test",
+    task_id: str | None = None,
+) -> SimpleNamespace:
+    return _parsed_otp_row(
+        totp_code_id=f"otp_link_{seconds}",
+        content=link if content is None else content,
+        code=link,
+        otp_type=OTPType.MAGIC_LINK,
+        created_at=_POLL_STARTED + timedelta(seconds=seconds),
+        workflow_run_id=workflow_run_id,
+        task_id=task_id,
+    )
+
+
+def _stored_code(code: str, *, seconds: int) -> SimpleNamespace:
+    return _parsed_otp_row(
+        totp_code_id=f"otp_{code}",
+        content=code,
+        code=code,
+        otp_type=OTPType.TOTP,
+        created_at=_POLL_STARTED + timedelta(seconds=seconds),
+        workflow_run_id="wr_test",
+    )
+
+
+_LINK = OTPValue(value=_STORED_LINK, type=OTPType.MAGIC_LINK)
+_CODE = OTPValue(value="482913", type=OTPType.TOTP)
+_NO_PARSE_CREDIT = otp_service.InsufficientCreditsForOTPParse()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "reparsed", "surfacing", "rejected_code", "expected"),
+    [
+        pytest.param([_stored_link()], None, None, None, None, id="off_unless_the_caller_opts_in"),
+        pytest.param([_stored_link()], _NO_PARSE_CREDIT, _SURFACE_LINKS, None, _LINK, id="bare_link_needs_no_parse"),
+        pytest.param(
+            [_stored_link(workflow_run_id=None, task_id="tsk_test")],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="bare_task_scoped_link",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5), _stored_code("482913", seconds=10)],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _CODE,
+            id="newer_code_beats_older_link",
+        ),
+        pytest.param(
+            [_stored_code("48291", seconds=5), _stored_link(seconds=6)],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="link_one_second_after_a_short_value_wins",
+        ),
+        pytest.param(
+            [_stored_code("482913", seconds=5), _stored_link(seconds=10)],
+            None,
+            MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset({_STORED_LINK})),
+            None,
+            _CODE,
+            id="spent_link_falls_back_to_older_code",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5), _stored_link(seconds=60, link=_RESENT_LINK)],
+            None,
+            MagicLinkSurfacing(created_after=_POLL_STARTED, spent_values=frozenset({_RESENT_LINK})),
+            None,
+            None,
+            id="spent_link_retires_the_older_link_it_replaced",
+        ),
+        pytest.param(
+            [_stored_link(link=_CLEANED_LINK, content=_ESCAPED_LINK_CONTENT)],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            OTPValue(value=_CLEANED_LINK, type=OTPType.MAGIC_LINK),
+            id="bare_link_the_store_cleaned_needs_no_parse",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _CODE,
+            _SURFACE_LINKS,
+            None,
+            _CODE,
+            id="email_with_a_code_and_a_link_yields_the_code",
+        ),
+        pytest.param(
+            [
+                _stored_link(
+                    content=f"Hi Alex Demo, confirm your account: {_STORED_LINK} Help: https://example.test/help"
+                )
+            ],
+            None,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="email_with_only_a_link_yields_the_link",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _CODE,
+            _SURFACE_LINKS,
+            "482913",
+            _LINK,
+            id="email_whose_code_was_rejected_yields_the_link",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            _NO_PARSE_CREDIT,
+            _SURFACE_LINKS,
+            None,
+            _LINK,
+            id="email_with_a_code_and_a_link_yields_the_link_without_parse_credit",
+        ),
+        pytest.param(
+            [_stored_link(content=f"Hi Alex Demo, your code is 482913. Or confirm here: {_STORED_LINK}")],
+            RuntimeError("transient parser failure"),
+            _SURFACE_LINKS,
+            None,
+            None,
+            id="email_with_a_code_and_a_link_retries_a_transient_parse_failure",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5)],
+            None,
+            MagicLinkSurfacing(
+                created_after=datetime(2026, 7, 30, 7, 0, 0, tzinfo=_UTC_MINUS_5), spent_values=frozenset()
+            ),
+            None,
+            _LINK,
+            id="aware_anchor_before_the_link",
+        ),
+        pytest.param(
+            [_stored_link(seconds=5)],
+            None,
+            MagicLinkSurfacing(
+                created_after=datetime(2026, 7, 30, 7, 0, 10, tzinfo=_UTC_MINUS_5), spent_values=frozenset()
+            ),
+            None,
+            None,
+            id="aware_anchor_after_the_link",
+        ),
+    ],
+)
+async def test_code_poll_hands_back_only_a_fresh_unspent_link_bound_to_this_run(
+    rows: list[SimpleNamespace],
+    reparsed: OTPValue | Exception | None,
+    surfacing: MagicLinkSurfacing | None,
+    rejected_code: str | None,
+    expected: OTPValue | None,
+) -> None:
+    # A caller that can open links opts in to receiving a stored link while it waits for a code; every
+    # other caller keeps the old answer. The newest usable value of either type wins, and an email holding
+    # both a code and a link still yields the code.
+    parse = AsyncMock(side_effect=reparsed) if isinstance(reparsed, Exception) else AsyncMock(return_value=reparsed)
+    with (
+        patch("skyvern.services.otp_service.app") as mock_app,
+        patch("skyvern.services.otp_service.parse_otp_login", new=parse),
+    ):
+        mock_app.DATABASE.otp.get_otp_codes = AsyncMock(return_value=rows)
+        mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock(return_value=[])
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "application_synthetic0001",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            expected_otp_type=OTPType.TOTP,
+            raw_context=otp_service.RawOTPVerificationContext(),
+            rejected_code_hash=hashlib.sha256(rejected_code.encode()).hexdigest() if rejected_code else None,
+            surface_magic_link=surfacing,
+        )
+
+    assert result == expected
 
 
 def _raw_otp_row(

@@ -118,7 +118,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "validation": "Validate page state with complete/terminate criteria",
     "http_request": "Call an external HTTP API",
     "web_search": "Search Google or Exa and optionally process the results with a prompt",
-    "send_email": "Send an email notification via SMTP",
+    "send_email": "Send an email via SMTP or from a connected Gmail account",
     "file_download": "Download a file from a page",
     "file_upload": "Upload a file from S3/Azure to a page element",
     "goto_url": "Navigate directly to a URL without additional instructions",

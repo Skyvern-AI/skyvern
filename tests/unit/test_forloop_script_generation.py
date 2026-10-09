@@ -14,7 +14,7 @@ import libcst as cst
 import pytest
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
-from skyvern.core.script_generations.generate_script import _build_for_loop_statement
+from skyvern.core.script_generations.generate_script import _build_for_loop_statement, _build_run_fn
 from skyvern.core.script_generations.transform_workflow_run import (
     CodeGenInput,
     transform_workflow_run_to_code_gen_input,
@@ -337,6 +337,7 @@ async def test_transform_forloop_block_with_mocked_db() -> None:
     ):
         mock_get_wfr.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
+        mock_app.DATABASE.observer.workflow_run_has_block_on_engine = AsyncMock(return_value=False)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
             return_value=[
                 mock_forloop_run_block,
@@ -502,6 +503,64 @@ class TestForLoopScriptExecution:
 
         assert "branch_a_http" in loop_code and "branch_b_http" in loop_code
         assert is_block_type_cacheable(forloop_block) is False
+
+    @pytest.mark.parametrize("shape", ["loop_holding_a_conditional", "nested_loop_holding_a_conditional", "plain_loop"])
+    @pytest.mark.asyncio
+    async def test_whole_script_run_refuses_a_loop_holding_an_engine_only_child_before_any_block_runs(
+        self, shape: str
+    ) -> None:
+        def prompt(label: str) -> dict[str, Any]:
+            return {"block_type": "text_prompt", "label": label, "prompt": label}
+
+        conditional = {
+            "block_type": "conditional",
+            "label": "cond_1",
+            "next_block_label": "after",
+            "branch_conditions": [
+                {
+                    "criteria": {"criteria_type": "jinja2_template", "expression": "{{ current_value.ok }}"},
+                    "next_block_label": "branch_a",
+                },
+                {"is_default": True, "next_block_label": "branch_b"},
+            ],
+        }
+        body = [prompt("step")] if shape == "plain_loop" else [conditional, prompt("branch_a"), prompt("branch_b")]
+        loop: dict[str, Any] = {"block_type": "for_loop", "label": "loop_1", "loop_blocks": body}
+        if shape == "nested_loop_holding_a_conditional":
+            loop = {**loop, "label": "outer", "loop_blocks": [{**loop, "label": "inner"}]}
+
+        ran: list[str] = []
+
+        class FakeSkyvern:
+            def workflow(self, **_: Any) -> Any:
+                return lambda fn: fn
+
+            async def setup(self, *_: Any) -> tuple[None, None]:
+                ran.append("setup")
+                return None, None
+
+            async def loop(self, **_: Any) -> Any:
+                for value in ("row_0", "row_1"):
+                    yield value
+
+            async def prompt(self, label: str, **_: Any) -> None:
+                ran.append(label)
+
+        namespace: dict[str, Any] = {
+            "skyvern": FakeSkyvern(),
+            "Any": Any,
+            "WorkflowParameters": type("WorkflowParameters", (), {}),
+            "GeneratedWorkflowParameters": None,
+        }
+        exec(cst.Module(body=[_build_run_fn([prompt("before"), loop], {"title": "t"})]).code, namespace)
+
+        if shape == "plain_loop":
+            await namespace["run_workflow"](parameters={})
+            assert ran == ["setup", "before", "step", "step"]
+        else:
+            with pytest.raises(RuntimeError, match="conditional"):
+                await namespace["run_workflow"](parameters={})
+            assert ran == []
 
 
 class TestForLoopScriptCompilation:

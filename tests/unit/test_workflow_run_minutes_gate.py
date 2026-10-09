@@ -302,6 +302,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
         SimpleNamespace(
             workflow_run_id="wr_finally",
             workflow_id="wf_finally",
+            browser_settings=None,
             workflow_permanent_id="wpid_finally",
             organization_id="org_finally",
             parent_workflow_run_id=None,
@@ -729,6 +730,8 @@ async def test_duration_log_reads_unknown_for_a_different_runs_context(
     duration_logs = [e for e in logs if e.get("event") == "Workflow run duration metrics"]
     assert len(duration_logs) == 1
     assert duration_logs[0]["task_v3_ab_arm"] == "unknown"
+    # Null, not false: a code-mode run whose attribution was lost must not read as an agent-mode run.
+    assert duration_logs[0]["would_be_code"] is None
     # And no route_reason, which is why the single-log arm read documented in
     # cloud_docs/feature-flags/task-v3-billing-tier-rollout.md cannot see this population at all: a
     # route_reason filter drops these rows from both arms, so they have to be counted and
@@ -821,8 +824,18 @@ _V3_DEFAULT_CUTOFF = datetime(2026, 9, 15, tzinfo=UTC)
                 "billing_tier": None,
             },
         ),
+        (
+            None,
+            {WORKFLOW_TASK_V3_AB_FLAG: True},
+            {"ineligibility_reason": None, "billing_tier": BillingTier.ENTERPRISE, "would_be_code": True},
+            {
+                "task_v3_ab_arm": "treatment",
+                "route_reason": WorkflowBlockEngineRouteReason.code_bucket_treatment,
+                "would_be_code": True,
+            },
+        ),
     ],
-    ids=["bucketed-treatment", "bucketed-control", "new-workflow-default", "ineligible"],
+    ids=["bucketed-treatment", "bucketed-control", "new-workflow-default", "ineligible", "code-mode-treatment"],
 )
 async def test_duration_log_carries_the_tier_and_route_reason_the_run_was_bucketed_on(
     monkeypatch: pytest.MonkeyPatch,

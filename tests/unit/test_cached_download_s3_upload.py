@@ -63,6 +63,7 @@ def mock_context():
     ctx.browser_session_id = None
     ctx.run_id = ctx.workflow_run_id
     ctx.prompt = None
+    ctx.download_suffix_applied_files = {}
     return ctx
 
 
@@ -103,7 +104,13 @@ def setup(mock_context, tmp_path):
                 new_callable=AsyncMock,
                 return_value=("wrb_1", "tsk_1", "stp_1"),
             ),
-            patch(f"{MODULE}._render_template_with_label", side_effect=lambda p, _: p),
+            patch(
+                f"{MODULE}._render_template_with_label",
+                side_effect=lambda p, _, extra_template_data=None: p.replace(
+                    "{{ original_filename }}",
+                    extra_template_data["original_filename"] if extra_template_data else "{{ original_filename }}",
+                ),
+            ),
             patch(f"{MODULE}.skyvern_context.ensure_context", return_value=mock_context),
             patch(f"{MODULE}._prepare_cached_block_inputs", new_callable=AsyncMock),
             patch(f"{MODULE}._run_cached_function", new=run_cached_mock),
@@ -128,6 +135,7 @@ def setup(mock_context, tmp_path):
             "update_block": update_block_mock,
             "rename": rename,
             "run_cached": run_cached_mock,
+            "context": mock_context,
             "wait_downloads": wait_downloads_mock,
             "get_download_dir": get_download_dir_mock,
         }
@@ -144,6 +152,7 @@ def test_render_template_with_label_injects_workflow_run_id():
     context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
     workflow_run_context = SimpleNamespace(
         values={},
+        secrets={},
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",
@@ -162,6 +171,35 @@ def test_render_template_with_label_injects_workflow_run_id():
         rendered = _render_template_with_label("exports/{{ workflow_run_id }}")
 
     assert rendered == "exports/wr_cached_run"
+
+
+def test_render_template_with_label_uses_workflow_parameter_over_extra_binding():
+    context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
+    workflow_run_context = SimpleNamespace(
+        values={"original_filename": "custom.pdf"},
+        secrets={},
+        workflow_title="Cached workflow",
+        workflow_id="wf_cached",
+        workflow_permanent_id="wpid_cached",
+        workflow_run_id="wr_cached_run",
+        browser_session_id=None,
+    )
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = workflow_run_context
+
+    with (
+        patch(f"{MODULE}.app", mock_app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+    ):
+        from skyvern.services.script_service import _render_template_with_label
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        rendered = _render_template_with_label(
+            "ACME_{{ original_filename }}",
+            extra_template_data={"original_filename": ORIGINAL_FILENAME_MARKER},
+        )
+
+    assert rendered == "ACME_custom.pdf"
 
 
 @pytest.mark.asyncio
@@ -586,6 +624,243 @@ async def test_cached_download_rename_emits_finalize_lineage(setup, tmp_path):
         assert event["pre_rename_filename_fp"] == expected_fingerprint("abc123.pdf")
         assert event["desired_name_fp"] == expected_fingerprint("invoice.pdf")
         assert event["will_rename"] is True
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_renders_filename_template_before_substituting_site_name(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    abs_path = str(download_dir / "Q4 Report.pdf")
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], ["Q4 Report.pdf"]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        with patch(
+            f"{MODULE}._render_template_with_label",
+            side_effect=lambda value, _, extra_template_data=None: value.replace("{{ fund }}", "Fund A").replace(
+                "{{ original_filename }}",
+                extra_template_data["original_filename"] if extra_template_data else "{{ original_filename }}",
+            ),
+        ):
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ fund }}_{{ original_filename }}",
+                label="test_block",
+            )
+
+        rename_mock.assert_called_once_with(abs_path, "Fund%20A_Q4 Report.pdf")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_applies_suffix_at_download_time_and_preserves_original_name(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    expected_name = "Fund_Q4 Report.pdf"
+    abs_path = str(download_dir / expected_name)
+    refs = setup(
+        get_side_effect=[[], [expected_name]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+    )
+    refs["context"].download_suffix = None
+    saved_targets = []
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.actions.handler import _download_target_path
+
+        async def save_download(_cached_fn):
+            target = _download_target_path(download_dir, "Q4 Report.pdf")
+            saved_targets.append(target)
+            target.touch()
+
+        refs["run_cached"].side_effect = save_download
+        with patch(f"{MODULE}.skyvern_context.current", return_value=refs["context"]):
+            await download(
+                prompt="Download invoice",
+                download_suffix="Fund_{{ original_filename }}",
+                label="test_block",
+            )
+
+        assert [target.name for target in saved_targets] == [expected_name]
+        assert refs["context"].download_suffix_applied_files[expected_name][0] == "Q4 Report.pdf"
+        assert refs["context"].download_suffix is None
+        refs["rename"].assert_not_called()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_rejects_transformations_on_original_filename(setup):
+    refs = setup(list_files_side_effect=[[], []])
+    try:
+        from skyvern.services.script_service import download
+
+        with pytest.raises(ValueError, match="must be used without Jinja transformations"):
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ original_filename | upper }}",
+                label="test_block",
+            )
+
+        refs["run_cached"].assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_allows_filters_on_workflow_owned_original_filename(setup):
+    refs = setup(get_side_effect=[[]], list_files_side_effect=[[], []])
+    refs["app"].WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.values = {
+        "original_filename": "custom.pdf"
+    }
+    refs["run_cached"].side_effect = RuntimeError("cached function failed")
+    try:
+        from skyvern.services.script_service import download
+
+        with patch(
+            f"{MODULE}._render_template_with_label",
+            side_effect=lambda value, *_args, **_kwargs: (
+                "CUSTOM.PDF" if value == "{{ original_filename | upper }}" else value
+            ),
+        ):
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ original_filename | upper }}",
+                label="test_block",
+            )
+
+        assert refs["fallback"].await_args.kwargs["download_suffix"] == "CUSTOM.PDF"
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_passes_rendered_suffix_to_ai_fallback(setup):
+    refs = setup(get_side_effect=[[]], list_files_side_effect=[[], []])
+    refs["context"].download_suffix = "ambient_suffix"
+    refs["run_cached"].side_effect = RuntimeError("cached function failed")
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        await download(
+            prompt="Download invoice",
+            download_suffix="Fund_{{ original_filename }}",
+            label="test_block",
+        )
+
+        refs["fallback"].assert_awaited_once()
+        assert refs["fallback"].await_args.kwargs["download_suffix"] == f"Fund_{ORIGINAL_FILENAME_MARKER}"
+        assert refs["context"].download_suffix == "ambient_suffix"
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_recovers_extension_with_dotted_prefix(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    target_name = "Acme.L.P._export"
+    abs_path = str(download_dir / target_name)
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], [f"{target_name}.xlsx"]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files[target_name] = (
+                "export",
+                f"Acme.L.P._{ORIGINAL_FILENAME_MARKER}",
+            )
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        with patch(f"{MODULE}.recover_download_extension", return_value=".xlsx") as recover_extension:
+            await download(
+                prompt="Download invoice",
+                download_suffix="Acme.L.P._{{ original_filename }}",
+                label="test_block",
+            )
+
+        recover_extension.assert_called_once_with(abs_path, f"Acme.L.P._{ORIGINAL_FILENAME_MARKER}")
+        rename_mock.assert_called_once_with(abs_path, f"{target_name}.xlsx")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_preserves_explicit_suffix_extension(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    target_name = "custom.txt"
+    abs_path = str(download_dir / target_name)
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], [target_name]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files[target_name] = ("report.pdf", target_name)
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        await download(
+            prompt="Download invoice",
+            download_suffix=target_name,
+            label="test_block",
+        )
+
+        rename_mock.assert_not_called()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_dedupes_recovered_extension_for_already_named_file(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    abs_path = str(download_dir / "ACME_export")
+    existing_path = str(download_dir / "ACME_export.xlsx")
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], ["ACME_export.xlsx"]],
+        list_files_side_effect=[
+            [existing_path],
+            [existing_path, abs_path],
+            [existing_path, abs_path],
+            [existing_path, abs_path],
+        ],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import _marked_download_suffix
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files["ACME_export"] = (
+                "export",
+                _marked_download_suffix("ACME_{{ original_filename }}"),
+            )
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        with patch(f"{MODULE}.recover_download_extension", return_value=".xlsx"):
+            await download(
+                prompt="Download invoice",
+                download_suffix="ACME_{{ original_filename }}",
+                label="test_block",
+            )
+
+        rename_mock.assert_called_once_with(abs_path, "ACME_export_1.xlsx")
     finally:
         _cleanup(refs)
 

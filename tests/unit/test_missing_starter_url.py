@@ -128,6 +128,7 @@ def _mock_block_execute_deps(
         yield {
             "task": task,
             "tasks_db": tasks_db,
+            "observer_db": observer_db,
             "agent": agent,
             "browser_state": browser_state,
             "browser_manager": browser_manager,

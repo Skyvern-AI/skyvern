@@ -700,6 +700,8 @@ class SkyvernContext:
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
+    # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
+    download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
@@ -720,6 +722,9 @@ class SkyvernContext:
     # scoped so bare tasks with no workflow-run context are still redacted; unioned into
     # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
+    # Copilot credential values this request filled or scrubbed with. Its log lines and span exceptions
+    # scrub them at any length, while other sessions' values reach its log lines only above a length floor.
+    copilot_scrub_values: set[str] = field(default_factory=builtins.set, repr=False)
     # Subset of runtime_secret_values that must also never reach the model's own view of tool
     # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
     # code) that are only scrubbed from artifacts/logs.
@@ -812,11 +817,6 @@ class SkyvernContext:
     slim_output_variant_resolved: bool = False
     slim_output_variant_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    # Pin one screenshot strategy per execution identity, including provider failures that select control.
-    screenshot_cdp_first: bool = False
-    screenshot_arm_resolved_distinct_id: str | None = None
-    screenshot_arm_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
     # without taking a dependency on the public-API request shape.
@@ -840,8 +840,6 @@ class SkyvernContext:
     prompt: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
-    # Caller-selected block labels for a partial workflow run; None/empty = full run.
-    run_block_labels: list[str] | None = None
     loop_metadata: dict[str, Any] | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None

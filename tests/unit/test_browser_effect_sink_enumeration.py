@@ -22,12 +22,13 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {
             "bring_to_front": 2,
             "check": 2,
-            "click": 25,
+            "click": 24,
             "clear": 6,
             # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
             "close": 6,
             "dblclick": 2,
-            "evaluate": 15,
+            # 16 = 15 prior + the held-autocomplete declared-list rows read after input_text (SKY-17867).
+            "evaluate": 16,
             "fill": 2,
             "focus": 4,
             "go_back": 1,
@@ -76,13 +77,14 @@ _DISCOVERED_BROWSER_API_CALLS = {
     "skyvern/forge/taskv3/input_dispatch.py": Counter(
         {
             "click": 4,
+            # A grid cell whose editor opens on a double-click (SKY-17868): one by selector, one by locator.
+            "dblclick": 2,
             "evaluate": 1,
             "fill": 3,
             "focus": 2,
             "hover": 1,
             "press": 3,
             "press_sequentially": 1,
-            "scroll_into_view_if_needed": 1,
             "select_option": 2,
             "set_files": 1,
             "set_input_files": 1,
@@ -124,6 +126,8 @@ _EVALUATE_CALLERS = {
             "_drive_grid_row_selection": 1,
             # detached-clone constraint check inside _static_declared_constraint_evidence's nested _inner (SKY-13631)
             "_inner": 1,
+            # read-only declared-list rows probe after input_text into a held autocomplete (SKY-17867)
+            "_held_value_lost_to_unmatched_text": 1,
             "_normal_select_readback_contradicts": 1,
             "_probe_tel_browser_validity": 1,
             "handle_click_action": 2,
@@ -260,21 +264,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 207
+    assert sum(sum(methods.values()) for methods in observed.values()) == 208
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 200
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 201
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 38
+    assert sum(sum(callers.values()) for callers in observed.values()) == 39
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

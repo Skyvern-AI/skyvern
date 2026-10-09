@@ -250,6 +250,13 @@ function advance(ms: number) {
   return act(() => vi.advanceTimersByTimeAsync(ms));
 }
 
+// Retries until React commits the expected state, polling on the real event
+// loop (React's scheduler runs there, and fake time does not drive it).
+// Interval 0 keeps vi.waitFor from also advancing fake time on every check.
+function settled(assertion: () => void) {
+  return vi.waitFor(assertion, { interval: 0 });
+}
+
 function sessionRequestCount() {
   return (mocks.apiGet.mock.calls as unknown[][]).filter(
     ([url]) => url === "/browser_sessions/pbs_test",
@@ -854,9 +861,13 @@ describe("BrowserStream", () => {
     try {
       const onStreamStateChange = vi.fn();
       renderBrowserStream({ onStreamStateChange });
-      await vi.advanceTimersByTimeAsync(1000);
+      await settled(() =>
+        expect(onStreamStateChange).toHaveBeenLastCalledWith(
+          "live",
+          "pbs_test",
+        ),
+      );
       expect(mocks.rfbInstances).toHaveLength(1);
-      expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_test");
       mocks.autoConnect.value = false;
 
       // Each disconnect schedules exactly one delayed redial, up to the cap.
@@ -867,13 +878,19 @@ describe("BrowserStream", () => {
         ] as unknown as {
           emit: (type: string, detail?: unknown) => void;
         };
-        rfb.emit("disconnect", { clean: false });
+        act(() => rfb.emit("disconnect", { clean: false }));
         // No immediate redial: the retry waits out its backoff delay.
-        await vi.advanceTimersByTimeAsync(0);
+        // This absence check settles on act's trailing macrotask, which drains
+        // only microtask-only chains (the mocked async getClient and
+        // useCredentialGetter); if the dial path ever awaits real macrotasks,
+        // it false-passes silently.
+        await advance(0);
         expect(mocks.rfbInstances).toHaveLength(instanceCount);
         // Max delay 15s plus up to 50% jitter.
-        await vi.advanceTimersByTimeAsync(30000);
-        expect(mocks.rfbInstances).toHaveLength(instanceCount + 1);
+        await advance(30000);
+        await settled(() =>
+          expect(mocks.rfbInstances).toHaveLength(instanceCount + 1),
+        );
       }
       expect(onStreamStateChange).toHaveBeenLastCalledWith(
         "connecting",
@@ -886,12 +903,14 @@ describe("BrowserStream", () => {
       ] as unknown as {
         emit: (type: string, detail?: unknown) => void;
       };
-      rfb.emit("disconnect", { clean: false });
-      await vi.advanceTimersByTimeAsync(120000);
+      act(() => rfb.emit("disconnect", { clean: false }));
+      await advance(120000);
       expect(mocks.rfbInstances).toHaveLength(instanceCount);
-      expect(onStreamStateChange).toHaveBeenLastCalledWith(
-        "stopped",
-        "pbs_test",
+      await settled(() =>
+        expect(onStreamStateChange).toHaveBeenLastCalledWith(
+          "stopped",
+          "pbs_test",
+        ),
       );
     } finally {
       vi.useRealTimers();

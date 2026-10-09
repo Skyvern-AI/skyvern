@@ -2,13 +2,18 @@ import { useEffect, useId, useRef, type KeyboardEvent } from "react";
 import { CheckIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
-import type { QuestionStepper } from "../useQuestionStepper";
-import type { QuestionInteraction } from "../workflowCopilotTypes";
+import { OTHER_CHOICE_ID, type QuestionStepper } from "../useQuestionStepper";
+import type {
+  QuestionChoice,
+  QuestionInteraction,
+} from "../workflowCopilotTypes";
 import { AttentionTray } from "./AttentionTray";
 import { keyedChoiceFor, MAX_KEYED_CHOICES } from "./keyedChoice";
 
 // One tray renders at a time, so the composer can name the prompt it is answering.
 export const QUESTION_PROMPT_ID = "copilot-question-prompt";
+// What the picked choice still needs typed, since a placeholder is not reliably announced.
+export const QUESTION_DETAIL_ID = "copilot-question-detail";
 
 export function QuestionTray({
   interaction,
@@ -19,6 +24,7 @@ export function QuestionTray({
   onCollapsedChange,
   onSend,
   onSkip,
+  onAnswerInComposer,
   onCancel,
   cancelDisabled,
   cancelTitle,
@@ -34,6 +40,7 @@ export function QuestionTray({
   onCollapsedChange: (collapsed: boolean) => void;
   onSend: () => void;
   onSkip: () => void;
+  onAnswerInComposer: () => void;
   onCancel?: () => void;
   cancelDisabled?: boolean;
   cancelTitle?: string;
@@ -52,13 +59,33 @@ export function QuestionTray({
   const total = interaction.parts.length;
   const part = interaction.parts[stepper.index];
   const noun = total === 1 ? "question" : "questions";
+  const choices: QuestionChoice[] = part?.choices.length
+    ? [...part.choices, { choice_id: OTHER_CHOICE_ID, text: "Other" }]
+    : [];
+  // Other never costs the generated choices their keys; it is unnumbered when it would be tenth.
+  const keyed = (part?.choices.length ?? 0) <= MAX_KEYED_CHOICES;
+  const advanceHint = stepper.advanceBlocked
+    ? "Type your answer in the message box to continue"
+    : undefined;
+
+  const pick = (choiceId: string) => {
+    if (!part) return;
+    const picking = stepper.choices[part.part_id] !== choiceId;
+    stepper.toggleChoice(part.part_id, choiceId);
+    const needsText =
+      choiceId === OTHER_CHOICE_ID ||
+      part.choices.some(
+        (choice) => choice.choice_id === choiceId && choice.detail_prompt,
+      );
+    if (picking && needsText) onAnswerInComposer();
+  };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (disabled || !part || part.choices.length > MAX_KEYED_CHOICES) return;
-    const choice = keyedChoiceFor(event, part.choices);
+    if (disabled || !keyed) return;
+    const choice = keyedChoiceFor(event, choices);
     if (!choice) return;
     event.preventDefault();
-    stepper.toggleChoice(part.part_id, choice.choice_id);
+    pick(choice.choice_id);
   };
 
   return (
@@ -101,21 +128,18 @@ export function QuestionTray({
           >
             {part.prompt}
           </p>
-          {part.choices.length > 0 ? (
+          {choices.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
-              {part.choices.map((choice, choiceIndex) => {
+              {choices.map((choice, choiceIndex) => {
                 const selected =
                   stepper.choices[part.part_id] === choice.choice_id;
-                const keyed = part.choices.length <= MAX_KEYED_CHOICES;
                 return (
                   <button
                     key={choice.choice_id}
                     type="button"
                     disabled={disabled}
                     aria-pressed={selected}
-                    onClick={() =>
-                      stepper.toggleChoice(part.part_id, choice.choice_id)
-                    }
+                    onClick={() => pick(choice.choice_id)}
                     className={cn(
                       "flex max-w-full items-start gap-1.5 rounded-md border border-border bg-slate-elevation3 py-1 pl-1.5 pr-2.5 text-left text-xs transition-colors hover:border-muted-foreground",
                       "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-default disabled:opacity-60 disabled:hover:border-border",
@@ -127,7 +151,7 @@ export function QuestionTray({
                         aria-hidden
                         className="size-4 shrink-0 text-success"
                       />
-                    ) : keyed ? (
+                    ) : keyed && choiceIndex < MAX_KEYED_CHOICES ? (
                       <kbd
                         aria-hidden
                         className="h-4 min-w-4 shrink-0 rounded border border-border px-1 text-center font-mono text-[10px] leading-[14px] text-muted-foreground"
@@ -138,21 +162,27 @@ export function QuestionTray({
                     <span className="min-w-0 whitespace-pre-wrap break-words">
                       {choice.text}
                     </span>
+                    {choice.recommended ? (
+                      // The space keeps the tag a separate word in the button's accessible name.
+                      <span className="shrink-0 self-center rounded bg-badge-neutral px-1.5 text-[10px] font-medium leading-4 text-foreground">
+                        {" "}
+                        Recommended
+                      </span>
+                    ) : null}
                   </button>
                 );
               })}
             </div>
           ) : null}
-          {/* Typing does not clear a picked choice, so the invitation to answer instead of the
-              choices only shows while none is picked. */}
           {part.choices.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               Type your answer in the message box below.
             </p>
-          ) : stepper.choices[part.part_id] === undefined ? (
-            <p className="text-xs text-muted-foreground">
-              None of these fit? Type your own answer in the message box below.
-            </p>
+          ) : null}
+          {stepper.detailPrompt ? (
+            <span id={QUESTION_DETAIL_ID} className="sr-only">
+              {stepper.detailPrompt}
+            </span>
           ) : null}
         </div>
       ) : null}
@@ -208,8 +238,12 @@ export function QuestionTray({
               ref={advanceRef}
               size="sm"
               className="h-7"
-              disabled={disabled || stepper.answeredCount === 0}
-              title={lockReason ?? undefined}
+              disabled={
+                disabled ||
+                stepper.answeredCount === 0 ||
+                stepper.advanceBlocked
+              }
+              title={lockReason ?? advanceHint}
               onClick={onSend}
             >
               Send
@@ -219,7 +253,8 @@ export function QuestionTray({
               ref={advanceRef}
               size="sm"
               className="h-7"
-              disabled={disabled}
+              disabled={disabled || stepper.advanceBlocked}
+              title={advanceHint}
               onClick={() => stepper.goTo(stepper.index + 1)}
             >
               Next

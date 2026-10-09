@@ -599,7 +599,7 @@ def test_record_run_blocks_result_resets_stale_verified_terminal_proposal_latch(
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
-    """Stagnation/ceiling cancels mid-session must still set last_test_ok=False
+    """Ceiling cancels mid-session must still set last_test_ok=False
     so the failed-test nudge can fire — only a coincident total timeout softens
     to ``None`` for the unvalidated WIP rescue path."""
     ctx = _fresh_ctx_for_record()

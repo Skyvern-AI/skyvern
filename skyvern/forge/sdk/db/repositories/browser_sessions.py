@@ -32,7 +32,7 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.repositories.workflow_runs import lock_workflow_run_for_dispatch
-from skyvern.forge.sdk.db.utils import serialize_proxy_location
+from skyvern.forge.sdk.db.utils import browser_settings_receipt_replaceable, serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
     BrowserProfileUsage,
@@ -40,15 +40,18 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfileUsageWorkflow,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    EXTERNAL_CDP_BROWSER_VENDOR,
     FINAL_STATUSES,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     Extensions,
     PersistentBrowserSession,
+    PersistentBrowserSessionStatus,
     PersistentBrowserType,
     is_final_status,
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
@@ -62,10 +65,31 @@ _FINAL_STATUS_VALUES = tuple(status.value for status in FINAL_STATUSES)
 # owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
 # customer-facing session surfaces. Self-hosted routed rows set both columns together, and
 # rows created before routing existed set neither — both cases stay visible.
-_VISIBLE_TO_CUSTOMER = or_(
-    PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
-    PersistentBrowserSessionModel.browser_address.isnot(None),
+_VISIBLE_TO_CUSTOMER = and_(
+    or_(
+        PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
+        PersistentBrowserSessionModel.browser_address.isnot(None),
+    ),
+    PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR),
 )
+
+
+def clear_terminal_session_fields(row: PersistentBrowserSessionModel) -> None:
+    """A registration's upstream carries the caller's CDP credential, which must not outlive it."""
+    row.download_run_id = None
+    if row.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR:
+        row.upstream_cdp_url = None
+
+
+# Longer than a registration probe can run: a 10 s connect plus a detach bounded by BROWSER_CLOSE_TIMEOUT (180 s).
+_ABANDONED_RESERVATION_AGE = timedelta(minutes=5)
+
+
+async def _take_advisory_xact_lock(session: AsyncSession, key: str) -> None:
+    bind = session.get_bind()
+    if bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(key))))
 
 
 def _managed_browser_profile_query(
@@ -994,6 +1018,8 @@ class BrowserSessionsRepository(BaseRepository):
         attempt_number: int | None = None,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
+        browser_settings: BrowserSettings | None = None,
+        created_for_workflow_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -1052,6 +1078,9 @@ class BrowserSessionsRepository(BaseRepository):
                 bound_key=bound_key,
                 created_by=created_by,
             )
+            if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
+                browser_session.browser_settings = browser_settings.model_dump(mode="json")
+                browser_session.created_for_workflow_run_id = created_for_workflow_run_id
             session.add(browser_session)
             await session.flush()
             if (
@@ -1064,9 +1093,30 @@ class BrowserSessionsRepository(BaseRepository):
             # Creation and its association commit together, before any browser launch.
             if run is not None:
                 run.browser_session_id = browser_session.persistent_browser_session_id
+            # Validate after this flush (the proxy pin's UPDATE stamps modified_at) and before commit expires the row.
+            await session.flush()
+            created = PersistentBrowserSession.model_validate(browser_session)
             await session.commit()
-            await session.refresh(browser_session)
-            return PersistentBrowserSession.model_validate(browser_session)
+            return created
+
+    @db_operation("record_persistent_browser_session_browser_settings_receipt")
+    async def record_persistent_browser_session_browser_settings_receipt(
+        self, session_id: str, organization_id: str, receipt: BrowserSettingsReceipt
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(PersistentBrowserSessionModel)
+                .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
+                .where(PersistentBrowserSessionModel.organization_id == organization_id)
+                .where(
+                    browser_settings_receipt_replaceable(
+                        PersistentBrowserSessionModel.browser_settings_receipt, receipt
+                    )
+                )
+                .values(browser_settings_receipt=receipt.model_dump(mode="json"))
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     @db_operation("update_persistent_browser_session", expected_errors=(BrowserSessionAlreadyEndedError,))
     async def update_persistent_browser_session(
@@ -1162,6 +1212,8 @@ class BrowserSessionsRepository(BaseRepository):
                         values["status"] = resolve_terminal_status(status, persistent_browser_session.close_reason)
                     for field, value in values.items():
                         setattr(persistent_browser_session, field, value)
+                    if completed_at or status in FINAL_STATUSES:
+                        clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
             except StatementError as exc:
                 exc.hide_parameters = True
@@ -1261,7 +1313,6 @@ class BrowserSessionsRepository(BaseRepository):
                 # into the text that callers log. The type and statement still identify the fault.
                 exc.hide_parameters = True
                 raise
-            await session.refresh(updated)
 
     @db_operation("update_persistent_browser_session_compute_cost")
     async def update_persistent_browser_session_compute_cost(
@@ -1481,6 +1532,7 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         *,
         workflow_run_id: str | None = None,
+        close_reason: str | None = None,
     ) -> PersistentBrowserSession:
         """Close a specific persistent browser session."""
         # Cloud consumes this out-of-band context when close emits lifecycle telemetry.
@@ -1497,10 +1549,11 @@ class BrowserSessionsRepository(BaseRepository):
                 if persistent_browser_session.completed_at:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 persistent_browser_session.completed_at = naive_utc_now()
+                persistent_browser_session.close_reason = persistent_browser_session.close_reason or close_reason
                 persistent_browser_session.status = resolve_terminal_status(
                     "completed", persistent_browser_session.close_reason
                 )
-                persistent_browser_session.download_run_id = None
+                clear_terminal_session_fields(persistent_browser_session)
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -1536,10 +1589,66 @@ class BrowserSessionsRepository(BaseRepository):
             await session.commit()
 
     @db_operation("get_uncompleted_persistent_browser_sessions")
-    async def get_uncompleted_persistent_browser_sessions(self) -> list[PersistentBrowserSessionModel]:
+    async def get_uncompleted_persistent_browser_sessions(
+        self, vendor_held_by: str | None = None, organization_id: str | None = None
+    ) -> list[PersistentBrowserSessionModel]:
         """Get all browser sessions that have not been completed or deleted."""
-        async with self.Session() as session:
-            result = await session.execute(
-                select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+        query = select(PersistentBrowserSessionModel).filter_by(deleted_at=None).filter_by(completed_at=None)
+        if organization_id is not None:
+            query = query.filter_by(organization_id=organization_id)
+        if vendor_held_by is not None:
+            # The vendor-held shape (an upstream, no browser_address) restated so idx_pbs_vendor_held_lease serves this.
+            query = query.filter_by(browser_vendor=vendor_held_by, browser_address=None).filter(
+                PersistentBrowserSessionModel.upstream_cdp_url.isnot(None)
             )
+        async with self.Session() as session:
+            result = await session.execute(query)
             return result.scalars().all()
+
+    @db_operation("reserve_external_cdp_session")
+    async def reserve_external_cdp_session(
+        self, organization_id: str, timeout_minutes: int, *, max_open: int, max_attempts_per_minute: int
+    ) -> PersistentBrowserSession | None:
+        """Take a registration slot before its probe runs, or return None when the org is at either limit. The row
+        holds no address until the probe succeeds, and it stays behind as the record of the attempt."""
+        model = PersistentBrowserSessionModel
+        async with self.Session() as session:
+            await _take_advisory_xact_lock(session, f"external_cdp_registration:{organization_id}")
+            # A reservation still without an address past its probe's longest run was left by a cancelled or killed
+            # process; nothing else would ever close it, and open it would hold a slot forever.
+            await session.execute(
+                update(model)
+                .where(
+                    model.organization_id == organization_id,
+                    model.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
+                    model.upstream_cdp_url.is_(None),
+                    model.completed_at.is_(None),
+                    model.created_at < naive_utc_now() - _ABANDONED_RESERVATION_AGE,
+                )
+                .values(status=PersistentBrowserSessionStatus.failed.value, completed_at=naive_utc_now())
+            )
+            open_count, recent_count = (
+                await session.execute(
+                    select(
+                        func.count().filter(model.completed_at.is_(None)),
+                        func.count().filter(model.created_at >= naive_utc_now() - timedelta(minutes=1)),
+                    ).where(
+                        model.organization_id == organization_id,
+                        model.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
+                        model.deleted_at.is_(None),
+                    )
+                )
+            ).one()
+            if open_count >= max_open or recent_count >= max_attempts_per_minute:
+                return None
+            reserved = model(
+                organization_id=organization_id,
+                status=PersistentBrowserSessionStatus.created.value,
+                started_at=naive_utc_now(),
+                timeout_minutes=timeout_minutes,
+                browser_vendor=EXTERNAL_CDP_BROWSER_VENDOR,
+            )
+            session.add(reserved)
+            await session.commit()
+            await session.refresh(reserved)
+            return PersistentBrowserSession.model_validate(reserved)

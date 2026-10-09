@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import hmac
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, Literal
 
-from sqlalchemy import String, cast, func, select, update
+from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.constants import SCRUBBED_VALUE
-from skyvern.exceptions import WorkflowChangedSinceReview
+from skyvern.exceptions import GroupAccountsRanSinceReview, WorkflowChangedSinceReview
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunGroupItemModel,
     WorkflowRunGroupModel,
 )
+from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
     IN_FLIGHT_ITEM_STATES,
     SCRUBBED_SUBMISSION_KEY_PREFIX,
@@ -43,6 +44,50 @@ def scrubbed_submission_key(submission_key: str) -> str:
     return f"{SCRUBBED_SUBMISSION_KEY_PREFIX}{digest}"
 
 
+async def _latest_group_ids_by_item_key(
+    session: AsyncSession,
+    organization_id: str,
+    workflow_permanent_id: str,
+    submission_key_prefix: str,
+    item_keys: Sequence[str],
+) -> dict[str, str]:
+    ranked = (
+        select(
+            WorkflowRunGroupItemModel.item_key,
+            WorkflowRunGroupItemModel.workflow_run_group_id,
+            func.row_number()
+            .over(
+                partition_by=WorkflowRunGroupItemModel.item_key,
+                order_by=WorkflowRunGroupItemModel.created_at.desc(),
+            )
+            .label("recency"),
+        )
+        .join(
+            WorkflowRunGroupModel,
+            WorkflowRunGroupModel.workflow_run_group_id == WorkflowRunGroupItemModel.workflow_run_group_id,
+        )
+        .where(
+            WorkflowRunGroupModel.organization_id == organization_id,
+            WorkflowRunGroupModel.workflow_permanent_id == workflow_permanent_id,
+            WorkflowRunGroupModel.submission_key.startswith(submission_key_prefix, autoescape=True),
+            WorkflowRunGroupItemModel.item_key.in_(item_keys),
+        )
+        .subquery()
+    )
+    rows = await session.execute(select(ranked.c.item_key, ranked.c.workflow_run_group_id).where(ranked.c.recency == 1))
+    return {item_key: group_id for item_key, group_id in rows}
+
+
+async def _lock_repeat_check(session: AsyncSession, organization_id: str, workflow_permanent_id: str) -> None:
+    # The repeat check spans every version, so approvals serialize per workflow. An advisory lock rather than
+    # every version's row, which bulk writers lock in their own order and could deadlock against.
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    lock_key = f"workflow_run_group_repeat:{organization_id}:{workflow_permanent_id}"
+    await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(lock_key))))
+
+
 class WorkflowRunGroupsRepository(BaseRepository):
     # Item parameters are cleared on every transition out of pending/dispatching; the child run holds its own copy.
     # Every state transition first touches the group row, so transitions of one group serialize on its row lock.
@@ -55,7 +100,10 @@ class WorkflowRunGroupsRepository(BaseRepository):
         )
         return WorkflowRunGroupStatus(status) if status is not None else None
 
-    @db_operation("create_workflow_run_group", expected_errors=(IntegrityError, WorkflowChangedSinceReview))
+    @db_operation(
+        "create_workflow_run_group",
+        expected_errors=(IntegrityError, WorkflowChangedSinceReview, GroupAccountsRanSinceReview),
+    )
     async def create_group(
         self,
         *,
@@ -67,14 +115,41 @@ class WorkflowRunGroupsRepository(BaseRepository):
         input_fingerprint: str,
         items: Sequence[tuple[str, dict[str, Any]]],
         expected_workflow_modified_at: datetime | None = None,
+        expected_latest_groups: tuple[str, Mapping[str, str]] | None = None,
     ) -> WorkflowRunGroup:
         async with self.Session() as session:
+            if expected_latest_groups is not None:
+                await _lock_repeat_check(session, organization_id, workflow_permanent_id)
             # Locks the row in-place edits lock, so an edit either lands before this check or sees this group.
             modified_at = await session.scalar(
                 select(WorkflowModel.modified_at).where(WorkflowModel.workflow_id == workflow_id).with_for_update()
             )
             if expected_workflow_modified_at is not None and modified_at != expected_workflow_modified_at:
                 raise WorkflowChangedSinceReview(workflow_id)
+            if expected_latest_groups is not None:
+                # A new version is a new row, so the reviewed row's lock cannot see it; recheck it is still latest.
+                latest_version_id = await session.scalar(
+                    select(WorkflowModel.workflow_id)
+                    .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .where(
+                        or_(
+                            WorkflowModel.created_by.is_(None),
+                            WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR,
+                        )
+                    )
+                    .order_by(WorkflowModel.version.desc())
+                    .limit(1)
+                )
+                if latest_version_id != workflow_id:
+                    raise WorkflowChangedSinceReview(workflow_id)
+                key_prefix, expected = expected_latest_groups
+                latest = await _latest_group_ids_by_item_key(
+                    session, organization_id, workflow_permanent_id, key_prefix, [key for key, _ in items]
+                )
+                if changed := sorted(key for key, group_id in latest.items() if expected.get(key) != group_id):
+                    raise GroupAccountsRanSinceReview(changed)
             group = WorkflowRunGroupModel(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -127,6 +202,27 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 )
             ).first()
             return WorkflowRunGroup.model_validate(group) if group else None
+
+    @db_operation("get_latest_group_ids_by_item_key")
+    async def get_latest_group_ids_by_item_key(
+        self, organization_id: str, workflow_permanent_id: str, submission_key_prefix: str, item_keys: Sequence[str]
+    ) -> dict[str, str]:
+        async with self.Session() as session:
+            return await _latest_group_ids_by_item_key(
+                session, organization_id, workflow_permanent_id, submission_key_prefix, item_keys
+            )
+
+    @db_operation("get_workflow_run_groups_by_submission_keys")
+    async def get_groups_by_submission_keys(
+        self, organization_id: str, submission_keys: Sequence[str]
+    ) -> dict[str, WorkflowRunGroup]:
+        async with self.Session() as session:
+            groups = await session.scalars(
+                select(WorkflowRunGroupModel)
+                .where(WorkflowRunGroupModel.organization_id == organization_id)
+                .where(WorkflowRunGroupModel.submission_key.in_(submission_keys))
+            )
+            return {group.submission_key: WorkflowRunGroup.model_validate(group) for group in groups}
 
     @db_operation("scrub_workflow_run_group_keys")
     async def scrub_keys(self, organization_id: str, workflow_run_group_ids: Sequence[str]) -> int:

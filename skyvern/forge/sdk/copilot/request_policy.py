@@ -62,6 +62,7 @@ from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotSteerMessage,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
@@ -137,6 +138,9 @@ RawSecretSafetyFailureKind = Literal[
     "invalid_citation",
 ]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
+# The value-over-label sentence released labelled passwords on other model settings, so it is
+# served only where it was measured; add a key here only with a replay of the secret controls.
+_VALUE_OVER_LABEL_WORDING_LLM_KEYS = frozenset({"AZURE_OPENAI_GPT6_LUNA_WITH_OPENAI_FALLBACK"})
 _RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 
@@ -401,6 +405,7 @@ async def _screen_raw_secret_safety(
         prompt = prompt_engine.load_prompt(
             template=_RAW_SECRET_SAFETY_PROMPT_NAME,
             user_message=escape_code_fences(deterministic_safe_message),
+            read_value_not_label=getattr(handler, "llm_key", None) in _VALUE_OVER_LABEL_WORDING_LLM_KEYS,
         )
     except Exception:
         return _screen_unavailable("malformed_output")
@@ -496,9 +501,6 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
-# Matches any final reply containing these substrings, not just credential-blocking
-# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
-_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 RAW_SECRET_QUESTION = (
@@ -889,7 +891,13 @@ class QuestionResponseSiteURLSource:
     kind: Literal["question_response"] = field(default="question_response", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+@dataclass(frozen=True)
+class SteerMessageSiteURLSource:
+    steer_id: str
+    kind: Literal["steer_message"] = field(default="steer_message", init=False)
+
+
+SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
 
 
 @dataclass(frozen=True)
@@ -959,6 +967,9 @@ class RequestPolicy:
     origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
+    # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
+    # again drops it from live_page_admitted_urls, so the pick card reads it here.
+    carried_credential_urls: dict[str, str] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -1001,6 +1012,14 @@ class RequestPolicy:
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
+
+    def project_steer_message(self, steer: CopilotSteerMessage) -> None:
+        # A delivered steer is more of the current user turn, so exact credential citations read it too.
+        self.canonical_user_message = f"{self.canonical_user_message}\n{steer.text}".strip()
+        if steer.raw_secret_detected:
+            self.apply_raw_secret_redacted_draft()
+            return
+        _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
 
     @property
     def raw_secret_redacted_draft(self) -> bool:
@@ -1197,18 +1216,15 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
     )
 
 
-def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
-    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
-    # allow_missing_credentials_in_draft alone also covers the generic skip_test
-    # fallthrough with no credential involvement — then a text marker.
-    if isinstance(policy, RequestPolicy):
-        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
-            return policy.clarification_reason
-        if policy.credential_draft_deferred_explicitly:
-            return "credential_deferred_draft"
-    normalized = " ".join((final_text or "").lower().split())
-    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
-        return "assistant_directed"
+def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
+    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
+    # also covers the generic skip_test fallthrough with no credential involvement.
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+        return policy.clarification_reason
+    if policy.credential_draft_deferred_explicitly:
+        return "credential_deferred_draft"
     return None
 
 
@@ -4176,6 +4192,19 @@ def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> l
     return [_SiteURLText(text=text, source=source) for text in texts]
 
 
+def _steer_message_url_texts(steer: CopilotSteerMessage) -> list[_SiteURLText]:
+    if steer.raw_secret_detected or steer.delivered_at is None:
+        return []
+    return [_SiteURLText(text=steer.text, source=SteerMessageSiteURLSource(steer_id=steer.steer_id))]
+
+
+def _persisted_steer_message_url_texts(raw_steer: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        return _steer_message_url_texts(CopilotSteerMessage.model_validate(raw_steer))
+    except ValidationError:
+        return []
+
+
 def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
     try:
         interaction = QuestionInteraction.model_validate(raw_interaction)
@@ -4231,10 +4260,10 @@ def _ground_user_provided_sites(
     user_message: str,
     full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
 ) -> None:
-    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+    """Rebuild the URL facts the person supplied in USER rows, accepted question responses and delivered steers.
 
     Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
-    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    in the three structured user-authored text surfaces; prompts, choices, rendered history, and
     PRODUCT or AI prose never become credential-origin authority.
     """
     url_texts: list[_SiteURLText] = []
@@ -4252,6 +4281,8 @@ def _ground_user_provided_sites(
             continue
         for raw_interaction in message.narrative_payload.get("questionInteractions", []):
             url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+        for raw_steer in message.narrative_payload.get("steerMessages", []):
+            url_texts.extend(_persisted_steer_message_url_texts(raw_steer))
     if user_message:
         url_texts.append(
             _SiteURLText(
@@ -4289,6 +4320,7 @@ async def _seed_prior_approved_credentials(
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
         if record.credential_id in approved_ids and record.admitted_url:
             policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.carried_credential_urls.setdefault(record.credential_id, record.admitted_url)
             policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
@@ -4332,6 +4364,7 @@ async def _seed_proposed_credential(
     # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
     # still skips it rather than promoting a one-turn carry to durable approval.
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.

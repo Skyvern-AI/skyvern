@@ -39,6 +39,7 @@ class FakeExperimentationProvider(BaseExperimentationProvider):
         raise_error: bool = False,
         strict_error_flags: set[str] | None = None,
         unresolvable_flags: set[str] | None = None,
+        values: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
         self.flags = dict(flags or {})
@@ -49,6 +50,8 @@ class FakeExperimentationProvider(BaseExperimentationProvider):
         # carrying a condition only the PostHog API can resolve. Neither resolver raises; both
         # return None.
         self.unresolvable_flags = set(unresolvable_flags or ())
+        # Multivariate answers, read through get_value; a flag in strict_error_flags raises there too.
+        self.values = dict(values or {})
 
     async def _prepare_feature_flag_resolution(self, feature_name: str, *, cached: bool) -> None:
         # Where a provider does raise in production: the local provider reloads its flag snapshot
@@ -81,7 +84,10 @@ class FakeExperimentationProvider(BaseExperimentationProvider):
         return bool(await self._resolve_feature_flag(feature_name, distinct_id, properties))
 
     async def _get_value(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> str | None:
-        return None
+        self.calls.append((feature_name, distinct_id, properties))
+        if feature_name in self.strict_error_flags:
+            raise RuntimeError("provider unavailable")
+        return self.values.get(feature_name)
 
     async def _get_payload(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> Any:
         return None
@@ -119,6 +125,7 @@ async def resolve_arm(
     workflow_status: WorkflowStatus = WorkflowStatus.published,
     trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
     takes_default_engine: bool | None = True,
+    would_be_code: bool = False,
 ) -> Resolution:
     async def read_birth_timestamp(workflow_permanent_id: str, organization_id: str) -> datetime | None:
         if first_version_error is not None:
@@ -163,6 +170,7 @@ async def resolve_arm(
             trigger_type=trigger_type,
             ineligibility_reason=ineligibility_reason,
             takes_default_engine=takes_default_engine,
+            would_be_code=would_be_code,
         )
     logged = dict(mock_log.info.call_args.kwargs) if mock_log.info.call_args else {}
     return Resolution(log=logged, birth_reads=birth_reads, warnings=list(mock_log.warning.call_args_list))
