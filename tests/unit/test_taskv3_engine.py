@@ -49,6 +49,7 @@ from skyvern.forge.taskv3.engine import (
 )
 from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
+from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
@@ -2781,3 +2782,42 @@ async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limi
     assert all(row.endswith(f'into "#f{n}"') and json.dumps(chunk) in row for n, row in enumerate(rows, start=1))
     assert f"- {len(values) - len(rows)} more typed values not listed" in user_prompt
     assert sent <= limit
+
+
+@pytest.mark.parametrize("via_click", [False, True])
+@pytest.mark.asyncio
+async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
+    monkeypatch: pytest.MonkeyPatch, via_click: bool
+) -> None:
+    # The real navigate tool behind the engine: a task URL redirected to a missing page is the task's own
+    # target; a page a click reached earlier, navigated back to and found missing, is a revisit.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    task_url = "https://jobs.example.test/acme/42"
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        dead = url == task_url
+        page.url = "https://jobs.example.test/acme/expired" if dead and not via_click else url
+        return SimpleNamespace(status=404 if dead else 200, url=page.url)
+
+    async def _click(selector: str, timeout: int | None = None) -> None:
+        page.url = task_url
+
+    page.goto = _goto  # type: ignore[method-assign]
+    page.click = _click  # type: ignore[method-assign]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+    if via_click:
+        script[:0] = [[("click", {"selector": "#go"})], [("navigate", {"url": "https://example.test/other"})]]
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=_ScriptedCaller(script),
+            goal="Apply.",
+            task_target_urls=frozenset() if via_click else caller_known_published_urls(task_url, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")

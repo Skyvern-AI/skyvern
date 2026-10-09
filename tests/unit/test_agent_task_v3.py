@@ -6293,6 +6293,10 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
             "https://portal.example.test/start",
             "Open {{ mail_output }}, then check https://portal.example.test/faq.",
         ),
+        navigation_payload={
+            "posting": {"note": "Apply at https://jobs.example.test/acme/42/apply\nthanks"},
+            "links": ["see\thttps://jobs.example.test/b/7\tnow", 'Open "https://jobs.example.test/c/9" now'],
+        },
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
@@ -6303,7 +6307,64 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
     assert kwargs["caller_known_urls"] == frozenset(
         {"https://portal.example.test/start", "https://portal.example.test/faq"}
     )
+    # The log-only provenance set counts the RENDERED fields and every payload string, each read as
+    # itself so a newline, tab or quote next to a URL is not glued onto it.
+    assert kwargs["task_target_urls"] >= {
+        "https://mail.example.test/reset/9f2c8a1b4d6e",
+        "https://jobs.example.test/acme/42/apply",
+        "https://jobs.example.test/b/7",
+        "https://jobs.example.test/c/9",
+    }
     assert off_the_page in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
+
+
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.asyncio
+async def test_execute_task_v3_logs_a_dead_task_url_with_a_query_as_task_supplied(
+    monkeypatch: pytest.MonkeyPatch, initial: bool
+) -> None:
+    # agent.py's task-target set and requested start URL, through the real engine and navigate tool: a
+    # task URL whose query names the page is the task's own target, whether the in-loop navigate or the
+    # setup navigation (redirected first) is the one that 404s.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    task_url = "https://jobs.example.test/portal.action?page=apply&id=42"
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        page.url = url
+        return SimpleNamespace(status=404, url=url)
+
+    page.goto = _goto  # type: ignore[method-assign]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+
+    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
+        return await run_task_v3_agent_loop(
+            **{
+                **kwargs,
+                "page_provider": _fixed_page_provider(page),
+                "llm_caller": _ScriptedCaller(script),
+                "step": None,
+            }
+        )
+
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
+            url=task_url,
+            navigation_goal="Apply.",
+            navigation_status=404 if initial else None,
+            landed_url="https://jobs.example.test/expired" if initial else None,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            loop_body=_real_loop,
+            working_page=page,
+        )
+
+    event = "taskv3 loop initial navigation dead end" if initial else "taskv3 loop navigation dead end"
+    assert [entry["provenance"] for entry in logs if entry["event"] == event] == ["task_supplied"]
 
 
 @pytest.mark.asyncio

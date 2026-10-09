@@ -40,7 +40,7 @@ from skyvern.forge.taskv3.goal_check import (
     TrailEntry,
     UnlistedReask,
 )
-from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, sanitize_published_url
+from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
@@ -876,6 +876,14 @@ class _NavDeadEnd(NamedTuple):
 
     status: int
     url: str | None
+    requested_url: str | None = None
+    revisit: bool = False
+
+
+def _dead_end_provenance(urls: tuple[object, ...], task_target_urls: Collection[str], revisit: bool) -> dict[str, Any]:
+    task_supplied = any(normalized_url(url) in task_target_urls for url in urls)
+    provenance = "task_supplied" if task_supplied else "previously_visited" if revisit else "undecided"
+    return {"task_supplied": task_supplied, "previously_visited": revisit, "provenance": provenance}
 
 
 # Defined here (not tools.py) so the batch-dispatch poisoning check below can compare against it
@@ -3307,10 +3315,13 @@ async def run_agent_tool_loop(
     # Only ever named in the dead-end verdict's text, so a caller that has the status but not the URL
     # (or whose URL is unfit to print) still gets the same verdict, minus the place.
     initial_navigation_url: str | None = None,
+    initial_navigation_requested_url: str | None = None,
     # Every URL the CALLER gave this run, normalized by `caller_known_published_urls`. A guard verdict
     # publishes a landed URL's path only when it is one of these; every other path is elided to its
     # host. Computed once by the caller (it owns the task config) and never read by a tool.
     caller_known_urls: frozenset[str] = frozenset(),
+    # Log-only: the URLs the task's RENDERED inputs name, for a dead end's provenance fields. Never published.
+    task_target_urls: frozenset[str] = frozenset(),
     # Resolves the run's drop-check secret values when a verdict is about to name a page-supplied
     # element. Read at verdict time, not loop start: the registry grows as a run resolves credentials.
     label_secret_values: Callable[[], Collection[str]] | None = None,
@@ -3863,6 +3874,9 @@ async def run_agent_tool_loop(
             LOG.info(
                 "taskv3 loop initial navigation dead end",
                 http_status=initial_navigation_status,
+                **_dead_end_provenance(
+                    (initial_navigation_url, initial_navigation_requested_url), task_target_urls, False
+                ),
                 guard=NAV_DEAD_END_GUARD,
             )
             st.outcome = _guard_verdict(
@@ -5072,7 +5086,12 @@ async def run_agent_tool_loop(
                 # A hard 404/410 landing is a non-capability dead-end (a dead/removed posting). Remember
                 # it but do NOT break the batch: a later navigate in the same turn can land the run on a
                 # live page and clear it below. Applied once the batch settles (after this for-loop).
-                st.pending_nav_dead_end = _NavDeadEnd(dead_end_status, result_data.get("navigation_dead_end_url"))
+                st.pending_nav_dead_end = _NavDeadEnd(
+                    dead_end_status,
+                    result_data.get("navigation_dead_end_url"),
+                    args.get("url"),
+                    result_data.get("nav_revisit") is True,
+                )
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
@@ -5206,11 +5225,13 @@ async def run_agent_tool_loop(
         # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
         if st.outcome is None and st.pending_nav_dead_end is not None:
+            dead = st.pending_nav_dead_end
             LOG.info(
                 "taskv3 loop navigation dead end",
-                http_status=st.pending_nav_dead_end.status,
+                http_status=dead.status,
                 turn=st.turns,
                 guard=NAV_DEAD_END_GUARD,
+                **_dead_end_provenance((dead.url, dead.requested_url), task_target_urls, dead.revisit),
             )
             st.outcome = _guard_verdict(
                 NAV_DEAD_END_GUARD,

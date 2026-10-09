@@ -9,7 +9,7 @@ finish_reason is masked as it is written, because that row is what the next bloc
 from __future__ import annotations
 
 import re
-from typing import Collection
+from typing import Any, Collection, Iterator
 from urllib.parse import unquote, urlsplit
 
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -93,6 +93,14 @@ def sanitize_handoff_url(url: str | None) -> str | None:
 ELIDED_URL_PATH = "/…"
 
 
+def normalized_url(url: object) -> str | None:
+    """Provenance-only form: the published form plus the query, which on many sites names a different page."""
+    if not isinstance(url, str) or (base := _normalized_published_url(url)) is None:
+        return None
+    query = urlsplit(url.strip()).query
+    return f"{base}?{query}" if query else base
+
+
 def _normalized_published_url(url: str | None) -> str | None:
     """The one form both sides of the caller-known comparison are reduced to, so the comparison is
     between the same text and the same text. None when there is no host to name."""
@@ -100,16 +108,19 @@ def _normalized_published_url(url: str | None) -> str | None:
     return None if bare_parts is None else _joined(*bare_parts)
 
 
-def caller_known_published_urls(*sources: str | None) -> frozenset[str]:
+def caller_known_published_urls(*sources: str | None, keep_query: bool = False) -> frozenset[str]:
     """The normalized URLs a guard verdict may publish a PATH for: each source is either a URL the
     caller configured or caller-authored text whose URL literals are read out of it.
 
-    Sources are what the AUTHOR TYPED, never what a render produced. A composed goal carries a prior
+    For publishing, sources are what the AUTHOR TYPED, never what a render produced. A composed goal carries a prior
     block's handoff prose; a workflow block's own `url`/`navigation_goal` are Jinja templates rendered
     from a run context that holds prior blocks' outputs. Either way the URL came off a page rather than
     from the caller, so a block's sources are read before `format_potential_template_parameters`
     (`pin_caller_authored_block_urls`). The disclosed limit: a URL that reaches a block only through
     templating is not caller-known, and a verdict names its host alone.
+
+    `keep_query=True` builds the log-only dead-end provenance set instead: its sources ARE the rendered
+    task fields and payload strings, and the query is kept. That set is never published.
     """
     candidates: list[str | None] = []
     for source in sources:
@@ -117,7 +128,17 @@ def caller_known_published_urls(*sources: str | None) -> frozenset[str]:
             continue
         candidates.append(source)
         candidates.extend(urls_in_text(source))
-    return frozenset(normalized for normalized in map(_normalized_published_url, candidates) if normalized)
+    normalize = normalized_url if keep_query else _normalized_published_url
+    return frozenset(normalized for normalized in map(normalize, candidates) if normalized)
+
+
+def string_leaves(value: Any) -> Iterator[str]:
+    """Each string in a parsed JSON value, read as itself: scanning a dump would glue escapes onto URLs."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, (dict, list)):
+        for item in value.values() if isinstance(value, dict) else value:
+            yield from string_leaves(item)
 
 
 def sanitize_published_url(url: str | None, caller_known_urls: Collection[str] = frozenset()) -> str | None:
