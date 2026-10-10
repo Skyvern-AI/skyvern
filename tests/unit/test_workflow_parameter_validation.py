@@ -175,6 +175,54 @@ class TestSanitizeWorkflowYamlWithReferences:
         assert result["workflow_definition"]["blocks"][0]["label"] == "my_block"
         assert "{{ my_block_output }}" in result["workflow_definition"]["blocks"][1]["navigation_goal"]
 
+    def test_sanitize_updates_mid_expression_output_references(self) -> None:
+        """Test that output references not at the head of an expression are updated (issue #7559)."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {"label": "my-block", "block_type": "task"},
+                    {
+                        "label": "loop_block",
+                        "block_type": "for_loop",
+                        "continue_on_failure": False,
+                        "loop_blocks": [
+                            {
+                                "label": "inner_block",
+                                "block_type": "task",
+                                "complete_criterion": "{{ current_index < my-block_output }}",
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        inner = result["workflow_definition"]["blocks"][1]["loop_blocks"][0]
+        assert inner["complete_criterion"] == "{{ current_index < my_block_output }}"
+
+    def test_sanitize_updates_statement_output_references(self) -> None:
+        """Test that output references inside {% %} statements are updated (issue #7559)."""
+        workflow_yaml = {
+            "title": "Test Workflow",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {"label": "my-block", "block_type": "task"},
+                    {
+                        "label": "second_block",
+                        "block_type": "task",
+                        "navigation_goal": "{% if my-block_output %}done{% endif %}",
+                    },
+                ],
+            },
+        }
+        result = sanitize_workflow_yaml_with_references(workflow_yaml)
+        assert (
+            result["workflow_definition"]["blocks"][1]["navigation_goal"] == "{% if my_block_output %}done{% endif %}"
+        )
+
     def test_sanitize_updates_next_block_label(self) -> None:
         """Test that next_block_label is updated when label is sanitized."""
         workflow_yaml = {
