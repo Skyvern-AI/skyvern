@@ -1,6 +1,6 @@
 """Tests for compute_stable_selector, compute_selector_options, and _looks_dynamic."""
 
-from skyvern.utils.css_selector import _looks_dynamic, compute_selector_options, compute_stable_selector
+from skyvern.utils.css_selector import _css_escape, _looks_dynamic, compute_selector_options, compute_stable_selector
 
 
 class TestLooksDynamic:
@@ -182,3 +182,30 @@ class TestComputeSelectorOptions:
         # Name should be #1 (ranked above ID)
         assert options[0][0] == 'input[name="credentials.passcode"]'
         assert options[0][1] == "form element name"
+
+
+class TestCssEscape:
+    """Tests for _css_escape, which builds the #id selector."""
+
+    def test_plain_id_unchanged(self):
+        assert _css_escape("submit-btn_2") == "submit-btn_2"
+
+    def test_special_characters_are_backslash_escaped(self):
+        assert _css_escape("form:email.0") == r"form\:email\.0"
+
+    def test_leading_digit_is_hex_escaped(self):
+        assert _css_escape("1st-name") == r"\31 st-name"
+
+    def test_leading_hyphen_then_digit_is_hex_escaped(self):
+        assert _css_escape("-1a") == r"-\31 a"
+
+    def test_lone_hyphen_is_escaped(self):
+        assert _css_escape("-") == r"\-"
+
+    def test_inner_whitespace_is_hex_escaped(self):
+        assert _css_escape("first name") == r"first\20 name"
+
+    def test_selector_uses_escaped_leading_digit(self):
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "3rd-panel"}}
+        options = compute_selector_options(elem)
+        assert options[0][0] == r"#\33 rd-panel"
