@@ -14,13 +14,15 @@ class Constants:
 _JINJA_TAG_CLOSERS = {"{%": "%}", "{#": "#}"}
 
 
-def _jinja_tag_spans(code: str) -> list[tuple[int, int]]:
-    """Leftmost non-overlapping `{% ... %}` / `{# ... #}` spans, found in one forward pass.
+def _jinja_tag_spans(code: str, tag_closers: dict[str, str] | None = None) -> list[tuple[int, int]]:
+    """Leftmost non-overlapping tag spans for the given openers (default: `{% ... %}` / `{# ... #}`), found in one forward pass.
 
     Once an opener has no closer after it, no later opener of that kind can close either, so that kind
     is dropped; a regex search would instead rescan to the end from every later opener (quadratic)."""
+    if tag_closers is None:
+        tag_closers = _JINJA_TAG_CLOSERS
     spans: list[tuple[int, int]] = []
-    next_opener = {opener: code.find(opener) for opener in _JINJA_TAG_CLOSERS}
+    next_opener = {opener: code.find(opener) for opener in tag_closers}
     position = 0
     while True:
         for opener, index in list(next_opener.items()):
@@ -31,18 +33,18 @@ def _jinja_tag_spans(code: str) -> list[tuple[int, int]]:
             return spans
         opener = min(open_kinds, key=open_kinds.__getitem__)
         start = open_kinds[opener]
-        end = code.find(_JINJA_TAG_CLOSERS[opener], start + len(opener))
+        end = code.find(tag_closers[opener], start + len(opener))
         if end == -1:
             del next_opener[opener]
             continue
-        position = end + len(_JINJA_TAG_CLOSERS[opener])
+        position = end + len(tag_closers[opener])
         spans.append((start, position))
 
 
-def _replace_jinja_tags(code: str, replacement: Callable[[str], str]) -> str:
+def _replace_jinja_tags(code: str, replacement: Callable[[str], str], tag_closers: dict[str, str] | None = None) -> str:
     parts: list[str] = []
     cursor = 0
-    for start, end in _jinja_tag_spans(code):
+    for start, end in _jinja_tag_spans(code, tag_closers):
         parts.append(code[cursor:start])
         parts.append(replacement(code[start:end]))
         cursor = end
@@ -63,7 +65,10 @@ def strip_jinja_control_blocks(code: str) -> str:
 def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     """Replaces jinja-style references in a string.
 
-    Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}}
+    Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}, {{oldKey[0]}},
+    references anywhere inside a {{ ... }} expression ({{ index < oldKey }}), and references
+    in {% ... %} statements ({% if count > oldKey %}). Attribute access on another root
+    (data.oldKey), quoted strings ('oldKey'), and {# ... #} comments are left untouched.
 
     Args:
         text: The text to search in
@@ -73,13 +78,21 @@ def replace_jinja_reference(text: str, old_key: str, new_key: str) -> str:
     Returns:
         The text with references replaced
     """
-    # Match {{oldKey}} or {{oldKey.something}} or {{oldKey | filter}} or {{oldKey[0]}} etc.
-    # Use negative lookahead to ensure key is not followed by identifier characters,
-    # which prevents matching {{keyOther}} when searching for {{key}}
-    # Capture whitespace after {{ to preserve formatting (e.g., "{{ key }}" stays "{{ newKey }}")
-    escaped_old_key = re.escape(old_key)
-    pattern = rf"\{{\{{(\s*){escaped_old_key}(?![a-zA-Z0-9_])"
-    return re.sub(pattern, rf"{{{{\1{new_key}", text)
+    if not old_key or old_key == new_key or ("{{" not in text and "{%" not in text):
+        return text
+    # Inside a tag, match quoted strings first so a literal like {{ 'oldKey' }} is never
+    # rewritten; the key itself must not be preceded by an identifier character or `.`
+    # (attribute access) and not be followed by identifier characters, which prevents
+    # matching {{keyOther}} when searching for {{key}}. Renamed keys are not guaranteed
+    # to be valid identifiers (e.g. max-attempts), so the key is matched literally.
+    pattern = re.compile(
+        r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""" + rf"|(?<![a-zA-Z0-9_.]){re.escape(old_key)}(?![a-zA-Z0-9_])"
+    )
+
+    def _rewrite_tag(tag: str) -> str:
+        return pattern.sub(lambda match: new_key if match.group(0) == old_key else match.group(0), tag)
+
+    return _replace_jinja_tags(text, _rewrite_tag, tag_closers={"{{": "}}", "{%": "%}"})
 
 
 def get_missing_variables(template_source: str, template_data: dict) -> set[str]:
