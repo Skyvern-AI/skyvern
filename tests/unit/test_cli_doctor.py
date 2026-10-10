@@ -119,6 +119,34 @@ def test_llm_config_check_flags_incomplete_openai_compatible_provider(
     assert "OPENAI_COMPATIBLE_API_BASE" in result.detail
 
 
+def test_llm_config_check_recognizes_cheaper_inference_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_KEY", "CHEAPER_INFERENCE_GPT5_4_MINI")
+    monkeypatch.setenv("ENABLE_CHEAPER_INFERENCE", "true")
+    monkeypatch.setenv("CHEAPER_INFERENCE_API_KEY", "test-key")
+
+    result = doctor._check_llm_config()
+
+    assert result.status == "ok"
+    assert "CHEAPER_INFERENCE" in result.detail
+
+
+def test_llm_config_check_flags_missing_cheaper_inference_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_workspace(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_KEY", "CHEAPER_INFERENCE_GPT5_4_MINI")
+    monkeypatch.setenv("ENABLE_CHEAPER_INFERENCE", "true")
+    monkeypatch.delenv("CHEAPER_INFERENCE_API_KEY", raising=False)
+
+    result = doctor._check_llm_config()
+
+    assert result.status == "error"
+    assert "CHEAPER_INFERENCE_API_KEY" in result.detail
+
+
 def test_credential_placeholder_set_is_stable() -> None:
     assert CREDENTIAL_PLACEHOLDERS == ("", "PLACEHOLDER", "YOUR_API_KEY")
 
