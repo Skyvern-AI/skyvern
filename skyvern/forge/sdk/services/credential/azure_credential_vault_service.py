@@ -69,15 +69,29 @@ class AzureCredentialVaultService(CredentialVaultService):
             credential=data.credential,
         )
 
-        credential = await self._create_db_credential(
-            organization_id=organization_id,
-            data=data,
-            item_id=item_id,
-            vault_type=CredentialVaultType.AZURE_VAULT,
-            created_by=created_by,
-        )
-
-        return credential
+        # The secret exists before the row that would point at it, so a failed or cancelled DB write
+        # must reclaim it here; nothing else knows the item_id.
+        try:
+            return await self._create_db_credential(
+                organization_id=organization_id,
+                data=data,
+                item_id=item_id,
+                vault_type=CredentialVaultType.AZURE_VAULT,
+                created_by=created_by,
+            )
+        except BaseException:
+            LOG.warning(
+                "DB create failed; reclaiming the new Azure Key Vault secret",
+                organization_id=organization_id,
+                new_item_id=item_id,
+            )
+            await self._reclaim_orphaned_vault_item(
+                delete=lambda: self._client.delete_secret(secret_name=item_id, vault_name=self._vault_name),
+                organization_id=organization_id,
+                item_id=item_id,
+                vault_type=CredentialVaultType.AZURE_VAULT,
+            )
+            raise
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
         credential_data = data.credential
