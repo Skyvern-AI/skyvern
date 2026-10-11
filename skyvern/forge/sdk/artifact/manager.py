@@ -296,13 +296,12 @@ class ArtifactManager:
             prompt = data.decode("utf-8")
             context = skyvern_context.current()
             if context and context.workflow_run_id:
-                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
-                    context.workflow_run_id
-                )
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
                 prompt = workflow_run_context.mask_secrets_in_data(prompt)
 
-            if context and context.sensitive_values:
-                for sensitive in sorted(context.sensitive_values, key=len, reverse=True):
+            if context and (context.sensitive_values or context.runtime_secret_values):
+                sensitive_values = context.sensitive_values | context.runtime_secret_values
+                for sensitive in sorted(sensitive_values, key=len, reverse=True):
                     if sensitive:
                         prompt = prompt.replace(sensitive, "*****")
 
@@ -1024,6 +1023,9 @@ class ArtifactManager:
         for artifact_data in request.artifacts:
             if artifact_data.data is not None:
                 artifact_type = ArtifactType(artifact_data.artifact_model.artifact_type)
+                # Mask prompts at this chokepoint so bulk callers that skip prepare_llm_artifact
+                # (for example the TextPromptBlock workflow run block path) cannot persist raw text.
+                artifact_data.data = self._mask_llm_prompt_artifact_data(artifact_data.data, artifact_type)
                 artifact_data.data = _maybe_redact_artifact_data(
                     artifact_type,
                     artifact_data.data,
