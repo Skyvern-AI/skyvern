@@ -58,8 +58,8 @@ function WorkflowFolderCell({
           )}
           <ChevronDownIcon
             className={cn(
-              "ml-auto h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/folder:opacity-100 group-hover/row:opacity-100 group-focus-visible/folder:opacity-100",
-              open && "opacity-100",
+              "ml-auto hidden h-3.5 w-3.5 shrink-0 text-muted-foreground group-hover/row:block group-focus-visible/folder:block",
+              open && "block",
             )}
           />
         </button>
