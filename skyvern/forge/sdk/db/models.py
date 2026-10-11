@@ -1678,6 +1678,10 @@ class PersistentBrowserSessionModel(Base):
                 "bound_workflow_permanent_id IS NOT NULL AND deleted_at IS NULL "
                 "AND status IN ('created', 'running', 'retry')"
             ),
+            sqlite_where=text(
+                "bound_workflow_permanent_id IS NOT NULL AND deleted_at IS NULL "
+                "AND status IN ('created', 'running', 'retry')"
+            ),
         ),
     )
 
@@ -2433,6 +2437,7 @@ class UploadedFileModel(Base):
             "storage_uri",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
         ),
         Index(
             "ix_uploaded_files_expires_at_live",
