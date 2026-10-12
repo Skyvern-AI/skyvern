@@ -1,0 +1,220 @@
+---
+title: Build in Studio
+description: Build and edit Skyvern agents in Studio, with Copilot or by hand. Add and configure blocks, define inputs, pick an engine, save versions, and organize agents in folders and templates.
+keywords:
+  - Studio
+  - Copilot
+  - editor
+  - blocks
+  - inputs
+  - parameters
+  - YAML
+  - engine
+  - version history
+  - template
+  - folders
+  - import
+  - export
+---
+
+Studio is where you open an agent to build it, change it, run it and watch it. You can let Copilot do the building, edit blocks yourself, or mix the two on the same agent.
+
+To open Studio, click an agent on **Agents** → **All Agents**, or create one with **New Agent** in the sidebar. The address is `/agents/<agent id>/studio`.
+
+<img src="/images/cloud/cloud-studio-overview.png" alt="Studio with the Copilot, Browser and Editor panes side by side, the pane toggles in the top bar, and Inputs and Run on the right" />
+
+## The layout
+
+Studio has four panes. Toggle each one from the center of the top bar. You can open several side by side.
+
+| Pane | What it does |
+|---|---|
+| **Copilot** | Chat that builds and edits the agent for you |
+| **Editor** | The agent's blocks as a flow you edit by hand, in **Visual** or **YAML** view |
+| **Browser** | The browser the agent drives: **Live** while something runs, then **Recording** and **Screenshots** |
+| **Run** | One run's **Timeline**, **Inputs** and **Outputs**. With no run open, the control reads **Past Runs** and lists earlier runs. |
+
+The right side of the top bar holds the agent's controls:
+
+| Control | What it does |
+|---|---|
+| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. |
+| **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
+| **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |
+| **Inputs** | The values the agent takes on each run. See [Inputs](#inputs). |
+| **Run** | Opens the run form. Shows **Stop** while a run is in progress and **Re-run** after one ends. See [Runs and schedules](/cloud/runs). |
+
+Click the agent's title at the top left to rename it. **Take a tour** (or <kbd>Shift</kbd>+<kbd>?</kbd>) walks you through Studio in the app.
+
+## Build with Copilot
+
+Type what you want in the Copilot message box ("Ask Copilot to build or change your workflow…") and send. Copilot plans the steps, opens the site in the **Browser** pane, adds or edits blocks and runs them to test them.
+
+Every change Copilot makes arrives as a **Proposed changes** card:
+
+- The card lists each block **Added**, **Changed** or **Removed**, and shows **Tested**, **Untested** or **Test failed**.
+- **Accept** applies the changes and saves them to the agent.
+- **Review** compares the proposed agent with the previous version before you decide.
+- **Reject** discards them and puts the agent back to the previous version.
+- **Always accept** (the arrow next to **Accept**) applies Copilot's future changes in this chat without asking. Turn it off with **Turn off** next to **Auto-accepting**.
+- **Test end-to-end** runs all the blocks together on the real site.
+
+<Warning>
+**Test end-to-end** performs real actions. It can submit forms, place orders or send messages.
+</Warning>
+
+Other things you can do in the Copilot pane:
+
+- **Attach files** with the **+** button in the message box, or attach a PDF procedure (an SOP) for Copilot to turn into blocks.
+- **Answer questions.** When Copilot asks one, pick an answer or type your own.
+- **Give it a login.** When a site needs an account, the **Copilot needs to sign in** card lets you pick from **Saved logins**. See [Credentials and 2FA](/credentials).
+- **Start over or go back.** **New chat** starts a fresh conversation. **History** reopens earlier chats on this agent.
+
+If a run fails, the Run pane offers **Fix with Copilot**, which sends the failure to Copilot to diagnose and propose a fix.
+
+<img src="/images/cloud/cloud-copilot-proposal.png" alt="Copilot reply with the extracted posts and a Proposed changes card marked Tested, with Accept, its Always accept option, Review and Reject" />
+
+## Edit blocks by hand
+
+Open the **Editor** pane. Blocks run top to bottom in the order shown.
+
+### Add a block
+
+<Steps>
+  <Step title="Open the add menu">
+    Hover over the **+** on the line between two blocks (or under **Start** on a new agent).
+  </Step>
+  <Step title="Choose Add Block">
+    The menu offers **Add Block**, **Record Task** (do the steps yourself in a live browser and turn them into blocks) and **Upload SOP** (generate blocks from a PDF procedure).
+  </Step>
+  <Step title="Pick a block">
+    The block library lists every block. Type in **Search blocks...** to filter, then click a block to insert it.
+  </Step>
+</Steps>
+
+<img src="/images/cloud/cloud-studio-add-block.png" alt="Editor with the Block Library open, showing its search box and block types" />
+
+The library holds browser blocks (such as **Browser Task**, **Extraction** and **Login**), data blocks (such as **Text Prompt**, **File Parser** and **Code**), control flow (**Loop**, **Conditional**, **Wait**, **Terminate**) and integrations (**Send Email**, **HTTP Request**, **Google Sheets Read** and **Write**, and others). The [blocks reference](/reference/blocks) documents every block and its fields.
+
+### Configure a block
+
+Click a block to open its settings in the block config sidebar. Every block has a **Label**. The label also names the block's output, which later blocks read as `{{ <label>_output }}`.
+
+Click **Start** at the top of the flow to open **Agent Settings**, the settings that apply to the whole agent. They include **Webhook Callback URL**, **Proxy Location**, **Run With**, **Prevent Overlapping Runs** and **Max Run Time (minutes)**. The run form can override some of them per run.
+
+<img src="/images/cloud/cloud-studio-block-config.png" alt="A Browser Task block with URL, Prompt, the Engine selector and Advanced Settings" />
+
+### Block actions
+
+- **Run this block** (the play button on a block) runs just that block in the Browser pane, which is useful for testing one step.
+- The **⋯** menu on a block (**Block Actions**) duplicates or deletes it.
+- **Search blocks** (magnifier in the Editor pane header) jumps to a block by name in a long flow.
+
+### Visual and YAML
+
+The Editor pane header switches between **Visual** (the flow) and **YAML** (the full agent definition as text). Edits in either view apply to the same agent. YAML is the quickest way to copy an agent's structure or make many edits at once.
+
+### Choose an engine per block
+
+Browser blocks have an **Engine** setting:
+
+| Option | Label in the app |
+|---|---|
+| **Default** | Runs on Skyvern 3.0 in agents created since October 1, 2026 |
+| **Skyvern 3.0** | Recommended |
+| **Skyvern 1.0** | Legacy |
+| **OpenAI CUA** | Enterprise |
+| **Anthropic CUA** | Enterprise |
+
+Leave **Default** unless a block needs a specific engine. [Concepts](/concepts#engines) explains the differences.
+
+## Inputs
+
+Inputs are the values that change from run to run: a search term, an account number, a file. Define them once and reference them in any block.
+
+<Steps>
+  <Step title="Open Inputs">
+    Click **Inputs** in the top bar. A badge on the button shows how many the agent has.
+  </Step>
+  <Step title="Add an input">
+    Click **Add Input**. Enter a **Key** (the name you reference it by), an optional **Description**, and a **Value Type**.
+  </Step>
+  <Step title="Set a default (optional)">
+    Turn on **Use Default Value** to prefill the run form and schedules.
+  </Step>
+  <Step title="Save">
+    Click **Save**, then save the agent.
+  </Step>
+</Steps>
+
+<img src="/images/cloud/cloud-studio-inputs.png" alt="The Inputs panel with the Add Input form showing Key, Description, Value Type and Use Default Value" />
+
+Value types are **string**, **credential**, **float**, **integer**, **boolean**, **file** and **JSON**.
+
+Reference an input in any block field with double curly braces:
+
+```text
+Search for {{ search_term }} and open the first result.
+```
+
+### Credential inputs
+
+Choose the **credential** value type to pass a login or secret without putting it in the agent.
+
+1. Pick a **Credential Type**: **Password**, **Secret** or **Credit Card**.
+2. Pick a **Source**: **Skyvern** (credentials saved in the app), **Bitwarden**, **1Password**, **Azure Key Vault**, or **Custom Credential Service** if your organization set one up. Not every source supports every type.
+3. Choose the credential, or fill in the vault details the source asks for.
+
+Skyvern fetches the value at run time and masks it in logs and outputs. [Credentials and 2FA](/credentials) covers saving credentials and connecting a vault.
+
+### Values every agent has
+
+These names are built in, so you can't use them as input keys:
+
+| Name | Value |
+|---|---|
+| `current_date` | Today's date in UTC (YYYY-MM-DD) |
+| `workflow_run_id` | ID of the current run |
+| `workflow_id`, `workflow_permanent_id` | The agent's IDs |
+| `workflow_title` | The agent's title |
+| `workflow_run_outputs` | JSON of every block output so far |
+| `workflow_run_summary` | Merged summary of every block output so far |
+| `current_value`, `current_item`, `current_index` | Inside a **Loop** block only: the current item and its zero-based index |
+
+## Save and versions
+
+Copilot's changes are saved when you accept them. Your own edits in the Editor or YAML are saved when you click the save icon. A **Saving Changes** dialog lists what will change before it saves.
+
+Each save creates a new version. Open **More actions** → **Version history** to see them in the **Agent History** panel. Select two versions and click **Visual Compare** to see what changed.
+
+## Save as Template
+
+**More actions** → **Save as Template** adds the agent to your organization's templates. Anyone in your organization can then start a copy from **All Agents** → **Create** → **From Template**. Template agents show a bookmark icon in the agents list. **Remove from Templates** undoes it.
+
+## Organize agents
+
+**Agents** → **All Agents** lists every agent in your organization, with **Title**, **Folder**, **Created At** and **Actions** columns (some organizations also see **Created By**).
+
+<img src="/images/cloud/cloud-agents-list.png" alt="All Agents page with Folders, the search box, Import and Create buttons, and a row menu open with Open in editor, Run, Move to folder, Duplicate Agent, Save as template, Export and Delete" />
+
+- **Create** → **Blank Agent** or **From Template** starts a new agent. **Or start from a description →** goes to Home and Copilot.
+- **Folders**: click **+ New folder** to create one, and click a folder card to show only its agents. Each agent's row shows its folder.
+- **Search by title or input...** filters the list.
+- Row buttons open the agent in Studio (**Open in Editor**) or start a run (**Create New Run**).
+
+The **⋯** menu on a row holds:
+
+| Action | What it does |
+|---|---|
+| **Duplicate Agent** | Creates a copy of the agent |
+| **Save as Template** / **Remove from Templates** | Adds or removes the agent from your organization's templates |
+| **Export as...** | Downloads the agent as YAML or JSON |
+| **Delete Agent** | Deletes the agent after you confirm |
+
+**Import** uploads one or more agents from `.yaml`, `.yml`, `.json` or `.zip` files. A `.pdf` procedure (SOP) is turned into a new agent.
+
+## Next
+
+- [Runs and schedules](/cloud/runs): run settings, live control, run history and schedules.
+- [Blocks reference](/reference/blocks): every block and its fields.
+- [Credentials and 2FA](/credentials): logins, secrets and 2FA codes for your agents.
