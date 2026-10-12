@@ -1688,7 +1688,14 @@ class LLMAPIHandlerFactory:
 
         # Models that use thinking_level (e.g. Gemini 3 Pro/Flash) don't support budget_tokens.
         # Their reasoning is already bounded by the thinking_level set in their config, so skip.
-        if "thinking_level" in parameters:
+        # A router whose primary is not Gemini keeps thinking_level on the Gemini deployment, not in `parameters`,
+        # and the request-level budget would reach that deployment and be rejected by litellm.
+        if "thinking_level" in parameters or (
+            isinstance(llm_config, LLMRouterConfig)
+            and any(
+                "thinking_level" in deployment.litellm_params for deployment in _dispatchable_deployments(llm_config)
+            )
+        ):
             return
 
         if "thinking" in parameters and isinstance(parameters["thinking"], dict):
