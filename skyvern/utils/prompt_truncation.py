@@ -84,6 +84,9 @@ def truncate_previous_extracted_information(
     rendered_before = value if isinstance(value, str) else json.dumps(value, default=str)
     before_tokens = count_tokens(rendered_before)
 
+    if before_tokens <= max_tokens:
+        return value
+
     if isinstance(value, str):
         result: Any = _crop_string(value, max_tokens)
     elif isinstance(value, list):
