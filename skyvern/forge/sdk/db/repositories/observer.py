@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import structlog
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -22,11 +23,12 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
+    capped_jsonb_write,
     convert_to_task_v2,
     convert_to_workflow_run_block,
     downloaded_file_count_from_output,
+    prefer_capped_columns,
     serialize_proxy_location,
-    truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -420,11 +422,10 @@ class ObserverRepository(BaseRepository):
         ai_fallback_triggered: bool | None = None,
         attempt_number: int | None = None,
     ) -> WorkflowRunBlock:
-        if output is not None:
-            output = truncate_oversized_jsonb_value(
-                output,
-                context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
-            )
+        output_write = capped_jsonb_write(
+            output,
+            context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
+        )
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
                 workflow_run_id=workflow_run_id,
@@ -434,7 +435,8 @@ class ObserverRepository(BaseRepository):
                 label=label,
                 block_type=block_type,
                 status=status,
-                output=output,
+                output=output_write.value,
+                capped_output=output_write.capped_value,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
                 current_value=current_value,
@@ -511,14 +513,13 @@ class ObserverRepository(BaseRepository):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
-        # Read before truncation: truncate_oversized_jsonb_value strips downloaded_files
-        # from oversized payloads, which would zero out an otherwise-real count.
+        # Read before truncation: the jsonb storage guard strips downloaded_files from
+        # oversized payloads, which would zero out an otherwise-real count.
         derived_downloaded_file_count = downloaded_file_count_from_output(output)
-        if output is not None:
-            output = truncate_oversized_jsonb_value(
-                output,
-                context={"workflow_run_block_id": workflow_run_block_id},
-            )
+        output_write = capped_jsonb_write(
+            output,
+            context={"workflow_run_block_id": workflow_run_block_id},
+        )
         async with self.Session() as session:
             workflow_run_block = (
                 await session.scalars(
@@ -531,7 +532,8 @@ class ObserverRepository(BaseRepository):
                 if status:
                     workflow_run_block.status = status
                 if output:
-                    workflow_run_block.output = output
+                    workflow_run_block.output = output_write.value
+                    workflow_run_block.capped_output = output_write.capped_value
                 if task_id:
                     workflow_run_block.task_id = task_id
                 if failure_reason:
@@ -754,16 +756,27 @@ class ObserverRepository(BaseRepository):
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
+        prefer_capped: bool = False,
     ) -> list[WorkflowRunBlock]:
         async with self.Session() as session:
-            workflow_run_blocks = (
-                await session.scalars(
+            if prefer_capped:
+                table = WorkflowRunBlockModel.__table__
+                capped = (
+                    select(*prefer_capped_columns(table, raw="output", capped="capped_output"))
+                    .where(table.c.workflow_run_id == workflow_run_id)
+                    .where(table.c.organization_id == organization_id)
+                    .subquery()
+                )
+                capped_block = aliased(WorkflowRunBlockModel, capped, adapt_on_names=True)
+                query = select(capped_block).order_by(capped_block.created_at.desc())
+            else:
+                query = (
                     select(WorkflowRunBlockModel)
                     .filter_by(workflow_run_id=workflow_run_id)
                     .filter_by(organization_id=organization_id)
                     .order_by(WorkflowRunBlockModel.created_at.desc())
                 )
-            ).all()
+            workflow_run_blocks = (await session.scalars(query)).all()
             if self._task_reader is None:
                 raise RuntimeError("task_reader dependency not set")
             tasks = await self._task_reader.get_tasks_by_workflow_run_id(workflow_run_id)

@@ -605,7 +605,17 @@ class SkyvernPage(Page):
         intention: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """Move the mouse over the element identified by `selector`."""
+        """Move the mouse over the element identified by `selector`.
+
+        Args:
+            selector: CSS selector for the element.
+            timeout: Maximum time to wait for the element, in milliseconds.
+            hold_seconds: How long to keep the mouse over the element, in seconds.
+            intention: Description of why you are hovering, recorded with the action.
+
+        Returns:
+            The selector that was hovered.
+        """
         if not selector:
             raise ValueError("Hover requires a selector.")
 
@@ -796,6 +806,23 @@ class SkyvernPage(Page):
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
+        """Enter text into an input using a selector, AI, or both. Behaves the same as `fill`.
+
+        With a selector, the value is set in one step (Playwright's `fill`), not typed key by key. For inputs
+        that need real key events, use `fill_autocomplete`, `keypress`, or `press_sequentially` on a Playwright locator.
+
+        Args:
+            selector: CSS selector for the input.
+            value: The text to enter.
+            ai: AI behavior mode. Defaults to "fallback", which tries the selector first, then AI.
+            prompt: Natural language description of which input to type into.
+            totp_identifier: Identifier of the 2FA code to type, when `value` is a TOTP placeholder.
+            totp_url: URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder.
+            **kwargs: Playwright options such as `timeout`.
+
+        Returns:
+            The value that was entered.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -1308,6 +1335,19 @@ class SkyvernPage(Page):
         ai: str | None = "fallback",
         **kwargs: Any,
     ) -> str:
+        """Upload a file to a file input, using a selector, AI, or both.
+
+        Args:
+            selector: CSS selector for the file input.
+            files: URL of the file to upload. One file per call.
+            prompt: Natural language description of which file input to use.
+            ai: AI behavior mode. With the default "fallback", a selector-only call uploads through the
+                selector. When a prompt is passed, the selector is tried first and AI then always runs the
+                upload, using the selector only if it worked.
+
+        Returns:
+            The file URL that was uploaded.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -1498,6 +1538,11 @@ class SkyvernPage(Page):
         seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
+        """Pause the script for a fixed time, recorded as a wait action.
+
+        Args:
+            seconds: How long to wait, in seconds.
+        """
         timeout_ms = kwargs.pop("timeout_ms", None)
         if seconds is not None:
             await asyncio.sleep(seconds)
@@ -1568,6 +1613,7 @@ class SkyvernPage(Page):
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:
+        """Reload the current page, recorded as an action."""
         await self.page.reload(**kwargs)
         return
 
@@ -3797,6 +3843,12 @@ class SkyvernPage(Page):
         scroll_y: int,
         **kwargs: Any,
     ) -> None:
+        """Scroll the page by a number of pixels.
+
+        Args:
+            scroll_x: Pixels to scroll horizontally (negative scrolls left).
+            scroll_y: Pixels to scroll vertically (negative scrolls up).
+        """
         await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
     @action_wrap(ActionType.KEYPRESS)
@@ -3807,6 +3859,13 @@ class SkyvernPage(Page):
         duration: float = 0,
         **kwargs: Any,
     ) -> None:
+        """Press one or more keys, such as `["Enter"]` or `["Control", "a"]`.
+
+        Args:
+            keys: Keys to press, using Playwright key names.
+            hold: Hold the keys down for `duration` seconds instead of tapping them.
+            duration: How long to hold the keys, in seconds, when `hold` is true.
+        """
         await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
     @action_wrap(ActionType.MOVE)
@@ -3816,6 +3875,12 @@ class SkyvernPage(Page):
         y: int,
         **kwargs: Any,
     ) -> None:
+        """Move the mouse cursor to a point on the page.
+
+        Args:
+            x: Horizontal position in pixels from the left of the viewport.
+            y: Vertical position in pixels from the top of the viewport.
+        """
         await EventStrategyFactory.move_cursor(self.page, x, y)
 
     @action_wrap(ActionType.DRAG)
@@ -3826,6 +3891,13 @@ class SkyvernPage(Page):
         path: list[tuple[int, int]],
         **kwargs: Any,
     ) -> None:
+        """Drag with the mouse from a start point along a path of points.
+
+        Args:
+            start_x: Horizontal start position in pixels.
+            start_y: Vertical start position in pixels.
+            path: Points `(x, y)` to drag through, ending where the mouse is released.
+        """
         await handler_utils.drag(self.page, start_x, start_y, path)
 
     @action_wrap(ActionType.LEFT_MOUSE)

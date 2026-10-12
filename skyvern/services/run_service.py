@@ -12,11 +12,11 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
-from skyvern.forge.sdk.workflow.service import (
+from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
 )
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
 from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,

@@ -118,6 +118,7 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
+from skyvern.services.credential_verdict_service import CredentialVerdictContext, confirm_credential_verdicts
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 from skyvern.utils.templating import reject_jinja_transformations_on_variable
@@ -1427,7 +1428,16 @@ async def _detect_user_defined_errors(
             errors=[e.error_code for e in user_defined_errors],
         )
 
-        return user_defined_errors
+        return await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=user_defined_errors,
+            context=CredentialVerdictContext(
+                current_url=current_url,
+                elements=elements,
+                screenshots=screenshots,
+            ),
+        )
 
     except Exception as e:
         LOG.exception(

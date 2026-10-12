@@ -50,6 +50,7 @@ from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
+    ExternalBrowserUnavailable,
     FailedToClearInputField,
     FailedToFetchSecret,
     FailedToTakeScreenshot,
@@ -152,6 +153,11 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.credential_verdict_service import (
+    CredentialVerdictContext,
+    confirm_credential_verdicts,
+    needs_credential_confirmation,
+)
 from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date as _canonical_iso_date
@@ -236,6 +242,7 @@ from skyvern.webeye.navigation import (
     record_task_nav_error_code,
     revalidate_redirect_chain,
 )
+from skyvern.webeye.real_browser_state import is_external_browser_state
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -2421,6 +2428,9 @@ async def _recover_download_page(
             try:
                 recovered_page = await browser_state.new_page()
             except Exception:
+                # A registered external browser is attach-only, so there is no address to reconnect through.
+                if is_external_browser_state(browser_state):
+                    raise ExternalBrowserUnavailable.lost() from None
                 # A context that cannot open a page is unusable regardless of what the driver
                 # reports: the browser-close event has often not propagated yet when the pending
                 # newPage call rejects, so is_connected() still answers True here.
@@ -2460,6 +2470,8 @@ async def _recover_download_page(
                 recovery_context.retire_intentional_page(task.task_id, recovered_page)
             await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
             await browser_state.set_active_page(recovered_page)
+    except ExternalBrowserUnavailable:
+        raise
     except Exception:
         LOG.warning(
             "Failed to recreate working page after download action closed it",
@@ -5163,7 +5175,9 @@ class ActionHandler:
                     )
             action.finished_at = naive_utc_now()
             persisted_action = await app.DATABASE.workflow_params.create_action(
-                action=skyvern_context.action_for_multi_field_totp_persistence(action)
+                action=skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
             )
             action.action_id = persisted_action.action_id
             return results
@@ -5979,7 +5993,9 @@ class ActionHandler:
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
             persisted_action = await app.DATABASE.workflow_params.create_action(
-                action=skyvern_context.action_for_multi_field_totp_persistence(action)
+                action=skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
             )
             action.action_id = persisted_action.action_id
 
@@ -10894,7 +10910,11 @@ async def handle_terminate_action(
         skyvern_errors = [error for error in action.errors if error.is_skyvern_defined]
         try:
             extracted_errors = await extract_user_defined_errors(
-                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                reasoning=action.reasoning,
+                confirm_credentials=False,
             )
         except Exception:
             LOG.warning(
@@ -10909,6 +10929,20 @@ async def handle_terminate_action(
             action.errors = skyvern_errors + [
                 error for error in extracted_errors if error.error_code not in skyvern_codes
             ]
+    # Gate the merged set once: a system-attached verdict and the extraction pass can describe the same
+    # rejection, but must not independently reach the model or leave conflicting outcomes.
+    if any(needs_credential_confirmation(error) for error in action.errors):
+        action.errors = await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=action.errors,
+            context=CredentialVerdictContext(
+                current_url=scraped_page.url,
+                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
+                screenshots=scraped_page.screenshots,
+                agent_reasoning=action.reasoning,
+            ),
+        )
     return [ActionSuccess()]
 
 
@@ -10925,6 +10959,21 @@ async def handle_complete_action(
     # attribution (periodic vs handler-forced) lives on the child
     # complete_verify span as `verification.trigger`.
     _span = otel_trace.get_current_span()
+    if action.errors:
+        credential_context = None
+        if any(needs_credential_confirmation(error) for error in action.errors):
+            credential_context = CredentialVerdictContext(
+                current_url=scraped_page.url,
+                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
+                screenshots=scraped_page.screenshots,
+                agent_reasoning=action.reasoning,
+            )
+        action.errors = await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=action.errors,
+            context=credential_context,
+        )
     if action.verified or not task.navigation_goal:
         _span.set_attribute("verification_path", "already_verified")
         return [ActionSuccess()]
@@ -11700,7 +11749,7 @@ def generate_totp_value_from_secret(totp_secret: str | None) -> str:
         raise NoTOTPSecretFound() from exc
 
 
-def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str) -> None:
+def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str | None) -> None:
     if not workflow_run_id or not code:
         return
     try:
@@ -16436,15 +16485,21 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
 
 
 async def extract_user_defined_errors(
-    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
+    task: Task,
+    step: Step,
+    scraped_page: ScrapedPage,
+    reasoning: str | None = None,
+    *,
+    confirm_credentials: bool = True,
 ) -> list[UserDefinedError]:
     action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
+    elements = scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML)
     prompt = prompt_engine.load_prompt(
         "surface-user-defined-errors",
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
-        elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
+        elements=elements,
         current_url=scraped_page_refreshed.url,
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
@@ -16468,5 +16523,18 @@ async def extract_user_defined_errors(
             allowed_codes=sorted((task.error_code_mapping or {}).keys()),
         )
     if not kept and reasoning:
-        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
-    return kept
+        kept = _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
+    if not confirm_credentials:
+        return kept
+    return await confirm_credential_verdicts(
+        task=task,
+        step=step,
+        errors=kept,
+        context=CredentialVerdictContext(
+            current_url=scraped_page_refreshed.url,
+            elements=elements,
+            screenshots=scraped_page_refreshed.screenshots,
+            action_history=json.dumps(action_history),
+            agent_reasoning=reasoning,
+        ),
+    )

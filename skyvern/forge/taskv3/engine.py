@@ -68,6 +68,7 @@ from skyvern.forge.taskv3.loop import (
     SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
+    UnseenPageText,
     VerificationBlocker,
     make_finish_tool,
     run_agent_tool_loop,
@@ -254,6 +255,8 @@ async def run_task_v3_agent_loop(
     goal: str,
     parameters: dict[str, Any] | None = None,
     starting_url: str | None = None,
+    # The browser is already on `starting_url`, so the prompt must not present it as somewhere to go.
+    starting_url_is_current: bool = False,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
@@ -275,6 +278,7 @@ async def run_task_v3_agent_loop(
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     settle_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    action_effect_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     completion_probe: CompletionProbe | None = None,
@@ -409,6 +413,7 @@ async def run_task_v3_agent_loop(
             staged_downloads=staged_downloads,
         )
     )
+    unseen_text = None if page_free else UnseenPageText()
     browser_tools = (
         []
         if page_free
@@ -422,6 +427,7 @@ async def run_task_v3_agent_loop(
             opaque_refs=refs,
             vision_enabled=vision_enabled,
             semantic_commit_stats=semantic_commit_stats,
+            unseen_text=unseen_text,
         )
     )
 
@@ -444,6 +450,7 @@ async def run_task_v3_agent_loop(
         completion_blocker = None
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
+    refuse_navigation = block_type == BlockType.VALIDATION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
     # A block with its own completion verifier is left to it, by every judge.
     judge_eligible = goal_check_eligible(
@@ -546,6 +553,7 @@ async def run_task_v3_agent_loop(
         return result
 
     finish_tool = make_finish_tool(
+        unseen_text=unseen_text,
         page_fingerprint=None if page_free else (settle_fingerprint or page_fingerprint),
         max_settle_deferrals=max_settle_deferrals,
         pending_marker=None if page_free else pending_marker,
@@ -593,7 +601,7 @@ async def run_task_v3_agent_loop(
             step=step,
         )
     )
-    apply_answer_basis_audit(tools, answer_audit)
+    answer_hold = apply_answer_basis_audit(tools, answer_audit)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -601,7 +609,12 @@ async def run_task_v3_agent_loop(
         # The goal is message 1 of every turn and an over-limit request is refused without retry, so typed rows get
         # what the smallest dispatchable model's input limit leaves after the rest of the request, the tool schemas,
         # and the page-read characters the loop retains (at approx_count_tokens' 4 characters per token).
-        rest = build_user_prompt(model_goal, refs.masked, model_starting_url) + f"\n\n{defaults_text}"
+        rest = (
+            build_user_prompt(
+                model_goal, refs.masked, model_starting_url, starting_url_is_current=starting_url_is_current
+            )
+            + f"\n\n{defaults_text}"
+        )
         budget = (
             (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
             - count_tokens(system_prompt)
@@ -610,7 +623,9 @@ async def run_task_v3_agent_loop(
             - approx_count_tokens("x" * PERCEPTION_RETAIN_CHARS_HIGH)
         )
         prompt_goal = "\n".join([model_goal, *typed_value_rows(code_typed_values, budget)])
-    user_prompt = build_user_prompt(prompt_goal, refs.masked, model_starting_url)
+    user_prompt = build_user_prompt(
+        prompt_goal, refs.masked, model_starting_url, starting_url_is_current=starting_url_is_current
+    )
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
     if defaults_text:
         user_prompt += f"\n\n{defaults_text}"
@@ -651,15 +666,18 @@ async def run_task_v3_agent_loop(
             login_identifier_tokens=login_identifier_tokens,
             page_probe=None if page_free else page_probe,
             page_fingerprint=None if page_free else page_fingerprint,
+            action_effect_fingerprint=None if page_free else action_effect_fingerprint,
             reload_page=None if page_free else reload_page,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
             refuse_input_entry=refuse_input_entry,
+            refuse_navigation=refuse_navigation,
             tool_trail=tool_trail,
             single_action_block=single_action_block,
             target_action_reserve=target_action_reserve,
             block_completion_check=_block_completion_check if block_check_on else None,
+            unseen_text=unseen_text,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
@@ -725,6 +743,7 @@ async def run_task_v3_agent_loop(
         age_default_reason=age_default_reason,
         application_defaults_rendered=bool(application_defaults_text),
         application_defaults_reason=application_defaults_reason,
+        answer_hold_at_end=answer_hold() if answer_hold is not None else None,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,

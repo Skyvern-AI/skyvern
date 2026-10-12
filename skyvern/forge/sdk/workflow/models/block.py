@@ -367,7 +367,7 @@ from skyvern.webeye.navigation import (
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
@@ -2614,6 +2614,14 @@ class BaseTaskBlock(Block):
                         workflow_run_id=workflow_run_id,
                         detected_at=datetime.now(UTC),
                         failure_reason="browser_state_registry_lookup_miss",
+                    )
+                if browser_session_id and is_external_browser_state(browser_state) and not browser_state.is_connected():
+                    # Re-acquiring a lost registered browser fails the run with the registration's own reason.
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run,
+                        url=None,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
 
                 working_page = await browser_state.must_get_working_page()
@@ -11415,14 +11423,16 @@ class UploadToS3Block(Block):
                     if attempt_started_at is None
                     or is_file_from_retry_attempt(os.path.join(resolved_path, name), attempt_started_at)
                 ]
-                if len(files) > MAX_UPLOAD_FILE_COUNT:
-                    raise ValueError("Too many files in the directory, not uploading")
+                file_paths = []
                 for file in files:
-                    # if the file is a directory, we will not upload it
-                    if os.path.isdir(os.path.join(resolved_path, file)):
+                    file_path = os.path.join(resolved_path, file)
+                    if os.path.isdir(file_path):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
-                    file_path = os.path.join(resolved_path, file)
+                    file_paths.append(file_path)
+                if len(file_paths) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file_path in file_paths:
                     s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
@@ -12085,13 +12095,13 @@ class FileDestinationBlock(Block):
                 if attempt_started_at is None
                 or is_file_from_retry_attempt(os.path.join(download_files_path, name), attempt_started_at)
             ]
-            if len(files) > max_file_count:
-                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
             for file in files:
                 if os.path.isdir(os.path.join(download_files_path, file)):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
         return files_to_upload
 
     async def _select_files_to_upload_with_prompt(
