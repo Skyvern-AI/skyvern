@@ -626,7 +626,7 @@ describe("RunView legacy run-page parity", () => {
 });
 
 describe("RunView view toggles", () => {
-  test("keeps status notification controls for an active run", () => {
+  test("keeps status notification controls for an active run", async () => {
     seedRunningRun();
     renderRunView(
       {},
@@ -637,7 +637,30 @@ describe("RunView view toggles", () => {
       </TooltipProvider>,
     );
 
-    expect(screen.getByRole("button", { name: /Notify/ })).toBeTruthy();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Notify" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    // Picking statuses is a multi-select, so the menu has to survive a toggle.
+    fireEvent.click(
+      await screen.findByRole("menuitemcheckbox", { name: "Running" }),
+    );
+    fireEvent.click(
+      screen.getByRole("menuitemcheckbox", { name: "Finished (any outcome)" }),
+    );
+
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Running", checked: true }),
+    ).toBeTruthy();
+
+    // The open menu hides the rest of the tree, so read the armed trigger back
+    // once it closes.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(
+      await screen.findByRole("button", {
+        name: "Notify, 6 statuses selected",
+      }),
+    ).toBeTruthy();
   });
 
   test("links to the runs before and after a retry", () => {

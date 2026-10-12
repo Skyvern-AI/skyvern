@@ -31,6 +31,16 @@ const WHIMSICAL_LOADING_MESSAGES = [
 
 const WHIMSICAL_SPARKLE = "‧₊˚ ⋅ ✦ ✨ ✦ ⋅ ˚₊‧";
 
+const STREAM_STARTING_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Waking up the browser stream",
+  detail: "Opening the stream and waiting for the first frame...",
+  pending: true,
+};
+
+const EXTERNAL_BROWSER_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Live view is not available for a registered external browser.",
+};
+
 const SCREENSHOT_PANEL_CLASS = "bg-slate-elevation1 text-slate-300";
 
 type StreamMode = "cdp" | "vnc" | "fallback" | "unavailable";
@@ -169,5 +179,11 @@ function StreamStatusPanel({
   );
 }
 
-export { SCREENSHOT_PANEL_CLASS, StreamModeBadge, StreamStatusPanel };
+export {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
+  SCREENSHOT_PANEL_CLASS,
+  STREAM_STARTING_DIAGNOSTIC,
+  StreamModeBadge,
+  StreamStatusPanel,
+};
 export type { StreamDiagnostic, StreamMode };

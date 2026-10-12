@@ -220,7 +220,11 @@ import {
 } from "./credentialRecovery";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
-import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
+import {
+  ReviewGateCard,
+  getPendingReviewGateVerdict,
+  getReviewGateVerdict,
+} from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
@@ -11078,10 +11082,18 @@ export function WorkflowCopilotChat({
                           <ReviewGateCard
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
-                            verdict={getReviewGateVerdict(
-                              message.narrative,
-                              proposedWorkflow,
-                            )}
+                            verdict={
+                              index === gateIndex && gateHasSubject
+                                ? getPendingReviewGateVerdict(
+                                    message.narrative,
+                                    proposedWorkflow,
+                                    pendingProposalMetadata,
+                                  )
+                                : getReviewGateVerdict(
+                                    message.narrative,
+                                    proposedWorkflow,
+                                  )
+                            }
                             settled={
                               turnId && acceptedTurnIds.has(turnId)
                                 ? "accepted"
@@ -11177,10 +11189,18 @@ export function WorkflowCopilotChat({
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
                               pending={isGateOwnerOrLast}
-                              verdict={getReviewGateVerdict(
-                                gateOwnerNarrative,
-                                proposedWorkflow,
-                              )}
+                              verdict={
+                                isGateOwnerOrLast
+                                  ? getPendingReviewGateVerdict(
+                                      gateOwnerNarrative,
+                                      proposedWorkflow,
+                                      pendingProposalMetadata,
+                                    )
+                                  : getReviewGateVerdict(
+                                      gateOwnerNarrative,
+                                      proposedWorkflow,
+                                    )
+                              }
                               settled={acceptedReceiptHere ? "accepted" : null}
                               actionsShown={gateActionsShown}
                               actionsEnabled={gateActionable}
@@ -11253,7 +11273,15 @@ export function WorkflowCopilotChat({
                 ) : null}
                 <ReviewGateCard
                   pending={!detachedReceiptShown}
-                  verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
+                  verdict={
+                    detachedReceiptShown
+                      ? getReviewGateVerdict(undefined, proposedWorkflow)
+                      : getPendingReviewGateVerdict(
+                          undefined,
+                          proposedWorkflow,
+                          pendingProposalMetadata,
+                        )
+                  }
                   settled={detachedReceiptShown ? "accepted" : null}
                   actionsShown={gateActionsShown}
                   actionsEnabled={gateActionable}
