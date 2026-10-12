@@ -21,9 +21,11 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 
 import skyvern.forge.sdk.core.skyvern_context as _skvctx
+from skyvern.exceptions import ExternalBrowserUnavailable
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import lost_external_browser_error
 from skyvern.webeye.actions.actions import (
     ClickAction,
     InputTextAction,
@@ -31,9 +33,15 @@ from skyvern.webeye.actions.actions import (
     SelectOptionAction,
     SwitchTabAction,
 )
-from skyvern.webeye.actions.handler import ActionHandler, _browser_dispatch_committed, handle_switch_tab_action
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    _browser_dispatch_committed,
+    _recover_download_page,
+    handle_switch_tab_action,
+)
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess, StaleActionAbort
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit._external_cdp_fakes import ORG_A, external_browser_state
 from tests.unit.helpers import make_organization, make_step, make_task
 
 _HANDLER = "skyvern.webeye.actions.handler"
@@ -2255,3 +2263,18 @@ async def test_terminal_fault_releases_all_download_reservations(phase: str, can
     assert not candidate.is_closed()
     assert context.page_listener_count() == 0
     assert ctx.download_popup_claims == ctx.download_popup_late_candidates == {}
+
+
+@pytest.mark.asyncio
+async def test_download_recovery_on_a_lost_registered_browser_raises_instead_of_reconnecting() -> None:
+    lost, context, _ = external_browser_state()
+    context.new_page.side_effect = RuntimeError("Target page, context or browser has been closed")
+    reconnect = AsyncMock()
+    task = MagicMock(task_id="tsk_1", workflow_run_id=None, browser_session_id="pbs_1", organization_id=ORG_A)
+
+    with patch.object(lost, "reconnect", reconnect), pytest.raises(ExternalBrowserUnavailable) as raised:
+        await _recover_download_page(lost, task, "https://example.test/", timeout_seconds=5.0, recovery_site="test")
+
+    assert str(raised.value) == str(lost_external_browser_error(None))
+    reconnect.assert_not_awaited()
+    context.close.assert_not_awaited()

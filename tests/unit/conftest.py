@@ -36,6 +36,8 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
+from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     model_written_context_fields,
@@ -65,6 +67,18 @@ from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+
+def fake_download_registration_app(
+    register: Callable[..., Awaitable[None]], rows: list[Artifact], storage: BaseStorage | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
+        DATABASE=SimpleNamespace(
+            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
+        ),
+    )
 
 
 class FakeWorkflowRunAttemptsRepository:

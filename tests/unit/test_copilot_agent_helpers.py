@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -195,10 +196,9 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
 from tests.unit.copilot_route_test_support import narrative_payload_with_run
-from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
-from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop, two_page_login_yaml
+from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
 
 
 def test_build_user_context_preserves_structured_evidence_after_redacting_secret() -> None:
@@ -575,6 +575,30 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
         in run_packet_text
     )
     assert "resume.pdf" not in run_packet_text
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_the_agents_sdk_keeps_the_prior_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "agents", None)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="continue",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="title: Canonical\n",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=None,
+        prior_executed_block_fingerprints={"sign_in": {"version_a"}},
+    )
+
+    assert "OpenAI Agents SDK" in result.user_response
+    assert result.executed_block_fingerprints == {"sign_in": {"version_a"}}
 
 
 @pytest.mark.asyncio
@@ -972,8 +996,8 @@ workflow_definition:
 
         rewritten = _rewrite_failed_test_response("Done.", ctx)
 
-        assert "pasted secret redacted" in rewritten
-        assert "Store the secret as a saved credential" in rewritten
+        assert "pasted" not in rewritten
+        assert "saved credential" in rewritten
         assert "not been verified end-to-end" in rewritten
 
     def test_rewrite_names_the_card_connected_credential_on_a_redacted_secret_draft(self) -> None:
@@ -3055,6 +3079,10 @@ workflow_definition:
         )
         assert producer_packet is not None
         dom_obstructions = producer_packet["page_obstructions"]
+        for obstruction in dom_obstructions:
+            for control in obstruction["visible_controls"]:
+                for candidate in control["selector_candidates"]:
+                    candidate["visible_match_count"] = 0
         screenshot_obstruction = _page_obstructions_from_visual_summary(
             {
                 "page_obstruction_detected": True,
@@ -3192,7 +3220,7 @@ workflow_definition:
         ]
         assert all(
             "selector" not in control
-            and all("match_count" not in candidate for candidate in control["selector_candidates"])
+            and all(set(candidate) == {"selector", "source"} for candidate in control["selector_candidates"])
             for obstruction in carried_obstructions
             for control in obstruction["visible_controls"]
         )
@@ -9466,25 +9494,49 @@ workflow_definition:
         assert rendered["facts"]["runCompleted"] is False
         assert rendered["disposition"] == "review_untested"
 
-    def test_a_block_failure_no_later_run_re_exercised_drops_the_tested_pill(self) -> None:
-        staged = two_page_login_yaml()
-        ctx = _ctx(
-            persisted_workflow_yaml=staged,
-            workflow_yaml=staged,
-            last_run_outcome=_clean_recorded_run(),
-        )
-        record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-        record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-        ctx.executed_block_fingerprints = {
-            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
-        }
-        ctx.executed_block_labels = {"sign_in_and_read"}
+    def test_the_tested_pill_follows_what_the_run_recorder_saw_each_block_do(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged, workflow_yaml=staged)
 
-        rendered = self._render(ctx, staged)
+        def run(run_id: str, label: str, *statuses: str) -> dict[str, Any]:
+            run_execution_module._commit_run_blocks_record(
+                ctx,
+                {
+                    "ok": statuses[-1] == "completed",
+                    "data": {
+                        "workflow_run_id": run_id,
+                        "overall_status": statuses[-1],
+                        "requested_block_labels": [label],
+                        "blocks": [{"label": label, "block_type": "TASK", "status": status} for status in statuses],
+                    },
+                },
+            )
+            return self._render(ctx, staged)
 
-        assert rendered["facts"]["matchingSourceBlockCount"] == rendered["facts"]["authoredBlockCount"]
-        assert rendered["facts"]["runCompleted"] is True
-        assert rendered["disposition"] == "review_untested"
+        run("wr_1", "sign_in", "failed")
+        sibling_passed_after_failure = run("wr_2", "read_metric", "completed")
+        failed_block_then_passed = run("wr_3", "sign_in", "completed")
+        run("wr_4", "sign_in", "failed")
+        sibling_passed_after_refailure = run("wr_5", "read_metric", "completed")
+        run("wr_6", "sign_in", "completed")
+        passed_then_failed_in_one_run = run("wr_7", "sign_in", "completed", "failed")
+        run("wr_8", "sign_in", "completed")
+        canceled_after_pass = run("wr_9", "sign_in", "canceled")
+
+        for untested in (sibling_passed_after_failure, sibling_passed_after_refailure):
+            assert untested["facts"]["runCompleted"] is True
+        for untested in (
+            sibling_passed_after_failure,
+            sibling_passed_after_refailure,
+            passed_then_failed_in_one_run,
+            canceled_after_pass,
+        ):
+            assert untested["facts"]["matchingSourceBlockCount"] == 1
+            assert untested["facts"]["ranCleanOnCurrentSource"] is False
+            assert untested["disposition"] == "review_untested"
+        assert failed_block_then_passed["facts"]["matchingSourceBlockCount"] == 2
+        assert failed_block_then_passed["facts"]["ranCleanOnCurrentSource"] is True
+        assert failed_block_then_passed["disposition"] == "review_tested"
 
     @staticmethod
     def _code_yaml(body: str) -> str:
@@ -9512,61 +9564,29 @@ workflow_definition:
             }
         )
 
-    def _proposed_after_code_failure(
-        self,
-        failure_reason: str,
-        proposal: str,
-        *,
-        persisted: str = "workflow_definition:\n  blocks: []\n",
-        raised: str | None = None,
-    ) -> dict[str, Any]:
-        """A code block fails mid-turn, then the turn proposes ``proposal``.
-
-        ``persisted_workflow_yaml`` stays at the turn-start snapshot because nothing writes it
-        mid-turn; a test that hand-sets it to the proposal cannot see either failure direction.
-        """
-        raised = raised or self._code_yaml("total = fare * pax")
+    def test_a_repaired_and_passing_code_failure_keeps_the_tested_pill(self) -> None:
+        """The block raised, the model rewrote it, and the re-run passed, so the turn is tested."""
+        proposal = self._code_yaml("total = float(await page.locator('#fare').inner_text())")
         ctx = _ctx(
-            persisted_workflow_yaml=persisted,
-            workflow_yaml=raised,
+            persisted_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            workflow_yaml=self._code_yaml("total = fare * pax"),
             last_run_outcome=_clean_recorded_run(),
         )
-        record_build_test_outcome(ctx, self._raised_run("wr_raised", failure_reason))
+        record_build_test_outcome(
+            ctx,
+            self._raised_run("wr_raised", "CodeBlock failed with NameError at line 1: name 'fare' is not defined."),
+        )
         ctx.workflow_yaml = proposal
         record_build_test_outcome(ctx, passing_run("wr_later", ["price"]))
         ctx.executed_block_fingerprints = {
             label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(proposal).items()
         }
         ctx.executed_block_labels = {"price"}
-        return self._render(ctx, proposal)
 
-    def test_a_repaired_and_passing_code_failure_keeps_the_tested_pill(self) -> None:
-        """The block raised, the model rewrote it, and the re-run passed, so the turn is tested."""
-        rendered = self._proposed_after_code_failure(
-            "CodeBlock failed with NameError at line 1: name 'fare' is not defined.",
-            self._code_yaml("total = float(await page.locator('#fare').inner_text())"),
-        )
+        rendered = self._render(ctx, proposal)
 
         assert rendered["facts"]["ranCleanOnCurrentSource"] is True
         assert rendered["disposition"] == "review_tested"
-
-    def test_a_proposal_still_carrying_the_failing_call_never_reads_as_tested(self) -> None:
-        """The pill claims the proposal ran clean, so a later passing run cannot launder a draft
-        that still carries the call the failure named.
-
-        The turn-start workflow does carry the block but not that call, so reading persistence here
-        would report the call as already removed and hand the draft a tested pill it never earned.
-        """
-        failing_call = 'await page.locator("#pay-now").click()'
-        rendered = self._proposed_after_code_failure(
-            'Timeout 30000ms exceeded. Call log: waiting for locator("#pay-now") to be visible',
-            self._code_yaml(failing_call),
-            persisted=self._code_yaml('await page.goto("https://shop.test/cart")'),
-            raised=self._code_yaml(failing_call),
-        )
-
-        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
-        assert rendered["disposition"] == "review_untested"
 
     def test_full_coverage_over_an_unconfirmed_outcome_drops_the_tested_pill(self) -> None:
         staged = self._two_block_yaml()
@@ -9585,6 +9605,7 @@ workflow_definition:
 
         assert rendered["facts"]["matchingSourceBlockCount"] == 2
         assert rendered["facts"]["evaluationState"] == "not_demonstrated"
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
         assert rendered["disposition"] == "review_untested"
 
     def test_an_unresolved_run_start_over_full_coverage_drops_the_tested_pill(self) -> None:

@@ -485,6 +485,81 @@ async def test_post_action_screenshot_keeps_captured_viewports_at_its_own_deadli
     assert [entry["outcome"] for entry in runtime_events(logs)] == ["timeout"]
 
 
+def _solid_png(color: tuple[int, int, int], size: tuple[int, int] = (80, 60)) -> bytes:
+    with BytesIO() as buffer, Image.new("RGB", size, color) as image:
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+_RED, _GREEN, _BLUE = (200, 0, 0), (0, 200, 0), (0, 0, 200)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "third_position,third_frame",
+    [
+        pytest.param(5, _solid_png(_BLUE), id="scrolls_backward"),
+        pytest.param(200, _solid_png(_BLUE), id="leaves_a_gap"),
+        pytest.param(80, _solid_png(_BLUE, (80, 50)), id="changes_size"),
+    ],
+)
+async def test_post_action_timeout_keeps_the_prefix_before_an_unsafe_seam(
+    page: MagicMock, monkeypatch: pytest.MonkeyPatch, third_position: int, third_frame: bytes
+) -> None:
+    frame = await SkyvernFrame.create_instance(page)
+    frame.scroll_to_next_page.side_effect = [40, third_position, 400]
+    frames = iter([_solid_png(_RED), _solid_png(_GREEN), third_frame])
+    entered = asyncio.Event()
+    stall = _stall(entered)
+
+    async def screenshot(**kwargs: Any) -> bytes:
+        return next(frames, None) or await stall(**kwargs)
+
+    page.screenshot.side_effect = screenshot
+    monkeypatch.setattr(
+        SkyvernFrame,
+        "take_scrolling_screenshot",
+        staticmethod(functools.partial(SkyvernFrame.take_scrolling_screenshot, timeout=150)),
+    )
+    state = RealBrowserState(pw=MagicMock(), browser_context=page.context)
+    monkeypatch.setattr(state, "get_working_page", AsyncMock(return_value=page))
+    with capture_logs() as logs:
+        png = await state.take_post_action_screenshot(scrolling_number=4)
+    assert entered.is_set()
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+    assert rgb.size == (80, 100)
+    assert rgb.getpixel((0, 0)) == rgb.getpixel((79, 59)) == _RED
+    assert rgb.getpixel((0, 60)) == rgb.getpixel((79, 99)) == _GREEN
+    [partial] = [entry for entry in logs if entry.get("incomplete_reason") == "capture_timeout"]
+    assert partial["frame_count"] == 3
+    assert partial["retained_frame_count"] == 2
+    assert partial["scroll_positions"] == [0, 40, third_position]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corrupt_frame",
+    [pytest.param(b"not-a-png", id="unreadable"), pytest.param(_solid_png(_BLUE)[:60], id="truncated")],
+)
+async def test_post_action_timeout_with_a_corrupt_later_frame_still_raises(
+    page: MagicMock, corrupt_frame: bytes
+) -> None:
+    frame = await SkyvernFrame.create_instance(page)
+    frame.scroll_to_next_page.side_effect = [40, 5, 400]
+    frames = iter([_solid_png(_RED), _solid_png(_GREEN), corrupt_frame])
+    stall = _stall(asyncio.Event())
+
+    async def screenshot(**kwargs: Any) -> bytes:
+        return next(frames, None) or await stall(**kwargs)
+
+    page.screenshot.side_effect = screenshot
+    with pytest.raises(TimeoutError):
+        await SkyvernFrame.take_scrolling_screenshot(
+            page, mode=ScreenshotMode.LITE, scrolling_number=4, timeout=150, keep_partial_on_timeout=True
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keep_partial,frames", [(False, 2), (True, 0)])
 async def test_default_and_frameless_scrolling_screenshot_timeouts_still_raise(

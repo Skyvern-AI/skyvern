@@ -582,8 +582,9 @@ class TestRunCredentialFetchOutcome:
         bound = {
             key: _sole_record(
                 json_stream,
-                lambda r, key=key: r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE
-                and r.get("parameter_key") == key,
+                lambda r, key=key: (
+                    r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE and r.get("parameter_key") == key
+                ),
             )["credential_id"]
             for key in ("portal_login", "backup_login")
         }
@@ -608,8 +609,9 @@ class TestRunCredentialFetchOutcome:
 
         record = _sole_record(
             json_stream,
-            lambda r: r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE
-            and r.get("parameter_key") == "backup_login",
+            lambda r: (
+                r.get("msg") == RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE and r.get("parameter_key") == "backup_login"
+            ),
         )
         assert (record["outcome"], record["credential_id"]) == ("missing_binding", None)
         assert "synthetic-password" not in json.dumps(record)

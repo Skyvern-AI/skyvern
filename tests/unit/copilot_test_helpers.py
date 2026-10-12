@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
@@ -72,11 +73,14 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.routes.workflow_copilot import _assistant_execution_receipts
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotTitleUpdate,
 )
@@ -1221,27 +1225,11 @@ def two_page_login_yaml(*, submit_selector: str = "Login") -> str:
     """
 
 
-def straight_line_login_yaml() -> str:
-    """One always-executed code block with no branching: executing it reaches every call in it."""
-    return """
-    title: Sign in and read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          await page.fill("#user", "demo")
-          await page.get_by_role("button", name="Login", exact=True).click()
-          return {"visitors": "9.42K"}
-    """
-
-
 def failed_second_factor_run(run_id: str) -> RecordedBuildTestOutcome:
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label="sign_in_and_read",
-        attempted_call_ref="role:button:Login",
         verdict="repairable_failure",
         reason_code="runtime_block_failure",
         workflow_run_id=run_id,
@@ -1732,3 +1720,35 @@ async def run_production_loop(
         final_reply=final_reply,
     )
     return result, ctx, stream
+
+
+RECEIPT_WORKFLOW_YAML = """
+title: Metric
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: sign_in
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read the metric
+"""
+
+
+def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
+    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+
+
+def all_blocks_tested_message() -> MagicMock:
+    current = workflow_block_fingerprints(RECEIPT_WORKFLOW_YAML)
+    return receipt_message({"testedBlockFingerprints": {label: sorted(fps) for label, fps in current.items()}})
+
+
+def receipt_coverage_after(
+    messages: Sequence[WorkflowCopilotChatMessage], proposal: dict[str, Any] | None = None
+) -> dict[str, str]:
+    seed = _assistant_execution_receipts(list(messages), proposal)
+    projection = build_review_projection(RECEIPT_WORKFLOW_YAML, RECEIPT_WORKFLOW_YAML, seed)
+    assert projection is not None
+    return {block["label"]: block["coverage"] for block in projection["blocks"]}

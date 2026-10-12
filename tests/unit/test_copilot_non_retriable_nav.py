@@ -73,9 +73,9 @@ from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import driver_nav_error_code
+from tests.unit._task_block_fakes import mock_block_execute_deps, output_parameter
 from tests.unit.copilot_test_helpers import install_run_blocks_harness, make_copilot_ctx, stub_copilot_agent_loop
 from tests.unit.force_stub_app import admit_block_dispatch
-from tests.unit.test_missing_starter_url import _mock_block_execute_deps, _output_parameter
 
 _DNS_FAILURE_REASON = (
     "Failed to navigate to url https://www.example.invalid/path. Error message: net::ERR_NAME_NOT_RESOLVED"
@@ -1617,7 +1617,7 @@ def test_a_driver_code_survives_the_code_block_result_scrub(
         failure_reason="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED",
         error_codes=["net::ERR_TUNNEL_CONNECTION_FAILED"],
         status=block_module.BlockStatus.failed,
-        output_parameter=_output_parameter(),
+        output_parameter=output_parameter(),
         workflow_run_block_id="wrb_test",
     )
 
@@ -1637,9 +1637,9 @@ async def test_a_task_that_terminates_after_a_failed_navigation_reports_its_code
     """The action handler keeps the code when the agent terminates right after a failed navigation; the
     block has to carry it too, or Copilot never sees the verdict the task ended on."""
     block = block_module.TaskBlock(
-        label="open", output_parameter=_output_parameter(), title="open", url="https://x.test/"
+        label="open", output_parameter=output_parameter(), title="open", url="https://x.test/"
     )
-    context = SkyvernContext(run_id="wr_missing_starter_url_test")
+    context = SkyvernContext(run_id="wr_task_block_test")
     context.task_nav_error_codes["tsk_test"] = "net::ERR_NAME_NOT_RESOLVED"
     built: dict[str, object] = {}
 
@@ -1647,8 +1647,8 @@ async def test_a_task_that_terminates_after_a_failed_navigation_reports_its_code
         built.update(kwargs)
         return SimpleNamespace(**kwargs)
 
-    with _mock_block_execute_deps(working_page_url="https://x.test/") as deps:
-        deps["tasks_db"].get_task = AsyncMock(
+    with mock_block_execute_deps(working_page_url="https://x.test/") as deps:
+        deps.tasks_db.get_task = AsyncMock(
             return_value=SimpleNamespace(
                 task_id="tsk_test", status=status, failure_reason="The site cannot be reached."
             )
@@ -1664,7 +1664,7 @@ async def test_a_task_that_terminates_after_a_failed_navigation_reports_its_code
             mock.patch.object(block_module.TaskOutput, "from_task", return_value=mock.MagicMock(model_dump=dict)),
         ):
             await block.execute(
-                workflow_run_id="wr_missing_starter_url_test", workflow_run_block_id="wrb", organization_id="o_test"
+                workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb", organization_id="o_test"
             )
 
     assert built["error_codes"] == expected
@@ -1867,7 +1867,7 @@ async def test_a_torn_down_run_still_reports_the_navigation_failure() -> None:
     handler -- so a run torn down while the block awaited must degrade to reporting the failure
     without the code, never to raising in place of the failure it was handling."""
     block = block_module.TaskBlock(
-        label="open", output_parameter=_output_parameter(), title="open", url="https://x.test/"
+        label="open", output_parameter=output_parameter(), title="open", url="https://x.test/"
     )
     navigation_failure = FailedToNavigateToUrl(
         url="https://x.test/",
@@ -1931,7 +1931,7 @@ def test_a_parameter_walk_that_runs_out_leaves_every_code_to_the_mask(monkeypatc
         failure_reason="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED",
         error_codes=["net::ERR_TUNNEL_CONNECTION_FAILED"],
         status=block_module.BlockStatus.failed,
-        output_parameter=_output_parameter(),
+        output_parameter=output_parameter(),
         workflow_run_block_id="wrb_test",
     )
 

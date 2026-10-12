@@ -8,7 +8,12 @@ error_code_mapping so only declared codes leak through to the user.
 
 import pytest
 
-from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes, resolve_error_code_mapping_key
+from skyvern.errors.errors import (
+    LoginUnconfirmedError,
+    UserDefinedError,
+    filter_to_user_defined_codes,
+    resolve_error_code_mapping_key,
+)
 
 
 def _make_error(code: str) -> UserDefinedError:
@@ -44,6 +49,15 @@ def test_filter_returns_empty_when_mapping_is_none() -> None:
     assert dropped == ["ANYTHING"]
 
 
+def test_filter_keeps_skyvern_generated_verdicts_without_customer_mapping() -> None:
+    error = LoginUnconfirmedError().to_user_defined_error()
+
+    kept, dropped = filter_to_user_defined_codes([error], None)
+
+    assert kept == [error]
+    assert dropped == []
+
+
 def test_filter_returns_empty_when_mapping_is_empty_dict() -> None:
     errors = [_make_error("ANYTHING")]
 
@@ -51,6 +65,15 @@ def test_filter_returns_empty_when_mapping_is_empty_dict() -> None:
 
     assert kept == []
     assert dropped == ["ANYTHING"]
+
+
+def test_filter_keeps_skyvern_generated_verdicts_with_a_customer_mapping() -> None:
+    error = LoginUnconfirmedError().to_user_defined_error()
+
+    kept, dropped = filter_to_user_defined_codes([error], {"invalid_credentials": "wrong password"})
+
+    assert kept == [error]
+    assert dropped == []
 
 
 def test_filter_handles_empty_errors_input() -> None:

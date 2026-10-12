@@ -69,6 +69,7 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    STALE_READ_MAX_HOLDS,
     TARGET_ACTION_ROUND_EVENT,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
@@ -83,6 +84,7 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    UnseenPageText,
     _arms_failure_evidence,
     _budget_extension_gate,
     _canonical_perception_content,
@@ -1129,21 +1131,96 @@ async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_
         assert outcome.status == "budget_exhausted"
 
 
+class _EffectPage:
+    """The tick-masked fingerprint the loop samples around a single-action block's call; a tool bumps it to act."""
+
+    def __init__(self) -> None:
+        self.state = 0
+
+    async def fingerprint(self) -> str:
+        return f"fp-{self.state}"
+
+
+def _acting_tool(
+    name: str,
+    page: _EffectPage,
+    *,
+    acts: Callable[[int], bool],
+    fails: bool = False,
+    data: dict[str, Any] | None = None,
+) -> ToolSpec:
+    # Production-shaped: an in-page click reports no page-change flag; only the page itself shows what it did.
+    calls: list[int] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls.append(len(calls) + 1)
+        if acts(len(calls)):
+            page.state += 1
+        return ToolResult.error("tool_error: boom") if fails else ToolResult.ok(f"{name} done", data=data)
+
+    return ToolSpec(name=name, description=name, parameters={"type": "object"}, handler=handler, billable=True)
+
+
+_MOVED_URL = {
+    "click": {"page_transitioned": True},
+    "navigate": {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "page_transitioned": True}},
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url_changed", [False, True], ids=["url_unchanged", "url_changed"])
-@pytest.mark.parametrize("reported_by", ["click", "navigate"])
-async def test_single_action_block_completes_on_the_step_cap_only_when_its_action_moved_the_page(
-    url_changed: bool, reported_by: str
+@pytest.mark.parametrize("effect", ["click_moved_url", "navigate_moved_url", "changed_the_page", "changed_nothing"])
+@pytest.mark.parametrize("verdict", ["achieved", "not_achieved"])
+async def test_single_action_block_completes_on_the_step_cap_only_when_its_action_had_an_effect_the_judge_accepts(
+    effect: str, verdict: str
 ) -> None:
-    # A click that succeeds without moving the page (a no-op control, a typed username before the login submits)
-    # is no sign the block is done. Navigate reports the move inside its action outcome.
-    data = (
-        {"page_transitioned": url_changed}
-        if reported_by == "click"
-        else {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "page_transitioned": url_changed}}
+    # An in-page action (a toggle, a filter) can finish the block without moving the URL; one that changed nothing (a
+    # no-op click, a tab click that never reached its tab) is no sign it is done, whatever the judge says.
+    async def check() -> GoalVerdict:
+        return GoalVerdict(verdict, "", "", None, 0.1)
+
+    page = _EffectPage()
+    data = _MOVED_URL.get(effect.split("_")[0]) if effect.endswith("moved_url") else {"page_transitioned": False}
+    click = _acting_tool("click", page, acts=lambda n: n == 1 and effect == "changed_the_page", data=data)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
     )
-    click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", click_calls, billable=True, ok_data=data)
+
+    completes = verdict == "achieved" and effect != "changed_nothing"
+    assert outcome.status == ("completed" if completes else "budget_exhausted")
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_reports_an_http_error_page_is_no_evidence_for_the_step_cap_completion() -> None:
+    # The error page differs from the one before, but landing on it is not the block's action happening. Today only
+    # the recordable navigate reports a status; this pins the success flag to the URL-move rule for any billable call.
+    page = _EffectPage()
+    error_page = {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "http_status": 500}}
+    navigate = _acting_tool("navigate", page, acts=lambda n: True, data=error_page)
+    script = [[("navigate", {"url": "https://example.com/b"})], [("navigate", {})], [("navigate", {})]]
+    check, asked = _scripted_block_check(_ACHIEVED)
+    outcome, _ = await _run(
+        script,
+        [navigate, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_changed_page_without_a_fingerprint_sample_is_no_evidence_for_the_step_cap_completion() -> None:
+    page = _EffectPage()
+    click = _acting_tool("click", page, acts=lambda n: True, data={"page_transitioned": False})
     script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, _ = await _run(
         script,
@@ -1153,9 +1230,148 @@ async def test_single_action_block_completes_on_the_step_cap_only_when_its_actio
         max_action_steps=1,
     )
 
-    assert outcome.status == ("completed" if url_changed else "budget_exhausted")
-    if not url_changed:
-        assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_after_sample_is_no_evidence_for_the_step_cap_completion() -> None:
+    samples = iter(["fp-0", None, "fp-0", None, "fp-0", None])
+
+    async def sampler() -> str | None:
+        return next(samples, None)
+
+    click = _recording_tool("click", [], billable=True, ok_data={"page_transitioned": False})
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=sampler,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["type", "select_option"])
+async def test_an_entry_that_changed_the_page_is_no_evidence_for_the_step_cap_completion(tool_name: str) -> None:
+    # Frameworks write a typed value into markup, so the page changes; a username typed before the login submits is
+    # still not the block done, whatever the judge says.
+    page = _EffectPage()
+    entry = _acting_tool(tool_name, page, acts=lambda n: True)
+    check, _asked = _scripted_block_check(_ACHIEVED)
+    script = [[(tool_name, {"selector": "#q", "text": "a"})], [(tool_name, {})], [(tool_name, {})]]
+    outcome, _ = await _run(
+        script,
+        [entry, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_batch", [True, False], ids=["same_batch", "next_batch"])
+async def test_a_page_change_from_another_call_is_no_evidence_for_the_successful_action(same_batch: bool) -> None:
+    # The successful click changed nothing; a failed call that changed the page says nothing about it.
+    page = _EffectPage()
+    noop = _acting_tool("click", page, acts=lambda n: False, data={"page_transitioned": False})
+    failing = _acting_tool("press_key", page, acts=lambda n: True, fails=True)
+    first = [("click", {}), ("press_key", {"key": "a"})] if same_batch else [("click", {})]
+    script = [first, [("press_key", {"key": "a"})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [noop, failing, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_the_completion_offer_never_reuses_a_verdict_from_an_earlier_cap_trip() -> None:
+    # The reserve judged the typed page "not done" and granted a round; the click in that round may have submitted,
+    # so the next trip's reserve does not judge, and the offer must ask about the page the click left.
+    page = _EffectPage()
+
+    async def typed(args: dict[str, Any]) -> ToolResult:
+        page.state += 1
+        return ToolResult.ok("typed")
+
+    tool = ToolSpec(name="type", description="type", parameters={"type": "object"}, handler=typed, billable=True)
+    click = _acting_tool("click", page, acts=lambda n: True, data={"page_transitioned": False})
+    check, asked = _scripted_block_check(_NOT_ACHIEVED, _ACHIEVED)
+    script = [[("type", {"selector": "#q", "text": "a"})], [("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [tool, click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert asked == [_NOT_ACHIEVED, _ACHIEVED]
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [1, 2])
+@pytest.mark.parametrize("follow_up", ["refused", "none"])
+@pytest.mark.parametrize("action_ok", [True, False], ids=["action_ok", "action_failed"])
+async def test_single_action_block_step_cap_outcome_matrix(cap: int, follow_up: str, action_ok: bool) -> None:
+    # Only a block whose action succeeded, and whose further action the cap refused, is completed for it; a block
+    # that never landed its action, or that finished on its own, keeps the verdict it reached.
+    page = _EffectPage()
+    click = _acting_tool("click", page, acts=lambda n: n == 1, fails=not action_ok, data={"page_transitioned": False})
+    clicks = [[("click", {})] for _ in range(cap)]
+    tail = (
+        [[("click", {})], [("click", {})]]
+        if follow_up == "refused"
+        else [[("finish", {"status": "failed", "reason": "the block's control was not there"})]]
+    )
+    outcome, _ = await _run(
+        clicks + tail,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=cap,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    if follow_up == "none":
+        assert outcome.status == "failed"
+    elif action_ok:
+        assert outcome.status == "completed"
+    else:
+        assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_hover_alone_is_no_evidence_for_the_step_cap_completion() -> None:
+    page = _EffectPage()
+    hover = _acting_tool("hover", page, acts=lambda n: True)
+    script = [[("hover", {})], [("hover", {})], [("hover", {})], [("hover", {})]]
+    outcome, _ = await _run(
+        script,
+        [hover, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
 
 
 @pytest.mark.asyncio
@@ -4830,6 +5046,75 @@ async def test_finish_completed_defers_until_page_settles() -> None:
         m for m in outcome.messages if m.get("role") == "tool" and "still rendering" in str(m.get("content"))
     ]
     assert len(deferral_messages) == 1
+
+
+def _unseen(reports: list[str]) -> UnseenPageText:
+    queue = iter(reports)
+
+    async def unreported() -> str:
+        return next(queue, "")
+
+    return UnseenPageText(unreported=unreported)
+
+
+_ROWS_SECTION = '\nbefore this call ran, the page newly showed (since your previous tool call): "Cart A" | "Cart B"'
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_held_once_on_page_text_no_result_carried() -> None:
+    unseen = _unseen([_ROWS_SECTION])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [("finish", {"status": "completed", "reason": "the list is empty"})],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
+    assert any('"Cart A"' in str(m.get("content")) for m in outcome.messages if m.get("name") == "finish")
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_held_on_text_a_result_in_its_own_batch_reported() -> None:
+    # Results reach the model on its next turn, so a finish batched behind them was judged without them.
+    async def wait(_args: dict[str, Any]) -> ToolResult:
+        data = {"delta_at": 6, "delta_end": 6 + len(_ROWS_SECTION)}
+        return ToolResult(status="ok", content="waited" + _ROWS_SECTION, data=data)
+
+    wait_spec = ToolSpec(name="wait", description="wait", parameters={"type": "object", "properties": {}}, handler=wait)
+    unseen = _unseen([])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [
+            ("wait", {}),
+            ("finish", {"status": "completed", "reason": "the list is empty"}),
+            ("finish", {"status": "completed", "reason": "still empty"}),
+            ("finish", {"status": "completed", "reason": "empty, third try"}),
+        ],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [wait_spec, finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
+
+
+@pytest.mark.asyncio
+async def test_finish_held_on_unseen_text_has_its_own_budget_even_with_settle_deferrals_off() -> None:
+    # Bare tasks run with settle deferrals off; the hold still applies there, and still ends.
+    unseen = _unseen([f'\npage newly shows: "Rotating banner {i}"' for i in range(20)])
+    finish = make_finish_tool(settle_wait_seconds=0.0, max_settle_deferrals=0, unseen_text=unseen)
+    script = [[("finish", {"status": "completed", "reason": f"try {i}"})] for i in range(5)]
+    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", f"try {STALE_READ_MAX_HOLDS}")
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_not_held_on_unseen_text_without_an_action_step_left() -> None:
+    # The step cap's own completion runs here; a hold it cannot act on would turn it into budget_exhausted.
+    activity = ActivityRecency()
+    activity.action_steps_remaining = 0
+    unseen = _unseen([_ROWS_SECTION])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen, activity=activity)
+    outcome, _ = await _run([[("finish", {"status": "completed", "reason": "capped"})]], [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "capped")
 
 
 @pytest.mark.asyncio
@@ -12698,6 +12983,65 @@ async def test_extraction_entry_guard_refuses_every_fill_tool_but_not_click(fill
     else:
         assert dispatched == [fill_tool, "click"]
         assert refusals == []
+
+
+def _url_changing_tool(name: str, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
+    # As built in production: neither is billable, navigate records an action row, and the link tool engages the page.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append((name, args))
+        return ToolResult.ok(f"{name} done")
+
+    return ToolSpec(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        recordable=name == "navigate",
+        engages_page=name == "open_verification_link",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", [True, False])
+@pytest.mark.parametrize("url_tool", sorted(loop_module.URL_CHANGING_TOOLS))
+async def test_navigation_guard_refuses_url_changing_tools_but_not_click(url_tool: str, refuse: bool) -> None:
+    assert {"navigate", "open_verification_link"} == loop_module.URL_CHANGING_TOOLS
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_url_changing_tool(url_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [(url_tool, {"url": "https://example.com/case"}), ("finish", {"status": "completed", "reason": "early"})],
+        [("click", {"selector": "#details"})],
+        [("finish", {"status": "completed", "reason": "read"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, refuse_navigation=refuse)
+
+    dispatched = [name for name, _ in calls]
+    refusals = [e for e in logs if e["event"] == loop_module.VALIDATION_NAVIGATION_REFUSED_EVENT]
+    results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"]
+    if refuse:
+        assert dispatched == ["click"]
+        assert [e["tool"] for e in refusals] == [url_tool]
+        # The verdict batched behind the refused call was written as if it had landed.
+        assert results[:2] == ["refused", "skipped"]
+        assert outcome.reason == "read"
+    else:
+        assert dispatched == [url_tool]
+        assert refusals == []
+        assert outcome.reason == "early"
+
+
+@pytest.mark.asyncio
+async def test_a_validation_block_that_keeps_navigating_still_ends_on_its_tool_call_cap() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": f"https://example.com/case/{i}"})] for i in range(30)]
+    outcome, _ = await _run(
+        script, [_url_changing_tool("navigate", calls), make_finish_tool()], refuse_navigation=True, max_tool_calls=5
+    )
+
+    assert calls == []
+    assert outcome.status == "budget_exhausted"
+    assert "tool-call budget" in outcome.reason
 
 
 @pytest.mark.asyncio
