@@ -44,6 +44,41 @@ class BudgetExpiryObservation(BaseModel):
     )
 
 
+class RecordedBlockState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    status: str
+    failure_reason: str | None = None
+
+
+class RecordedRunState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    workflow_run_id: str
+    status: str | None
+    failure_reason: str | None = None
+    blocks: list[RecordedBlockState] = []
+    earlier_blocks_not_shown: int = 0
+
+
+class BudgetExpiredReplyObservation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    budget_expired: Literal[True] = True
+    source: BudgetExpirySource | None
+    staged_draft: str | None
+    stopped_waiting: bool
+    runs_not_in_history: list[RecordedRunState]
+    message: str = (
+        "This turn's time is spent and nothing more can run in it. Call `reply` now with your final response for "
+        "this turn; any other tool call will not run. staged_draft is the draft this turn holds. "
+        "stopped_waiting means the turn stopped waiting for the step still in progress: that step's model response "
+        "and tool results are not in your history, and the result of a browser action in it is unknown. The time "
+        "limit does not stop runs: runs_not_in_history lists each run that step started, as its record reads now."
+    )
+
+
 class BudgetRunDenialData(TypedDict):
     budget_expired: Literal[True]
     run_dispatched: Literal[False]

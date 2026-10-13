@@ -130,6 +130,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
+    budget_expired_reply_observation,
     outcome_fully_verified,
     raw_secret_reply_withheld_observation,
     run_final_reply_drain,
@@ -246,6 +247,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     WatchdogExitReason,
     finalize_build_test_result,
     hydrate_prior_run_packet,
+    recorded_open_step_runs,
     reusable_origin_input_keys,
     run_workflow_end_to_end,
 )
@@ -3254,6 +3256,11 @@ def _build_budget_expiry_exit_result(ctx: CopilotContext, global_llm_context: st
         attempted_kind=stopped_exit_response_kind(terminal_reason),
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason,
+        tool_calls=[
+            str(entry.get("tool") or entry.get("name") or "")
+            for entry in ctx.tool_activity
+            if isinstance(entry, dict) and (entry.get("tool") or entry.get("name"))
+        ],
     )
     staged_workflow = ctx.staged_workflow if ctx.has_staged_proposal else None
     staged_workflow_yaml = ctx.staged_workflow_yaml if staged_workflow is not None else None
@@ -3316,7 +3323,7 @@ def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | 
     return result
 
 
-def _handle_budget_drain_exhausted(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+def _record_budget_drain_exhausted(ctx: CopilotContext) -> None:
     ctx.copilot_max_turns_exceeded = True
     start_monotonic = ctx.copilot_run_start_monotonic
     LOG.warning(
@@ -3326,7 +3333,6 @@ def _handle_budget_drain_exhausted(ctx: CopilotContext, global_llm_context: str 
         elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
         model_call_count=ctx.model_calls_this_turn,
     )
-    return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
 
 def _build_unexpected_error_exit_result(
@@ -3589,7 +3595,9 @@ async def _translate_to_agent_result(
     # Deferred tools.py imports here and below: tools.py -> routes.workflow_copilot -> this module (circular at import time).
     from skyvern.forge.sdk.copilot.tools import _process_workflow_yaml
 
-    budget_drain = ctx.budget_expiry_state.drain_attempted
+    budget_drain = ctx.budget_expiry_state.drain_attempted or (
+        final_reply and ctx.budget_expiry_state.source is not None
+    )
     text = extract_final_text(result)
     if not text and budget_drain:
         return _build_budget_expiry_exit_result(ctx, global_llm_context)
@@ -5734,6 +5742,39 @@ async def _run_copilot_turn_impl(
             LOG.warning("copilot_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
             return _output_policy_blocked(exc)
 
+    async def _reply_after_budget_expiry() -> AgentResult:
+        # The hard backstop or an exhausted drain otherwise ends the turn with no reply at all,
+        # so the model gets one final-reply call to report what it did before the turn ends.
+        try:
+            state = ctx.budget_expiry_state
+            runs_not_in_history = await recorded_open_step_runs(ctx) if state.hard_backstop_reached else []
+            reply = await _run_attempt(
+                model_name,
+                run_config,
+                llm_key,
+                is_fallback=False,
+                final_reply=True,
+                final_reply_observation=budget_expired_reply_observation(
+                    _budget_expiry_state_with_staged_draft(ctx), runs_not_in_history
+                ),
+            )
+            return await _translate_to_agent_result(
+                reply,
+                ctx,
+                global_llm_context,
+                chat_request,
+                organization_id,
+                final_reply=True,
+            )
+        except asyncio.CancelledError:
+            LOG.info("Copilot run cancelled")
+            return _build_cancelled_exit_result(ctx, global_llm_context)
+        except OutputGuardrailTripwireTriggered as reply_exc:
+            return _output_policy_blocked(reply_exc)
+        except Exception as reply_error:
+            LOG.warning("copilot_budget_expiry_reply_failed", error_type=type(reply_error).__name__)
+            return _build_budget_expiry_exit_result(ctx, global_llm_context)
+
     try:
         from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
 
@@ -5821,9 +5862,10 @@ async def _run_copilot_turn_impl(
                 )
                 return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
-                return _handle_budget_drain_exhausted(ctx, global_llm_context)
+                _record_budget_drain_exhausted(ctx)
+                return await _reply_after_budget_expiry()
             except CopilotTotalTimeoutError:
-                return _build_budget_expiry_exit_result(ctx, global_llm_context)
+                return await _reply_after_budget_expiry()
             except CopilotEmptyCompletionError as empty_error:
                 if (
                     (empty_error.retry_allowed and ctx.tool_calls_this_turn == 0)
