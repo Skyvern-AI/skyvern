@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 import time
@@ -42,16 +43,19 @@ from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_TIMEOUT_SECONDS,
     INSTRUCTIONS_MAX_CHARS,
+    TERMINATE_PREMISE_PROMPT_NAME,
     UNLISTED_REASK_PROMPT_NAME,
     GoalJudge,
     GoalVerdict,
     NonCompletedStatus,
     Redactor,
+    TerminatePremise,
     ToolTrail,
     UnlistedReask,
     goal_check_eligible,
     reask_entered_values,
     run_goal_check,
+    run_terminate_premise,
     run_unlisted_reask,
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
@@ -306,13 +310,15 @@ async def run_task_v3_agent_loop(
     # Called once per goal check; the redactor it returns is applied to every judge input before
     # truncation. The caller owns the run's secret set.
     goal_check_redactor: Callable[[], Redactor] | None = None,
-    # (complete_criterion, terminate_criterion) for a block whose failed or terminated finish may be re-asked
-    # once; None means the block is not eligible.
+    # (complete_criterion, terminate_criterion) for a block whose terminated finish is checked against the page, and
+    # whose failed or terminated finish may be re-asked once when it has a completion criterion; None means neither.
     unlisted_reask_criteria: tuple[str, str | None] | None = None,
     # The criteria may carry page-derived text, so the re-ask shows them as untrusted data.
     unlisted_reask_criteria_untrusted: bool = False,
     # The workflow system prompt reads a page-derived value, so the re-ask shows it as untrusted data.
     unlisted_reask_instructions_untrusted: bool = False,
+    # Off on a customer's own model key: the check is only our measurement, so it must not bill theirs.
+    terminate_premise_check: bool = True,
     single_action_block: bool = False,
     # Extra action rounds a single-action block may spend before its own action lands; see the loop.
     target_action_reserve: int = 0,
@@ -452,15 +458,16 @@ async def run_task_v3_agent_loop(
     refuse_input_entry = block_type == BlockType.EXTRACTION
     refuse_navigation = block_type == BlockType.VALIDATION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
-    # A block with its own completion verifier is left to it, by every judge.
+    # A block with its own completion verifier is left to it by every completion judge; the terminate check is not one.
     judge_eligible = goal_check_eligible(
         page_free=page_free,
         completion_blocker_present=completion_blocker is not None,
         extraction_requested=extraction_requested,
     )
-    reask_on = unlisted_reask_criteria is not None and judge_eligible
+    reask_on = unlisted_reask_criteria is not None and bool(unlisted_reask_criteria[0]) and judge_eligible
+    premise_on = unlisted_reask_criteria is not None and not page_free
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
-    tool_trail = ToolTrail() if reask_on or block_check_on else None
+    tool_trail = ToolTrail() if reask_on or premise_on or block_check_on else None
     reasks: list[UnlistedReask] = []
 
     async def _judge_goal(judge: GoalJudge, *, secret_entered: bool, failure_log: str) -> GoalVerdict:
@@ -498,33 +505,41 @@ async def run_task_v3_agent_loop(
             failure_log="taskv3 block completion judge failed",
         )
 
-    async def _reask_judge(reask_caller: LLMCaller, prompt: str) -> dict[str, Any] | None:
+    async def _reask_judge(reask_caller: LLMCaller, prompt_name: str, prompt: str) -> dict[str, Any] | None:
         # The run's own model, on its non-flex twin when one exists: flex queueing outlasts the 20s limit.
         # No message history, so the loop's transcript is untouched.
         return await reask_caller.call(
             prompt=prompt,
-            prompt_name=UNLISTED_REASK_PROMPT_NAME,
+            prompt_name=prompt_name,
             step=step,
             organization_id=organization_id,
             use_message_history=False,
             force_dict=True,
         )
 
-    async def _unlisted_reask(status: NonCompletedStatus, reason: str) -> UnlistedReask:
-        assert unlisted_reask_criteria is not None and tool_trail is not None
+    def _stop_check_setup() -> tuple[float, Redactor | None, LLMCaller, str | None]:
+        """The timeout, redactor and caller a stop check runs with, and why it cannot run, if it cannot."""
         timeout = GOAL_CHECK_TIMEOUT_SECONDS
         if deadline_at is not None:
             timeout = min(timeout, deadline_at - time.monotonic() - GOAL_CHECK_DEADLINE_MARGIN_SECONDS)
         redact = goal_check_redactor() if goal_check_redactor is not None else None
         non_flex_key = app.AGENT_FUNCTION.get_standard_tier_twin_llm_key(llm_caller.llm_key)
-        reask_caller = llm_caller
+        caller = llm_caller
         if non_flex_key and LLMConfigRegistry.is_registered(non_flex_key):
-            reask_caller = LLMCaller(non_flex_key)
+            caller = LLMCaller(non_flex_key)
+        skip = None
         if timeout <= 0:
-            result = UnlistedReask(status, converts=False, skipped_reason="deadline", latency_s=0.0)
+            skip = "deadline"
         # A rule past the cap could be the one that says this stop is right.
         elif len(redact(goal_instructions) if redact is not None else goal_instructions) > INSTRUCTIONS_MAX_CHARS:
-            result = UnlistedReask(status, converts=False, skipped_reason="instructions_too_long", latency_s=0.0)
+            skip = "instructions_too_long"
+        return timeout, redact, caller, skip
+
+    async def _unlisted_reask(status: NonCompletedStatus, reason: str) -> UnlistedReask:
+        assert unlisted_reask_criteria is not None and tool_trail is not None
+        timeout, redact, reask_caller, skip = _stop_check_setup()
+        if skip is not None:
+            result = UnlistedReask(status, converts=False, skipped_reason=skip, latency_s=0.0)
         else:
             entered = reask_entered_values(
                 tool_trail.entered_values,
@@ -539,7 +554,7 @@ async def run_task_v3_agent_loop(
                 status=status,
                 reason=reason,
                 trail=tool_trail,
-                judge=functools.partial(_reask_judge, reask_caller),
+                judge=functools.partial(_reask_judge, reask_caller, UNLISTED_REASK_PROMPT_NAME),
                 timeout_seconds=timeout,
                 entered_values=entered,
                 instructions=goal_instructions,
@@ -551,6 +566,40 @@ async def run_task_v3_agent_loop(
         result.reask_llm_key = reask_caller.llm_key
         reasks.append(result)
         return result
+
+    async def _terminate_premise(reason: str, prior_checks: int) -> None:
+        assert unlisted_reask_criteria is not None and tool_trail is not None
+        try:
+            timeout, redact, caller, skip = _stop_check_setup()
+            if not terminate_premise_check:
+                result = TerminatePremise(never_overturn="customer_key")
+            elif skip is not None and not prior_checks:
+                result = TerminatePremise(skipped_reason=skip)
+            else:
+                result = await run_terminate_premise(
+                    goal=model_goal,
+                    complete_criterion=unlisted_reask_criteria[0],
+                    terminate_criterion=unlisted_reask_criteria[1],
+                    reason=reason,
+                    trail=tool_trail,
+                    judge=functools.partial(_reask_judge, caller, TERMINATE_PREMISE_PROMPT_NAME),
+                    timeout_seconds=timeout,
+                    prior_checks=prior_checks,
+                    instructions=goal_instructions,
+                    redact=redact,
+                    criteria_untrusted=unlisted_reask_criteria_untrusted,
+                    instructions_untrusted=unlisted_reask_instructions_untrusted,
+                )
+            # Shadow: logged and never acted on. Never the quote or the judge's sentence: both carry page text.
+            LOG.info(
+                "taskv3 terminate premise",
+                **dataclasses.asdict(result),
+                why=result.why,
+                llm_key=caller.llm_key,
+                has_complete_criterion=bool(unlisted_reask_criteria[0]),
+            )
+        except Exception:
+            LOG.warning("taskv3 terminate premise failed", exc_info=True)
 
     finish_tool = make_finish_tool(
         unseen_text=unseen_text,
@@ -565,6 +614,7 @@ async def run_task_v3_agent_loop(
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
         unlisted_reask=_unlisted_reask if reask_on else None,
+        terminate_premise=_terminate_premise if premise_on else None,
         document_identity=None if page_free else document_identity,
         completion_gate=None if page_free else completion_gate,
     )
