@@ -272,16 +272,19 @@ On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase (
 
 ### Runs refused for credits
 
-Skyvern checks credits before it starts a run and returns `402` if they don't cover it.
+Skyvern checks credits before it starts a run and returns `402` if they don't cover it. Scheduled runs and retries are checked as they start, so an out-of-credit run fails before a browser opens. Code blocks and cached actions are checked when the run reaches them: a refused block fails and the run stops, even when **On block failure** would otherwise continue.
 
 | Message | Why | Fix |
 |---|---|---|
 | `Credits exhausted. Upgrade your plan in Billing.` | No credits left this period | Buy extra credits or upgrade |
 | `Insufficient credit balance` | Older accounts without a plan. A run needs $0.10 per step of **Max Steps Per Run** ($1.00 when it's blank), and charges on your upcoming invoice count against your balance, so you can be refused while still showing credit. | Add credit, or lower **Max Steps Per Run** |
+| `Not enough credit balance.` | The balance is too low at run start, at a Code block, at a cached action, at an AI step, or on an SDK browser action | Buy extra credits or upgrade |
 
 ## Members
 
 Go to **Settings → Members** to invite teammates by email and manage their roles. **Invite teammates** in the organization menu at the top of the sidebar opens the same page. Members share the organization's agents, runs, credentials, API key and credits.
+
+**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session, **Admin** or **Member**. It reads **Role information unavailable** when no role comes back. The role is shown for reference only; it doesn't change what you can do in the app, because the organization is still the only [permission boundary](#permissions).
 
 <img src="/images/cloud/cloud-settings-members.png" alt="Settings, Members page showing No organization yet and the Create organization button" />
 
