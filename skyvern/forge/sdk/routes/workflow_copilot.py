@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import credential_delet
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
     private_workflow_settings_from_proposal,
+    proposal_is_displayable,
     proposal_workflow_fingerprint_matches,
     strip_copilot_yaml_headers,
 )
@@ -1095,7 +1096,7 @@ async def _persist_proposed_workflow_state(
     chat: Any, agent_result: AgentResult, restored: bool, keep_pending_proposal: bool = False
 ) -> None:
     updated_workflow = agent_result.updated_workflow
-    if not await _proposal_ownership_is_current(chat, agent_result):
+    if agent_result.proposal_adopted or not await _proposal_ownership_is_current(chat, agent_result):
         _discard_superseded_proposal(agent_result)
         return
     auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
@@ -1601,6 +1602,7 @@ async def _persist_cancel_turn(
             agent_result.updated_workflow is None
             and chat.proposed_workflow is not None
             and not effective_keep_pending_proposal
+            and not agent_result.proposal_adopted
         ):
             await asyncio.shield(_clear_proposed_workflow(chat))
         else:
@@ -2591,6 +2593,9 @@ async def _new_copilot_chat_post(
                     # the row holds now, so its clear would take a candidate another turn published.
                     recovered_result.proposal_owner_turn_id = agent_result.proposal_owner_turn_id
                     recovered_result.proposal_revision = agent_result.proposal_revision
+                    recovered_result.proposal_adopted = agent_result.proposal_adopted
+                elif turn_ctx_sink and turn_ctx_sink[0].proposal_adopted:
+                    recovered_result.proposal_adopted = True
                 LOG.error(
                     translated_log_message,
                     organization_id=organization.organization_id,
@@ -3908,22 +3913,15 @@ async def _history_proposal_state(
     if not isinstance(chat.proposed_workflow, dict):
         return None, None, None, claim_expires_in
     metadata = copilot_proposal_metadata(chat.proposed_workflow)
-    if metadata is None:
-        # Safe to show unfingerprinted: Accept gives a tokenless proposal a token before it writes.
-        return chat.proposed_workflow, None, None, claim_expires_in
-    # A live claim is reported, not hidden. A server that dies mid-accept leaves the claim behind
-    # for the length of the lease, and withholding the card for that long is the invisible-work
-    # problem this store exists to remove; Accept meanwhile answers 409 and the client refetches.
-    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=chat.workflow_permanent_id,
-        organization_id=organization_id,
-    )
-    if canonical is None or not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint):
+    if not await proposal_is_displayable(chat.proposed_workflow, chat.workflow_permanent_id, organization_id):
         # Canonical moved, so the proposal is no longer displayable - but a concurrent Accept may
         # still be writing under this claim, and that is exactly when a client must not save over
         # it. Hiding the proposal here MUST NOT hide the claim; reporting no claim while one is
         # live is not ambiguity, it is a client-trusted lie.
         return None, None, None, claim_expires_in
+    if metadata is None:
+        # Safe to show unfingerprinted: Accept gives a tokenless proposal a token before it writes.
+        return chat.proposed_workflow, None, None, claim_expires_in
     run_facts = await _proposal_run_facts(metadata, chat.workflow_permanent_id, organization_id)
     return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 

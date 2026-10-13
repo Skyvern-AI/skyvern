@@ -26,6 +26,7 @@ from skyvern.cli.core.client import (
 )
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import (
+    RequestFailureLog,
     SessionState,
     register_copilot_session,
     scoped_session,
@@ -477,6 +478,9 @@ class AgentContext:
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
     )
+    # Shared by this turn's per-dispatch SessionStates, whose page listeners keep writing between calls. Those listeners
+    # keep a log alive past the turn, but only this turn reads it.
+    request_failure_logs_by_browser_session: dict[str, RequestFailureLog] = field(default_factory=dict)
     browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_session_recovery_owner: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     browser_session_recovery_depth: int = field(default=0, init=False, repr=False)
@@ -1531,6 +1535,9 @@ async def _mcp_browser_context_impl(
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
             organization_id=ctx.organization_id,
+            request_failures=ctx.request_failure_logs_by_browser_session.setdefault(
+                browser_session_id, RequestFailureLog()
+            ),
         )
         if working_page is not None:
             # The browser state's pin outlives this per-call SessionState, so every tool call

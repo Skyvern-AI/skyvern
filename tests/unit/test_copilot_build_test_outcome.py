@@ -4,7 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.failure_classifier import with_sign_in_form_visible
@@ -23,8 +25,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY,
     _build_dynamic_system_prompt,
     _build_user_context,
+    _build_wip_exit_result,
     _prior_run_debug_text,
     _recorded_build_test_outcome_prompt,
+    _review_projection_for,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -64,9 +68,11 @@ from skyvern.forge.sdk.copilot.completion_verification import CompletionVerifica
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+    BUILD_TEST_PACKET_KEY,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
     labelled_url_screen_reasons,
@@ -74,6 +80,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     project_direct_test_handoff_packet_for_llm,
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     build_test_page_state_from_evidence,
@@ -81,9 +88,10 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
-    COPILOT_PROPOSAL_CHANGED_ERROR,
+    COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR,
     _authored_literal_locator_selectors,
     _carry_prior_attempt_change_identity_into_result,
     _failed_block_code,
@@ -100,9 +108,22 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     project_run_results_page,
     with_loop_observations,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _update_workflow,
+    publish_workflow_candidate,
+    restore_pending_workflow_proposal,
+)
+from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations, workflow_to_copilot_yaml
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PRIVATE_SETTINGS_KEY,
+    CopilotProposalMetadata,
+    copilot_proposal_metadata,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
@@ -115,6 +136,8 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
+    WorkflowDefinition,
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
@@ -5499,8 +5522,11 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("token_moved", "source_moved"), [(True, True), (False, True), (True, False)])
 async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
     monkeypatch: pytest.MonkeyPatch,
+    token_moved: bool,
+    source_moved: bool,
 ) -> None:
     ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
     ctx.workflow_copilot_chat_id = "chat-1"
@@ -5511,12 +5537,15 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 
     async def bind_candidate_run(**kwargs: object) -> None:
         captured.update(kwargs)
-        raise CopilotProposalConflictError("candidate changed")
+        raise CopilotProposalConflictError("candidate changed", reason="token_changed")
 
     async def prepare_workflow(**_kwargs: object) -> SimpleNamespace:
-        ctx.proposal_owner_turn_id = "turn-newer"
-        ctx.proposal_revision = 1
-        ctx.staged_workflow = ctx.staged_workflow.model_copy(update={"title": "Newer candidate"})
+        if token_moved:
+            ctx.proposal_owner_turn_id = "turn-newer"
+            ctx.proposal_revision = 1
+        if source_moved:
+            ctx.staged_workflow = ctx.staged_workflow.model_copy(update={"title": "Newer candidate"})
+        captured["ctx_at_bind"] = (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow)
         return SimpleNamespace(
             workflow_run_id="wr_source",
             workflow_id="w_source",
@@ -5526,18 +5555,17 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 
     forge_app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run = bind_candidate_run
     forge_app.DATABASE.workflows.soft_delete_workflow_by_id = AsyncMock()
-    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
     monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
-    assert result == {
-        "ok": False,
-        "error": COPILOT_PROPOSAL_CHANGED_ERROR,
-    }
+    assert (result["ok"], result["conflict_reason"], result["adoption"]) == (False, "token_changed", "kept")
+    assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert captured["expected_owner_turn_id"] == "turn-source"
     assert captured["expected_revision"] == 3
     assert captured["expected_workflow_yaml"] == HANDBACK_WORKFLOW_YAML
+    assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == captured["ctx_at_bind"]
 
 
 @pytest.mark.asyncio
@@ -5566,6 +5594,446 @@ async def test_canonical_run_does_not_bind_a_stale_proposal_token(
     assert result["data"]["execution_source"]["source_kind"] == "canonical"
     bind_candidate_run.assert_not_awaited()
     assert harness["executor_cancelled"] is False
+
+
+_NEWER_CANDIDATE_YAML = HANDBACK_WORKFLOW_YAML.replace("title: extraction example", "title: newer example")
+_STORED_CODE_ARTIFACT_METADATA = {"extract_heading": {"goal_value_paths": ["heading"]}}
+_OTHER_TURN_PRIVATE_SETTINGS = {
+    "totp_identifier": "otp@example.test",
+    "webhook_callback_url": "https://hooks.test/done",
+}
+
+
+async def _install_real_candidate_cas(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    *,
+    blockless_saved_workflow: bool = False,
+) -> tuple[dict[str, Any], WorkflowParametersRepository, str]:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="completed",
+        terminal_blocks=[terminal_extraction_block("completed")],
+    )
+    saved = harness["workflow"]
+    if blockless_saved_workflow:
+        saved = saved.model_copy(update={"workflow_definition": WorkflowDefinition(parameters=[], blocks=[])})
+        forge_app.DATABASE.workflows.get_workflow = AsyncMock(return_value=saved)
+        forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=saved)
+    forge_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=saved)
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    forge_app.DATABASE.workflow_params = repo
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wfp-1")
+    turn_one = make_copilot_ctx(workflow_copilot_chat_id=chat.workflow_copilot_chat_id, turn_id="turn-one")
+    await publish_workflow_candidate(turn_one, workflow=harness["workflow"], workflow_yaml=HANDBACK_WORKFLOW_YAML)
+    return harness, repo, chat.workflow_copilot_chat_id
+
+
+async def _restored_turn(chat_id: str, turn_id: str, **overrides: object) -> CopilotContext:
+    ctx = make_copilot_ctx(
+        browser_session_id="pbs_chat", workflow_copilot_chat_id=chat_id, turn_id=turn_id, **overrides
+    )
+    await restore_pending_workflow_proposal(ctx)
+    return ctx
+
+
+async def _run_extract_heading(ctx: CopilotContext) -> dict[str, Any]:
+    ctx.frontier_resume_session_id = "pbs_run"
+    return await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+
+async def _publish_from_another_turn(chat_id: str, code_artifact_metadata: dict[str, Any] | None = None) -> None:
+    turn_b = await _restored_turn(chat_id, "turn-b")
+    turn_b.code_artifact_metadata = code_artifact_metadata
+    turn_b.authored_private_workflow_settings = dict(_OTHER_TURN_PRIVATE_SETTINGS)
+    assert turn_b.staged_workflow is not None
+    newer = turn_b.staged_workflow.model_copy(update={"title": "newer example"})
+    await publish_workflow_candidate(turn_b, workflow=newer, workflow_yaml=_NEWER_CANDIDATE_YAML)
+
+
+async def _stored_candidate(
+    repo: WorkflowParametersRepository, chat_id: str
+) -> tuple[dict[str, Any], CopilotProposalMetadata]:
+    chat = await repo.get_workflow_copilot_chat_by_id(organization_id="org-1", workflow_copilot_chat_id=chat_id)
+    assert chat is not None and isinstance(chat.proposed_workflow, dict)
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    assert metadata is not None
+    return chat.proposed_workflow, metadata
+
+
+async def _next_model_response(ctx: CopilotContext) -> None:
+    await CopilotRunHooks(ctx).on_llm_end(MagicMock(), MagicMock(), MagicMock(output=[]))
+
+
+def _bind_lost_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry for entry in logs if entry["event"] == "copilot candidate run bind lost"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["as_stored", "other_settings", "cleared", "saved_changed"])
+async def test_candidate_run_bind_after_a_rejected_restore_dispatches_only_the_stored_prior_draft(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, case: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(
+        monkeypatch, sqlite_engine, blockless_saved_workflow=True
+    )
+    stored, _ = await _stored_candidate(repo, chat_id)
+    if case == "saved_changed":
+        changed = forge_app.DATABASE.workflows.get_workflow_by_permanent_id.return_value.model_copy(
+            update={"description": "edited after the proposal"}
+        )
+        forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=changed)
+    ctx = await _restored_turn(
+        chat_id,
+        "turn-two",
+        workflow_yaml=HANDBACK_WORKFLOW_YAML.replace("extract_heading", "user_edited_block"),
+        prior_copilot_workflow_yaml=stored["_copilot_yaml"],
+        private_workflow_settings={"webhook_callback_url": "https://hooks.test/request"}
+        if case == "other_settings"
+        else {},
+    )
+    assert (ctx.staged_workflow, ctx.proposal_owner_turn_id, ctx.proposal_revision) == (None, "turn-one", 1)
+    if case == "cleared":
+        await repo.clear_workflow_copilot_candidate(
+            "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+        )
+    settings_before = copy.deepcopy(ctx.private_workflow_settings)
+
+    with capture_logs() as logs:
+        first = await _run_extract_heading(ctx)
+
+    assert first["ok"] is (case == "as_stored"), first
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == (1 if case == "as_stored" else 0)
+    if case == "saved_changed":
+        assert (first["conflict_reason"], first["adoption"]) == ("bytes_changed", "canonical_fingerprint_mismatch")
+    elif case == "cleared":
+        assert (first["conflict_reason"], first["adoption"]) == ("candidate_missing", "cleared")
+        assert [entry["reason"] for entry in _bind_lost_logs(logs)] == ["candidate_missing"]
+        await _next_model_response(ctx)
+        assert (await _run_extract_heading(ctx))["ok"] is False
+        assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    elif case == "other_settings":
+        second = await _run_extract_heading(ctx)
+        assert [first, second] == [{"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}] * 2
+        workflow_service_module.prepare_workflow.assert_not_awaited()
+        assert ctx.private_workflow_settings == settings_before
+        assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, None)
+        assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
+    else:
+        assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id == "wr_paused"
+
+
+@pytest.mark.asyncio
+async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim_is_live(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    ctx = await _restored_turn(chat_id, "turn-a")
+    passed = await _run_extract_heading(ctx)
+    assert passed["ok"] is True, passed
+    await repo.claim_workflow_copilot_candidate(
+        "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+    )
+    claimed_before, _ = await _stored_candidate(repo, chat_id)
+    staged_before, outcome_before, trace_before = ctx.staged_workflow, ctx.last_run_outcome, list(ctx.run_outcome_trace)
+    ctx.last_test_ok, ctx.frontier_resume_session_id = True, "pbs_run"
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(run_execution_module, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        tools_module, "_plan_frontier", lambda *_args: (["extract_heading"], {}, "extract_heading", "initial")
+    )
+    workflow_service_module.prepare_workflow.return_value = SimpleNamespace(
+        workflow_run_id="wr_refused",
+        workflow_id="w_source",
+        browser_session_id="pbs_run",
+        sequential_credential_id=None,
+    )
+    tool_context = SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug")
+    arguments = json.dumps({"block_labels": ["extract_heading"], "parameters": {}})
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+
+    with capture_logs() as logs:
+        runs = [json.loads(await tools_module.run_blocks_tool.on_invoke_tool(tool_context, arguments))]
+        runs.append(await _run_extract_heading(ctx))
+        edits = [await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True) for _ in "ab"]
+
+    assert [(result["ok"], result["conflict_reason"], result["adoption"]) for result in runs + edits] == [
+        (False, "being_accepted", "claimed")
+    ] * 4
+    assert BUILD_TEST_PACKET_KEY not in runs[0]["data"]
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 1
+    assert [(entry["reason"], entry["adoption"]) for entry in _bind_lost_logs(logs)] == [
+        ("being_accepted", "claimed")
+    ] * 2
+    assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, staged_before)
+    assert (ctx.last_test_ok, ctx.last_run_outcome, ctx.run_outcome_trace) == (True, outcome_before, trace_before)
+    assert (await _stored_candidate(repo, chat_id))[0] == claimed_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "event"),
+    [("bytes_changed", "copilot candidate run bind lost"), ("unexpected_error", "copilot candidate run bind failed")],
+)
+async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, reason: str, event: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    ctx = await _restored_turn(chat_id, "turn-a")
+    if reason == "bytes_changed":
+        ctx.staged_workflow_yaml = HANDBACK_WORKFLOW_YAML.replace("https://example.com", "https://example.org")
+    else:
+        monkeypatch.setattr(repo, "bind_workflow_copilot_candidate_run", AsyncMock(side_effect=RuntimeError("down")))
+
+    with capture_logs() as logs:
+        result = await _run_extract_heading(ctx)
+
+    assert (result["ok"], result.get("conflict_reason")) == (False, reason if reason == "bytes_changed" else None)
+    assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
+    assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
+    assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
+
+
+_ACCEPTED_WEBHOOK = "https://hooks.example.test/accepted"
+
+
+async def _accept_concurrently(harness: dict[str, Any], repo: WorkflowParametersRepository, chat_id: str) -> Workflow:
+    accepted = harness["workflow"].model_copy(
+        update={"workflow_id": "w_accepted", "webhook_callback_url": _ACCEPTED_WEBHOOK}
+    )
+    versions = {harness["workflow"].workflow_id: harness["workflow"], accepted.workflow_id: accepted}
+    forge_app.DATABASE.workflows.get_workflow = AsyncMock(
+        side_effect=lambda workflow_id, organization_id: versions.get(workflow_id)
+    )
+    forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=accepted)
+    forge_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=accepted)
+    await repo.clear_workflow_copilot_candidate(
+        "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+    )
+    return accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["test", "edit"])
+@pytest.mark.parametrize("concurrent", ["publish", "accept"])
+async def test_stale_proposal_token_conflict_recovers_so_the_next_call_succeeds(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, path: str, concurrent: str
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(
+        chat_id,
+        "turn-a",
+        workflow_id=harness["workflow"].workflow_id,
+        private_workflow_settings={"webhook_callback_url": "https://hooks.example.test/stale"}
+        if path == "edit"
+        else {},
+    )
+    ctx.executed_block_fingerprints = workflow_block_fingerprints(HANDBACK_WORKFLOW_YAML)
+    ctx.verified_prefix_labels = ["extract_heading"]
+    ctx.workflow_verification_evidence.full_workflow_verified = True
+    if concurrent == "publish":
+        await _publish_from_another_turn(chat_id, code_artifact_metadata=_STORED_CODE_ARTIFACT_METADATA)
+        expected = ("token_changed", "adopted")
+    else:
+        accepted = await _accept_concurrently(harness, repo, chat_id)
+        expected = ("candidate_missing", "cleared")
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+
+    async def test_or_edit() -> dict[str, Any]:
+        if path == "test":
+            return await _run_extract_heading(ctx)
+        return await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True)
+
+    with capture_logs() as logs:
+        first = await test_or_edit()
+
+    assert (first["ok"], first["conflict_reason"], first["adoption"]) == (False, *expected)
+    conflict_events = {"copilot candidate run bind lost", "copilot_candidate_publication_conflict"}
+    assert [(entry["reason"], entry["adoption"]) for entry in logs if entry["event"] in conflict_events] == [expected]
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    if concurrent == "publish":
+        assert first["adopted_workflow_yaml"] == _NEWER_CANDIDATE_YAML
+        assert (ctx.proposal_owner_turn_id, ctx.proposal_revision) == ("turn-b", 1)
+        assert ctx.code_artifact_metadata == _STORED_CODE_ARTIFACT_METADATA
+        assert (ctx.verified_prefix_labels, ctx.workflow_verification_evidence.full_workflow_verified) == ([], False)
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
+        assert review is not None and [block["neverTested"] for block in review["blocks"]] == [True]
+    else:
+        assert ctx.workflow_yaml == workflow_to_copilot_yaml(accepted)
+
+    await _next_model_response(ctx)
+    second = await test_or_edit()
+
+    assert second["ok"] is True, second
+    if path == "test":
+        assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 1
+        if concurrent == "accept":
+            resolved_workflow_id = workflow_service_module.prepare_workflow.await_args.kwargs["resolved_workflow_id"]
+            assert resolved_workflow_id == accepted.workflow_id
+            return
+        create_draft = forge_app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version
+        dispatched = create_draft.await_args.kwargs["runtime_workflow"]
+        assert [dispatched.totp_identifier, dispatched.webhook_callback_url] == [*_OTHER_TURN_PRIVATE_SETTINGS.values()]
+        return
+    stored, metadata = await _stored_candidate(repo, chat_id)
+    assert (metadata.owner_turn_id, metadata.revision) == ("turn-a", 1)
+    assert "Extract the page title." in stored["_copilot_yaml"]
+    if concurrent == "publish":
+        assert stored[COPILOT_PRIVATE_SETTINGS_KEY] == _OTHER_TURN_PRIVATE_SETTINGS
+    else:
+        assert ctx.staged_workflow is not None and ctx.staged_workflow.webhook_callback_url == _ACCEPTED_WEBHOOK
+        assert stored.get("webhook_callback_url") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_call", "second_call", "overlap"),
+    [
+        ("edit", "edit", True),
+        ("test", "edit", True),
+        ("edit", "edit", False),
+        ("edit", "test", False),
+        ("test", "test", False),
+    ],
+)
+async def test_stale_proposal_token_adoption_refuses_a_call_written_before_it(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, first_call: str, second_call: str, overlap: bool
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(chat_id, "turn-a", workflow_id=harness["workflow"].workflow_id)
+    await _publish_from_another_turn(chat_id)
+    stored_before, _ = await _stored_candidate(repo, chat_id)
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+    stale_metadata = {"extract_heading": {"goal_value_paths": ["stale"]}}
+
+    def call(kind: str, metadata: object = None) -> Coroutine[Any, Any, dict[str, Any]]:
+        if kind == "test":
+            return _run_extract_heading(ctx)
+        params = {"workflow_yaml": edit, "code_artifact_metadata": metadata}
+        return _update_workflow(params, ctx, allow_missing_credentials=True)
+
+    if overlap:
+        results = await asyncio.gather(call(first_call), call(second_call, stale_metadata))
+    else:
+        # The second call of the same model response starts after the first adopted, as when a wrapper waits on
+        # a lock or the credential gate before reaching the write.
+        results = [await call(first_call)]
+        submission_before = (ctx.raw_code_artifact_metadata, ctx.code_artifact_metadata)
+        results.append(await call(second_call, stale_metadata))
+        assert (ctx.raw_code_artifact_metadata, ctx.code_artifact_metadata) == submission_before
+
+    assert [(result["ok"], result["conflict_reason"], result["adoption"]) for result in results] == [
+        (False, "token_changed", "adopted")
+    ] * 2
+    assert (await _stored_candidate(repo, chat_id))[0] == stored_before
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dropped_by", ["in_flight_edit", "earlier_edit"])
+async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, dropped_by: str
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(chat_id, "turn-a", workflow_id=harness["workflow"].workflow_id)
+    ctx.code_artifact_metadata = {
+        "extract_heading": {"completion_criteria": [{"deliverable_kind": "generated_file", "id": "report"}]}
+    }
+    contract_dropping_edit = HANDBACK_WORKFLOW_YAML.replace(
+        "  parameters: []\n",
+        "  parameters: []\n  completion_contract:\n    schema_version: 1\n    criteria:\n"
+        "      - id: report\n        kind: generated_file\n        min_count: 1\n",
+    )
+    if dropped_by == "earlier_edit":
+        dropped = await _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True)
+        assert dropped["ok"] is True and ctx.clear_persisted_completion_contract is True
+        await _publish_from_another_turn(chat_id)
+        adopting = await _run_extract_heading(ctx)
+    else:
+        await _publish_from_another_turn(chat_id)
+        sibling_adopted = asyncio.Event()
+        real_canonicalize = workflow_update_module.canonicalize_named_google_sheet_bindings
+
+        async def canonicalize_after_the_sibling_adopts(workflow_yaml: str, call_ctx: object) -> object:
+            # Holds the contract-dropping edit past its entry check until its sibling has adopted.
+            if "completion_contract" in workflow_yaml:
+                await sibling_adopted.wait()
+            return await real_canonicalize(workflow_yaml, call_ctx)
+
+        monkeypatch.setattr(
+            workflow_update_module, "canonicalize_named_google_sheet_bindings", canonicalize_after_the_sibling_adopts
+        )
+
+        async def sibling_edit() -> dict[str, Any]:
+            try:
+                return await _update_workflow(
+                    {"workflow_yaml": HANDBACK_WORKFLOW_YAML}, ctx, allow_missing_credentials=True
+                )
+            finally:
+                sibling_adopted.set()
+
+        adopting, in_flight = await asyncio.gather(
+            sibling_edit(),
+            _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True),
+        )
+        assert (in_flight["ok"], in_flight["adoption"]) == (False, "adopted")
+    assert (adopting["ok"], adopting["adoption"]) == (False, "adopted")
+
+    await _next_model_response(ctx)
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+    assert (await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True))["ok"] is True
+
+    assert (ctx.has_staged_proposal, ctx.clear_persisted_completion_contract) == (True, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["auto_accept", "cancel"])
+async def test_stale_proposal_token_adoption_leaves_the_stored_candidate_untouched_at_turn_end(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, exit_path: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    turn_start_chat = await repo.update_workflow_copilot_chat(
+        organization_id="org-1", workflow_copilot_chat_id=chat_id, auto_accept=exit_path == "auto_accept"
+    )
+    assert turn_start_chat is not None
+    ctx = await _restored_turn(chat_id, "turn-a")
+    ctx.staged_workflow_yaml = HANDBACK_WORKFLOW_YAML.replace("https://example.com", "https://example.org")
+    conflict = await _run_extract_heading(ctx)
+    assert (conflict["conflict_reason"], conflict["adoption"]) == ("bytes_changed", "adopted")
+    await _next_model_response(ctx)
+    assert (await _run_extract_heading(ctx))["ok"] is True
+    stored_before, _ = await _stored_candidate(repo, chat_id)
+
+    if exit_path == "cancel":
+        await workflow_copilot_route._persist_cancel_turn(
+            stream=MagicMock(send=AsyncMock(return_value=True)),
+            chat=turn_start_chat,
+            organization_id="org-1",
+            original_workflow=None,
+            user_message="stop",
+            agent_result=_build_wip_exit_result(ctx, None, cancelled=True),
+            turn_id="turn-a",
+        )
+    else:
+        await workflow_copilot_route._persist_proposed_workflow_state(
+            turn_start_chat, _build_wip_exit_result(ctx, None), restored=False
+        )
+
+    assert (await _stored_candidate(repo, chat_id))[0] == stored_before
 
 
 @pytest.mark.asyncio

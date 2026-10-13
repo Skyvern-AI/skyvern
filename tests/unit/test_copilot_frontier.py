@@ -155,6 +155,7 @@ class _FakeDefinition:
 class _FakeWorkflow:
     def __init__(self, definition: _FakeDefinition) -> None:
         self.workflow_definition = definition
+        self.proxy_location = None
 
     def model_copy(self, *, deep: bool = False) -> _FakeWorkflow:
         return copy.deepcopy(self) if deep else _FakeWorkflow(self.workflow_definition)
