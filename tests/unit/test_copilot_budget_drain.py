@@ -9,41 +9,60 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from agents import ModelSettings, function_tool
+from agents import Agent, ModelSettings, RunContextWrapper, SQLiteSession, function_tool
 from agents.exceptions import MaxTurnsExceeded
 from agents.run_config import RunConfig
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
+    _build_narrative_payload,
     _build_timeout_exit_result,
     _format_chat_history,
     _translate_to_agent_result,
 )
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionPart, QuestionResponse
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     BUDGET_DRAIN_HEADROOM,
     EXPIRED_TURN_REPLY_SECONDS,
     HARD_BACKSTOP_ALLOWANCE_SECONDS,
     TOTAL_TIMEOUT_SECONDS,
+    CopilotTotalTimeoutError,
     run_final_reply_drain,
     run_with_enforcement,
 )
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
-from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _run_blocks_and_collect_debug,
+    hydrate_prior_run_packet,
+    recorded_open_step_runs,
+)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
+from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import (
+    HANDBACK_WORKFLOW_YAML,
+    OWNED_RUN_ID,
     REPLY_ARGUMENTS,
+    FakeCopilotStream,
+    OwnedRunRow,
     ScriptedModel,
+    install_run_blocks_harness,
+    install_secret_carrying_run_registry,
+    make_build_test_ctx,
     make_copilot_ctx,
     run_scripted_turn,
     scripted_call,
+    scripted_text,
+    settle_cancelled_tools,
     tool_outputs_for,
 )
 
@@ -700,3 +719,165 @@ async def test_unknown_tool_recovery_keeps_the_budget_drain_within_its_headroom(
         await run_scripted_turn(model, tools=[probe], max_turns=1)
 
     assert len(model.inputs) == 1 + BUDGET_DRAIN_HEADROOM
+
+
+async def _build_test_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dispatch_to_worker: bool,
+    block_first_read: bool = False,
+    on_chat_browser: bool = False,
+) -> tuple[dict[str, Any], OwnedRunRow, CopilotContext, ScriptedModel]:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+    )
+    owned = OwnedRunRow(monkeypatch, block_first_read=block_first_read)
+    monkeypatch.setattr(forge_app, "CACHE", MagicMock(get=AsyncMock(return_value=None)))
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.steer.STEER_POLL_SECONDS", 0.01)
+    ctx = make_build_test_ctx(harness, monkeypatch, on_chat_browser=on_chat_browser, stream=FakeCopilotStream())
+    ctx.workflow_copilot_chat_id = "chat-1"
+    ctx.copilot_cancel_token = "cancel-token"
+    model = ScriptedModel(
+        [
+            [scripted_call("run_blocks_and_collect_debug", {"block_labels": ["extract_heading"]}, "call_run")],
+            [scripted_text("A model call after the build test was cancelled.")],
+        ]
+    )
+    return harness, owned, ctx, model
+
+
+@function_tool(name_override="run_blocks_and_collect_debug", strict_mode=False)
+async def _build_test_tool(ctx: RunContextWrapper[CopilotContext], block_labels: list[str]) -> str:
+    result = await _run_blocks_and_collect_debug({"block_labels": block_labels, "parameters": {}}, ctx.context)
+    return json.dumps(result, default=str)
+
+
+async def _run_build_test_turn(ctx: CopilotContext, model: ScriptedModel) -> None:
+    session = SQLiteSession("build-test-turn")
+    try:
+        await run_with_enforcement(
+            agent=Agent(
+                name="build-test-turn",
+                model=model,
+                tools=[_build_test_tool, tools_module.reply_tool],
+                tool_use_behavior=tools_module.reply_ends_turn,
+            ),
+            initial_input="Test the workflow.",
+            ctx=ctx,
+            stream=ctx.stream,
+            session=session,
+            hooks=CopilotRunHooks(ctx),
+            run_config=RunConfig(tracing_disabled=True),
+        )
+    finally:
+        session.close()
+
+
+def _saved_left_run_ids(ctx: CopilotContext) -> list[str]:
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="", narrative_summary="")
+    return payload.get("budgetExpiry", {}).get("leftRunIds", [])
+
+
+def _expire_turn_soon(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0.3)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.1)
+
+
+def _make_prior_run_readable(monkeypatch: pytest.MonkeyPatch, workflow: Workflow) -> None:
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_for_workflow_run", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(forge_app.DATABASE.artifacts, "get_artifacts_for_run", AsyncMock(return_value=[]))
+    monkeypatch.setattr(forge_app.DATABASE.self_heal, "get_heal_episodes_for_run", AsyncMock(return_value=[]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_outcome", ["completed", "failed", None])
+async def test_hard_backstop_leaves_the_active_dispatched_test_to_its_worker(
+    monkeypatch: pytest.MonkeyPatch, worker_outcome: str | None
+) -> None:
+    harness, owned, ctx, model = await _build_test_turn(monkeypatch, dispatch_to_worker=True)
+    _expire_turn_soon(monkeypatch)
+
+    with pytest.raises(CopilotTotalTimeoutError):
+        await _run_build_test_turn(ctx, model)
+    left_run_ids = _saved_left_run_ids(ctx)
+    reported = await recorded_open_step_runs(ctx)
+    await settle_cancelled_tools()
+    if worker_outcome is not None:
+        owned.finish(worker_outcome)
+
+    assert left_run_ids == [OWNED_RUN_ID]
+    assert [(run.workflow_run_id, run.left_running) for run in reported] == [(OWNED_RUN_ID, True)]
+
+    assert ctx.budget_expiry_state.hard_backstop_reached
+    assert owned.polled.is_set()
+    assert owned.cancel_writes == []
+    assert len(model.inputs) == 1
+    assert ctx.dispatched_run_ids_this_turn == {OWNED_RUN_ID}
+    owned.draft_deletes.assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    _make_prior_run_readable(monkeypatch, harness["workflow"])
+    packet = await hydrate_prior_run_packet(make_copilot_ctx(), workflow_run_id=OWNED_RUN_ID)
+    assert packet is not None
+    assert (packet["run"]["workflow_run_id"], packet["run"]["status"]) == (
+        OWNED_RUN_ID,
+        worker_outcome or "running",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", ["on_chat_browser", "owes_secrets", "carries_registered_secrets"])
+async def test_hard_backstop_still_cancels_a_test_it_cannot_leave_running(
+    monkeypatch: pytest.MonkeyPatch, run: str
+) -> None:
+    harness, owned, ctx, model = await _build_test_turn(
+        monkeypatch, dispatch_to_worker=True, on_chat_browser=run == "on_chat_browser"
+    )
+    if run != "on_chat_browser":
+        install_secret_carrying_run_registry(monkeypatch, all_registered=run == "carries_registered_secrets")
+    _expire_turn_soon(monkeypatch)
+
+    with pytest.raises(CopilotTotalTimeoutError):
+        await _run_build_test_turn(ctx, model)
+    left_run_ids = _saved_left_run_ids(ctx)
+    reported = await recorded_open_step_runs(ctx)
+    await settle_cancelled_tools()
+
+    assert left_run_ids == []
+    assert [(run.workflow_run_id, run.left_running) for run in reported] == [(OWNED_RUN_ID, False)]
+    assert ctx.budget_expiry_state.hard_backstop_reached
+    assert owned.cancel_writes == [OWNED_RUN_ID]
+    assert owned.row.status == "canceled"
+    assert len(model.inputs) == 1
+    assert harness["clear"].await_count == (0 if run == "on_chat_browser" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False])
+@pytest.mark.parametrize("elapsed_at_stop", [300.0, 950.0])
+@pytest.mark.parametrize("block_first_read", [False, True])
+async def test_stop_still_cancels_the_active_build_test(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool, elapsed_at_stop: float, block_first_read: bool
+) -> None:
+    harness, owned, ctx, model = await _build_test_turn(
+        monkeypatch, dispatch_to_worker=dispatch_to_worker, block_first_read=block_first_read
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement._elapsed_run_seconds", lambda *_: elapsed_at_stop)
+
+    turn = asyncio.create_task(_run_build_test_turn(ctx, model))
+    await asyncio.wait_for(owned.polled.wait(), timeout=5)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    left_run_ids = _saved_left_run_ids(ctx)
+    await settle_cancelled_tools()
+
+    assert left_run_ids == []
+    assert ctx.copilot_total_timeout_exceeded is (elapsed_at_stop >= 900)
+    assert owned.cancel_writes == [OWNED_RUN_ID]
+    assert owned.row.status == "canceled"
+    assert harness["executor_cancelled"] is not dispatch_to_worker
+    harness["clear"].assert_awaited_once()

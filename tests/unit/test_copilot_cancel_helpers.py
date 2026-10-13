@@ -19,13 +19,28 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import itertools
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.copilot.tools import _cancel_run_task_if_not_final, _trusted_post_drain_status
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.runtime import browser_session_lock
+from skyvern.forge.sdk.copilot.tools import _cancel_run_task_if_not_final, _trusted_post_drain_status, run_execution
+from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from tests.unit.copilot_test_helpers import (
+    HANDBACK_WORKFLOW_YAML,
+    OWNED_RUN_ID,
+    OwnedRunRow,
+    adopted_detached_tasks,
+    install_run_blocks_harness,
+    install_secret_carrying_run_registry,
+    make_build_test_ctx,
+    make_copilot_ctx,
+    settle_cancelled_tools,
+)
 
 
 class _FakeService:
@@ -223,3 +238,125 @@ def test_trusted_post_drain_handles_missing_row() -> None:
     """A missing row (DB read returned None) is treated the same as a
     non-final row: no trusted status, caller emits the timeout error."""
     assert _trusted_post_drain_status(None) is None
+
+
+async def _build_test_under_backstop(ctx: CopilotContext, fire_when: asyncio.Event) -> None:
+    """Expire the stream's real timeout once the tool reaches the phase under test, not after a wall-clock delay."""
+    async with asyncio.timeout(None) as deadline:
+        ctx.model_stream_deadline = deadline
+
+        async def _expire_when_reached() -> None:
+            await fire_when.wait()
+            deadline.reschedule(asyncio.get_running_loop().time())
+
+        trigger = asyncio.create_task(_expire_when_reached())
+        try:
+            await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+        finally:
+            trigger.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_sibling_does_not_unmark_a_concurrent_leavable_run() -> None:
+    ctx = make_copilot_ctx()
+    ctx.budget_expiry_state.leavable_run_ids.extend(["wr_left", "wr_sibling"])
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0) as deadline:
+            await asyncio.sleep(1)
+
+    run_execution._unmark_leavable_run(ctx, "wr_sibling")
+
+    assert run_execution._backstop_may_leave_run_running(deadline, ctx.budget_expiry_state, "wr_left")
+    assert not run_execution._backstop_may_leave_run_running(deadline, ctx.budget_expiry_state, "wr_sibling")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_first_read", [False, True])
+async def test_backstop_detaches_an_inline_build_test_instead_of_cancelling_it(
+    monkeypatch: pytest.MonkeyPatch, block_first_read: bool
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=HANDBACK_WORKFLOW_YAML, polled_status="running"
+    )
+    owned = OwnedRunRow(monkeypatch, block_first_read=block_first_read)
+    ctx = make_build_test_ctx(harness, monkeypatch)
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+
+    with pytest.raises(TimeoutError):
+        await _build_test_under_backstop(ctx, fire_when=owned.polled)
+    await settle_cancelled_tools()
+
+    adopted = adopted_detached_tasks(before)
+    try:
+        assert owned.polled.is_set()
+        assert owned.cancel_writes == []
+        assert harness["executor_cancelled"] is False
+        assert len(adopted) == 1 and not adopted[0].done()
+        harness["clear"].assert_not_awaited()
+    finally:
+        for task in adopted:
+            task.cancel()
+        await asyncio.gather(*adopted, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", ["detached", "detached_owes_secrets", "on_chat_browser"])
+async def test_backstop_during_submission_cancels_the_run(monkeypatch: pytest.MonkeyPatch, run: str) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=HANDBACK_WORKFLOW_YAML, polled_status="running", dispatch_to_worker=True
+    )
+    owned = OwnedRunRow(monkeypatch)
+    owned.row.status = WorkflowRunStatus.queued
+    if run == "detached_owes_secrets":
+        install_secret_carrying_run_registry(monkeypatch)
+    submitted = asyncio.Event()
+
+    async def _submit_forever(**_kwargs: object) -> None:
+        submitted.set()
+        await asyncio.Event().wait()
+
+    harness["worker_execute"].side_effect = _submit_forever
+    ctx = make_build_test_ctx(harness, monkeypatch, on_chat_browser=run == "on_chat_browser")
+
+    with pytest.raises(TimeoutError):
+        await _build_test_under_backstop(ctx, fire_when=submitted)
+
+    assert submitted.is_set()
+    assert owned.draft_deletes.await_count == 1
+    assert owned.cancel_writes == [OWNED_RUN_ID]
+    if run == "detached_owes_secrets":
+        assert not browser_session_lock(ctx, session_id="pbs_run").locked()
+        assert ("pbs_run", OWNED_RUN_ID) in ctx.awaited_run_secret_handoffs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_by", ["worker", "watchdog", "watchdog_cancel_in_flight"])
+async def test_backstop_after_the_run_ended_does_not_leave_it_to_an_owner(
+    monkeypatch: pytest.MonkeyPatch, ended_by: str
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=HANDBACK_WORKFLOW_YAML, polled_status="running", dispatch_to_worker=True
+    )
+    owned = OwnedRunRow(monkeypatch, block_first_cancel=ended_by == "watchdog_cancel_in_flight")
+    if ended_by == "worker":
+        owned.finish("completed")
+    else:
+        monkeypatch.setattr(run_execution, "time", SimpleNamespace(monotonic=itertools.count(step=600).__next__))
+    run_ended = asyncio.Event()
+
+    async def _park_after_the_run(*_args: object, **_kwargs: object) -> None:
+        run_ended.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(run_execution, "_halt_turn_if_superseded", _park_after_the_run)
+    ctx = make_build_test_ctx(harness, monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        await _build_test_under_backstop(
+            ctx, fire_when=owned.cancel_started if ended_by == "watchdog_cancel_in_flight" else run_ended
+        )
+
+    assert owned.cancel_writes == ([] if ended_by == "worker" else [OWNED_RUN_ID])
+    assert owned.row.status == ("completed" if ended_by == "worker" else "canceled")
+    owned.draft_deletes.assert_awaited_once()
+    harness["clear"].assert_awaited_once()
