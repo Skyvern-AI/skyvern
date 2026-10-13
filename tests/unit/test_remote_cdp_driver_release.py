@@ -1291,7 +1291,7 @@ async def test_cleanup_for_script_releases_persistent_session_without_closing_dr
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="session_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )
@@ -1341,7 +1341,7 @@ async def test_cleanup_for_script_tracing_failure_does_not_skip_close_or_release
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="session_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )
@@ -1570,7 +1570,7 @@ async def test_cleanup_for_script_completes_release_when_cancelled_during_close(
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="session_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )  # release too
@@ -1651,7 +1651,7 @@ async def test_cleanup_for_script_survives_repeated_cancellation(monkeypatch: py
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="session_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )

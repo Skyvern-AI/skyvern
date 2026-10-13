@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.webeye import schemas as browser_session_schemas
 from skyvern.webeye.schemas import BrowserSessionResponse
+from tests.unit._external_cdp_fakes import CDP_URL, TOKEN, external_session_row
 
 # Every field a client is allowed to read off a browser session. Adding a field to
 # BrowserSessionResponse fails the pin below until it is listed here, which is the point:
@@ -49,6 +50,8 @@ PINNED_CLIENT_FIELDS = frozenset(
         "deleted_at",
         "created_by",
         "warning",
+        "source",
+        "remaining_lifetime_seconds",
     }
 )
 
@@ -488,6 +491,38 @@ async def test_no_server_side_row_value_reaches_the_serialized_response() -> Non
     for field, sentinel in sentinels.items():
         assert sentinel not in serialized, f"{field} leaked into the response"
         assert field not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "source", "lifetime"),
+    [
+        ("open", "external", (58 * 60, 59 * 60)),
+        ("past_deadline", "external", (0, 0)),
+        ("closed", "external", None),
+        ("managed", "managed", None),
+    ],
+)
+async def test_a_registration_reports_its_source_and_fixed_remaining_lifetime_but_never_its_address(
+    state: str, source: str, lifetime: tuple[int, int] | None
+) -> None:
+    session = external_session_row(started_minutes_ago=61 if state == "past_deadline" else 1)
+    if state == "closed":
+        session.status, session.completed_at = "completed", datetime.now(timezone.utc)
+    if state == "managed":
+        session.browser_vendor, session.upstream_cdp_url = None, None
+
+    with patch.object(app.AGENT_FUNCTION, "resolve_browser_session_connect_url", AsyncMock(return_value=None)):
+        response = await BrowserSessionResponse.from_browser_session(session)
+
+    assert response.source == source
+    if lifetime is None:
+        assert response.remaining_lifetime_seconds is None
+    else:
+        assert response.remaining_lifetime_seconds is not None
+        assert lifetime[0] <= response.remaining_lifetime_seconds <= lifetime[1]
+    serialized = response.model_dump_json()
+    assert CDP_URL not in serialized and TOKEN not in serialized and ":9333" not in serialized
 
 
 @pytest.mark.asyncio

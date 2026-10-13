@@ -240,6 +240,44 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("page_free", [False, True])
+async def test_engine_samples_a_single_actions_effect_with_the_action_effect_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, page_free: bool
+) -> None:
+    # The settle fingerprint drops a frame that will not answer, which would read as the action having an effect.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def unmasked() -> str:
+        return "unmasked"
+
+    async def masked() -> str:
+        return "masked"
+
+    async def action_effect() -> str:
+        return "action_effect"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_free=page_free,
+        page_fingerprint=unmasked,
+        settle_fingerprint=masked,
+        action_effect_fingerprint=action_effect,
+    )
+
+    assert captured["action_effect_fingerprint"] is (None if page_free else action_effect)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("single_action_block", [True, False])
 async def test_engine_forwards_single_action_block_to_the_loop(
     monkeypatch: pytest.MonkeyPatch, single_action_block: bool
@@ -1052,6 +1090,60 @@ async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_
     assert all(sig not in transcript for sig in (signature, cover_signature, start_signature))
     assert captured_sources == [signed_url, cover_url]
     assert page.url == start_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("block_type", "navigates"), [("validation", False), ("extraction", True), ("action", True)])
+async def test_only_a_validation_block_is_refused_navigation(
+    monkeypatch: pytest.MonkeyPatch, block_type: str, navigates: bool
+) -> None:
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    start_url, other_url = "https://portal.example.test/case", "https://portal.example.test/other"
+    caller = _ScriptedCaller(
+        [[("navigate", {"url": other_url})], [("finish", {"status": "completed", "reason": "checked"})]]
+    )
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check the case.",
+        starting_url=start_url,
+        block_type=block_type,
+    )
+
+    assert page.url == (other_url if navigates else start_url)
+    navigate_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert navigate_result.startswith("refused") is not navigates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_url", "masked"),
+    [
+        ("https://portal.example.test/case?ticket=q8ZtR2vXk9LmP4sWb7NcY1hJd6FgT3aE", True),
+        ("https://portal.example.test/case/42", False),
+    ],
+)
+async def test_a_start_url_the_browser_is_on_is_not_offered_as_a_destination(start_url: str, masked: bool) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "checked"})]])
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check that the case is open.",
+        starting_url=start_url,
+        starting_url_is_current=True,
+    )
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert "You start on" not in user_prompt
+    shown = OpaqueUrlRefs(masked=None, refs={}).derive(start_url) if masked else start_url
+    assert shown in user_prompt
+    assert "ticket=" not in user_prompt
 
 
 @pytest.mark.asyncio

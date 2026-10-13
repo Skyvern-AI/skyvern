@@ -1,0 +1,390 @@
+---
+title: "Browser profiles"
+description: "Save and reuse browser state (cookies, storage) across runs."
+slug: sdk-reference/browser-profiles
+keywords:
+  - "browser profile"
+  - "cookies"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+A browser profile is a saved snapshot of browser state. Create one from a finished run or session, then pass its `browser_profile_id` (`bp_…`) to later runs to start already signed in.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## create_browser_profile
+
+Create a blank browser profile, or create one from a persistent browser session or workflow run.
+
+<CodeGroup>
+```python Python
+await skyvern.create_browser_profile(
+    *,
+    name: str,
+    description: str | None = ...,
+    browser_session_id: str | None = ...,
+    workflow_run_id: str | None = ...,
+    proxy_location: CreateBrowserProfileRequestProxyLocation | None = ...,
+    proxy_session_id: str | None = ...,
+) -> BrowserProfile
+```
+
+```typescript TypeScript
+skyvern.createBrowserProfile(request: CreateBrowserProfileRequest): Promise<BrowserProfile>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `name` | `name` | `str` | Yes | — | Name for the browser profile |
+| `description` | `description` | `str \| None` | No | — | Optional profile description |
+| `browser_session_id` | `browser_session_id` | `str \| None` | No | — | Persistent browser session to convert into a profile. Omit for a blank profile. |
+| `workflow_run_id` | `workflow_run_id` | `str \| None` | No | — | Workflow run whose persisted session should be captured. Omit for a blank profile. |
+| `proxy_location` | `proxy_location` | `CreateBrowserProfileRequestProxyLocation \| None` | No | — | Optional proxy location for this profile's pinned proxy identity. |
+| `proxy_session_id` | `proxy_session_id` | `str \| None` | No | — | Explicit sticky-session id for this profile's pinned proxy identity. |
+
+**Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
+
+<Accordion title="BrowserProfile fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_profile_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `name` | `str` |  |
+| `description` | `str \| None` |  |
+| `source_browser_type` | `str \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `proxy_session_id` | `str \| None` |  |
+| `is_managed` | `bool \| None` |  |
+| `workflow_permanent_id` | `str \| None` |  |
+| `browser_profile_key_digest` | `str \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.create_browser_profile(
+        name="Signed-in profile",
+        browser_session_id="pbs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.createBrowserProfile({
+    name: "Signed-in profile",
+    browser_session_id: "pbs_123",
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_browser_profile
+
+Get a specific browser profile by ID
+
+<CodeGroup>
+```python Python
+await skyvern.get_browser_profile(profile_id: str) -> BrowserProfile
+```
+
+```typescript TypeScript
+skyvern.getBrowserProfile(profileId: string): Promise<BrowserProfile>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile. browser_profile_id starts with `bp_` |
+
+**Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
+
+<Accordion title="BrowserProfile fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_profile_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `name` | `str` |  |
+| `description` | `str \| None` |  |
+| `source_browser_type` | `str \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `proxy_session_id` | `str \| None` |  |
+| `is_managed` | `bool \| None` |  |
+| `workflow_permanent_id` | `str \| None` |  |
+| `browser_profile_key_digest` | `str \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_browser_profile(profile_id="bp_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getBrowserProfile("bp_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## list_browser_profiles
+
+Get all browser profiles for the organization
+
+<CodeGroup>
+```python Python
+await skyvern.list_browser_profiles(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    include_deleted: bool | None = None,
+    search_key: str | None = None,
+    managed: bool | None = None,
+) -> list[BrowserProfile]
+```
+
+```typescript TypeScript
+skyvern.listBrowserProfiles(request?: ListBrowserProfilesRequest): Promise<BrowserProfile[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | `page` | `int \| None` | No | `None` |  |
+| `page_size` | `page_size` | `int \| None` | No | `None` |  |
+| `include_deleted` | `include_deleted` | `bool \| None` | No | `None` | Include deleted browser profiles |
+| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches. |
+| `managed` | `managed` | `bool \| None` | No | `None` | Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles. |
+
+**Returns** `list[BrowserProfile]` · TypeScript `Promise<BrowserProfile[]>`
+
+<Accordion title="BrowserProfile fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_profile_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `name` | `str` |  |
+| `description` | `str \| None` |  |
+| `source_browser_type` | `str \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `proxy_session_id` | `str \| None` |  |
+| `is_managed` | `bool \| None` |  |
+| `workflow_permanent_id` | `str \| None` |  |
+| `browser_profile_key_digest` | `str \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.list_browser_profiles()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.listBrowserProfiles();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## update_browser_profile
+
+Update a browser profile's name and/or description
+
+<CodeGroup>
+```python Python
+await skyvern.update_browser_profile(
+    profile_id: str,
+    *,
+    name: str | None = ...,
+    description: str | None = ...,
+    proxy_location: UpdateBrowserProfileRequestProxyLocation | None = ...,
+    proxy_session_id: str | None = ...,
+    rotate_proxy_session_id: bool | None = ...,
+) -> BrowserProfile
+```
+
+```typescript TypeScript
+skyvern.updateBrowserProfile(profileId: string, request?: UpdateBrowserProfileRequest): Promise<BrowserProfile>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile to update. browser_profile_id starts with `bp_` |
+| `name` | `name` | `str \| None` | No | — | New name for the browser profile |
+| `description` | `description` | `str \| None` | No | — | New description for the browser profile |
+| `proxy_location` | `proxy_location` | `UpdateBrowserProfileRequestProxyLocation \| None` | No | — | Optional proxy location for this profile's pinned proxy identity. |
+| `proxy_session_id` | `proxy_session_id` | `str \| None` | No | — | Opaque Skyvern-managed proxy sticky-session id. |
+| `rotate_proxy_session_id` | `rotate_proxy_session_id` | `bool \| None` | No | — | Rotate the Skyvern-managed proxy sticky-session id for this profile. |
+
+**Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
+
+<Accordion title="BrowserProfile fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_profile_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `name` | `str` |  |
+| `description` | `str \| None` |  |
+| `source_browser_type` | `str \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `proxy_session_id` | `str \| None` |  |
+| `is_managed` | `bool \| None` |  |
+| `workflow_permanent_id` | `str \| None` |  |
+| `browser_profile_key_digest` | `str \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.update_browser_profile(profile_id="bp_123", name="Signed-in profile")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.updateBrowserProfile("bp_123", { name: "Signed-in profile" });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## delete_browser_profile
+
+Delete a browser profile (soft delete)
+
+<CodeGroup>
+```python Python
+await skyvern.delete_browser_profile(profile_id: str) -> None
+```
+
+```typescript TypeScript
+skyvern.deleteBrowserProfile(profileId: string): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile to delete. browser_profile_id starts with `bp_` |
+
+**Returns** `None` · TypeScript `Promise<void>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    await skyvern.delete_browser_profile(profile_id="bp_123")
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+await skyvern.deleteBrowserProfile("bp_123");
+```
+</CodeGroup>

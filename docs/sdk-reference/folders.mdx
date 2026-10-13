@@ -1,0 +1,451 @@
+---
+title: "Folders"
+description: "Organize agents into folders."
+slug: sdk-reference/folders
+keywords:
+  - "folder"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Folders group agents in the Skyvern app. An agent belongs to at most one folder.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## create_folder
+
+Create a new folder to organize workflows
+
+<CodeGroup>
+```python Python
+await skyvern.create_folder(*, title: str, description: str | None = ...) -> Folder
+```
+
+```typescript TypeScript
+skyvern.createFolder(request: FolderCreate): Promise<Folder>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `title` | `title` | `str` | Yes | — | Folder title |
+| `description` | `description` | `str \| None` | No | — | Folder description |
+
+**Returns** `Folder` · TypeScript `Promise<Folder>`
+
+<Accordion title="Folder fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | `str` | Folder title |
+| `description` | `str \| None` | Folder description |
+| `folder_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `workflow_count` | `int \| None` | Number of workflows in this folder |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.create_folder(title="Invoices")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.createFolder({ title: "Invoices" });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_folder
+
+Get a specific folder by ID
+
+<CodeGroup>
+```python Python
+await skyvern.get_folder(folder_id: str) -> Folder
+```
+
+```typescript TypeScript
+skyvern.getFolder(folderId: string): Promise<Folder>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
+
+**Returns** `Folder` · TypeScript `Promise<Folder>`
+
+<Accordion title="Folder fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | `str` | Folder title |
+| `description` | `str \| None` | Folder description |
+| `folder_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `workflow_count` | `int \| None` | Number of workflows in this folder |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_folder(folder_id="fld_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getFolder("fld_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_folders
+
+Get all folders for the organization
+
+<CodeGroup>
+```python Python
+await skyvern.get_folders(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    search: str | None = None,
+) -> list[Folder]
+```
+
+```typescript TypeScript
+skyvern.getFolders(request?: GetFoldersRequest): Promise<Folder[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | `page` | `int \| None` | No | `None` | Page number |
+| `page_size` | `page_size` | `int \| None` | No | `None` | Number of folders per page |
+| `search` | `search` | `str \| None` | No | `None` | Search folders by title or description |
+
+**Returns** `list[Folder]` · TypeScript `Promise<Folder[]>`
+
+<Accordion title="Folder fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | `str` | Folder title |
+| `description` | `str \| None` | Folder description |
+| `folder_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `workflow_count` | `int \| None` | Number of workflows in this folder |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_folders()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getFolders();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## update_folder
+
+Update a folder's title or description
+
+<CodeGroup>
+```python Python
+await skyvern.update_folder(
+    folder_id: str,
+    *,
+    title: str | None = ...,
+    description: str | None = ...,
+) -> Folder
+```
+
+```typescript TypeScript
+skyvern.updateFolder(folderId: string, request?: FolderUpdate): Promise<Folder>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
+| `title` | `title` | `str \| None` | No | — | Folder title |
+| `description` | `description` | `str \| None` | No | — | Folder description |
+
+**Returns** `Folder` · TypeScript `Promise<Folder>`
+
+<Accordion title="Folder fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `title` | `str` | Folder title |
+| `description` | `str \| None` | Folder description |
+| `folder_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `workflow_count` | `int \| None` | Number of workflows in this folder |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.update_folder(folder_id="fld_123", title="Invoices")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.updateFolder("fld_123", { title: "Invoices" });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## delete_folder
+
+Delete a folder. Optionally delete all workflows in the folder.
+
+<CodeGroup>
+```python Python
+await skyvern.delete_folder(
+    folder_id: str,
+    *,
+    delete_workflows: bool | None = None,
+) -> dict[str, Any | None]
+```
+
+```typescript TypeScript
+skyvern.deleteFolder(folderId: string, request?: DeleteFolderRequest): Promise<Record<string, unknown>>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
+| `delete_workflows` | `delete_workflows` | `bool \| None` | No | `None` | If true, also delete all workflows in this folder |
+
+**Returns** `dict[str, Any \| None]` · TypeScript `Promise<Record<string, unknown>>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.delete_folder(folder_id="fld_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.deleteFolder("fld_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## update_workflow_folder
+
+Update a workflow's folder assignment for the latest version
+
+<CodeGroup>
+```python Python
+await skyvern.update_workflow_folder(
+    workflow_permanent_id: str,
+    *,
+    folder_id: str | None = ...,
+) -> Workflow
+```
+
+```typescript TypeScript
+skyvern.updateWorkflowFolder(workflowPermanentId: string, request?: UpdateWorkflowFolderRequest): Promise<Workflow>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | Workflow permanent ID |
+| `folder_id` | `folder_id` | `str \| None` | No | — | Folder ID to assign workflow to. Set to null to remove from folder. |
+
+**Returns** `Workflow` · TypeScript `Promise<Workflow>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.update_workflow_folder(
+        workflow_permanent_id="wpid_123",
+        folder_id="fld_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.updateWorkflowFolder("wpid_123", { folder_id: "fld_123" });
+console.log(result);
+```
+</CodeGroup>

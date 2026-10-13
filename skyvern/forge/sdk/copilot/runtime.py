@@ -343,6 +343,7 @@ class ScoutedSelectorCandidate(TypedDict):
     selector: str
     source: str
     match_count: int | None
+    visible_match_count: NotRequired[int]
 
 
 class ScoutedInteraction(TypedDict):
@@ -969,7 +970,7 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
 
 BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
 RAW_SECRET_BROWSER_ERROR = (
-    "This turn contains a redacted raw secret. Do not use the browser; persist only the redacted draft and call "
+    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
     "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
 )
 

@@ -856,6 +856,21 @@ describe("BrowserStream", () => {
     });
   });
 
+  it("opens no stream on the session page for a registered external browser", async () => {
+    respondWith(async () => ({
+      data: { ...(await respondWithRunningSession()).data, source: "external" },
+    }));
+
+    renderBrowserSession();
+
+    await screen.findByText(
+      "Live view is not available for a registered external browser.",
+    );
+    expect(mocks.rfbInstances).toHaveLength(0);
+    expect(mocks.wsInstances).toHaveLength(0);
+    expect(screen.queryByTestId("cdp-screencast")).toBeNull();
+  });
+
   it("backs off VNC reconnects and reports stopped only after the cap", async () => {
     vi.useFakeTimers();
     try {

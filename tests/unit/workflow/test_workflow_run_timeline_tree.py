@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import TypeAdapter
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
@@ -13,9 +16,13 @@ from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockType
-from skyvern.utils.action_redaction import REDACTED_OTP_VALUE
-from skyvern.webeye.actions.actions import ActionType, ExtractAction
-from tests.unit.helpers import make_action_row, make_session_factory_yielding
+from skyvern.webeye.actions.actions import Action, ExtractAction
+from tests.unit.helpers import (
+    ONE_TIME_CODE,
+    assert_one_time_code_withheld,
+    make_one_time_code_action_rows,
+    make_session_factory_yielding,
+)
 
 
 def _block(
@@ -154,42 +161,34 @@ async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> N
 
 
 @pytest.mark.asyncio
-async def test_timeline_serves_the_typed_value_and_the_one_time_code(
-    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("cap_output_values", [True, False])
+async def test_timeline_serves_the_typed_value_and_withholds_the_one_time_code(
+    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch, cap_output_values: bool
 ) -> None:
     """Driven through the real repository read, because the typed value is resolved in hydration."""
     base = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
     mock_db.return_value = [_block("wrb_task", created_at=base, task_id="tsk_test")]
-    otp_row = make_action_row(
-        action_id="act_otp",
-        action_type=ActionType.INPUT_TEXT,
-        element_id="otp",
-        response=REDACTED_OTP_VALUE,
-        action_json={
-            "element_id": "otp",
-            "text": "314159",
-            "response": "314159",
-            "totp_identifier": "inbox@example.test",
-        },
+    repo = TasksRepository.__new__(TasksRepository)
+    monkeypatch.setattr(
+        TasksRepository, "Session", make_session_factory_yielding(make_one_time_code_action_rows()), raising=False
     )
-    typed_row = make_action_row(
-        action_id="act_typed",
-        action_type=ActionType.INPUT_TEXT,
-        element_id="street",
-        action_json={"element_id": "street", "text": "Meridian Ave"},
-    )
-    monkeypatch.setattr(TasksRepository, "Session", make_session_factory_yielding([otp_row, typed_row]), raising=False)
-    monkeypatch.setattr(app.DATABASE, "tasks", TasksRepository.__new__(TasksRepository))
+    hydrated: list[Action] = []
+    read = repo.get_tasks_actions
+
+    async def read_and_keep(**kwargs: Any) -> list[Action]:
+        hydrated.extend(await read(**kwargs))
+        return hydrated
+
+    monkeypatch.setattr(repo, "get_tasks_actions", read_and_keep)
+    monkeypatch.setattr(app.DATABASE, "tasks", repo)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
-        workflow_run_id="wr_test", organization_id="o_test", cap_output_values=True
+        workflow_run_id="wr_test", organization_id="o_test", cap_output_values=cap_output_values
     )
 
-    assert timeline[0].block is not None
-    otp_action, typed_action = timeline[0].block.actions
-    assert otp_action.text == "314159"
-    assert otp_action.response == "314159"
-    assert typed_action.text == "Meridian Ave"
+    body = TypeAdapter(list[WorkflowRunTimeline]).dump_json(timeline).decode()
+    assert_one_time_code_withheld(body, json.loads(body)[0]["block"]["actions"], hydrated)
+    assert hydrated[0].text == ONE_TIME_CODE
 
 
 @pytest.mark.asyncio

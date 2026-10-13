@@ -569,6 +569,9 @@ function finishTurnHistory() {
 async function stageProposalOn(
   blockLabel: string,
   props: Partial<ChatProps> = {},
+  narrative_payload = proposalNarrativePayload({
+    draft: { blockCount: 1, blockLabels: [blockLabel], summary: null },
+  }),
 ) {
   historyGet.mockImplementation((path: string) =>
     Promise.resolve(
@@ -589,9 +592,7 @@ async function stageProposalOn(
   await act(async () => {
     streamCalls[0]!.onMessage(
       proposalResponse("Draft ready.", {
-        narrative_payload: proposalNarrativePayload({
-          draft: { blockCount: 1, blockLabels: [blockLabel], summary: null },
-        }),
+        narrative_payload,
         proposed_workflow_metadata: {
           owner_turn_id: "turn-1",
           revision: 1,
@@ -8188,63 +8189,128 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.queryByTestId("proposal-run-facts")).toBeNull();
   });
 
-  it("keeps facts and the accepted receipt on the earlier proposal owner", async () => {
-    await stageProposalOn("extract_titles");
-    await submit("test it end to end");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
-    historyResponse.data.proposed_workflow_metadata = {
+  const seamBlocks = ["open_listing", "extract_titles", "save_report"];
+  const seamOwner = (state: string) =>
+    proposalNarrativePayload({
+      draft: { blockCount: 3, blockLabels: seamBlocks, summary: null },
+      blocks: seamBlocks.map((label) => ({
+        workflowRunBlockId: `wrb_${label}`,
+        label,
+        state,
+        activity: [],
+      })),
+    });
+  const laterFullTest = proposalNarrativePayload({
+    turnId: "turn-2",
+    turnIndex: 1,
+    proposalDisposition: "review_tested",
+    turnFacts: { ...bundles["full-coverage"].turnFacts, runId: "wr-extracted" },
+  });
+  // The server re-records the stored candidate's disposition when a later turn tests its bytes.
+  let stored: "review_tested" | "review_untested" = "review_tested";
+  const boundCandidate = () => ({
+    proposed_workflow_metadata: {
       owner_turn_id: "turn-1",
       revision: 1,
       canonical_fingerprint: "canonical-1",
-      disposition: "review_untested",
+      disposition: stored,
       workflow_run_id: "wr-extracted",
-    };
-    historyResponse.data.proposed_workflow_run = objectOutputRunFacts();
+    },
+    proposed_workflow_run: objectOutputRunFacts(),
+  });
+  const hydrate = async (...chat_history: Record<string, unknown>[]) => {
+    Object.assign(historyResponse.data, boundCandidate(), {
+      proposed_workflow: proposedWorkflowPayload(),
+      chat_history,
+    });
+    await renderChat();
+  };
+  const reload = (...payloads: Record<string, unknown>[]) =>
+    hydrate(
+      ...payloads.map((narrative_payload) => ({
+        sender: "ai",
+        content: "Done.",
+        narrative_payload,
+      })),
+    );
+  const stream = async (owner: Record<string, unknown>) => {
+    await stageProposalOn("extract_titles", {}, owner);
+    await submit("test it end to end");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    Object.assign(historyResponse.data, boundCandidate());
     await act(async () => {
       streamCalls[1]!.onMessage(
         proposalResponse("Test finished.", {
           turn_id: "turn-2",
-          narrative_payload: proposalNarrativePayload({
-            turnId: "turn-2",
-            turnIndex: 1,
-          }),
-          proposed_workflow_metadata: {
-            owner_turn_id: "turn-1",
-            revision: 1,
-            canonical_fingerprint: "canonical-1",
-            disposition: "review_untested",
-            workflow_run_id: "wr-extracted",
-          },
+          proposal_disposition: "review_tested",
+          narrative_payload: laterFullTest,
+          ...boundCandidate(),
           proposed_workflow_run: null,
         }),
       );
       streamCalls[1]!.resolve();
     });
+  };
 
-    expectReadableObjectOutput(await screen.findByTestId("proposal-run-facts"));
-    expect(
-      gateActionsIn(document.getElementById("copilot-gate-turn-1")),
-    ).not.toHaveLength(0);
-    expect(
-      gateActionsIn(document.getElementById("copilot-gate-turn-2")),
-    ).toHaveLength(0);
+  // A clean-looking later turn is not enough: the card reads only what the server stored.
+  it.each([
+    ["stream", "completed", "review_tested"],
+    ["history", "completed", "review_tested"],
+    ["history", "failed", "review_tested"],
+    ["stream", "completed", "review_untested"],
+    ["history", "completed", "review_untested"],
+  ] as const)(
+    "%s, owner blocks %s, stored %s",
+    async (seam, state, disposition) => {
+      stored = disposition;
+      await (seam === "stream" ? stream : reload)(
+        seamOwner(state),
+        laterFullTest,
+      );
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Accept" }));
-    });
+      const runCard = await screen.findByTestId("proposal-run-facts");
+      expectReadableObjectOutput(runCard);
+      const gate = document.getElementById("copilot-gate-turn-1")?.textContent;
+      if (disposition === "review_tested") {
+        expect(gate).toContain("Tested");
+        expect(gate).not.toMatch(/Untested|not together|Test failed/);
+      } else {
+        expect(gate).toContain("Untested");
+      }
+      const link = within(runCard).getByRole("link", { name: /View run/ });
+      expect(link).toHaveProperty("pathname", "/runs/wr-extracted");
+      expect(
+        gateActionsIn(document.getElementById("copilot-gate-turn-1")),
+      ).not.toHaveLength(0);
+      expect(
+        gateActionsIn(document.getElementById("copilot-gate-turn-2")),
+      ).toHaveLength(0);
 
-    expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
-      expect.objectContaining({ owner_turn_id: "turn-1" }),
-      expect.anything(),
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+      });
+
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/apply-proposed-workflow",
+        expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
+        expect.anything(),
+      );
+      expect(
+        acceptedReceiptIn(document.getElementById("copilot-gate-turn-1")),
+      ).not.toBeNull();
+      expect(
+        acceptedReceiptIn(document.getElementById("copilot-gate-turn-2")),
+      ).toBeNull();
+    },
+  );
+
+  it("reads Tested on a pending gate that has no owner row", async () => {
+    stored = "review_tested";
+    await hydrate(
+      { sender: "ai", content: "Done.", narrative_payload: laterFullTest },
+      { sender: "user", content: "thanks" },
     );
-    expect(
-      acceptedReceiptIn(document.getElementById("copilot-gate-turn-1")),
-    ).not.toBeNull();
-    expect(
-      acceptedReceiptIn(document.getElementById("copilot-gate-turn-2")),
-    ).toBeNull();
+    expect(await screen.findByText("Tested")).toBeTruthy();
   });
 
   it("backfills facts on a first turn, before the chat id ref catches up", async () => {

@@ -6,9 +6,11 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 const useCloseBrowserSessionMutation = ({
   browserSessionId,
+  external = false,
   onSuccess,
 }: {
   browserSessionId?: string;
+  external?: boolean;
   onSuccess?: () => void;
 }) => {
   const credentialGetter = useCredentialGetter();
@@ -34,11 +36,20 @@ const useCloseBrowserSessionMutation = ({
       queryClient.invalidateQueries({
         queryKey: ["browserSession", browserSessionId],
       });
-      toast({
-        variant: "success",
-        title: "Browser Session Closed",
-        description: "The browser session has been successfully closed.",
-      });
+      toast(
+        external
+          ? {
+              variant: "success",
+              title: "Disconnected",
+              description:
+                "Skyvern disconnected from the browser. The browser itself keeps running.",
+            }
+          : {
+              variant: "success",
+              title: "Browser Session Closed",
+              description: "The browser session has been successfully closed.",
+            },
+      );
       onSuccess?.();
     },
     onError: (error) => {

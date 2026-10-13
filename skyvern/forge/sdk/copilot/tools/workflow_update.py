@@ -787,7 +787,7 @@ def _latest_draft_yaml(ctx: AgentContext) -> str | None:
     return last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
 
 
-# Headroom under enforcement._RECENT_TOOL_OUTPUT_CHAR_CAP: a result past that cap is head-truncated,
+# Headroom under output_utils._RECENT_TOOL_OUTPUT_CHAR_CAP: a result past that cap is head-truncated,
 # which would leave the model a sliced, unparseable JSON payload instead of code it can re-anchor on.
 _MAX_STORED_CODE_CHARS = 30_000
 

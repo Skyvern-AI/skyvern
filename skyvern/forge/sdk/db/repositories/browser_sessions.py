@@ -61,17 +61,14 @@ _UNSET = object()
 # The status column is plain text; bind the final statuses as their string values for SQL predicates.
 _FINAL_STATUS_VALUES = tuple(status.value for status in FINAL_STATUSES)
 
-# A row with an upstream endpoint but no client-facing address yet is vendor-held (the vendor
-# owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
-# customer-facing session surfaces. Self-hosted routed rows set both columns together, and
-# rows created before routing existed set neither — both cases stay visible.
-_VISIBLE_TO_CUSTOMER = and_(
-    or_(
-        PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
-        PersistentBrowserSessionModel.browser_address.isnot(None),
-    ),
-    PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR),
+# A vendor-held row has an upstream endpoint but no client-facing address, and stays off customer-facing surfaces.
+# Self-hosted routed rows, pre-routing rows and the caller's own registered external browsers all stay visible.
+_VISIBLE_TO_CUSTOMER = or_(
+    PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
+    PersistentBrowserSessionModel.browser_address.isnot(None),
+    PersistentBrowserSessionModel.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
 )
+_NOT_EXTERNAL_CDP = PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR)
 
 
 def clear_terminal_session_fields(row: PersistentBrowserSessionModel) -> None:
@@ -591,10 +588,13 @@ class BrowserSessionsRepository(BaseRepository):
         self,
         organization_id: str,
         active_hours: int = 24,
+        *,
+        include_external_cdp: bool = False,
     ) -> list[PersistentBrowserSession]:
-        """Get all active persistent browser sessions for an organization."""
+        """Active sessions for an organization. Registered external browsers only on request, because some callers
+        close every session listed and must not end a browser the customer runs."""
         async with self.Session() as session:
-            result = await session.execute(
+            query = (
                 select(PersistentBrowserSessionModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
@@ -602,6 +602,9 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter(PersistentBrowserSessionModel.created_at > naive_utc_now() - timedelta(hours=active_hours))
                 .filter(_VISIBLE_TO_CUSTOMER)
             )
+            if not include_external_cdp:
+                query = query.filter(_NOT_EXTERNAL_CDP)
+            result = await session.execute(query)
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
 
@@ -864,9 +867,9 @@ class BrowserSessionsRepository(BaseRepository):
     async def touch_last_activity(self, session_id: str, last_activity_at: datetime | None = None) -> None:
         """Record that a session was actively driven, for activity-based lease renewal.
 
-        Unscoped by organization on purpose: the CDP proxy calls this and learns the owning
-        org from the row, never from client input. A single UPDATE with no read-back — a
-        best-effort, no-op when the row is gone — so it stays cheap on the relay hot path.
+        Unscoped by organization on purpose: the CDP proxy learns the owning org from the row,
+        while SDK callers must verify ownership before calling. A single UPDATE with no read-back,
+        and a no-op when the row is gone, keeps it cheap on the relay hot path.
         """
         ts = to_naive_utc(last_activity_at) if last_activity_at is not None else naive_utc_now()
         async with self.Session() as session:
@@ -876,9 +879,16 @@ class BrowserSessionsRepository(BaseRepository):
                 .where(PersistentBrowserSessionModel.deleted_at.is_(None))
                 # Monotonic write: touches are fire-and-forget from the proxy, so an out-of-order
                 # commit must never move last_activity_at backward and shorten a live lease.
+                # CASE, not GREATEST: SQLite has no GREATEST, and the statement error rolls back
+                # whatever transaction the test DB's shared connection is carrying. A NULL mark
+                # fails the comparison and takes the else, matching the prior COALESCE behavior.
                 .values(
-                    last_activity_at=func.greatest(
-                        func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts
+                    last_activity_at=case(
+                        (
+                            PersistentBrowserSessionModel.last_activity_at > ts,
+                            PersistentBrowserSessionModel.last_activity_at,
+                        ),
+                        else_=ts,
                     )
                 )
             )

@@ -418,6 +418,40 @@ def test_unknown_error_still_redacts_cdp_endpoints_for_session_closed_error() ->
     assert "[remote browser endpoint]" in message
 
 
+@pytest.mark.parametrize(
+    ("call_log_tail", "expects_new_session_advice"),
+    [
+        # The socket opened and the attach handshake then blew the deadline. Playwright leaves that
+        # socket attached to the browser, so it keeps buffering events and the next attach to the
+        # same session is slower — "high demand" and "re-run" both point the caller the wrong way.
+        (
+            "- <ws connecting> wss://sessions.skyvern.com/pbs_1/tok - <ws connected> wss://sessions.skyvern.com/pbs_1/tok",
+            True,
+        ),
+        # Timed out before the socket opened: Playwright cleaned it up, nothing is attached, and
+        # retrying the same session is still the right move.
+        ("- <ws connecting> wss://sessions.skyvern.com/pbs_1/tok", False),
+    ],
+    ids=["socket-opened-then-handshake-stalled", "timed-out-before-socket-opened"],
+)
+def test_connect_timeout_message_depends_on_whether_the_socket_opened(
+    call_log_tail: str, expects_new_session_advice: bool
+) -> None:
+    raw_error = f"BrowserType.connect_over_cdp: Timeout 30000ms exceeded. Call log: {call_log_tail}"
+
+    message = get_user_facing_exception_message(Exception(raw_error))
+
+    assert "sessions.skyvern.com" not in message
+    assert "wss://" not in message
+    if expects_new_session_advice:
+        assert "high demand" not in message
+        assert "re-running" not in message
+        assert "Start a new browser session" in message
+    else:
+        assert "high demand" in message
+        assert "try re-running" in message
+
+
 def test_non_browser_error_not_intercepted() -> None:
     """Regular errors should still pass through as-is."""
     message = get_user_facing_exception_message(ValueError("some other error"))

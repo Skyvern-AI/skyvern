@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunA
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
+from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
@@ -2037,7 +2038,9 @@ async def test_attempt_failure_reason_uses_response_text_cap(
     )
     assert response.attempts[0].failure_reason == response.failure_reason
     if cap_output_values:
-        assert len(response.attempts[0].failure_reason.encode("utf-8")) <= service_module.RUN_RESPONSE_MAX_VALUE_BYTES
+        assert (
+            len(response.attempts[0].failure_reason.encode("utf-8")) <= response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES
+        )
         assert response.attempts[0].failure_reason != reason
     else:
         assert response.attempts[0].failure_reason == reason

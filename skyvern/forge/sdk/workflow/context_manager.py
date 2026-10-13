@@ -96,6 +96,16 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 
+def _context_totp_values(current_context: skyvern_context.SkyvernContext | None) -> list[str]:
+    if current_context is None:
+        return []
+    return [
+        value
+        for key, value in current_context.totp_codes.items()
+        if isinstance(key, str) and not key.endswith(("_valid_from", "_valid_until")) and value is not None
+    ]
+
+
 def _normalize_credential_totp_identifier(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -2516,13 +2526,7 @@ class WorkflowContextManager:
             return task_secret_values
 
         context = self.workflow_run_contexts[workflow_run_id]
-        totp_values: list[str] = []
-        if current_context is not None:
-            totp_values = [
-                value
-                for key, value in current_context.totp_codes.items()
-                if isinstance(key, str) and not key.endswith(("_valid_from", "_valid_until")) and value is not None
-            ]
+        totp_values = _context_totp_values(current_context)
         runtime_otp_values: set[str] = getattr(context, "runtime_otp_values", set())
         secret_values = collect_redactable_secret_values(
             context.secrets, otp_values=[*totp_values, *runtime_otp_values]
@@ -2531,6 +2535,17 @@ class WorkflowContextManager:
             secret_values -= runtime_otp_values
             secret_values -= set(totp_values)
         return secret_values | task_secret_values
+
+    def get_one_time_codes_for_run(self, workflow_run_id: str | None) -> set[str]:
+        current_context = skyvern_context.current()
+        codes = set(_context_totp_values(current_context))
+        if current_context is not None:
+            # Magic sign-in links share runtime_secret_values but are not codes; marking one would make
+            # script generation emit a code fetch in place of the typed value.
+            codes |= current_context.runtime_secret_values - current_context.model_hidden_values
+        if workflow_run_id is not None and workflow_run_id in self.workflow_run_contexts:
+            codes |= self.workflow_run_contexts[workflow_run_id].runtime_otp_values
+        return codes
 
     def runtime_secret_values_for_artifacts(self) -> set[str]:
         """Runtime-resolved secrets (e.g. a v3-resolved verification code) redact under the global
