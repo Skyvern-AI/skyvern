@@ -64,6 +64,7 @@ from skyvern.forge.sdk.api.llm.utils import (
     llm_messages_builder_with_history,
     loads_with_repair,
     parse_api_response,
+    uses_only_anthropic_models,
 )
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -1203,6 +1204,27 @@ class LLMAPIHandlerFactory:
         return prompt_stripped
 
     @staticmethod
+    def _cache_static_prompt_for_anthropic(messages: list[dict[str, Any]], static_prompt: str) -> bool:
+        marked_static_block = {
+            "type": "text",
+            "text": static_prompt.rstrip(),
+            "cache_control": {"type": "ephemeral"},
+        }
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                return False
+            if content and content[0] == marked_static_block:
+                return True
+            if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
+                return False
+            content.insert(0, marked_static_block)
+            return True
+        return False
+
+    @staticmethod
     def _models_equivalent(left: str | None, right: str | None) -> bool:
         """Used only by `llm_api_handler_with_router_and_fallback`. Router model
         groups carry the `vertex-` prefix while LiteLLM responses return the
@@ -2105,6 +2127,16 @@ class LLMAPIHandlerFactory:
                     if (
                         context
                         and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages, redacted_cached_static_prompt
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        context
+                        and redacted_cached_static_prompt
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME  # Only inject for extract-actions
                         and isinstance(llm_config, LLMConfig)
                         and isinstance(llm_config.model_name, str)
@@ -2946,6 +2978,16 @@ class LLMAPIHandlerFactory:
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
                 # (e.g., check-user-goal) with the extract-action schema
                 try:
+                    if (
+                        context
+                        and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages, redacted_cached_static_prompt
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
                         context
                         and redacted_cached_static_prompt

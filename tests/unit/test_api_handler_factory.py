@@ -33,6 +33,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
+from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1079,6 +1080,146 @@ async def test_openai_caching_injected_for_extract_actions(monkeypatch: pytest.M
     assert any(part.get("text") == "This is the extract-action-static prompt content" for part in system_content), (
         f"System message should contain cached_static_prompt, got: {system_content}"
     )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "uses_anthropic_cache"),
+    [
+        ("anthropic/claude-sonnet-test", True),
+        ("gpt-test", False),
+        ("openai/claude-proxy", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_anthropic_prompt_caching_marks_static_user_content(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, uses_anthropic_cache: bool
+) -> None:
+    static_prompt = "static instructions"
+    dynamic_prompt = "dynamic context"
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = True
+    context.cached_static_prompt = static_prompt
+    context.hashed_href_map = {}
+    llm_config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+    captured_messages: list[dict[str, Any]] = []
+
+    async def mock_acompletion(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+        captured_messages.extend(kwargs["messages"])
+        return FakeLLMResponse(model_name)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", mock_acompletion)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler(f"TEST_PROMPT_CACHING_{model_name}")
+    await handler(
+        prompt=f"{static_prompt}\n\n{dynamic_prompt}",
+        prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+    )
+
+    user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
+    if uses_anthropic_cache:
+        assert LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(captured_messages, static_prompt)
+        assert user_content[:2] == [
+            {
+                "type": "text",
+                "text": static_prompt,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": dynamic_prompt},
+        ]
+        text_blocks = [
+            block["text"]
+            for message in captured_messages
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "text"
+        ]
+        assert text_blocks.count(static_prompt) == 1
+    else:
+        assert all("cache_control" not in block for block in user_content)
+
+
+@pytest.mark.parametrize(
+    ("provider_models", "uses_anthropic_cache"),
+    [
+        (["anthropic/claude-sonnet-test", "bedrock/us.anthropic.claude-test"], True),
+        (["anthropic/claude-sonnet-test", "openai/gpt-5.5"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
+    monkeypatch: pytest.MonkeyPatch, provider_models: list[str], uses_anthropic_cache: bool
+) -> None:
+    static_prompt = "static instructions"
+    dynamic_prompt = "dynamic context"
+    captured_messages: list[dict[str, Any]] = []
+
+    class _CapturingRouter:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: list[dict[str, Any]], **_: Any) -> FakeLLMResponse:
+            captured_messages.extend(messages)
+            return FakeLLMResponse(model)
+
+    llm_key = f"TEST_ANTHROPIC_CACHE_ROUTER_{uses_anthropic_cache}"
+    config = LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name=f"group-{index}",
+                litellm_params={"model": provider_model},
+            )
+            for index, provider_model in enumerate(provider_models)
+        ],
+        main_model_group="group-0",
+        fallback_model_group="group-1",
+    )
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    async def messages_builder(prompt: str, *_: Any) -> list[dict[str, Any]]:
+        return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+    monkeypatch.setattr(api_handler_factory, "llm_messages_builder", messages_builder)
+    context = SkyvernContext()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = True
+    context.cached_static_prompt = static_prompt
+    context.hashed_href_map = {}
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+    await handler(
+        prompt=f"{static_prompt}\n\n{dynamic_prompt}",
+        prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+    )
+
+    user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
+    marked_blocks = [block for block in user_content if "cache_control" in block]
+    if uses_anthropic_cache:
+        assert marked_blocks == [user_content[0]]
+        assert user_content[0]["text"] == static_prompt
+        assert sum(block.get("text") == static_prompt for block in user_content) == 1
+    else:
+        assert not marked_blocks
+
+
+def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
+    assert not uses_only_anthropic_models(_custom_llm_config("openai/claude-proxy"))
 
 
 def test_normalize_llm_model_strips_provider_prefix() -> None:
