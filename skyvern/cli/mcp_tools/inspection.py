@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import structlog
@@ -30,6 +30,11 @@ from ._common import DIRECT_TARGET_DESCRIPTION, BrowserContext, ErrorCode, make_
 from ._element_state import DEFAULT_ACTION_TIMEOUT_MS, action_deadline_error
 from ._read_retry import retry_read_on_page_change
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page, Request
+
+    from skyvern.cli.core.session_manager import RequestFailure
 
 # Query param keys whose values are redacted from captured URLs.
 _SECRET_QUERY_PARAMS = frozenset(
@@ -228,6 +233,9 @@ async def _capture_body(response: Any, request_id: int, state: Any) -> None:
             state._body_store[request_id] = safe_body
 
 
+_RECORDED_REQUEST_FAILURE_TYPES = frozenset({"document", "xhr", "fetch"})
+
+
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     """Create console/network/dialog/pageerror handlers bound to a specific page."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -378,6 +386,38 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         except BaseException:
             pass
 
+    def _on_requestfailed(request: Request) -> None:
+        try:
+            if request.resource_type not in _RECORDED_REQUEST_FAILURE_TYPES or raw_page.is_closed():
+                return
+            log = state.request_failures
+            if request in log.seen:
+                return
+            log.seen.add(request)
+            failure: RequestFailure = {
+                "url": _redact_url(request.url),
+                "method": request.method,
+                "resource_type": request.resource_type,
+                "failure_text": request.failure or "",
+                "page_url": _redact_url(raw_page.url),
+                "tab_id": str(id(raw_page)),
+                "timestamp": time.time(),
+            }
+            entry = _redact_inspection_value(state, failure)
+            if type(entry) is dict:
+                # tab_id is an internal key the model never sees; redacting it would file the entry under no tab.
+                entry["tab_id"] = failure["tab_id"]
+                log.append(entry)
+        except BaseException:
+            pass
+
+    def _on_close(_page: Page) -> None:
+        # Python reuses a closed page's id() for a later page, which would inherit these entries.
+        try:
+            state.request_failures.take_tab(str(id(raw_page)))
+        except BaseException:
+            pass
+
     def _body_capture_done(task: asyncio.Task[None], request_id: int, url: str) -> None:
         if task.cancelled():
             return
@@ -443,7 +483,14 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         except BaseException:
             pass
 
-    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog, "pageerror": _on_pageerror}
+    return {
+        "console": _on_console,
+        "response": _on_response,
+        "requestfailed": _on_requestfailed,
+        "close": _on_close,
+        "dialog": _on_dialog,
+        "pageerror": _on_pageerror,
+    }
 
 
 def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
@@ -455,6 +502,8 @@ def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
     handlers = _make_page_handlers(state, raw_page)
     raw_page.on("console", handlers["console"])
     raw_page.on("response", handlers["response"])
+    raw_page.on("requestfailed", handlers["requestfailed"])
+    raw_page.on("close", handlers["close"])
     raw_page.on("dialog", handlers["dialog"])
     raw_page.on("pageerror", handlers["pageerror"])
     state._hooked_page_ids.add(page_id)

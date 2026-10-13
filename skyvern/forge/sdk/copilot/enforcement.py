@@ -112,6 +112,10 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_FACT_KEYS,
+    PAGE_REQUEST_FAILURES_KEY,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError as CopilotUnrecoverableToolError,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
@@ -817,10 +821,10 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
-    # page_state rides on every browser result; it must not be what pushes a short result into compaction.
-    if isinstance(parsed.get("page_state"), dict):
-        without_page_state = {key: value for key, value in parsed.items() if key != "page_state"}
-        if len(json.dumps(without_page_state)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+    # Page facts ride on browser results; they must not be what pushes a short result into compaction.
+    if parsed.keys() & PAGE_FACT_KEYS:
+        without_page_facts = {key: value for key, value in parsed.items() if key not in PAGE_FACT_KEYS}
+        if len(json.dumps(without_page_facts)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
             return output
 
     # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
@@ -846,6 +850,9 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
     if isinstance(parsed.get("page_state"), dict):
         synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
+    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
+    if isinstance(request_failures, list) and request_failures:
+        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the

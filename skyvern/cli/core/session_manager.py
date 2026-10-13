@@ -10,7 +10,7 @@ from collections import deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, TypedDict
 
 import httpx
 import structlog
@@ -31,7 +31,7 @@ LOG = structlog.get_logger(__name__)
 _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page
+    from playwright.async_api import Frame, Page, Request
 
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -56,6 +56,55 @@ class ObserveV2State:
         self.refs = {}
 
 
+class RequestFailure(TypedDict):
+    url: str
+    method: str
+    resource_type: str
+    failure_text: str
+    page_url: str
+    tab_id: str
+    timestamp: float
+
+
+_MAX_REQUEST_FAILURES_PER_TAB = 20
+
+
+def newest_per_failure_text_first(entries: list[RequestFailure], limit: int) -> list[RequestFailure]:
+    """Up to ``limit`` entries in time order: the newest of each failure text first, then the newest of the rest,
+    so a burst of one kind of failure cannot displace a different one."""
+    seen: set[str] = set()
+    firsts: list[RequestFailure] = []
+    rest: list[RequestFailure] = []
+    for entry in reversed(entries):
+        (rest if entry["failure_text"] in seen else firsts).append(entry)
+        seen.add(entry["failure_text"])
+    kept = {id(entry) for entry in (firsts + rest)[:limit]}
+    return [entry for entry in entries if id(entry) in kept]
+
+
+@dataclass
+class RequestFailureLog:
+    # Keyed by tab so a noisy background tab cannot evict the working tab's failures.
+    entries: dict[str, list[RequestFailure]] = field(default_factory=dict)
+    # Several SessionStates can hook the same page, so each failed request is recorded once.
+    seen: weakref.WeakSet[Request] = field(default_factory=weakref.WeakSet)
+
+    def append(self, entry: RequestFailure) -> None:
+        tab = self.entries.setdefault(entry["tab_id"], [])
+        tab.append(entry)
+        if len(tab) > _MAX_REQUEST_FAILURES_PER_TAB:
+            tab[:] = newest_per_failure_text_first(tab, _MAX_REQUEST_FAILURES_PER_TAB)
+
+    def take_tab(self, tab_id: str) -> list[RequestFailure]:
+        return self.entries.pop(tab_id, [])
+
+    def restore(self, taken: list[RequestFailure]) -> None:
+        if taken:
+            tab_id = taken[0]["tab_id"]
+            merged = [*taken, *self.entries.get(tab_id, [])]
+            self.entries[tab_id] = newest_per_failure_text_first(merged, _MAX_REQUEST_FAILURES_PER_TAB)
+
+
 @dataclass
 class SessionState:
     browser: SkyvernBrowser | None = None
@@ -66,6 +115,7 @@ class SessionState:
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    request_failures: RequestFailureLog = field(default_factory=RequestFailureLog)
     tracing_active: bool = False
     har_enabled: bool = False
     _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))

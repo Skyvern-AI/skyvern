@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.mcp_adapter import HeldRequestFailures, stamp_page_facts
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
     value_designation_probe_expression,
@@ -319,7 +320,7 @@ from .scouting import _record_scouted_interaction as _record_scouted_interaction
 from .scouting import _register_scout_interaction_observation as _register_scout_interaction_observation
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
-from .scouting import read_page_state as read_page_state
+from .scouting import read_page_state_on_page as read_page_state_on_page
 from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
@@ -2414,14 +2415,15 @@ def _with_page_state(tool: FunctionTool) -> FunctionTool:
             # An empty result is the fail-closed answer, and a stamp would turn it into a successful call.
             if not isinstance(result, dict) or not result or "page_state" in result:
                 return output
-            page_state = await read_page_state(
+            page_state, page = await read_page_state_on_page(
                 copilot_ctx,
                 tool_name=tool.name,
                 result=result,
                 binding=binding,
                 custody_lock=browser_session_turn(copilot_ctx, session_id=binding.session_id_for(copilot_ctx)),
             )
-        return json.dumps({"page_state": page_state, **result})
+            stamped = stamp_page_facts(copilot_ctx, HeldRequestFailures(), result, page_state, page)
+        return json.dumps(stamped)
 
     return dataclasses.replace(tool, on_invoke_tool=invoke_with_page_state)
 

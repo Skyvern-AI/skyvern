@@ -411,7 +411,7 @@ def test_workflow_update_clears_non_retriable_flag() -> None:
         {
             "ok": True,
             "data": {"block_count": 2},
-            "_workflow": SimpleNamespace(workflow_id="wf_new"),
+            "_workflow": SimpleNamespace(workflow_id="wf_new", proxy_location=None, workflow_definition=None),
         },
     )
     assert ctx.last_test_non_retriable_nav_error is None
@@ -443,7 +443,9 @@ def test_workflow_update_records_runtime_proxy_default(
         {
             "ok": True,
             "data": {"block_count": 1},
-            "_workflow": SimpleNamespace(workflow_id="wf_new", proxy_location=workflow_proxy_location),
+            "_workflow": SimpleNamespace(
+                workflow_id="wf_new", proxy_location=workflow_proxy_location, workflow_definition=None
+            ),
         },
     )
 

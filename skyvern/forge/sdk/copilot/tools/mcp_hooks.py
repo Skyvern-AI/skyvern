@@ -40,9 +40,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
+    POST_HOOK_HELD_REQUEST_FAILURES,
     PreHook,
     SchemaOverlay,
     scrub_model_facing_tool_result,
+    stamp_page_facts,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
@@ -158,9 +160,10 @@ from .scouting import (
     _shed_scout_page_summary_section,
     _start_scout_challenge_settle,
     _take_viewport_frame,
-    read_page_state,
+    read_page_state_on_page,
     record_signed_out_page_observation,
 )
+from .workflow_update import proposal_is_displayable
 
 LOG = structlog.get_logger()
 
@@ -1061,10 +1064,10 @@ async def _navigate_post_hook(
     try:
         navigated = await _navigate_post_hook_body(result, raw, ctx)
         # The adapter refuses an unavailable binding before dispatch, and a post-hook runs only after one.
-        page_state = await read_page_state(
+        page_state, page = await read_page_state_on_page(
             ctx, tool_name="navigate_browser", result=navigated, binding=None, settle=True
         )
-        return {"page_state": page_state, **navigated}
+        return stamp_page_facts(ctx, POST_HOOK_HELD_REQUEST_FAILURES.get(), navigated, page_state, page)
     finally:
         ctx.pending_scout_challenge_frames = []
         ctx.pending_scout_challenge_prior_frames = []
@@ -2173,7 +2176,11 @@ async def _chat_has_pending_proposal(ctx: AgentContext) -> bool:
         organization_id=ctx.organization_id,
         workflow_copilot_chat_id=chat_id,
     )
-    return chat is not None and isinstance(chat.proposed_workflow, dict)
+    return chat is not None and await proposal_is_displayable(
+        chat.proposed_workflow,
+        chat.workflow_permanent_id,
+        ctx.organization_id,
+    )
 
 
 async def _create_workflow_schedule_pre_hook(
