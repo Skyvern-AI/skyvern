@@ -37,7 +37,7 @@ def redact_action_payload_for_log(action_payload: Mapping[str, Any]) -> dict[str
 
 def redact_input_text_payload_for_log(action_payload: Mapping[str, Any], *, value_key: str) -> dict[str, Any]:
     redacted_payload = dict(action_payload)
-    if _is_otp_input_payload(redacted_payload):
+    if is_otp_input_payload(redacted_payload):
         if redacted_payload.get(value_key):
             redacted_payload[value_key] = REDACTED_OTP_VALUE
         if redacted_payload.get("response"):
@@ -59,7 +59,7 @@ def redact_input_text_payload_for_log(action_payload: Mapping[str, Any], *, valu
     return redacted_payload
 
 
-def _is_otp_input_payload(action_payload: Mapping[str, Any]) -> bool:
+def is_otp_input_payload(action_payload: Mapping[str, Any]) -> bool:
     # Keep this in sync with OTP marker fields on SDK/web InputTextAction models.
     if action_payload.get("totp_identifier") or action_payload.get("totp_url"):
         return True

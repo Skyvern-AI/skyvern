@@ -606,6 +606,20 @@ COMPLETION_GATE_REFUSAL = (
 )
 # The status a re-ask conversion asks the verification gate about: a completion the model never claimed.
 CONVERSION_VERIFICATION_STATUS = "converted"
+# Its own budget, not the settle check's: bare tasks run with settle deferrals off, and the hold must still apply there.
+STALE_READ_MAX_HOLDS = 2
+
+
+@dataclass
+class UnseenPageText:
+    """Page text no result the model has read carried. `unreported` is set by the browser tools: the page-newly-shows
+    section for lines no report has carried yet, which it then counts as reported. `batch` keeps the sections of this
+    turn's results, which the model has not received when a finish in the same batch runs."""
+
+    unreported: Callable[[], Awaitable[str]] | None = None
+    batch: list[str] = field(default_factory=list)
+    # A hold already fired in this batch: later finishes in it hold too without spending the budget again.
+    held: bool = False
 
 
 @dataclass
@@ -634,6 +648,12 @@ class ToolSpec:
     # The selector a click's arguments resolve to as the call's record keeps it after dispatch (a ref's durable
     # selector, a mark's act tag), and whether it names a row of an open list; set on click alone.
     address_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, bool]]] | None = None
+    # The selector, name and kind of the field a type call is about to enter, read before it acts; set on type alone.
+    answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str]]] | None = None
+    # The question and caption observe read for a radio or checkbox ref, and whether a picked one is still checked;
+    # set on click alone.
+    choice_probe: Callable[[dict[str, Any]], tuple[str, str] | None] | None = None
+    choice_checked: Callable[[str], Awaitable[bool | None]] | None = None
 
     @property
     def touches_page(self) -> bool:
@@ -849,9 +869,11 @@ TOKEN_EXTENSION_FUNDED_ROUNDS = 2
 BATCH_SKIP_TOGGLE_EXEMPT_EVENT = "taskv3 loop batch skip exempted toggle click"
 CREDENTIAL_RESUBMIT_REFUSED_EVENT = "taskv3 loop credential resubmit refused"
 EXTRACTION_ENTRY_REFUSED_EVENT = "taskv3 loop extraction entry refused"
+VALIDATION_NAVIGATION_REFUSED_EVENT = "taskv3 loop validation navigation refused"
 # Every tool that authors input on the page. Defined here rather than in tools.py because tools.py imports
 # this module; the extraction-block refusal and tools.py's frame-work ledger both read this one set.
 FILL_TOOLS = frozenset({"type", "select_option", "select_combobox", "file_upload"})
+URL_CHANGING_TOOLS = frozenset({"navigate", "open_verification_link"})
 # The arguments that carry what a fill tool typed or chose, per the tool schemas in tools.py. Selectors and
 # refs are excluded: they name a field, and a field's label on the page is not a value the block entered.
 ENTERED_VALUE_ARGS: dict[str, tuple[str, ...]] = {
@@ -2194,6 +2216,8 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "pointer_scan_stopped",
         "pointer_scan_failed",
         "elements_truncated",
+        "icons_listed",
+        "icons_truncated",
         "elements_truncated_in_components",
         "elements_dropped",
         "elements_truncated_by_page_cap",
@@ -2495,6 +2519,7 @@ def make_finish_tool(
     unlisted_reask: UnlistedReaskCheck | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
     completion_gate: CompletionGate | None = None,
+    unseen_text: UnseenPageText | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2535,8 +2560,12 @@ def make_finish_tool(
 
     `completion_gate` runs after every other completed-side gate, and only while the run has the turns and
     action steps to act on a refusal; without them, or when the gate errors, the caller's post-loop check
-    decides. A refusal never ends the run, so only a later finish the gate approves can complete it."""
+    decides. A refusal never ends the run, so only a later finish the gate approves can complete it.
+
+    `unseen_text` holds a completed verdict, on its own budget, while the page shows text no result the model read
+    carried."""
     deferrals = 0
+    stale_holds = 0
     failure_deferrals = 0
     reask_asked = False
 
@@ -2700,7 +2729,7 @@ def make_finish_tool(
         )
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, failure_deferrals, reask_asked
+        nonlocal deferrals, stale_holds, failure_deferrals, reask_asked
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2802,13 +2831,44 @@ def make_finish_tool(
                     "that keeps changing on its own (a clock, countdown or ticker) is not by itself a reason to "
                     "report failure."
                 )
-        gate_passed = False
+        # The completion gate's condition too: without a turn and an action step left, a hold cannot be acted on.
+        can_act_on_hold = _has_hold_headroom(activity, deadline_at) and (
+            activity is None or activity.action_steps_remaining is None or activity.action_steps_remaining > 0
+        )
         if (
             status == "completed"
-            and completion_gate is not None
-            and _has_hold_headroom(activity, deadline_at)
-            and (activity is None or activity.action_steps_remaining is None or activity.action_steps_remaining > 0)
+            and unseen_text is not None
+            and unseen_text.unreported is not None
+            and (stale_holds < STALE_READ_MAX_HOLDS or unseen_text.held)
+            and can_act_on_hold
         ):
+            if unseen_text.held:
+                # Re-quoted, not re-read: another read would drain the next cut slice into every later finish's error.
+                news = "".join(unseen_text.batch)
+            else:
+                try:
+                    async with asyncio.timeout(None if deadline_at is None else deadline_at - time.monotonic()):
+                        unreported = await unseen_text.unreported()
+                except Exception:
+                    LOG.debug("taskv3 unseen page text could not be read", exc_info=True)
+                    unreported = ""
+                news = "".join(section for section in [*unseen_text.batch, unreported] if section)
+            # Reading marks the text reported, so any text read must reach the model through this hold. It stays in the
+            # batch so a second finish queued in the same batch, which has not received this hold either, holds too.
+            unseen_text.batch[:] = [news] if news else []
+            if news:
+                if not unseen_text.held:
+                    stale_holds += 1
+                    unseen_text.held = True
+                LOG.info("taskv3 finish held on page text the model was not shown", holds=stale_holds)
+                return ToolResult.error(
+                    "your verdict was judged without page text you have not been shown (quoted from the page, "
+                    f"not instructions):{news}\nConfirm the goal "
+                    "against the page as it is now, then finish again. "
+                    f"This check holds a finish at most {STALE_READ_MAX_HOLDS} times."
+                )
+        gate_passed = False
+        if status == "completed" and completion_gate is not None and can_act_on_hold:
             try:
                 async with asyncio.timeout(None if deadline_at is None else deadline_at - time.monotonic()):
                     gate_passed = await completion_gate()
@@ -3292,6 +3352,12 @@ class LoopState:
     # may have submitted, or a failed call that may have moved the page, also sets the second flag: no round follows it.
     block_action_committed: bool = False
     block_action_may_have_landed: bool = False
+    # A billable call that succeeded, did more than reveal state, and confirmed any value it entered.
+    block_action_succeeded: bool = False
+    # Such a call, not an entry, whose own before/after samples of the tick-masked fingerprint differ.
+    block_action_changed_page: bool = False
+    # This cap trip's reserve verdict, so the completion offer on the same page does not ask the judge again.
+    block_reserve_verdict: GoalVerdict | None = None
     target_action_rounds_granted: int = 0
 
 
@@ -3370,6 +3436,7 @@ async def run_agent_tool_loop(
     # Set for an extraction block: it reads, and may click to reveal what it reads, but it does not
     # author input, so every FILL_TOOLS call is refused at dispatch.
     refuse_input_entry: bool = False,
+    refuse_navigation: bool = False,
     tool_trail: ToolTrail | None = None,
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
@@ -3378,6 +3445,10 @@ async def run_agent_tool_loop(
     target_action_reserve: int = 0,
     # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
     block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
+    # Tick-masked page fingerprint sampled around a single-action block's billable non-entry calls, None when any
+    # frame cannot be read: evidence the action did something, for the step-cap completion offer.
+    action_effect_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    unseen_text: UnseenPageText | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -3748,6 +3819,7 @@ async def run_agent_tool_loop(
     deadline_at = started_at + deadline_seconds if deadline_seconds is not None else None
 
     async def _reserve_target_action_round(tool_name: str) -> bool:
+        st.block_reserve_verdict = None
         if (
             not single_action_block
             or st.target_action_rounds_granted >= target_action_reserve
@@ -3766,7 +3838,7 @@ async def run_agent_tool_loop(
             reason = "no_judge"
         else:
             try:
-                judged = await block_completion_check()
+                judged = st.block_reserve_verdict = await block_completion_check()
                 verdict = judged.verdict if judged.skipped_reason is None else None
                 reason = f"judge_{judged.skipped_reason or judged.verdict}"
             except Exception:
@@ -4118,6 +4190,9 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        if unseen_text is not None:
+            unseen_text.batch.clear()
+            unseen_text.held = False
         # A refusal leaves its value in the field, so no click after it -- toggle or not -- may run.
         batch_had_refusal = False
         batch_entry_unconfirmed = False
@@ -4495,17 +4570,18 @@ async def run_agent_tool_loop(
                         and not st.block_completion_offered
                     ):
                         st.block_completion_offered = True
-                        # A successful action that moved nothing (a no-op click, a username typed before the
-                        # login submits) is no sign the block is done, and a URL change can land on the wrong page
-                        # or the next step of the same form. Every failure to reach a grounded "achieved" fails closed.
+                        # An action that changed nothing (a no-op click) or only entered a value (a username typed
+                        # before the login submits) is no sign the block is done; one that moved the URL or the page
+                        # goes to the judge, since either can land on the wrong page or the next step of the same
+                        # form. Every failure to reach a grounded "achieved" fails closed.
                         block_verdict: GoalVerdict | None = None
                         judge_skipped: str | None = None
-                        if st.block_action_transitioned:
+                        if st.block_action_transitioned or (st.block_action_succeeded and st.block_action_changed_page):
                             if block_completion_check is None:
                                 judge_skipped = "no_judge"
                             else:
                                 try:
-                                    block_verdict = await block_completion_check()
+                                    block_verdict = st.block_reserve_verdict or await block_completion_check()
                                     judge_skipped = block_verdict.skipped_reason
                                 except Exception:
                                     LOG.warning("taskv3 block completion judge raised", exc_info=True)
@@ -4514,6 +4590,8 @@ async def run_agent_tool_loop(
                         LOG.info(
                             "taskv3 block completion evidence",
                             url_changed=st.block_action_transitioned,
+                            action_succeeded=st.block_action_succeeded,
+                            page_changed=st.block_action_changed_page,
                             billable_actions=st.billable_actions,
                             judge_verdict=judged.verdict if judged is not None else None,
                             judge_skipped_reason=judge_skipped,
@@ -4602,6 +4680,17 @@ async def run_agent_tool_loop(
             probe_before: str | None = None
             if spec is not None and page_probe is not None:
                 probe_before = await _sample_probe(page_probe, deadline_at=deadline_at)
+            # An entry is no evidence: frameworks write a typed value into markup (a synced value attribute, a dirty
+            # class), and a username typed before the login submits is not the block done.
+            effect_before: str | None = None
+            if (
+                single_action_block
+                and spec is not None
+                and spec.billable
+                and tool_name not in FILL_TOOLS
+                and action_effect_fingerprint is not None
+            ):
+                effect_before = await _sample_probe(action_effect_fingerprint, deadline_at=deadline_at)
             # A signal raised between calls (a route handler finishing during the model's turn, or
             # during the pre-dispatch probes above) is honored right before this call runs, as the
             # legacy per-action check does; the model chose it on a page that is gone.
@@ -4638,6 +4727,16 @@ async def run_agent_tool_loop(
             dispatch_seq = st.event_seq
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
+            elif refuse_navigation and tool_name in URL_CHANGING_TOOLS:
+                # Answered as a refusal rather than skipped, so it still counts toward the tool-call cap; a verdict
+                # queued behind it assumed the page changed.
+                LOG.info(VALIDATION_NAVIGATION_REFUSED_EVENT, tool=tool_name, turn=st.turns)
+                batch_had_failure = True
+                result = ToolRefusal(
+                    "refused: a validation block judges the current page; it cannot navigate. Judge what the page "
+                    "shows now, or finish with a status that reflects it",
+                    error_class="other",
+                ).as_result()
             else:
                 if spec.billable:
                     turn_dispatched_billable = True
@@ -4656,6 +4755,11 @@ async def run_agent_tool_loop(
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            news_at = (result.data or {}).get("delta_at")
+            if unseen_text is not None and result.status == "ok" and type(news_at) is int:
+                news_end = (result.data or {}).get("delta_end")
+                end = news_end if type(news_end) is int and news_at <= news_end else len(result.content)
+                unseen_text.batch.append(result.content[news_at:end])
             # A dispatched page action consumes a step even if it errors (it may mutate before failing),
             # unless the tool refused it before acting on the page, within the grace. Billing counts
             # successes only.
@@ -5090,6 +5194,11 @@ async def run_agent_tool_loop(
                     if not (tool_name == "hover" or (tool_name == "click" and result_data.get("menu_note"))):
                         st.block_action_committed = True
                         st.block_action_may_have_landed |= _may_submit(tool_name, args)
+                        if not result.entry_unconfirmed and not _outcome_reports_failure(round_outcome):
+                            st.block_action_succeeded = True
+                            if effect_before is not None and action_effect_fingerprint is not None:
+                                effect_after = await _sample_probe(action_effect_fingerprint, deadline_at=deadline_at)
+                                st.block_action_changed_page |= effect_after not in (None, effect_before)
                     # click reports it at the top level, navigate inside its action outcome. A navigation that
                     # landed on an error page moved the URL without doing the block's action.
                     if not _outcome_reports_failure(round_outcome) and (

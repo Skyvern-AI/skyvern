@@ -551,6 +551,59 @@ async def test_execute_task_v3_passes_the_workflow_system_prompt_to_a_page_free_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_cls", "block_fields", "task_url", "page_url", "expected"),
+    [
+        # Backfilled from the live page: the block has no url of its own.
+        (
+            ValidationBlock,
+            {"complete_criterion": "The record is open"},
+            "https://portal.example.test/rec?t=1",
+            None,
+            True,
+        ),
+        # An authored url the block runner already opened, reported back in the browser's normalized form.
+        (
+            NavigationBlock,
+            {"navigation_goal": "Open the record", "url": "HTTPS://Portal.Example.test/rec"},
+            "HTTPS://Portal.Example.test/rec",
+            "https://portal.example.test/rec",
+            True,
+        ),
+        # The runner's navigation redirected: the start URL is not where the browser is.
+        (
+            NavigationBlock,
+            {"navigation_goal": "Open the record", "url": "https://portal.example.test/rec"},
+            "https://portal.example.test/rec",
+            "https://portal.example.test/sign-in",
+            False,
+        ),
+        # A bare task: setup's landing is the task's own start, so its wording stays.
+        (None, {}, "https://portal.example.test/rec", None, False),
+    ],
+)
+async def test_execute_task_v3_says_the_start_url_is_already_open_only_when_a_block_is_on_it(
+    monkeypatch: pytest.MonkeyPatch,
+    block_cls: type[BaseTaskBlock] | None,
+    block_fields: dict[str, Any],
+    task_url: str,
+    page_url: str | None,
+    expected: bool,
+) -> None:
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="ok", billable_actions=[]),
+        task_block=_make_block(block_cls, **block_fields) if block_cls is not None else None,
+        url=task_url,
+        page_url_after_settle=page_url,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.await_args.kwargs["starting_url_is_current"] is expected
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_tells_an_extraction_block_it_only_reports(monkeypatch: pytest.MonkeyPatch) -> None:
     # The framing must reach the goal the loop is given, not only render_block_context (SKY-16398).
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[], extracted_output={"status": None})
@@ -2263,6 +2316,7 @@ async def _run_execute_task_v3_download(
     )
     step = make_step(now, task, step_id=step_id, status=StepStatus.created, order=0, output=None)
     browser_state, _, page = make_browser_state()
+    page.url = task.url
     browser_state.must_get_working_page = AsyncMock(return_value=page)
     browser_state.get_working_page = AsyncMock(return_value=page)
     browser_state.take_post_action_screenshot = AsyncMock(return_value=b"png-bytes")
@@ -3387,6 +3441,7 @@ async def test_execute_task_v3_workflow_provider_resolves_live_working_page(
     # page gets a reopen attempt, matching the step engine's per-action re-acquisition.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     probe, page_a, page_b, page_c = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    probe.url = "https://example.com"
     block = _make_block(ActionBlock)
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -5398,6 +5453,53 @@ async def test_execute_task_v3_settle_fingerprint_masks_ticks_and_page_fingerpri
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dropout", ["evaluate_raises", "host_unreadable"])
+async def test_execute_task_v3_action_effect_fingerprint_fails_closed_when_a_frame_is_read_once(
+    monkeypatch: pytest.MonkeyPatch, dropout: str
+) -> None:
+    # "Changed" is the permissive answer for the completion offer: a frame that is read in one sample and dropped from
+    # the next must give no sample, not a shorter one.
+    from skyvern.forge.taskv3 import tools as tools_mod
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    main_frame = object()
+    child = MagicMock()
+    child.parent_frame = main_frame
+    child.is_detached = MagicMock(return_value=False)
+    host = MagicMock()
+    host.is_visible = AsyncMock(return_value=True)
+    host.dispose = AsyncMock()
+    if dropout == "host_unreadable":
+        child.frame_element = AsyncMock(side_effect=[host, RuntimeError("frame reloading")])
+        child.evaluate = AsyncMock(return_value="frame")
+    else:
+        child.frame_element = AsyncMock(return_value=host)
+        child.evaluate = AsyncMock(side_effect=["frame", RuntimeError("frame detached")])
+    # A realm the run acted in whose frame has since gone: a fixed stand-in, never a failed sample.
+    gone = MagicMock()
+    gone.is_detached = MagicMock(return_value=True)
+    gone.evaluate = AsyncMock(side_effect=RuntimeError("frame was detached"))
+    monkeypatch.setattr(tools_mod, "_recorded_work_frames", lambda _page: [gone])
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.main_frame = main_frame
+    pinned.frames = [main_frame, child]
+    pinned.evaluate = AsyncMock(return_value="main")
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        working_page=pinned,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    sample = loop_mock.await_args.kwargs["action_effect_fingerprint"]
+
+    assert await sample() == "main\nframe\ndetached"
+    assert await sample() is None
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_document_identity_changes_with_an_acted_in_frame_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6219,6 +6321,10 @@ async def test_execute_task_v3_row_scrubs_the_run_password_but_keeps_the_runtime
         "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run",
         manager.get_secret_values_for_run,
     )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run",
+        manager.get_one_time_codes_for_run,
+    )
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
     _step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -6232,6 +6338,7 @@ async def test_execute_task_v3_row_scrubs_the_run_password_but_keeps_the_runtime
     assert task.status == TaskStatus.completed
     persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args_list[0].kwargs["action"]
     assert persisted.text == otp_code
+    assert persisted.totp_code_required
     assert otp_code in (persisted.reasoning or "")
     assert password not in (persisted.reasoning or "")
     assert REDACTED_SECRET_PLACEHOLDER in (persisted.reasoning or "")

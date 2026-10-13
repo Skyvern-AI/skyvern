@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge import app, forge_app_initializer, request_logging
 from skyvern.forge.sdk.core import organization_age_cache
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
@@ -45,6 +46,12 @@ def _configure_logging_once_per_process() -> None:
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     setup_logger()
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+@pytest.fixture(autouse=True)
+def _url_validation_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """URL validation is off by default; tests assert the validated behavior unless they opt out."""
+    monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", True)
 
 
 @pytest.fixture(autouse=True)

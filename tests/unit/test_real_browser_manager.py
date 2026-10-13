@@ -7,10 +7,12 @@ on every call and re-invoke navigate_to_url() on every step.
 """
 
 import asyncio
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from itertools import pairwise
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1842,7 +1844,7 @@ async def test_attached_run_renews_the_session_activity_lease() -> None:
             # A failed release keeps the lease for cleanup attribution; renewal must still stop there.
             mock_app.PERSISTENT_SESSIONS_MANAGER.release_browser_session = AsyncMock(return_value=False)
             await manager._release_persistent_session(
-                "pbs_renew", "org_test", manager._persistent_session_leases["s_renew"]
+                "pbs_renew", "org_test", manager._persistent_session_leases["s_renew"], "s_renew"
             )
             assert "s_renew" in manager._persistent_session_leases, "the lease is retained on a failed release"
 
@@ -1862,6 +1864,127 @@ async def test_attached_run_renews_the_session_activity_lease() -> None:
         finally:
             if manager._session_activity_renewer is not None:
                 manager._session_activity_renewer.cancel()
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+
+async def _let_the_renewer_run() -> None:
+    """Yield enough times for the renewal task to reach its next wait, without a wall-clock sleep."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_session_activity_is_stamped_at_attach_not_an_interval_later() -> None:
+    # The renewer waited out a full interval before its first write, so work shorter than the interval
+    # never stamped at all and an attach landing near the end of a session's base budget was killed
+    # mid-action anyway (SKY-16256). The interval here is long enough that any wait before the first
+    # stamp fails the test.
+    manager = RealBrowserManager()
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch.object(real_browser_manager, "SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS", 600.0),
+    ):
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(return_value="gen_attach")
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        touch = AsyncMock()
+        mock_app.DATABASE.browser_sessions.touch_last_activity = touch
+
+        try:
+            await manager.get_or_create_for_script(
+                script_id="s_first", browser_session_id="pbs_first", organization_id="org_test"
+            )
+            await _let_the_renewer_run()
+            assert touch.await_args_list == [call("pbs_first")]
+
+            # A session attaching while the renewer is already waiting must not sit out the rest of
+            # that interval for its own first stamp either.
+            await manager.get_or_create_for_script(
+                script_id="s_second", browser_session_id="pbs_second", organization_id="org_test"
+            )
+            await _let_the_renewer_run()
+            assert call("pbs_second") in touch.await_args_list
+        finally:
+            if manager._session_activity_renewer is not None:
+                manager._session_activity_renewer.cancel()
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_session_activity_cadence_is_not_reset_by_new_attaches() -> None:
+    manager = RealBrowserManager()
+    steady_stamps: list[float] = []
+
+    async def touch(session_id: str) -> None:
+        if session_id == "pbs_steady":
+            steady_stamps.append(asyncio.get_running_loop().time())
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch.object(real_browser_manager, "SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS", 0.4),
+    ):
+        mock_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock(side_effect=touch)
+        try:
+            await manager.begin_session_activity_renewal("pbs_steady")
+            await asyncio.sleep(0.3)
+            await manager.begin_session_activity_renewal("pbs_wakeup_1")
+            await asyncio.sleep(0.3)
+            await manager.begin_session_activity_renewal("pbs_wakeup_2")
+            await asyncio.sleep(0.45)
+
+            assert len(steady_stamps) >= 3
+            assert max(right - left for left, right in pairwise(steady_stamps)) < 0.55
+        finally:
+            for session_id in ("pbs_steady", "pbs_wakeup_1", "pbs_wakeup_2"):
+                manager.end_session_activity_renewal(session_id)
+            if manager._session_activity_renewer is not None:
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+
+def test_session_activity_renewer_recreates_event_for_a_new_loop() -> None:
+    manager = RealBrowserManager()
+    stamps: list[Any] = []
+
+    async def run_once() -> None:
+        with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+            touch = AsyncMock()
+            mock_app.DATABASE.browser_sessions.touch_last_activity = touch
+            await manager.begin_session_activity_renewal("pbs_loop")
+            await _let_the_renewer_run()
+            assert touch.await_args_list == [call("pbs_loop")]
+            stamps.extend(touch.await_args_list)
+            manager.end_session_activity_renewal("pbs_loop")
+            assert manager._session_activity_renewer is not None
+            await manager._session_activity_renewer
+
+    asyncio.run(run_once())
+    asyncio.run(run_once())
+    assert stamps == [call("pbs_loop"), call("pbs_loop")]
+
+
+@pytest.mark.asyncio
+async def test_close_propagates_cancellation_while_waiting_for_renewer() -> None:
+    manager = RealBrowserManager()
+    renewer_cancelled = asyncio.Event()
+
+    async def blocked_renewer() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            renewer_cancelled.set()
+            await asyncio.Future()
+
+    manager._session_activity_renewer = asyncio.create_task(blocked_renewer())
+    close_task = asyncio.create_task(manager.close())
+    await renewer_cancelled.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
 
 
 @pytest.mark.asyncio
@@ -2149,6 +2272,7 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
         runnable_type="task",
         runnable_id="tsk_adopt",
         organization_id="org_test",
+        expected_runnable_generation_id=None,
     )
     mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with(
         "bs_adopt",

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -23,6 +23,8 @@ from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 
@@ -598,6 +600,128 @@ async def test_context_refcount_released_when_upload_drain_is_cancelled(
 
     assert "wr_test" not in _sdk_action_context_refcounts
     mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context.assert_called_once_with("wr_test")
+
+
+async def _run_action_watching_session_activity(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> tuple[RealBrowserManager, list[list[Any]], list[Any]]:
+    """Run one inline action and report the liveness stamps that landed while it was in flight."""
+    manager = RealBrowserManager()
+    mock_app.BROWSER_MANAGER = manager
+    touch = AsyncMock()
+    stamps_before_browser_work: list[list[Any]] = []
+    stamped_during_action: list[Any] = []
+
+    async def act(*_: Any, **__: Any) -> Any:
+        stamps_before_browser_work.append(touch.await_args_list.copy())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        stamped_during_action.extend(touch.await_args_list)
+        raise RuntimeError("stop once the action is in flight")
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch("skyvern.webeye.real_browser_manager.app") as browser_app,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=act,
+        ),
+    ):
+        browser_app.DATABASE.browser_sessions.touch_last_activity = touch
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        try:
+            with pytest.raises(RuntimeError, match="stop once the action is in flight"):
+                await run_sdk_action(mock_request, organization=mock_organization)
+        finally:
+            if manager._session_activity_renewer is not None:
+                manager._session_activity_renewer.cancel()
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+    return manager, stamps_before_browser_work, stamped_during_action
+
+
+@pytest.mark.asyncio
+async def test_inline_action_renews_the_session_it_drives(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # SKY-16256: the synthetic run stores no lease, so nothing stamped last_activity_at and the
+    # session Pod — which ends a session on that mark alone — closed the browser mid-action.
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=MagicMock())
+
+    manager, stamps_before_browser_work, stamped_during_action = await _run_action_watching_session_activity(
+        mock_request, mock_organization, mock_app
+    )
+
+    assert stamps_before_browser_work == [[call("pbs_sdk")]]
+    assert stamped_during_action == [call("pbs_sdk")]
+    # The renewal is bounded by the request: nothing keeps the session alive once the action returns.
+    assert manager._renewable_session_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_inline_action_does_not_renew_a_session_the_caller_does_not_own(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # The session id is client-supplied and the touch is org-unscoped, so an unowned id must not buy
+    # a stranger's browser another timeout window.
+    mock_request.browser_session_id = "pbs_not_ours"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
+
+    _, stamps_before_browser_work, stamped_during_action = await _run_action_watching_session_activity(
+        mock_request, mock_organization, mock_app
+    )
+
+    assert stamps_before_browser_work == [[]]
+    assert stamped_during_action == []
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session.assert_awaited_with("pbs_not_ours", "o_test")
+
+
+@pytest.mark.asyncio
+async def test_sdk_action_ownership_read_failure_creates_no_task(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
+        side_effect=RuntimeError("database unavailable")
+    )
+
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app), pytest.raises(RuntimeError, match="database unavailable"):
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sdk_action_initial_stamp_failure_marks_task_failed(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=MagicMock())
+    manager = RealBrowserManager()
+    mock_app.BROWSER_MANAGER = manager
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.webeye.real_browser_manager.app") as browser_app,
+        pytest.raises(RuntimeError, match="activity table unavailable"),
+    ):
+        browser_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock(
+            side_effect=RuntimeError("activity table unavailable")
+        )
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    mock_app.DATABASE.tasks.update_task.assert_awaited_once_with(
+        task_id="tsk_test",
+        organization_id="o_test",
+        status=TaskStatus.failed,
+        failure_reason="activity table unavailable",
+    )
+    assert manager._renewable_session_ids() == set()
+    assert "wr_test" not in _sdk_action_context_refcounts
 
 
 async def _run_upload_action(

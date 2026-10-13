@@ -19,6 +19,7 @@ import structlog
 from bs4 import BeautifulSoup
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from pydantic import TypeAdapter
 
 from skyvern.config import settings
 from skyvern.forge import agent as agent_module
@@ -26,6 +27,7 @@ from skyvern.forge.agent import (
     ForgeAgent,
     _first_plan_carries_consumable_totp,
     _multi_field_totp_box_group,
+    _taskv3_action_for_tool_call,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import (
@@ -34,28 +36,33 @@ from skyvern.forge.sdk.core.skyvern_context import (
     SkyvernContext,
     action_for_multi_field_totp_persistence,
 )
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow import service as workflow_service
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPType, OTPValue
 from skyvern.utils import stall_watch
-from skyvern.utils.action_redaction import redact_action_for_log
+from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, redact_action_for_log
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions import multi_field_totp as multi_field_totp_module
 from skyvern.webeye.actions.actions import (
+    Action,
     ActionStatus,
+    ActionType,
     ClickAction,
     InputOrSelectContext,
     InputTextAction,
     TerminateAction,
+    VerificationCodeAction,
 )
 from skyvern.webeye.actions.handler import (
     _fill_multi_field_totp_group,
+    _register_runtime_otp_value_best_effort,
     _resolve_multi_field_totp_code,
 )
 from skyvern.webeye.actions.multi_field_totp import (
@@ -64,7 +71,7 @@ from skyvern.webeye.actions.multi_field_totp import (
     _multi_field_totp_frame_gone,
 )
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionSuccess
-from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.helpers import ONE_TIME_CODE, make_action_row, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _SEED = "JBSWY3DPEHPK3PXP"
@@ -2528,6 +2535,7 @@ async def test_execute_step_rebound_group_requires_expected_value(
             workflow_run_contexts={"workflow": workflow_context},
             get_workflow_run_context=lambda _workflow_run_id: workflow_context,
             has_workflow_run_context=lambda _workflow_run_id: True,
+            get_one_time_codes_for_run=lambda _workflow_run_id: set(),
         ),
     )
     tree = json.loads((Path(__file__).parent / "fixtures" / "otp_page_elements.json").read_text())
@@ -6511,3 +6519,133 @@ async def test_verified_burst_observation_controls_retry_dispatch(
     assert not result.skip_remaining_actions
     assert values == list(code)
     assert all(not element.input_fill.await_args_list for element in elements)
+
+
+@pytest.mark.parametrize("source", ["polled", "tool_delivered", "handed_off", "cached"])
+@pytest.mark.parametrize("builder", ["task_v3", "computer_use"])
+def test_typed_one_time_code_persists_marked_and_is_withheld_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch, source: str, builder: str
+) -> None:
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_otp"] = WorkflowRunContext("title", "workflow-id", "permanent-id", "wr_otp", None)
+    monkeypatch.setattr(handler.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    context = SkyvernContext(task_id="tsk_otp", workflow_run_id="wr_otp")
+    with skyvern_context.scoped(context):
+        if source == "polled":
+            skyvern_context.register_multi_field_totp_candidate(ONE_TIME_CODE)
+        elif source == "tool_delivered":
+            context.register_secret_value(ONE_TIME_CODE)
+        elif source == "handed_off":
+            _register_runtime_otp_value_best_effort("wr_otp", ONE_TIME_CODE)
+        else:
+            context.totp_codes["tsk_otp_totp_cache"] = ONE_TIME_CODE
+        context.register_secret_value("https://example.com/magic?t=abc", hide_from_model=True)
+        codes = manager.get_one_time_codes_for_run("wr_otp")
+
+    def build(text: str) -> Action:
+        fields = {"workflow_run_id": "wr_otp", "task_id": "tsk_otp", "reasoning": f"Typing {text}.", "response": text}
+        if builder == "task_v3":
+            return _taskv3_action_for_tool_call("type", {"selector": "otp", "text": text}, **fields)
+        return InputTextAction(element_id="", text=text, **fields)
+
+    live, ordinary = build(ONE_TIME_CODE), build("Meridian Ave")
+    persisted = action_for_multi_field_totp_persistence(live, codes)
+    persisted_ordinary = action_for_multi_field_totp_persistence(ordinary, codes)
+    magic_link = build("https://example.com/magic?t=abc")
+    assert action_for_multi_field_totp_persistence(magic_link, codes) is magic_link
+
+    assert isinstance(live, InputTextAction) and isinstance(persisted, InputTextAction)
+    assert persisted.totp_code_required and persisted.text == ONE_TIME_CODE
+    assert not live.totp_code_required and live.text == ONE_TIME_CODE
+    assert persisted_ordinary is ordinary
+
+    served = [
+        workflow_service.redact_one_time_code_action(
+            hydrate_action(make_action_row(action_type=ActionType.INPUT_TEXT, action_json=row.model_dump(mode="json")))
+        )
+        for row in (persisted, persisted_ordinary)
+    ]
+    body = TypeAdapter(list[Action]).dump_json(served).decode()
+    assert ONE_TIME_CODE not in body
+    assert "Meridian Ave" in body
+
+
+def test_multi_field_code_is_scrubbed_whole_from_sibling_text_and_lone_digits_stay_readable() -> None:
+    box_ids = [f"box-{index}" for index in range(len(ONE_TIME_CODE))]
+    digits = [
+        action_for_multi_field_totp_persistence(
+            InputTextAction(
+                element_id=box_id,
+                text=digit,
+                step_id="stp_mf",
+                totp_timing_info={"is_totp_sequence": True, "action_index": index, "box_element_ids": box_ids},
+            )
+        )
+        for index, (box_id, digit) in enumerate(zip(box_ids, ONE_TIME_CODE, strict=True))
+    ]
+    sibling = ClickAction(
+        element_id="verify", step_id="stp_mf", reasoning=f"Entered {ONE_TIME_CODE}; try again after 1 second."
+    )
+    rows = [
+        make_action_row(action_type=action.action_type, action_json=action.model_dump(mode="json"))
+        for action in (*reversed(digits), sibling)
+    ]
+
+    served = workflow_service.redact_one_time_code_actions([hydrate_action(row) for row in rows])
+
+    body = TypeAdapter(list[Action]).dump_json(served).decode()
+    assert ONE_TIME_CODE not in body
+    assert served[-1].reasoning is not None and "try again after 1 second." in served[-1].reasoning
+
+
+def test_unmarked_input_typing_a_known_code_has_its_text_scrubbed() -> None:
+    fetched = VerificationCodeAction(action_id="act_fetch", verification_code=ONE_TIME_CODE)
+    typed = InputTextAction(action_id="act_typed", element_id="otp", text=ONE_TIME_CODE)
+    ordinary = InputTextAction(action_id="act_street", element_id="street", text="Meridian Ave")
+
+    served = workflow_service.redact_one_time_code_actions([fetched, typed, ordinary])
+
+    assert ONE_TIME_CODE not in TypeAdapter(list[Action]).dump_json(served).decode()
+    assert served[2].text == "Meridian Ave"
+
+
+def test_fallback_input_text_is_withheld_without_scrubbing_its_text_from_siblings() -> None:
+    fallback = Action(action_type=ActionType.INPUT_TEXT, action_id="act_state", text="CA")
+    sibling = ClickAction(action_id="act_ship", element_id="ship", reasoning="Ship to CA.")
+
+    served_fallback, served_sibling = workflow_service.redact_one_time_code_actions([fallback, sibling])
+
+    assert served_fallback.text == REDACTED_INPUT_VALUE
+    assert served_sibling.reasoning == "Ship to CA."
+
+
+@pytest.mark.asyncio
+async def test_computer_use_code_hand_off_without_a_workflow_run_marks_the_typed_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), task_id="tsk_cu", workflow_run_id=None)
+    typed = InputTextAction(element_id="", text=ONE_TIME_CODE, task_id="tsk_cu")
+    llm_caller = MagicMock(current_tool_results=[], message_history=[{"role": "user", "content": "Sign in"}])
+    llm_caller.llm_key = "ANTHROPIC_CLAUDE_SONNET_4"
+    llm_caller.browser_window_dimension = None
+    llm_caller.get_screenshot_resize_target_dimension = MagicMock(return_value=None)
+    llm_caller.call = AsyncMock(return_value={"content": []})
+    monkeypatch.setattr(agent_module.LLMAPIHandlerFactory, "requires_adaptive_thinking", lambda _model_name: False)
+    monkeypatch.setattr(agent_module, "parse_anthropic_actions", AsyncMock(return_value=[typed]))
+    context = SkyvernContext(task_id="tsk_cu")
+    context.totp_codes["tsk_cu"] = ONE_TIME_CODE
+
+    with skyvern_context.scoped(context):
+        [action] = await ForgeAgent.__new__(ForgeAgent)._generate_anthropic_actions(
+            task=task,
+            step=MagicMock(),
+            scraped_page=MagicMock(screenshots=[], window_dimension=None),
+            llm_caller=llm_caller,
+        )
+        codes = WorkflowContextManager().get_one_time_codes_for_run(None)
+
+    assert ONE_TIME_CODE in llm_caller.call.await_args.kwargs["prompt"]
+    persisted = action_for_multi_field_totp_persistence(action, codes)
+    assert isinstance(persisted, InputTextAction) and persisted.totp_code_required
+    assert action.text == ONE_TIME_CODE

@@ -10,6 +10,7 @@ import orjson
 import pytest
 import pytest_asyncio
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.statement_timeout_fakes import statement_timeout_error
 
 
 def _caller(org_id: str = "org_123") -> SimpleNamespace:
@@ -339,6 +341,98 @@ async def test_get_runs_v2_rejects_workflow_filter_page_beyond_fetch_cap(monkeyp
     assert exc_info.value.status_code == 400
     assert str(MAX_SEARCH_FETCH_LIMIT) in exc_info.value.detail
     mock_workflow_runs.get_all_runs_v2.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_reports_a_search_timeout_as_an_actionable_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A timeout on the unindexed substring search is returned as a client-actionable 400.
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key="no-such-term",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "exact browser profile or session ID" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_does_not_relabel_unmeasured_non_search_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No-search filters have unmeasured query plans; preserve the server error rather than suggesting
+    # a retry that may repeat a deterministic full-organization scan.
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_key", ["bp_123", "pbs_123"])
+async def test_get_runs_v2_keeps_indexed_identifier_timeouts_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    search_key: str,
+) -> None:
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=search_key,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers["Retry-After"]
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_does_not_mask_other_database_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only a cancelled statement is the caller's to act on; anything else is still a server fault and
+    # must keep reaching the error handlers rather than being reported as a bad request.
+    failure = OperationalError("SELECT 1", {}, Exception("connection reset"))
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=failure))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=None,
+        )
 
 
 @pytest.mark.asyncio

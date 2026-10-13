@@ -7,7 +7,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
 import structlog
@@ -56,13 +56,17 @@ from skyvern.webeye.browser_runtime_events import (
     log_browser_runtime_event,
     with_acquired_browser_runtime,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
     disable_download_interceptor_for_context,
     has_download_interceptor_for_context,
 )
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
-from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss, driver_transport_error_future
+from skyvern.webeye.driver_connection import (
+    close_driver_connection_on_transport_loss,
+    driver_transport_error_future,
+    kill_driver_process,
+)
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
@@ -481,7 +485,7 @@ class RealBrowserState(BrowserState):
     async def close_pages_opened_after(self, baseline_pages: set[Page]) -> None:
         # Close only pages opened after baseline_pages was captured; preserve the baseline set
         # (e.g. a pre-loop deliverable tab) and the current working page.
-        if not self.browser_context:
+        if not self.browser_context or self.external_browser:
             return
         working_page = await self.get_working_page()
         for page in list(self.browser_context.pages):
@@ -541,7 +545,7 @@ class RealBrowserState(BrowserState):
     ) -> None:
         if self.browser_context is None:
             if self.external_browser:
-                raise ExternalBrowserUnavailable("the connection to the browser was lost")
+                raise ExternalBrowserUnavailable.lost()
             LOG.info("creating browser context")
             context = skyvern_context.current()
             effective_route_policy_url = (
@@ -740,13 +744,7 @@ class RealBrowserState(BrowserState):
         pages = [
             http_page
             for http_page in self.browser_context.pages
-            if http_page not in self._crashed_pages
-            and (
-                http_page.url == "about:blank"
-                or http_page.url == ":"  # sometimes the page url is ":", which is the blank page
-                or http_page.url == "chrome-error://chromewebdata/"
-                or urlparse(http_page.url).scheme in ["http", "https"]
-            )
+            if http_page not in self._crashed_pages and is_selectable_page_url(http_page.url)
         ]
 
         if max_pages <= 0 or self.external_browser or len(pages) <= max_pages:
@@ -1736,7 +1734,13 @@ class RealBrowserState(BrowserState):
             if close_browser_on_completion:
                 await self._run_on_close_callbacks()
             if release_driver is not False:
-                await self.detach_remote_driver()
+                try:
+                    await self.detach_remote_driver()
+                except Exception:
+                    # ponytail: one best-effort kill of the local driver process, no retry; a driver that
+                    # survives it leaks until this worker exits. Add a retry watcher if that leak is ever seen.
+                    kill_driver_process(self.pw)
+                    raise
             return False
         # ``release_driver`` decouples the local Playwright driver's lifetime
         # from the remote browser's: callers that retain this state for reuse
@@ -1836,22 +1840,22 @@ class RealBrowserState(BrowserState):
         """
         if self._remote_driver_detached:
             return
-        if self.browser_context is not None:
-            interceptor = getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None)
-            if interceptor is not None:
-                await interceptor.disable()
-                if getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None) is interceptor:
-                    self.browser_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
-        if self.pw is not None:
-            context = self.browser_context
-            try:
-                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+        context = self.browser_context
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if context is not None:
+                    interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None)
+                    if interceptor is not None:
+                        await interceptor.disable()
+                        if getattr(context, "_skyvern_cdp_download_interceptor", None) is interceptor:
+                            context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
+                if self.pw is not None:
                     self._expect_runtime_end("deliberate_detach", context)
                     await self.pw.stop()
-            except BaseException:
-                if context is not None:
-                    self._expected_runtime_ends.pop(context, None)
-                raise
+        except BaseException:
+            if context is not None:
+                self._expected_runtime_ends.pop(context, None)
+            raise
         self._remote_driver_detached = True
 
     async def _run_bounded_detachable(
@@ -1997,3 +2001,7 @@ class RealBrowserState(BrowserState):
             runtime_context=self._runtime_event_context,
             keep_partial_on_timeout=True,
         )
+
+
+def is_external_browser_state(browser_state: BrowserState | None) -> TypeGuard[RealBrowserState]:
+    return isinstance(browser_state, RealBrowserState) and browser_state.external_browser

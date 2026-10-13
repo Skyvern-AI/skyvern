@@ -277,7 +277,7 @@ from .run_execution import _attach_action_traces as _attach_action_traces
 from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import (
-    _carry_unresolved_failure_into_result,
+    _carry_prior_attempt_change_identity_into_result,
     _chronological_run_block_rows,
 )
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
@@ -338,7 +338,7 @@ _CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
     "Add them in the Credentials UI and ask me to test the workflow."
 )
 _REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE = (
-    "Saved this as a draft without running it: this turn contains a redacted secret, so its credential "
+    "Saved this as a draft without running it: this turn withheld a value that may be a secret, so its credential "
     "parameter is unbound and nothing runs. The in-chat credential card is available: call "
     "`request_credential` with the user's sign-in URL{site_hint} so they can connect a saved credential."
 )
@@ -630,7 +630,7 @@ async def edit_block_and_run_tool(
     }
 
     def fail_before_run(result: dict[str, Any]) -> str:
-        _carry_unresolved_failure_into_result(copilot_ctx, result, "edit_block_and_run")
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
@@ -753,7 +753,7 @@ async def edit_block_and_run_tool(
     except BlockEditError as exc:
         return fail_before_run({"ok": False, "error": str(exc)})
     if not update_result.get("ok"):
-        _carry_unresolved_failure_into_result(copilot_ctx, update_result, "edit_block_and_run")
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, update_result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
         finalize_build_test_result(
             copilot_ctx,
@@ -992,7 +992,8 @@ workflow or a credential-card reply, pass it as `exact_reference` without asking
 Exact mode verifies provenance and organization-wide cardinality, then atomically binds
 the single match into server-owned request authority. It does not classify the surrounding
 prose and never falls back to fuzzy search, discovery, or pagination. Zero or multiple exact
-matches grant no authority.
+matches grant no authority. After zero matches the server binds no login from a page's URL for
+the rest of the turn and withdraws one it had bound; the result lists it.
 
 Without `exact_reference`, this is metadata-only discovery. Paginated. `page_size` caps at {LIST_CREDENTIALS_MAX_PAGE_SIZE}. The response includes `has_more`;
 before concluding no credential exists, keep incrementing `page` until
@@ -1437,7 +1438,7 @@ async def run_blocks_tool(
                 new_exit=new_exit,
             )
         recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
-        _carry_unresolved_failure_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         finalize_build_test_result(
             copilot_ctx,
@@ -1717,7 +1718,7 @@ async def update_and_run_blocks_tool(
             update_result = promotion_error
 
     if not update_result.get("ok"):
-        _carry_unresolved_failure_into_result(copilot_ctx, update_result, "update_and_run_blocks")
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, update_result, "update_and_run_blocks")
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
         finalize_build_test_result(
             copilot_ctx,
@@ -1829,7 +1830,7 @@ async def _run_updated_workflow_blocks(
             )
         recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         run_result = carry_author_time_findings(update_result, run_result)
-        _carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)
+        _carry_prior_attempt_change_identity_into_result(copilot_ctx, run_result, tool_name)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         finalize_build_test_result(
             copilot_ctx,

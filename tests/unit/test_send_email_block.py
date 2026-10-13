@@ -45,6 +45,7 @@ from email_validator import EmailUndeliverableError, validate_email
 from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.orm import undefer
 
 from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_send_email_statement
@@ -1291,9 +1292,12 @@ class GmailEnv:
     def sent(self) -> list[EmailMessage]:
         return [message_from_bytes(request.content, policy=email_policy.default) for request in self.requests]
 
-    async def rows(self, model: type[Base]) -> list[Base]:
+    async def rows(self, model: type[Base], *, include_deferred: bool = False) -> list[Base]:
+        query = select(model)
+        if include_deferred:
+            query = query.options(undefer("*"))
         async with self.database.Session() as session:
-            return list((await session.scalars(select(model))).all())
+            return list((await session.scalars(query)).all())
 
     async def add_run(
         self, workflow_run_id: str, retried_from: str | None = None, organization_id: str = GMAIL_ORG, **values: object
@@ -1627,7 +1631,7 @@ async def test_gmail_send_keeps_tokens_recipients_and_message_text_out_of_logs_a
     rows = [
         row
         for model in (WorkflowRunBlockModel, GmailSendDispatchModel, WorkflowRunOutputParameterModel)
-        for row in await gmail_env.rows(model)
+        for row in await gmail_env.rows(model, include_deferred=True)
     ]
     stored = repr([[getattr(row, column.name) for column in row.__table__.columns] for row in rows])
     for sentinel in SENTINELS:

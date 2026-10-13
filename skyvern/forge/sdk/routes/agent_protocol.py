@@ -28,7 +28,7 @@ from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
 from opentelemetry import trace
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from skyvern import analytics
 from skyvern._version import __version__
@@ -77,7 +77,12 @@ from skyvern.forge.sdk.db.repositories.tags import (
     TagValueRenameCollision,
     TagValueRenameResult,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+    is_indexed_runs_list_search_key,
+)
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
+from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.experimentation.workflow_block_engine import effective_default_engine
@@ -120,6 +125,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationUpdate,
 )
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_external_cdp_session
 from skyvern.forge.sdk.schemas.prompts import CreateFromPromptRequest
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
@@ -156,7 +162,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
-from skyvern.forge.sdk.workflow.service import cap_action_payloads, capped_task_v1_response, capped_task_v2
+from skyvern.forge.sdk.workflow.service import (
+    cap_action_payloads,
+    capped_task_v1_response,
+    capped_task_v2,
+    one_time_code_markers,
+    redact_one_time_code_actions,
+    redact_one_time_code_step,
+)
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
@@ -4031,7 +4044,13 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
-    if workflow_run.browser_session_id:
+    # A caller's registered browser is freed only by the worker's own release, so no new run can drive it while
+    # the canceled worker is still attached.
+    if workflow_run.browser_session_id and not is_external_cdp_session(
+        await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            workflow_run.browser_session_id, organization_id
+        )
+    ):
         await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
             workflow_run.browser_session_id,
             organization_id,
@@ -4545,6 +4564,31 @@ async def _parse_and_gate_tag_filter_terms(
     return parsed_tags
 
 
+_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS = 15
+
+
+def _runs_list_filter_names(
+    *,
+    status: list[RunStatus] | None,
+    search_key: str | None,
+    run_type: list[RunType] | None,
+    workflow_permanent_id: list[str] | None,
+    tags: list[str] | None,
+    failure_category: str | None,
+) -> list[str]:
+    """Names of the filters the request carried. Never the values: a search term, tag or agent id can
+    be customer data, and the name alone identifies which query shape was slow."""
+    supplied: dict[str, object | None] = {
+        "status": status,
+        "search_key": search_key,
+        "run_type": run_type,
+        "workflow_permanent_id": workflow_permanent_id,
+        "tags": tags,
+        "failure_category": failure_category,
+    }
+    return sorted(name for name, value in supplied.items() if value)
+
+
 # NOTE: v2 returns TaskRunListItem from the unified task_runs table,
 # replacing the v1 response type (list[WorkflowRun | Task]) which
 # merged two separate queries. The v1 endpoint is preserved for
@@ -4629,17 +4673,49 @@ async def get_runs_v2(
 
     run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
-    rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
-        current_org.organization_id,
-        page=page,
-        page_size=page_size,
-        status=[s.value for s in status] if status else None,
-        search_key=search_key,
-        run_type=[r.value for r in run_type] if run_type else None,
-        workflow_permanent_ids=workflow_permanent_id,
-        run_tags=run_tags or None,
-        failure_category=failure_category,
-    )
+    try:
+        rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
+            current_org.organization_id,
+            page=page,
+            page_size=page_size,
+            status=[s.value for s in status] if status else None,
+            search_key=search_key,
+            run_type=[r.value for r in run_type] if run_type else None,
+            workflow_permanent_ids=workflow_permanent_id,
+            run_tags=run_tags or None,
+            failure_category=failure_category,
+        )
+    except SQLAlchemyError as exc:
+        if not is_statement_timeout(exc) or not search_key:
+            raise
+        LOG.warning(
+            "runs_list_statement_timeout",
+            organization_id=current_org.organization_id,
+            # Names, never values: a search term, tag or agent id can carry customer data.
+            filters=_runs_list_filter_names(
+                status=status,
+                search_key=search_key,
+                run_type=run_type,
+                workflow_permanent_id=workflow_permanent_id,
+                tags=tags,
+                failure_category=failure_category,
+            ),
+            page=page,
+            page_size=page_size,
+            statement_timeout_seconds=RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+        )
+        if not is_indexed_runs_list_search_key(search_key):
+            # Do not suggest a rarer substring: the unindexed search can still walk the whole org.
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail="Free-text run search exceeded its time limit. Try an exact browser profile or session ID.",
+            ) from exc
+        # Exact browser identifiers use indexed equality lookups; a timeout is retryable.
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="This run list could not be computed in time. Please retry shortly.",
+            headers={"Retry-After": str(_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS)},
+        ) from exc
     items = [TaskRunListItem.model_validate(row) for row in rows]
     workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
     latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
@@ -4689,7 +4765,11 @@ async def get_steps(
     """
     analytics.capture("skyvern-oss-agent-task-steps-get")
     steps = await app.DATABASE.tasks.get_task_steps(task_id, organization_id=current_org.organization_id)
-    return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
+    actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    marked_ids, values = one_time_code_markers(actions)
+    return ORJSONResponse(
+        [redact_one_time_code_step(step, marked_ids, values).model_dump(exclude_none=True) for step in steps]
+    )
 
 
 @legacy_base_router.get(
@@ -4806,7 +4886,8 @@ async def get_actions(
     analytics.capture("skyvern-oss-agent-task-actions-get")
     # Hydrated, not the base read: the typed value of an INPUT_TEXT lives only in action_json, so
     # Action.model_validate on the ORM row returns text=None for every row.
-    actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    hydrated = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    actions = redact_one_time_code_actions(hydrated)
     if caps_run_response_values(x_user_agent):
         # Hydration puts a completion action's whole response/output on the wire, which the app
         # renders with JSON.stringify on the main thread. Same bound the run-detail reads apply.

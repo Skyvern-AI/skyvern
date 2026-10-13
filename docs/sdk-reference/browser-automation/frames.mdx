@@ -1,0 +1,142 @@
+---
+title: "Frames"
+description: "Work inside iframes."
+slug: sdk-reference/browser-automation/frames
+keywords:
+  - "iframe"
+  - "frame_switch"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Switch the page's working frame to run actions inside an iframe, then switch back.
+
+---
+
+## page.frame_switch
+
+Switch the working context to an iframe. Exactly one parameter required.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.frame_switch(
+    *,
+    selector: str | None = None,
+    name: str | None = None,
+    index: int | None = None,
+) -> dict[str, Any]
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `selector` | — | `str \| None` | No | `None` | CSS selector for the iframe element (uses content_frame()). |
+| `name` | — | `str \| None` | No | `None` | Frame name attribute. |
+| `index` | — | `int \| None` | No | `None` | Frame index in page.frames list (0 = main frame). |
+
+**Returns** `dict[str, Any]` — Dict with frame name, url, and the parameter used to switch.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.frame_switch(selector="#payment-iframe")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.frame_main
+
+Switch back to the main page frame, clearing the working iframe.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+page.frame_main() -> dict[str, str]
+```
+</CodeGroup>
+
+**Returns** `dict[str, str]`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = page.frame_main()
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.frame_list
+
+List all frames on the current page.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.frame_list() -> list[dict[str, Any]]
+```
+</CodeGroup>
+
+**Returns** `list[dict[str, Any]]` — List of dicts with name, url, is_main, and index for each frame.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.frame_list()
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>

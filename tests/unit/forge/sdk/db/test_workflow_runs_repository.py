@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from structlog.testing import capture_logs
 from structlog.types import EventDict
@@ -40,24 +41,28 @@ from skyvern.forge.sdk.db.models import (
     TaskRunModel,
     TaskV2Model,
     WorkflowModel,
+    WorkflowParameterModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
     WorkflowRunModel,
+    WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
+from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
-from skyvern.schemas.workflows import WorkflowRetryPolicy
+from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowRetryPolicy
+from tests.unit.statement_timeout_fakes import FakeQueryCanceled
 
 
 class _SessionContext:
@@ -4425,3 +4430,302 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
         assert statements
     finally:
         event.remove(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)
+
+
+@pytest.mark.asyncio
+async def test_credential_login_history_matches_the_same_parameter_key_and_uses_one_query(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(workflow_run_id="current", queued_at=now),
+                _workflow_run_model(workflow_run_id="wrong_key", queued_at=now - timedelta(hours=1)),
+                _workflow_run_model(workflow_run_id="wrong_value", queued_at=now - timedelta(hours=2)),
+                WorkflowParameterModel(
+                    workflow_parameter_id="login_parameter",
+                    workflow_id="wf_test",
+                    key="login",
+                    workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID.value,
+                ),
+                WorkflowParameterModel(
+                    workflow_parameter_id="backup_parameter",
+                    workflow_id="wf_test",
+                    key="backup",
+                    workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID.value,
+                ),
+                WorkflowRunParameterModel(
+                    workflow_run_id="current", workflow_parameter_id="login_parameter", value="credential-a"
+                ),
+                WorkflowRunParameterModel(
+                    workflow_run_id="wrong_key", workflow_parameter_id="backup_parameter", value="credential-a"
+                ),
+                WorkflowRunParameterModel(
+                    workflow_run_id="wrong_value", workflow_parameter_id="login_parameter", value="credential-b"
+                ),
+            ]
+        )
+        await session.commit()
+
+    statements: list[str] = []
+
+    def record_statement(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        no_match = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
+            organization_id="org_test",
+            workflow_run_id="current",
+            since=now - timedelta(days=1),
+            credential_parameter_keys={"login"},
+        )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert no_match.credential_known is True
+    assert no_match.logged_in_at is None
+    assert len(statements) == 1
+
+    expected_time = now - timedelta(hours=3)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(workflow_run_id="matching", queued_at=expected_time),
+                WorkflowRunParameterModel(
+                    workflow_run_id="matching", workflow_parameter_id="login_parameter", value="credential-a"
+                ),
+                WorkflowRunBlockModel(
+                    workflow_run_id="matching",
+                    organization_id="org_test",
+                    block_type=BlockType.LOGIN.value,
+                    status=BlockStatus.completed.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    statements.clear()
+    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        match = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
+            organization_id="org_test",
+            workflow_run_id="current",
+            since=now - timedelta(days=1),
+            credential_parameter_keys={"login"},
+        )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert match.credential_known is True
+    assert match.logged_in_at == expected_time
+    assert len(statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_credential_login_history_includes_static_and_selected_credentials(sqlite_db: AgentDB) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    previous_login = now - timedelta(hours=2)
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(workflow_run_id="current", workflow_id="wf_current", queued_at=now),
+                _workflow_run_model(workflow_run_id="previous", workflow_id="wf_previous", queued_at=previous_login),
+                CredentialParameterModel(
+                    workflow_id="wf_current",
+                    key="static_login",
+                    credential_id="credential-static",
+                    credential_ids=None,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_previous",
+                    key="static_login",
+                    credential_id="credential-other",
+                    credential_ids=None,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_current",
+                    key="rotated_login",
+                    credential_id="credential-default",
+                    credential_ids=["credential-a", "credential-b"],
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_previous",
+                    key="rotated_login",
+                    credential_id="credential-default",
+                    credential_ids=["credential-a", "credential-b"],
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="current",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="rotated_login",
+                    credential_id="credential-a",
+                ),
+                WorkflowRunCredentialSelectionModel(
+                    organization_id="org_test",
+                    workflow_run_id="previous",
+                    workflow_permanent_id="wpid_test",
+                    parameter_key="rotated_login",
+                    credential_id="credential-a",
+                ),
+                WorkflowRunBlockModel(
+                    workflow_run_id="previous",
+                    organization_id="org_test",
+                    block_type=BlockType.LOGIN.value,
+                    status=BlockStatus.completed.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    recent = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
+        organization_id="org_test",
+        workflow_run_id="current",
+        since=now - timedelta(days=1),
+        credential_parameter_keys={"static_login", "rotated_login"},
+    )
+
+    assert recent.credential_known is True
+    assert recent.logged_in_at == previous_login
+
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _workflow_run_model(workflow_run_id="static_current", workflow_id="wf_static_current", queued_at=now),
+                _workflow_run_model(
+                    workflow_run_id="static_previous",
+                    workflow_id="wf_static_previous",
+                    queued_at=previous_login,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_static_current",
+                    key="static_login",
+                    credential_id="credential-shared",
+                    credential_ids=None,
+                ),
+                CredentialParameterModel(
+                    workflow_id="wf_static_previous",
+                    key="static_login",
+                    credential_id="credential-shared",
+                    credential_ids=None,
+                ),
+                WorkflowRunBlockModel(
+                    workflow_run_id="static_previous",
+                    organization_id="org_test",
+                    block_type=BlockType.LOGIN.value,
+                    status=BlockStatus.completed.value,
+                ),
+            ]
+        )
+        await session.commit()
+
+    static_recent = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
+        organization_id="org_test",
+        workflow_run_id="static_current",
+        since=now - timedelta(days=1),
+        credential_parameter_keys={"static_login"},
+    )
+
+    assert static_recent.credential_known is True
+    assert static_recent.logged_in_at == previous_login
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("search_seconds", "expected_fallback_seconds"), [(12, 18), (30, 0.25)])
+async def test_get_all_runs_v2_splits_one_timeout_budget_across_both_search_statements(
+    monkeypatch: pytest.MonkeyPatch,
+    search_seconds: int,
+    expected_fallback_seconds: float,
+) -> None:
+    # A search runs the primary query and then the workflow_runs fallback. PostgreSQL applies
+    # statement_timeout per statement, so re-applying the full ceiling before the second one would let
+    # the request hold its connection for twice the intended budget.
+    applied: list[float] = []
+    clock = [0.0]
+
+    async def _checkout() -> None:
+        clock[0] += 50  # Pool wait is outside the connection-hold budget.
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    execute_count = 0
+
+    async def _execute(_query: Any) -> _EmptyExecuteResult:
+        nonlocal execute_count
+        execute_count += 1
+        if execute_count == 1:
+            clock[0] += search_seconds
+        return _EmptyExecuteResult()
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    monkeypatch.setattr(workflow_runs_repository, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock(side_effect=_checkout)
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", page=1, page_size=10, search_key="no-such-term")
+
+    assert len(applied) == 2
+    ceiling = workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+    assert applied[0] == ceiling
+    # The fallback gets what is left, never a fresh ceiling, and never a non-positive value that
+    # PostgreSQL would read as "no timeout".
+    assert applied == [ceiling, expected_fallback_seconds]
+    session.connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_does_not_cap_unmeasured_or_indexed_query_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(
+        organization_id="o_test",
+        status=["failed"],
+        workflow_permanent_ids=["wpid_123"],
+        failure_category="LOGIN_FAILURE",
+    )
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="bp_123")
+
+    assert applied == []
+    session.connection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_hides_search_parameters_on_timeout_before_retry_logging() -> None:
+    search_key = "customer-private-search"
+    failure = OperationalError(
+        "SELECT ... WHERE searchable_text ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_EmptyExecuteResult(), failure])
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError) as exc_info:
+            await repo.get_all_runs_v2(organization_id="o_test", search_key=search_key)
+
+    assert exc_info.value.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)

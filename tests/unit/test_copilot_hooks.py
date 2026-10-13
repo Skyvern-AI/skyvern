@@ -3687,7 +3687,9 @@ class TestScoutPageSummary:
         def element(selector: str, **facts: Any) -> dict[str, Any]:
             return {
                 **facts,
-                "selector_candidates": [{"selector": selector, "source": "test_fixture", "match_count": 1}],
+                "selector_candidates": [
+                    {"selector": selector, "source": "test_fixture", "match_count": 2, "visible_match_count": 1}
+                ],
             }
 
         return {

@@ -13,7 +13,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Literal, TypedDict
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,7 @@ from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from skyvern.config import settings
 from skyvern.schemas.run_enums import RunEngine
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
@@ -390,13 +391,11 @@ def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[s
     return redacted
 
 
-def action_for_multi_field_totp_persistence(action: Action) -> Action:
-    """Return a copy of a multi-box OTP action carrying only the seed-free timing metadata.
-
-    The digit typed into the box stays on the row: the one-time code is a record the customer has to
-    be able to read back, and only the seed that mints codes is a secret. The allowlist below is what
-    keeps a `totp_secret` out of `totp_timing_info`.
-    """
+def action_for_multi_field_totp_persistence(action: Action, one_time_codes: Collection[str] = ()) -> Action:
+    """Return the persisted copy of an action; the live action must stay unmarked for execution and policy."""
+    text = action.text.strip() if action.action_type == ActionType.INPUT_TEXT and action.text else ""
+    if text and text in one_time_codes:
+        action = action.model_copy(update={"totp_code_required": True})
     timing_info = action.totp_timing_info
     if not timing_info or not timing_info.get("is_totp_sequence"):
         return action

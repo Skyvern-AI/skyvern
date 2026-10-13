@@ -666,8 +666,9 @@ async def _request_credential(
             return {
                 "ok": False,
                 "error": (
-                    "This turn has a redacted secret, so the credential card opens only for a sign-in site the "
-                    "user gave. Ask the user for the site's sign-in URL, then call `request_credential` with it."
+                    "This turn withheld a value that may be a secret, so the credential card opens only for a "
+                    "sign-in site the user gave. Ask the user for the site's sign-in URL, then call "
+                    "`request_credential` with it."
                 ),
             }
 

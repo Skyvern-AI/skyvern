@@ -1,0 +1,560 @@
+---
+title: "Browsers"
+description: "Launch or connect to a browser and get pages to automate."
+slug: sdk-reference/browser-automation/browsers
+keywords:
+  - "launch_cloud_browser"
+  - "playwright"
+  - "cdp"
+  - "SkyvernBrowser"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Browser automation drives a Playwright browser with AI added on top. Start from a `Skyvern` client, get a `SkyvernBrowser`, then a page.
+
+## Launch or connect
+
+### skyvern.launch_cloud_browser
+
+Launch a new cloud-hosted browser session.
+
+This creates a new browser session in Skyvern's cloud infrastructure and connects to it.
+
+<CodeGroup>
+```python Python
+await skyvern.launch_cloud_browser(
+    *,
+    timeout: int | None = None,
+    proxy_location: ProxyLocationInput = None,
+    extensions: list[Extensions] | None = None,
+    browser_profile_id: str | None = None,
+    browser_type: PersistentBrowserType | None = None,
+) -> SkyvernBrowser
+```
+
+```typescript TypeScript
+skyvern.launchCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLocation; }): Promise<SkyvernBrowser>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `timeout` | `timeout` | `int \| None` | No | `None` | Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. |
+| `proxy_location` | `proxyLocation` | `ProxyLocationInput` | No | `None` | Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
+| `extensions` | — | `list[Extensions] \| None` | No | `None` | Browser extensions to install in the session. |
+| `browser_profile_id` | — | `str \| None` | No | `None` | Browser profile ID to load into the session. |
+| `browser_type` | — | `PersistentBrowserType \| None` | No | `None` | Browser engine for the session (msedge, chrome, or stealth-chromium). |
+
+**Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the new cloud session.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.launch_cloud_browser()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.launchCloudBrowser();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### skyvern.use_cloud_browser
+
+Get or create a cloud browser session.
+
+This method attempts to reuse the most recent available cloud browser session.
+If no session exists, it creates a new one. This is useful for cost efficiency
+and session persistence.
+
+<CodeGroup>
+```python Python
+await skyvern.use_cloud_browser(
+    *,
+    timeout: int | None = None,
+    proxy_location: ProxyLocationInput = None,
+) -> SkyvernBrowser
+```
+
+```typescript TypeScript
+skyvern.useCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLocation; }): Promise<SkyvernBrowser>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `timeout` | `timeout` | `int \| None` | No | `None` | Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. Only used when creating a new session. |
+| `proxy_location` | `proxyLocation` | `ProxyLocationInput` | No | `None` | Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud. Only used when creating a new session. |
+
+**Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to an existing or new cloud session.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.use_cloud_browser()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.useCloudBrowser();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### skyvern.connect_to_cloud_browser_session
+
+Connect to an existing cloud-hosted browser session by ID.
+
+<CodeGroup>
+```python Python
+await skyvern.connect_to_cloud_browser_session(
+    browser_session_id: str,
+) -> SkyvernBrowser
+```
+
+```typescript TypeScript
+skyvern.connectToCloudBrowserSession(browserSessionId: string): Promise<SkyvernBrowser>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `browser_session_id` | `browserSessionId` | `str` | Yes | — | The ID of the cloud browser session to connect to. |
+
+**Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the cloud session.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.connect_to_cloud_browser_session(browser_session_id="pbs_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.connectToCloudBrowserSession("pbs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### skyvern.connect_to_browser_over_cdp
+
+Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
+
+Use this to connect to a browser that's already running with CDP enabled,
+whether local or remote.
+
+<CodeGroup>
+```python Python
+await skyvern.connect_to_browser_over_cdp(cdp_url: str) -> SkyvernBrowser
+```
+
+```typescript TypeScript
+skyvern.connectToBrowserOverCdp(cdpUrl: string): Promise<SkyvernBrowser>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `cdp_url` | `cdpUrl` | `str` | Yes | — | The CDP WebSocket URL (e.g., "http://localhost:9222"). |
+
+**Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the existing browser.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.connect_to_browser_over_cdp(cdp_url="http://localhost:9222")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.connectToBrowserOverCdp("http://localhost:9222");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### skyvern.launch_local_browser
+
+Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
+
+This method launches a browser on your local machine with remote debugging enabled,
+allowing Skyvern to control it via CDP. Useful for development and debugging.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await skyvern.launch_local_browser(
+    *,
+    headless: bool = False,
+    port: int | None = None,
+    args: list[str] | None = None,
+    user_data_dir: str | None = None,
+) -> SkyvernBrowser
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `headless` | — | `bool` | No | `False` | Whether to run the browser in headless mode. Defaults to False. |
+| `port` | — | `int \| None` | No | `None` | The port number for the CDP endpoint. Anonymous launches use an OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT. |
+| `args` | — | `list[str] \| None` | No | `None` | Additional command-line arguments to pass to Chromium. Defaults to None. Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"] |
+| `user_data_dir` | — | `str \| None` | No | `None` |  |
+
+**Returns** `SkyvernBrowser` — A browser instance with Skyvern capabilities.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.launch_local_browser()
+    print(result)
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### skyvern.aclose
+
+Close Playwright, embedded server resources, and release all handles.
+
+<CodeGroup>
+```python Python
+await skyvern.aclose() -> None
+```
+
+```typescript TypeScript
+skyvern.close(): Promise<void>
+```
+</CodeGroup>
+
+**Returns** `None` · TypeScript `Promise<void>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    await skyvern.aclose()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+await skyvern.close();
+```
+</CodeGroup>
+
+## Pages
+
+### browser.get_working_page
+
+Get the most recent page or create a new one if none exists.
+
+This method returns the last page in the browser context, or creates a new page
+if the context has no pages. This is useful for continuing work on an existing
+page without creating unnecessary new tabs.
+
+<CodeGroup>
+```python Python
+await browser.get_working_page() -> SkyvernBrowserPage
+```
+
+```typescript TypeScript
+browser.getWorkingPage(): Promise<SkyvernBrowserPage>
+```
+</CodeGroup>
+
+**Returns** `SkyvernBrowserPage` · TypeScript `Promise<SkyvernBrowserPage>` — The most recent page wrapped with Skyvern capabilities.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    result = await browser.get_working_page()
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const result = await browser.getWorkingPage();
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### browser.new_page
+
+Create a new page (tab) in the browser context.
+
+This method always creates a new page, similar to opening a new tab in a browser.
+The new page will have both Playwright's standard API and Skyvern's AI capabilities.
+
+<CodeGroup>
+```python Python
+await browser.new_page() -> SkyvernBrowserPage
+```
+
+```typescript TypeScript
+browser.newPage(): Promise<SkyvernBrowserPage>
+```
+</CodeGroup>
+
+**Returns** `SkyvernBrowserPage` · TypeScript `Promise<SkyvernBrowserPage>` — A new page wrapped with Skyvern capabilities.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    result = await browser.new_page()
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const result = await browser.newPage();
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### browser.get_page_for
+
+Wrap an existing Playwright Page with Skyvern capabilities.
+
+Use this to create a SkyvernBrowserPage for a specific tab when you
+already have a reference to the raw Playwright Page object.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await browser.get_page_for(page: Page) -> SkyvernBrowserPage
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | — | `Page` | Yes | — |  |
+
+**Returns** `SkyvernBrowserPage`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    result = await browser.get_page_for(page=browser.pages[0])
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### browser.close
+
+Close the browser and optionally close the browser session.
+
+This method closes the browser context. If the browser is associated with a
+cloud browser session (has a browser_session_id), it will also close the
+browser session via the API, marking it as completed.
+
+<CodeGroup>
+```python Python
+await browser.close(**kwargs: Any) -> None
+```
+
+```typescript TypeScript
+browser.close(): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `**kwargs` | — | `Any` | No | — | Arguments passed to the underlying BrowserContext.close() method. |
+
+**Returns** `None` · TypeScript `Promise<void>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## Browser properties
+
+| Property | TypeScript | Type | Description |
+|---|---|---|---|
+| `browser.browser_session_id` | `browserSessionId` | `str \| None` | ID of the cloud browser session (`pbs_…`), or `None` for a local or CDP browser. |
+| `browser.browser_address` | `browserAddress` | `str \| None` | CDP address the browser was connected through, if any. |
+| `browser.app_url` | — | `str \| None` | Link to watch the cloud session live in the Skyvern app, if any. |
+| `browser.local_cdp_port` | — | `int \| None` | CDP port of a browser started by `launch_local_browser`. |
+| `browser.local_user_data_dir` | — | `str \| None` | Chrome user-data directory of a browser started by `launch_local_browser`. |
+| `browser.skyvern` | `skyvern` | `Skyvern` | The `Skyvern` client this browser belongs to. |
