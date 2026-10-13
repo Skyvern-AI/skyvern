@@ -24,7 +24,10 @@ from openai.types.responses import ResponseFunctionToolCall
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.budget_expiry import (
+    BudgetExpiredReplyObservation,
     BudgetExpirySource,
+    BudgetExpiryState,
+    RecordedRunState,
     serialize_budget_expiry_observation,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -138,6 +141,9 @@ LOG = structlog.get_logger()
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
+# A turn whose budget is already spent may have no backstop time left for its one final reply, so
+# that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.
+EXPIRED_TURN_REPLY_SECONDS = 60
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -1341,6 +1347,7 @@ async def _run_streamed_with_deadline(
     iteration: int,
     *,
     watch_steer: bool = False,
+    min_remaining_seconds: float | None = None,
 ) -> Any:
     """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
@@ -1352,11 +1359,12 @@ async def _run_streamed_with_deadline(
     credential card) can suspend it for the length of that wait.
 
     ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so a zero
-    timeout never panics on an already-spent budget.
+    timeout never panics on an already-spent budget; ``min_remaining_seconds``
+    raises that floor.
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(
-        MIN_DEADLINE_REMAINING_SECONDS,
+        MIN_DEADLINE_REMAINING_SECONDS if min_remaining_seconds is None else min_remaining_seconds,
         TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
     )
     with pending_operation("turn.stream", span=True):
@@ -1457,13 +1465,22 @@ async def _run_drain(
     iteration: int,
     *,
     total_turns: int,
+    min_remaining_seconds: float | None = None,
 ) -> RunResultStreaming:
     """One drain run. A response naming a tool that was not offered gets its results and one more run, within
     ``total_turns`` model calls across both runs."""
     calls_before = ctx.model_calls_this_turn
     try:
         return await _run_streamed_with_deadline(
-            agent, observation, ctx, session, _SendTrackingStream(stream), runner_kwargs, start_time, iteration
+            agent,
+            observation,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            runner_kwargs,
+            start_time,
+            iteration,
+            min_remaining_seconds=min_remaining_seconds,
         )
     except ModelBehaviorError:
         if not await _save_unrun_call_results(agent, ctx, session, stream):
@@ -1480,6 +1497,7 @@ async def _run_drain(
         {**runner_kwargs, "max_turns": remaining_turns},
         start_time,
         iteration,
+        min_remaining_seconds=min_remaining_seconds,
     )
 
 
@@ -1540,6 +1558,18 @@ async def _run_budget_drain(
     return result
 
 
+def budget_expired_reply_observation(state: BudgetExpiryState, runs_not_in_history: list[RecordedRunState]) -> str:
+    return (
+        NUDGE_SENTINEL
+        + BudgetExpiredReplyObservation(
+            source=state.source,
+            staged_draft=state.staged_draft_id,
+            stopped_waiting=state.hard_backstop_reached,
+            runs_not_in_history=runs_not_in_history,
+        ).model_dump_json()
+    )
+
+
 async def run_final_reply_drain(
     agent: Agent,
     ctx: CopilotContext,
@@ -1552,7 +1582,7 @@ async def run_final_reply_drain(
 ) -> RunResultStreaming:
     state = ctx.budget_expiry_state
     expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded)
-    LOG.info("copilot_final_reply_drain_started")
+    LOG.info("copilot_final_reply_drain_started", budget_expiry_source=state.source)
     # Only `reply` is offered: any other call is rejected before its input checks run, and gets a result.
     reply_only = agent.clone(tools=[tool for tool in agent.tools if tool.name == REPLY_TOOL_NAME], mcp_servers=[])
     try:
@@ -1566,6 +1596,7 @@ async def run_final_reply_drain(
             ctx.copilot_run_start_monotonic or time.monotonic(),
             0,
             total_turns=2,
+            min_remaining_seconds=EXPIRED_TURN_REPLY_SECONDS if state.source is not None else None,
         )
     except CopilotTotalTimeoutError:
         # The hard backstop marks the turn budget-expired; this call is not a budget drain.

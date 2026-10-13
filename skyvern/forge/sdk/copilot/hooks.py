@@ -111,6 +111,7 @@ class CopilotRunHooks(RunHooksBase):
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
                 self._ctx.eval_prompt_sha256 = prompt_sha256(system_prompt)
+            self._ctx.open_step_run_ids.clear()
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",

@@ -42,7 +42,7 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locat
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.budget_expiry import budget_run_denial
+from skyvern.forge.sdk.copilot.budget_expiry import RecordedBlockState, RecordedRunState, budget_run_denial
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
@@ -966,6 +966,40 @@ async def _recorded_watchdog_block_receipts(
     return recorded, results
 
 
+async def recorded_open_step_runs(ctx: CopilotContext) -> list[RecordedRunState]:
+    """Each run started in the step the turn stopped waiting for, as its record reads now."""
+    runs: list[RecordedRunState] = []
+    for workflow_run_id in ctx.open_step_run_ids:
+        run = await _safe_read_workflow_run(workflow_run_id, ctx.organization_id, context="budget-expiry-reply")
+        try:
+            rows = await _chronological_run_block_rows(workflow_run_id, ctx.organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to read the blocks of an unreported run", workflow_run_id=workflow_run_id, exc_info=True
+            )
+            rows = []
+        blocks = [
+            RecordedBlockState(label=row.label, status=row.status, failure_reason=row.failure_reason)
+            for row in rows
+            if row.label and row.status
+        ]
+        shown = blocks[-RUN_RESULTS_PAGE_ROWS:]
+        state = RecordedRunState(
+            workflow_run_id=workflow_run_id,
+            status=str(run.status) if run is not None else None,
+            failure_reason=run.failure_reason if run is not None else None,
+            blocks=shown,
+            earlier_blocks_not_shown=len(blocks) - len(shown),
+        )
+        # The same scrub a run tool's own result gets before the model reads it.
+        runs.append(
+            RecordedRunState.model_validate(
+                redact_totp_runtime_values(scrub_secrets_from_structure(ctx, state.model_dump()))
+            )
+        )
+    return runs
+
+
 def _forget_browser_position(ctx: CopilotContext) -> None:
     """Drop the claim about where the browser stopped, keeping the verified prefix itself."""
     ctx.verified_prefix_block_end_urls = {}
@@ -981,6 +1015,7 @@ def _forget_interim_run_start(ctx: CopilotContext, workflow_run_id: str) -> None
         for outcome in outcomes
         if not (is_interim_run_outcome(outcome) and outcome.workflow_run_id == workflow_run_id)
     ]
+    ctx.open_step_run_ids[:] = [run_id for run_id in ctx.open_step_run_ids if run_id != workflow_run_id]
 
 
 def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str, str]:
@@ -4234,6 +4269,9 @@ async def _run_blocks_and_collect_debug(
     run_submission_attempted = False
     # Set before a re-entry of this call, which owns the minted browser from then on.
     keep_run_session = False
+    # Held, not re-read later: the turn clears it from the context as its stream unwinds, which can
+    # happen before this call's own cancellation is delivered.
+    turn_deadline = ctx.model_stream_deadline
     try:
         execution.recorded_settings = await _browser_execution_settings(workflow, ctx, run_session_id)
 
@@ -4590,6 +4628,7 @@ async def _run_blocks_and_collect_debug(
         # the tool-return record supersedes this one.
         interim_run_id = workflow_run.workflow_run_id
         ctx.run_outcome_trace.append(interim_run_start_outcome(interim_run_id))
+        ctx.open_step_run_ids.append(interim_run_id)
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
 
         if dispatch_to_worker:
@@ -4672,8 +4711,10 @@ async def _run_blocks_and_collect_debug(
         # Run setup / submission failed OR the tool was cancelled after the dispatch version was
         # created. The watchdog cleanup below never runs on this path, so soft-delete the version
         # here so it does not linger as the latest-by-permanent-id pointer. Catch BaseException so
-        # asyncio.CancelledError (the SDK tool timeout) also cleans the draft up.
-        if dispatch_draft_workflow_id is not None:
+        # asyncio.CancelledError (the SDK tool timeout) also cleans the draft up. The turn's own deadline
+        # leaves a submitted run's version in place, since the worker may already be loading it (ADR-0025).
+        deadline_left_run = run_submission_attempted and turn_deadline is not None and turn_deadline.expired()
+        if dispatch_draft_workflow_id is not None and not deadline_left_run:
             await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
             dispatch_draft_workflow_id = None
         if secret_run_session_lock is not None:
@@ -4696,6 +4737,7 @@ async def _run_blocks_and_collect_debug(
 
     active_run_association: ActiveRunSessionAssociation | None = None
     run_paused = False
+    run_left_running = False
     try:
         # Inside this try so a cancellation while publishing still reaches the browser lock release below.
         if run_detached_from_chat and debug_session_id and run_session_id:
@@ -4936,6 +4978,11 @@ async def _run_blocks_and_collect_debug(
             # run to the ``finally`` below, which adopts the executor instead.
             if run_paused:
                 raise
+            # The turn's hard deadline ends the turn's wait for the run, never the run (ADR-0025): the
+            # run stays with its executor and the turn's final reply reads its record.
+            if turn_deadline is not None and turn_deadline.expired():
+                run_left_running = True
+                raise
             # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
             # the cleanup so the parent cancellation can't interrupt it mid-await.
             # If the shield itself is cancelled, fall back to a detached task
@@ -4964,9 +5011,9 @@ async def _run_blocks_and_collect_debug(
             # poll loop — signal the run_task so we don't leak it. Dispatched runs have no in-process
             # task, so there is nothing to signal.
             if run_task is not None and not run_task.done():
-                if run_paused:
-                    # The inline executor coroutine is what observes the approval and resumes the
-                    # run, so it has to outlive this tool call instead of being cancelled.
+                if run_paused or run_left_running:
+                    # The inline executor coroutine is the run itself (and what observes a pause's
+                    # approval), so it has to outlive this tool call instead of being cancelled.
                     detached_task = asyncio.create_task(
                         _retire_snapshot_after_execution(
                             run_task,
@@ -5221,9 +5268,9 @@ async def _run_blocks_and_collect_debug(
 
         return response
     finally:
-        # A paused run keeps its association so the pane still follows the run the person was
-        # asked to act on; the next run's generation replaces it.
-        if active_run_association is not None and not run_paused:
+        # A paused or still-running run keeps its association so the pane still follows it; the next
+        # run's generation replaces it.
+        if active_run_association is not None and not (run_paused or run_left_running):
             try:
                 await clear_active_run_session(
                     organization_id=active_run_association.organization_id,
