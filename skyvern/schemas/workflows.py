@@ -24,7 +24,7 @@ from pydantic import (
 )
 
 from skyvern.config import settings
-from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -97,6 +97,13 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
 
 ENGINE_PINNED_DESCRIPTION = (
     "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
+
+FORCE_OCR_DESCRIPTION = (
+    "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. "
+    "Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. "
+    f"OCR reads at most the first {MAX_PDF_OCR_PAGES} pages, so a longer PDF loses the rest; "
+    "leave this off unless the text layer is unusable."
 )
 
 
@@ -1270,6 +1277,7 @@ class FileParserBlockYAML(BlockYAML):
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
     worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
 
 
 class PDFParserBlockYAML(BlockYAML):

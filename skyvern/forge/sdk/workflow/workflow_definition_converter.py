@@ -715,6 +715,7 @@ def block_yaml_to_block(
             file_type=block_yaml.file_type,
             json_schema=block_yaml.json_schema,
             worksheet=block_yaml.worksheet,
+            force_ocr=block_yaml.force_ocr,
         )
     elif block_yaml.block_type == BlockType.PDF_PARSER:
         return PDFParserBlock(

@@ -148,6 +148,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
     MultiFieldTotpAttempt,
     MultiFieldTotpRejection,
     SkyvernContext,
+    UnconsumedOTPCode,
     action_for_multi_field_totp_persistence,
     canonical_url,
     normalize_multi_field_totp_code,
@@ -224,6 +225,7 @@ from skyvern.services.credential_verdict_service import (
 )
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
+    OTPValue,
     describe_webhook_contract_failure,
     extract_totp_from_navigation_inputs,
     is_usable_credential_totp_placeholder,
@@ -361,6 +363,11 @@ STEP_STALL_LOG_REPEAT_EVERY_SECONDS = 30 * 60
 # Shared by the goal verification and the speculative next-step plan that start together after a step. Each is
 # a scrape plus one LLM call, and fewer than 1 in 100,000 of those LLM calls alone runs past 15 minutes.
 PARALLEL_VERIFICATION_TIMEOUT_SECONDS = 15 * 60
+
+# How long a polled verification code may be carried to a later plan. Emailed codes outlive this by
+# minutes, but a code the page never accepted is better re-polled than submitted indefinitely, and
+# two steps' worth is enough to cover a code field that renders one step after the gate fires.
+UNCONSUMED_OTP_CODE_TTL_SECONDS = 120.0
 
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
@@ -866,6 +873,30 @@ def _replace_multi_field_totp_code(
     return value
 
 
+def _plan_without_unresolved_code_entry(
+    task: Task, json_response: dict[str, Any], otp_value: OTPValue | None
+) -> dict[str, Any]:
+    """Drop a plan that would type into the code field when no code of the expected type resolved.
+
+    The planner writes a placeholder ("OTP code from email") into its own input_text action and
+    relies on the resolver to replace it, so returning that plan verbatim submits the placeholder.
+    A plan that only clicks or waits is still the right move and is returned untouched.
+    """
+    planned_actions = json_response.get("actions")
+    if not isinstance(planned_actions, list) or not any(
+        isinstance(action, dict) and str(action.get("action_type", "")).upper() == ActionType.INPUT_TEXT.value.upper()
+        for action in planned_actions
+    ):
+        return json_response
+    LOG.warning(
+        "No verification code resolved; dropping the plan that would have typed into the code field",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        resolved_otp_type=otp_value.get_otp_type().value if otp_value else None,
+    )
+    return {**json_response, "actions": []}
+
+
 def _replace_multi_field_totp_prompt_code(
     task_id: str, prompt_kwargs: dict[str, Any], *, rejection: MultiFieldTotpRejection | None = None
 ) -> dict[str, Any]:
@@ -1023,6 +1054,43 @@ def recovery_credential_release_guard(
         return None
     guard.log_armed()
     return guard
+
+
+def _unconsumed_otp_code(context: SkyvernContext, task_id: str) -> UnconsumedOTPCode | None:
+    """The polled code an earlier plan was given but never typed, while it is still worth submitting."""
+    held = context.unconsumed_otp_codes.get(task_id)
+    if held is None or context.totp_codes.get(task_id) != held.value:
+        return None
+    if time.time() - held.obtained_at > UNCONSUMED_OTP_CODE_TTL_SECONDS:
+        return None
+    return held
+
+
+def _release_planned_otp_code(context: SkyvernContext, task_id: str, actions: Sequence[Action]) -> None:
+    """Discard the verification code the plan was given, unless the plan never typed it.
+
+    The OTP gate can fire on a page whose code field has not rendered yet, so the plan that follows
+    is a click rather than an input. Discarding the code there means the next step polls again, and
+    a second poll of the same email can resolve to the sign-in link beside the code instead.
+    """
+    held = _unconsumed_otp_code(context, task_id)
+    if held is None:
+        context.pop_totp_code(task_id)
+        return
+    canonical = skyvern_context.strip_multi_field_totp_code_separators(held.value)
+    for action in actions:
+        if not isinstance(action, InputTextAction):
+            continue
+        if held.value in action.text or canonical in skyvern_context.strip_multi_field_totp_code_separators(
+            action.text
+        ):
+            context.pop_totp_code(task_id)
+            return
+    LOG.info(
+        "Verification code was not typed by the planned actions; carrying it to the next step",
+        task_id=task_id,
+        code_age_seconds=round(time.time() - held.obtained_at, 1),
+    )
 
 
 def _first_plan_carries_consumable_totp(
@@ -5868,7 +5936,7 @@ class ForgeAgent:
                                 actions = [terminate_action]
 
                     if context:
-                        context.pop_totp_code(task.task_id)
+                        _release_planned_otp_code(context, task.task_id, actions)
                 except NoTOTPVerificationCodeFound as e:
                     # Surface only the source poll_otp_value actually queried so
                     # the failure_reason tells the customer which delivery endpoint
@@ -8737,7 +8805,9 @@ class ForgeAgent:
                     final_navigation_payload.append(verification_code_dict)
             elif final_navigation_payload is None:
                 final_navigation_payload = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
-        if expire_verification_code:
+        # A carried code is owned by the planning round that polled it, not by this prompt: expiring
+        # it here would send the step that finally has the code field back to the delivery source.
+        if expire_verification_code and _unconsumed_otp_code(current_context, task.task_id) is None:
             current_context.pop_totp_code(task.task_id)
         mask_values = (
             current_context.multi_field_totp_mask_values.get(task.task_id, set())
@@ -11460,6 +11530,7 @@ class ForgeAgent:
         current_context = skyvern_context.current()
         attempt = current_context.multi_field_totp.get(task.task_id) if current_context else None
         rejection = current_context.multi_field_totp_rejections.get(task.task_id) if current_context else None
+        held_code: UnconsumedOTPCode | None = None
         if attempt is not None or rejection is not None:
             expected_digits = (
                 attempt.expected_digits
@@ -11478,11 +11549,21 @@ class ForgeAgent:
                 multi_field_expected_digits=expected_digits,
             )
         else:
-            otp_value = await resolve_otp_value(
-                task,
-                expected_otp_type=OTPType.TOTP,
-                allowed_credential_parameter_keys=allowed_credential_parameter_keys,
-            )
+            if current_context is not None:
+                held_code = _unconsumed_otp_code(current_context, task.task_id)
+            if held_code is not None:
+                LOG.info(
+                    "Reusing the verification code fetched before the code field rendered",
+                    task_id=task.task_id,
+                    code_age_seconds=round(time.time() - held_code.obtained_at, 1),
+                )
+                otp_value = OTPValue(value=held_code.value, type=OTPType.TOTP)
+            else:
+                otp_value = await resolve_otp_value(
+                    task,
+                    expected_otp_type=OTPType.TOTP,
+                    allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+                )
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             if (
@@ -11494,7 +11575,7 @@ class ForgeAgent:
                 )
             ):
                 return {**_replace_multi_field_totp_prompt_code(task.task_id, json_response), "actions": []}
-            return json_response
+            return _plan_without_unresolved_code_entry(task, json_response, otp_value)
 
         if current_context is not None and not otp_value.from_credential_seed:
             code_digits = (
@@ -11521,7 +11602,13 @@ class ForgeAgent:
             elif has_box_inputs and not skyvern_context.is_supported_multi_field_totp_code(otp_value.value):
                 normalize_multi_field_totp_code(otp_value.value, task_id=task.task_id)
                 return {**_replace_multi_field_totp_prompt_code(task.task_id, json_response), "actions": []}
-        external_code_obtained_at = time.time() if not otp_value.from_credential_seed else None
+        # A carried-over code keeps its original fetch time, so passing it to another plan cannot
+        # stretch either its reuse window or the rejection timing derived from it.
+        external_code_obtained_at = (
+            None
+            if otp_value.from_credential_seed
+            else (held_code.obtained_at if held_code is not None else time.time())
+        )
         if current_context is not None:
             if otp_value.from_credential_seed:
                 current_context.seed_generated_totp_values.setdefault(task.task_id, set()).add(otp_value.value)
@@ -11542,8 +11629,16 @@ class ForgeAgent:
                     current_context.totp_codes[f"{task.task_id}_totp_cache"] = otp_value.value
                     current_context.register_secret_value(otp_value.value)
                 current_context.totp_codes[task.task_id] = attempt.hint_code
+                current_context.unconsumed_otp_codes.pop(task.task_id, None)
             else:
                 current_context.totp_codes[task.task_id] = otp_value.value
+                if external_code_obtained_at is None:
+                    # Seed-generated codes are regenerated on demand, so there is nothing to carry.
+                    current_context.unconsumed_otp_codes.pop(task.task_id, None)
+                else:
+                    current_context.unconsumed_otp_codes[task.task_id] = UnconsumedOTPCode(
+                        value=otp_value.value, obtained_at=external_code_obtained_at
+                    )
 
         build_result = await self._build_extract_action_prompt(
             task,

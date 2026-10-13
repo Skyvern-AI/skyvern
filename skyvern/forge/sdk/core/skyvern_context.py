@@ -61,6 +61,18 @@ class MultiFieldTotpAttempt:
     observed_max_filled: int = 0
 
 
+@dataclass(frozen=True)
+class UnconsumedOTPCode:
+    """A polled verification code handed to a plan that did not type it.
+
+    ``obtained_at`` is the wall-clock time the code was fetched, not the time it was handed over, so
+    carrying it to a later plan cannot extend how long it is considered worth submitting.
+    """
+
+    value: str = field(repr=False)
+    obtained_at: float
+
+
 @dataclass
 class MultiFieldTotpRejection:
     rejected_code_hash: str = field(repr=False)
@@ -702,6 +714,9 @@ class SkyvernContext:
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    # Polled codes placed in totp_codes that no plan has typed yet. Only the single-field polling
+    # path records one, so every other producer keeps the historical discard-after-planning behavior.
+    unconsumed_otp_codes: dict[str, UnconsumedOTPCode] = field(default_factory=dict, repr=False)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
@@ -1075,6 +1090,7 @@ class SkyvernContext:
         return self.__repr__()
 
     def pop_totp_code(self, task_id: str) -> None:
+        self.unconsumed_otp_codes.pop(task_id, None)
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
@@ -1104,6 +1120,7 @@ class SkyvernContext:
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)
         self.seed_generated_totp_values.pop(task_id, None)
+        self.unconsumed_otp_codes.pop(task_id, None)
         self.totp_codes.pop(task_id, None)
         self.totp_codes.pop(f"{task_id}_secret", None)
         cached_code = self.totp_codes.pop(f"{task_id}_totp_cache", None)

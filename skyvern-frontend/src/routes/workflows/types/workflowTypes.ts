@@ -498,6 +498,7 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema: Record<string, unknown> | null;
   worksheet: string | null;
+  force_ocr: boolean;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {

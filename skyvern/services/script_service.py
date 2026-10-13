@@ -4041,6 +4041,7 @@ async def parse_file(
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
     worksheet: str | None = None,
+    force_ocr: bool = False,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
@@ -4051,6 +4052,7 @@ async def parse_file(
         file_type=file_type,
         json_schema=schema,
         worksheet=worksheet,
+        force_ocr=force_ocr,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
