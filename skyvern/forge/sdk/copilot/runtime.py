@@ -461,6 +461,9 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # Runs started since the current model call began. The SDK saves a step to the session only once all of
+    # its tools return, so after the hard backstop cuts a step these are the runs the session has no result for.
+    open_step_run_ids: list[str] = field(default_factory=list)
     # True from on_llm_start to on_llm_end: no tool of that response has started, so aborting the
     # stream then discards only the call itself.
     model_call_in_flight: bool = False

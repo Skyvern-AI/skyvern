@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from agents import function_tool
+from agents import ModelSettings, function_tool
 from agents.exceptions import MaxTurnsExceeded
+from agents.run_config import RunConfig
 
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
@@ -18,7 +21,14 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionPart, QuestionResponse
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.enforcement import BUDGET_DRAIN_HEADROOM, run_with_enforcement
+from skyvern.forge.sdk.copilot.enforcement import (
+    BUDGET_DRAIN_HEADROOM,
+    EXPIRED_TURN_REPLY_SECONDS,
+    HARD_BACKSTOP_ALLOWANCE_SECONDS,
+    TOTAL_TIMEOUT_SECONDS,
+    run_final_reply_drain,
+    run_with_enforcement,
+)
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
 from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
@@ -367,6 +377,37 @@ def test_hard_backstop_preserves_staged_proposal_without_fallback() -> None:
     assert result.proposal_disposition == "review_untested"
     assert result.turn_outcome is not None
     assert result.turn_outcome.budget_expiry_staged_draft_id == "wf_draft"
+
+
+@pytest.mark.asyncio
+async def test_expired_turn_reply_gets_its_own_allowance_past_the_hard_backstop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx()
+    ctx.budget_expiry_state.source = "deadline"
+    ctx.copilot_run_start_monotonic = time.monotonic() - 2 * (TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
+    allowances: list[float] = []
+
+    async def record_allowance(_result: Any, _stream: Any, stream_ctx: Any) -> None:
+        when = stream_ctx.model_stream_deadline.when()
+        allowances.append(when - asyncio.get_running_loop().time())
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", lambda *_args, **_kwargs: _result("")
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", record_allowance)
+
+    await run_final_reply_drain(
+        MagicMock(),
+        ctx,
+        MagicMock(),
+        session=None,
+        hooks=MagicMock(),
+        run_config=RunConfig(model_settings=ModelSettings(), tracing_disabled=True),
+    )
+
+    [allowance] = allowances
+    assert allowance > EXPIRED_TURN_REPLY_SECONDS - 5
 
 
 @pytest.mark.asyncio

@@ -2479,6 +2479,8 @@ async def _run_tool_bearing_empty_completion_turn(
         runner_kwargs: dict[str, Any],
         start_time: float,
         iteration: int,
+        *,
+        min_remaining_seconds: float | None = None,
     ) -> RunResultStreaming | SimpleNamespace:
         drain_calls.append(
             _DrainCall(
@@ -2492,7 +2494,15 @@ async def _run_tool_bearing_empty_completion_turn(
         )
         if drain_outcome is None:
             return await real_run_streamed_with_deadline(
-                agent, current_input, ctx, session, stream, runner_kwargs, start_time, iteration
+                agent,
+                current_input,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                min_remaining_seconds=min_remaining_seconds,
             )
         if isinstance(drain_outcome, BaseException):
             raise drain_outcome
@@ -7557,6 +7567,147 @@ class TestCopilotConfig:
             monkeypatch, OutputGuardrailTripwireTriggered(MagicMock())
         )
         assert blocked.result is blocked_result
+
+    @staticmethod
+    def _hit_hard_backstop(ctx: CopilotContext) -> None:
+        ctx.tool_activity.append({"tool": "update_and_run_blocks", "summary": "run still going"})
+        ctx.run_outcome_trace.append(interim_run_start_outcome("wr_left"))
+        ctx.open_step_run_ids.append("wr_left")
+        ctx.budget_expiry_state.hard_backstop_reached = True
+        enforcement_module._mark_copilot_total_timeout(ctx, elapsed_seconds=990.0, iteration=3)
+
+    @staticmethod
+    def _exhaust_budget_drain(ctx: CopilotContext) -> None:
+        ctx.tool_activity.append({"tool": "click", "summary": "clicked"})
+        enforcement_module._mark_budget_expiry(ctx, "deadline")
+        ctx.budget_expiry_state.begin_drain()
+        ctx.budget_expiry_state.drain_active = False
+
+    @staticmethod
+    def _record_run_still_going(monkeypatch: pytest.MonkeyPatch) -> None:
+        now = datetime.now(timezone.utc)
+        monkeypatch.setattr(
+            forge_app.DATABASE.workflow_runs,
+            "get_workflow_run",
+            AsyncMock(return_value=SimpleNamespace(status="running", failure_reason=None)),
+        )
+        monkeypatch.setattr(
+            forge_app.DATABASE.observer,
+            "get_workflow_run_blocks",
+            AsyncMock(
+                return_value=[
+                    WorkflowRunBlock(
+                        workflow_run_block_id=f"wrb_{label}",
+                        workflow_run_id="wr_left",
+                        organization_id="org-1",
+                        label=label,
+                        block_type=BlockType.CODE,
+                        status=status,
+                        created_at=now,
+                        modified_at=now,
+                    )
+                    # The repository returns rows newest first.
+                    for label, status in (("download_invoice", "running"), ("sign_in", "completed"))
+                ]
+            ),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "expire", "stopped_waiting", "runs_not_in_history"),
+        [
+            pytest.param(
+                CopilotTotalTimeoutError(),
+                _hit_hard_backstop,
+                True,
+                [
+                    {
+                        "workflow_run_id": "wr_left",
+                        "status": "running",
+                        "failure_reason": None,
+                        "blocks": [
+                            {"label": "sign_in", "status": "completed", "failure_reason": None},
+                            {"label": "download_invoice", "status": "running", "failure_reason": None},
+                        ],
+                        "earlier_blocks_not_shown": 0,
+                    }
+                ],
+                id="hard_backstop",
+            ),
+            pytest.param(MaxTurnsExceeded("drain"), _exhaust_budget_drain, False, [], id="drain_exhausted"),
+        ],
+    )
+    async def test_budget_expiry_without_a_report_gets_one_final_reply_from_the_recorded_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error: BaseException,
+        expire: Callable[[CopilotContext], None],
+        stopped_waiting: bool,
+        runs_not_in_history: list[dict[str, Any]],
+    ) -> None:
+        report = "I saved the login draft. Its test run signed in and is still downloading the invoice."
+        staged_workflow = MagicMock(workflow_id="w_draft")
+        stage = _stage_proposal(staged_workflow)
+        self._record_run_still_going(monkeypatch)
+
+        def stage_then_expire(ctx: CopilotContext) -> None:
+            stage(ctx)
+            expire(ctx)
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": report}),
+            attempts=(_EnforcementAttempt(error=error),),
+            during_attempt=stage_then_expire,
+        )
+
+        [call] = run.drain_calls
+        assert isinstance(call.current_input, str)
+        observation = json.loads(call.current_input.removeprefix(NUDGE_SENTINEL))
+        assert observation["budget_expired"] is True
+        assert observation["staged_draft"] == "w_draft"
+        assert observation["stopped_waiting"] is stopped_waiting
+        assert observation["runs_not_in_history"] == runs_not_in_history
+        assert call.model_settings.tool_choice is None
+        assert call.max_turns == 1
+        assert run.result.user_response == report
+        assert run.result.staged_workflow is staged_workflow
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expired is True
+        assert outcome.budget_expiry_report_produced is True
+        assert run.result.narrative_payload is not None
+        assert run.result.narrative_payload["budgetExpiry"]["reportProduced"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_outcome",
+        [
+            pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
+            pytest.param(RuntimeError("provider unavailable"), id="failed"),
+            pytest.param(CopilotTotalTimeoutError(), id="reply_timed_out"),
+            pytest.param(asyncio.CancelledError(), id="user_stopped_during_reply"),
+        ],
+    )
+    async def test_budget_expiry_reply_that_fails_keeps_the_typed_no_report_fact(
+        self, monkeypatch: pytest.MonkeyPatch, reply_outcome: SimpleNamespace | BaseException
+    ) -> None:
+        self._record_run_still_going(monkeypatch)
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            reply_outcome,
+            attempts=(_EnforcementAttempt(error=CopilotTotalTimeoutError()),),
+            during_attempt=self._hit_hard_backstop,
+        )
+
+        assert len(run.drain_calls) == 1
+        assert run.result.user_response == ""
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expiry_report_produced is False
+        assert outcome.tool_calls == ["update_and_run_blocks"]
 
     @staticmethod
     def _withheld_reply(*reason_codes: OutputPolicyReason, user_response: str = "") -> OutputGuardrailTripwireTriggered:

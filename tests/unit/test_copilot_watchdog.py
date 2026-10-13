@@ -1003,6 +1003,73 @@ async def test_externally_cancelled_worker_run_still_cooperatively_cancels(
     harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+async def test_the_turn_deadline_ends_the_wait_and_leaves_the_run_with_its_executor(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool
+) -> None:
+    """ADR-0025: the turn cap never cancels a run. The turn's hard deadline cancels this call's wait;
+    the run keeps executing, and the turn still knows the cut step started it."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+    )
+    polling = asyncio.Event()
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime]:
+        polling.set()
+        return _fake_run(status="running"), datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 3600)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+    tool_calls: list[asyncio.Task[Any]] = []
+
+    async def _turn_stream() -> None:
+        # Shaped like _run_streamed_with_deadline over the SDK: the tool runs in its own task, the
+        # stream's immediate cancel does not await it, and the deadline is cleared on the way out.
+        try:
+            async with asyncio.timeout(None) as deadline:
+                ctx.model_stream_deadline = deadline
+                tool_calls.append(
+                    asyncio.create_task(
+                        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+                    )
+                )
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    tool_calls[0].cancel()
+                    raise
+        finally:
+            ctx.model_stream_deadline = None
+
+    turn = asyncio.create_task(_turn_stream())
+    await asyncio.wait_for(polling.wait(), timeout=5)
+    assert ctx.model_stream_deadline is not None
+    ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    with pytest.raises(TimeoutError):
+        await turn
+    with pytest.raises(asyncio.CancelledError):
+        await tool_calls[0]
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    assert harness["executor_cancelled"] is False
+    assert ctx.open_step_run_ids == ["wr_paused"]
+
+    adopted = _adopted_detached_tasks(before)
+    for task in adopted:
+        task.cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
+
+
 def test_paused_result_records_last_test_ok_as_none() -> None:
     """``None`` is the only honest value: at ``False`` the finalizer rewrites the reply into a
     failed test, and ``True`` would let an unapproved draft count as verified."""
