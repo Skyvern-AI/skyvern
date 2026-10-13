@@ -97,6 +97,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
+    BlockTerminationError,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
@@ -9292,6 +9293,23 @@ async def wrapper({default_args}):
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
+        try:
+            await app.AGENT_FUNCTION.validate_block_execution(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except BlockTerminationError as e:
+            # Returned, not raised: execute() rewrites a raised error into a generic machinery failure.
+            return await self.build_block_result(
+                success=False,
+                failure_reason=get_user_facing_exception_message(e),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                can_continue_after_failure=False,
+            )
 
         block_context = skyvern_context.current()
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
