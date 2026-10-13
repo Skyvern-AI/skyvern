@@ -80,7 +80,8 @@
             "vite": "^7.3.5",
             "rollup": "^4.59.0",
             "serialize-javascript": "^7.0.3",
-            "fast-uri": "^3.1.2"
+            "fast-uri": "^3.1.7",
+            "source-map-js": "^1.2.2"
         }
     }
 }

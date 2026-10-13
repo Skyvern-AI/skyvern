@@ -41,7 +41,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     coerce_block_action_observations,
     coerce_block_end_urls,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    INTERNAL_VALIDATION_FAILURE_PREFIX,
+    model_visible_composition_evidence,
+)
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     PageObstruction,
@@ -1628,6 +1631,21 @@ def _remove_registered_output_copies(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+# A tripwire against pathological payloads, not a routine ration: code-bearing tool
+# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
+# and must reach the model whole, so the cap sits above that class with headroom.
+_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
+
+
+def _fit_post_run_page_evidence(result: dict[str, Any]) -> None:
+    data = result.get("data")
+    packet = data.get("post_run_page_evidence") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not isinstance(packet, dict):
+        return
+    if len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        data["post_run_page_evidence"] = model_visible_composition_evidence(packet)
+
+
 def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     """Strip large/binary fields from tool results before sending to the LLM."""
     sanitized = sanitize_generic_tool_result_for_llm(
@@ -1786,6 +1804,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             else:
                 data.pop("block_fact_omission_notices", None)
             sanitized["data"] = data
+        _fit_post_run_page_evidence(sanitized)
     if tool_name in {"get_org_workflow", "skyvern_workflow_get"} and isinstance(sanitized.get("data"), dict):
         strip_private_workflow_settings(sanitized["data"])
         return {

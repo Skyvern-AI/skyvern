@@ -13,6 +13,7 @@ from playwright.async_api import Page
 from typing_extensions import TypedDict
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
+from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -1091,6 +1092,9 @@ async def on_working_page(
                 page = await live_working_page(ctx)
                 if page is None:
                     return {"ok": False, "error": no_page_error}
+                # An MCP call attaches this turn's inspection listeners in get_page, which a native action skips.
+                if (browser := get_current_session().browser) is not None:
+                    ensure_browser_hooks(browser)
                 return await act(page)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")

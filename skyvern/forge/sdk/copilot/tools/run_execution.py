@@ -91,7 +91,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_run_blocks_result,
     solver_receipt,
-    unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
@@ -118,6 +117,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     model_visible_composition_evidence,
     parse_composition_html,
     stamp_page_evidence_provenance,
+    without_authoring_facts,
 )
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
@@ -234,6 +234,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import DeliveredOutputFile
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
@@ -341,7 +342,14 @@ from .guardrails import (
     _placeholder_for_parameter_type,
 )
 from .scouting import _mark_post_run_page_observed, _redact_codeblock_value
-from .workflow_update import strip_copilot_yaml_headers
+from .workflow_update import (
+    ProposalAdoptionOutcome,
+    adopt_stored_workflow_candidate,
+    prior_draft_settings_match_stored_candidate,
+    proposal_conflict_result,
+    strip_copilot_yaml_headers,
+    unseen_adoption,
+)
 
 LOG = structlog.get_logger()
 
@@ -363,7 +371,7 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
 COPILOT_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
-COPILOT_PROPOSAL_CHANGED_ERROR = "The pending Copilot proposal changed before the test started; reload and try again."
+_PROPOSAL_BIND_REFUSED_KEY = "proposal_bind_refused"
 COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR = (
     "This request's workflow settings differ from the pending Copilot proposal's; "
     "re-save the proposal with the current settings, then test again."
@@ -1983,6 +1991,8 @@ class CopilotExecutionSnapshot:
     workflow_parameters: tuple[WorkflowParameter, ...]
     output_parameters: tuple[OutputParameter, ...]
     workflow_yaml: str | None = None
+    # The stored candidate bytes a prior-draft run was parsed from; only the proposal bind compares them.
+    proposal_bind_yaml: str | None = None
 
 
 @dataclass
@@ -2131,7 +2141,15 @@ async def _select_execution_snapshot(
     if allow_prior_draft and not _workflow_has_blocks(workflow):
         prior_draft = await _workflow_from_prior_draft(ctx, list(requested_labels))
         if prior_draft is not None:
-            return _declared_execution_snapshot(prior_draft)
+            snapshot = _declared_execution_snapshot(prior_draft)
+            settings_match = await prior_draft_settings_match_stored_candidate(ctx)
+            if settings_match:
+                snapshot = replace(snapshot, proposal_bind_yaml=ctx.prior_copilot_workflow_yaml)
+            elif (
+                settings_match is False and ctx.proposal_owner_turn_id is not None and ctx.proposal_revision is not None
+            ):
+                ctx.settings_diverged_proposal_token = (ctx.proposal_owner_turn_id, ctx.proposal_revision)
+            return snapshot
     if workflow is None:
         return None
 
@@ -2289,7 +2307,7 @@ def _pin_pre_run_page_reference(ctx: CopilotContext, run_id: str) -> None:
     evidence = ctx.composition_page_evidence
     if not isinstance(evidence, Mapping):
         return
-    text = page_evidence_prose_text(evidence).strip()
+    text = page_evidence_prose_text(without_authoring_facts(evidence)).strip()
     if not text:
         return
     ctx.pre_run_page_reference = PreRunPageReference(text=text, workflow_run_id=run_id)
@@ -3459,8 +3477,7 @@ async def run_workflow_end_to_end(
         result=result,
         recorded_outcome=recorded_outcome,
     )
-    if not finalized.get("ok"):
-        _carry_prior_attempt_change_identity_into_result(ctx, finalized.get("data"), "test_end_to_end")
+    _carry_prior_attempt_change_identity_into_result(ctx, finalized, "test_end_to_end")
     return finalized
 
 
@@ -3596,7 +3613,9 @@ async def _attach_post_run_browser_enrichment(
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run_id)
     if post_run_page_evidence is not None:
-        result_data["post_run_page_evidence"] = model_visible_composition_evidence(post_run_page_evidence)
+        result_data["post_run_page_evidence"] = model_visible_composition_evidence(
+            post_run_page_evidence, authoring_facts=True
+        )
     if post_run_page_capture is not None:
         result_data["post_run_page_capture"] = post_run_page_capture.model_dump(mode="json")
     _attach_run_session_facts(
@@ -3753,6 +3772,14 @@ async def _run_blocks_and_collect_debug(
         reused_origin_output_labels=reused_origin_output_labels,
         origin_workflow_run_id=ctx.repair_origin_outputs_run_id if reused_origin_output_labels else None,
     )
+    # Same check as an edit's, synchronous with the token capture above: the labels and parameters were chosen
+    # against the draft an unseen adoption replaced.
+    if (adoption := unseen_adoption(ctx)) is not None:
+        LOG.info("copilot candidate run refused", reason="token_changed", adoption=adoption)
+        return {
+            **proposal_conflict_result(ctx, lost="The test was not run.", reason="token_changed", adoption=adoption),
+            "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
+        }
     if ctx.settings_diverged_proposal_token == (execution.proposal_owner_turn_id, execution.proposal_revision):
         LOG.info(
             "copilot candidate run refused",
@@ -4450,37 +4477,78 @@ async def _run_blocks_and_collect_debug(
             and execution.proposal_owner_turn_id is not None
             and execution.proposal_revision is not None
         ):
-            try:
-                async with ctx.proposal_mutation_lock:
+            bind_conflict: tuple[CopilotProposalConflictReason, ProposalAdoptionOutcome] | None = None
+            bind_unexpected = False
+            async with ctx.proposal_mutation_lock:
+                try:
                     await app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run(
                         organization_id=ctx.organization_id,
                         workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
                         expected_owner_turn_id=execution.proposal_owner_turn_id,
                         expected_revision=execution.proposal_revision,
-                        expected_workflow_yaml=execution.workflow_yaml,
+                        expected_workflow_yaml=execution.snapshot.proposal_bind_yaml or execution.workflow_yaml,
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
+                except CopilotProposalConflictError as conflict:
+                    # A token or source this call no longer shares with ctx belongs to a candidate the turn replaced.
+                    ctx_holds_call_token = (ctx.proposal_owner_turn_id, ctx.proposal_revision) == (
+                        execution.proposal_owner_turn_id,
+                        execution.proposal_revision,
+                    ) and execution.source_is_current(ctx)
+                    bind_conflict = (
+                        conflict.reason,
+                        await adopt_stored_workflow_candidate(ctx) if ctx_holds_call_token else "kept",
+                    )
+                except Exception:  # noqa: BLE001 - any custody failure must stop dispatch.
+                    bind_unexpected = True
+                    LOG.warning(
+                        "copilot candidate run bind failed",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        reason="unexpected_error",
+                        exc_info=True,
+                    )
+                else:
                     if (
                         ctx.proposal_owner_turn_id == execution.proposal_owner_turn_id
                         and ctx.proposal_revision == execution.proposal_revision
                         and execution.source_is_current(ctx)
                     ):
                         ctx.proposal_workflow_run_id = workflow_run.workflow_run_id
-            except Exception:  # noqa: BLE001 - any custody failure must stop dispatch.
-                await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+            if bind_conflict is not None or bind_unexpected:
+                if bind_conflict is None:
+                    cancel_reason = "The Copilot test run could not be bound to its proposal."
+                elif bind_conflict[0] == "being_accepted":
+                    cancel_reason = "The Copilot proposal was being accepted, so its test run was not started."
+                else:
+                    cancel_reason = "The Copilot proposal changed before its test run started."
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
                     workflow_run_id=workflow_run.workflow_run_id,
-                    failure_reason="The Copilot proposal changed before its test run started.",
+                    failure_reason=cancel_reason,
                 )
                 if dispatch_draft_workflow_id is not None:
                     await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
                     dispatch_draft_workflow_id = None
+                if bind_conflict is None:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "The test run could not be bound to the pending Copilot proposal, so it was not started."
+                        ),
+                        "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
+                    }
+                reason, adoption = bind_conflict
                 LOG.info(
                     "copilot candidate run bind lost",
                     workflow_run_id=workflow_run.workflow_run_id,
                     proposal_owner_turn_id=execution.proposal_owner_turn_id,
                     proposal_revision=execution.proposal_revision,
+                    reason=reason,
+                    adoption=adoption,
                 )
-                return {"ok": False, "error": COPILOT_PROPOSAL_CHANGED_ERROR}
+                return {
+                    **proposal_conflict_result(ctx, lost="The test was not run.", reason=reason, adoption=adoption),
+                    "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
+                }
         ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
         # A seeded producer's value belongs to the run that produced it, never to this one.
         seeded_only_labels = frozenset(block_outputs_to_seed) - frozenset(labels_that_may_execute)
@@ -5497,7 +5565,9 @@ async def _get_run_results(
             run_id=workflow_run_id,
             run_browser_session_id=run.browser_session_id,
         )
-        result_data["post_run_page_evidence"] = model_visible_composition_evidence(stamped_page_evidence)
+        result_data["post_run_page_evidence"] = model_visible_composition_evidence(
+            stamped_page_evidence, authoring_facts=True
+        )
 
     return {
         "ok": True,
@@ -6455,8 +6525,13 @@ def _record_executed_block_labels(copilot_ctx: CopilotContext, result: dict[str,
         if isinstance(label, str) and label:
             copilot_ctx.executed_block_labels.add(label)
             block_fingerprints = fingerprints.get(label)
-            if block_fingerprints is not None:
+            if block_fingerprints is None:
+                continue
+            # The label's last row in this result decides: completed adds coverage, anything else drops it.
+            if block.get("status") == BlockStatus.completed.value:
                 copilot_ctx.executed_block_fingerprints.setdefault(label, set()).update(block_fingerprints)
+            else:
+                copilot_ctx.executed_block_fingerprints.get(label, set()).difference_update(block_fingerprints)
 
 
 def _same_run_runtime_failure_class(copilot_ctx: CopilotContext, workflow_run_id: str | None) -> str | None:
@@ -6734,71 +6809,14 @@ async def _resolve_captcha_solver_availability(copilot_ctx: Any, result_url: str
     copilot_ctx.captcha_solver_available_for_url = url
 
 
-def _carry_unresolved_failure_into_result(copilot_ctx: Any, result: dict[str, Any], tool_name: str = "") -> None:
-    """Keep an earlier unresolved failure visible in the result this run returns to the model.
-
-    A later success otherwise displaces the failure before the model decides whether to repair: it
-    sees a passing run, has no record of the one that failed, and reports done. The fact is reported,
-    not interpreted - which run failed, at which block, how, and that this success did not establish
-    the failure was resolved. The model still owns what to do about it.
-    """
-    data = result.get("data")
-    if not result.get("ok"):
-        _carry_prior_attempt_change_identity_into_result(copilot_ctx, data, tool_name)
-        return
-    this_run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
-    # Clearance compares block signatures, so it needs the authored bytes the signature was taken
-    # from: only the snapshot's own yaml, never _RunExecution's re-serialized fallback, whose
-    # model dump drops authoring-only fields and reads as a changed signature.
-    execution = result.execution if isinstance(result, _ExecutionResult) else None
-    executed_workflow_yaml = execution.snapshot.workflow_yaml if execution is not None else None
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        copilot_ctx,
-        reported_workflow_yaml=executed_workflow_yaml or copilot_ctx.persisted_workflow_yaml,
-        pending_later_run_id=this_run_id if isinstance(this_run_id, str) else None,
-        reported_workflow_is_persisted=executed_workflow_yaml is None,
-    )
-    # This seam is load-bearing for repair: a failure it fails to carry is one the model decides
-    # without. One bounded event per successful hand-back, so a miss is attributable rather than
-    # silent.
-    LOG.info(
-        "copilot run result unresolved-failure disposition",
-        tool_name=tool_name,
-        workflow_run_id=this_run_id,
-        retained_history=len(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])),
-        disposition=disposition,
-        attached=unresolved is not None,
-    )
-    if unresolved is None:
-        return
-    failure_kind = ""
-    for entry in reversed(getattr(copilot_ctx, "recorded_build_test_outcome_history", [])):
-        if entry.get("workflow_run_id") == unresolved.workflow_run_id:
-            failure_kind = _safe_reason_code(entry.get("reason_code"))
-            break
-    if not isinstance(data, dict):
-        return
-    data["unresolved_earlier_failure"] = {
-        "workflow_run_id": unresolved.workflow_run_id,
-        "block_label": unresolved.block_label,
-        "failure_kind": failure_kind,
-        "note": "this run passing does not establish that the earlier failure was resolved",
-    }
-    LOG.info(
-        "copilot carried unresolved failure into run result",
-        workflow_run_id=unresolved.workflow_run_id,
-        block_label=unresolved.block_label,
-        failure_kind=failure_kind,
-    )
-
-
 def _carry_prior_attempt_change_identity_into_result(
-    copilot_ctx: CopilotContext, data: dict[str, Any] | None, tool_name: str
+    copilot_ctx: CopilotContext, result: dict[str, Any], tool_name: str
 ) -> None:
     """Tell a repeat failing hand-back whether the code it just ran differs from the code that raised.
     The rendered source binding compares the latest attempt to the current definition, which on a
     repeat failure reads as a match and says nothing about the prior attempt."""
-    if not isinstance(data, dict):
+    data = result.get("data")
+    if result.get("ok") or not isinstance(data, dict):
         return
     run_id = data.get("workflow_run_id")
     latest = copilot_ctx.latest_recorded_build_test_outcome
@@ -6821,10 +6839,6 @@ def _carry_prior_attempt_change_identity_into_result(
         changed=identity.changed,
         basis=identity.basis,
     )
-
-
-def _safe_reason_code(value: object) -> str:
-    return value if isinstance(value, str) else ""
 
 
 _RUN_SIDE_CONNECT_STATES: dict[str, BuildTestConnectFailureState] = {
@@ -6913,21 +6927,25 @@ async def _capture_delivered_output_files(copilot_ctx: CopilotContext, result: d
     )
 
 
-def _is_budget_run_denial(result: Mapping[str, object]) -> bool:
+def _is_undispatched_run(result: Mapping[str, object]) -> bool:
     data = result.get("data")
-    return isinstance(data, dict) and data.get("budget_expired") is True and data.get("run_dispatched") is False
+    return isinstance(data, dict) and data.get("run_dispatched") is False
 
 
-def _is_refused_new_exit(result: Mapping[str, object]) -> bool:
+def _skips_build_test_finalize(result: Mapping[str, object]) -> bool:
     data = result.get("data")
-    return isinstance(data, dict) and "new_exit" in data and data.get("run_dispatched") is False
+    return (
+        isinstance(data, dict)
+        and data.get("run_dispatched") is False
+        and (data.get("budget_expired") is True or data.get(_PROPOSAL_BIND_REFUSED_KEY) is True)
+    )
 
 
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
 ) -> RecordedBuildTestOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
-    if _is_budget_run_denial(result) or _is_refused_new_exit(result):
+    if _is_undispatched_run(result):
         # A denied dispatch is not a new failed run; retain the last actual run's evidence.
         return None
     if result.get(_INTERNAL_RUN_OUTCOME_RECORDED_KEY) is True:
@@ -7632,7 +7650,7 @@ def finalize_build_test_result(
     recorded_outcome: RecordedBuildTestOutcome | None = None,
 ) -> dict[str, Any]:
     """Finalize diagnosis state and attach the one shared factual packet."""
-    if _is_budget_run_denial(result):
+    if _skips_build_test_finalize(result):
         return result
     # Tool seams sometimes deliberately suppress collection and return no recorded outcome.
     # Treat any non-record as absent rather than allowing a test double or failed observer to

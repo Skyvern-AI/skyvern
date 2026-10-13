@@ -6,9 +6,11 @@ verdict does not depend on which engine ran the blocks or how generated code des
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -17,7 +19,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompleti
 from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import (
     CompletionCriterion,
     carried_contract,
@@ -26,8 +28,16 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     parse_completion_contract,
     with_contract,
 )
-from skyvern.forge.sdk.workflow.service import run_selection_is_partial
+from skyvern.forge.sdk.workflow.service import WorkflowService, run_selection_is_partial
 from skyvern.schemas.workflows import BlockType
+from tests.unit._external_cdp_fakes import (
+    ORG_A,
+    backdate_registration,
+    begin_lease,
+    external_browser_state,
+    external_cdp_stack,
+    register_external,
+)
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 
 _DOWNLOAD_CONTRACT = {
@@ -120,6 +130,7 @@ def _wire_finalize(monkeypatch, *, contract, downloaded, run_blocks=(), attempts
         workflow_id="w_pinned",
         workflow_permanent_id="wpid_1",
         organization_id="o_1",
+        browser_session_id=None,
         status=WorkflowRunStatus.running,
     )
     statuses: list[WorkflowRunStatus] = []
@@ -780,3 +791,72 @@ def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
     routes = [r for r in base_router.routes if getattr(r, "path", "") == "/workflow/copilot/apply-proposed-workflow"]
     assert routes, "route not registered"
     assert routes[0].endpoint.__name__ == "workflow_copilot_apply_proposed_workflow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registration,browser_connected,expected_reason",
+    [
+        ("open", True, None),
+        ("expired", True, "expired"),
+        ("open", False, "no longer reachable"),
+        ("unreadable", False, "no longer reachable"),
+    ],
+    ids=["open", "expired_mid_run", "browser_died_mid_run", "browser_died_and_row_unreadable"],
+)
+async def test_a_workflow_whose_registered_browser_ended_mid_run_fails_at_finalization(
+    registration: str, browser_connected: bool, expected_reason: str | None
+) -> None:
+    async with external_cdp_stack() as stack:
+        session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
+        if registration == "expired":
+            await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
+        await begin_lease(stack.manager, session_id, "wr_a")
+        if registration == "expired":
+            await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
+        run = SimpleNamespace(
+            workflow_run_id="wr_a",
+            organization_id=ORG_A,
+            browser_session_id=session_id,
+            status=WorkflowRunStatus.running,
+        )
+        run_browser, run_context, _ = external_browser_state()
+        run_context.browser.is_connected.return_value = browser_connected
+        run_browsers = {"wr_a": run_browser}
+        sessions = stack.repo
+        if registration == "unreadable":
+            sessions = SimpleNamespace(get_persistent_browser_session=AsyncMock(side_effect=RuntimeError("db down")))
+        service = WorkflowService()
+
+        async def write_status(
+            *, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+        ) -> SimpleNamespace:
+            return SimpleNamespace(status=status, failure_reason=failure_reason)
+
+        with (
+            patch.object(
+                service_module,
+                "app",
+                SimpleNamespace(
+                    DATABASE=SimpleNamespace(browser_sessions=sessions),
+                    BROWSER_MANAGER=SimpleNamespace(get_for_workflow_run=run_browsers.get),
+                ),
+            ),
+            patch.object(service, "_update_workflow_run_status_if_not_final", write_status),
+        ):
+            lost = service._lost_external_browser(cast(WorkflowRun, run))
+            run_browsers.clear()
+            finalized = await service._finalize_workflow_run_status(
+                workflow_run_id="wr_a",
+                workflow_run=cast(WorkflowRun, run),
+                pre_finally_status=WorkflowRunStatus.completed,
+                pre_finally_failure_reason=None,
+                is_partial_run=True,
+                lost_external_browser=lost,
+            )
+
+    if expected_reason is None:
+        assert finalized.status == WorkflowRunStatus.completed and finalized.failure_reason is None
+    else:
+        assert finalized.status == WorkflowRunStatus.failed and expected_reason in finalized.failure_reason
+    run_context.close.assert_not_awaited()

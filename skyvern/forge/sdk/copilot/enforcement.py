@@ -48,7 +48,10 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    has_bounded_page_schema,
+    model_visible_composition_evidence,
+)
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -66,6 +69,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     BUILD_TEST_PACKET_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
@@ -106,6 +110,10 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_FACT_KEYS,
+    PAGE_REQUEST_FAILURES_KEY,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError as CopilotUnrecoverableToolError,
@@ -173,10 +181,6 @@ TOKENS_PER_RESIZED_IMAGE = 765
 # Keep the last N function_call_output items at full (head-truncated) size.
 # Older outputs collapse to a compact synopsis so context doesn't grow linearly.
 KEEP_RECENT_TOOL_OUTPUTS = 3
-# A tripwire against pathological payloads, not a routine ration: code-bearing tool
-# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
-# and must reach the model whole, so the cap sits above that class with headroom.
-_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
 # Older tool-call arguments that fail to summarize keep only this much; that channel
 # exists to shrink replayed context and must not follow the recent-window cap.
 _SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
@@ -754,6 +758,7 @@ def _bounded_evidence_entries(value: list[Any], budget: int) -> list[Any]:
 
 
 def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    data = model_visible_composition_evidence(data)
     kept: dict[str, Any] = {}
     for key in _PAGE_EVIDENCE_IDENTITY:
         value = data.get(key, parsed.get(key))
@@ -816,10 +821,10 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
-    # page_state rides on every browser result; it must not be what pushes a short result into compaction.
-    if isinstance(parsed.get("page_state"), dict):
-        without_page_state = {key: value for key, value in parsed.items() if key != "page_state"}
-        if len(json.dumps(without_page_state)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+    # Page facts ride on browser results; they must not be what pushes a short result into compaction.
+    if parsed.keys() & PAGE_FACT_KEYS:
+        without_page_facts = {key: value for key, value in parsed.items() if key not in PAGE_FACT_KEYS}
+        if len(json.dumps(without_page_facts)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
             return output
 
     # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
@@ -845,6 +850,9 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
     if isinstance(parsed.get("page_state"), dict):
         synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
+    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
+    if isinstance(request_failures, list) and request_failures:
+        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the
@@ -882,13 +890,6 @@ def _summarize_tool_output(output: str) -> str:
             if val is None or val == "":
                 continue
             synopsis[key] = val if isinstance(val, (bool, int, float)) else str(val)[:200]
-
-        # An unresolved earlier failure survives compaction for the reason it is attached at all:
-        # the model may decide whether to repair several turns after the run that passed, and dropping
-        # it here would reproduce the loss it exists to prevent.
-        unresolved = data.get("unresolved_earlier_failure")
-        if isinstance(unresolved, dict) and unresolved:
-            synopsis["unresolved_earlier_failure"] = unresolved
 
         change_identity = data.get("prior_attempt_change_identity")
         if isinstance(change_identity, dict) and change_identity:

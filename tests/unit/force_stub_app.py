@@ -52,6 +52,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts = MagicMock(return_value=set())
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run = MagicMock(return_value=set())
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.secret_values_for_drop_check = MagicMock(return_value=set())
     # Sync lookup feeding the redactor's placeholder exemption — _LazyNamespace would auto-mock it as
     # a non-iterable AsyncMock and make every redacting call site raise.

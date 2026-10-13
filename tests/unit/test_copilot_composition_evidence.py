@@ -65,12 +65,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     parse_composition_structured,
     unresolved_requested_targets,
+    without_authoring_facts,
 )
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     _relation_label_child_index,
     candidate_page_context,
     value_designation_probe_expression,
 )
+from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
@@ -3780,7 +3782,7 @@ async def test_interaction_blocking_layer_evidence_matches_on_the_same_rendered_
 
     assert structured is not None
     assert structured["modal_overlays"] == parsed["modal_overlays"] == []
-    structured_obstruction = structured["page_obstructions"][0]
+    structured_obstruction = without_authoring_facts(structured["page_obstructions"][0])
     parsed_obstruction = parsed["page_obstructions"][0]
     assert structured_obstruction["selector"] == parsed_obstruction["selector"] == "#veil"
     assert structured_obstruction["kind"] == parsed_obstruction["kind"] == "interaction_blocking_layer"
@@ -3824,7 +3826,7 @@ async def test_aria_role_button_and_root_selectors_match_on_the_same_blocking_la
     for evidence in (structured, parsed):
         assert evidence["modal_overlays"] == []
         assert len(evidence["page_obstructions"]) == 1
-    structured_obstruction = structured["page_obstructions"][0]
+    structured_obstruction = without_authoring_facts(structured["page_obstructions"][0])
     parsed_obstruction = parsed["page_obstructions"][0]
     assert (
         structured_obstruction["selector"] == parsed_obstruction["selector"] == ('section[aria-label="Blocking layer"]')
@@ -4331,6 +4333,116 @@ async def test_blocking_layer_twins_report_exact_omitted_control_count() -> None
         ]
         assert obstruction["visible_controls_omitted"] == 2
         assert "visible_controls_truncated" not in obstruction
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_candidate_counts_reach_an_author_only_where_a_selector_is_not_unique_or_matches_hidden_elements() -> (
+    None
+):
+    url = "https://test.example.com/catalog"
+    raw, content = await _capture_live_dom(
+        url,
+        (
+            "<html><head><style>.legacy{display:none}</style></head><body>"
+            '<form id="search">'
+            '<button type="submit" class="go" style="display:none">Search</button>'
+            '<button type="submit" class="go legacy">Search</button>'
+            '<input id="q" name="q" type="text">'
+            '<button type="submit" class="go">Search</button></form></body></html>'
+        ),
+        "#q",
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert [control["text"] for control in structured["forms"][0]["submit_controls"]] == ["Search"]
+
+    def controls(packet: dict[str, Any]) -> list[dict[str, Any]]:
+        return [*packet["forms"][0]["fields"], *packet["forms"][0]["submit_controls"]]
+
+    authoring = controls(model_visible_composition_evidence(structured, authoring_facts=True))
+    candidates = {
+        candidate["selector"]: candidate for control in authoring for candidate in control["selector_candidates"]
+    }
+    assert candidates["button.go"] == {
+        "selector": "button.go",
+        "source": "class",
+        "match_count": 3,
+        "visible_match_count": 1,
+    }
+    assert candidates["#q"] == {"selector": "#q", "source": "id"}
+    assert [control["pointer_at_center"] for control in authoring] == ["reaches_control", "reaches_control"]
+
+    # Every other reader gets no counts, and neither does an author reading stored HTML, which cannot see that
+    # a stylesheet hides one of the two buttons it still counts.
+    stored_html_counts = [
+        candidate.get("match_count") for control in controls(parsed) for candidate in control["selector_candidates"]
+    ]
+    assert 2 in stored_html_counts
+    for packet in (
+        model_visible_composition_evidence(structured),
+        model_visible_composition_evidence(parsed, authoring_facts=True),
+    ):
+        for control in controls(packet):
+            assert all(set(candidate) == {"selector", "source"} for candidate in control["selector_candidates"])
+    assert all(
+        "pointer_at_center" not in control for control in controls(model_visible_composition_evidence(structured))
+    )
+
+
+_VISUALLY_HIDDEN = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"
+_HIT_TEST_EDGE_PAGE = f"""<!doctype html><html><head><style>html {{ overflow-y: scroll; }} body {{ margin: 0; }}</style><script>
+customElements.define("scroll-box", class extends HTMLElement {{
+  constructor() {{
+    super();
+    this.attachShadow({{ mode: "open" }}).innerHTML =
+      '<div style="height:40px;overflow:auto"><div style="height:80px"></div><slot></slot></div>';
+  }}
+}});
+</script></head><body><form id="prefs">
+<label><input type="checkbox" id="remember" name="remember" style="{_VISUALLY_HIDDEN}">Remember me</label>
+<div style="height:20px;overflow:hidden"><input id="clipped" name="clipped" style="margin-top:40px"></div>
+<scroll-box><label><input type="checkbox" id="slotted" name="slotted" style="{_VISUALLY_HIDDEN}">Slotted</label>
+</scroll-box>
+<div style="position:relative;width:200px;height:40px;overflow:auto;border-right:40px solid #ccc">
+<label style="position:absolute;left:215px;top:5px"><input type="checkbox" id="under-border" name="under-border"
+ style="{_VISUALLY_HIDDEN}">Under border</label></div>
+<div style="height:1500px"></div>
+<label><input type="checkbox" id="scrolled-to" name="scrolled-to" style="{_VISUALLY_HIDDEN}">Scrolled to</label>
+<div style="height:1500px"></div>
+</form></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interaction", "reaches_other_element"),
+    [(None, ["remember"]), ("scroll", ["scrolled-to"]), ("throw", [])],
+    ids=["hit_tested", "page_scrolled", "hit_test_throws"],
+)
+async def test_a_control_hit_testing_skips_reads_as_covered_unless_an_ancestor_clips_it(
+    interaction: str | None, reaches_other_element: list[str]
+) -> None:
+    url = "https://test.example.com/preferences"
+
+    async def interact(page: Page) -> None:
+        if interaction == "scroll":
+            await page.evaluate("() => window.scrollTo(0, 1500)")
+        if interaction == "throw":
+            await page.evaluate("() => { document.elementsFromPoint = () => { throw new Error('no hit test'); }; }")
+
+    raw, _ = await _capture_live_dom(url, _HIT_TEST_EDGE_PAGE, "#remember", interact=interact)
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+
+    assert structured is not None
+    fields = structured["forms"][0]["fields"]
+    assert {field["id"]: field["pointer_at_center"] for field in fields} == {
+        field_id: "reaches_other_element" if field_id in reaches_other_element else "not_measured"
+        for field_id in ("remember", "clipped", "slotted", "under-border", "scrolled-to")
+    }
+    assert [field["id"] for field in fields if "element_at_center" in field] == reaches_other_element
 
 
 @_skip_no_browser
@@ -4961,7 +5073,9 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     raw = server.results[0]
     assert len(raw) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
     compaction = json.loads(raw)["size_compaction"]
-    assert compaction["original_char_count"] == len(expected_raw)
+    # Counted after pointer states and visible counts are dropped, as the packet would have been without them.
+    without_them = re.sub(r',"(pointer_at_center":"[a-z_]+"|visible_match_count":\d+)', "", expected_raw)
+    assert compaction["original_char_count"] == len(without_them)
     assert compaction["omissions"][0] == {
         "category": "visible_text_excerpt",
         "omitted_count": len(expected_payload["visible_text_excerpt"]),
@@ -4970,6 +5084,142 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     assert error is None
     assert evidence is not None
     assert evidence["size_compaction"] == compaction
+
+
+def _full_forms_under_a_page_wide_layer_html(
+    form_count: int = 5, chrome_count: int = 40, placeholder_chars: int = 0
+) -> str:
+    style = (
+        "body{margin:2px;font:8px sans-serif}input{width:44px;height:10px;font:8px sans-serif;margin:0}"
+        "label{display:inline-block;width:38px;overflow:hidden;white-space:nowrap}"
+        "a,button{font:8px sans-serif;margin:0 2px;padding:0}"
+        ".layer{position:fixed;left:0;top:0;right:0;bottom:0;z-index:1000;background:rgba(0,0,0,.4)}"
+    )
+    links = "".join(f'<a class="nav-link" href="/section/{index}">Section {index}</a>' for index in range(chrome_count))
+    actions = "".join(f'<button type="button" class="action">Action {index}</button>' for index in range(chrome_count))
+    forms = "".join(
+        f'<form id="form-{form_index}" action="/submit/{form_index}" method="post">'
+        + "".join(
+            f'<label for="f{form_index}-{field_index}">Field {form_index} {field_index}</label>'
+            f'<input id="f{form_index}-{field_index}" name="form{form_index}_field{field_index}" '
+            f'class="field-input" placeholder="Value {field_index}{"." * placeholder_chars}">'
+            for field_index in range(20)
+        )
+        + f'<button type="submit" class="submit-btn">Submit {form_index}</button></form>'
+        for form_index in range(form_count)
+    )
+    return (
+        f"<html><head><title>Full forms under a layer</title><style>{style}</style></head><body>"
+        f"<nav>{links}</nav><div>{actions}</div>{forms}"
+        '<div id="notice" class="layer" role="dialog" aria-label="Notice">'
+        '<button type="button" id="notice-close">Close</button></div></body></html>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placeholder_chars", [0, 200], ids=["fits", "over_the_bound"])
+async def test_capture_over_its_bound_drops_pointer_states_and_visible_counts_before_a_page_fact(
+    placeholder_chars: int,
+) -> None:
+    unbounded_expression = COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION.replace(
+        "return boundedStructuredEvidence(structuredEvidence);",
+        "return JSON.stringify(structuredEvidence);",
+    )
+    html = _full_forms_under_a_page_wide_layer_html(placeholder_chars=placeholder_chars)
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
+        try:
+            page = await browser.new_page()
+            await page.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
+            await page.goto("https://example.com/forms")
+            unbounded = json.loads(await page.evaluate(unbounded_expression))
+            bounded = json.loads(await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION))
+        finally:
+            await browser.close()
+
+    without_them = without_authoring_facts(unbounded)
+    assert len(json.dumps(without_them, separators=(",", ":"))) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    controls = [control for form in unbounded["forms"] for control in [*form["fields"], *form["submit_controls"]]]
+    assert all("pointer_at_center" in control and "element_at_center" in control for control in controls)
+    assert all(
+        "visible_match_count" in candidate for control in controls for candidate in control["selector_candidates"]
+    )
+    over_the_bound = len(json.dumps(unbounded, separators=(",", ":"))) > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+
+    assert bounded == (without_them if over_the_bound else unbounded)
+    assert over_the_bound == bool(placeholder_chars)
+    parsed = parse_composition_structured(
+        bounded, inspected_url="https://example.com/forms", current_url="https://example.com/forms"
+    )
+    assert parsed is not None
+    assert all(parsed[key] for key in ("modal_overlays", "page_obstructions", "clickable_controls"))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("form_count", [2, 3], ids=["fits", "over_the_bound"])
+async def test_inspect_result_over_the_model_bound_is_the_packet_without_authoring_facts(form_count: int) -> None:
+    url = "https://example.com/forms"
+    raw, _ = await _capture_live_dom(
+        url, _full_forms_under_a_page_wide_layer_html(form_count=form_count, chrome_count=2), "#notice"
+    )
+    parsed = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    assert parsed is not None
+    stored = json.dumps(parsed)
+    with_them = model_visible_composition_evidence(parsed, authoring_facts=True)
+    without_them = model_visible_composition_evidence(parsed)
+    page_state = {"read": "ok", "url": url + "/" + "p" * 1975, "title": "T" * 240, "challenge_vendor": None}
+
+    def model_facing(data: dict[str, Any]) -> str:
+        return json.dumps({"page_state": page_state, "ok": True, "data": data})
+
+    assert with_them != without_them and len(model_facing(without_them)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+    over_the_bound = len(model_facing(with_them)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert over_the_bound == (form_count == 3)
+
+    data = _model_facing_inspect_result({"ok": True, "data": parsed})["data"]
+
+    assert json.dumps(parsed) == stored
+    assert data == (without_them if over_the_bound else with_them)
+    head = model_facing(data)[:_RECENT_TOOL_OUTPUT_CHAR_CAP]
+    for key in ("modal_overlays", "page_obstructions", "clickable_controls"):
+        assert data[key] and json.dumps({key: data[key]})[1:-1] in head
+
+
+def test_inspect_result_with_authoring_facts_fits_the_largest_page_state_stamp() -> None:
+    largest_stamp = {
+        "read": "ok",
+        "url": "\U0001f600" * 200,
+        "title": "\U0001f600" * 240,
+        "challenge_vendor": "challenges.cloudflare",
+    }
+    shared = {"selector": "button.row", "source": "class", "match_count": 40, "visible_match_count": 20}
+    fields = [
+        {"id": f"f{index}", "type": "text", "pointer_at_center": "reaches_control", "selector_candidates": [shared]}
+        for index in range(25)
+    ]
+
+    def evidence(padding: int) -> dict[str, Any]:
+        return {"page_title": "Rows", "forms": [{"fields": fields}], "visible_text_excerpt": "x" * padding}
+
+    def stamped(result: dict[str, Any]) -> int:
+        return len(json.dumps({"page_state": largest_stamp, **result}))
+
+    unpadded = len(
+        json.dumps({"ok": True, "data": model_visible_composition_evidence(evidence(0), authoring_facts=True)})
+    )
+    data = evidence(46_000 - unpadded)
+    with_them = {"ok": True, "data": model_visible_composition_evidence(data, authoring_facts=True)}
+    without_them = {"ok": True, "data": model_visible_composition_evidence(data)}
+    # Main's packet fits with the stamp; the authoring packet is under the old 47,500 threshold but does not.
+    assert stamped(without_them) <= _RECENT_TOOL_OUTPUT_CHAR_CAP < stamped(with_them)
+    assert len(json.dumps(with_them)) < _RECENT_TOOL_OUTPUT_CHAR_CAP - 2_500
+
+    assert stamped(_model_facing_inspect_result({"ok": True, "data": data})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -6055,10 +6305,9 @@ def test_structured_preserves_typed_selector_candidates_and_identity_on_every_ca
     assert relation["identity"]["label_context"] == "Visitors"
 
 
-def test_structured_element_address_packets_withdraw_candidate_counts_after_neutral_ablation() -> None:
+def test_structured_element_address_packets_carry_candidate_counts_only_for_an_author() -> None:
     payload = _typed_candidate_payload()
     for carrier in (
-        payload["forms"][0]["fields"][0],
         payload["forms"][0]["submit_controls"][0],
         payload["navigation_targets"][0],
         payload["result_containers"][0],
@@ -6067,8 +6316,13 @@ def test_structured_element_address_packets_withdraw_candidate_counts_after_neut
         payload["modal_overlays"][0],
     ):
         carrier["selector_match_count"] = 1
-        for index, candidate in enumerate(carrier["selector_candidates"]):
-            candidate["match_count"] = index + 1
+        for candidate in carrier["selector_candidates"]:
+            candidate.update(match_count=2, visible_match_count=1)
+    payload["forms"][0]["fields"][0]["selector_candidates"][0].update(match_count=1, visible_match_count=1)
+    for candidate in payload["navigation_targets"][0]["selector_candidates"]:
+        del candidate["visible_match_count"]
+    for candidate in payload["clickable_controls"][0]["selector_candidates"]:
+        candidate["visible_match_count"] = 3
 
     parsed = parse_composition_structured(
         payload,
@@ -6077,28 +6331,51 @@ def test_structured_element_address_packets_withdraw_candidate_counts_after_neut
     )
 
     assert parsed is not None
-    model_visible = model_visible_composition_evidence(parsed)
-    carriers = [
-        model_visible["forms"][0]["fields"][0],
-        model_visible["forms"][0]["submit_controls"][0],
-        model_visible["navigation_targets"][0],
-        model_visible["result_containers"][0],
-        model_visible["clickable_controls"][0],
-        model_visible["challenge_controls"][0],
-        model_visible["modal_overlays"][0],
-        model_visible["key_value_relations"][0],
-    ]
-    for carrier in carriers:
-        assert "selector" not in carrier
-        assert "selector_match_count" not in carrier
-        assert "container_selector" not in carrier
-        assert "container_match_count" not in carrier
-        assert all(set(candidate) == {"selector", "source"} for candidate in carrier["selector_candidates"])
+
+    def counts(*carriers: dict[str, Any]) -> list[dict[str, Any]]:
+        carried = [
+            {key: value for key, value in candidate.items() if key not in {"selector", "source"}}
+            for carrier in carriers
+            for candidate in carrier["selector_candidates"]
+        ]
+        assert carried
+        return carried
+
+    for authoring_facts in (False, True):
+        model_visible = model_visible_composition_evidence(parsed, authoring_facts=authoring_facts)
+        shared_with_a_hidden_match = [
+            model_visible["forms"][0]["submit_controls"][0],
+            model_visible["result_containers"][0],
+            model_visible["challenge_controls"][0],
+            model_visible["modal_overlays"][0],
+        ]
+        unique = model_visible["forms"][0]["fields"][0]
+        visibility_not_measured = [
+            model_visible["key_value_relations"][0],
+            model_visible["navigation_targets"][0],
+            model_visible["clickable_controls"][0],
+        ]
+        for carrier in [*shared_with_a_hidden_match, unique, *visibility_not_measured]:
+            assert "selector" not in carrier
+            assert "selector_match_count" not in carrier
+            assert "container_selector" not in carrier
+            assert "container_match_count" not in carrier
+        if not authoring_facts:
+            assert not any(counts(*shared_with_a_hidden_match, unique, *visibility_not_measured))
+            continue
+        assert all(
+            carried == {"match_count": 2, "visible_match_count": 1} for carried in counts(*shared_with_a_hidden_match)
+        )
+        assert counts(unique) == [{}]
+        # A total with no measured visible count would read as every match being visible, so none is shown.
+        assert not any(counts(*visibility_not_measured))
 
 
 def test_model_facing_inspect_projection_preserves_internal_selector_custody() -> None:
+    payload = _typed_candidate_payload()
+    payload["navigation_targets"][0]["selector_candidates"][0]["match_count"] = 1
     parsed = parse_composition_structured(
-        _typed_candidate_payload(),
+        payload,
         inspected_url="https://example.com/web",
         current_url="https://example.com/web",
     )
@@ -6174,6 +6451,30 @@ def test_live_html_table_withdraws_server_derived_row_and_expand_selectors() -> 
         {"selector": candidate["selector"], "source": candidate["source"]}
         for candidate in stored["selector_candidates"]
     ]
+
+
+def test_structured_form_keeps_only_a_known_pointer_at_center_state_and_only_for_an_author() -> None:
+    payload = _typed_candidate_payload()
+    cover = {"tag": "DIV", "role": "dialog", "label_context": "Cookie preferences " + "x" * 200}
+    payload["forms"][0]["fields"][0].update(pointer_at_center="reaches_other_element", element_at_center=cover)
+    payload["forms"][0]["submit_controls"][0].update(pointer_at_center="definitely_clickable", element_at_center=cover)
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/web", current_url="https://example.com/web"
+    )
+
+    assert parsed is not None
+    form = model_visible_composition_evidence(parsed, authoring_facts=True)["forms"][0]
+    assert form["fields"][0]["pointer_at_center"] == "reaches_other_element"
+    assert form["fields"][0]["element_at_center"] == {
+        "tag": "div",
+        "role": "dialog",
+        "label_context": ("Cookie preferences " + "x" * 200)[:120],
+    }
+    assert "pointer_at_center" not in form["submit_controls"][0]
+    assert "element_at_center" not in form["submit_controls"][0]
+    default_field = model_visible_composition_evidence(parsed)["forms"][0]["fields"][0]
+    assert "pointer_at_center" not in default_field and "element_at_center" not in default_field
 
 
 def test_structured_element_address_never_falls_back_to_a_singular_selector() -> None:

@@ -168,7 +168,7 @@ workflow_definition:
         lambda *_args: (["staged_step"], {}, "staged_step", "initial"),
     )
     monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools_module, "_carry_unresolved_failure_into_result", lambda *_args: None)
+    monkeypatch.setattr(tools_module, "_carry_prior_attempt_change_identity_into_result", lambda *_args: None)
     monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *_args: None)
     monkeypatch.setattr(tools_module, "finalize_build_test_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *_args, **_kwargs: None)
@@ -311,11 +311,6 @@ async def test_drain_translation_keeps_safe_authored_text_unchanged(monkeypatch:
         classifier_mode="build",
     )
     authored = "I kept the useful draft and stopped before another run."
-    unresolved_detector = MagicMock(side_effect=AssertionError("budget drain must not append backend prose"))
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.agent.unresolved_runtime_block_failure_with_disposition",
-        unresolved_detector,
-    )
 
     translated = await _translate_to_agent_result(
         _result(json.dumps({"type": "REPLY", "user_response": authored})),
@@ -333,7 +328,6 @@ async def test_drain_translation_keeps_safe_authored_text_unchanged(monkeypatch:
     assert translated.turn_outcome.budget_expiry_staged_draft_id == "wf_draft"
     assert translated.narrative_payload is not None
     assert translated.narrative_payload["budgetExpiry"]["stagedDraftId"] == "wf_draft"
-    unresolved_detector.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -658,6 +658,10 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
                     raise
 
     setdownloadbehavior_applied = False
+    if any(getattr(context, "_skyvern_external_browser", False) is True for context in rebind_contexts):
+        # Browser-wide and on the caller's machine: it would redirect their own downloads to a worker path.
+        LOG.info("setDownloadBehavior skipped: registered external browser", run_id=run_id)
+        return
     if monitor_owns_binding:
         # The download monitor holds {behavior:deny, eventsEnabled:True} and saves files over HTTP
         # (remote CDP has no valid downloadPath). Re-sending allow/downloadPath would disable it, so

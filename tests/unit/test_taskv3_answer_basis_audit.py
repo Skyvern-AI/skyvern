@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import pytest
@@ -39,11 +40,29 @@ async def _address(args: dict[str, Any]) -> tuple[str, bool]:
     return _REFS.get(selector, (selector, False))
 
 
-def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
+async def _answer(args: dict[str, Any]) -> tuple[str, str, str]:
+    # What the field reads as before the call acts; `_probed` stands in for a probe that resolves elsewhere or fails.
+    if args.get("_probed") == "":
+        return "", "", ""
+    return str(args.get("_probed", args.get("selector"))), str(args.get("_label", "")), args.get("_kind", "textbox")
+
+
+def _tools(dispatched: list[tuple[str, dict[str, Any]]], page: dict[str, bool] | None = None) -> list[ToolSpec]:
+    # Which radios and checkboxes the fake page shows checked; a pick sets the states it lists in `_sets`.
+    page = {} if page is None else page
+
+    async def checked(selector: str) -> bool | None:
+        return page.get(selector)
+
     def make(name: str) -> ToolSpec:
         async def handler(args: dict[str, Any]) -> ToolResult:
             dispatched.append((name, args))
             sel = str(args.get("selector") or "")
+            if "_choice" in args:
+                page.update(args.get("_sets", {}))
+                return ToolResult("ok", f"clicked {sel}", {"page_transitioned": args.get("_advances", False)})
+            if args.get("_fail"):
+                return ToolResult("error", f"{name} failed", {}, error_class="not_editable")
             if name == "click" and "_row" in args:
                 return ToolResult("ok", f"clicked {sel}", {PICKED_OPTION_DATA_KEY: args["_row"]})
             if name == "click" and sel.startswith("#q"):
@@ -56,7 +75,17 @@ def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
                 return ToolResult("error", content, {TARGET_LABEL_DATA_KEY: label}, error_class="list_no_match")
             return ToolResult("ok", f"{name} done", {TARGET_LABEL_DATA_KEY: label, TARGET_KIND_DATA_KEY: "textbox"})
 
-        return ToolSpec(name=name, description="", parameters={}, handler=handler, address_probe=_address)
+        probe = _answer if name == "type" else None
+        return ToolSpec(
+            name=name,
+            description="",
+            parameters={},
+            handler=handler,
+            address_probe=_address,
+            answer_probe=probe,
+            choice_probe=(lambda args: args.get("_choice")) if name == "click" else None,
+            choice_checked=checked if name == "click" else None,
+        )
 
     names = ("click", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME, "observe")
     return [make(n) for n in names]
@@ -141,18 +170,22 @@ async def test_two_fields_with_the_same_label_are_audited_apart() -> None:
 async def test_the_refusal_stops_only_on_a_required_question_and_a_cleared_answer_lifts_the_hold() -> None:
     dispatched: list[tuple[str, dict[str, Any]]] = []
     tools = _tools(dispatched)
-    apply_answer_basis_audit(tools, _Audit(flag={"Canadian", "Yes"}))
+    holding = apply_answer_basis_audit(tools, _Audit(flag={"Canadian", "Yes"}))
+    assert holding is not None
     await _by_name(tools, "type").handler({"selector": "#nat", "text": "Canadian", "_label": "Nationality"})
     await _by_name(tools, "select_combobox").handler({"selector": "#auth", "value": "Yes", "_label": "Authorized?"})
 
     message = await _held(tools, "click", {"selector": "#next"})
+    # A run that ended here would end held: the pre-registered count of holds never cleared.
+    assert holding() == 1
     assert "if the question is required, stop" in message and "if it is optional, clear it and continue" in message
     assert "'Nationality' answered 'Canadian'" in message and "'Authorized?' answered 'Yes'" in message
 
     await _by_name(tools, "type").handler({"selector": "#nat", "text": "", "_label": "Nationality"})
     await _by_name(tools, "select_combobox").handler({"selector": "#auth", "value": "", "_label": "Authorized?"})
+    assert holding() == 0
     await _by_name(tools, "click").handler({"selector": "#next"})
-    assert ("click", {"selector": "#next"}) in dispatched
+    assert ("click", {"selector": "#next"}) in dispatched and holding() == 0
 
 
 @pytest.mark.asyncio
@@ -198,3 +231,195 @@ def test_no_audit_leaves_every_handler_untouched() -> None:
     before = [t.handler for t in tools]
     apply_answer_basis_audit(tools, None)
     assert [t.handler for t in tools] == before
+
+
+WORK_AUTH = "Are you legally authorized to work in the United States?"
+TYPED = {"selector": "#work-auth", "text": "No", "press_enter": True, "_label": WORK_AUTH}
+
+
+@pytest.mark.asyncio
+async def test_an_answer_typed_with_enter_is_judged_before_the_call_acts() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+
+    # The call's own Enter could submit the form, so a flagged answer never reaches the page, and nothing is recorded
+    # for a value the field never held.
+    message = await _held(tools, "type", dict(TYPED))
+    assert f"'{WORK_AUTH}' with 'No' (field #work-auth; not typed" in message
+    assert dispatched == [] and audit.seen == [[RecordedAnswer(WORK_AUTH, "No")]]
+    # Retrying the refused answer is not a second chance at the judge.
+    audit.flag = set()
+    await _held(tools, "type", dict(TYPED))
+    assert dispatched == [] and len(audit.seen) == 1
+    audit.flag = {"No"}
+    await _by_name(tools, "click").handler({"selector": "#next"})
+
+    # A supported answer goes through once, with the call's own arguments, and is not audited a second time.
+    supported = {**TYPED, "text": "Yes"}
+    await _by_name(tools, "type").handler(dict(supported))
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert [args for _, args in dispatched] == [{"selector": "#next"}, supported, {"selector": "#submit"}]
+    assert len(audit.seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_typed_enter_that_does_not_land_leaves_the_fields_flag_in_place() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    type_ = _by_name(tools, "type").handler
+    await type_({**TYPED, "press_enter": False})
+    await _held(tools, "click", {"selector": "#submit"})
+
+    # Typing the held value again is not a second chance at the judge.
+    audit.flag = set()
+    await _held(tools, "type", dict(TYPED))
+    audit.flag = {"No"}
+
+    # A supported answer whose call fails, and an empty one, change nothing on the page: the held "No" still holds.
+    await type_({**TYPED, "text": "Yes", "_fail": True})
+    for unchanged in ("", " because of my visa"):
+        message = await _held(tools, "type", {**TYPED, "text": unchanged, "clear": False})
+        assert "answered 'No'" in message
+    message = await _held(tools, "type", {**TYPED, "text": ""})
+    assert "answered 'No'" in message
+    await _held(tools, "click", {"selector": "#submit"})
+    # A supported answer that lands replaces the held one, so the submit goes through.
+    await type_({**TYPED, "text": "Yes"})
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert dispatched[-1] == ("click", {"selector": "#submit"})
+
+    # A typed answer the audit never reads (here a password-like field) is entered as before, unjudged.
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "selector": "#pin", "_kind": "password", "_label": "PIN"})
+    assert [args.get("selector") for _, args in dispatched][-1] == "#pin" and audit.seen == []
+
+
+@pytest.mark.asyncio
+async def test_an_answer_appended_with_enter_into_an_empty_field_is_judged_before_the_call_acts() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    apply_answer_basis_audit(tools, _Audit(flag={"No"}))
+
+    assert "not typed" in await _held(tools, "type", {**TYPED, "clear": False})
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_typed_enter_the_probe_cannot_place_is_still_recorded_after_the_call() -> None:
+    # Unread: the call acts as it did before this check, and its answer is recorded from the result and held.
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "_probed": ""})
+    await _held(tools, "click", {"selector": "#submit"})
+    assert [name for name, _ in dispatched] == ["type"] and len(audit.seen) == 1
+
+    # Read as another field: judged before, and recorded again as the field the call reports.
+    dispatched.clear()
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "_probed": "#elsewhere", "text": "Yes"})
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert [name for name, _ in dispatched] == ["type", "click"] and len(audit.seen) == 2
+
+
+AUTH_Q = "Are you legally authorized to work in the United States?"
+
+
+def _pick(ref: str, question: str, option: str, sets: dict[str, bool]) -> dict[str, Any]:
+    return {"selector": ref, "_choice": (question, option), "_sets": sets}
+
+
+@pytest.mark.asyncio
+async def test_a_picked_option_is_an_answer_held_only_while_it_stays_checked() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    click = _by_name(tools, "click").handler
+
+    # A pick moves nothing on, so it is never held itself; the submit after an unsupported one is.
+    await click(_pick("ref=3", AUTH_Q, "No", {"ref=3": True}))
+    message = await _held(tools, "click", {"selector": "#submit"})
+    assert f"'{AUTH_Q}' answered 'No'" in message
+    # Picking the flagged option again is not a second chance at the judge.
+    audit.flag = set()
+    await click(_pick("ref=3", AUTH_Q, "No", {"ref=3": True}))
+    await _held(tools, "click", {"selector": "#submit"})
+    audit.flag = {"No"}
+    # Another option of the group unchecks it on the page, whatever its question reads as now, and that lifts the hold.
+    await click(_pick("ref=4", "Authorized? Yes No Decline", "Decline", {"ref=3": False, "ref=4": True}))
+    await click({"selector": "#submit"})
+    assert dispatched[-1] == ("click", {"selector": "#submit"})
+
+
+@pytest.mark.parametrize("state", [False, None], ids=["unchecked", "unreadable"])
+@pytest.mark.asyncio
+async def test_an_unchecked_pick_lifts_its_hold_and_an_unreadable_one_keeps_it(state: bool | None) -> None:
+    page: dict[str, bool] = {}
+    tools = _tools([], page)
+    apply_answer_basis_audit(tools, _Audit(flag={"No"}))
+    click = _by_name(tools, "click").handler
+    await click(_pick("ref=7", "Which of these apply to you?", "No", {"ref=7": True}))
+    await click(_pick("ref=8", "Which of these apply to you?", "Veteran", {"ref=8": True}))
+    await _held(tools, "click", {"selector": "#submit"})
+    if state is None:
+        del page["ref=7"]
+        await _held(tools, "click", {"selector": "#submit"})
+    else:
+        await click(_pick("ref=7", "Which of these apply to you?", "No", {"ref=7": False}))
+        await click({"selector": "#submit"})
+    # Two groups that read alike stay apart: each option is its own answer.
+    await click(_pick("ref=9", "Do you hold a licence?", "No", {"ref=9": True}))
+    await click(_pick("ref=10", "Do you hold a licence?", "Yes", {"ref=10": True}))
+    await _held(tools, "click", {"selector": "#submit"})
+
+
+@pytest.mark.asyncio
+async def test_a_pick_that_moves_the_page_on_is_counted_with_whether_a_flag_was_pending() -> None:
+    tools = _tools([])
+    apply_answer_basis_audit(tools, _Audit(flag={"No"}))
+    click = _by_name(tools, "click").handler
+    with capture_logs() as logs:
+        await click({**_pick("ref=3", AUTH_Q, "No", {"ref=3": True}), "_advances": True})
+        await click({**_pick("ref=4", "Do you need sponsorship?", "Yes", {"ref=4": True}), "_advances": True})
+        await click(_pick("ref=5", "Willing to relocate?", "Yes", {"ref=5": True}))
+    advanced = [e["flag_pending"] for e in logs if e["event"] == "taskv3 answer basis pick advanced"]
+    assert advanced == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_pick_is_held_while_another_kind_of_answer_is_flagged() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    apply_answer_basis_audit(tools, _Audit(flag={"Canadian"}))
+    await _by_name(tools, "type").handler({"selector": "#nat", "text": "Canadian", "_label": "Nationality"})
+    await asyncio.sleep(0)
+
+    # The pick could move the page on past the flagged answer, as any other click could.
+    assert "'Nationality' answered 'Canadian'" in await _held(
+        tools, "click", _pick("ref=4", "Willing to relocate?", "Yes", {"ref=4": True})
+    )
+    assert [name for name, _ in dispatched] == ["type"]
+
+
+@pytest.mark.asyncio
+async def test_a_pick_that_moves_the_page_on_counts_no_flag_the_judge_cleared() -> None:
+    tools = _tools([])
+    apply_answer_basis_audit(tools, _Audit(flag=set()))
+    click = _by_name(tools, "click").handler
+    with capture_logs() as logs:
+        await _by_name(tools, "type").handler({"selector": "#name", "text": "Ada", "_label": "First name"})
+        await asyncio.sleep(0)
+        await click({**_pick("ref=3", AUTH_Q, "Yes", {"ref=3": True}), "_advances": True})
+        await asyncio.sleep(0)
+        await click({**_pick("ref=4", "Willing to relocate?", "Yes", {"ref=4": True}), "_advances": True})
+    assert [e["flag_pending"] for e in logs if e["event"] == "taskv3 answer basis pick advanced"] == [0, 0]

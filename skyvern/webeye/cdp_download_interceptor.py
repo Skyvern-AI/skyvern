@@ -37,7 +37,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -58,7 +58,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     is_unenrolled_redirect_hop_authorizer,
 )
 from skyvern.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import BlobTooLargeError, SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.api.files import GuardedFileFetchHopResult
@@ -855,6 +855,24 @@ def extract_filename(headers: dict[str, str], url: str) -> str:
     return ""
 
 
+class DownloadTally(NamedTuple):
+    """Counts since the last accounting reset; a different generation means the counts restarted."""
+
+    generation: str
+    saved: int
+    unsolicited_failures: dict[str, int]
+    pending: bool
+
+
+def download_limits() -> dict[str, int]:
+    """The enforced limit behind each limit rejection reason."""
+    return {
+        "file_count_limit": MAX_DOWNLOAD_FILES_PER_RUN,
+        "run_size_limit": MAX_RUN_DOWNLOAD_BYTES,
+        "file_size_limit": min(MAX_FILE_SIZE_BYTES, MAX_STREAMED_FILE_SIZE_BYTES),
+    }
+
+
 class CDPDownloadInterceptor:
     """
     Intercepts download responses via the CDP Fetch domain and optionally handles
@@ -941,6 +959,8 @@ class CDPDownloadInterceptor:
         self._reset_download_accounting()
 
     def _reset_download_accounting(self) -> None:
+        self._download_accounting_generation = uuid.uuid4().hex
+        self._unsolicited_download_failure_totals: dict[str, int] = {}
         self._download_attempt_counter = 0
         self._download_request_counter = 0
         self._run_download_file_count = 0
@@ -990,6 +1010,14 @@ class CDPDownloadInterceptor:
             "error_type": "SYSTEM_DEFINED_ERROR",
             "details": {"failed_download_count": failed_count, "reasons": reasons},
         }
+
+    def download_tally(self) -> DownloadTally:
+        return DownloadTally(
+            generation=self._download_accounting_generation,
+            saved=self._captured_download_count,
+            unsolicited_failures=dict(self._unsolicited_download_failure_totals),
+            pending=self.has_pending_download_activity(),
+        )
 
     def record_artifact_outcome(
         self,
@@ -1164,6 +1192,9 @@ class CDPDownloadInterceptor:
                     failures.add(reason)
         else:
             self._unsolicited_download_failures[reason] = self._unsolicited_download_failures.get(reason, 0) + 1
+            self._unsolicited_download_failure_totals[reason] = (
+                self._unsolicited_download_failure_totals.get(reason, 0) + 1
+            )
         self._log_download_attempt(
             attempt,
             capture_outcome="failed",
@@ -2243,9 +2274,13 @@ class CDPDownloadInterceptor:
         # shared reader must not emit ERROR logs for pages that don't own the blob's origin.
         data: bytes | None = None
         for page in list(self._browser_context.pages):
-            data = await SkyvernFrame.read_blob_url_bytes(
-                page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True
-            )
+            try:
+                data = await SkyvernFrame.read_blob_url_bytes(
+                    page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True, raise_too_large=True
+                )
+            except BlobTooLargeError:
+                self._record_download_failure(attempt, "file_size_limit")
+                return
             if data is not None:
                 break
 
@@ -3249,6 +3284,13 @@ def consume_unsolicited_download_error_for_context(browser_context: BrowserConte
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     return interceptor.consume_unsolicited_download_error() if isinstance(interceptor, CDPDownloadInterceptor) else None
+
+
+def download_tally_for_context(browser_context: BrowserContext | None) -> DownloadTally | None:
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    return interceptor.download_tally() if isinstance(interceptor, CDPDownloadInterceptor) else None
 
 
 def record_download_artifact_outcome_for_context(

@@ -751,8 +751,8 @@ def credential_pause_reason(ctx: Any) -> str | None:
 
 
 RAW_SECRET_CONNECTED_NEXT = (
-    "Bind this credential as the workflow's credential parameter in the draft. This turn contains a "
-    "redacted secret, so do not run, test, or use the browser; the draft stays untested until a later "
+    "Bind this credential as the workflow's credential parameter in the draft. This turn withheld a value "
+    "that may be a secret, so do not run, test, or use the browser; the draft stays untested until a later "
     "message asks to test it."
 )
 
