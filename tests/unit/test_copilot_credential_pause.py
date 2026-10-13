@@ -1915,6 +1915,20 @@ def _stub_credential_lookup(
 
 
 @pytest.mark.asyncio
+async def test_a_card_pick_fills_on_a_turn_whose_named_login_was_not_saved(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    _stub_credential_lookup(monkeypatch, _make_credential())
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy.record_named_login_not_found()
+
+    result = await _ask(ctx)
+    grant, error = await tools_module.credential_fill._credential_fill_origin_grant(ctx, "cred_1")
+
+    assert result["status"] == "connected"
+    assert error is None and grant is not None
+
+
+@pytest.mark.asyncio
 async def test_the_tool_call_raises_the_card_and_returns_the_connected_credential_to_the_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

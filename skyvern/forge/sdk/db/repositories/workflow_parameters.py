@@ -958,7 +958,15 @@ class WorkflowParametersRepository(BaseRepository):
                 raise CopilotProposalConflictError("Copilot proposal is being accepted")
             if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
                 raise CopilotProposalConflictError("Copilot proposal bytes changed")
-            metadata = current.model_copy(update={"workflow_run_id": workflow_run_id})
+            # A new run is not yet proof. Turn end re-records the disposition from its result, but a turn
+            # that exits without one must not leave a stale Tested beside this run.
+            proven = current.disposition in ("review_tested", "auto_applicable")
+            metadata = current.model_copy(
+                update={
+                    "workflow_run_id": workflow_run_id,
+                    "disposition": "review_untested" if proven else current.disposition,
+                }
+            )
             chat.proposed_workflow = {
                 **chat.proposed_workflow,
                 COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),

@@ -1,0 +1,1157 @@
+---
+title: "Agents"
+description: "Create, run and manage agents (workflows) and their runs."
+slug: sdk-reference/agents
+keywords:
+  - "run_workflow"
+  - "create_workflow"
+  - "agents"
+  - "workflows"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Agents are saved, multi-step automations (called workflows in older SDK versions and in method names). Agent IDs start with `wpid_`; agent run IDs start with `wr_`.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+## Run an agent
+
+### run_workflow
+
+Run an agent
+
+<CodeGroup>
+```python Python
+await skyvern.run_workflow(
+    workflow_id: str,
+    parameters: dict[str, Any] | None = None,
+    template: bool | None = None,
+    title: str | None = None,
+    proxy_location: ProxyLocationInput = None,
+    webhook_url: str | None = None,
+    totp_url: str | None = None,
+    totp_identifier: str | None = None,
+    browser_session_id: str | None = None,
+    max_steps_override: int | None = None,
+    user_agent: str | None = None,
+    browser_profile_id: str | None = None,
+    max_screenshot_scrolls: int | None = None,
+    max_elapsed_time_minutes: int | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    browser_address: str | None = None,
+    ai_fallback: bool | None = None,
+    run_with: str | None = None,
+    run_metadata: dict[str, str] | None = None,
+    wait_for_completion: bool = False,
+    timeout: float = 1800,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+skyvern.runWorkflow(request: RunWorkflowOptions): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_id` | `agent_id` | `str` | Yes | — | ID of the agent (`wpid_…`). |
+| `parameters` | `parameters` | `dict[str, Any] \| None` | No | `None` | Parameters to pass to the workflow |
+| `template` | `template` | `bool \| None` | No | `None` |  |
+| `title` | `title` | `str \| None` | No | `None` | The title for this workflow run |
+| `proxy_location` | `proxy_location` | `ProxyLocationInput` | No | `None` | Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
+| `webhook_url` | `webhook_url` | `str \| None` | No | `None` | URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions. |
+| `totp_url` | `totp_url` | `str \| None` | No | `None` | URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details. |
+| `totp_identifier` | `totp_identifier` | `str \| None` | No | `None` | Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details. |
+| `browser_session_id` | `browser_session_id` | `str \| None` | No | `None` | ID of a Skyvern browser session to reuse, having it continue from the current screen state |
+| `max_steps_override` | `x-max-steps-override` | `int \| None` | No | `None` | Override the agent's maximum number of steps for this run. |
+| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
+| `browser_profile_id` | `browser_profile_id` | `str \| None` | No | `None` | ID of a browser profile to reuse for this workflow run |
+| `max_screenshot_scrolls` | `max_screenshot_scrolls` | `int \| None` | No | `None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. |
+| `max_elapsed_time_minutes` | `max_elapsed_time_minutes` | `int \| None` | No | `None` | Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes. |
+| `extra_http_headers` | `extra_http_headers` | `dict[str, str] \| None` | No | `None` | The extra HTTP headers for the requests in browser. |
+| `browser_address` | `browser_address` | `str \| None` | No | `None` | The CDP address for the workflow run. |
+| `ai_fallback` | `ai_fallback` | `bool \| None` | No | `None` | Whether to fallback to AI if the workflow run fails. |
+| `run_with` | `run_with` | `str \| None` | No | `None` | Whether to run the workflow with agent or code. Null inherits from the workflow setting. |
+| `run_metadata` | `run_metadata` | `dict[str, str] \| None` | No | `None` | String key/value metadata to attach to this workflow run for analytics tag filtering. |
+| `wait_for_completion` | `waitForCompletion` | `bool` | No | `False` | Wait for the run to reach a final status before returning. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time to wait for completion, in seconds. |
+| — | `cdp_connect_headers` | `Record<string, string \| undefined>` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites. |
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.run_workflow(workflow_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.runWorkflow({ agent_id: "wpid_123" });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### retry_workflow_run
+
+Retry a workflow run using the original run parameters.
+
+<CodeGroup>
+```python Python
+await skyvern.retry_workflow_run(
+    workflow_run_id: str,
+    *,
+    max_steps_override: int | None = None,
+    user_agent: str | None = None,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+skyvern.retryWorkflowRun(workflowRunId: string, request?: RetryWorkflowRunRequest): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_run_id` | `workflowRunId` | `str` | Yes | — | The id of the workflow run to retry. |
+| `max_steps_override` | `x-max-steps-override` | `int \| None` | No | `None` | Override the agent's maximum number of steps for this run. |
+| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.retry_workflow_run(workflow_run_id="wr_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.retryWorkflowRun("wr_123");
+console.log(result);
+```
+</CodeGroup>
+
+## Manage agents
+
+### create_workflow
+
+Create a new agent
+
+<CodeGroup>
+```python Python
+await skyvern.create_workflow(
+    *,
+    folder_id: str | None = None,
+    json_definition: WorkflowCreateYamlRequest | None = ...,
+    yaml_definition: str | None = ...,
+) -> Workflow
+```
+
+```typescript TypeScript
+skyvern.createWorkflow(request: CreateWorkflowRequest): Promise<Workflow>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `folder_id` | `folder_id` | `str \| None` | No | `None` | Optional folder ID to assign the workflow to |
+| `json_definition` | `body.json_definition` | `WorkflowCreateYamlRequest \| None` | No | — | Workflow definition in JSON format |
+| `yaml_definition` | `body.yaml_definition` | `str \| None` | No | — | Workflow definition in YAML format |
+| — | `body` | `WorkflowRequest` | No | — | TypeScript only. |
+
+**Returns** `Workflow` · TypeScript `Promise<Workflow>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.create_workflow(
+        json_definition={
+            "title": "Hacker News top post",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {
+                        "block_type": "task",
+                        "label": "top_post",
+                        "url": "https://news.ycombinator.com",
+                        "navigation_goal": "Find the top post and return its title",
+                    },
+                ],
+            },
+        },
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.createWorkflow({
+    body: {
+        json_definition: {
+            title: "Hacker News top post",
+            workflow_definition: {
+                parameters: [],
+                blocks: [
+                    {
+                        block_type: "task",
+                        label: "top_post",
+                        url: "https://news.ycombinator.com",
+                        navigation_goal: "Find the top post and return its title",
+                    },
+                ],
+            },
+        },
+    },
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_workflow
+
+Get an agent by id
+
+<CodeGroup>
+```python Python
+await skyvern.get_workflow(
+    workflow_permanent_id: str,
+    *,
+    version: int | None = None,
+    template: bool | None = None,
+) -> Workflow
+```
+
+```typescript TypeScript
+skyvern.getWorkflow(workflowPermanentId: string, request?: GetWorkflowRequest): Promise<Workflow>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
+| `version` | `version` | `int \| None` | No | `None` |  |
+| `template` | `template` | `bool \| None` | No | `None` |  |
+
+**Returns** `Workflow` · TypeScript `Promise<Workflow>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_workflow(workflow_permanent_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getWorkflow("wpid_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_workflows
+
+Get all workflows with the latest version for the organization.
+
+Search semantics:
+- If `search_key` is provided, its value is used as a unified search term for
+  `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
+  `WorkflowParameterModel`).
+- Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+- Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
+
+<CodeGroup>
+```python Python
+await skyvern.get_workflows(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    only_saved_tasks: bool | None = None,
+    only_workflows: bool | None = None,
+    only_templates: bool | None = None,
+    search_key: str | None = None,
+    title: str | None = None,
+    folder_id: str | None = None,
+    status: WorkflowStatus | Sequence[WorkflowStatus] | None = None,
+    tags: str | Sequence[str] | None = None,
+    template: bool | None = None,
+) -> list[Workflow]
+```
+
+```typescript TypeScript
+skyvern.getWorkflows(request?: GetWorkflowsRequest): Promise<Workflow[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | `page` | `int \| None` | No | `None` |  |
+| `page_size` | `page_size` | `int \| None` | No | `None` |  |
+| `only_saved_tasks` | `only_saved_tasks` | `bool \| None` | No | `None` |  |
+| `only_workflows` | `only_workflows` | `bool \| None` | No | `None` |  |
+| `only_templates` | `only_templates` | `bool \| None` | No | `None` |  |
+| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter. |
+| `title` | `title` | `str \| None` | No | `None` | Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided. |
+| `folder_id` | `folder_id` | `str \| None` | No | `None` | Filter workflows by folder ID |
+| `status` | `status` | `WorkflowStatus \| Sequence[WorkflowStatus] \| None` | No | `None` |  |
+| `tags` | `tags` | `str \| Sequence[str] \| None` | No | `None` | Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -&gt; customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`. |
+| `template` | `template` | `bool \| None` | No | `None` |  |
+
+**Returns** `list[Workflow]` · TypeScript `Promise<Workflow[]>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_workflows()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getWorkflows();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_workflow_versions
+
+Get all versions of a workflow by its permanent ID.
+
+<CodeGroup>
+```python Python
+await skyvern.get_workflow_versions(
+    workflow_permanent_id: str,
+    *,
+    template: bool | None = None,
+) -> list[Workflow]
+```
+
+```typescript TypeScript
+skyvern.getWorkflowVersions(workflowPermanentId: string, request?: GetWorkflowVersionsRequest): Promise<Workflow[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
+| `template` | `template` | `bool \| None` | No | `None` |  |
+
+**Returns** `list[Workflow]` · TypeScript `Promise<Workflow[]>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_workflow_versions(workflow_permanent_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getWorkflowVersions("wpid_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### update_workflow
+
+Update an agent
+
+<CodeGroup>
+```python Python
+await skyvern.update_workflow(
+    workflow_id: str,
+    *,
+    json_definition: WorkflowCreateYamlRequest | None = ...,
+    yaml_definition: str | None = ...,
+) -> Workflow
+```
+
+```typescript TypeScript
+skyvern.updateWorkflow(workflowId: string, request: WorkflowRequest): Promise<Workflow>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_id` | `workflowId` | `str` | Yes | — | The ID of the agent to update. Starts with `wpid_`. |
+| `json_definition` | `json_definition` | `WorkflowCreateYamlRequest \| None` | No | — | Workflow definition in JSON format |
+| `yaml_definition` | `yaml_definition` | `str \| None` | No | — | Workflow definition in YAML format |
+
+**Returns** `Workflow` · TypeScript `Promise<Workflow>`
+
+<Accordion title="Workflow fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `title` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `version` | `int` |  |
+| `is_saved_task` | `bool` |  |
+| `is_template` | `bool \| None` |  |
+| `description` | `str \| None` |  |
+| `workflow_definition` | `WorkflowDefinition` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `persist_browser_session` | `bool \| None` |  |
+| `pin_saved_session_ip` | `bool \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `browser_profile_key` | `str \| None` |  |
+| `model` | `dict[str, Any \| None] \| None` |  |
+| `status` | `"published" \| "draft" \| "auto_generated" \| "importing" \| "import_failed" \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `run_with` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `cache_key` | `str \| None` |  |
+| `adaptive_caching` | `bool \| None` |  |
+| `enable_self_healing` | `bool \| None` |  |
+| `code_version` | `int \| None` |  |
+| `generate_script_on_terminal` | `bool \| None` |  |
+| `run_sequentially` | `bool \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `folder_id` | `str \| None` |  |
+| `import_error` | `str \| None` |  |
+| `created_by` | `str \| None` |  |
+| `edited_by` | `str \| None` |  |
+| `copilot_authored` | `bool \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+| `deleted_at` | `datetime \| None` |  |
+| `agent_id` | `str \| None` | Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`). |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.update_workflow(
+        workflow_id="wpid_123",
+        json_definition={
+            "title": "Hacker News top post",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {
+                        "block_type": "task",
+                        "label": "top_post",
+                        "url": "https://news.ycombinator.com",
+                        "navigation_goal": "Find the top post and return its title and URL",
+                    },
+                ],
+            },
+        },
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.updateWorkflow("wpid_123", {
+    json_definition: {
+        title: "Hacker News top post",
+        workflow_definition: {
+            parameters: [],
+            blocks: [
+                {
+                    block_type: "task",
+                    label: "top_post",
+                    url: "https://news.ycombinator.com",
+                    navigation_goal: "Find the top post and return its title and URL",
+                },
+            ],
+        },
+    },
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### delete_workflow
+
+Delete an agent
+
+<CodeGroup>
+```python Python
+await skyvern.delete_workflow(workflow_id: str) -> Any | None
+```
+
+```typescript TypeScript
+skyvern.deleteWorkflow(workflowId: string): Promise<unknown>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_id` | `workflowId` | `str` | Yes | — | The ID of the agent to delete. Starts with `wpid_`. |
+
+**Returns** `Any \| None` · TypeScript `Promise<unknown>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.delete_workflow(workflow_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.deleteWorkflow("wpid_123");
+console.log(result);
+```
+</CodeGroup>
+
+## Agent runs
+
+### get_workflow_runs
+
+List workflow runs across all workflows for the current organization.
+
+Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.
+
+**search_key**
+
+A case-insensitive substring search that matches against **any** of the following fields:
+
+| Searched field | Description |
+|---|---|
+| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |
+| Parameter **key** | The `key` of any workflow parameter definition associated with the run |
+| Parameter **description** | The `description` of any workflow parameter definition |
+| Run parameter **value** | The actual value supplied for any parameter when the run was created |
+| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |
+
+Soft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.
+
+**error_code**
+
+An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).
+
+**Combining filters**
+
+All query parameters use AND logic:
+- `?status=failed` — only failed runs
+- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error
+- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match
+
+<CodeGroup>
+```python Python
+await skyvern.get_workflow_runs(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    status: WorkflowRunStatus | Sequence[WorkflowRunStatus] | None = None,
+    search_key: str | None = None,
+    error_code: str | None = None,
+) -> list[WorkflowRun]
+```
+
+```typescript TypeScript
+skyvern.getWorkflowRuns(request?: GetWorkflowRunsRequest): Promise<WorkflowRun[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | `page` | `int \| None` | No | `None` | Page number for pagination. |
+| `page_size` | `page_size` | `int \| None` | No | `None` | Number of runs to return per page. |
+| `status` | `status` | `WorkflowRunStatus \| Sequence[WorkflowRunStatus] \| None` | No | `None` | Filter by one or more run statuses. |
+| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. |
+| `error_code` | `error_code` | `str \| None` | No | `None` | Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. |
+
+**Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`
+
+<Accordion title="WorkflowRun fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_run_id` | `str` |  |
+| `workflow_id` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `browser_session_id` | `str \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `debug_session_id` | `str \| None` |  |
+| `status` | `"created" \| "queued" \| "running" \| "failed" \| "terminated" \| "canceled" \| "timed_out" \| "completed" \| "paused"` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `webhook_failure_reason` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `failure_reason` | `str \| None` |  |
+| `failure_category` | `list[dict[str, Any \| None]] \| None` |  |
+| `parent_workflow_run_id` | `str \| None` |  |
+| `workflow_title` | `str \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `browser_address` | `str \| None` |  |
+| `run_with` | `str \| None` |  |
+| `script_run` | `ScriptRunResponse \| None` |  |
+| `job_id` | `str \| None` |  |
+| `depends_on_workflow_run_id` | `str \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `code_gen` | `bool \| None` |  |
+| `trigger_type` | `"manual" \| "mcp" \| "api" \| "scheduled" \| "webhook" \| None` |  |
+| `workflow_schedule_id` | `str \| None` |  |
+| `ignore_inherited_workflow_system_prompt` | `bool \| None` |  |
+| `copilot_session_id` | `str \| None` |  |
+| `credits_used` | `int \| None` |  |
+| `cached_credits_used` | `int \| None` |  |
+| `queued_at` | `datetime \| None` |  |
+| `started_at` | `datetime \| None` |  |
+| `finished_at` | `datetime \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_workflow_runs()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getWorkflowRuns();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_workflow_runs_by_id
+
+List runs for a specific workflow.
+
+Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+
+**search_key**
+
+Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+
+**error_code**
+
+Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+
+<CodeGroup>
+```python Python
+await skyvern.get_workflow_runs_by_id(
+    workflow_id: str,
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    status: WorkflowRunStatus | Sequence[WorkflowRunStatus] | None = None,
+    search_key: str | None = None,
+    error_code: str | None = None,
+    created_at_start: datetime | None = None,
+    created_at_end: datetime | None = None,
+) -> list[WorkflowRun]
+```
+
+```typescript TypeScript
+skyvern.getWorkflowRunsById(workflowId: string, request?: GetWorkflowRunsByIdRequest): Promise<WorkflowRun[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_id` | `workflowId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
+| `page` | `page` | `int \| None` | No | `None` | Page number for pagination. |
+| `page_size` | `page_size` | `int \| None` | No | `None` | Number of runs to return per page. |
+| `status` | `status` | `WorkflowRunStatus \| Sequence[WorkflowRunStatus] \| None` | No | `None` | Filter by one or more run statuses. |
+| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. |
+| `error_code` | `error_code` | `str \| None` | No | `None` | Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. |
+| `created_at_start` | `created_at_start` | `datetime \| None` | No | `None` | Only include runs created at or after this UTC timestamp (ISO 8601). |
+| `created_at_end` | `created_at_end` | `datetime \| None` | No | `None` | Only include runs created strictly before this UTC timestamp (ISO 8601). |
+
+**Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`
+
+<Accordion title="WorkflowRun fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `workflow_run_id` | `str` |  |
+| `workflow_id` | `str` |  |
+| `workflow_permanent_id` | `str` |  |
+| `organization_id` | `str` |  |
+| `browser_session_id` | `str \| None` |  |
+| `browser_profile_id` | `str \| None` |  |
+| `debug_session_id` | `str \| None` |  |
+| `status` | `"created" \| "queued" \| "running" \| "failed" \| "terminated" \| "canceled" \| "timed_out" \| "completed" \| "paused"` |  |
+| `extra_http_headers` | `dict[str, str \| None] \| None` |  |
+| `cdp_connect_headers` | `dict[str, str \| None] \| None` |  |
+| `proxy_location` | `"RESIDENTIAL" \| "US-CA" \| "US-NY" \| "US-TX" \| "US-FL" \| "US-WA" \| "RESIDENTIAL_ES" \| "RESIDENTIAL_IE" \| "RESIDENTIAL_GB" \| "RESIDENTIAL_IN" \| "RESIDENTIAL_JP" \| "RESIDENTIAL_FR" \| "RESIDENTIAL_DE" \| "RESIDENTIAL_NZ" \| "RESIDENTIAL_ZA" \| "RESIDENTIAL_AR" \| "RESIDENTIAL_AU" \| "RESIDENTIAL_BR" \| "RESIDENTIAL_TR" \| "RESIDENTIAL_CA" \| "RESIDENTIAL_MX" \| "RESIDENTIAL_IT" \| "RESIDENTIAL_NL" \| "RESIDENTIAL_PH" \| "RESIDENTIAL_KR" \| "RESIDENTIAL_SA" \| "RESIDENTIAL_ISP" \| "NONE" \| Any \| GeoTarget \| dict[str, Any \| None] \| None` |  |
+| `webhook_callback_url` | `str \| None` |  |
+| `webhook_failure_reason` | `str \| None` |  |
+| `totp_verification_url` | `str \| None` |  |
+| `totp_identifier` | `str \| None` |  |
+| `failure_reason` | `str \| None` |  |
+| `failure_category` | `list[dict[str, Any \| None]] \| None` |  |
+| `parent_workflow_run_id` | `str \| None` |  |
+| `workflow_title` | `str \| None` |  |
+| `max_screenshot_scrolls` | `int \| None` |  |
+| `max_elapsed_time_minutes` | `int \| None` |  |
+| `browser_address` | `str \| None` |  |
+| `run_with` | `str \| None` |  |
+| `script_run` | `ScriptRunResponse \| None` |  |
+| `job_id` | `str \| None` |  |
+| `depends_on_workflow_run_id` | `str \| None` |  |
+| `sequential_key` | `str \| None` |  |
+| `ai_fallback` | `bool \| None` |  |
+| `code_gen` | `bool \| None` |  |
+| `trigger_type` | `"manual" \| "mcp" \| "api" \| "scheduled" \| "webhook" \| None` |  |
+| `workflow_schedule_id` | `str \| None` |  |
+| `ignore_inherited_workflow_system_prompt` | `bool \| None` |  |
+| `copilot_session_id` | `str \| None` |  |
+| `credits_used` | `int \| None` |  |
+| `cached_credits_used` | `int \| None` |  |
+| `queued_at` | `datetime \| None` |  |
+| `started_at` | `datetime \| None` |  |
+| `finished_at` | `datetime \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_workflow_runs_by_id(workflow_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getWorkflowRunsById("wpid_123");
+console.log(result);
+```
+</CodeGroup>

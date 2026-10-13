@@ -186,6 +186,17 @@ def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
 
 
+def is_stalled_attach_handshake(message: str) -> bool:
+    """True for a CDP connect timeout that fired after the socket was already open.
+
+    Playwright leaves that socket attached to the browser, where it keeps buffering events, so
+    reconnecting to the same browser gets slower rather than faster. A timeout before
+    ``<ws connected>`` is cleaned up and stays safe to retry.
+    """
+    lowered = message.lower()
+    return "connect_over_cdp" in lowered and "timeout" in lowered and "<ws connected>" in lowered
+
+
 def _is_session_closed_error(message: str) -> bool:
     # The session router closes with (4410, "session closed") when the session was already closed;
     # match the reason text, not the bare code — 4410 is reused elsewhere with other reasons.
@@ -223,6 +234,13 @@ def get_user_facing_exception_message(exception: Exception) -> str:
                 "Failed to connect to the browser session because the session is already closed. "
                 "Start a new browser session to continue. "
                 "If this is unexpected, contact support@skyvern.com."
+            )
+        if is_stalled_attach_handshake(raw):
+            return (
+                "Failed to connect to the browser session: it accepted the connection but did not "
+                "finish the attach handshake in time. Start a new browser session to continue -- "
+                "reconnecting to the same one is likely to fail again. "
+                "If this continues, contact support@skyvern.com."
             )
         return (
             f"Failed to connect to the browser session. "
@@ -1731,7 +1749,10 @@ class LLMCallerNotFoundError(SkyvernException):
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, runnable_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
+        super().__init__(
+            f"Browser session {browser_session_id} is already occupied by {runnable_id}. "
+            "Wait for that run to finish or cancel it, then retry."
+        )
 
 
 class BrowserSessionAlreadyEndedError(SkyvernException):
@@ -1800,10 +1821,17 @@ class MissingRoutedVncAddressError(SkyvernException):
         super().__init__(f"Browser session {browser_session_id} has no routed VNC address.")
 
 
+REREGISTER_EXTERNAL_BROWSER = (
+    "A registered browser cannot be extended or replaced by a new session: register it again "
+    "(POST /v1/browser_sessions/external) and pass the new id."
+)
+
+
 class BrowserSessionClosed(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str, *, reason: str | None = None) -> None:
+    def __init__(self, browser_session_id: str, *, reason: str | None = None, registered: bool = False) -> None:
+        remedy = REREGISTER_EXTERNAL_BROWSER if registered else "Create a new browser session and retry."
         super().__init__(
-            f"Browser session {browser_session_id} {reason or 'is closed'}. Create a new browser session and retry.",
+            f"Browser session {browser_session_id} {reason or 'is closed'}. {remedy}",
             status_code=HTTPStatus.GONE,
         )
 
@@ -1827,6 +1855,7 @@ class BrowserSessionExpired(BrowserSessionClosed):
         created_by: str | None,
         bound: bool = False,
         refused_at_submission: bool = False,
+        registered: bool = False,
     ) -> None:
         self.browser_session_id = browser_session_id
         self.started_at = started_at
@@ -1834,12 +1863,14 @@ class BrowserSessionExpired(BrowserSessionClosed):
         self.timeout_minutes = timeout_minutes
         self.created_by = created_by
         self.bound = bound
-        if refused_at_submission:
+        if refused_at_submission and not registered:
             SkyvernHTTPException.__init__(
                 self, self.expired_before_run_message(run_created=False), status_code=HTTPStatus.GONE
             )
         else:
-            super().__init__(browser_session_id, reason="expired after reaching its configured lifetime")
+            super().__init__(
+                browser_session_id, reason="expired after reaching its configured lifetime", registered=registered
+            )
 
     def expired_before_run_message(self, *, run_created: bool) -> str:
         """States that the session ended before the run was submitted, so use it only once that is established."""
@@ -1866,9 +1897,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
 class ExternalBrowserUnavailable(SkyvernHTTPException):
     def __init__(self, cause: str) -> None:
         super().__init__(
-            f"The registered browser's CDP endpoint is unavailable: {cause}.",
+            f"The registered browser's CDP endpoint is unavailable: {cause}. "
+            "Check that the browser is still running and reachable from Skyvern, then retry.",
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
         )
+
+    @classmethod
+    def lost(cls) -> "ExternalBrowserUnavailable":
+        return cls("the browser is no longer reachable")
 
 
 class ExternalBrowserEndpointNotEncrypted(SkyvernHTTPException):
@@ -1877,14 +1913,6 @@ class ExternalBrowserEndpointNotEncrypted(SkyvernHTTPException):
             "The registered browser's CDP endpoint, and any websocket it advertises, must use https:// or wss:// "
             "outside local development.",
             status_code=HTTPStatus.BAD_REQUEST,
-        )
-
-
-class ExternalBrowserSessionNotRunnable(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(
-            f"Browser session {browser_session_id} is a registered external browser, which cannot host a run yet.",
-            status_code=HTTPStatus.CONFLICT,
         )
 
 

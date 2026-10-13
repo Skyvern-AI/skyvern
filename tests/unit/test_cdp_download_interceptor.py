@@ -21,6 +21,7 @@ import structlog
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
+from skyvern.config import settings
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
@@ -474,6 +475,19 @@ async def test_timeout_recovery_late_request_response_releases_exact_state(tmp_p
     assert marker not in interceptor._active_recovery_markers
     assert interceptor._run_download_bytes == 0
     assert interceptor._run_download_file_count == 0
+
+
+def test_default_file_limit_admits_300_downloads_and_rejects_the_next() -> None:
+    assert mod.MAX_DOWNLOAD_FILES_PER_RUN == settings.BROWSER_DOWNLOAD_MAX_FILES_PER_RUN
+    interceptor = _make_interceptor()
+
+    admitted = [interceptor._new_download_attempt() for _ in range(300)]
+
+    assert all(attempt is not None for attempt in admitted)
+    assert interceptor._run_download_file_count == 300
+    assert interceptor._new_download_attempt() is None
+    assert interceptor._unsolicited_download_failures == {"file_count_limit": 1}
+    assert interceptor._run_download_file_count == 300
 
 
 @pytest.mark.asyncio
@@ -5553,6 +5567,26 @@ def test_duplicate_identical_publish_is_not_reported_as_unsolicited_failure(tmp_
     assert genuine is not None
     assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
     assert saved.read_bytes() == payload  # genuine collision fails closed; no overwrite
+
+
+def test_download_tally_survives_consume_and_restarts_on_accounting_reset(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path / "first"))
+    assert interceptor.publish_download_bytes(b"first", "statement.pdf", "application/pdf") is not None
+    assert interceptor.publish_download_bytes(b"other", "statement.pdf", "application/pdf") is None
+    before = interceptor.download_tally()
+
+    consumed = interceptor.consume_unsolicited_download_error()
+
+    assert consumed is not None and consumed["details"]["reasons"] == {"capture_failed": 1}
+    assert interceptor.consume_unsolicited_download_error() is None
+    assert interceptor.download_tally() == before
+    assert (before.saved, before.unsolicited_failures, before.pending) == (1, {"capture_failed": 1}, False)
+
+    interceptor.set_download_dir(str(tmp_path / "second"))
+
+    after_reset = interceptor.download_tally()
+    assert after_reset.generation != before.generation
+    assert (after_reset.saved, after_reset.unsolicited_failures) == (0, {})
 
 
 def test_requested_duplicate_is_satisfied_but_different_bytes_still_fails(tmp_path: Path) -> None:

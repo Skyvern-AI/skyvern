@@ -751,6 +751,50 @@ async def test_resolve_browser_wraps_connect_failure_without_leaking_raw_detail(
     assert exc_info.value.raw_detail == raw_detail
 
 
+def test_no_browser_error_sends_a_stalled_attach_to_a_new_session() -> None:
+    # SKY-17975: a connect_over_cdp timeout that reached "<ws connected>" leaves an abandoned CDP
+    # client attached to the browser, so the stock "retry the same session_id" hint makes the next
+    # attach slower and the session never recovers — the caller has to move to a fresh session.
+    stalled = session_manager.BrowserSessionConnectionError(
+        "BrowserType.connect_over_cdp: Timeout 30000ms exceeded. "
+        "Call log: - <ws connecting> wss://sessions.skyvern.com/pbs_123/tok "
+        "- <ws connected> wss://sessions.skyvern.com/pbs_123/tok"
+    )
+    assert stalled.attach_handshake_stalled is True
+    assert stalled.session_gone is False
+
+    error = session_manager.no_browser_error(stalled)
+
+    assert error["code"] == "SDK_ERROR"
+    assert "Create a new browser session" in error["hint"]
+    assert "Retry with the same session_id" not in error["hint"]
+    assert "high demand" not in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_browser_rollback_does_not_close_a_session_it_only_attached_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-17975: the rollback called SkyvernBrowser.close(), which also closes the cloud session
+    # through the API. On the attach path the session belongs to the caller, so a failure after a
+    # successful attach must drop only our CDP connection.
+    playwright_browser = MagicMock()
+    playwright_browser.close = AsyncMock()
+    attached_browser = MagicMock()
+    attached_browser.browser = playwright_browser
+    attached_browser.close = AsyncMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=attached_browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+    monkeypatch.setattr(session_manager, "BrowserContext", MagicMock(side_effect=RuntimeError("classification failed")))
+
+    with pytest.raises(RuntimeError, match="classification failed"):
+        await session_manager.resolve_browser(session_id="pbs_123")
+
+    attached_browser.close.assert_not_awaited()
+    playwright_browser.close.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_get_page_wraps_target_closed_failure_without_leaking_raw_detail(
     monkeypatch: pytest.MonkeyPatch,

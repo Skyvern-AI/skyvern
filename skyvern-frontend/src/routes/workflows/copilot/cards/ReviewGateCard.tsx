@@ -23,6 +23,7 @@ import {
   TurnNarrativeState,
   ranCleanOnCurrentSource,
 } from "../narrativeState";
+import type { CopilotProposalMetadata } from "../workflowCopilotTypes";
 import {
   AppliedCheck,
   CardBody,
@@ -80,6 +81,25 @@ export function getReviewGateVerdict(
     return null;
   }
   return covered ? "tested" : "untested";
+}
+
+// The stored candidate's disposition is the recorded verdict: the server re-records it when a
+// later turn tests the same candidate bytes, so it outranks the turn that proposed them.
+// eslint-disable-next-line react-refresh/only-export-components
+export function getPendingReviewGateVerdict(
+  turn: TurnNarrativeState | undefined,
+  proposedWorkflow: WorkflowApiResponse | null,
+  metadata: CopilotProposalMetadata | null,
+): ReviewGateVerdict {
+  switch (metadata?.disposition) {
+    case "review_tested":
+    case "auto_applicable":
+      return "tested";
+    case "review_untested":
+      return "untested";
+    default:
+      return getReviewGateVerdict(turn, proposedWorkflow);
+  }
 }
 
 const END_TO_END_REAL_ACTIONS =
@@ -207,7 +227,10 @@ const CHANGE_ORDER = [
   },
 ] as const;
 
-function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
+function changeRows(
+  turn: TurnNarrativeState | undefined,
+  tested: boolean,
+): ChangeRow[] {
   const review = turn?.review ?? null;
   if (review) {
     return CHANGE_ORDER.flatMap((section) =>
@@ -215,8 +238,9 @@ function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
         .filter((block) => block.change === section.change)
         .map((block) => {
           const neverTested =
-            block.coverage === "never_run" ||
-            (block.coverage === undefined && Boolean(block.neverTested));
+            !tested &&
+            (block.coverage === "never_run" ||
+              (block.coverage === undefined && Boolean(block.neverTested)));
           return {
             key: `${block.change}-${block.label}`,
             label: block.label,
@@ -225,8 +249,9 @@ function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
             markerClass: section.markerClass,
             struck: section.change === "removed",
             muted: section.change === "unchanged",
-            coverageTag:
-              block.coverage === "different_source"
+            coverageTag: tested
+              ? null
+              : block.coverage === "different_source"
                 ? "Different source"
                 : block.coverage === "unknown"
                   ? "Not tested under this name"
@@ -542,7 +567,9 @@ export function ReviewGateCard({
     restoreFocusRef.current = true;
     setConfirmingTest(false);
   };
-  const rows = changeRows(turn);
+  // A tested candidate outranks what its proposing turn recorded about blocks and starts.
+  const tested = verdict === "tested";
+  const rows = changeRows(turn, tested);
   const rejected = settled === "rejected";
   const accepted = settled === "accepted";
   const title = turn
@@ -570,13 +597,12 @@ export function ReviewGateCard({
     : accepting
       ? GATE_STATUS.accepting
       : null;
+  const startFailureCause = tested ? null : turn?.turnFacts?.terminalCause;
   const billingCreditRefusal =
-    turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
-  const testFailed = Boolean(turn && hasFailedTestBlock(turn));
+    startFailureCause === "billing_credit_admission_refusal";
+  const testFailed = !tested && Boolean(turn && hasFailedTestBlock(turn));
   const showActions = actionsShown && hasProposal;
-  const connectFailure = isBuildTestConnectFailureState(
-    turn?.turnFacts?.terminalCause,
-  );
+  const connectFailure = isBuildTestConnectFailureState(startFailureCause);
   const canTest = Boolean(onTestEndToEnd) && !billingCreditRefusal;
   const testLabel = connectFailure
     ? "Retry in a fresh session"

@@ -58,6 +58,7 @@ const browserSession = (
   status: "completed",
   timeout: null,
   vnc_streaming_supported: true,
+  source: "managed",
   ...overrides,
 });
 

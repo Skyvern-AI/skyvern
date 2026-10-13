@@ -130,7 +130,13 @@ from tests.unit.copilot_route_test_support import (
     setup_new_copilot_mocks,
     terminal_narrative_payload,
 )
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    RECEIPT_WORKFLOW_YAML,
+    all_blocks_tested_message,
+    make_copilot_ctx,
+    receipt_coverage_after,
+    receipt_message,
+)
 from tests.unit.services.test_browser_recording_code_first import draft_for, make_click, make_input, make_url_change
 from tests.unit.test_copilot_credential_pause import _FakeCache
 
@@ -1359,6 +1365,8 @@ async def _persist_cancel_and_read_row(
     staged_draft: bool = False,
     draft_from_an_earlier_turn: bool = False,
     proposal_disposition: ProposalDisposition = "auto_applicable",
+    with_agent_payload: bool = True,
+    executed_block_fingerprints: dict[str, set[str]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -1379,7 +1387,8 @@ async def _persist_cancel_and_read_row(
         cancelled=True,
         cancellation_iteration=4,
         cancellation_last_recorded_phase="persisted_block_run",
-        narrative_payload=_narrative_payload(),
+        narrative_payload=_narrative_payload() if with_agent_payload else None,
+        executed_block_fingerprints=executed_block_fingerprints or {},
     )
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
 
@@ -2662,6 +2671,78 @@ async def test_route_error_on_a_barred_turn_keeps_the_proposal(
     assert finalise_results[1].clear_proposed_workflow is False
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     assert not [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+
+
+@pytest.mark.asyncio
+async def test_route_error_after_a_retraction_keeps_the_block_untested_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    current = workflow_block_fingerprints(RECEIPT_WORKFLOW_YAML)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="sign_in failed",
+        updated_workflow=None,
+        global_llm_context=None,
+        executed_block_fingerprints={"read_metric": set(current["read_metric"])},
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_calls: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: Any, **kwargs: Any) -> None:
+        finalise_calls.append(kwargs["agent_result"])
+        if len(finalise_calls) == 1:
+            raise RuntimeError("post-agent route boom")
+        await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    await captured["handler"](copilot_stream)
+
+    assert len(finalise_calls) == 2
+    turn_2 = receipt_message(
+        workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["narrative_payload"]
+    )
+    assert receipt_coverage_after([all_blocks_tested_message(), turn_2]) == {
+        "sign_in": "never_run",
+        "read_metric": "current_source",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_turn_after_a_retraction_keeps_the_block_untested_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = workflow_block_fingerprints(RECEIPT_WORKFLOW_YAML)
+
+    _, payload = await _persist_cancel_and_read_row(
+        monkeypatch,
+        record_as_interrupted=True,
+        with_agent_payload=False,
+        executed_block_fingerprints={"read_metric": set(current["read_metric"])},
+    )
+
+    assert receipt_coverage_after([all_blocks_tested_message(), receipt_message(payload)]) == {
+        "sign_in": "never_run",
+        "read_metric": "current_source",
+    }
 
 
 @pytest.mark.asyncio
@@ -6442,6 +6523,40 @@ async def test_a_turn_finishing_after_reconcile_claimed_it_cannot_write(
     assert row.turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
     assert row.turn_outcome.interrupted_row_final is True
     assert not await workflow_copilot_route._claim_turn_finalisation(chat, "turn-done")
+
+
+@pytest.mark.asyncio
+async def test_a_turn_recovered_on_read_does_not_revive_an_older_receipt(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    await repo.create_workflow_copilot_chat_message(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="done",
+        narrative_payload={**terminal_narrative_payload(), **all_blocks_tested_message().narrative_payload},
+    )
+    await repo.start_copilot_turn(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        pending_turn=CopilotPendingTurn(
+            turn_id="turn-2",
+            started_at=datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS + 60),
+        ),
+        user_message="sign_in failed, fix it",
+    )
+
+    await workflow_copilot_route._reconcile_interrupted_copilot_turns(
+        await repo.get_workflow_copilot_chat_by_id("org", chat.workflow_copilot_chat_id), "org"
+    )
+
+    messages = await repo.get_workflow_copilot_chat_messages(chat.workflow_copilot_chat_id)
+    assert messages[-1].turn_outcome is not None
+    assert messages[-1].turn_outcome.terminal_reason == INTERRUPTED_TERMINAL_REASON
+    assert receipt_coverage_after(messages) == {"sign_in": "never_run", "read_metric": "never_run"}
 
 
 @pytest.mark.asyncio

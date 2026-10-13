@@ -962,6 +962,10 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # The model looked up a reference the user wrote and no saved login carries it, so the card settles
+    # the login rather than a page's URL. Sticky for the turn: clearing it on a later match would let a
+    # second site's page bind an unnamed login.
+    named_login_not_found: bool = False
     # A credential the user named before a refused cross-site fill connected a provider login in its place.
     # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
     origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
@@ -1025,6 +1029,26 @@ class RequestPolicy:
     def raw_secret_redacted_draft(self) -> bool:
         return self.raw_secret_detected and self.raw_secret_handling == "redacted_draft"
 
+    def record_named_login_not_found(self) -> list[str]:
+        """Returns the ids of logins the server bound without the user naming them, which are withdrawn."""
+        self.named_login_not_found = True
+        # A page, this turn or the one before, may have bound its own login before the model looked the
+        # name up. One the user named, approved earlier or saved in the workflow stays; a carry the model
+        # only cited does not, because naming a different login declines it.
+        settled = (
+            self.current_turn_named_credential_ids
+            | self.prior_approved_credential_ids
+            | set(self.persisted_workflow_credential_ids)
+        )
+        withdrawn = sorted({credential.credential_id for credential in self.auto_bound_credentials} - settled)
+        self.resolved_credentials = [c for c in self.resolved_credentials if c.credential_id not in withdrawn]
+        self.auto_bound_credentials = [c for c in self.auto_bound_credentials if c.credential_id not in withdrawn]
+        # Leaving the carry's id here would renew the withdrawn proposal for the next turn.
+        self.seeded_proposal_credential_ids.difference_update(withdrawn)
+        for credential_id in withdrawn:
+            self.live_page_admitted_urls.pop(credential_id, None)
+        return withdrawn
+
     def apply_raw_secret_redacted_draft(self) -> None:
         self.raw_secret_detected = True
         self.raw_secret_handling = "redacted_draft"
@@ -1069,6 +1093,7 @@ class RequestPolicy:
             "raw_secret_safety_failure_kind": self.raw_secret_safety_failure_kind,
             "raw_secret_safety_citation_count": self.raw_secret_safety_citation_count,
             "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
+            "named_login_not_found": self.named_login_not_found,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
@@ -4409,7 +4434,7 @@ def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
     Callers that must pay for evidence — a browser read, a credential load — check this first so a
     turn that could never admit does not buy the evidence to decide it.
     """
-    return not policy.raw_secret_detected
+    return not policy.raw_secret_detected and not policy.named_login_not_found
 
 
 def _live_page_url_abstains(
@@ -4453,8 +4478,13 @@ async def _resolve_live_page_credentials(
     """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
     if not live_page_credentials_admissible(policy) or not page_url:
         return None
+    credentials = await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id))
+    # Tool calls in one model response run concurrently, so a lookup can close page binding while this
+    # load is awaited. Callers record the admission without another await, so re-read it here.
+    if not live_page_credentials_admissible(policy):
+        return None
     return resolve_by_url(
-        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
+        credentials,
         [page_url],
         # The scout reached this page, so its own path is the evidence; a bare host match would let
         # any other page on that host — a profile, an upload, a user-content route — claim the login.

@@ -1320,6 +1320,42 @@ def test_independent_post_run_snapshot_removes_singular_selector_recommendation(
     ]
 
 
+def test_grading_page_text_leaves_out_pointer_states_and_visible_counts() -> None:
+    candidate = {"selector": "button.go", "source": "class", "match_count": 2, "visible_match_count": 1}
+    form = {
+        "fields": [
+            {
+                "label": "Query",
+                "pointer_at_center": "reaches_other_element",
+                "element_at_center": {"tag": "label", "role": "", "label_context": "Query field"},
+            }
+        ],
+        "submit_controls": [
+            {"text": "Search", "pointer_at_center": "reaches_control", "selector_candidates": [candidate]}
+        ],
+    }
+    ctx = _producer_ctx()
+    ctx.composition_page_evidence = {"forms": [form]}
+    run_execution_module._pin_pre_run_page_reference(ctx, "wr_current")
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_current",
+        "forms": [form],
+    }
+
+    snapshot = _snapshot_from_ctx(ctx, "wr_current")
+
+    shown_candidate = {"selector": "button.go", "source": "class"}
+    assert snapshot.block_outputs["post_run_page_observation"]["forms"] == [
+        {
+            "fields": [{"label": "Query"}],
+            "submit_controls": [{"text": "Search", "selector_candidates": [shown_candidate]}],
+        }
+    ]
+    assert snapshot.pre_run_page_reference_text == "Query Search button.go class 2"
+    assert ctx.composition_page_evidence["forms"][0]["submit_controls"][0]["selector_candidates"] == [candidate]
+
+
 def test_pre_run_baseline_provenance_valid_for_scout_evidence() -> None:
     assert run_execution_module._pre_run_baseline_is_provenance_valid({"visible_text_excerpt": "a form"}) is True
 

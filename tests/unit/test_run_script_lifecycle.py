@@ -179,7 +179,7 @@ async def test_run_script_persistent_session_closes_reusable_and_releases(monkey
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="sess_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )

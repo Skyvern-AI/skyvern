@@ -60,6 +60,7 @@ from skyvern.exceptions import (
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
     EmptyScrapePage,
+    ExternalBrowserUnavailable,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
@@ -168,7 +169,10 @@ from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    external_browser_failure_reason,
+    unusable_browser_session_error,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import parse_totp_config
@@ -211,6 +215,11 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
+from skyvern.services.credential_verdict_service import (
+    CredentialVerdictContext,
+    confirm_credential_verdicts,
+    is_credential_rejection_code,
+)
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
     describe_webhook_contract_failure,
@@ -280,7 +289,12 @@ from skyvern.webeye.actions.actions import (
     VerificationStatus,
     WebAction,
 )
-from skyvern.webeye.actions.handler import ActionHandler, _fill_multi_field_totp_group, _resolve_multi_field_totp_code
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    _fill_multi_field_totp_group,
+    _register_runtime_otp_value_best_effort,
+    _resolve_multi_field_totp_code,
+)
 from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.multi_field_totp import (
@@ -393,6 +407,21 @@ async def resolve_inherited_workflow_task_page(browser_state: BrowserState, work
     raise InvalidWorkflowTaskURLState(workflow_run_id)
 
 
+async def lost_external_browser_reason(
+    organization_id: str, browser_session_id: str | None, browser_state: BrowserState | None
+) -> str | None:
+    if not browser_session_id:
+        return None
+    try:
+        row = await app.DATABASE.browser_sessions.get_persistent_browser_session(browser_session_id, organization_id)
+    except Exception:
+        LOG.warning("Could not read the browser session behind a lost browser", exc_info=True)
+        return None
+    return external_browser_failure_reason(
+        row, browser_connected=browser_state is not None and browser_state.is_connected()
+    )
+
+
 def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
     """Probe liveness and fail the step if the browser is already known to be gone.
 
@@ -497,13 +526,7 @@ def _taskv3_row_intention(
 
 
 def _taskv3_row_secret_values(workflow_run_id: str | None) -> set[str]:
-    """What a persisted v3 action row scrubs.
-
-    The one-time code the run typed is deliberately absent: it is a record the customer has to be
-    able to read back off the row, and only the seed that mints codes is a secret. A model-hidden
-    runtime value (a magic sign-in link) stays in -- a signed URL is a secret whatever minted it, and
-    ``exclude_runtime_otp`` drops the whole task-scoped set that holds both.
-    """
+    """Scrubs model-hidden runtime values such as a magic sign-in link, but never the typed one-time code."""
     secret_values = (
         set(app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run_id, exclude_runtime_otp=True))
         if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(workflow_run_id)
@@ -591,12 +614,13 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     "(maskTicks) => {" + OTP_INPUT_PRIVACY_JS + " if (!document.body) return '0'; let h = 0; let v = 0; let elems = 0;"
     " const mix = (str, seed) => { let x = seed;"
     " for (let i = 0; i < str.length; i++) x = (Math.imul(x, 31) + str.charCodeAt(i)) | 0; return x; };"
-    # The act-by-mark tag is OUR writing and it now outlives the action, so a page that never
-    # moved still hashes differently the first time each control is acted on. That reads as a
-    # page change and resets the stall counter -- on a frozen page the model works through
-    # mark after mark, which is precisely the run the stall detector exists to catch.
-    # OTP bookkeeping attributes must also be ignored after masking so stamps do not count as page progress.
-    ' const scrub = (s) => s.replace(/ data-(?:tv3-act|tv3-cover|tv3-pick|skyvern-otp-[^\\s=]+)="[^"]*"/gi, \'\');'
+    # Our tools' markers (act and pre-click marks, menu and close numbering) and observe's minted handles outlive the
+    # action, so a page that never moved would still hash differently the first time a tool touches it: the stall
+    # detector reads that as progress and the action-effect check as an effect. Page-authored data-tv3 values stay
+    # significant, as in loop.py's canonicalization. OTP bookkeeping attributes are ignored for the same reason.
+    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|close|codebox|collateral|cover|dateseg"
+    '|filter-base|focus|look|menu|menu-scroller|pick|popup-filter|pre|sugg|sugglist)|skyvern-otp-[^\\s=]+)="[^"]*"'
+    "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
     # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
     # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
     # text whose digit-masked shape it has shown before: a countdown, a clock or a carousel, never a new word.
@@ -687,6 +711,26 @@ _EXPECTED_STEP_FAILURES = (FailedToReloadPage, LLMResponseMissingActionsError)
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": FailureCategory.LLM_ERROR.value, "confidence_float": 0.9, "reasoning": reasoning}]
+
+
+def _append_mapped_category_errors(
+    errors: list[UserDefinedError], categories: list[dict[str, Any]], error_code_mapping: dict[str, str] | None
+) -> None:
+    error_codes = {error.error_code for error in errors}
+    for category in categories:
+        category_name = category.get("category")
+        if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
+            continue
+        error_code = resolve_error_code_mapping_key(category_name, error_code_mapping)
+        if error_code and error_code not in error_codes:
+            errors.append(
+                UserDefinedError(
+                    error_code=error_code,
+                    reasoning=f"{error_code}: {(error_code_mapping or {})[error_code]}",
+                    confidence_float=1.0,
+                )
+            )
+            error_codes.add(error_code)
 
 
 def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
@@ -2248,7 +2292,12 @@ class ForgeAgent:
         # new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
         # Fail fast (with the recovery attempt must_get makes) when the page is already gone at the
         # start; mid-run losses surface through the per-call provider instead.
-        await browser_state.must_get_working_page()
+        start_page = await browser_state.must_get_working_page()
+        # A block's url is either backfilled from this page or one its runner already opened. A bare
+        # task's start URL is what its caller asked for, so it stays a destination.
+        starting_url_is_current = (
+            task_block is not None and task.url is not None and canonical_url(start_page.url) == canonical_url(task.url)
+        )
         # A block reuses the browser across blocks, so neither the landing status nor its URL belongs
         # to this block's start; only a bare task names a starting page in the dead-end verdict.
         initial_navigation_url: str | None = None
@@ -2785,7 +2834,9 @@ class ForgeAgent:
                     )
                     v3_persisted_actions.append(action)
                     await app.DATABASE.workflow_params.create_action(
-                        action=action_for_multi_field_totp_persistence(action)
+                        action=action_for_multi_field_totp_persistence(
+                            action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                        )
                     )
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
@@ -2858,7 +2909,7 @@ class ForgeAgent:
             " return window.__skyvern_doc_nonce; }"
         )
 
-        async def _page_fingerprint(mask_ticks: bool = False) -> str | None:
+        async def _page_fingerprint(mask_ticks: bool = False, action_effect: bool = False) -> str | None:
             peek = await _fingerprint_page()
             if peek is None:
                 return None
@@ -2867,7 +2918,11 @@ class ForgeAgent:
             # shadow stall measurement: a main-frame-only fingerprint reads a page whose child frame is
             # still rendering as settled. When work can happen in a frame, whatever judges that work has
             # to look there.
-            frames, _skipped, _unjudged = await _observable_child_frames(peek)
+            frames, _skipped, unjudged = await _observable_child_frames(peek)
+            # The action-effect check reads "changed" as permission to offer completion, so a frame that is read in
+            # one sample only, dropped here or failing below, must not pass for an effect.
+            if action_effect and unjudged:
+                return None
             # Plus every realm the run already acted in, which the observable set does not contain:
             # it drops a hidden host and caps at OBSERVE_FRAME_MAX, so a frame the app hides WHILE it
             # submits leaves both samples equal and the deferral accepts a completed verdict over work
@@ -2876,9 +2931,16 @@ class ForgeAgent:
             frames = list(frames) + [realm for realm in _recorded_work_frames(peek) if realm not in frames]
             parts = [own or ""]
             for frame in frames:
+                # The work ledger keeps a realm after its frame is gone; a fixed stand-in keeps that from failing
+                # every later sample.
+                if action_effect and frame.is_detached():
+                    parts.append("detached")
+                    continue
                 try:
                     parts.append(str(await frame.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks) or ""))
                 except Exception:
+                    if action_effect:
+                        return None
                     # A frame that will not answer contributes nothing rather than costing the page's
                     # own fingerprint -- the deferral still has the main document to judge.
                     LOG.debug("taskv3 page fingerprint could not read a child frame", exc_info=True)
@@ -2886,6 +2948,9 @@ class ForgeAgent:
 
         async def _settle_fingerprint() -> str | None:
             return await _page_fingerprint(mask_ticks=True)
+
+        async def _action_effect_fingerprint() -> str | None:
+            return await _page_fingerprint(mask_ticks=True, action_effect=True)
 
         # Document identity, not content: a failed call's leftover text or open menu changes the DOM
         # without re-mapping other selectors, while a navigation or reload (which does) wipes the nonce.
@@ -3059,6 +3124,7 @@ class ForgeAgent:
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
                 settle_fingerprint=_settle_fingerprint,
+                action_effect_fingerprint=_action_effect_fingerprint,
                 page_probe=_page_probe,
                 document_identity=_document_identity,
                 reload_page=_reload_page,
@@ -3096,6 +3162,7 @@ class ForgeAgent:
                 goal=goal,
                 parameters=parameters,
                 starting_url=task.url,
+                starting_url_is_current=starting_url_is_current,
                 downloads_dir=get_download_dir(download_id),
                 organization_id=organization.organization_id,
                 max_action_steps=step_cap,
@@ -4327,7 +4394,8 @@ class ForgeAgent:
             await self.fail_task(
                 task,
                 step,
-                get_user_facing_exception_message(e),
+                await lost_external_browser_reason(task.organization_id, browser_session_id, browser_state)
+                or get_user_facing_exception_message(e),
                 browser_state,
                 exception=e,
             )
@@ -4385,6 +4453,7 @@ class ForgeAgent:
             BrowserSessionClosed,
             BrowserSessionOwnershipConflict,
             BrowserTargetClosedError,
+            ExternalBrowserUnavailable,
         ) as e:
             # UnknownErrorWhileCreatingBrowserContext wraps *any* exception raised during
             # browser-context creation (BrowserFactory.create_browser_context's `except
@@ -4398,6 +4467,11 @@ class ForgeAgent:
                 LOG.warning("Recognized browser/session failure, marking the task as failed", exc_info=True)
 
             failure_reason = get_user_facing_exception_message(e)
+            if isinstance(e, (BrowserTargetClosedError, ExternalBrowserUnavailable)):
+                failure_reason = (
+                    await lost_external_browser_reason(task.organization_id, browser_session_id, browser_state)
+                    or failure_reason
+                )
 
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
             if is_task_marked_as_failed:
@@ -5175,7 +5249,9 @@ class ForgeAgent:
                     action.started_at = action.finished_at = naive_utc_now()
                     action.action_id = (
                         await app.DATABASE.workflow_params.create_action(
-                            action=action_for_multi_field_totp_persistence(action)
+                            action=action_for_multi_field_totp_persistence(
+                                action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                            )
                         )
                     ).action_id
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [stop_result])
@@ -5244,7 +5320,9 @@ class ForgeAgent:
                 action.started_at = naive_utc_now()
                 action.finished_at = naive_utc_now()
                 persisted_action = await app.DATABASE.workflow_params.create_action(
-                    action=action_for_multi_field_totp_persistence(action)
+                    action=action_for_multi_field_totp_persistence(
+                        action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                    )
                 )
                 action.action_id = persisted_action.action_id
                 detailed_agent_step_output.actions_and_results[action_idx] = (action, results)
@@ -5935,6 +6013,8 @@ class ForgeAgent:
             if task.task_id in current_context.totp_codes:
                 verification_code = current_context.totp_codes[task.task_id]
                 current_context.totp_codes.pop(task.task_id)
+                current_context.register_secret_value(verification_code)
+                _register_runtime_otp_value_best_effort(task.workflow_run_id, verification_code)
                 LOG.info(
                     "Using verification code from context",
                     task_id=task.task_id,
@@ -6134,6 +6214,8 @@ class ForgeAgent:
             if task.task_id in current_context.totp_codes:
                 verification_code = current_context.totp_codes[task.task_id]
                 current_context.totp_codes.pop(task.task_id)
+                current_context.register_secret_value(verification_code)
+                _register_runtime_otp_value_best_effort(task.workflow_run_id, verification_code)
                 LOG.info(
                     "Using verification code from context for anthropic CU call",
                     task_id=task.task_id,
@@ -10350,14 +10432,18 @@ class ForgeAgent:
             )
 
             user_errors = list(failure_response.errors)
-            # The summary model sometimes files a mapped code as a failure category instead of an error.
-            # A taxonomy name is its own classification, even when a mapping key reuses that name.
+            # Keep legacy mapping support for non-credential categories; credential verdicts must have passed
+            # through summary_failure_reason_for_max_retries' confirmation gate.
             for category in failure_response.failure_categories:
                 category_name = category.get("category")
                 if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
                     continue
                 error_code = resolve_error_code_mapping_key(category_name, task.error_code_mapping)
-                if error_code and error_code not in {error.error_code for error in user_errors}:
+                if (
+                    error_code
+                    and not is_credential_rejection_code(error_code)
+                    and error_code not in {error.error_code for error in user_errors}
+                ):
                     user_errors.append(
                         UserDefinedError(
                             error_code=error_code,
@@ -10429,7 +10515,14 @@ class ForgeAgent:
             )
             return next_step
 
-    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
+    async def _filter_response_errors(
+        self,
+        task: Task,
+        step: Step,
+        errors: list[UserDefinedError],
+        *,
+        credential_context: CredentialVerdictContext | None = None,
+    ) -> list[UserDefinedError]:
         canonical = [
             error.model_copy(update={"error_code": key})
             if (key := resolve_error_code_mapping_key(error.error_code, task.error_code_mapping))
@@ -10445,7 +10538,7 @@ class ForgeAgent:
                 dropped_codes=dropped,
                 allowed_codes=sorted((task.error_code_mapping or {}).keys()),
             )
-        return kept
+        return await confirm_credential_verdicts(task=task, step=step, errors=kept, context=credential_context)
 
     async def summary_failure_reason_for_max_steps(
         self,
@@ -10545,7 +10638,17 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
+            response.errors = await self._filter_response_errors(
+                task=task,
+                step=step,
+                errors=response.errors,
+                credential_context=CredentialVerdictContext(
+                    current_url=page.url if page is not None else None,
+                    screenshots=screenshots,
+                    agent_reasoning=response.reasoning,
+                ),
+            )
             return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
@@ -10699,7 +10802,19 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
+            # A category-only credential verdict must reach this same gate before it is returned.
+            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
+            response.errors = await self._filter_response_errors(
+                task=task,
+                step=step,
+                errors=response.errors,
+                credential_context=CredentialVerdictContext(
+                    current_url=page.url if page is not None else None,
+                    elements=html or None,
+                    screenshots=screenshots,
+                    agent_reasoning=response.reasoning,
+                ),
+            )
             return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")

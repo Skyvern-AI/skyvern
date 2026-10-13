@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
+from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -19,6 +20,11 @@ if TYPE_CHECKING:
 # URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
 # whose only navigation turned into a download.
 BLANK_PAGE_URLS = {"about:blank", ":"}
+
+
+def is_selectable_page_url(url: str) -> bool:
+    """Whether the working-page lookup can pick a tab at `url`; others (an Edge download hub) are skipped."""
+    return url in BLANK_PAGE_URLS or url == "chrome-error://chromewebdata/" or urlparse(url).scheme in ("http", "https")
 
 
 class BrowserState(Protocol):

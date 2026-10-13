@@ -449,6 +449,10 @@ def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSel
     )
 
 
+class BlobTooLargeError(Exception):
+    pass
+
+
 def _extract_playwright_screenshot_stage(exc: BaseException) -> str:
     """Playwright 1.46 joins call-log entries with ``-``, leaving the first one undashed; 1.58 dashes every entry."""
     _, separator, tail = str(exc).rpartition("Call log:")
@@ -1490,12 +1494,27 @@ def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -
 
 def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:
     positions = [position for _, position in partial_frames]
+    frame_sizes: list[tuple[int, int]] = []
     try:
-        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames], positions)
+        for frame, _ in partial_frames:
+            with Image.open(BytesIO(frame)) as img:
+                img.load()
+                frame_sizes.append(img.size)
+        # The merge only lines up a viewport that scrolled forward, by no more than its height, and has the
+        # first viewport's size; keep frames up to the first seam that breaks this instead of reordering them.
+        retained = 1
+        while retained < len(partial_frames):
+            step = positions[retained] - positions[retained - 1]
+            if frame_sizes[retained] != frame_sizes[0] or not 0 < step <= frame_sizes[0][1]:
+                break
+            retained += 1
+        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames[:retained]], positions[:retained])
     except Exception:
         LOG.warning(
             "Failed to stitch the viewports captured before the scrolling screenshot timed out",
             frame_count=len(positions),
+            scroll_positions=positions,
+            frame_sizes=frame_sizes,
             exc_info=True,
         )
         return None
@@ -1503,7 +1522,9 @@ def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | N
         "Scrolling screenshot timed out; keeping the viewports captured so far",
         incomplete_reason="capture_timeout",
         frame_count=len(positions),
+        retained_frame_count=retained,
         scroll_positions=positions,
+        frame_sizes=frame_sizes,
     )
     return png
 
@@ -2197,6 +2218,7 @@ class SkyvernFrame:
         workflow_run_id: str | None = None,
         max_size_bytes: int | None = None,
         probe: bool = False,
+        raise_too_large: bool = False,
     ) -> bytes | None:
         # probe=True is for best-effort multi-page fallback where the caller tries every open
         # page; expected misses on non-owning pages shouldn't spam ERROR/WARN logs, so downgrade
@@ -2245,6 +2267,8 @@ class SkyvernFrame:
                     size=result.get("size"),
                     max_size_bytes=max_size_bytes,
                 )
+                if raise_too_large:
+                    raise BlobTooLargeError
                 return None
             if not isinstance(result, dict) or not result.get("ok"):
                 retry_log(

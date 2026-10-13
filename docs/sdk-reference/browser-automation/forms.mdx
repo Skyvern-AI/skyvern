@@ -1,0 +1,425 @@
+---
+title: "Forms"
+description: "Fill whole forms with AI, or extract fields and fill them from a mapping."
+slug: sdk-reference/browser-automation/forms
+keywords:
+  - "fill_form"
+  - "form filling"
+  - "autocomplete"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Use `fill_form` to fill a form in one call. For more control, `extract_form_fields` lists the fields, `dynamic_field_map` maps your data onto them, and `fill_from_mapping` fills them.
+
+---
+
+## page.fill_form
+
+Scan page for form fields, map data to fields via LLM, and fill them.
+
+This is the primary SDK interface for form filling. It composes:
+1. extract_form_fields() — scan all fields from the DOM (free)
+2. dynamic_field_map() — one LLM call to map data to fields
+3. validate_mapping() — one LLM call to check user conditions
+4. fill_from_mapping() — fill via CSS selectors with AI fallback
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.fill_form(data: dict[str, Any], *, prompt: str = 'Fill out the form') -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `data` | — | `dict[str, Any]` | Yes | — | Dict of data keys/values to fill into the form. |
+| `prompt` | — | `str` | No | `'Fill out the form'` | User instructions for how to fill the form. |
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.fill_form(data={"email": "jane@example.com", "full_name": "Jane Doe"})
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.fill_multipage_form
+
+Fill a multi-page form by looping: fill current page → click next → repeat.
+
+Returns the number of pages filled. Stops when:
+- No fillable form fields are found on the current page (e.g., Review page)
+- The next button is not found (last page)
+- max_pages is reached
+- Wall-clock timeout is exceeded
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.fill_multipage_form(
+    data: dict[str, Any],
+    *,
+    prompt: str = 'Fill out the form',
+    next_button: str = 'button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")',
+    max_pages: int = 10,
+    timeout_seconds: float = 300,
+    debug_dir: str | None = None,
+) -> int
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `data` | — | `dict[str, Any]` | Yes | — | Dict of data keys/values to fill into the form. |
+| `prompt` | — | `str` | No | `'Fill out the form'` | User instructions for how to fill the form. |
+| `next_button` | — | `str` | No | `'button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")'` | CSS selector(s) for the next/continue button. |
+| `max_pages` | — | `int` | No | `10` | Safety limit on number of pages to fill. |
+| `timeout_seconds` | — | `float` | No | `300` | Wall-clock timeout for the entire multi-page fill (default 5 min). |
+| `debug_dir` | — | `str \| None` | No | `None` |  |
+
+**Returns** `int`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.fill_multipage_form(
+        data={"email": "jane@example.com", "full_name": "Jane Doe"},
+    )
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.extract_form_fields
+
+Scan the page for visible form fields using DOM inspection (no LLM).
+
+The base scanner handles standard HTML form elements (input, select,
+textarea) and ARIA role-based groups.  Platform-specific passes
+(e.g., custom listbox buttons, multiselect widgets) are injected
+at runtime via `AgentFunction.get_form_field_extraction_js()`.
+
+Returns a list of field descriptors.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.extract_form_fields() -> list[dict[str, Any]]
+```
+</CodeGroup>
+
+**Returns** `list[dict[str, Any]]`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.extract_form_fields()
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.dynamic_field_map
+
+Map data to form fields via a single cheap text-only LLM call.
+
+One LLM call sees ALL fields + ALL data and produces a complete mapping —
+no deterministic matching, no caching, no accumulated state.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.dynamic_field_map(
+    form_fields: list[dict[str, Any]],
+    data: dict[str, Any],
+    *,
+    prompt: str | None = None,
+) -> dict[int, str | list | bool | None]
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
+| `data` | — | `dict[str, Any]` | Yes | — | Flat dict of data keys/values to map to form fields. |
+| `prompt` | — | `str \| None` | No | `None` |  |
+
+**Returns** `dict[int, str \| list \| bool \| None]` — Mapping of 0-based field index -&gt; value to fill (or None to skip).
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    fields = await page.extract_form_fields()
+    result = await page.dynamic_field_map(
+        form_fields=fields,
+        data={"email": "jane@example.com", "full_name": "Jane Doe"},
+    )
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.fill_from_mapping
+
+Fill form fields using a pre-computed mapping from `dynamic_field_map`.
+
+Iterates over the mapping and fills each field using the appropriate
+browser method based on field type.  No LLM calls — pure execution.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.fill_from_mapping(
+    form_fields: list[dict[str, Any]],
+    mapping: dict[int, str | list | bool | None],
+    data: dict[str, Any] | None = None,
+) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
+| `mapping` | — | `dict[int, str \| list \| bool \| None]` | Yes | — | Output of `dynamic_field_map` (index -&gt; value). |
+| `data` | — | `dict[str, Any] \| None` | No | `None` | Original data dict for post-fill file upload matching. |
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    fields = await page.extract_form_fields()
+    mapping = await page.dynamic_field_map(fields, {"email": "jane@example.com"})
+    await page.fill_from_mapping(form_fields=fields, mapping=mapping)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.validate_mapping
+
+Validate the field mapping against the user's prompt/instructions.
+
+Makes one LLM call that sees the prompt (user instructions),
+the form fields, and what was mapped to each field.  Returns True if
+the run should complete, False if it should terminate.
+
+This catches user directives like "terminate if you can't answer the
+security clearance question" or "never fabricate answers — fail if
+data is missing for required fields."
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.validate_mapping(
+    form_fields: list[dict[str, Any]],
+    mapping: dict[int, str | list | bool | None],
+    prompt: str | None,
+) -> bool
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
+| `mapping` | — | `dict[int, str \| list \| bool \| None]` | Yes | — | Output of `dynamic_field_map`. |
+| `prompt` | — | `str \| None` | Yes | — | The user's instructions/prompt for this automation. |
+
+**Returns** `bool` — True to complete, False to terminate.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    fields = await page.extract_form_fields()
+    mapping = await page.dynamic_field_map(fields, {"email": "jane@example.com"})
+    result = await page.validate_mapping(
+        form_fields=fields,
+        mapping=mapping,
+        prompt="Fill in the contact form",
+    )
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+## page.fill_autocomplete
+
+Fill an autocomplete input by typing a value and clicking the matching dropdown option.
+
+Handles widgets like Google Places, autocomplete location fields, and other
+autocomplete inputs where typing triggers a dropdown and the user must
+select an option for the value to persist.
+
+The flow:
+1. Clear the field and type the value character-by-character (triggers autocomplete)
+2. Wait for dropdown options to appear
+3. Find the best-matching option by text similarity
+4. Click it so the value is committed
+
+If no dropdown options appear, falls back to the same behavior as `page.fill()`.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.fill_autocomplete(
+    selector: str | None = None,
+    value: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+    option_selector: str | None = None,
+    wait_seconds: float = 1.5,
+) -> str
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `selector` | — | `str \| None` | No | `None` | CSS selector for the input field. |
+| `value` | — | `str \| None` | No | `None` | The text to type (e.g. "San Francisco, CA"). |
+| `prompt` | — | `str \| None` | No | `None` | Natural language description for AI fallback. |
+| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode (same as fill). Defaults to "fallback". |
+| `option_selector` | — | `str \| None` | No | `None` | CSS selector for the dropdown options. If not provided, tries common patterns: `[role="option"]`, `.pac-item`, `li[role="option"]`, `[data-option-id]`. |
+| `wait_seconds` | — | `float` | No | `1.5` | How long to wait for dropdown options to appear after typing. Defaults to 1.5 seconds. |
+
+**Returns** `str` — The value that was selected from the dropdown, or the typed value if no dropdown appeared.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.fill_autocomplete(selector="#city", value="San Francisco")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>

@@ -98,4 +98,4 @@ the infobar revokes debugger access. Removing a tab with the popup or dragging i
 all extension access to that tab.
 
 For the complete setup, security model, and limitations, see
-[Control Your Chrome with Skyvern Agent](../../../docs/developers/optimization/chrome-extension.mdx).
+[Browsers: use your own Chrome](https://www.skyvern.com/docs/browsers#share-tabs-with-a-local-mcp-server).

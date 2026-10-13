@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
     post_run_evidence_source_refused,
     stamp_page_evidence_provenance,
+    without_authoring_facts,
 )
 from skyvern.forge.sdk.copilot.context import SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP, SignedOutPageObservation
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -602,7 +603,7 @@ def _model_visible_selector_candidates(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [
-        {key: item for key, item in candidate.items() if key != "match_count"}
+        {key: item for key, item in candidate.items() if key not in {"match_count", "visible_match_count"}}
         if isinstance(candidate, dict)
         else candidate
         for candidate in value
@@ -1062,7 +1063,9 @@ _PAGE_EVIDENCE_STATE_KEYS = (
 
 
 def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
-    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    """Return DOM-observed structure without visual augmentation, transport metadata or authoring facts:
+    pointer states change with scroll, and can tip the capture over its bound, which drops the visible counts."""
+    packet = without_authoring_facts(packet)
     state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
     page_obstructions = packet.get("page_obstructions")
     state["page_obstructions"] = (

@@ -74,6 +74,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service
+from tests.unit._task_block_fakes import mock_block_execute_deps
 from tests.unit._workflow_block_engine_fakes import (
     WORKFLOW_BLOCK_ENGINE_APP_TARGET,
     FakeExperimentationProvider,
@@ -88,7 +89,6 @@ from tests.unit.test_agent_task_v3 import (
     stub_workflow_block_engine_app,
 )
 from tests.unit.test_block_description_caching import _block_result, _setup_mocks
-from tests.unit.test_missing_starter_url import _mock_block_execute_deps
 
 
 @pytest.fixture
@@ -489,7 +489,7 @@ async def test_base_task_block_execute_dispatches_with_the_resolved_engine(scope
     call. A revert of engine=self.resolve_engine(...) back to engine=self.engine only shows up
     here -- the persist-side test mocks BaseTaskBlock.execute out entirely.
     """
-    scoped_context.workflow_block_engine_resolved_run_id = "wr_missing_starter_url_test"
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_task_block_test"
     scoped_context.workflow_block_engine_override = RunEngine.skyvern_v3
     block = _make_block(TaskBlock, label="dispatch_block")
 
@@ -499,12 +499,12 @@ async def test_base_task_block_execute_dispatches_with_the_resolved_engine(scope
         captured["engine"] = kwargs.get("engine")
         raise _EngineCaptured()
 
-    with _mock_block_execute_deps(working_page_url="https://example.com/dashboard") as deps:
-        deps["agent"].execute_step = AsyncMock(side_effect=_capture_engine_and_abort)
+    with mock_block_execute_deps(working_page_url="https://example.com/dashboard") as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=_capture_engine_and_abort)
 
         with pytest.raises(_EngineCaptured):
             await block.execute(
-                workflow_run_id="wr_missing_starter_url_test",
+                workflow_run_id="wr_task_block_test",
                 workflow_run_block_id="wrb_test",
                 organization_id="o_test",
             )
@@ -534,10 +534,10 @@ async def test_a_retry_after_a_step_engine_fallback_runs_v3_under_a_v3_row(scope
 
     now = datetime.now(UTC)
     failed_task = make_task(now, make_organization(now), status=TaskStatus.failed, failure_reason="step failed")
-    with _mock_block_execute_deps(working_page_url="https://example.com/dashboard") as deps:
-        deps["agent"].execute_step = AsyncMock(side_effect=_execute_step)
-        deps["observer_db"].update_workflow_run_block = AsyncMock(side_effect=_update_row)
-        deps["tasks_db"].get_task = AsyncMock(return_value=failed_task)
+    with mock_block_execute_deps(working_page_url="https://example.com/dashboard") as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=_execute_step)
+        deps.observer_db.update_workflow_run_block = AsyncMock(side_effect=_update_row)
+        deps.tasks_db.get_task = AsyncMock(return_value=failed_task)
         with (
             patch(
                 "skyvern.forge.sdk.workflow.models.block.app.STORAGE",
@@ -558,7 +558,7 @@ async def test_a_retry_after_a_step_engine_fallback_runs_v3_under_a_v3_row(scope
             pytest.raises(_EngineCaptured),
         ):
             await block.execute(
-                workflow_run_id="wr_missing_starter_url_test",
+                workflow_run_id="wr_task_block_test",
                 workflow_run_block_id="wrb_test",
                 organization_id="o_test",
             )

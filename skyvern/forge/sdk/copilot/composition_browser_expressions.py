@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
     _MAX_SELECTOR_CHARS,
+    _MAX_SUBMIT_CONTROLS_PER_FORM,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_CONTROLS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
@@ -473,6 +474,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const OBSERVED_CHECKED_TYPES=new Set({json.dumps(sorted(OBSERVED_CHECKED_FIELD_TYPES))});"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
+    f"const MAX_SUBMIT_CONTROLS_PER_FORM={int(_MAX_SUBMIT_CONTROLS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
     f"const MAX_RESULT_CONTAINERS={int(MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
@@ -533,6 +535,19 @@ const cssMatchesFor = (selector) => {
   try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { matches = null; }
   cssSelectorMatchCache.set(selector, matches);
   return matches;
+};
+// A selector's matches are counted once and each element's visibility is read once: a selector shared by N
+// controls would otherwise rescan its N matches for every one of them.
+const elementVisibilityCache = new WeakMap();
+const visibleMatchCountCache = new WeakMap();
+const visibleMatchCount = (matches) => {
+  if (!visibleMatchCountCache.has(matches)) {
+    visibleMatchCountCache.set(matches, matches.filter((el) => {
+      if (!elementVisibilityCache.has(el)) elementVisibilityCache.set(el, controlVisible(el));
+      return elementVisibilityCache.get(el);
+    }).length);
+  }
+  return visibleMatchCountCache.get(matches);
 };
 const resolvesUniquely = (sel, el) => {
   if (!sel) return false;
@@ -623,7 +638,7 @@ const textAnchorCandidateFor = (base, label, anchor, inner, el) => {
     let within; try { within = Array.from(anchor.querySelectorAll(inner)); } catch (e) { return null; }
     if (within.length !== 1 || within[0] !== el) return null;
   }
-  return { selector: selector, source: 'text_anchor', match_count: 1 };
+  return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([el]) };
 };
 const textAnchorCandidatesFor = (el) => {
   const out = [];
@@ -766,7 +781,9 @@ const selectorCandidatesFor = (
   const offer = (selector, source) => {
     if (!selector || selector.length > MAX_SELECTOR_CHARS) return;
     const matches = cssMatchesFor(selector);
-    candidates.push({ selector: selector, source: source, match_count: matches === null ? null : matches.length });
+    const candidate = { selector: selector, source: source, match_count: matches === null ? null : matches.length };
+    if (matches !== null) candidate.visible_match_count = visibleMatchCount(matches);
+    candidates.push(candidate);
   };
   const id = attr(el, 'id');
   if (id) offer(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]', 'id');
@@ -852,7 +869,7 @@ const labelAnchorCandidateFor = (carrier, labelEl, label) => {
     }
   }
   if (matched.length !== 1 || matched[0] !== carrier) return null;
-  return { selector: selector, source: 'text_anchor', match_count: 1 };
+  return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([carrier]) };
 };
 // A relation's key can provide one additional factual representation. It is appended after the
 // generic capture so its presence does not reorder or privilege another source.
@@ -1013,6 +1030,39 @@ const controlVisible = (node) => {
   // Match Playwright for form-control readiness: opacity alone does not make a control hidden.
   return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 };
+// What a pointer aimed at the control's centre lands on, read without scrolling. A centre that is
+// outside the viewport or clipped by an ancestor cannot be hit-tested, so it reports not_measured.
+const pointerAtCenterFacts = (node) => {
+  const rect = node.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) return { pointer_at_center: 'not_measured' };
+  let stack; try { stack = document.elementsFromPoint(x, y); } catch (e) { return { pointer_at_center: 'not_measured' }; }
+  if (!stack.length) return { pointer_at_center: 'not_measured' };
+  if (stack[0] === node || node.contains(stack[0])) return { pointer_at_center: 'reaches_control' };
+  // Cut to the parser's bound here, so a long label on a layer over many controls cannot fill the capture.
+  const elementAtCenter = identityFor(stack[0]);
+  elementAtCenter.label_context = elementAtCenter.label_context.slice(0, 120);
+  const reachesOtherElement = { pointer_at_center: 'reaches_other_element', element_at_center: elementAtCenter };
+  if (stack.includes(node)) return reachesOtherElement;
+  // A control that ignores pointer events is never in the stack: the pointer lands on whatever is under it.
+  let pointerEvents = ''; try { pointerEvents = window.getComputedStyle(node).pointerEvents; } catch (e) { pointerEvents = ''; }
+  if (pointerEvents === 'none') return reachesOtherElement;
+  // So does one hit-testing skips (a 1px control under `clip`, an inert subtree), unless an ancestor clips it at its
+  // padding box. The walk follows the flat tree into shadow trees and stops below body, whose clip is the viewport.
+  const flatParent = (el) => el.assignedSlot || el.parentElement || (el.parentNode && el.parentNode.host) || null;
+  for (let cur = flatParent(node); cur && cur !== document.body && cur !== document.documentElement; cur = flatParent(cur)) {
+    let style; try { style = window.getComputedStyle(cur); } catch (e) { return { pointer_at_center: 'not_measured' }; }
+    if (style.overflowX === 'visible' && style.overflowY === 'visible') continue;
+    const box = cur.getBoundingClientRect();
+    const left = box.left + cur.clientLeft;
+    const top = box.top + cur.clientTop;
+    if (x < left || x >= left + cur.clientWidth || y < top || y >= top + cur.clientHeight) return { pointer_at_center: 'not_measured' };
+  }
+  return reachesOtherElement;
+};
 const layerControlActionable = (control) => {
   const tag = (control.tagName || '').toLowerCase();
   const role = lower(attr(control, 'role')).trim();
@@ -1134,12 +1184,14 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push(Object.assign({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) }, disclosureFacts(node)));
+      // The parser keeps only a form's first MAX_SUBMIT_CONTROLS_PER_FORM submit controls, so later ones are not hit-tested.
+      submitControls.push(Object.assign({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) }, disclosureFacts(node), submitControls.length < MAX_SUBMIT_CONTROLS_PER_FORM ? pointerAtCenterFacts(node) : {}));
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
+    Object.assign(field, pointerAtCenterFacts(node));
     // Unmasked observed state needs both a real <input> tag here and the reported attribute type at the
     // Python and replay re-gates; the pair is deliberately an AND so a page that declares
     // type="date" on a textarea mirroring a password acquires no observed value.
@@ -1685,6 +1737,19 @@ const boundedStructuredEvidence = (payload) => {
   const pythonCharCount = (value) => Array.from(value).length;
   let serialized = JSON.stringify(payload);
   let serializedCharCount = pythonCharCount(serialized);
+  if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
+  // Over the bound, pointer facts and visible counts all go first and uncounted, so what follows sees the packet
+  // as it would be without them.
+  const dropAuthoringFacts = (value) => {
+    if (!value || typeof value !== 'object') return;
+    delete value.pointer_at_center;
+    delete value.element_at_center;
+    delete value.visible_match_count;
+    Object.values(value).forEach(dropAuthoringFacts);
+  };
+  dropAuthoringFacts(payload);
+  serialized = JSON.stringify(payload);
+  serializedCharCount = pythonCharCount(serialized);
   if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
 
   const originalCharCount = serializedCharCount;

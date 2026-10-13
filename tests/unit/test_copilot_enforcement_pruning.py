@@ -1531,12 +1531,16 @@ class TestPageEvidenceCompaction:
             }
         )
 
-    def _signed_out(self) -> str:
-        return self._packet(
-            session="pbs_cold",
-            forms=[{"fields": [{"id": "email", "label": "Email"}, {"id": "password", "label": "Password"}]}],
-            nav=[],
-        )
+    def _signed_out(self, authoring_facts: bool = False) -> str:
+        email: dict[str, Any] = {"id": "email", "label": "Email"}
+        form: dict[str, Any] = {"fields": [email, {"id": "password", "label": "Password"}]}
+        candidate: dict[str, Any] = {"selector": "input.field", "source": "class"}
+        email["selector_candidates"] = [candidate]
+        if authoring_facts:
+            email["pointer_at_center"] = "reaches_other_element"
+            email["element_at_center"] = {"tag": "div", "role": "dialog", "label_context": "Cookie preferences"}
+            candidate.update(match_count=2, visible_match_count=1)
+        return self._packet(session="pbs_cold", forms=[form], nav=[])
 
     def _signed_in(self) -> str:
         return self._packet(session="pbs_warm", forms=[], nav=[{"id": "navWebAnalytics", "text": "Web analytics"}])
@@ -1555,6 +1559,7 @@ class TestPageEvidenceCompaction:
         assert warm["source_browser_session_id"] == "pbs_warm"
         assert cold["current_url"] == warm["current_url"], "same URL — only the browser state differs"
         assert "email" in json.dumps(cold["forms"]), "the sign-in fields are what the cold state carries"
+        assert json.loads(_summarize_tool_output(self._signed_out(authoring_facts=True)))["page_evidence"] == cold
         assert not warm.get("forms")
         assert "navWebAnalytics" in json.dumps(warm["navigation_targets"])
 

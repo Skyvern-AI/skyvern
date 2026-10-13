@@ -100,7 +100,7 @@ keywords:
 - **More Reliable Date Field Filling** — Task runs now tab out of certain hard-to-click date fields before reading their value back, fixing cases where a filled field was incorrectly reported as empty.
 - **Guided Credential Example on Home** — The "Log into an HR portal" example on the Home page now walks new users step by step through connecting and using a demo login.
 - **Copilot Names Agents from the Home Prompt Box** — Agents created from the Home page prompt box now get a short, Copilot-generated name instead of keeping the full prompt as their title.
-- **Smarter Partial Date-of-Birth Handling** — When a task only provides a birth year, Skyvern now enters 01/01/<year> instead of terminating, and never invents an address or phone number. ([#8747](https://github.com/Skyvern-AI/skyvern/pull/8747))
+- **Smarter Partial Date-of-Birth Handling** — When a task only provides a birth year, Skyvern now enters `01/01/<year>` instead of terminating, and never invents an address or phone number. ([#8747](https://github.com/Skyvern-AI/skyvern/pull/8747))
 - **More Reliable Dropdown and Combobox Selection** — Improved how Skyvern verifies that a dropdown list was read completely and that a selection was actually committed, reducing false "not found" and "didn't select" errors.
 - **Behavior-Based Onboarding Emails** — Onboarding emails now adapt to what a new user has actually done, and free accounts are notified when they run out of credits.
 - **Visible Conditional Block Errors** — The run view now shows when a conditional block's condition couldn't be evaluated and which branch was taken, instead of showing nothing.

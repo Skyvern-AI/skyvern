@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
   runs: [] as Array<{ workflow_run_id: string }>,
   realScreenshot: false,
   artifactsByUrl: {} as Record<string, Array<Record<string, unknown>>>,
+  streamExternal: false,
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -68,7 +69,10 @@ vi.mock("../hooks/useWorkflowRunsQuery", () => ({
 }));
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({ browserStreamingMode: "vnc" }),
-  useStreamTransport: () => ({ streamTransport: "vnc" }),
+  useStreamTransport: () => ({
+    streamTransport: mocks.streamExternal ? null : "vnc",
+    isExternal: mocks.streamExternal,
+  }),
 }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
@@ -77,6 +81,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("@/routes/streaming/StreamDiagnostics", () => ({
+  EXTERNAL_BROWSER_DIAGNOSTIC: { title: "external" },
   StreamModeBadge: ({ mode }: { mode: string }) => (
     <span data-testid="stream-mode-badge">{mode}</span>
   ),
@@ -299,6 +304,7 @@ beforeEach(() => {
   mocks.runs = [];
   mocks.realScreenshot = false;
   mocks.artifactsByUrl = {};
+  mocks.streamExternal = false;
 });
 
 afterEach(() => {
@@ -663,6 +669,18 @@ describe("BrowserTab view machine", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "emit run stopped" }));
     expect(status.textContent).toBe("Browser stopped");
+  });
+
+  it("does not call a run on a registered external browser stopped", () => {
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    mocks.streamExternal = true;
+    renderBrowserPane(STUDIO_PATH);
+
+    fireEvent.click(screen.getByRole("button", { name: "emit run stopped" }));
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "No live view",
+    );
   });
 
   it("ignores stream state reported for a different run", () => {
