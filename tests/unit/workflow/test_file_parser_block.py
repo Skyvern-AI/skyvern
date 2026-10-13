@@ -778,6 +778,25 @@ class TestPDFParserSchemaValidation:
         assert "expected type object, got array" in prompts[1]
         record_output_parameter_value.assert_awaited_once()
 
+    async def test_stalled_model_fails_the_block_at_the_deadline(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/resume.pdf")
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_execute_dependencies(mp, block, AsyncMock(side_effect=stalled_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute("workflow-run", "workflow-run-block", organization_id="org-1"), timeout=10
+            )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "did not answer within" in (result.failure_reason or "")
+
 
 @pytest.mark.asyncio
 class TestOcrPdfPages:
@@ -902,6 +921,31 @@ class TestOcrPdfPages:
 
             with pytest.raises(RuntimeError, match="vision model outage"):
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
+
+    @pytest.mark.parametrize(
+        ("call_timeout", "pass_timeout", "expected_reason"),
+        [(0.05, 10, "did not answer within"), (10, 0.05, "did not transcribe")],
+        ids=["page_deadline", "whole_pass_deadline"],
+    )
+    async def test_stalled_page_fails_the_pass_instead_of_being_skipped(
+        self, call_timeout: float, pass_timeout: float, expected_reason: str
+    ) -> None:
+        """Skipping a page the model never answered would hand extraction a document with that page missing."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"stalled":
+                await asyncio.Event().wait()
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", call_timeout)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.PDF_OCR_TOTAL_TIMEOUT_SECONDS", pass_timeout)
+
+            with pytest.raises(TimeoutError, match=expected_reason):
+                await asyncio.wait_for(block._ocr_pdf_pages([b"good-1", b"stalled", b"good-3"]), timeout=5)
 
     async def test_empty_pages_contribute_nothing(self) -> None:
         """Pages that OCR to empty text add neither a marker nor content."""
@@ -1253,6 +1297,62 @@ class TestParseStepTimeout:
         assert result.success is False
         assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
         assert "timed out" in captured["failure_reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("handler_error", "expected_reason"),
+        [
+            (None, "did not answer within"),
+            (TimeoutError("gateway gave up on the request"), "gateway gave up on the request"),
+        ],
+        ids=["stalled_model_hits_the_deadline", "handler_timeout_keeps_its_own_cause"],
+    )
+    async def test_stalled_extraction_model_fails_the_block_at_the_deadline(
+        self, handler_error: Exception | None, expected_reason: str
+    ) -> None:
+        """A provider that never answers fails the block at the deadline instead of holding the run's slot."""
+        block = _make_file_parser_block("https://example.com/resume.pdf", FileType.PDF)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        mock_ctx = _mock_workflow_run_context()
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            if handler_error is not None:
+                raise handler_error
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/resume.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "Jane Doe, engineer"
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: stalled_handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"),
+                timeout=10,
+            )
+
+        assert result.success is False
+        assert expected_reason in captured["failure_reason"]
 
     async def test_validation_timeout_fails_the_block(self) -> None:
         block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)

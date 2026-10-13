@@ -28,7 +28,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -81,12 +81,14 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
+    FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
     PDF_OCR_PAGE_CONCURRENCY,
+    PDF_OCR_TOTAL_TIMEOUT_SECONDS,
     PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -13615,6 +13617,32 @@ async def _run_blocking_parse_step(
         raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
 
 
+class _FileParserLLMTimeout(TimeoutError):
+    pass
+
+
+@contextlib.asynccontextmanager
+async def _file_parser_llm_deadline(step: str, file_url: str, llm_key: str | None) -> AsyncIterator[None]:
+    """Bound one file-parser LLM call by wall-clock time, so a stalled provider fails the block."""
+    try:
+        async with asyncio.timeout(FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS) as deadline:
+            yield
+    except TimeoutError:
+        # A TimeoutError this scope did not raise came from inside the handler; relabelling it would bury its cause.
+        if not deadline.expired():
+            raise
+        LOG.warning(
+            "File parser LLM call exceeded its time budget",
+            step=step,
+            timeout_seconds=FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
+            file_url=_log_safe_url(file_url),
+            llm_key=llm_key,
+        )
+        raise _FileParserLLMTimeout(
+            f"The model did not answer within {FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS} seconds during {step}."
+        ) from None
+
+
 # csv.field_size_limit is process-global. Raising it once at import (rather than
 # set/restore around each parse) avoids a race between concurrent CSV parses on
 # separate worker threads stepping on each other's limit.
@@ -14180,6 +14208,7 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id), default=default_handler
         )
+        llm_key = _handler_llm_key(llm_api_handler)
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
         async def _ocr_page(page_image: bytes) -> str:
@@ -14189,15 +14218,16 @@ class FileParserBlock(Block):
                     try:
                         # OCR transcription intentionally skips system_prompt; it still applies
                         # to the downstream extract-information-from-file-text call.
-                        llm_response = await llm_api_handler(
-                            prompt=prompt_for_attempt,
-                            prompt_name="extract-text-from-image",
-                            screenshots=[page_image],
-                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                            force_dict=False,
-                            workflow_run_block_id=workflow_run_block_id,
-                            organization_id=organization_id,
-                        )
+                        async with _file_parser_llm_deadline("PDF page OCR", self.file_url, llm_key=llm_key):
+                            llm_response = await llm_api_handler(
+                                prompt=prompt_for_attempt,
+                                prompt_name="extract-text-from-image",
+                                screenshots=[page_image],
+                                # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                                force_dict=False,
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
+                            )
                     except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                         failure_reason = _llm_response_format_failure_reason(e)
                         will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -14232,11 +14262,31 @@ class FileParserBlock(Block):
                     prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
                 raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
-        page_results = await asyncio.gather(
-            *(_ocr_page(page_image) for page_image in page_images),
-            return_exceptions=True,
-        )
+        try:
+            async with asyncio.timeout(PDF_OCR_TOTAL_TIMEOUT_SECONDS) as ocr_deadline:
+                page_results = await asyncio.gather(
+                    *(_ocr_page(page_image) for page_image in page_images),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            if not ocr_deadline.expired():
+                raise
+            LOG.warning(
+                "File parser PDF OCR exceeded its time budget",
+                timeout_seconds=PDF_OCR_TOTAL_TIMEOUT_SECONDS,
+                pages=len(page_images),
+                file_url=_log_safe_url(self.file_url),
+                llm_key=llm_key,
+            )
+            raise _FileParserLLMTimeout(
+                f"The model did not transcribe the PDF's {len(page_images)} pages within "
+                f"{PDF_OCR_TOTAL_TIMEOUT_SECONDS} seconds."
+            ) from None
 
+        # A page the model never answered would silently drop its text from the extraction, so it fails the block.
+        stalled_pages = [r for r in page_results if isinstance(r, _FileParserLLMTimeout)]
+        if stalled_pages:
+            raise stalled_pages[0]
         # A total OCR outage must fail the block, not record an empty success — match the
         # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
         errors = [r for r in page_results if isinstance(r, BaseException)]
@@ -14305,20 +14355,22 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key_for_organization(organization_id), default=default_handler
             )
+            llm_key = _handler_llm_key(llm_api_handler)
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
             prompt_for_attempt = llm_prompt
             for attempt in range(self.ocr_validation_max_attempts):
                 try:
-                    llm_response = await llm_api_handler(
-                        prompt=prompt_for_attempt,
-                        prompt_name="extract-text-from-image",
-                        screenshots=[image_bytes],
-                        # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                        force_dict=False,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
+                    async with _file_parser_llm_deadline("image OCR", self.file_url, llm_key=llm_key):
+                        llm_response = await llm_api_handler(
+                            prompt=prompt_for_attempt,
+                            prompt_name="extract-text-from-image",
+                            screenshots=[image_bytes],
+                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                            force_dict=False,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
                 except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                     failure_reason = _llm_response_format_failure_reason(e)
                     will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -14673,15 +14725,16 @@ class FileParserBlock(Block):
         for attempt in range(self.schema_validation_max_attempts):
             telemetry.extraction_attempts = attempt + 1
             try:
-                llm_response = await llm_api_handler(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=telemetry.llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
             except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                 failure_reason = _llm_response_format_failure_reason(e)
                 will_retry = attempt + 1 < self.schema_validation_max_attempts
@@ -15173,15 +15226,27 @@ class PDFParserBlock(Block):
         )
 
         llm_response: dict[str, Any] | list | str | None = None
+        llm_api_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
+        llm_key = _handler_llm_key(llm_api_handler)
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:
-                llm_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+            except _FileParserLLMTimeout as e:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=str(e),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )

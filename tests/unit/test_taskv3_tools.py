@@ -79,6 +79,7 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
+    _NO_QUESTION_MARKER,
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
@@ -565,6 +566,8 @@ async def test_observe_renders_checkbox_checked_state() -> None:
         r = await _tool(tools, "observe").handler({})
     assert _ref_line(r.content, "I agree") and "checked=" in r.content
 
+
+_MARKER = f"group={_NO_QUESTION_MARKER}"
 
 _DISABLED_SHAPES_HTML = """
 <!doctype html><html><body>
@@ -4115,7 +4118,7 @@ def _assert_marked_not_guessed(data: dict[str, Any], content: str, markers: int,
         assert not e.get("group"), e
         for text in never:
             assert text not in json.dumps({k: v for k, v in e.items() if k != "placement"}), (text, e)
-    assert content.count("group=(no question found)") == markers, content
+    assert content.count(_MARKER) == markers, content
 
 
 @_skip_no_browser
@@ -4341,8 +4344,11 @@ async def test_observe_renders_the_no_question_marker_once_per_radio_group() -> 
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 4, r.content
-    assert r.content.count("group=(no question found)") == 2, r.content
-    assert "(no question found)" in radio_lines[0] and "(no question found)" in radio_lines[2], r.content
+    assert r.content.count(_MARKER) == 2, r.content
+    assert _NO_QUESTION_MARKER in radio_lines[0] and _NO_QUESTION_MARKER in radio_lines[2], r.content
+    # The marker points at a read, never at a position: the text beside an unbound group is often the wrong text.
+    assert "get_html" in _NO_QUESTION_MARKER, _NO_QUESTION_MARKER
+    assert not re.search(r"\b(look|above|below|beside|right|near)\b", _NO_QUESTION_MARKER), _NO_QUESTION_MARKER
 
 
 @_skip_no_browser
@@ -4483,8 +4489,13 @@ async def test_observe_radios_in_each_options_own_shadow_root_are_one_group(para
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radios = _radio_records(data)
     assert [e.get("label") for e in radios] == ["Light", "Medium", "Dark"], radios
+    if paragraph:
+        # The paragraph is the one text block of the card holding only these options.
+        assert [e.get("question") for e in radios] == [paragraph] * 3, radios
+        assert _NO_QUESTION_MARKER not in r.content, r.content
+        return
     assert len({e.get("group_missing") for e in radios}) == 1 and radios[0].get("group_missing"), radios
-    _assert_marked_not_guessed(data, r.content, 1, [paragraph] if paragraph else [])
+    _assert_marked_not_guessed(data, r.content, 1, [])
 
 
 @_skip_no_browser
@@ -5102,7 +5113,9 @@ def _aria_radio(caption: str) -> str:
     ],
 )
 async def test_observe_a_section_name_over_several_groups_is_never_their_question(body: str, section: str) -> None:
-    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+    # Without their own captions, the section name still never stands in for either group's question.
+    bare = re.sub(r"<p>[^<]*</p>", "", body)
+    async with _content_page(f"<!doctype html><html><body><form>{bare}</form></body></html>") as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     _assert_marked_not_guessed(data, r.content, 2, [section])
@@ -5138,9 +5151,10 @@ async def test_observe_a_section_holding_several_questions_gives_none_of_them_to
         items = "".join(
             f'<li><label><input type="{kind}" name="{k}" value="{k}-{v}">{v}</label></li>' for v in ("Yes", "No")
         )
-        return f'<div class="row"><p>{questions[k]}</p><ul>{items}</ul></div>'
+        return f'<div class="row"><ul>{items}</ul></div>'
 
-    html = f"<!doctype html><html><body><form><fieldset>{row('a')}{row('b')}</fieldset></form></body></html>"
+    captions = "".join(f"<p>{q}</p>" for q in questions.values())
+    html = f"<!doctype html><html><body><form><fieldset>{captions}{row('a')}{row('b')}</fieldset></form></body></html>"
     async with _content_page(html) as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
@@ -5157,16 +5171,16 @@ async def test_observe_a_section_holding_several_questions_gives_none_of_them_to
 @pytest.mark.asyncio
 async def test_observe_a_frames_radio_group_keeps_its_marker_beside_the_pages_own() -> None:
     # Each realm numbers its groups from 1, so the page's first group and the frame's share a number.
-    frame = "<form><div><p>Do you smoke?</p><div>{}</div></div></form>".format(_yes_no_radios("f").replace('"', "'"))
+    frame = "<form><div><div>{}</div></div></form>".format(_yes_no_radios("f").replace('"', "'"))
     html = (
-        f"<!doctype html><html><body><form><div><p>Do you drive?</p><div>{_yes_no_radios('m')}</div></div></form>"
+        f"<!doctype html><html><body><form><div><div>{_yes_no_radios('m')}</div></div></form>"
         f'<iframe srcdoc="{frame}" width="400" height="200"></iframe></body></html>'
     )
     async with _live_page(html) as page:
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 4, r.content
-    assert [("(no question found)" in line) for line in radio_lines] == [True, False, True, False], r.content
+    assert [(_NO_QUESTION_MARKER in line) for line in radio_lines] == [True, False, True, False], r.content
 
 
 def _two_realm_page(page_script: str, frame_script: str) -> str:
@@ -5275,7 +5289,7 @@ async def test_observe_a_radio_groups_description_never_puts_its_marker_mid_grou
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 2, r.content
-    assert "(no question found)" not in radio_lines[1], r.content
+    assert _NO_QUESTION_MARKER not in radio_lines[1], r.content
 
 
 @_skip_no_browser
@@ -5297,7 +5311,7 @@ async def test_observe_a_short_hint_never_silences_an_undeclared_radio_groups_ma
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     assert not any(e.get("group") for e in _radio_records(data)), _radio_records(data)
-    assert r.content.count("group=(no question found)") == 1, r.content
+    assert r.content.count(_MARKER) == 1, r.content
 
 
 _TWO_CHECKBOXES = (
@@ -5441,7 +5455,7 @@ async def test_observe_a_choice_groups_own_text_outranks_an_outer_declared_name(
     for e in choices.values():
         for text in wrong:
             assert text not in (e.get("group") or ""), choices
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5497,7 +5511,9 @@ async def test_observe_a_choice_groups_own_text_outranks_an_outer_declared_name(
 async def test_observe_a_declared_name_that_is_not_this_whole_groups_gets_the_marker(
     body: str, never: list[str]
 ) -> None:
-    async with _content_page(_choice_form(body)) as page:
+    # Without the group's own caption, the outer name still never stands in for its question.
+    bare = re.sub(r"<p>[^<]*</p>", "", body)
+    async with _content_page(_choice_form(bare)) as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     _assert_marked_not_guessed(data, r.content, 1, never)
@@ -5540,7 +5556,7 @@ async def test_observe_a_per_option_name_defers_to_the_named_group_above_it(body
         return
     radios = {str(e.get("value")): e for e in _radio_records(data)}
     assert question in (radios["a-yes"].get("group") or ""), radios
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 def _aria_yes_no(k: str) -> str:
@@ -5556,9 +5572,9 @@ def _aria_yes_no(k: str) -> str:
     ("body", "question", "markers"),
     [
         pytest.param(
-            '<div class="q"><p id="q-label">Are you over 18?</p><div role="radiogroup" aria-labelledby="q-label">'
-            f'{_aria_yes_no("qa")}</div></div><div class="q"><p id="q-label">Have you ever been convicted of a felony?</p>'
-            f'<div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qb")}</div></div>',
+            '<p id="q-label">Are you over 18?</p><p id="q-label">Have you ever been convicted of a felony?</p>'
+            f'<div class="q"><div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qa")}</div></div>'
+            f'<div class="q"><div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qb")}</div></div>',
             "Are you over 18?",
             2,
             id="templated-question-reusing-its-id",
@@ -5583,6 +5599,377 @@ async def test_observe_a_declared_name_that_may_be_another_questions_gets_the_ma
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_on_a_choice_option_names_the_question_observe_bound_it_to() -> None:
+    # Two adjacent caption cards, then a group with no question.
+    cards = "".join(
+        f"<div class='q'><div>{q}</div><div>{_yes_no_radios(k)}</div></div>"
+        for k, q in (("s", "Will you now or in the future require sponsorship?"), ("w", "Can you work here?"))
+    )
+    html = f"<!doctype html><html><body><form>{cards}<div>{_yes_no_radios('u')}</div></form></body></html>"
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        refs = [int(m.group(1)) for m in re.finditer(r"^ref=(\d+) .*/radio", r.content, re.M)]
+        assert len(refs) == 6, r.content
+        picked = [await _tool(tools, "click").handler({"selector": f"ref={refs[i]}"}) for i in (3, 5)]
+        by_selector = await _tool(tools, "click").handler({"selector": "input[value=s-no]"})
+    assert picked[0].status == "ok" and picked[0].content.endswith("\npicked 'No' for question 'Can you work here?'")
+    assert picked[1].content.endswith("\npicked 'No' for an unknown question"), picked[1].content
+    # A pick by a raw selector has no observe record to name the question from.
+    assert by_selector.content.endswith("\npicked this option for an unknown question"), by_selector.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_echo_stays_silent_when_the_pick_could_not_be_confirmed() -> None:
+    # The card leaves the page on click, so its state cannot be read back.
+    html = (
+        "<!doctype html><html><body><form><div class='q' id=card><div>Can you work here?</div>"
+        f"<div>{_yes_no_radios('w')}</div></div></form>"
+        "<script>document.getElementById('card').addEventListener('click', (e) => e.currentTarget.remove());</script>"
+        "</body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        ref = int(re.findall(r"^ref=(\d+) .*/radio", r.content, re.M)[1])
+        picked = await _tool(tools, "click").handler({"selector": f"ref={ref}"})
+    assert picked.entry_unconfirmed, picked
+    assert "picked" not in picked.content, picked.content
+
+
+_AUTH_Q = "Are you legally authorized to work in this country?"
+_FUTURE_SPONSOR_Q = "Will you now or in the future require visa sponsorship?"
+_EMAIL = "<label>Email <input type=text name=e></label>"
+
+
+def _list_radios(name: str) -> str:
+    return (
+        f"<ul><li><label><input type=radio name={name} value={name}-yes><span>Yes</span></label></li>"
+        f"<li><label><input type=radio name={name} value={name}-no><span>No</span></label></li></ul>"
+    )
+
+
+def _choice_records(data: dict[str, Any]) -> list[dict[str, Any]]:
+    kinds = ("radio", "checkbox")
+    return [e for e in data["elements"] if e.get("type") in kinds or e.get("role") in kinds]
+
+
+def _choice_lines(content: str) -> list[str]:
+    return [line for line in content.splitlines() if "/radio" in line or "/checkbox" in line]
+
+
+def _opts(name: str, extra: str = "") -> str:
+    return (
+        f"<div class='opts'><label><input type=radio name={name} value={name}-yes{extra}>Yes</label>"
+        f"<label><input type=radio name={name} value={name}-no{extra}>No</label></div>"
+    )
+
+
+def _required_card(name: str, question: str) -> str:
+    return (
+        f"<li class=item><div class=caption>{question}<span class=req>✱</span></div>"
+        f"<div class=answers>{_list_radios(name)}</div></li>"
+    )
+
+
+# The card rung: a group with no declared question takes the one text block of the largest ancestor that holds
+# nothing observe lists but this group's options.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "questions", "never"),
+    [
+        pytest.param(
+            f"<ul class=questions>{_required_card('s', _FUTURE_SPONSOR_Q)}{_required_card('a', _AUTH_Q)}</ul>" + _EMAIL,
+            [f"{_FUTURE_SPONSOR_Q} ✱"] * 2 + [f"{_AUTH_Q} ✱"] * 2,
+            [],
+            id="list-of-required-question-cards",
+        ),
+        pytest.param(
+            "<div class=page><h4>WORK AUTHORIZATION</h4><p>Answer every question below.</p>"
+            f"<ul class=questions>{_required_card('a', _AUTH_Q)}</ul><h4>SPONSORSHIP</h4>"
+            f"<ul class=questions>{_required_card('s', _FUTURE_SPONSOR_Q)}</ul></div>" + _EMAIL,
+            [f"{_AUTH_Q} ✱"] * 2 + [f"{_FUTURE_SPONSOR_Q} ✱"] * 2,
+            ["WORK AUTHORIZATION", "Answer every question", "SPONSORSHIP"],
+            id="question-card-under-a-section-heading-and-notice",
+        ),
+        pytest.param(
+            f"<div class=card>{_AUTH_Q}<div class=opts>{_yes_no_radios('t')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-as-a-bare-text-node-in-the-card",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p> * <span>✱</span><div class=opts>{_yes_no_radios('m')}</div></div>"
+            + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-beside-one-character-required-markers",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p><div role='alert status'>This field is required</div>"
+            f"<div class=opts>{_yes_no_radios('e')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["This field is required"],
+            id="question-then-an-error-with-two-roles",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p><div class=error><span role=alert>Required</span></div>"
+            f"<div class=opts>{_yes_no_radios('n')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["Required"],
+            id="question-then-an-error-wrapping-its-alert",
+        ),
+        pytest.param(
+            f"<div class=card><p aria-live=off>{_AUTH_Q}</p><div class=opts>{_yes_no_radios('f')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-in-a-region-whose-announcements-are-off",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q} <span role=status>(required)</span></p>"
+            f"<div class=opts>{_yes_no_radios('i')}</div></div>" + _EMAIL,
+            [f"{_AUTH_Q} (required)"] * 2,
+            [],
+            id="question-holding-an-inline-status",
+        ),
+        pytest.param(
+            f"<div class=q><p>{_AUTH_Q}</p><div role=alert>This field is required</div><div class=opts>"
+            f"{_yes_no_radios('a')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["This field is required"],
+            id="question-then-alert-error",
+        ),
+        pytest.param(
+            "<div class=q><div>Do you require sponsorship?</div>"
+            "<label><input type=checkbox name=sy value=s-yes>Yes</label>"
+            "<label><input type=checkbox name=sn value=s-no>No</label></div>" + _EMAIL,
+            ["Do you require sponsorship?"] * 2,
+            [],
+            id="checkbox-list-under-its-question",
+        ),
+    ],
+)
+async def test_observe_binds_each_choice_group_to_exactly_its_own_question(
+    body: str, questions: list[str], never: list[str]
+) -> None:
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    choices = _choice_records(data)
+    assert [e.get("question") for e in choices] == questions, choices
+    for e, own in zip(choices, questions, strict=True):
+        record = json.dumps({k: v for k, v in e.items() if k != "placement"})
+        for text in [*never, "Email", *(q for q in set(questions) if q != own)]:
+            assert text not in record, (text, e)
+    lines = _choice_lines(r.content)
+    for q in set(questions):
+        assert any(q in line for line in lines), f"{q!r} is on no choice line:\n{r.content}"
+    assert _MARKER not in r.content, r.content
+
+
+# Known residual (SKY-18213), pinned as today's output because the browser gate fails on an xfail: the legacy
+# rung reads a whole fieldset, so its hint and captions fold into the legend's question. Invert when it closes.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_fieldset_read_whole_by_the_legacy_rung_still_folds_its_hint_and_captions_in() -> None:
+    body = (
+        "<fieldset><legend>Have you ever been excluded from a federal health care program?</legend><p>Select one</p>"
+        f"{_yes_no_radios('m1')}</fieldset>" + _EMAIL
+    )
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+    folded = "Have you ever been excluded from a federal health care program? Select one YesNo"
+    assert [e.get("question") for e in _choice_records(data)] == [folded] * 2
+
+
+# A section panel drawing its `label` attribute above its slotted content.
+_SECTION_COMPONENT_JS = """<script>
+customElements.define('x-section', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<div class=t></div><slot></slot>'; }
+  connectedCallback() {
+    this.style.display = 'block';
+    this.shadowRoot.querySelector('.t').textContent = this.getAttribute('label');
+  }
+});
+</script>"""
+
+
+# The marker, never a guess, when the card does not single out one question.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "never"),
+    [
+        pytest.param(
+            f"<div class=q><p>Do you accept the <a href='#'>policy</a>?</p><div class=opts>{_yes_no_radios('p')}"
+            "</div></div>" + _EMAIL,
+            ["Do you accept the", "policy"],
+            id="link-inside-the-question",
+        ),
+        pytest.param(
+            "<div class='card'><h4>VISA STATUS</h4><ul><li class='item'>"
+            "<div class='caption'>Will you require sponsorship?<span class='req'>*</span></div>"
+            f"<div class='answers'>{_list_radios('k')}</div></li></ul></div>",
+            ["VISA STATUS"],
+            id="single-question-card-under-a-heading",
+        ),
+        pytest.param(
+            f"<div class='q'><div class='step'>Step 3 of 5</div><p>{_AUTH_Q}</p><div>{_yes_no_radios('d')}</div>"
+            "</div>" + _EMAIL,
+            ["Step 3 of 5", _AUTH_Q],
+            id="step-counter-then-question",
+        ),
+        pytest.param(
+            f"{_SECTION_COMPONENT_JS}<x-section label='Work eligibility'><p>{_FUTURE_SPONSOR_Q}</p>"
+            f"{_yes_no_radios('s')}</x-section>" + _EMAIL,
+            ["Work eligibility", _FUTURE_SPONSOR_Q],
+            id="section-component-label-over-a-slotted-question",
+        ),
+        pytest.param(
+            f"<div class=blk><div class=row><span>{_AUTH_Q}</span> <a href='#help'>Help</a></div><div class=wrap>"
+            f"<small>Select one option</small><div class=opts>{_yes_no_radios('w')}</div></div></div>" + _EMAIL,
+            ["Select one option", _AUTH_Q],
+            id="hint-in-the-card-beside-a-question-row-holding-a-help-link",
+        ),
+        pytest.param(
+            f"<p>{_AUTH_Q}</p><label>Notes <input name=notes></label><div class=card><label for=cy>Yes</label>"
+            "<input type=radio id=cy name=c value=y><label for=cn>No</label><input type=radio id=cn name=c value=n></div>"
+            + _EMAIL,
+            [_AUTH_Q],
+            id="caption-placed-before-its-own-option",
+        ),
+        pytest.param(
+            f"<div class=wrap><div class=title><h4>CONTACT PREFERENCES</h4></div><div class=opts>{_yes_no_radios('h')}"
+            "</div></div>" + _EMAIL,
+            ["CONTACT PREFERENCES"],
+            id="section-title-nested-in-a-wrapper-block",
+        ),
+        pytest.param(
+            "<div class=wrap><div role='heading text' aria-level=4>CONTACT PREFERENCES</div>"
+            f"<div class=opts>{_yes_no_radios('k')}</div></div>" + _EMAIL,
+            ["CONTACT PREFERENCES"],
+            id="section-title-with-two-roles",
+        ),
+        pytest.param(
+            "<div class=card><span>Yes No</span><div><input type=radio name=t aria-label=Yes>"
+            "<input type=radio name=t aria-label=No></div></div>" + _EMAIL,
+            [],
+            id="card-text-that-is-only-its-options-captions",
+        ),
+    ],
+)
+async def test_observe_marks_a_choice_group_whose_card_does_not_single_out_its_question(
+    body: str, never: list[str]
+) -> None:
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, never)
+
+
+# Each group's `group=` field in order: its question, or None for the marker.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "groups"),
+    [
+        pytest.param(
+            f"<div class=wrap><p>Tell us about your eligibility.</p><div class=card2><div id=qa>{_AUTH_Q}</div>"
+            f"{_opts('au', ' aria-describedby=qa')}</div></div>" + _EMAIL,
+            [_AUTH_Q],
+            id="described-question-under-a-wrapper-intro",
+        ),
+        pytest.param(
+            f"<div id=qa>{_AUTH_Q}</div><label>Notes <input></label>"
+            f"<div class=card><div>This field is required</div>{_opts('au', ' aria-describedby=qa')}</div>" + _EMAIL,
+            [_AUTH_Q],
+            id="question-described-from-outside-a-card-holding-an-error",
+        ),
+        pytest.param(
+            "<div class=wrap><p>Tell us about your eligibility.</p><div class=card2><div role=status>Required</div>"
+            f"{_opts('au')}</div></div>" + _EMAIL,
+            [None],
+            id="intro-above-a-card-holding-only-a-status-note",
+        ),
+        pytest.param(
+            f"<div class=card><div id=qa>{_AUTH_Q}</div><div>This field is required</div>"
+            f"{_opts('au', ' aria-describedby=qa')}</div>" + _EMAIL,
+            [_AUTH_Q],
+            id="question-described-inside-a-card-holding-an-error",
+        ),
+        pytest.param(
+            f"<div class=card>{_opts('au')}<div>This field is required</div></div>" + _EMAIL,
+            [None],
+            id="error-after-the-options-of-a-bare-group",
+        ),
+    ],
+)
+async def test_observe_prints_each_choice_group_its_own_question_or_the_marker(
+    body: str, groups: list[str | None]
+) -> None:
+    html = f"<!doctype html><html><body><form>{body}</form></body></html>"
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    printed = [line for line in _choice_lines(r.content) if " group=" in line]
+    assert len(printed) == len(groups), r.content
+    for line, question in zip(printed, groups, strict=True):
+        assert (_MARKER if question is None else f" group={question!r}") in line, (question, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_marks_a_choice_group_whose_question_the_group_budget_withholds() -> None:
+    filler = "".join(
+        f"<div class=q><div>Question {i}: please describe in your own words whether you have previously held a "
+        f"position that involved {'x' * 60} responsibilities of kind {i}?</div><div>{_yes_no_radios(f'f{i}')}</div></div>"
+        for i in range(30)
+    )
+    legal = "".join(
+        f"<div class=q><div>{q}</div><div>{_yes_no_radios(k)}</div></div>"
+        for k, q in (("au", _AUTH_Q), ("sp", _FUTURE_SPONSOR_Q))
+    )
+    async with _content_page(_choice_form(filler + legal)) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    firsts = [line for line in r.content.splitlines() if "/radio" in line][0::2]
+    assert len(firsts) == 32, r.content
+    # A group whose question the budget withheld still says so, rather than printing nothing.
+    assert all(" group=" in line for line in firsts), r.content
+    assert 0 < sum(_MARKER in line for line in firsts) < 32, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_echo_names_no_question_for_an_option_the_page_replaced_since_observe() -> None:
+    def screen(q: str) -> str:
+        return (
+            f"<div class='q'><p>{q}</p><div><label><input type=radio id='opt-yes' name='x' value='y'>Yes</label>"
+            "<label><input type=radio id='opt-no' name='x' value='n'>No</label></div></div>"
+        )
+
+    html = (
+        f"<!doctype html><html><body><form><div id='screen'>{screen(_FUTURE_SPONSOR_Q)}</div>{_EMAIL}</form>"
+        f"<script>function next(){{document.getElementById('screen').innerHTML = {json.dumps(screen(_AUTH_Q))};}}"
+        "</script></body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        refs = [int(m.group(1)) for m in re.finditer(r"^ref=(\d+) .*/radio", r.content, re.M)]
+        assert len(refs) == 2 and _FUTURE_SPONSOR_Q in r.content, r.content
+        await page.evaluate("next()")
+        click = _tool(tools, "click")
+        c = await click.handler({"selector": f"ref={refs[1]}"})
+        assert await page.evaluate("document.querySelector('#opt-no').checked"), c.content
+        again = await click.handler({"selector": f"ref={refs[1]}"})
+    for res in (c, again):
+        assert res.status == "ok" and "\npicked 'No' for an unknown question" in res.content, res.content
+        assert _FUTURE_SPONSOR_Q not in res.content, res.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_a_legend_never_names_a_radio_group_it_holds_only_part_of() -> None:
     body = (
         f"<fieldset><legend>Contact preference</legend><div class=opts>{_li_radios('x')}</div></fieldset>"
@@ -5592,7 +5979,7 @@ async def test_observe_a_legend_never_names_a_radio_group_it_holds_only_part_of(
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     assert "Contact preference" not in json.dumps(_radio_records(data)), _radio_records(data)
-    assert "group=(no question found)" in r.content, r.content
+    assert _MARKER in r.content, r.content
 
 
 @_skip_no_browser
@@ -5654,7 +6041,7 @@ async def test_observe_a_later_members_question_drops_an_earlier_members_marker(
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radios = {str(e.get("value")): e for e in _radio_records(data)}
     assert "Extra fee applies" in (radios["express"].get("group") or ""), radios
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5728,7 +6115,7 @@ async def test_observe_a_legend_names_proxy_radios_whose_option_wrappers_hold_on
         if sel.startswith("#notify"):
             assert "Subscription Plan" not in text, groups
         assert text not in ("Basic", "Pro", "Email", "SMS"), groups
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5779,7 +6166,7 @@ async def test_observe_an_options_only_field_container_gets_the_marker_not_its_c
         assert e.get("group") in (None, own), e
         if e.get("group"):
             shown.add(own)
-    assert r.content.count("group=(no question found)") == len(questions) - len(shown), r.content
+    assert r.content.count(_MARKER) == len(questions) - len(shown), r.content
     checkboxes = [e for e in data["elements"] if e.get("type") == "checkbox"]
     assert len(checkboxes) == 40, checkboxes
     assert all(e.get("group") in (None, "Language skills") for e in checkboxes), checkboxes
@@ -5822,7 +6209,7 @@ async def test_observe_a_declared_question_held_back_from_printing_is_not_marked
         )
     async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
