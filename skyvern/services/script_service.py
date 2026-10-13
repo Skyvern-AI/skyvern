@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
+    StepTerminationError,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -783,6 +784,21 @@ async def _create_workflow_block_run_and_task(
             admitted = await app.AGENT_FUNCTION.admit_recipe_step_attempt(task, step, is_cached=True)
             if not admitted:
                 raise RuntimeError("Recipe step was not admitted")
+        else:
+            try:
+                await app.AGENT_FUNCTION.validate_step_execution(task, step)
+            except StepTerminationError as e:
+                await _update_workflow_block(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=e.message,
+                    step_id=step_id,
+                    step_status=StepStatus.failed,
+                    label=label,
+                )
+                raise
 
     # The agent path settles a prior failed block's owned capture in execute_safe; a cached
     # successor reaches the same browser here, so it settles it before its own reads. Kept above

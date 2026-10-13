@@ -72,6 +72,7 @@ from skyvern.exceptions import (
     SequentialCredentialLimitExceeded,
     SkyvernException,
     SkyvernHTTPException,
+    StepTerminationError,
     UnrecognizedWorkflowParameters,
     WorkflowAttemptDispatchSuperseded,
     WorkflowHasNoBlocks,
@@ -6884,7 +6885,10 @@ class WorkflowService:
         except WorkflowAttemptDispatchSuperseded:
             raise
         except Exception as error:
-            LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
+            if isinstance(error, SkyvernHTTPException) and error.status_code == 402:
+                LOG.info("Workflow run refused at admission", workflow_run_id=workflow_run_id, reason=str(error))
+            else:
+                LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
             failed_run = await self._mark_workflow_run_as_failed_for_dispatch(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -9243,7 +9247,8 @@ class WorkflowService:
                         duration_ms=block_exec_duration_ms,
                     )
                     block_executed_with_code = False
-            except _WorkflowRunDispatchScopeError:
+            # A refused step is not a script failure: AI fallback would re-run the block into the same refusal.
+            except (_WorkflowRunDispatchScopeError, StepTerminationError):
                 raise
             except Exception as e:
                 block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
