@@ -2209,12 +2209,16 @@ def _build_narrative_payload(
             if not isinstance(label, str) or not label:
                 continue
             block_labels.append(label)
+    left_run_ids = ctx.budget_expiry_state.leavable_run_ids if ctx.budget_expiry_state.hard_backstop_reached else []
     for attempt in ctx.narrative_block_attempts.values():
+        block_state = _block_ui_state(attempt["rawStatus"], drafted_fallback=False)
+        if block_state == "running" and attempt["workflowRunId"] in left_run_ids:
+            block_state = "unfinished"
         block_entry: NarrativeBlock = {
             "label": attempt["label"],
             "workflowRunBlockId": attempt["workflowRunBlockId"],
             "blockType": attempt["blockType"],
-            "state": _block_ui_state(attempt["rawStatus"], drafted_fallback=False),
+            "state": block_state,
             "lastSeenIteration": attempt["lastSeenIteration"],
             "activity": list(block_activity.get(attempt["workflowRunBlockId"], [])),
             "startedAt": attempt["startedAt"],
@@ -2263,6 +2267,7 @@ def _build_narrative_payload(
             "reportProduced": budget_state.report_produced,
             "stagedDraftId": budget_state.staged_draft_id,
             "drainFingerprint": budget_state.drain_fingerprint,
+            "leftRunIds": list(budget_state.leavable_run_ids) if budget_state.hard_backstop_reached else [],
         }
     if ctx.google_connection_notices:
         payload["googleConnectionNotices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
