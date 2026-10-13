@@ -221,9 +221,9 @@ def _make_original_workflow() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_timeout_wip_persists_proposed_workflow_with_yaml_when_canonical_restored() -> None:
-    workflow_params = SimpleNamespace(update_workflow_copilot_chat=AsyncMock())
-    app.DATABASE.workflow_params = workflow_params
+async def test_timeout_wip_persists_proposed_workflow_with_yaml_when_canonical_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     chat = _make_chat(auto_accept=False)
     updated_workflow = MagicMock()
     updated_workflow.model_dump.return_value = {
@@ -246,11 +246,12 @@ async def test_timeout_wip_persists_proposed_workflow_with_yaml_when_canonical_r
         ),
         proposal_disposition="review_tested",
     )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, _make_original_workflow(), agent_result)
 
     await _persist_proposed_workflow_state(chat, agent_result, restored=True)
 
-    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
-    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    workflow_params.publish_workflow_copilot_candidate.assert_awaited_once()
+    proposed_workflow = workflow_params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]
     assert proposed_workflow["workflow_definition"]["blocks"][0]["label"] == "extract_record_status_info"
     assert proposed_workflow["_copilot_yaml"].startswith("title: Record lookup")
     assert "_copilot_unvalidated" not in proposed_workflow
@@ -569,8 +570,8 @@ async def test_route_cancel_wip_persists_proposal_and_response_frame(
 
     restore_mock.assert_awaited_once()
 
-    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
-    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    workflow_params.publish_workflow_copilot_candidate.assert_awaited_once()
+    proposed_workflow = workflow_params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]
     expected_proposed: dict[str, object] = {
         "workflow_id": "wf-canonical",
         "title": title,
@@ -1038,7 +1039,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     await handler(stream)
 
     restore_mock.assert_awaited_once()
-    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    proposal = workflow_params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]
     assert proposal["_copilot_yaml"] == "version: '1.0'"
     assert proposal["_copilot_unvalidated"] is True
 
@@ -1057,9 +1058,9 @@ async def test_timeout_wip_result_streams_normal_response_frame(
 
 
 @pytest.mark.asyncio
-async def test_verified_terminal_timeout_result_persists_proposed_workflow_with_blocks_and_params() -> None:
-    workflow_params = SimpleNamespace(update_workflow_copilot_chat=AsyncMock())
-    app.DATABASE.workflow_params = workflow_params
+async def test_verified_terminal_timeout_result_persists_proposed_workflow_with_blocks_and_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     chat = _make_chat(proposed_workflow=None, auto_accept=False)
     blocks = [
         {"block_type": "code", "label": "open_search_search_page"},
@@ -1093,10 +1094,11 @@ async def test_verified_terminal_timeout_result_persists_proposed_workflow_with_
         workflow_was_persisted=True,
         proposal_disposition="auto_applicable",
     )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, _make_original_workflow(), agent_result)
 
     await _persist_proposed_workflow_state(chat, agent_result, restored=False)
 
-    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    proposal = workflow_params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]
     assert proposal["_copilot_yaml"].startswith("title: Record Status Draft")
     assert [block["label"] for block in proposal["workflow_definition"]["blocks"]] == [
         "open_search_search_page",
@@ -1168,7 +1170,7 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
     await handler(stream)
 
     restore_mock.assert_awaited_once()
-    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    proposal = workflow_params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]
     assert proposal["_copilot_yaml"] == "title: Last Good"
     assert "_copilot_unvalidated" not in proposal
 

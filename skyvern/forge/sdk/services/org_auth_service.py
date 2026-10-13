@@ -21,7 +21,7 @@ from skyvern.forge.sdk.core.organization_age_cache import remember_organization_
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
-from skyvern.forge.sdk.services.request_principal import resolve_request_principal
+from skyvern.forge.sdk.services.request_principal import resolve_request_principal, synthetic_user_id
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
@@ -429,7 +429,7 @@ async def get_current_user_id(
             authorization=authorization,
         )
         if organization:
-            return f"{organization.organization_id}_user"
+            return synthetic_user_id(organization.organization_id)
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -834,7 +834,7 @@ async def get_current_caller_context(
         if x_user_agent == SKYVERN_UI_USER_AGENT:
             return CallerContext(
                 organization=organization,
-                caller_id=f"{organization.organization_id}_user",
+                caller_id=synthetic_user_id(organization.organization_id),
                 caller_type=CallerType.USER,
             )
         return CallerContext(
