@@ -49,6 +49,8 @@ LOG = structlog.get_logger()
 ToolStatus = Literal["ok", "error"]
 FinishStatus = Literal["completed", "failed", "terminated"]
 UnlistedReaskCheck = Callable[[NonCompletedStatus, str], Awaitable[UnlistedReask]]
+# (reason, earlier checks this run); logs its own verdict and never raises.
+TerminatePremiseCheck = Callable[[str, int], Awaitable[None]]
 
 # Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
 # because the whole value of the facet is that it is closed: it is written at ~33 literal sites in
@@ -2520,6 +2522,7 @@ def make_finish_tool(
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
     completion_gate: CompletionGate | None = None,
     unseen_text: UnseenPageText | None = None,
+    terminate_premise: TerminatePremiseCheck | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2563,10 +2566,13 @@ def make_finish_tool(
     decides. A refusal never ends the run, so only a later finish the gate approves can complete it.
 
     `unseen_text` holds a completed verdict, on its own budget, while the page shows text no result the model read
-    carried."""
+    carried.
+
+    `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing."""
     deferrals = 0
     stale_holds = 0
     failure_deferrals = 0
+    premise_checks = 0
     reask_asked = False
 
     async def _bounded_fingerprint() -> str | None:
@@ -2728,8 +2734,18 @@ def make_finish_tool(
             },
         )
 
+    async def _premise_done(premise: asyncio.Future[None] | None) -> None:
+        try:
+            if premise is not None:
+                await premise
+        except asyncio.CancelledError:
+            # A cancel raised inside the shadow's own call is not the run's; only the run's own cancel goes on.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals, stale_holds, failure_deferrals, reask_asked
+        nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -2953,18 +2969,33 @@ def make_finish_tool(
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
         original = _non_completed(status)
+        premise = None
+        if status == "terminated" and terminate_premise is not None:
+            premise = asyncio.ensure_future(terminate_premise(args.get("reason") or "", premise_checks))
+            premise_checks += 1
         if original is not None and unlisted_reask is not None and not reask_asked:
             reask_asked = True
-            converted = await _reask(original, args)
+            try:
+                converted = await _reask(original, args)
+            except BaseException:
+                if premise is not None:
+                    premise.cancel()
+                raise
             try:
                 canceled_during_reask = should_cancel is not None and await should_cancel()
             except Exception:
                 canceled_during_reask = False
             if canceled_during_reask:
+                if premise is not None:
+                    premise.cancel()
                 # Defer: the loop's cancellation check persists `canceled` before another turn.
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
+            # After the cancel check, so the shadow's wait never widens the window in which a cancel changes the result.
+            await _premise_done(premise)
             if converted is not None:
                 return converted
+        else:
+            await _premise_done(premise)
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={

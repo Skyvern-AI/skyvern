@@ -3059,11 +3059,10 @@ class ForgeAgent:
             workflow_system_guidance = task.workflow_system_prompt
             block_type = str(task_block.block_type) if task_block is not None else None
             extraction_requested = bool(task.data_extraction_goal or task.extracted_information_schema)
-            # Not on validation: there the criterion is the question itself, and a skipped screen answers another.
-            reask_complete_criterion = goal_fields["complete_criterion"]
+            # Not on validation: there the criterion is the question itself, and its terminate is the answer.
             unlisted_reask_criteria = (
-                (reask_complete_criterion, goal_fields["terminate_criterion"])
-                if reask_complete_criterion and task.task_type != TaskType.validation
+                (goal_fields["complete_criterion"] or "", goal_fields["terminate_criterion"])
+                if task.task_type != TaskType.validation
                 else None
             )
             # A block that completes on a download is not done by its one action.
@@ -3145,6 +3144,7 @@ class ForgeAgent:
                     presented_fields.keys() & {"complete_criterion", "terminate_criterion"}
                 ),
                 unlisted_reask_instructions_untrusted=bool(system_prompt_page_roots),
+                terminate_premise_check=not is_custom_llm_key(llm_caller.original_llm_key),
                 # Unfenced across both populations, unlike the settle probe above: that fence exists
                 # to keep a RENDERING wait off the bare arm, and this asks a different question. The
                 # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
