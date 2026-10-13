@@ -290,6 +290,30 @@ vi.mock("@/routes/workflows/editor/hooks/useSaveWorkflow", () => ({
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
+// Same reason: the chats query the History dropdown subscribes to needs a
+// QueryClientProvider. One other chat, so a pick off the list is a real switch.
+vi.mock("./useInfiniteCopilotChatsQuery", () => ({
+  useInfiniteCopilotChatsQuery: () => ({
+    data: {
+      pages: [
+        [
+          {
+            workflow_copilot_chat_id: "chat-2",
+            workflow_permanent_id: "wpid_1",
+            workflow_title: "Workflow",
+            title: "OTHER chat",
+            created_at: "2026-06-20T10:00:00Z",
+            modified_at: "2026-06-20T10:05:00Z",
+          },
+        ],
+      ],
+    },
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    isFetching: false,
+  }),
+}));
 vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
   RecordingPanel: () => <div data-testid="recording-chapter" />,
 }));
@@ -6841,9 +6865,11 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       >[0]);
     });
 
-    // The user gives up on it and starts a new chat, which clears the board.
+    // The user gives up on it and starts a new chat, which clears the board. CALLBACK-LEVEL since
+    // New chat is disabled for the length of a load: the epoch guard is what keeps the abandoned
+    // response harmless, and it has to hold for every caller, not just the one the chrome allows.
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+      useCopilotHeaderStore.getState().controls!.onNewChat();
     });
     // Only now does the abandoned load answer.
     await act(async () => {
@@ -10615,6 +10641,97 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         },
       ],
     },
+  });
+
+  it("disables New chat while selected chat history is loading", async () => {
+    await renderChat({ docked: true });
+    let releaseHistory!: (value: unknown) => void;
+    historyGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseHistory = resolve;
+        }),
+    );
+
+    await selectChat("chat-2");
+    await waitFor(() =>
+      expect(useCopilotHeaderStore.getState().controls?.disabled).toBe(true),
+    );
+    expect(useCopilotHeaderStore.getState().controls?.newChatDisabled).toBe(
+      true,
+    );
+
+    await act(async () => {
+      releaseHistory(chatPayload("chat-2", "OTHER chat body"));
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      const controls = useCopilotHeaderStore.getState().controls;
+      expect(controls?.disabled).toBe(false);
+      expect(controls?.newChatDisabled).toBe(false);
+    });
+  });
+
+  it("keeps New chat enabled during a turn so it can abort the request", async () => {
+    await renderChat({ docked: true });
+    await submit("build a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      const controls = useCopilotHeaderStore.getState().controls;
+      expect(controls?.disabled).toBe(true);
+      expect(controls?.newChatDisabled).toBe(false);
+    });
+
+    await act(async () =>
+      useCopilotHeaderStore.getState().controls!.onNewChat(),
+    );
+    expect(streamCalls[0]?.signal?.aborted).toBe(true);
+  });
+
+  // The floating window keeps its own header button, which the docked store never carries, so a
+  // flag wired only into setControls leaves this one live. Driven through the dropdown, because
+  // the initial read holds New chat on startupPending anyway - a History pick is the only load
+  // that reaches it on isLoadingHistory alone.
+  it("disables the floating window's New chat while a History pick loads", async () => {
+    await renderChat({ docked: false });
+    const header = (name: string) => screen.getByRole("button", { name });
+    expect(header("New chat").matches(":disabled")).toBe(false);
+
+    let releaseHistory!: (value: unknown) => void;
+    const hangTheChatRead = (path: string) =>
+      path === "/workflow/copilot/chat-history"
+        ? new Promise((resolve) => {
+            releaseHistory = resolve;
+          })
+        : Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: saveData.workflow }
+              : historyResponse,
+          );
+    historyGet.mockImplementation(hangTheChatRead);
+
+    fireEvent.click(header("History"));
+    await act(async () => {
+      fireEvent.click(await screen.findByText("OTHER chat"));
+    });
+    await waitFor(() =>
+      expect(header("New chat").matches(":disabled")).toBe(true),
+    );
+
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    await act(async () => {
+      releaseHistory(chatPayload("chat-2", "OTHER chat body"));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(header("New chat").matches(":disabled")).toBe(false),
+    );
   });
 
   it("lets the NEWER chat selection win when two loads overlap", async () => {

@@ -4958,6 +4958,7 @@ export function WorkflowCopilotChat({
   // gate until it settles (New chat stays usable during a turn only to abort it).
   const headerControlsDisabled =
     isLoading || isLoadingHistory || acceptHoldReason !== null;
+  const newChatDisabled = isLoadingHistory || acceptHoldReason !== null;
   useEffect(() => {
     if (!docked) {
       return;
@@ -4970,7 +4971,7 @@ export function WorkflowCopilotChat({
         headerHandlersRef.current.handleSelectHistoryChat(chat),
       onNewChat: () => headerHandlersRef.current.handleNewChat(),
       disabled: headerControlsDisabled,
-      newChatDisabled: acceptHoldReason !== null,
+      newChatDisabled,
       navigationLockedReason: acceptHoldReason,
     });
     return () => store.setControls(null);
@@ -4979,6 +4980,7 @@ export function WorkflowCopilotChat({
     workflowPermanentId,
     workflowCopilotChatId,
     headerControlsDisabled,
+    newChatDisabled,
     acceptHoldReason,
   ]);
 
@@ -10617,7 +10619,7 @@ export function WorkflowCopilotChat({
                 >
                   <button
                     type="button"
-                    disabled={acceptHoldReason !== null}
+                    disabled={newChatDisabled}
                     onClick={handleNewChat}
                     className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
                   >
