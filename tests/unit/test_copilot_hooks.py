@@ -3904,6 +3904,7 @@ def test_browser_overlays_are_covered_by_session_classification() -> None:
 async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> None:
     ctx = make_copilot_ctx()
     hooks = CopilotRunHooks(ctx)
+    ctx.open_step_run_ids.append("wr_saved_with_its_step")
 
     await hooks.on_agent_start(MagicMock(), MagicMock())
     await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
@@ -3911,6 +3912,8 @@ async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> Non
 
     assert ctx.enforcement_pass_count == 1
     assert ctx.model_calls_this_turn == 2
+    # The SDK saves a step before it starts the next model call, so that step's runs are in the session.
+    assert ctx.open_step_run_ids == []
 
 
 @pytest.mark.asyncio
