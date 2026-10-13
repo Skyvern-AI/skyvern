@@ -842,10 +842,9 @@ def block_yaml_to_block(
 
     elif block_yaml.block_type == BlockType.LOGIN:
         login_block_parameters = _resolve_block_parameters(block_yaml, parameters)
-        # Apply a default complete_criterion for login blocks when the user hasn't provided one.
-        # This guides the LLM to check for actual logged-in indicators (username in header,
-        # account menu, logout button) rather than relying on page location, which fails on sites
-        # that redirect to the homepage after successful login.
+        # A login block with no navigation goal falls back to the default prompt, whose closing line
+        # ("If login is completed, you're successful") is the only stop condition such a block gets.
+        # complete_criterion stays as authored; an authored goal must carry its own stop condition.
         login_navigation_goal = block_yaml.navigation_goal
         if not login_navigation_goal or not login_navigation_goal.strip():
             login_navigation_goal = DEFAULT_LOGIN_PROMPT
