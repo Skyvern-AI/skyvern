@@ -201,7 +201,12 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -313,6 +318,7 @@ from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
+    FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
     BlockResult,
     BlockStatus,
@@ -13758,6 +13764,7 @@ class FileParserBlock(Block):
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
     worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
@@ -14138,32 +14145,52 @@ class FileParserBlock(Block):
     ) -> str:
         """Parse PDF file and return extracted text.
 
-        Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails. If text extraction
-        yields empty/minimal content (e.g. scanned or image-based PDFs),
-        renders pages as images and sends them to a vision LLM for OCR.
+        Uses the shared PDF parsing utility that tries pypdf first, then falls back to
+        pdfplumber if pypdf fails. When the text layer cannot be trusted — it is empty
+        (scanned or image-based PDF), its glyphs are scrambled by a broken embedded font,
+        or the block asks for OCR outright — renders pages as images and sends them to a
+        vision LLM for OCR instead.
         """
-        try:
-            extracted_text = await _run_blocking_parse_step(
-                "PDF text extraction",
-                self.file_url,
-                extract_pdf_file,
-                file_path,
-                file_identifier=self.file_url,
-            )
-        except PDFParsingError as e:
-            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+        extracted_text = ""
+        ocr_reason: str | None = None
+        if self.force_ocr:
+            ocr_reason = "the block is configured to always OCR PDFs"
+        else:
+            try:
+                extracted_text = await _run_blocking_parse_step(
+                    "PDF text extraction",
+                    self.file_url,
+                    extract_pdf_file,
+                    file_path,
+                    file_identifier=self.file_url,
+                )
+            except PDFParsingError as e:
+                raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
-        # If text extraction returned meaningful content, use it directly
-        if extracted_text.strip():
-            return extracted_text
+            if not extracted_text.strip():
+                ocr_reason = "PDF text extraction returned empty content"
+            else:
+                # A scrambled text layer is worse than an empty one: it reaches the extraction
+                # LLM as plausible text, which then invents values for the characters it cannot
+                # read. Only OCR recovers the real ones. The scan is per-character over a text
+                # layer that can reach a million characters, so it stays off the event loop.
+                ocr_reason = await _run_blocking_parse_step(
+                    "PDF text layer check",
+                    self.file_url,
+                    scrambled_text_layer_reason,
+                    extracted_text,
+                )
 
-        # Scanned / image-based PDF — render pages as images and OCR each page in
-        # its own vision-LLM call. A single call covering every page collapses a
-        # multi-page document down to the first page or two.
+            if ocr_reason is None:
+                return extracted_text
+
+        # Render pages as images and OCR each page in its own vision-LLM call. A single
+        # call covering every page collapses a multi-page document down to the first page
+        # or two.
         LOG.info(
-            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            "Falling back to vision LLM OCR for the PDF text layer",
             file_url=self.file_url,
+            ocr_reason=ocr_reason,
         )
         try:
             page_images = await _run_blocking_parse_step(
