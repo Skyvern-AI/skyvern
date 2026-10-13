@@ -532,7 +532,12 @@ class _DownloadProgressSampler:
 
     async def aclose(self) -> None:
         if self._task is not None:
-            self._task.cancel()
+            # A task cancelled before its first step is dropped un-awaited by the OTel asyncio instrumentor, which logs a
+            # "never awaited" RuntimeWarning at error level; yield once so it starts first.
+            try:
+                await asyncio.sleep(0)
+            finally:
+                self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
 
 

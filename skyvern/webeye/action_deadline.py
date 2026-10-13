@@ -74,10 +74,22 @@ async def cancellable_driver_call(call: Callable[[], Awaitable[T]]) -> T:
     call_task = asyncio.create_task(issue(), context=context)
     call_task.add_done_callback(_retrieve_outcome)
     try:
-        return await call_task
+        # Not ``await call_task``: that hands the caller's cancellation to a task that may not have taken its first
+        # step, and the OTel asyncio instrumentor drops such a task's coroutine, which CPython reports as a
+        # "never awaited" RuntimeWarning at error level.
+        await asyncio.wait({call_task})
+        return call_task.result()
     except asyncio.CancelledError:
-        # A cancellation that arrives after the call has answered never reached the task.
-        call_task.cancel()
+        # asyncio.wait does not forward cancellation. Cancel the call once it has had a chance to start, and again
+        # for every later cancellation (a deadline re-arm), as awaiting the task directly did; return only once it ends.
+        while True:
+            try:
+                await asyncio.sleep(0)
+                call_task.cancel()
+                await asyncio.wait({call_task})
+                break
+            except asyncio.CancelledError:
+                continue
         raise
     finally:
         # The task ran in a copy of this context, so a write inside the call would otherwise be lost.
