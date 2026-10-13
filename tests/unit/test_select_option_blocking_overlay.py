@@ -47,6 +47,7 @@ class TestSelectOptionFirst:
         blocker_is_surrogate: bool = True,
         select_visible: bool = True,
         preselected: str | None = None,
+        normal_result: object | None = None,
     ) -> tuple:
         from skyvern.webeye.actions import handler as handler_module
         from skyvern.webeye.actions.actions import SelectOption, SelectOptionAction
@@ -62,6 +63,8 @@ class TestSelectOptionFirst:
 
         if normal_raises:
             normal_select = AsyncMock(side_effect=Exception("LLM provider error"))
+        elif normal_result is not None:
+            normal_select = AsyncMock(return_value=[normal_result])
         else:
             normal_result = [ActionSuccess()] if normal_success else [ActionFailure(Exception("no option"))]
             normal_select = AsyncMock(return_value=normal_result)
@@ -135,6 +138,30 @@ class TestSelectOptionFirst:
         assert results == ["CHECKBOX_ROUTED"]
 
     @pytest.mark.asyncio
+    async def test_canceled_normal_select_does_not_fall_back_to_styled_widget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions import handler as handler_module
+
+        terminal_failure, _ = handler_module._terminal_custom_select_failure(
+            target_value="California",
+            matched_label=None,
+            reason=handler_module.RUN_STOPPED_BEFORE_SELECTING_REASON,
+        )
+        blocker = MagicMock()
+        results, _, select_element, handle_checkbox = await self._run(
+            monkeypatch,
+            normal_success=False,
+            normal_result=terminal_failure,
+            blocking_return=(blocker, True),
+            blocker_is_checkbox=True,
+        )
+
+        assert results == [terminal_failure]
+        select_element.find_blocking_element.assert_not_awaited()
+        handle_checkbox.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_select_option_fails_with_modal_blocker_no_hijack(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # select_option failed AND the overlapping element is an unrelated modal (not a dropdown
         # surrogate): do NOT retarget onto it — return the honest native-select failure.
@@ -166,6 +193,35 @@ class TestSelectOptionFirst:
         normal_select.assert_awaited_once()
         handle_checkbox.assert_awaited_once()
         assert results == ["CHECKBOX_ROUTED"]
+
+    @pytest.mark.asyncio
+    async def test_canceled_normal_select_exception_does_not_fall_back_to_styled_widget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.schemas.tasks import TaskStatus
+        from skyvern.services.run_cancellation import RunCancellation
+        from skyvern.webeye.actions import handler as handler_module
+
+        cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
+        monkeypatch.setattr(handler_module, "read_run_cancellation", AsyncMock(return_value=cancellation))
+        terminal_failure, _ = handler_module._terminal_custom_select_failure(
+            target_value="California",
+            matched_label=None,
+            reason=handler_module.RUN_STOPPED_BEFORE_SELECTING_REASON,
+        )
+        blocker = MagicMock()
+        results, normal_select, select_element, handle_checkbox = await self._run(
+            monkeypatch,
+            normal_success=False,
+            normal_raises=True,
+            blocking_return=(blocker, True),
+            blocker_is_checkbox=True,
+        )
+
+        assert results == [terminal_failure]
+        normal_select.assert_awaited_once()
+        select_element.find_blocking_element.assert_not_awaited()
+        handle_checkbox.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_hidden_backing_select_click_navigates_widget_even_without_role(
@@ -278,11 +334,14 @@ class TestSelectCommitsUnderOverlay:
         locator.click.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_deterministic_select_commits_when_preclick_intercepted(self) -> None:
+    async def test_deterministic_select_commits_when_preclick_intercepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from skyvern.webeye.actions import handler as handler_module
         from skyvern.webeye.actions.actions import SelectOption, SelectOptionAction
         from skyvern.webeye.actions.responses import ActionSuccess
 
+        monkeypatch.setattr(handler_module, "read_run_cancellation", AsyncMock(return_value=None))
         locator = MagicMock()
         locator.click = AsyncMock(side_effect=Exception("click intercepted by overlay"))
         locator.select_option = AsyncMock(return_value=None)  # DOM select succeeds regardless
@@ -296,6 +355,8 @@ class TestSelectCommitsUnderOverlay:
             action=action,
             skyvern_element=skyvern_element,
             locator=locator,
+            task=MagicMock(),
+            target_value="California",
             matched_label="California",
             matched_value="CA",
             matched_index=0,
