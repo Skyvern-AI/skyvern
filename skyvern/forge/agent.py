@@ -32,6 +32,7 @@ from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
     BROWSER_PAGE_CLOSE_TIMEOUT,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
+    DEFAULT_MAX_TOKENS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -121,6 +122,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMResponseMissingActionsError,
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
+from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
     YutoriNavigatorLLMCaller,
@@ -242,7 +244,6 @@ from skyvern.services.webhook_delivery import (
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
-    PROMPT_HARD_CEILING_TOKENS,
     MaxStepsReasonResponse,
     enforce_prompt_ceiling_tracked,
     load_prompt_with_elements,
@@ -683,10 +684,7 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
 
 
 class _PromptCeilingExceeded(Exception):
-    """Internal signal: the cached split-template prompt blew past the
-    PROMPT_HARD_CEILING_TOKENS budget. Raised inside the cached extract-action
-    branch to trigger the fall-through to load_prompt_with_elements, which
-    applies the per-template fallback drop chain."""
+    """Internal signal that the cached split prompt needs the full-render fallback."""
 
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
@@ -8111,15 +8109,24 @@ class ForgeAgent:
         # Check if prompt caching is enabled for extract-action
         use_caching = False
         prompt_caching_settings = await self._get_prompt_caching_settings(context)
-        effective_llm_key = task.llm_key
-        if not effective_llm_key:
-            handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=get_org_aware_primary_llm_api_handler()
-            )
-            effective_llm_key = getattr(handler_for_key, "llm_key", None)
-        cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
-            EXTRACT_ACTION_TEMPLATE
+        handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            task.llm_key, default=get_org_aware_primary_llm_api_handler()
         )
+        # A bound LLMCaller.call exposes no llm_key and never adds the Anthropic marker, so it stays off.
+        handler_llm_key = getattr(handler_for_key, "llm_key", None)
+        effective_llm_key = task.llm_key or handler_llm_key
+        uses_anthropic_handler = (
+            isinstance(handler_llm_key, str)
+            and LLMConfigRegistry.is_registered(handler_llm_key)
+            and uses_only_anthropic_models(LLMConfigRegistry.get_config(handler_llm_key))
+        )
+        cache_enabled = (
+            prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME)
+            or prompt_caching_settings.get(EXTRACT_ACTION_TEMPLATE)
+            or (template == EXTRACT_ACTION_TEMPLATE and uses_anthropic_handler)
+        )
+        if cache_enabled and uses_anthropic_handler and await self._is_anthropic_prompt_caching_disabled(context):
+            cache_enabled = False
         LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
@@ -8294,15 +8301,13 @@ class ForgeAgent:
                     "template_name": f"{template}-cached",
                 }
 
-                if combined_token_count > PROMPT_HARD_CEILING_TOKENS:
+                if combined_token_count > DEFAULT_MAX_TOKENS:
                     # The cached split-template path renders static+dynamic separately,
                     # so the load_prompt_with_elements ceiling logic never sees this
                     # prompt. Raise the dedicated sentinel to trigger the except below,
                     # which falls through to the full load_prompt_with_elements render
                     # where the fallback drop chain can apply.
-                    raise _PromptCeilingExceeded(
-                        f"cached extract-action prompt exceeded {PROMPT_HARD_CEILING_TOKENS} tokens"
-                    )
+                    raise _PromptCeilingExceeded(f"cached extract-action prompt exceeded {DEFAULT_MAX_TOKENS} tokens")
 
                 LOG.info(
                     "Using cached prompt",
@@ -8314,6 +8319,11 @@ class ForgeAgent:
                 )
                 # Map template to prompt_name for logging/caching guards
                 prompt_name = EXTRACT_ACTION_PROMPT_NAME if template == EXTRACT_ACTION_TEMPLATE else template
+                _prompt_build_span = otel_trace.get_current_span()
+                _prompt_build_span.set_attribute("prompt_name", prompt_name)
+                _prompt_build_span.set_attribute("prompt_tokens", combined_token_count)
+                _prompt_build_span.set_attribute("use_caching", bool(use_caching))
+                _prompt_build_span.set_attribute("stable_prefix_ordering", stable_prefix_ordering)
                 if recent_dialog_messages_str is not None:
                     context.clear_recent_dialog_messages()
                 return PromptBuildResult(
@@ -8422,6 +8432,26 @@ class ForgeAgent:
             )
 
         return context.prompt_caching_settings
+
+    async def _is_anthropic_prompt_caching_disabled(self, context: SkyvernContext) -> bool:
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        if not distinct_id or not organization_id:
+            return False
+        try:
+            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_ANTHROPIC_PROMPT_CACHING",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate Anthropic prompt caching kill switch; leaving caching on",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return False
 
     async def _is_multi_tab_control_enabled(self, context: SkyvernContext) -> bool:
         distinct_id = context.run_id or context.workflow_run_id or context.task_id
