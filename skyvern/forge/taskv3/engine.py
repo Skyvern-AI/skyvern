@@ -651,7 +651,7 @@ async def run_task_v3_agent_loop(
             step=step,
         )
     )
-    answer_hold = apply_answer_basis_audit(tools, answer_audit)
+    apply_answer_basis_audit(tools, answer_audit)
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -793,7 +793,6 @@ async def run_task_v3_agent_loop(
         age_default_reason=age_default_reason,
         application_defaults_rendered=bool(application_defaults_text),
         application_defaults_reason=application_defaults_reason,
-        answer_hold_at_end=answer_hold() if answer_hold is not None else None,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         unlisted_reask=outcome.unlisted_reask,
