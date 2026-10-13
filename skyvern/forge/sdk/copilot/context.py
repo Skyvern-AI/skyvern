@@ -248,6 +248,7 @@ class NarrativeBudgetExpiry(TypedDict):
     reportProduced: bool | None
     stagedDraftId: str | None
     drainFingerprint: str | None
+    leftRunIds: NotRequired[list[str]]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.

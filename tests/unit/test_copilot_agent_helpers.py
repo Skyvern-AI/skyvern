@@ -7630,6 +7630,7 @@ class TestCopilotConfig:
                             {"label": "download_invoice", "status": "running", "failure_reason": None},
                         ],
                         "earlier_blocks_not_shown": 0,
+                        "left_running": False,
                     }
                 ],
                 id="hard_backstop",
