@@ -1259,6 +1259,7 @@ function convertToNode(
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           worksheet: block.worksheet ?? "",
+          forceOcr: block.force_ocr ?? false,
           model: block.model,
         },
       };
@@ -3741,6 +3742,7 @@ function getWorkflowBlock(
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         worksheet: node.data.worksheet || null,
+        force_ocr: node.data.forceOcr ?? false,
       };
     }
     case "textPrompt": {
@@ -5332,6 +5334,7 @@ function convertBlocksToBlockYAML(
           file_type: block.file_type,
           json_schema: block.json_schema,
           worksheet: block.worksheet,
+          force_ocr: block.force_ocr,
         };
         return blockYaml;
       }
