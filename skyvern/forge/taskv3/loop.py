@@ -654,10 +654,6 @@ class ToolSpec:
     address_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, bool]]] | None = None
     # The selector, name and kind of the field a type call is about to enter, read before it acts; set on type alone.
     answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str]]] | None = None
-    # The question and caption observe read for a radio or checkbox ref, and whether a picked one is still checked;
-    # set on click alone.
-    choice_probe: Callable[[dict[str, Any]], tuple[str, str] | None] | None = None
-    choice_checked: Callable[[str], Awaitable[bool | None]] | None = None
 
     @property
     def touches_page(self) -> bool:
