@@ -43580,6 +43580,25 @@ async def test_type_does_not_press_enter_on_a_value_the_field_did_not_keep() -> 
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_a_phone_field_that_reads_a_national_number_as_international_asks_for_the_country_code() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="tel" type="tel"></form>'
+    html += "<script>document.getElementById('tel').addEventListener('input', (e) => {"
+    html += (
+        " const d = e.target.value.replace(/\\D/g, ''); e.target.value = '+' + d.slice(0, 2) + ' ' + d.slice(2); });"
+    )
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#tel", "text": "5550001234", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+        fixed = await _tool(tools, "type").handler({"selector": "#tel", "text": "+1 5550001234"})
+    assert r.ok_class == "held_international" and r.entry_unconfirmed, r.content
+    assert "Enter was not pressed" in r.content and not submitted
+    assert fixed.ok_class == "held_as" and not fixed.entry_unconfirmed, fixed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_password_the_page_changed_is_never_a_reformat_and_is_not_submitted() -> None:
     html = '<form onsubmit="window.__submitted = true; return false"><input id="pw" type="password"></form>'
     html += "<script>document.getElementById('pw').addEventListener('input', (e) => {"
