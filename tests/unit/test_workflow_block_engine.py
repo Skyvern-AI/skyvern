@@ -1018,6 +1018,7 @@ async def test_script_create_site_stamps_the_script_run_marker(scoped_context: S
             AsyncMock()
         )
         mock_app.AGENT_FUNCTION.is_recipe_step_attempt = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
         mock_app.DATABASE.tasks.update_step = AsyncMock(return_value=SimpleNamespace(step_id="stp_script_marker"))
 
         block_id, task_id, step_id = await script_service._create_workflow_block_run_and_task(
