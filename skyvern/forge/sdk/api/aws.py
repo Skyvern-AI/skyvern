@@ -49,6 +49,8 @@ def _recording_content_type(uri_or_path: str) -> str | None:
 _S3_OPERATION_RETRIES = 2
 # get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
 S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
+# get_object on an object in an archive tier (GLACIER, DEEP_ARCHIVE) that has not been restored.
+S3_ARCHIVED_OBJECT_ERROR_CODES = frozenset({"InvalidObjectState"})
 # Expired AWS credentials surface under either exact code depending on the service/path.
 _EXPIRED_TOKEN_ERROR_CODES = frozenset({"ExpiredTokenException", "ExpiredToken"})
 # Aborting an upload id that no longer exists (e.g. an ambiguous Complete actually landed) returns this; it
@@ -468,6 +470,13 @@ class AsyncAWSClient:
         """Check if an exception is a missing-object (terminal not-found) error."""
         return (
             isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_ERROR_CODES
+        )
+
+    def _is_archived_object_error(self, error: Exception) -> bool:
+        """Check if an exception means the object exists but sits in an archive tier and cannot be read."""
+        return (
+            isinstance(error, ClientError)
+            and error.response.get("Error", {}).get("Code") in S3_ARCHIVED_OBJECT_ERROR_CODES
         )
 
     def _error_code(self, error: Exception) -> str:
@@ -1337,6 +1346,11 @@ class AsyncAWSClient:
             if self._is_not_found_error(e):
                 if log_exception:
                     LOG.info("S3 object not found", uri=uri)
+                return None
+            # An archived object stays unreadable until restored, so a traceback per request adds nothing.
+            if self._is_archived_object_error(e):
+                if log_exception:
+                    LOG.warning("S3 object is archived and not restored", uri=uri)
                 return None
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)

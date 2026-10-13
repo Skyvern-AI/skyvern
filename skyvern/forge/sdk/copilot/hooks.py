@@ -120,6 +120,7 @@ class CopilotRunHooks(RunHooksBase):
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
         self._ctx.model_call_in_flight = False
         self._ctx.last_model_response = response
+        self._ctx.proposal_adoptions_seen_by_model = self._ctx.proposal_adoptions
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         try:

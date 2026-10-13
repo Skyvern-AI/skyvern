@@ -252,7 +252,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
     hydrate_prior_carried_trajectory,
-    read_page_state,
+    read_page_state_on_page,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _candidate_proposal_data,
@@ -2136,6 +2136,7 @@ def _make_agent_result(
         result.resolved_model = ctx.resolved_model
         result.proposal_owner_turn_id = ctx.proposal_owner_turn_id
         result.proposal_revision = ctx.proposal_revision
+        result.proposal_adopted = ctx.proposal_adopted
         result.proposal_workflow_run_id = ctx.proposal_workflow_run_id
         result.clear_persisted_completion_contract = ctx.clear_persisted_completion_contract
         result.work_plan = ctx.work_plan if ctx.work_plan is None else list(ctx.work_plan)
@@ -3801,6 +3802,7 @@ async def _translate_to_agent_result(
                 LOG.info(
                     "copilot_inline_replace_candidate_publication_conflict",
                     workflow_permanent_id=ctx.workflow_permanent_id,
+                    reason=publication_conflict.reason,
                     error=str(publication_conflict),
                 )
                 user_response = _with_inline_reject_note(
@@ -4230,7 +4232,7 @@ async def _run_agent_loop_with_surface(
             dispatch_allowlist_enforced(ctx.tool_surface_identity)
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
-        page_state_reader=read_page_state,
+        page_state_reader=read_page_state_on_page,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
