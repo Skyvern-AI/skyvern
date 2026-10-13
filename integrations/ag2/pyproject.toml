@@ -1,0 +1,28 @@
+[project]
+name = "skyvern-ag2"
+version = "0.1.0"
+description = "AG2 multi-agent integration for Skyvern browser automation"
+authors = [{ name = "Skyvern", email = "info@skyvern.com" }]
+requires-python = ">=3.11,<3.14"
+readme = "README.md"
+
+dependencies = [
+    "skyvern>=0.2.0",
+    "ag2[openai]>=0.11.4,<1.0",
+]
+
+[tool.uv.sources]
+skyvern = { path = "../.." }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["twine>=6.1.0,<7"]
+
+[tool.hatch.build.targets.sdist]
+include = ["skyvern_ag2"]
+
+[tool.hatch.build.targets.wheel]
+include = ["skyvern_ag2"]
