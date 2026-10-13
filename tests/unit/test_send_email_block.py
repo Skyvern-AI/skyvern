@@ -73,6 +73,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidWorkflowDefinition,
     NoValidEmailRecipient,
 )
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HumanInteractionBlock,
@@ -104,6 +105,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import script_service
 from skyvern.services.email import gmail as gmail_service
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _output_parameter(label: str) -> OutputParameter:
@@ -922,8 +924,8 @@ def _paused_run_database() -> MagicMock:
     database.observer.update_workflow_run_block = AsyncMock()
     database.workflow_runs.update_workflow_run = AsyncMock()
     database.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
-    # Any status other than paused ends the block's wait loop on its first check.
-    database.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(status=WorkflowRunStatus.completed))
+    # An approved run ends the block's wait loop on its first check.
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(status=WorkflowRunStatus.running))
     return database
 
 
@@ -939,6 +941,126 @@ async def _human_interaction_message(
         result = await block.execute("wr_1", "wrb_1", organization_id="o_1", browser_session_id=browser_session_id)
     assert result.success is True, result.failure_reason
     return transport.call_args.kwargs["message"]
+
+
+def _waiting_run_database(statuses: list[WorkflowRunStatus], sessions: list[SimpleNamespace]) -> MagicMock:
+    database = _paused_run_database()
+    database.workflow_runs.get_workflow_run = AsyncMock(
+        side_effect=[MagicMock(status=status) for status in statuses] + [MagicMock(status=statuses[-1])] * 1000
+    )
+    database.browser_sessions.get_persistent_browser_session = AsyncMock(side_effect=sessions + [sessions[-1]] * 1000)
+    return database
+
+
+async def _wait_for_human_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+    database: MagicMock,
+    timeout_seconds: int,
+    browser_session_id: str | None = "pbs_1",
+) -> tuple[BlockResult, list[float]]:
+    sleeps: list[float] = []
+    clock = SimpleNamespace(now=0.0)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(
+        block_module,
+        "asyncio",
+        ScopedAsyncio(sleep=fake_sleep, get_event_loop=lambda: SimpleNamespace(time=lambda: clock.now)),
+    )
+    monkeypatch.setattr(
+        HumanInteractionBlock, "get_workflow_run_context", staticmethod(lambda _run_id: _workflow_run_context({}))
+    )
+    monkeypatch.setattr(app, "DATABASE", database)
+    block = _human_interaction_block(timeout_seconds=timeout_seconds)
+    with patch("skyvern.forge.sdk.api.email._send", AsyncMock(return_value=True)):
+        result = await block.execute("wr_1", "wrb_1", organization_id="o_1", browser_session_id=browser_session_id)
+    return result, sleeps
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_wait_fails_when_the_browser_session_is_closed(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    database = _waiting_run_database(
+        [WorkflowRunStatus.paused],
+        [SimpleNamespace(completed_at=None), SimpleNamespace(completed_at=datetime.now(UTC))],
+    )
+
+    result, sleeps = await _wait_for_human_interaction(monkeypatch, database, timeout_seconds=600)
+
+    assert result.status == BlockStatus.failed
+    assert result.success is False
+    assert result.failure_reason == "Browser session was closed while waiting for human interaction"
+    assert "no human interaction" not in result.failure_reason
+    assert result.output_parameter_value == {"success": False, "reason": result.failure_reason}
+    assert sleeps == [5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_status", "block_status", "success"),
+    [
+        (WorkflowRunStatus.running, BlockStatus.completed, True),
+        (WorkflowRunStatus.canceled, BlockStatus.canceled, False),
+        (WorkflowRunStatus.terminated, BlockStatus.terminated, False),
+        (WorkflowRunStatus.failed, BlockStatus.failed, False),
+        (WorkflowRunStatus.completed, BlockStatus.failed, False),
+    ],
+)
+async def test_human_interaction_wait_maps_the_run_leaving_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    offline_address_validation: None,
+    new_status: WorkflowRunStatus,
+    block_status: BlockStatus,
+    success: bool,
+) -> None:
+    open_session, closed_session = SimpleNamespace(completed_at=None), SimpleNamespace(completed_at=datetime.now(UTC))
+    # Cancel closes the session too, so the status change must win over the closed session in the same poll.
+    database = _waiting_run_database(
+        [WorkflowRunStatus.paused, WorkflowRunStatus.paused, new_status], [open_session, closed_session]
+    )
+
+    result, _ = await _wait_for_human_interaction(monkeypatch, database, timeout_seconds=600)
+
+    assert (result.status, result.success) == (block_status, success)
+    assert result.output_parameter_value == {"success": success, "reason": f"status_changed:{new_status}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("new_status", "block_status"),
+    [(WorkflowRunStatus.running, BlockStatus.completed), (WorkflowRunStatus.canceled, BlockStatus.canceled)],
+)
+async def test_human_interaction_wait_honors_a_status_change_seen_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    offline_address_validation: None,
+    new_status: WorkflowRunStatus,
+    block_status: BlockStatus,
+) -> None:
+    database = _waiting_run_database(
+        [WorkflowRunStatus.paused, WorkflowRunStatus.paused, new_status], [SimpleNamespace(completed_at=None)]
+    )
+
+    result, sleeps = await _wait_for_human_interaction(monkeypatch, database, timeout_seconds=5)
+
+    assert sleeps == [5]
+    assert result.status == block_status
+
+
+@pytest.mark.asyncio
+async def test_human_interaction_wait_without_a_browser_session_still_times_out(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    database = _waiting_run_database([WorkflowRunStatus.paused], [SimpleNamespace(completed_at=datetime.now(UTC))])
+
+    result, _ = await _wait_for_human_interaction(monkeypatch, database, timeout_seconds=12, browser_session_id=None)
+
+    assert result.status == BlockStatus.timed_out
+    assert result.failure_reason == "Timeout elapsed with no human interaction"
+    database.browser_sessions.get_persistent_browser_session.assert_not_awaited()
 
 
 def test_body_format_round_trips_from_yaml_for_both_blocks() -> None:
