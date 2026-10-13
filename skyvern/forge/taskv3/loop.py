@@ -192,9 +192,11 @@ ToolOkClass = Literal[
     "document_ready",
     "committed_not_loaded",
     # A field-entry read-back (field_commit): the field shows the value in its own format, holds something other
-    # than what was entered, or could not be read at all.
+    # than what was entered (`held_international`: a national phone number it put a "+" in front of), or could not be
+    # read at all.
     "held_as",
     "held_differs",
+    "held_international",
     "unverified",
 ]
 

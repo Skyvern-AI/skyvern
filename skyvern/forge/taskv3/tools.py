@@ -18450,7 +18450,7 @@ def build_browser_tools(
             return entry
         if password_anchor is not None:
             input_dispatch.note_secret_fill(page, password_anchor)
-        if press_enter and entry.ok_class == "held_differs":
+        if press_enter and entry.ok_class in ("held_differs", "held_international"):
             # Enter would submit a value the field shows is not the one typed, before the batch rule could hold it back;
             # an unreadable field is no such evidence, so Enter still goes there, as before.
             entry.content += " Enter was not pressed: check the field, then press Enter once it holds the value."
