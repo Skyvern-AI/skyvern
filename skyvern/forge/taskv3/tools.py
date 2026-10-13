@@ -8230,6 +8230,9 @@ def _disambiguate_digest_bodies(
 
 
 OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
+# Points at a read, never at a position: the text beside an unbound group is often a hint, an error or another
+# question.
+_NO_QUESTION_MARKER = "(no question found; read the question in get_html before answering)"
 # Display width of each masked-then-capped field of the observe digest. Every render site reads its
 # width here, so the retain margin below is always sized for the widest window.
 OBSERVE_DISPLAY_WIDTHS = {
@@ -8826,11 +8829,107 @@ async (__tv3TextArgs) => {
     }
     return _normText(out);
   };
+  const _TITLE_SEL = 'h1,h2,h3,h4,h5,h6,[role~=heading],legend';
+  const _NOTE_SEL = '[role~=alert],[role~=status],[aria-live]:not([aria-live=off])';
+  const _END = {};
+  const _NOTE = {};
+  // Every visible character, no depth cap: a capped read of a deep question looks empty and the walk moves on.
+  const _allText = (el) => {
+    if (_unseen(el)) return '';
+    let out = '';
+    for (let c = _firstChildOf.call(el); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1) out += ' ' + _allText(c);
+    }
+    return _normText(out);
+  };
+  const _noteIds = (g, el) => {
+    const ids = new Set();
+    const add = (n) => { for (const a of ['aria-describedby', 'aria-errormessage']) for (const id of (n.getAttribute(a) || '').split(/\s+/)) if (id) ids.add(id); };
+    add(el);
+    if (g.box) { add(g.box); for (const c of _qsa.call(g.box, _CHOICE_SEL)) add(c); }
+    return ids;
+  };
+
+  // Built once per call: under each composed ancestor, every control observe enumerated (those it counts as
+  // omitted included).
+  let _listedUnder = null;
+  const _listedIn = (n) => {
+    if (_listedUnder) return _listedUnder.get(n) || [];
+    const m = new Map();
+    for (const e of els) {
+      for (let p = _composedParent(e.el); p; p = _composedParent(p)) {
+        const l = m.get(p);
+        if (l) l.push(e.el); else m.set(p, [e.el]);
+      }
+    }
+    // Published only once whole, so a throw mid-build leaves it null for the next call.
+    return (_listedUnder = m).get(n) || [];
+  };
+  const _holdsAnotherControl = (card, el, g, kin) =>
+    _listedIn(card).some((c) => !_matches.call(c, kin) || !(_inGroup(c, el, g, kin) || _proxied(c, kin)));
+  // One block of a card: null when absent or empty, _NOTE for a live region (or a block that is only one), _END
+  // for a heading, else its text.
+  const _cardBlock = (c) => {
+    const kind = _nodeTypeOf.call(c);
+    if (kind === 3) { const t = _normText(_contentOf.call(c)); return t.length < 2 ? null : t; }
+    if (kind !== 1) return null;
+    const t = _allText(c);
+    if (t.length < 2) return null;
+    const note = _matches.call(c, _NOTE_SEL) ? c : _qs.call(c, _NOTE_SEL);
+    if (note && (note === c || _allText(note) === t)) return _NOTE;
+    return _matches.call(c, _TITLE_SEL) || _qs.call(c, _TITLE_SEL) ? _END : t;
+  };
+  const _fieldOrChoice = (c) => { const k = _controlsOf(c); return k.nonChoice || k.choices.length > 0; };
+  // A label placed before the option it names is that option's caption, not a question.
+  const _beforeOwnOption = (c, el, g, kin) => {
+    if (_nodeTypeOf.call(c) !== 1 || !_matches.call(c, 'label')) return false;
+    try { const x = c.control; return !!x && _matches.call(x, kin) && _inGroup(x, el, g, kin); } catch (e) { return false; }
+  };
+  // Exactly one candidate block across the whole card, read in order from the options box up to the largest
+  // ancestor holding nothing but this group. At the box, content after the first option is its captions, and a
+  // level with content but no candidate is never climbed past.
+  const _cardQuestion = (el, g) => {
+    const kin = g.radio ? _RADIO_SEL : _CHECK_SEL;
+    if (_noteIds(g, el).size) return '';
+    let found = '';
+    let below = false;
+    for (let card = g.box, inner = null; card; inner = card, card = _parentOf.call(card)) {
+      if (_openShadowOf(card)) break;
+      if (_holdsAnotherControl(card, el, g, kin)) {
+        // The level that ends the card: text beside its own link or button, back to the previous answered field, may be
+        // a question row the control split off the card.
+        for (let c = inner && _prevOf.call(inner); c && !(_nodeTypeOf.call(c) === 1 && _fieldOrChoice(c)); c = _prevOf.call(c)) {
+          if (_nodeTypeOf.call(c) === 1 && _listedIn(c).length && _cardBlock(c) !== null) return '';
+        }
+        break;
+      }
+      let after = false;
+      let here = false;
+      for (let c = _firstChildOf.call(card); c; c = _nextOf.call(c)) {
+        if (!after && (inner ? c === inner : _nodeTypeOf.call(c) === 1 && _hasChoice(c))) { after = true; continue; }
+        if (after && !inner) break;
+        if (!inner && _beforeOwnOption(c, el, g, kin)) continue;
+        const b = _cardBlock(c);
+        if (b === null) continue;
+        if (b === _END || (b !== _NOTE && (after || found || below))) return '';
+        here = true;
+        if (b !== _NOTE) found = b;
+      }
+      below = below || here;
+    }
+    return found && !_captionsOnly(g.box, found) ? found : '';
+  };
   const _choiceQuestion = (el, g) => {
     const declared = _declaredGroupName(el, g);
     if (declared || !g.box || g.multi) return declared;
     const t = _boxQuestion(g.box, g);
-    if (!t || _matches.call(g.box, 'tr,[role=row]')) return t;
+    if (_matches.call(g.box, 'tr,[role=row]')) return t;
+    if (!t) {
+      if (g.entry) g.entry.nearby = true;
+      return _cardQuestion(el, g);
+    }
     return _namesOnlyThisGroup(g.box, el, g) && !_captionsOnly(g.box, t) ? t : '';
   };
   const _isAutocomplete = """
@@ -10159,9 +10258,10 @@ async (__tv3TextArgs) => {
       if (el.type === 'radio' || role === 'radio') {
         // A fresh object per element on purpose: a control with no group entry is its own group.
         const entry = (g && g.entry) || {};
-        // Found means the page gave a question, printed or not: the page budget or the same-text dedupe
-        // may hold it back. A description is a hint or an error, never the group's question.
-        if (ownGroup) entry.found = true;
+        // Found means the page gave a question, even one the budget or the same-text dedupe held back; a question read
+        // from the card counts only once shown, so a withheld one keeps the marker.
+        const withheld = !rec.group && groupTotal + gt.length > _GROUP_TEXT_TOTAL_CAP;
+        if (ownGroup && !(withheld && entry.nearby)) entry.found = true;
         else if (!entry.found) {
           if (!entry.missing) entry.missing = ++radioGroupsMissing;
           rec.group_missing = entry.missing;
@@ -12118,6 +12218,8 @@ async def _observable_child_frames(page: Any) -> tuple[list[Any], int, int]:
 # "the main frame" and must not decay into it: the main frame is a real document a selector will happily
 # resolve in.
 _UNKNOWN_REALM = object()
+# Set by the click echo for one call; the click path records the kind of choice control it found under the target.
+_CLICK_CHOICE_KIND: ContextVar[list[str] | None] = ContextVar("taskv3_click_choice_kind", default=None)
 
 
 class _RealmChangedDuringRead(Exception):
@@ -13282,7 +13384,7 @@ def build_browser_tools(
                 extra += f" group={_field(e['group'], OBSERVE_DISPLAY_WIDTHS['group'])}"
             elif e.get("group_missing") and missing_key not in missing_groups_shown:
                 missing_groups_shown.add(missing_key)
-                extra += " group=(no question found)"
+                extra += f" group={_NO_QUESTION_MARKER}"
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page
@@ -14997,6 +15099,8 @@ def build_browser_tools(
             await asyncio.sleep(0.1)
             # Enabling can re-render or move the control, so the label point is measured again after the wait.
             pre_click_arg = await _probe_arg(page, selector)
+        if isinstance(skin_probe, dict) and "radio" in skin_probe and (kinds := _CLICK_CHOICE_KIND.get()) is not None:
+            kinds.append("radio" if skin_probe["radio"] else "checkbox")
         if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
             # A drawn input under its own label is already force-clicked below, and a frame's label point is
             # frame-relative, so neither takes the label route.
@@ -21618,6 +21722,7 @@ def build_browser_tools(
             except Exception:
                 pass
         entry["handle"] = matches[0]
+        entry["reresolved"] = True
         return selector, None
 
     async def _realm_for_typed_selector(page: Any, selector: str) -> tuple[Any, ToolResult | None]:
@@ -21923,6 +22028,36 @@ def build_browser_tools(
         _pick_realms[key] = realm if prior == realm or gone else _UNKNOWN_REALM
         return entry["question"], entry.get("option") or ""
 
+    def _with_pick_echo(handler: ToolHandler) -> ToolHandler:
+        # Names the question observe bound the clicked option to, so a wrong pairing is visible in the result.
+        @functools.wraps(handler)
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            ref = REF_SELECTOR_RE.match(str(args.get("selector") or "")) if args.get("mark") is None else None
+            entry = (_observe_manifest.get(int(ref.group(1))) if ref else None) or {}
+            kinds: list[str] = []
+            token = _CLICK_CHOICE_KIND.set(kinds)
+            try:
+                result = await handler(args)
+            finally:
+                _CLICK_CHOICE_KIND.reset(token)
+            kind = entry.get("choice") or (kinds[0] if kinds else "")
+            question = None if entry.get("reresolved") else entry.get("question")
+            # A lone checkbox is mostly a consent that names itself; an unknown question there says nothing.
+            if result.status != "ok" or result.entry_unconfirmed or not kind or (kind == "checkbox" and not question):
+                return result
+            mark = args.get("mark")
+            option = entry.get("option") or _mask_refs(
+                str(_look_manifest.get(mark, {}).get("label") or "") if isinstance(mark, int) else ""
+            )
+            width = OBSERVE_DISPLAY_WIDTHS["group"]
+            what = repr(str(option)[:width]) if option else "this option"
+            line = f"{'picked' if kind == 'radio' else 'clicked'} {what} for " + (
+                f"question {question[:width]!r}" if question else "an unknown question"
+            )
+            return dataclasses.replace(result, content=f"{result.content}\n{line}")
+
+        return wrapped
+
     async def _choice_checked(selector: str) -> bool | None:
         realm = _pick_realms.get(selector, (None, ""))
         if realm is _UNKNOWN_REALM:
@@ -22190,6 +22325,7 @@ def build_browser_tools(
         # Again outermost, for the refusals the mark and ref resolvers raise themselves.
         _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name == "click":
+            _tool_spec.handler = _with_pick_echo(_tool_spec.handler)
             _tool_spec.toggle_probe = _click_targets_toggle
             _tool_spec.address_probe = _click_address
             _tool_spec.choice_probe = _click_choice

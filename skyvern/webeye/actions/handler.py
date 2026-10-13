@@ -4102,6 +4102,8 @@ async def _select_deterministic_normal_option(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
     locator: Locator,
+    task: Task,
+    target_value: str,
     matched_label: str | None,
     matched_value: str | None,
     matched_index: int | None,
@@ -4113,6 +4115,11 @@ async def _select_deterministic_normal_option(
 
     value = matched_value if matched_value is not None else matched_label
     if value is not None and not _select_value_is_ambiguous(skyvern_element.get_options(), value):
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value, matched_label=matched_label
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             await locator.select_option(
                 value=value,
@@ -4130,6 +4137,11 @@ async def _select_deterministic_normal_option(
             )
 
     if not is_success and matched_label is not None and matched_label != value:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value, matched_label=matched_label
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             await locator.select_option(
                 label=matched_label,
@@ -4155,6 +4167,11 @@ async def _select_deterministic_normal_option(
                 locator=locator,
             )
         else:
+            cancellation_failure = await _native_select_cancellation_failure(
+                task=task, target_value=target_value, matched_label=matched_label
+            )
+            if cancellation_failure is not None:
+                return [cancellation_failure]
             try:
                 await locator.select_option(
                     index=matched_index,
@@ -10513,8 +10530,17 @@ async def handle_select_option_action(
                 # normal_select can raise before returning (e.g. an LLM/provider error). Don't lose
                 # the styled-dropdown fallback below — record the failure and keep going.
                 LOG.warning("normal_select raised; falling back to blocking-element detection", exc_info=True)
+                cancellation_failure = await _native_select_cancellation_failure(
+                    task=task,
+                    target_value=_select_option_target_value(action.option) or "",
+                    matched_label=None,
+                )
+                if cancellation_failure is not None:
+                    return [cancellation_failure]
                 normal_select_result = [ActionFailure(exception=e)]
             if _normal_select_successful(normal_select_result):
+                return normal_select_result
+            if normal_select_result and normal_select_result[-1].skip_remaining_actions:
                 return normal_select_result
 
         blocking_element: SkyvernElement | None = None
@@ -13973,6 +13999,22 @@ def _is_terminal_custom_select_failure(action_result: ActionResult | None) -> bo
     )
 
 
+async def _native_select_cancellation_failure(
+    *,
+    task: Task,
+    target_value: str,
+    matched_label: str | None,
+) -> ActionFailure | None:
+    if await read_run_cancellation(task) is None:
+        return None
+    action_failure, _ = _terminal_custom_select_failure(
+        target_value=target_value,
+        matched_label=matched_label,
+        reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+    )
+    return action_failure
+
+
 async def _select_deterministic_custom_option(
     *,
     target_value: str | None,
@@ -15643,14 +15685,26 @@ async def normal_select(
             organization_id=task.organization_id,
         )
         if not resolution.fallback_to_llm and resolution.matched_index is not None:
+            if await read_run_cancellation(task) is not None:
+                action_failure, _ = _terminal_custom_select_failure(
+                    target_value=target_value,
+                    matched_label=resolution.matched_label,
+                    reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+                )
+                return [action_failure]
+
             deterministic_result = await _select_deterministic_normal_option(
                 action=action,
                 skyvern_element=skyvern_element,
                 locator=locator,
+                task=task,
+                target_value=target_value,
                 matched_label=resolution.matched_label,
                 matched_value=resolution.matched_value,
                 matched_index=resolution.matched_index,
             )
+            if deterministic_result and _is_terminal_custom_select_failure(deterministic_result[-1]):
+                return deterministic_result
             if _normal_select_successful(deterministic_result) and not await _normal_select_readback_contradicts(
                 locator=locator,
                 matched_index=resolution.matched_index,
@@ -15686,6 +15740,14 @@ async def normal_select(
     json_response = await get_org_aware_secondary_llm_api_handler(default=app.NORMAL_SELECT_AGENT_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="normal-select"
     )
+    if await read_run_cancellation(task) is not None:
+        action_failure, _ = _terminal_custom_select_failure(
+            target_value=target_value or "",
+            matched_label=None,
+            reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+        )
+        return [action_failure]
+
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
     _log_select_shadow_match(
@@ -15703,6 +15765,11 @@ async def normal_select(
     await _best_effort_focus_click_before_select(locator=locator, action=action)
 
     if not is_success and value is not None:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value or "", matched_label=None
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             # click by value (if it matches)
             await locator.select_option(
@@ -15721,6 +15788,11 @@ async def normal_select(
             )
 
     if not is_success and value is not None:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value or "", matched_label=None
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             # click by label (if it matches)
             await locator.select_option(
@@ -15747,6 +15819,11 @@ async def normal_select(
                 locator=locator,
             )
         else:
+            cancellation_failure = await _native_select_cancellation_failure(
+                task=task, target_value=target_value or "", matched_label=None
+            )
+            if cancellation_failure is not None:
+                return [cancellation_failure]
             try:
                 # This means the supplied index was for the select element, not a reference to the css dict
                 await locator.select_option(
