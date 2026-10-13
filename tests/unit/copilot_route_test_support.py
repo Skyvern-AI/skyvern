@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +17,8 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PROPOSAL_METADATA_KEY, copilot_proposal_metadata
 
 
 def terminal_narrative_payload() -> dict[str, Any]:
@@ -115,8 +117,12 @@ def setup_new_copilot_mocks(
         agent_result.proposal_revision = None
     if not hasattr(agent_result, "proposal_workflow_run_id"):
         agent_result.proposal_workflow_run_id = None
+    if not hasattr(chat, "workflow_permanent_id"):
+        chat.workflow_permanent_id = getattr(original_workflow, "workflow_permanent_id", "wpid-1")
     if not hasattr(original_workflow, "modified_at"):
         original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
+    if not hasattr(original_workflow, "title"):
+        original_workflow.title = "Original"
     if not hasattr(original_workflow, "model_dump"):
         original_workflow.model_dump = MagicMock(return_value={"workflow_id": original_workflow.workflow_id})
 
@@ -135,6 +141,58 @@ def setup_new_copilot_mocks(
         restore_mock,
     )
 
+    async def publish_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        expected = (kwargs["expected_owner_turn_id"], kwargs["expected_revision"])
+        if (current is None and expected != (None, None)) or (
+            current is not None and expected != (current.owner_turn_id, current.revision)
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        owner_turn_id = kwargs["owner_turn_id"]
+        metadata = {
+            "owner_turn_id": owner_turn_id,
+            "revision": current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1,
+            "canonical_fingerprint": kwargs["canonical_fingerprint"],
+            "canonical_title": kwargs["canonical_title"],
+            "disposition": kwargs["disposition"],
+        }
+        proposal = {**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
+    async def clear_workflow_copilot_candidate(**kwargs: Any) -> None:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        expected = (kwargs["expected_owner_turn_id"], kwargs["expected_revision"])
+        if (current is None and expected != (None, None)) or (
+            current is not None and expected != (current.owner_turn_id, current.revision)
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        chat.proposed_workflow = None
+
+    async def enrich_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        if current is None or (current.owner_turn_id, current.revision) != (
+            kwargs["expected_owner_turn_id"],
+            kwargs["expected_revision"],
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        metadata = current.model_copy(update={"disposition": kwargs["disposition"]})
+        proposal = {**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json")}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
+    async def claim_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        if current is None or (current.owner_turn_id, current.revision) != (
+            kwargs["expected_owner_turn_id"],
+            kwargs["expected_revision"],
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(UTC)})
+        proposal = {**chat.proposed_workflow, COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json")}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
     monkeypatch.setattr(
         "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
         AsyncMock(return_value=agent_result),
@@ -144,6 +202,10 @@ def setup_new_copilot_mocks(
         get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
         get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
         update_workflow_copilot_chat=AsyncMock(),
+        publish_workflow_copilot_candidate=AsyncMock(side_effect=publish_workflow_copilot_candidate),
+        enrich_workflow_copilot_candidate=AsyncMock(side_effect=enrich_workflow_copilot_candidate),
+        clear_workflow_copilot_candidate=AsyncMock(side_effect=clear_workflow_copilot_candidate),
+        claim_workflow_copilot_candidate=AsyncMock(side_effect=claim_workflow_copilot_candidate),
         create_workflow_copilot_chat_message=AsyncMock(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
         ),

@@ -360,6 +360,7 @@ def _unfinished_plan_agent_result(work_plan: list[str] | None) -> AgentResult:
         global_llm_context=None,
         response_type="REPLY",
         proposal_disposition="review_untested",
+        turn_id="turn-plan",
         narrative_payload=terminal_narrative_payload(),
     )
     result.work_plan = work_plan
@@ -405,7 +406,7 @@ async def test_an_unfinished_plan_naming_the_requested_output_still_leaves_the_r
     with_plan, params = await _finalise_with_plan(monkeypatch, plan)
     without_plan, _ = await _finalise_with_plan(monkeypatch, None)
 
-    assert params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]["workflow_id"] == "wf-draft"
+    assert params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]["workflow_id"] == "wf-draft"
     assert with_plan.message == "Saved a draft; I have not run it yet."
     assert (
         params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["content"]
