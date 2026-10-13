@@ -156,6 +156,18 @@ describe("EmailInboxBlockForm", () => {
     });
   });
 
+  test("enables attachment downloads from the block editor", () => {
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    const toggle = screen.getByRole("switch", { name: "Download Attachments" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(toggle);
+
+    expect(updateNodeData).toHaveBeenCalledWith("email-1", {
+      downloadAttachments: true,
+    });
+  });
+
   test("replaces a stale credential parameter key", () => {
     mockNodes.set("email-1", {
       id: "email-1",

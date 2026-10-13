@@ -137,6 +137,8 @@ export const helpTooltips = {
     newerThanDays: "Only include emails newer than this many days.",
     maxResults: "Maximum number of emails to return.",
     includeBody: "Include email body text in matching results.",
+    downloadAttachments:
+      "Download non-inline attachments from matched emails for downstream blocks.",
   },
   google_sheets_write: {
     ...baseHelpTooltipContent,

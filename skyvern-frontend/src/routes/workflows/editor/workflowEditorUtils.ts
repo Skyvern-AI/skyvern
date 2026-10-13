@@ -1469,6 +1469,7 @@ function convertToNode(
           newerThanDays: block.newer_than_days ?? null,
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
+          downloadAttachments: block.download_attachments ?? false,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3885,6 +3886,7 @@ function getWorkflowBlock(
         newer_than_days: node.data.newerThanDays,
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
+        download_attachments: node.data.downloadAttachments,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5490,6 +5492,7 @@ function convertBlocksToBlockYAML(
           newer_than_days: block.newer_than_days,
           max_results: block.max_results,
           include_body: block.include_body,
+          download_attachments: block.download_attachments,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;

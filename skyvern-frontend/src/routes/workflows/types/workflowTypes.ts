@@ -732,6 +732,7 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   newer_than_days: number | null;
   max_results: number;
   include_body: boolean;
+  download_attachments: boolean;
   parameters: Array<WorkflowParameter>;
 };
 

@@ -582,6 +582,7 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   newer_than_days: number | null;
   max_results: number;
   include_body: boolean;
+  download_attachments: boolean;
   parameter_keys?: Array<string> | null;
 };
 
