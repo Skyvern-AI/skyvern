@@ -1,3 +1,5 @@
+from typing import Literal
+
 try:
     import psycopg
 except ImportError:  # psycopg ships with the server extra only
@@ -36,8 +38,24 @@ class DuplicateCopilotTurnError(Exception):
         self.turn_id = turn_id
 
 
+CopilotProposalConflictReason = Literal[
+    "token_changed",
+    "candidate_missing",
+    "metadata_invalid",
+    "being_accepted",
+    "bytes_changed",
+    "content_changed",
+    "claim_changed",
+    "disposition_changed",
+]
+
+
 class CopilotProposalConflictError(Exception):
     """The candidate changed after the caller read its owner/revision token."""
+
+    def __init__(self, message: str, *, reason: CopilotProposalConflictReason) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ScheduleLimitExceededError(Exception):

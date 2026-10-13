@@ -915,6 +915,7 @@ def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> No
         "ok": False,
         "error": "evaluate failed: element not visible",
         "page_state": {"read": "ok", "url": None, "title": "Browser session not found", "challenge_vendor": None},
+        "page_request_failures": [{"method": "GET", "url": "/no browser context", "failure_text": "net::ERR_FAILED"}],
     }
 
     assert not _is_unrecoverable_browser_session_error("evaluate", output)
