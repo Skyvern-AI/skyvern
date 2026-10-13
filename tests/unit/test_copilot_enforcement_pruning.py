@@ -1098,7 +1098,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
     assert json.loads(pruned[0]["output"])["page_state"] == expected
 
 
-def test_page_state_alone_does_not_push_a_short_result_into_compaction() -> None:
+def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
     solved = {
         "ok": True,
         "outcome": "solved",
@@ -1113,7 +1113,8 @@ def test_page_state_alone_does_not_push_a_short_result_into_compaction() -> None
         "title": "Northfield Parts - Catalog",
         "challenge_vendor": None,
     }
-    old_output = json.dumps({"page_state": page_state, **solved})
+    failures = [{"method": "POST", "resource_type": "xhr", "failure_text": "net::ERR_EMPTY_RESPONSE", "url": "/r"}]
+    old_output = json.dumps({"page_state": page_state, "page_request_failures": failures, **solved})
     assert len(json.dumps(solved)) <= 300 < len(old_output)
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)

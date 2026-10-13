@@ -890,7 +890,7 @@ async def test_a_candidate_claimed_mid_turn_does_not_cost_the_user_the_reply(
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=SimpleNamespace(proposed_workflow=stored))
     workflow_params.enrich_workflow_copilot_candidate = AsyncMock(
-        side_effect=CopilotProposalConflictError("Copilot proposal is being accepted")
+        side_effect=CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
     )
     stream = MagicMock(send=AsyncMock(return_value=True))
 
@@ -3229,7 +3229,7 @@ def _serve_live_chat_row(workflow_params: SimpleNamespace, chat: SimpleNamespace
     ) -> None:
         token = (chat_row["proposed_workflow"] or {}).get(COPILOT_PROPOSAL_METADATA_KEY, {})
         if (token.get("owner_turn_id"), token.get("revision")) != (expected_owner_turn_id, expected_revision):
-            raise CopilotProposalConflictError("Copilot proposal changed")
+            raise CopilotProposalConflictError("Copilot proposal changed", reason="token_changed")
         chat_row["proposed_workflow"] = None
 
     workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(side_effect=get_chat)
@@ -3337,6 +3337,58 @@ async def test_route_error_recovery_keeps_the_committed_workflow_and_other_turns
         if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
     ]
     assert frames[-1].workflow_applied is not agent_fails
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["agent-raises", "assistant-row-write-fails"])
+async def test_route_error_recovery_leaves_a_candidate_the_turn_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+    failure: str,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    chat_row: dict[str, Any] = {"proposed_workflow": _candidate_owned_by("turn-newer", unvalidated=True)}
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=chat_row["proposed_workflow"],
+        auto_accept=True,
+    )
+    unused_result = AgentResult(user_response="", updated_workflow=None, global_llm_context=None)
+    _, workflow_params = setup_new_copilot_mocks(
+        monkeypatch, chat, _make_copilot_workflow("Saved workflow", _NOW), unused_result
+    )
+    _serve_live_chat_row(workflow_params, chat, chat_row)
+
+    adopted_result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    adopted_result.proposal_owner_turn_id, adopted_result.proposal_revision = "turn-newer", 1
+    adopted_result.proposal_adopted = True
+
+    async def run_agent(*args: object, ctx_sink: list[Any], **kwargs: object) -> AgentResult:
+        if failure == "assistant-row-write-fails":
+            return adopted_result
+        ctx_sink.append(SimpleNamespace(proposal_adopted=True, executed_block_fingerprints={}))
+        raise RuntimeError("agent run failed")
+
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", run_agent)
+    first_assistant_write_failure = [RuntimeError("assistant row write failed")] if failure != "agent-raises" else []
+
+    async def create_message(**kwargs: Any) -> SimpleNamespace:
+        if kwargs["sender"] == WorkflowCopilotChatSender.AI and first_assistant_write_failure:
+            raise first_assistant_write_failure.pop()
+        return SimpleNamespace(created_at=_NOW)
+
+    workflow_params.create_workflow_copilot_chat_message = AsyncMock(side_effect=create_message)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assert chat_row["proposed_workflow"] == _candidate_owned_by("turn-newer", unvalidated=True)
 
 
 @pytest.mark.asyncio
@@ -4153,6 +4205,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         has_staged_proposal=False,
         proposal_owner_turn_id=None,
         proposal_revision=None,
+        proposal_adopted=False,
         proposal_workflow_run_id=None,
     )
 
@@ -4179,6 +4232,7 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         "private_workflow_settings": {},
         "proposal_owner_turn_id": None,
         "proposal_revision": None,
+        "proposal_adopted": False,
         "proposal_workflow_run_id": None,
     }
     fields.update(overrides)

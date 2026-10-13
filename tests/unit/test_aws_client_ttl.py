@@ -56,6 +56,19 @@ async def test_download_file_missing_key_returns_none_without_traceback() -> Non
 
 
 @pytest.mark.asyncio
+async def test_download_file_archived_object_returns_none_with_a_warning_and_no_traceback() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("InvalidObjectState"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/archived.png")
+    assert result is None
+    mock_log.exception.assert_not_called()
+    mock_log.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_download_file_real_error_still_logs_exception() -> None:
     client = aws.AsyncAWSClient()
     with (

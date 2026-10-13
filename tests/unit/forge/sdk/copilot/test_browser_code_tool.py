@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.workflow_yaml import stored_block_code
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError
 from skyvern.webeye.persistent_sessions_manager import BrowserRetirementReason
+from tests.unit._mcp_browser_fakes import logged_request_failures, make_request_failure, seed_request_failures
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import (
     AUTO_RENDER_TURNSTILE_HTML,
@@ -1852,14 +1853,20 @@ async def test_a_last_run_browser_code_call_reads_the_run_browser(monkeypatch: p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("code", [pytest.param(" ", id="refused"), pytest.param("1", id="ran-with-source-reference")])
-async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld(
-    monkeypatch: pytest.MonkeyPatch, code: str
+@pytest.mark.parametrize("failures_redactable", [True, False])
+async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld_and_carries_only_redactable_failures(
+    monkeypatch: pytest.MonkeyPatch, code: str, failures_redactable: bool
 ) -> None:
     _patch_cell_runtime(monkeypatch)
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_scrub_emptied"
     register_secret_scrub_value(ctx, "ok")
-    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_titled_page("Orders")))
+    if not failures_redactable:
+        register_secret_scrub_value(ctx, "resource_type")
+    working_page = _titled_page("Orders")
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(working_page))
+    failure = make_request_failure(working_page)
+    log = seed_request_failures(ctx, "pbs_scrub_emptied", failure)
     try:
         result = await _invoke_advertised_tool(ctx, {"code": code})
     finally:
@@ -1867,4 +1874,6 @@ async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld(
 
     assert mcp_adapter.is_redaction_withheld(result) and result["ok"] is False
     assert result["data"]["redaction_withheld"]["reason"] == "redaction_unavailable"
-    assert set(result) == {"page_state", "ok", "error", "data"}
+    reported = ["page_request_failures"] if failures_redactable else []
+    assert list(result) == ["page_state", *reported, "ok", "error", "data"]
+    assert logged_request_failures(log) == ([] if failures_redactable else [failure])
