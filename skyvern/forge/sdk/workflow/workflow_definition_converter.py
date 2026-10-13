@@ -1052,6 +1052,7 @@ def block_yaml_to_block(
             newer_than_days=block_yaml.newer_than_days,
             max_results=block_yaml.max_results,
             include_body=block_yaml.include_body,
+            download_attachments=block_yaml.download_attachments,
             parameters=email_inbox_parameters,
         )
     elif block_yaml.block_type == BlockType.GOOGLE_SHEETS_WRITE:

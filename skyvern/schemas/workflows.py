@@ -1697,6 +1697,9 @@ class EmailInboxBlockYAML(BlockYAML):
     newer_than_days: int | None = None
     max_results: int = 25
     include_body: bool = True
+    download_attachments: bool = Field(
+        default=False, description="Download non-inline attachments from matched emails for downstream blocks."
+    )
     parameter_keys: list[str] | None = None
 
 

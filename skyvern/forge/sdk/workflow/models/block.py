@@ -655,8 +655,52 @@ def extract_file_url_from_block_output(value: Any) -> str | None:
 
 
 def sanitize_filename(filename: str, default: str = "document") -> str:
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]', "_", filename).strip(". ")
     return sanitized[:200] if sanitized else default
+
+
+async def register_workflow_downloads(
+    *,
+    organization_id: str | None,
+    run_download_id: str | None,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+) -> list[FileInfo]:
+    if not organization_id:
+        return []
+    try:
+        async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+            await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timeout saving workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        return []
+    except DownloadSaveIncompleteError:
+        pass
+    except Exception:
+        LOG.warning(
+            "Failed to register workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
+    try:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            return await app.STORAGE.get_current_attempt_downloaded_files(
+                organization_id=organization_id, run_id=run_download_id
+            )
+    except Exception:
+        LOG.warning(
+            "Failed to read registered workflow downloads",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
 
 
 class ParquetExportMixin:
@@ -684,50 +728,6 @@ class ParquetExportMixin:
         if isinstance(current_index, int) and not isinstance(current_index, bool):
             stem = f"{stem}-{current_index + 1:04d}"
         return f"{stem}.parquet"
-
-    async def _register_export_download(
-        self,
-        *,
-        organization_id: str | None,
-        run_download_id: str | None,
-        workflow_run_id: str,
-        workflow_run_block_id: str,
-    ) -> list[FileInfo]:
-        if not organization_id:
-            return []
-        try:
-            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "Timeout saving Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            return []
-        except DownloadSaveIncompleteError:
-            pass
-        except Exception:
-            LOG.warning(
-                "Failed to register Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
-        try:
-            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_current_attempt_downloaded_files(
-                    organization_id=organization_id, run_id=run_download_id
-                )
-        except Exception:
-            LOG.warning(
-                "Failed to read registered Parquet exports",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
 
     async def write_parquet_export(
         self,
@@ -773,7 +773,7 @@ class ParquetExportMixin:
             raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
 
         filename = path.name
-        downloaded_files = await self._register_export_download(
+        downloaded_files = await register_workflow_downloads(
             organization_id=organization_id,
             run_download_id=run_download_id,
             workflow_run_id=workflow_run_id,
@@ -15630,7 +15630,69 @@ class HumanInteractionBlock(BaseTaskBlock):
                 )
                 log_that_we_are_waiting = False
 
-            # Check if timeout_seconds has elapsed
+            # Run status is read before the session because cancel paths also close the session.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                if workflow_run.status == WorkflowRunStatus.running:
+                    success, status = True, BlockStatus.completed
+                elif workflow_run.status == WorkflowRunStatus.canceled:
+                    success, status = False, BlockStatus.canceled
+                elif workflow_run.status == WorkflowRunStatus.terminated:
+                    success, status = False, BlockStatus.terminated
+                else:
+                    success, status = False, BlockStatus.failed
+                reason = f"status_changed:{workflow_run.status}"
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=None if success else reason,
+                    output_parameter_value=result_dict,
+                    status=status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if browser_session_id and organization_id:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    browser_session_id, organization_id
+                )
+                if browser_session and browser_session.completed_at:
+                    LOG.info(
+                        "Browser session closed while waiting for human interaction",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+
+                    workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                    reason = "Browser session was closed while waiting for human interaction"
+                    result_dict = {"success": False, "reason": reason}
+
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=reason,
+                        output_parameter_value=result_dict,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
             if elapsed_time_seconds >= self.timeout_seconds:
                 LOG.info(
                     "Human Interaction block timeout_seconds reached",
@@ -15651,33 +15713,6 @@ class HumanInteractionBlock(BaseTaskBlock):
                     failure_reason=reason,
                     output_parameter_value=result_dict,
                     status=BlockStatus.timed_out,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
-            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-
-            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
-                LOG.info(
-                    "Workflow run status changed from paused",
-                    workflow_run_id=workflow_run_id,
-                    new_status=workflow_run.status,
-                    browser_session_id=browser_session_id,
-                )
-
-                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
-
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-
-                return await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=result_dict,
-                    status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
