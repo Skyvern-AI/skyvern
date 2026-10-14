@@ -1746,12 +1746,12 @@ class TestGemini3ReasoningEffortExperiment:
     @pytest.mark.parametrize("value", ["minimal", "low", "medium", "high", "MEDIUM", " low "])
     def test_set_gemini_3_reasoning_effort_override_accepts_valid_values(self, value: str) -> None:
         LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
-        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override == value.strip().lower()
+        assert LLMAPIHandlerFactory.gemini_3_reasoning_effort_override() == value.strip().lower()
 
     @pytest.mark.parametrize("value", ["disable", "off", "high-er", 1024])
     def test_set_gemini_3_reasoning_effort_override_rejects_invalid_values(self, value: Any) -> None:
         LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
-        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override is None
+        assert LLMAPIHandlerFactory.gemini_3_reasoning_effort_override() is None
 
     def test_apply_gemini_thinking_optimization_overrides_when_thinking_level_pre_merged(self) -> None:
         """Single-handler path (api_handler_factory.py:1402-1404) merges

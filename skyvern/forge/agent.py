@@ -8494,8 +8494,9 @@ class ForgeAgent:
         are mostly used by scripts/tests. When no override exists, evaluate the PostHog experiment
         once per context and cache the result on the context to avoid repeated lookups.
         """
-        if LLMAPIHandlerFactory._prompt_caching_settings is not None:
-            return LLMAPIHandlerFactory._prompt_caching_settings
+        explicit_settings = LLMAPIHandlerFactory.prompt_caching_settings()
+        if explicit_settings is not None:
+            return explicit_settings
 
         if context.prompt_caching_settings is not None:
             return context.prompt_caching_settings
