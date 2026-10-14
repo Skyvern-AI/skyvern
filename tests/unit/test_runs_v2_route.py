@@ -19,6 +19,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
@@ -481,6 +482,65 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         created_at_end=None,
         run_tags=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("indexed_search", "expected_status", "expected_detail_fragment"),
+    [
+        (False, 400, "created_at_start"),
+        (True, 503, "retry shortly"),
+    ],
+)
+async def test_get_workflow_runs_by_id_reports_a_cancelled_search_as_a_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    indexed_search: bool,
+    expected_status: int,
+    expected_detail_fragment: str,
+) -> None:
+    # A workflow's own runs list carries the same unindexed search arms as the global list, so its
+    # cancelled search is the caller's to narrow rather than a 500 on an interactive list.
+    cancelled = RunsListSearchCanceled(indexed_search=indexed_search, statement_timeout_seconds=30)
+    mock_service = SimpleNamespace(
+        get_workflow_runs_for_workflow_permanent_id=AsyncMock(side_effect=cancelled),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_workflow_runs_by_id(
+            workflow_id="wpid_123",
+            page=1,
+            page_size=10,
+            search_key="a-search-term",
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc_info.value.status_code == expected_status
+    assert expected_detail_fragment in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_by_id_does_not_blame_the_search_for_another_query_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The service attaches attempt views with a second, uncapped query after the search read
+    # returns. Its cancellation is not the search's, so it must stay a server error even though the
+    # request carried a search term.
+    mock_service = SimpleNamespace(
+        get_workflow_runs_for_workflow_permanent_id=AsyncMock(side_effect=statement_timeout_error()),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_workflow_runs_by_id(
+            workflow_id="wpid_123",
+            page=1,
+            page_size=10,
+            search_key="a-search-term",
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
 
 
 @pytest.mark.parametrize(

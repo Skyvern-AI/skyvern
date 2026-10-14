@@ -1,7 +1,10 @@
 import { createContext, useContext } from "react";
+import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowAnalyticsPanelProps = {
   workflowPermanentId: string;
+  workflow?: WorkflowApiResponse;
+  workflowIsLoading?: boolean;
 };
 export type WorkflowRunMilestoneCardProps = Readonly<{
   workflowRunId: string;

@@ -71,6 +71,7 @@ from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
     is_job_recipe_workflow_run_trigger_type,
 )
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagValueAlreadyExists,
@@ -4565,28 +4566,33 @@ async def _parse_and_gate_tag_filter_terms(
 
 
 _RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS = 15
+_RUNS_LIST_SEARCH_TIMEOUT_DETAIL = (
+    "Free-text run search exceeded its time limit. Try an exact browser profile or session ID."
+)
+_WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL = (
+    "Free-text run search exceeded its time limit. Retry with a created_at_start/created_at_end "
+    "window of a few weeks or less, or search an exact browser profile or session ID."
+)
 
 
-def _runs_list_filter_names(
-    *,
-    status: list[RunStatus] | None,
-    search_key: str | None,
-    run_type: list[RunType] | None,
-    workflow_permanent_id: list[str] | None,
-    tags: list[str] | None,
-    failure_category: str | None,
-) -> list[str]:
+def _runs_list_filter_names(**filters: object | None) -> list[str]:
     """Names of the filters the request carried. Never the values: a search term, tag or agent id can
     be customer data, and the name alone identifies which query shape was slow."""
-    supplied: dict[str, object | None] = {
-        "status": status,
-        "search_key": search_key,
-        "run_type": run_type,
-        "workflow_permanent_id": workflow_permanent_id,
-        "tags": tags,
-        "failure_category": failure_category,
-    }
-    return sorted(name for name, value in supplied.items() if value)
+    return sorted(name for name, value in filters.items() if value)
+
+
+def _runs_list_timeout_error(*, indexed_search: bool, search_detail: str) -> HTTPException:
+    """The client-facing form of a runs-list search that ran out of time. An unindexed free-text
+    search is the caller's to narrow; an exact browser identifier resolves through indexed equality
+    lookups, so its timeout is transient and retryable."""
+    if not indexed_search:
+        # Do not suggest a rarer substring: the unindexed search can still walk the whole org.
+        return HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=search_detail)
+    return HTTPException(
+        status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="This run list could not be computed in time. Please retry shortly.",
+        headers={"Retry-After": str(_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS)},
+    )
 
 
 # NOTE: v2 returns TaskRunListItem from the unified task_runs table,
@@ -4688,6 +4694,7 @@ async def get_runs_v2(
     except SQLAlchemyError as exc:
         if not is_statement_timeout(exc) or not search_key:
             raise
+        indexed_search = is_indexed_runs_list_search_key(search_key)
         LOG.warning(
             "runs_list_statement_timeout",
             organization_id=current_org.organization_id,
@@ -4702,19 +4709,13 @@ async def get_runs_v2(
             ),
             page=page,
             page_size=page_size,
-            statement_timeout_seconds=RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+            # Null for an indexed identifier search: it is not capped, so it ran under the
+            # connection's own timeout rather than this budget.
+            statement_timeout_seconds=None if indexed_search else RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
         )
-        if not is_indexed_runs_list_search_key(search_key):
-            # Do not suggest a rarer substring: the unindexed search can still walk the whole org.
-            raise HTTPException(
-                status_code=http_status.HTTP_400_BAD_REQUEST,
-                detail="Free-text run search exceeded its time limit. Try an exact browser profile or session ID.",
-            ) from exc
-        # Exact browser identifiers use indexed equality lookups; a timeout is retryable.
-        raise HTTPException(
-            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="This run list could not be computed in time. Please retry shortly.",
-            headers={"Retry-After": str(_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS)},
+        raise _runs_list_timeout_error(
+            indexed_search=indexed_search,
+            search_detail=_RUNS_LIST_SEARCH_TIMEOUT_DETAIL,
         ) from exc
     items = [TaskRunListItem.model_validate(row) for row in rows]
     workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
@@ -5138,19 +5139,45 @@ async def _get_workflow_runs_by_id(
     run_tags: Sequence[tuple[str | None, str | None]] | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
-    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
-        workflow_permanent_id=workflow_id,
-        organization_id=organization_id,
-        page=page,
-        page_size=page_size,
-        status=status,
-        search_key=search_key,
-        error_code=error_code,
-        exclude_child_runs=exclude_child_runs,
-        created_at_start=created_at_start,
-        created_at_end=created_at_end,
-        run_tags=run_tags,
-    )
+    try:
+        return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id=workflow_id,
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            exclude_child_runs=exclude_child_runs,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
+            run_tags=run_tags,
+        )
+    except RunsListSearchCanceled as exc:
+        # Only the search statement raises this, so a cancellation in the attempt lookup that
+        # follows it stays a server error instead of being reported as a slow search.
+        LOG.warning(
+            "runs_list_statement_timeout",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_id,
+            # Names, never values: a search term or tag can carry customer data.
+            filters=_runs_list_filter_names(
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
+                tags=run_tags,
+                exclude_child_runs=exclude_child_runs,
+            ),
+            page=page,
+            page_size=page_size,
+            statement_timeout_seconds=exc.statement_timeout_seconds,
+        )
+        raise _runs_list_timeout_error(
+            indexed_search=exc.indexed_search,
+            search_detail=_WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL,
+        ) from exc
 
 
 @base_router.get(

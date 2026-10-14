@@ -168,6 +168,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import (
 )
 from skyvern.forge.sdk.experimentation.workflow_block_engine import task_v3_disabled
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -321,8 +322,14 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionResult, ActionSuccess
-from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_errors import BrowserTargetClosedError
+from skyvern.webeye.browser_driver_errors import is_driver_error
+from skyvern.webeye.browser_engine import BrowserEngineSelection, is_any_engine_error
+from skyvern.webeye.browser_errors import (
+    BrowserTargetClosedError,
+    is_content_navigating_message,
+    is_context_lost_message,
+    is_target_closed_message,
+)
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
     consume_unsolicited_download_error_for_context,
@@ -1440,6 +1447,19 @@ def _task_v3_run_secret_values(task: Task) -> set[str]:
         app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
         if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
         else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+    )
+
+
+def _is_transient_page_read_refusal(exc: BaseException) -> bool:
+    """Whether a browser refused a read because the page closed, is mid-navigation, or lost the
+    document's context. Matched on the message across every driver family the image can hold,
+    because these refusals arrive carrying more than one of those identities.
+    """
+    if not (is_driver_error(exc) or is_any_engine_error(exc)):
+        return False
+    message = str(exc)
+    return (
+        is_target_closed_message(message) or is_content_navigating_message(message) or is_context_lost_message(message)
     )
 
 
@@ -7106,6 +7126,7 @@ class ForgeAgent:
                 exc_info=True,
             )
 
+        html: str | None = None
         try:
             if skyvern_frame is None:
                 skyvern_frame = await SkyvernFrame.create_instance(
@@ -7113,30 +7134,43 @@ class ForgeAgent:
                     engine_selection=browser_state.engine_selection,
                 )
             html = await skyvern_frame.get_content()
-            _ctx = skyvern_context.current()
-            # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
-            # second pass through html.encode() in the chosen branch.
-            html_bytes = html.encode("utf-8")
-            _bundled = bool(step and not step.is_speculative and _ctx)
-            _tracer = otel_trace.get_tracer("skyvern")
-            with traced_span(_tracer, "skyvern.agent.artifact.html_action") as _html_art_span:
-                apply_context_attrs(_html_art_span)
-                _html_art_span.set_attribute("html_bytes", len(html_bytes))
-                _html_art_span.set_attribute("bundled", _bundled)
-                if _bundled:
-                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html_bytes)
-                else:
-                    artifacts.append(
-                        await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                            data=html_bytes,
-                            artifact_type=ArtifactType.HTML_ACTION,
-                            step=step,
-                        )
-                    )
-        except SkyvernPageAnalysisTimeout:
+        except (SkyvernPageAnalysisTimeout, TimeoutError):
+            # get_content bounds frame.content() with asyncio.timeout, which raises the builtin TimeoutError.
             LOG.warning("Timed out reading the post-action html, skipping it")
-        except Exception:
-            LOG.exception("Failed to record html after action")
+        except Exception as e:
+            if _is_transient_page_read_refusal(e):
+                LOG.warning(
+                    "Skipping the post-action html because the page closed or was mid-navigation",
+                    error=str(e),
+                    **exception_log_fields(e),
+                )
+            else:
+                LOG.exception("Failed to read the post-action html")
+
+        if html is not None:
+            try:
+                _ctx = skyvern_context.current()
+                # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
+                # second pass through html.encode() in the chosen branch.
+                html_bytes = html.encode("utf-8")
+                _bundled = bool(step and not step.is_speculative and _ctx)
+                _tracer = otel_trace.get_tracer("skyvern")
+                with traced_span(_tracer, "skyvern.agent.artifact.html_action") as _html_art_span:
+                    apply_context_attrs(_html_art_span)
+                    _html_art_span.set_attribute("html_bytes", len(html_bytes))
+                    _html_art_span.set_attribute("bundled", _bundled)
+                    if _bundled:
+                        app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=html_bytes)
+                    else:
+                        artifacts.append(
+                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                                data=html_bytes,
+                                artifact_type=ArtifactType.HTML_ACTION,
+                                step=step,
+                            )
+                        )
+            except Exception:
+                LOG.exception("Failed to record html after action")
 
         if artifacts:
             _tracer = otel_trace.get_tracer("skyvern")

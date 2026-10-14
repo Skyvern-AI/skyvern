@@ -26,11 +26,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright._impl._errors import Error as DriverError
 from playwright._impl._errors import TargetClosedError
 
 import skyvern.forge.agent as agent_mod
 import skyvern.services.task_v2_service as task_v2_mod
 import skyvern.webeye.actions.handler as handler_mod
+import skyvern.webeye.browser_driver_errors as driver_errors_mod
 import skyvern.webeye.scraper.scraper as scraper_mod
 from skyvern.exceptions import (
     BrowserStateDiagnostic,
@@ -161,6 +163,104 @@ class TestRecordArtifactsAfterActionTargetClosed:
         await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
 
         assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
+
+
+_NAVIGATING_REFUSAL = "Page.content: Unable to retrieve content because the page is navigating and changing the content"
+
+
+class _SecondPackageDriverError(Exception):
+    """Stands in for the second Playwright-family package's ``Error``. The browser image repoints the
+    driver import but leaves persistent-session pages on the un-rewritten package, so one process
+    holds two unrelated classes for the same refusal -- and this environment installs only one of
+    them, hence a local stand-in registered the way the image resolves both.
+    """
+
+
+class TestRecordArtifactsAfterActionHtmlCapture:
+    """The post-action html read is best-effort too, and it hits the same expected page states: the
+    tab closed, or the document is being replaced mid-navigation. Those refusals must not be ERRORs
+    with tracebacks, while a genuine failure to read or to record the html still must be.
+    """
+
+    @pytest.mark.parametrize(
+        "html_error, register_second_package",
+        [
+            (DriverError(_NAVIGATING_REFUSAL), False),
+            (TargetClosedError("Target page, context or browser has been closed"), False),
+            (DriverError("Execution context was destroyed, most likely because of a navigation"), False),
+            (_SecondPackageDriverError(_NAVIGATING_REFUSAL), True),
+        ],
+        ids=["navigating", "closed_target", "context_lost", "navigating_from_second_driver_package"],
+    )
+    @pytest.mark.asyncio
+    async def test_transient_refusals_warn_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, html_error: Exception, register_second_package: bool
+    ) -> None:
+        if register_second_package:
+            monkeypatch.setattr(
+                driver_errors_mod,
+                "DRIVER_ERROR_TYPES",
+                driver_errors_mod.DRIVER_ERROR_TYPES + (_SecondPackageDriverError,),
+            )
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=html_error)
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        warning = next(
+            (call for call in log.warning.call_args_list if "Skipping the post-action html" in str(call.args[0])),
+            None,
+        )
+        assert warning is not None, f"refusal did not warn: {log.warning.call_args_list}"
+        assert not warning.kwargs.get("exc_info"), "the downgraded warning must carry no traceback"
+        # Keeps the downgraded lines splittable by driver class, which exc_info used to supply.
+        assert warning.kwargs["error_type"].endswith(type(html_error).__name__)
+
+    @pytest.mark.asyncio
+    async def test_read_deadline_timeout_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``get_content`` bounds the read with ``asyncio.timeout``, so expiry is the builtin
+        TimeoutError rather than a Skyvern one."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=TimeoutError())
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        assert any("Timed out reading the post-action html" in str(call.args[0]) for call in log.warning.call_args_list)
+
+    @pytest.mark.parametrize(
+        "html_error",
+        [RuntimeError("page is navigating"), DriverError("Target crashed")],
+        ids=["same_text_without_driver_identity", "driver_error_with_unrecognized_message"],
+    )
+    @pytest.mark.asyncio
+    async def test_non_transient_read_failures_keep_their_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, html_error: Exception
+    ) -> None:
+        """Controls for both halves of the classification: the identity gate rejects an unrelated
+        exception carrying a refusal's text, and the message gate rejects a driver error that is a
+        real failure (a crash) rather than an expected page state."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=html_error)
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to read the post-action html" in str(call.args[0]) for call in log.exception.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_failure_still_logs_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The narrowed read guard must not cover the artifact write: recording a page Skyvern did
+        read is not a transient page state, whatever the write raises."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+        monkeypatch.setattr(
+            agent_mod.app.ARTIFACT_MANAGER,
+            "accumulate_action_html_to_archive",
+            MagicMock(side_effect=TargetClosedError("Target page, context or browser has been closed")),
+        )
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to record html after action" in str(call.args[0]) for call in log.exception.call_args_list)
 
 
 class TestScrapeWebsiteTargetClosed:

@@ -404,6 +404,11 @@ class CustomSelectFamilyOutcome(StrEnum):
     terminal_unverified_toggle = "terminal_unverified_toggle"
 
 
+# Wall clock a date-related custom-select cascade may spend walking levels. Each level costs an LLM
+# round trip, so bounding the walk by time rather than by level count keeps a cheap deep walk (a
+# calendar stepped one month per click) while stopping a walk that cannot finish inside the action
+# execution deadline — the deadline cancels the action, which skips every recovery below.
+DATEPICKER_WALK_BUDGET_SECONDS = 300.0
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
@@ -13134,10 +13139,16 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # TODO: only support the third-level dropdown selection now, but for date picker, we need to support more levels as it will move the month, year, etc.
+    # A date picker takes more levels than a plain cascade since a pick can just move the month, so
+    # the count here is only a backstop: DATEPICKER_WALK_BUDGET_SECONDS is what bounds the walk.
     MAX_DATEPICKER_DEPTH = 30
     MAX_SELECT_DEPTH = 3
     max_depth = MAX_DATEPICKER_DEPTH if input_or_select_context.is_date_related else MAX_SELECT_DEPTH
+    date_walk_deadline = (
+        asyncio.get_running_loop().time() + DATEPICKER_WALK_BUDGET_SECONDS
+        if input_or_select_context.is_date_related
+        else None
+    )
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
@@ -13182,6 +13193,14 @@ async def sequentially_select_from_dropdown(
             LOG.warning(
                 "Reaching the max selection depth",
                 depth=i,
+            )
+            break
+
+        if date_walk_deadline is not None and asyncio.get_running_loop().time() >= date_walk_deadline:
+            LOG.warning(
+                "Date selection spent its walk budget without finishing",
+                depth=i,
+                budget_seconds=DATEPICKER_WALK_BUDGET_SECONDS,
             )
             break
 
@@ -13259,27 +13278,87 @@ async def sequentially_select_from_dropdown(
         if json_response.get("is_mini_goal_finished", False):
             LOG.info("The user has finished the selection for the current opened dropdown")
             return single_select_result
-    else:
-        if input_or_select_context.is_date_related:
-            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
-                try:
-                    LOG.info("Try to input the date directly")
-                    await skyvern_element.input_sequentially(action.option.label)
-                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
-                    result.action_result = ActionSuccess()
-                    return result
 
-                except Exception:
-                    LOG.warning(
-                        "Failed to input the date directly",
-                        exc_info=True,
-                    )
-
-            if single_select_result and single_select_result.action_result:
-                single_select_result.action_result.skip_remaining_actions = True
-                return single_select_result
+    # Only a walk that ran out of budget or depth gets here: every other exit from the loop returns.
+    if input_or_select_context.is_date_related:
+        return await _give_up_date_walk(
+            skyvern_element=skyvern_element,
+            skyvern_frame=skyvern_frame,
+            date_label=action.option.label,
+            entry_action_type=entry_action_type,
+            target_value=target_value,
+            # is_done() is false for every level that got here, so the menu is still open. Carrying
+            # it is what makes the input_text caller close the picker before it types.
+            dropdown_menu=single_select_result.dropdown_menu if single_select_result else None,
+            task=task,
+            step=step,
+        )
 
     return select_history[-1] if len(select_history) > 0 else None
+
+
+async def _give_up_date_walk(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    date_label: str | None,
+    entry_action_type: str,
+    target_value: str,
+    dropdown_menu: SkyvernElement | None,
+    task: Task,
+    step: Step,
+) -> CustomSingleSelectResult:
+    """End an unfinished date cascade without claiming a date that was never set.
+
+    The levels already clicked leave the picker open over a field that may still hold its old
+    value, so the only safe way to report this is a failure, except where this function can both
+    clear and type the date itself.
+    """
+    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+    result.dropdown_menu = dropdown_menu
+
+    if entry_action_type == "input_text":
+        # The input_text handler resumes its own text path on a non-terminal failure: it closes the
+        # picker, refuses a readonly field and types with replace semantics. Typing here instead
+        # would append to whatever the picker left behind.
+        LOG.info("Date selection did not finish, leaving the date to the input_text fallback")
+        result.action_result = _no_element_matched_failure(
+            target_value, "Date selection did not finish within its walk budget"
+        )
+        return result
+
+    if date_label and skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+        try:
+            if await skyvern_element.is_readonly(dynamic=True):
+                LOG.warning(
+                    "Try to input the date on a readonly element",
+                    element_id=skyvern_element.get_id(),
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                result.action_result = ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))
+                return result
+
+            LOG.info("Try to input the date directly")
+            # input_sequentially appends a value this short, so whatever the picker left in the
+            # field has to go first or the two dates concatenate.
+            await skyvern_element.input_clear()
+            await skyvern_element.input_sequentially(date_label)
+            result.action_result = ActionSuccess()
+            return result
+
+        except Exception:
+            LOG.warning(
+                "Failed to input the date directly",
+                exc_info=True,
+            )
+
+    result.action_result, _ = _terminal_custom_select_failure(
+        target_value=target_value,
+        matched_label=None,
+        reason="Date selection did not finish within its walk budget and the date could not be typed",
+    )
+    return result
 
 
 def build_sequential_select_history(history_list: list[CustomSingleSelectResult]) -> list[dict[str, Any]]:

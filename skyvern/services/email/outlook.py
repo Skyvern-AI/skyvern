@@ -136,6 +136,78 @@ async def _get_json(
     raise OutlookAPIError(status=response.status_code, code=code, message=message)
 
 
+async def download_attachment(
+    *,
+    access_token: str,
+    message_id: str,
+    attachment_id: str,
+    max_size_bytes: int,
+    client: httpx.AsyncClient | None = None,
+) -> bytes:
+    async def _download(client_: httpx.AsyncClient) -> bytes:
+        url = (
+            f"{GRAPH_API_BASE}/me/messages/{quote(message_id, safe='')}/attachments/"
+            f"{quote(attachment_id, safe='')}/$value"
+        )
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                async with client_.stream(
+                    "GET",
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/octet-stream"},
+                ) as response:
+                    if response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_ATTEMPTS:
+                        retry_after = response.headers.get("Retry-After")
+                    elif response.is_success:
+                        body = bytearray()
+                        chunks = response.aiter_bytes()
+                        try:
+                            async for chunk in chunks:
+                                body.extend(chunk)
+                                if len(body) > max_size_bytes:
+                                    raise OutlookAPIError(
+                                        status=413,
+                                        code="file_size_limit",
+                                        message="Outlook attachment exceeded the configured download limit",
+                                    )
+                        finally:
+                            await chunks.aclose()
+                        return bytes(body)
+                    else:
+                        await response.aread()
+                        try:
+                            error = response.json().get("error")
+                            code = error.get("code") if isinstance(error, dict) else None
+                        except (ValueError, AttributeError):
+                            code = None
+                        if response.status_code == 401 or (
+                            response.status_code == 403
+                            and isinstance(code, str)
+                            and code.casefold() in _RECONNECT_ERROR_CODES
+                        ):
+                            code = "reconnect_required"
+                        raise OutlookAPIError(
+                            status=response.status_code,
+                            code=code,
+                            message=f"Microsoft Graph attachment fetch failed (HTTP {response.status_code})",
+                        )
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                if attempt == _MAX_ATTEMPTS:
+                    raise OutlookAPIError(
+                        status=503, code="upstream_unavailable", message="Microsoft Graph attachment fetch failed"
+                    ) from exc
+                retry_after = None
+            await asyncio.sleep(_compute_backoff(attempt, retry_after))
+        raise OutlookAPIError(
+            status=503, code="upstream_unavailable", message="Microsoft Graph attachment fetch failed"
+        )
+
+    if client is None:
+        async with httpx.AsyncClient(timeout=20.0) as owned_client:
+            return await _download(owned_client)
+    return await _download(client)
+
+
 async def fetch_primary_account_email(
     *,
     access_token: str,
@@ -703,11 +775,13 @@ async def _attachments(
     *,
     access_token: str,
     message_id: str,
+    raise_errors: bool = False,
 ) -> list[EmailAttachment]:
     attachments: list[EmailAttachment] = []
     request_url: str | None = f"{GRAPH_API_BASE}/me/messages/{quote(message_id, safe='')}/attachments"
-    request_params: dict[str, Any] | None = {"$select": "id,name,contentType,size"}
+    request_params: dict[str, Any] | None = {"$select": "id,name,contentType,size,isInline"}
     page_count = 0
+    raw_next_link: object = None
     try:
         while request_url and page_count < _MAX_ATTACHMENT_PAGES:
             payload = await _get_json(client, request_url, access_token=access_token, params=request_params)
@@ -727,12 +801,22 @@ async def _attachments(
                         mime_type=content_type if isinstance(content_type, str) else None,
                         size=size if isinstance(size, int) else None,
                         attachment_id=attachment_id if isinstance(attachment_id, str) else None,
+                        is_inline=bool(item.get("isInline")),
                     )
                 )
-            request_url = _validated_next_link(payload.get("@odata.nextLink"))
+            raw_next_link = payload.get("@odata.nextLink")
+            request_url = _validated_next_link(raw_next_link)
             request_params = None
+        # Checks the raw link: a page cap or a rejected continuation both leave attachments unlisted.
+        if raw_next_link and raise_errors:
+            raise OutlookAPIError(
+                status=413,
+                code="attachment_list_truncated",
+                message="Not every attachment on the message could be listed for download",
+            )
     except OutlookAPIError as exc:
-        if exc.code == "reconnect_required":
+        # A requested download must not look like an attachment-free message.
+        if exc.code == "reconnect_required" or raise_errors:
             raise
         LOG.warning(
             "Failed to fetch Outlook message attachments",
@@ -810,6 +894,7 @@ async def list_folder_messages(
     newer_than_days: int | None = None,
     max_results: int = 25,
     include_body: bool = True,
+    include_attachments: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> list[EmailMessage]:
     async def _list(client_: httpx.AsyncClient) -> list[EmailMessage]:
@@ -860,10 +945,24 @@ async def list_folder_messages(
                     continue
                 message_id = item.get("id")
                 item_attachments: list[EmailAttachment] = []
-                if include_body and bool(item.get("hasAttachments")) and isinstance(message_id, str):
-                    item_attachments = await _attachments(client_, access_token=access_token, message_id=message_id)
+                attachment_list_error: str | None = None
+                if (
+                    (include_body or include_attachments)
+                    and bool(item.get("hasAttachments"))
+                    and isinstance(message_id, str)
+                ):
+                    try:
+                        item_attachments = await _attachments(
+                            client_, access_token=access_token, message_id=message_id, raise_errors=include_attachments
+                        )
+                    except OutlookAPIError as exc:
+                        if exc.code == "reconnect_required":
+                            raise
+                        # Recorded rather than raised: only a message that later matches should fail the block.
+                        attachment_list_error = exc.code or "attachment_list_failed"
                 message = _message_from_graph(item, item_attachments, include_body=include_body)
                 if message:
+                    message.attachment_list_error = attachment_list_error
                     messages.append(message)
                 if len(messages) >= max_results_clamped:
                     break

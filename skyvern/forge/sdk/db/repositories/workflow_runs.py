@@ -52,7 +52,7 @@ from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import DispatchFinalizationStatus, WorkflowRunTriggerType
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import NotFoundError, RunsListSearchCanceled
 from skyvern.forge.sdk.db.id import BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX, PERSISTENT_BROWSER_SESSION_ID
 from skyvern.forge.sdk.db.statement_timeout import apply_statement_timeout, is_statement_timeout
 from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
@@ -153,6 +153,17 @@ def _runs_list_search_id_prefix(search_key: str) -> str | None:
 
 def is_indexed_runs_list_search_key(search_key: str) -> bool:
     return _runs_list_search_id_prefix(search_key) in (BROWSER_PROFILE_PREFIX, PERSISTENT_BROWSER_SESSION_ID)
+
+
+def _is_bounded_runs_list_read(session: AsyncSession, search_key: str | None) -> bool:
+    """Whether a runs-list read runs under ``RUNS_LIST_STATEMENT_TIMEOUT_SECONDS``.
+
+    Only the unindexed free-text search is capped: query plans for the other filter shapes are not
+    known, and a complete browser identifier resolves through an indexed equality lookup.
+    """
+    if not search_key or is_indexed_runs_list_search_key(search_key):
+        return False
+    return session.bind.dialect.name == "postgresql"
 
 
 @dataclass(frozen=True)
@@ -1662,13 +1673,7 @@ class WorkflowRunsRepository(BaseRepository):
                         exc.hide_parameters = True
                     raise
 
-            # Only cap the unindexed free-text search until query plans for other filter shapes are known.
-            bounded_read = (
-                session.bind.dialect.name == "postgresql"
-                and search_key is not None
-                and search_key != ""
-                and not is_indexed_runs_list_search_key(search_key)
-            )
+            bounded_read = _is_bounded_runs_list_read(session, search_key)
             if bounded_read:
                 # Start after checkout so pool wait does not consume the connection-hold budget.
                 await session.connection()
@@ -3131,7 +3136,7 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
-    @db_operation("get_workflow_runs_for_workflow_permanent_id")
+    @db_operation("get_workflow_runs_for_workflow_permanent_id", expected_errors=(RunsListSearchCanceled,))
     async def get_workflow_runs_for_workflow_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -3151,6 +3156,12 @@ class WorkflowRunsRepository(BaseRepository):
         and complete browser or credential identifiers.
         """
         async with self.Session() as session:
+            statement_timeout_seconds: float | None = None
+            if _is_bounded_runs_list_read(session, search_key):
+                # Start after checkout so pool wait does not consume the connection-hold budget.
+                await session.connection()
+                statement_timeout_seconds = RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+                await apply_statement_timeout(session, statement_timeout_seconds)
             db_page = page - 1  # offset logic is 0 based
             query = (
                 select(WorkflowRunModel, WorkflowModel.title)
@@ -3172,7 +3183,18 @@ class WorkflowRunsRepository(BaseRepository):
             for subquery in run_tag_run_id_subqueries(run_tags, organization_id):
                 query = query.filter(WorkflowRunModel.workflow_run_id.in_(subquery))
             query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
-            workflow_runs_and_titles_tuples = (await session.execute(query)).all()
+            try:
+                workflow_runs_and_titles_tuples = (await session.execute(query)).all()
+            except StatementError as exc:
+                if not search_key or not is_statement_timeout(exc):
+                    raise
+                # Typed for the route to report, and only for this statement: a cancellation in any
+                # other query of the request is not the search's and keeps its own error and log.
+                exc.hide_parameters = True
+                raise RunsListSearchCanceled(
+                    indexed_search=is_indexed_runs_list_search_key(search_key),
+                    statement_timeout_seconds=statement_timeout_seconds,
+                ) from exc
             workflow_runs = [
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                 for run, title in workflow_runs_and_titles_tuples

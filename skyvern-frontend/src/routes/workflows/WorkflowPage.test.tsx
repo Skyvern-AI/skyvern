@@ -106,6 +106,10 @@ vi.mock("./hooks/useWorkflowQuery", () => ({
   }),
 }));
 
+vi.mock("./hooks/useGlobalWorkflowsQuery", () => ({
+  useGlobalWorkflowsQuery: () => ({ data: [], isError: false }),
+}));
+
 vi.mock("./hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: (props: unknown) => mockWorkflowRunsQuery(props),
 }));
