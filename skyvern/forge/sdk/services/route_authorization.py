@@ -60,6 +60,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.get_steps": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_task_v1": "task.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_task_v2": "task.read",
+    "skyvern.forge.sdk.routes.agent_protocol.export_tasks": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_tasks": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_version": "version.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_workflow": "workflow.read",
