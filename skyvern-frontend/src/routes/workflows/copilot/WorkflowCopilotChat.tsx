@@ -1559,6 +1559,7 @@ type CanonicalRecovery = {
   keepProposalTurnId?: string;
   // The turn whose proposal this Accept took, kept for a proposal with no token to say it.
   acceptedTurnId?: string | null;
+  acceptedOutcomeConfirmed?: boolean;
   acceptAttempt?: Pick<
     CopilotProposalMetadata,
     "owner_turn_id" | "revision" | "disposition"
@@ -4683,21 +4684,28 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId || !row.workflow_copilot_chat_id) return;
     const remaining = row.proposed_claim_expires_in_seconds;
     const metadata = row.proposed_workflow_metadata;
-    // The marker counts only for the proposal it was written for, so one that outlived its own
-    // Accept cannot claim a later proposal; a tokenless Accept's marker never matches.
+    // A tokenless marker is recoverable only when history positively records its turn as accepted.
     const stored = readStoredAccept(workflowPermanentId);
+    const sameChatStored =
+      stored?.chatId === row.workflow_copilot_chat_id ? stored : null;
+    const storedTurnId = sameChatStored?.acceptAttempt?.owner_turn_id;
+    const storedTurnAccepted =
+      storedTurnId != null && row.accepted_turn_ids?.includes(storedTurnId);
+    const storedReceiptMatchesProposal =
+      storedTurnAccepted &&
+      (!row.proposed_workflow || metadata?.owner_turn_id === storedTurnId);
     const ownStored =
-      stored !== null &&
+      sameChatStored !== null &&
       metadata != null &&
-      stored.chatId === row.workflow_copilot_chat_id &&
-      stored.acceptAttempt?.owner_turn_id === metadata.owner_turn_id &&
-      stored.acceptAttempt?.revision === metadata.revision
-        ? stored
+      sameChatStored.acceptAttempt?.owner_turn_id === metadata.owner_turn_id &&
+      sameChatStored.acceptAttempt?.revision === metadata.revision
+        ? sameChatStored
         : null;
     if (
       !(typeof remaining === "number" && remaining > 0) &&
       metadata?.disposition !== "accepting" &&
-      !ownStored
+      !ownStored &&
+      !storedReceiptMatchesProposal
     )
       return;
     const parked =
@@ -4716,6 +4724,10 @@ export function WorkflowCopilotChat({
       chatId: row.workflow_copilot_chat_id,
       acceptChatId: row.workflow_copilot_chat_id,
       acceptAttempt: ownStored?.acceptAttempt ?? metadata ?? null,
+      acceptedTurnId:
+        existing?.acceptedTurnId ??
+        sameChatStored?.acceptAttempt?.owner_turn_id ??
+        null,
       // History reports a live claim from any chat on the workflow, and a proposal can stay
       // accepting after its own claim died, so only this tab's stored Accept makes the claim its own.
       unattributedClaim: !ownStored,
@@ -5158,10 +5170,7 @@ export function WorkflowCopilotChat({
     [credentialGetter],
   );
 
-  // Clears the staged proposal unless it is provably another (another token, or another owner turn
-  // when the Accept had no token); missing identity clears, since keeping a replaced proposal is a
-  // false receipt. Without a token an accepting proposal never counts, as a tokenless one gets a
-  // fresh owner when its Accept claims it.
+  // Keep a staged proposal only when its token or legacy owner turn proves it is different.
   const settleAcceptedProposal = useCallback(
     (
       ownerTurnId: string | null,
@@ -5174,17 +5183,20 @@ export function WorkflowCopilotChat({
         setAcceptedTurnIds(accepted);
       }
       const staged = stagedProposalMetadata.current;
-      if (
-        staged !== null &&
-        (acceptedToken !== null
-          ? proposalTokenOf(staged) !== acceptedToken
-          : acceptedTurnId !== null &&
-            staged.disposition !== "accepting" &&
-            staged.owner_turn_id !== acceptedTurnId)
-      ) {
+      const differentProposal =
+        staged === null
+          ? acceptedTurnId !== null &&
+            pendingProposalTurnIdRef.current !== null &&
+            pendingProposalTurnIdRef.current !== acceptedTurnId
+          : acceptedToken !== null
+            ? proposalTokenOf(staged) !== acceptedToken
+            : acceptedTurnId !== null &&
+              staged.disposition !== "accepting" &&
+              staged.owner_turn_id !== acceptedTurnId;
+      if (differentProposal) {
         // Staging skips retagging while an Accept is pending, so the kept proposal still carries
         // the accepted one's tag, and with it that proposal's title and graph edits.
-        if (workflowPermanentId)
+        if (workflowPermanentId && staged !== null)
           useWorkflowTitleStore
             .getState()
             .trackCopilotMetadata(
@@ -5361,7 +5373,8 @@ export function WorkflowCopilotChat({
           );
           if (!applied) return false;
           const observedSave =
-            pending.savedFromApply === true &&
+            (pending.savedFromApply === true ||
+              pending.acceptedOutcomeConfirmed === true) &&
             !pending.gateAttempt?.wroteNothing;
           if (
             settleAcceptedProposal(
@@ -5449,6 +5462,16 @@ export function WorkflowCopilotChat({
               )
                 throw new Error("Accept recovery read cancelled");
               proposal = history.data.proposed_workflow;
+              pending.acceptedOutcomeConfirmed ||= Boolean(
+                !pending.gateAttempt?.wroteNothing &&
+                pending.acceptedTurnId &&
+                history.data.accepted_turn_ids?.includes(
+                  pending.acceptedTurnId,
+                ),
+              );
+              if (pending.acceptedOutcomeConfirmed && stillOnRecoveryChat()) {
+                applyChatRowProposal(history.data, autoAcceptWritesAtRead);
+              }
               const metadata = history.data.proposed_workflow_metadata;
               const attempt = pending.acceptAttempt;
               const remaining = history.data.proposed_claim_expires_in_seconds;
@@ -5673,6 +5696,17 @@ export function WorkflowCopilotChat({
               variant: "destructive",
             });
         }
+        if (
+          pending.acceptedOutcomeConfirmed &&
+          pending.acceptedTurnId &&
+          stillOnRecoveryChat() &&
+          settleAcceptedProposal(
+            pending.acceptedTurnId,
+            pending.gateAttempt?.token ?? null,
+            pending.acceptedTurnId,
+          )
+        )
+          setAcceptReceiptAnchor(gateReceiptAnchorRef.current);
         clearRecoveryProposal();
         if (pending.acceptChatId && stillOnRecoveryChat())
           setGateFailure(
@@ -5783,7 +5817,13 @@ export function WorkflowCopilotChat({
             revision: pendingProposalMetadata.revision,
             disposition: pendingProposalMetadata.disposition,
           }
-        : null;
+        : pendingProposalTurnId
+          ? {
+              owner_turn_id: pendingProposalTurnId,
+              revision: 1,
+              disposition: "review_untested" as const,
+            }
+          : null;
       const preservedSettings =
         structuredClone(saveData?.settings) ??
         (proposalPreservedSettings.current?.workflow === workflow
