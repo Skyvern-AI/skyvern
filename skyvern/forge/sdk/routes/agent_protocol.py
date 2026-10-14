@@ -34,6 +34,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from opentelemetry import trace
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from starlette.types import Receive, Scope, Send
 
 from skyvern import analytics
 from skyvern._version import __version__
@@ -66,7 +67,12 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     verify_artifact_signature,
 )
-from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.base import (
+    StoredObjectChangedError,
+    StoredObjectStream,
+    StreamingArtifactStorage,
+    artifact_filename_from_uri,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
@@ -3433,6 +3439,67 @@ def _artifact_content_response_headers(
     }
 
 
+# The most one storage read returns, so a response holds about this much however large the object is.
+_ARTIFACT_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+class _StoredArtifactResponse(StreamingResponse):
+    """Streams a stored artifact and closes its storage read however the response ends, disconnects included."""
+
+    def __init__(self, stream: StoredObjectStream, **kwargs: Any) -> None:
+        super().__init__(stream.iter_chunks(_ARTIFACT_STREAM_CHUNK_BYTES), **kwargs)
+        self._stream = stream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._stream.aclose()
+
+
+async def _stream_artifact_content(
+    storage: StreamingArtifactStorage,
+    artifact: Artifact,
+    range_header: str | None,
+    media_type: str,
+    headers: dict[str, str],
+) -> Response:
+    # A Range header resolves against the stored size exactly as it does against whole bytes, and the read is
+    # pinned to the version that was sized; an object replaced in between is sized again.
+    for _ in range(2):
+        byte_range: tuple[int, int] | None = None
+        etag: str | None = None
+        content_range: str | None = None
+        if range_header:
+            version = await storage.stat_artifact(artifact)
+            if version is None:
+                break
+            parsed_range = _parse_range_header(range_header, version.size)
+            if parsed_range == _RANGE_UNSATISFIABLE:
+                headers["Content-Range"] = f"bytes */{version.size}"
+                return Response(status_code=http_status.HTTP_416_RANGE_NOT_SATISFIABLE, headers=headers)
+            if parsed_range is not None:
+                byte_range, etag = parsed_range, version.etag
+                content_range = f"bytes {parsed_range[0]}-{parsed_range[1]}/{version.size}"
+        try:
+            stream = await storage.open_artifact_stream(artifact, byte_range=byte_range, etag=etag)
+        except StoredObjectChangedError:
+            continue
+        if stream is None:
+            break
+        headers["Content-Length"] = str(stream.content_length)
+        if content_range is None:
+            return _StoredArtifactResponse(stream, media_type=media_type, headers=headers)
+        headers["Content-Range"] = content_range
+        return _StoredArtifactResponse(
+            stream, status_code=http_status.HTTP_206_PARTIAL_CONTENT, media_type=media_type, headers=headers
+        )
+    raise HTTPException(
+        status_code=http_status.HTTP_404_NOT_FOUND,
+        detail="Artifact content not available",
+    )
+
+
 @base_router.get(
     "/artifacts/{artifact_id}/content",
     tags=["Artifacts"],
@@ -3505,12 +3572,6 @@ async def get_artifact_content(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-    if content is None:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail="Artifact content not available",
-        )
     media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
     signed_expiry_unix: int | None = None
@@ -3527,6 +3588,15 @@ async def get_artifact_content(
     headers["Accept-Ranges"] = "bytes"
     if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
         headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
+    storage = app.STORAGE
+    if isinstance(storage, StreamingArtifactStorage) and storage.can_stream_artifact(artifact):
+        return await _stream_artifact_content(storage, artifact, request.headers.get("range"), media_type, headers)
+    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+    if content is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
     content_length = len(content)
     parsed_range = _parse_range_header(request.headers.get("range"), content_length)
     if parsed_range == _RANGE_UNSATISFIABLE:
