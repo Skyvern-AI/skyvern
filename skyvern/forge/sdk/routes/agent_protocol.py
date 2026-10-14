@@ -1,14 +1,19 @@
 import asyncio
+import base64
+import binascii
 import json
 import random
+import re
 import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, urlparse
 
+import orjson
 import structlog
 import yaml
 from fastapi import (
@@ -25,7 +30,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi import status as http_status
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from opentelemetry import trace
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -3985,6 +3990,160 @@ async def run_task_v1(
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
+@dataclass(frozen=True)
+class TaskListFilters:
+    """The task filters shared by GET /tasks and GET /tasks/export, named as the repository's get_tasks takes them."""
+
+    task_status: list[TaskStatus] | None
+    workflow_run_id: str | None
+    only_standalone_tasks: bool
+    application: str | None
+    order_by_column: OrderBy
+    order: SortDirection
+
+
+def task_list_filters(
+    task_status: Annotated[list[TaskStatus] | None, Query()] = None,
+    workflow_run_id: Annotated[str | None, Query()] = None,
+    only_standalone_tasks: bool = Query(False),
+    application: Annotated[str | None, Query()] = None,
+    sort: OrderBy = Query(OrderBy.created_at),
+    order: SortDirection = Query(SortDirection.desc),
+) -> TaskListFilters:
+    if only_standalone_tasks and workflow_run_id:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+        )
+    return TaskListFilters(
+        task_status=sorted(task_status) if task_status else None,
+        workflow_run_id=workflow_run_id,
+        only_standalone_tasks=only_standalone_tasks,
+        application=application,
+        order_by_column=sort,
+        order=order,
+    )
+
+
+_TASK_CURSOR_MAX_LENGTH = 1024
+# A client can edit a decoded cursor, and a NUL or lone surrogate in the id would fail in the driver as a 500.
+_CURSOR_TASK_ID_PATTERN = re.compile(r"tsk_[A-Za-z0-9_]+")
+TASK_NEXT_CURSOR_HEADER = "X-Next-Cursor"
+
+
+def _task_cursor_scope(organization_id: str, filters: TaskListFilters) -> str:
+    # The positional layout is the cursor wire format; changing it rejects every cursor already handed out.
+    scope = [
+        organization_id,
+        filters.order_by_column,
+        filters.order,
+        filters.task_status or [],
+        filters.workflow_run_id,
+        filters.only_standalone_tasks,
+        filters.application,
+    ]
+    return calculate_sha256(json.dumps(scope))[:16]
+
+
+def _task_keyset_position(task: Task, sort: OrderBy) -> tuple[datetime, str]:
+    sort_value = task.created_at if sort == OrderBy.created_at else task.modified_at
+    if sort_value.tzinfo is not None:
+        sort_value = sort_value.astimezone(UTC).replace(tzinfo=None)
+    return sort_value, task.task_id
+
+
+def _encode_task_cursor(scope: str, task: Task, sort: OrderBy) -> str:
+    sort_value, task_id = _task_keyset_position(task, sort)
+    payload = json.dumps({"scope": scope, "after": [sort_value.isoformat(), task_id]}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _decode_task_cursor(cursor: str, scope: str) -> tuple[datetime, str] | None:
+    if cursor == "":
+        return None
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        cursor_scope = decoded["scope"]
+        sort_value_raw, task_id = decoded["after"]
+        if not isinstance(sort_value_raw, str) or not isinstance(task_id, str):
+            raise ValueError
+        if not _CURSOR_TASK_ID_PATTERN.fullmatch(task_id):
+            raise ValueError
+        sort_value = datetime.fromisoformat(sort_value_raw)
+        if sort_value.tzinfo is not None:
+            raise ValueError
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid cursor") from exc
+    if cursor_scope != scope:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="cursor was issued for a different organization, sort, order or filters; restart with cursor=''",
+        )
+    return sort_value, task_id
+
+
+TASK_EXPORT_BATCH_SIZE = 500
+
+
+def _ndjson_line(content: Any) -> bytes:
+    line = orjson.dumps(content, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)
+    # orjson leaves U+2028, U+2029 and U+0085 raw, and str.splitlines() splits on them. They can only occur inside
+    # JSON strings, so escaping them keeps each record on one line for any line reader.
+    return (
+        line.replace(b"\xe2\x80\xa8", b"\\u2028").replace(b"\xe2\x80\xa9", b"\\u2029").replace(b"\xc2\x85", b"\\u0085")
+        + b"\n"
+    )
+
+
+def _serialize_task_export_batch(tasks: list[Task]) -> bytes:
+    return b"".join(_ndjson_line(task.to_task_response().model_dump()) for task in tasks)
+
+
+# Registered before /tasks/{task_id}, which would otherwise match "export" as a task id.
+@legacy_base_router.get("/tasks/export", tags=["agent"])
+@legacy_base_router.get("/tasks/export/", include_in_schema=False)
+async def export_tasks(
+    filters: Annotated[TaskListFilters, Depends(task_list_filters)],
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
+) -> StreamingResponse:
+    """
+    Stream every task matching the GET /tasks filters as newline-delimited JSON, one task per line.
+
+    After each full batch a {"cursor": "..."} line marks a checkpoint, and the stream ends with
+    {"export_complete": true, "task_count": N}. A stream without that last line was cut off: drop the task lines after
+    its last checkpoint and resume by passing that cursor back. Cursors from GET /tasks with the same filters also work.
+    Each batch is a fresh query, so an export is not a snapshot: with sort=modified_at or a task_status filter, a task
+    that changes during the export (or before a resume) can be skipped or written twice.
+    """
+    analytics.capture("skyvern-oss-agent-tasks-export")
+    organization_id = current_org.organization_id
+    scope = _task_cursor_scope(organization_id, filters)
+    start_after = _decode_task_cursor(cursor or "", scope)
+
+    async def batches() -> AsyncIterator[bytes]:
+        after = start_after
+        task_count = 0
+        while True:
+            tasks = await app.DATABASE.tasks.get_tasks(
+                page_size=TASK_EXPORT_BATCH_SIZE,
+                organization_id=organization_id,
+                keyset=True,
+                after=after,
+                **asdict(filters),
+            )
+            if tasks:
+                task_count += len(tasks)
+                yield await asyncio.to_thread(_serialize_task_export_batch, tasks)
+            if len(tasks) < TASK_EXPORT_BATCH_SIZE:
+                yield _ndjson_line({"export_complete": True, "task_count": task_count})
+                return
+            after = _task_keyset_position(tasks[-1], filters.order_by_column)
+            yield _ndjson_line({"cursor": _encode_task_cursor(scope, tasks[-1], filters.order_by_column)})
+
+    return StreamingResponse(batches(), media_type="application/x-ndjson")
+
+
 @legacy_base_router.get(
     "/tasks/{task_id}",
     tags=["agent"],
@@ -4393,18 +4552,19 @@ async def retry_webhook(
     include_in_schema=False,
 )
 async def get_tasks(
+    filters: Annotated[TaskListFilters, Depends(task_list_filters)],
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
-    task_status: Annotated[list[TaskStatus] | None, Query()] = None,
-    workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    only_standalone_tasks: bool = Query(False),
-    application: Annotated[str | None, Query()] = None,
-    sort: OrderBy = Query(OrderBy.created_at),
-    order: SortDirection = Query(SortDirection.desc),
+    cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
 ) -> Response:
     """
     Get all tasks.
+    :param cursor: Opt-in keyset pagination. Pass an empty cursor to start, then the X-Next-Cursor response header
+        to continue; the header is absent on the last page. Rows are ordered by (sort, task_id) and page must stay 1.
+        A cursor only works with the organization, sort, order and filters it was issued for. Each page is a fresh
+        query, so a walk is not a snapshot: with sort=modified_at or a task_status filter, a task that changes during
+        the walk can be skipped or returned twice.
     :param page: Starting page, defaults to 1
     :param page_size: Page size, defaults to 10
     :param task_status: Task status filter
@@ -4416,25 +4576,34 @@ async def get_tasks(
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
-    if only_standalone_tasks and workflow_run_id:
+    if cursor is None:
+        tasks = await app.DATABASE.tasks.get_tasks(
+            page, page_size, organization_id=current_org.organization_id, **asdict(filters)
+        )
+        # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
+        # in a thread keeps it from stalling every other request on the event loop.
+        return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+
+    if page != 1:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
-            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+            detail="page cannot be combined with cursor",
         )
+    scope = _task_cursor_scope(current_org.organization_id, filters)
     tasks = await app.DATABASE.tasks.get_tasks(
-        page,
-        page_size,
-        task_status=task_status,
-        workflow_run_id=workflow_run_id,
+        page_size=page_size + 1,
         organization_id=current_org.organization_id,
-        only_standalone_tasks=only_standalone_tasks,
-        order=order,
-        order_by_column=sort,
-        application=application,
+        keyset=True,
+        after=_decode_task_cursor(cursor, scope),
+        **asdict(filters),
     )
-    # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
-    # in a thread keeps it from stalling every other request on the event loop.
-    return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+    page_tasks = tasks[:page_size]
+    response = await asyncio.to_thread(
+        lambda: ORJSONResponse([task.to_task_response().model_dump() for task in page_tasks])
+    )
+    if len(tasks) > page_size:
+        response.headers[TASK_NEXT_CURSOR_HEADER] = _encode_task_cursor(scope, page_tasks[-1], filters.order_by_column)
+    return response
 
 
 _RUN_IDENTIFIER_SEARCH_DESCRIPTION = (
