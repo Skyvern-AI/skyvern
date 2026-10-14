@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -15,8 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import yaml
+from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -819,7 +822,9 @@ class TestMCPFailedStepLoopDetection:
             observed_session_ids.append(current.context.session_id if current.context else None)
             observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
             assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
-            return SimpleNamespace(data=b"fake-png")
+            png = io.BytesIO()
+            Image.new("RGB", (1920, 947)).save(png, format="PNG")
+            return ScreenshotResult(data=png.getvalue(), viewport_css_px=(1920, 947))
 
         monkeypatch.setattr(browser_tools, "do_screenshot", fake_do_screenshot)
 
@@ -858,6 +863,7 @@ class TestMCPFailedStepLoopDetection:
         assert result.isError is False
         assert parsed["ok"] is True
         assert parsed["data"]["screenshot_base64"]
+        assert [entry.provenance.viewport_css_px for entry in ctx.pending_screenshots] == [(1920, 947)]
         assert observed_session_ids == ["pbs_copilot"]
         assert observed_localhost_access == [True]
         fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()

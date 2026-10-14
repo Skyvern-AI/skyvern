@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -28,6 +30,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 from playwright.sync_api import sync_playwright
 
@@ -62,6 +65,12 @@ from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workf
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     OriginRunRedactionRegistry,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+    ScreenshotProvenance,
+    resize_screenshot_b64,
 )
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
@@ -1354,6 +1363,33 @@ def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
     The record is plain interaction dicts, so this only spares tests the brace noise.
     """
     return dict(fields)
+
+
+def captured_frame_entry(width: int = 1920, height: int = 947) -> ScreenshotEntry:
+    """A frame staged from a real PNG; each call is a new capture event."""
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (40, 90, 160)).save(buf, format="PNG")
+    return resize_screenshot_b64(
+        base64.b64encode(buf.getvalue()).decode("ascii"),
+        provenance=ScreenshotProvenance(
+            source_tool="get_browser_screenshot",
+            captured_url="https://example.com/page",
+            observation_step=None,
+            browser_session_id="pbs_123",
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.TOOL_RESULT,
+            viewport_css_px=(width, height),
+        ),
+    )
+
+
+def sent_image_px(message: Any) -> list[tuple[int, int]]:
+    content = message.get("content") if isinstance(message, dict) else None
+    return [
+        Image.open(io.BytesIO(base64.b64decode(part["image_url"].partition(";base64,")[2]))).size
+        for part in (content if isinstance(content, list) else [])
+        if part.get("type") == "input_image"
+    ]
 
 
 def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
