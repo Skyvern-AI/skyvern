@@ -1966,107 +1966,136 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     "500 unchanged",
     "cleared unchanged",
     "pending newer commit",
-  ])("settles uncertain Accept from proposal evidence: %s", async (outcome) => {
-    const baseline = {
-      ...saveData.workflow,
-      version: 1,
-      modified_at: "2026-09-01T00:00:00Z",
-    };
-    saveData.workflow = baseline;
-    const canonical = {
-      ...baseline,
-      ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
-      version: 2,
-      modified_at: "2026-09-02T00:00:00Z",
-    };
-    historyResponse.data.proposed_workflow = canonical;
-    if (!outcome.startsWith("legacy")) {
-      historyResponse.data.proposed_workflow_metadata = {
-        owner_turn_id: "turn-recovered",
-        revision: 1,
-        canonical_fingerprint: "baseline",
-        disposition: "review_untested",
-        workflow_run_id: null,
+  ])(
+    "settles uncertain Accept only from a recorded outcome: %s",
+    async (outcome) => {
+      const baseline = {
+        ...saveData.workflow,
+        version: 1,
+        modified_at: "2026-09-01T00:00:00Z",
       };
-      historyResponse.data.chat_history = pausedHistory().chat_history;
-    }
-    const apply = vi.fn();
-    await renderChat({ onWorkflowUpdate: apply });
-    const accept = await screen.findByRole(
-      "button",
-      { name: "Accept" },
-      { timeout: 10_000 },
-    );
-    const owner = createYamlCommitOwner("wpid_1");
-    registerEditorOwner(owner);
-    cancelPost.mockRejectedValueOnce(
-      Object.assign(new Error("accept failed"), {
-        response: { status: 500 },
-      }),
-    );
-    if (["500 unchanged", "pending newer commit"].includes(outcome)) {
-      historyResponse.data.proposed_workflow_metadata = {
-        ...historyResponse.data.proposed_workflow_metadata!,
-        disposition: "accepting",
-        claimed_at: new Date(Date.now() - 301_000).toISOString(),
+      saveData.workflow = baseline;
+      const canonical = {
+        ...baseline,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
+        version: 2,
+        modified_at: "2026-09-02T00:00:00Z",
       };
-    }
-    const committed =
-      outcome.endsWith("commit") || outcome === "cleared unchanged";
-    const saved = outcome === "cleared unchanged" ? baseline : canonical;
-    historyGet.mockImplementation((path: string) =>
-      Promise.resolve(
-        path === "/workflows/wpid_1"
-          ? { data: committed ? saved : baseline }
-          : historyResponse,
-      ),
-    );
-    historyGet.mockClear();
-    vi.useFakeTimers();
-    await act(async () => fireEvent.click(accept));
-    expect(apply).not.toHaveBeenCalled();
-    expect(historyGet).not.toHaveBeenCalled();
-    expect(beginSaveTransaction(owner)).toBe(false);
-    if (committed && outcome !== "pending newer commit")
-      historyResponse.data.proposed_workflow = null;
-    await act(async () => vi.advanceTimersByTimeAsync(2_000));
-    if (
-      ["legacy unchanged", "500 unchanged", "pending newer commit"].includes(
-        outcome,
-      )
-    ) {
-      expect(apply).not.toHaveBeenCalled();
-      expect(beginSaveTransaction(owner)).toBe(false);
-      await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
-      expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
-      expect(beginSaveTransaction(owner)).toBe(false);
-      return;
-    }
-    expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-      "/workflow/copilot/chat-history",
-      "/workflows/wpid_1",
-    ]);
-    expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
-      workflow_copilot_chat_id: "chat-1",
-    });
-    if (committed)
-      expect(apply).toHaveBeenCalledWith(
-        saved,
-        expect.objectContaining({ persisted: true }),
+      historyResponse.data.proposed_workflow = canonical;
+      if (!outcome.startsWith("legacy")) {
+        historyResponse.data.proposed_workflow_metadata = {
+          owner_turn_id: "turn-recovered",
+          revision: 1,
+          canonical_fingerprint: "baseline",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        };
+        historyResponse.data.chat_history = pausedHistory().chat_history;
+      }
+      const accepted = outcome === "interrupted commit";
+      if (accepted) historyResponse.data.chat_history = [];
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole(
+        "button",
+        { name: "Accept" },
+        { timeout: 10_000 },
       );
-    else {
-      expect(apply).not.toHaveBeenCalled();
-      expect(toast).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: "Accept failed",
-          variant: "destructive",
+      const owner = createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      cancelPost.mockRejectedValueOnce(
+        Object.assign(new Error("accept failed"), {
+          response: { status: 500 },
         }),
       );
-      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-    }
-    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
-    expect(beginSaveTransaction(owner)).toBe(true);
-  });
+      if (["500 unchanged", "pending newer commit"].includes(outcome)) {
+        historyResponse.data.proposed_workflow_metadata = {
+          ...historyResponse.data.proposed_workflow_metadata!,
+          disposition: "accepting",
+          claimed_at: new Date(Date.now() - 301_000).toISOString(),
+        };
+      }
+      const committed =
+        outcome.endsWith("commit") || outcome === "cleared unchanged";
+      const saved = outcome === "cleared unchanged" ? baseline : canonical;
+      if (accepted) historyResponse.data.accepted_turn_ids = ["turn-recovered"];
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: committed ? saved : baseline }
+            : historyResponse,
+        ),
+      );
+      historyGet.mockClear();
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(accept));
+      expect(apply).not.toHaveBeenCalled();
+      expect(historyGet).not.toHaveBeenCalled();
+      expect(beginSaveTransaction(owner)).toBe(false);
+      if (committed && outcome !== "pending newer commit")
+        historyResponse.data.proposed_workflow = null;
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      if (!accepted) {
+        expect(
+          screen.queryByText("Accepted and saved to the workflow"),
+        ).toBeNull();
+        if (outcome === "cleared unchanged") {
+          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+            "/workflow/copilot/chat-history",
+            "/workflows/wpid_1",
+          ]);
+          expect(apply).toHaveBeenCalledWith(
+            saved,
+            expect.objectContaining({ persisted: true }),
+          );
+          expect(beginSaveTransaction(owner)).toBe(true);
+        }
+        if (
+          [
+            "legacy unchanged",
+            "500 unchanged",
+            "pending newer commit",
+          ].includes(outcome)
+        ) {
+          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+            "/workflow/copilot/chat-history",
+          ]);
+          expect(apply).not.toHaveBeenCalled();
+          expect(beginSaveTransaction(owner)).toBe(false);
+          await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
+          expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+          expect(beginSaveTransaction(owner)).toBe(false);
+        }
+        return;
+      }
+      expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+        "/workflow/copilot/chat-history",
+        "/workflows/wpid_1",
+      ]);
+      expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
+        workflow_copilot_chat_id: "chat-1",
+      });
+      if (committed)
+        expect(apply).toHaveBeenCalledWith(
+          saved,
+          expect.objectContaining({ persisted: true }),
+        );
+      else {
+        expect(apply).not.toHaveBeenCalled();
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Accept failed",
+            variant: "destructive",
+          }),
+        );
+        expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+      }
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+    },
+  );
 
   it.each(["canonical", "proposal"])(
     "retains uncertain Accept only while the %s read fails, then Retry settles",
@@ -13556,7 +13585,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     "cleared unchanged",
     "pending newer commit",
   ])(
-    "A42 settles uncertain Accept from proposal evidence: %s",
+    "A42 settles uncertain Accept only from a recorded outcome: %s",
     async (outcome) => {
       changesState.hasChanges = true;
       const baseline = {
@@ -13599,6 +13628,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       const committed =
         outcome.endsWith("commit") || outcome === "cleared unchanged";
       const saved = outcome === "cleared unchanged" ? baseline : canonical;
+      const accepted = outcome === "interrupted commit";
+      if (accepted) historyResponse.data.accepted_turn_ids = ["turn-recovered"];
       historyGet.mockImplementation((path: string) =>
         Promise.resolve(
           path === "/workflows/wpid_1"
@@ -13615,13 +13646,18 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       if (committed && outcome !== "pending newer commit")
         historyResponse.data.proposed_workflow = null;
       await act(async () => vi.advanceTimersByTimeAsync(2_000));
-      if (!committed || outcome === "pending newer commit") {
-        expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-          "/workflow/copilot/chat-history",
-        ]);
-        expect(apply).not.toHaveBeenCalled();
-        expect(beginSaveTransaction(owner)).toBe(false);
-        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      if (!accepted) {
+        expect(
+          screen.queryByText("Accepted and saved to the workflow"),
+        ).toBeNull();
+        if (!committed || outcome === "pending newer commit") {
+          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+            "/workflow/copilot/chat-history",
+          ]);
+          expect(apply).not.toHaveBeenCalled();
+          expect(beginSaveTransaction(owner)).toBe(false);
+          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+        }
         return;
       }
       expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
@@ -13791,6 +13827,7 @@ describe("A46 Accept recovery", () => {
     expect(beginSaveTransaction(owner)).toBe(false);
     historyResponse.data.proposed_workflow = null;
     historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.accepted_turn_ids = ["turn-pending"];
     const canonical = { ...saveData.workflow, version: 2 };
     historyGet.mockImplementation((path: string) =>
       Promise.resolve(
@@ -13855,6 +13892,214 @@ describe("A46 Accept recovery", () => {
     expect(
       useWorkflowYamlEditorStore.getState().copilotAcceptance,
     ).not.toBeNull();
+  });
+
+  it.each([true, false])(
+    "recovers a tokenless Accept receipt only when history names its turn: %s",
+    async (accepted) => {
+      historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+      historyResponse.data.proposed_workflow_metadata = null;
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Draft ready.",
+          created_at: new Date().toISOString(),
+          turn_outcome: {
+            copilot_turn_id: "turn-tokenless",
+            terminal_reason: null,
+          },
+          narrative_payload: proposalNarrativePayload({
+            turnId: "turn-tokenless",
+          }),
+        },
+      ];
+      const canonical = {
+        ...saveData.workflow,
+        ...proposedWorkflowPayload({ workflow_id: "wf_accepted", version: 2 }),
+      };
+      const recoveredHistory = {
+        data: {
+          ...structuredClone(historyResponse.data),
+          proposed_workflow: null,
+          accepted_turn_ids: accepted ? ["turn-tokenless"] : [],
+        },
+      };
+      const apply = vi.fn();
+      await renderChat({ onWorkflowUpdate: apply });
+      const accept = await screen.findByRole("button", { name: "Accept" });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : recoveredHistory,
+        ),
+      );
+      cancelPost.mockRejectedValueOnce(new Error("Accept response lost"));
+      await act(async () => {
+        fireEvent.click(accept);
+      });
+
+      await waitFor(() => expect(apply).toHaveBeenCalledOnce());
+      if (accepted) {
+        expect(
+          await screen.findByText("Accepted and saved to the workflow"),
+        ).toBeTruthy();
+      } else {
+        expect(
+          screen.queryByText("Accepted and saved to the workflow"),
+        ).toBeNull();
+      }
+      expect(
+        cancelPost.mock.calls.find(
+          ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+        )?.[1],
+      ).toMatchObject({ owner_turn_id: "turn-tokenless" });
+    },
+  );
+
+  it("recovers a tokenless Accept receipt after reload from its accepted turn", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: "turn-tokenless",
+      revision: 1,
+      canonical_fingerprint: "baseline",
+      disposition: "accepting",
+      workflow_run_id: null,
+    };
+    historyResponse.data.proposed_claim_expires_in_seconds = 120;
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Draft ready.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-tokenless",
+          terminal_reason: null,
+        },
+        narrative_payload: proposalNarrativePayload({
+          turnId: "turn-tokenless",
+        }),
+      },
+    ];
+    storeOwnAccept();
+    const claimedHistory = structuredClone(historyResponse);
+    claimedHistory.data.proposed_workflow = null;
+    claimedHistory.data.proposed_workflow_metadata = null;
+    claimedHistory.data.accepted_turn_ids = [];
+    const acceptedHistory = {
+      data: {
+        ...claimedHistory.data,
+        proposed_claim_expires_in_seconds: null,
+        accepted_turn_ids: ["turn-tokenless"],
+      },
+    };
+    let acceptingHistoryReads = 0;
+    historyGet.mockClear();
+    historyGet.mockImplementation(
+      (
+        path: string,
+        config?: { params?: { workflow_copilot_chat_id?: string } },
+      ) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saveData.workflow }
+            : config?.params?.workflow_copilot_chat_id === "chat-1"
+              ? ++acceptingHistoryReads === 1
+                ? claimedHistory
+                : acceptedHistory
+              : claimedHistory,
+        ),
+    );
+    vi.useFakeTimers();
+    await renderChat();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(screen.getByText("Accepted and saved to the workflow")).toBeTruthy();
+  });
+
+  it("recovers a completed Accept receipt already present in the first history read", async () => {
+    const acceptedHistory = {
+      data: {
+        ...structuredClone(historyResponse.data),
+        proposed_workflow: null,
+        proposed_workflow_metadata: null,
+        proposed_claim_expires_in_seconds: null,
+        accepted_turn_ids: ["turn-tokenless"],
+        chat_history: [
+          {
+            sender: "ai",
+            content: "Draft ready.",
+            created_at: new Date().toISOString(),
+            turn_outcome: {
+              copilot_turn_id: "turn-tokenless",
+              terminal_reason: null,
+            },
+            narrative_payload: proposalNarrativePayload({
+              turnId: "turn-tokenless",
+            }),
+          },
+        ],
+      },
+    };
+    const canonical = {
+      ...saveData.workflow,
+      ...proposedWorkflowPayload({ workflow_id: "wf_accepted", version: 2 }),
+    };
+    storePendingAccept("wpid_1", {
+      chatId: "chat-1",
+      acceptAttempt: {
+        owner_turn_id: "turn-tokenless",
+        revision: 1,
+        disposition: "review_untested",
+      },
+      alwaysAccept: false,
+    });
+    historyGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1" ? { data: canonical } : acceptedHistory,
+      ),
+    );
+    const apply = vi.fn();
+    vi.useFakeTimers();
+    await renderChat({ onWorkflowUpdate: apply });
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(apply).toHaveBeenCalledOnce();
+    expect(screen.getByText("Accepted and saved to the workflow")).toBeTruthy();
+  });
+
+  it("does not recover an old receipt while a newer tokenless proposal is present", async () => {
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = null;
+    historyResponse.data.accepted_turn_ids = ["turn-previous"];
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Draft ready.",
+        created_at: new Date().toISOString(),
+        turn_outcome: {
+          copilot_turn_id: "turn-current",
+          terminal_reason: null,
+        },
+        narrative_payload: proposalNarrativePayload({ turnId: "turn-current" }),
+      },
+    ];
+    storePendingAccept("wpid_1", {
+      chatId: "chat-1",
+      acceptAttempt: {
+        owner_turn_id: "turn-previous",
+        revision: 1,
+        disposition: "review_untested",
+      },
+      alwaysAccept: false,
+    });
+    vi.useFakeTimers();
+    await renderChat();
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    const owner = createYamlCommitOwner("wpid_1");
+    registerEditorOwner(owner);
+    expect(beginSaveTransaction(owner)).toBe(true);
   });
 
   it.each([null, 0, -1])(
@@ -14303,6 +14548,15 @@ async function checkSerializedAcceptRecovery(
   first: "aborted" | "failed" | "live",
 ) {
   historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+  historyResponse.data.chat_history = [
+    {
+      sender: "ai",
+      content: "Draft ready.",
+      created_at: new Date().toISOString(),
+      turn_outcome: { copilot_turn_id: "turn-1", terminal_reason: null },
+      narrative_payload: proposalNarrativePayload({ turnId: "turn-1" }),
+    },
+  ];
   const apply = vi.fn();
   await renderChat({ onWorkflowUpdate: apply });
   vi.useFakeTimers();
@@ -14382,6 +14636,7 @@ async function checkSerializedAcceptRecovery(
     reads[1]!.resolve({
       data: {
         ...historyResponse.data,
+        accepted_turn_ids: ["turn-1"],
         proposed_workflow: null,
         proposed_claim_expires_in_seconds: null,
       },
