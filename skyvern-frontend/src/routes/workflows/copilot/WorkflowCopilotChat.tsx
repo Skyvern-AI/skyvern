@@ -9,6 +9,7 @@ import {
   type AcceptAttempt,
   applyWroteNothing,
   type GateFailure,
+  gateFailureAllowsAction,
   proposalTokenOf,
   definitiveAcceptRejection,
 } from "./acceptFence";
@@ -10295,19 +10296,19 @@ export function WorkflowCopilotChat({
     gateFailure?.kind === "saved" ||
     gateFailure?.kind === "recover" ||
     gateFailure?.kind === "changed";
-  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate's
-  // footer waits for idle. Another writer's claim holds the workflow, and an Accept now would only
-  // be refused.
-  const gateActionsShown =
-    gateHasSubject && !isLoading && !isLoadingHistory && !unattributedClaim;
-  // Accept, Reject and Test write over the proposal, so they wait out an Accept whose outcome is
-  // unresolved, and a proposal that could not be re-read.
+  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate waits
+  // for idle. Another writer's claim holds the workflow, and an Accept now would only be refused.
+  const gateIdleAndUnclaimed =
+    !isLoading && !isLoadingHistory && !unattributedClaim;
+  const gateActionsShown = gateHasSubject && gateIdleAndUnclaimed;
+  // A different question from the one above, asked from its own subject: Accept, Reject and Test
+  // write over a staged proposal, so they need one in hand, they wait out an Accept whose outcome
+  // is unresolved, and they stay dark in the gates that may not write at all.
   const gateActionable =
-    gateActionsShown &&
+    Boolean(proposedWorkflow) &&
+    gateIdleAndUnclaimed &&
     !isAccepting &&
-    gateFailureKind !== "reload" &&
-    gateFailureKind !== "recover" &&
-    gateFailureKind !== "saved";
+    gateFailureAllowsAction(gateFailureKind);
   // The chip jumps to the gate, so it waits for the gate's footer rather than pointing at a card
   // with nothing to click.
   const pendingChipVisible = Boolean(
