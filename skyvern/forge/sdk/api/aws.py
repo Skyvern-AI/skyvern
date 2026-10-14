@@ -358,6 +358,27 @@ class _SharedS3Client:
                 await context.__aexit__(None, None, None)
 
 
+class S3ObjectStream:
+    """An open GetObject read in bounded chunks; it holds its shared-client lease until ``aclose``, so retiring that
+    client (a session refresh) cannot close the connection the body is still read from."""
+
+    def __init__(self, response: dict[str, Any], lease: contextlib.AsyncExitStack) -> None:
+        self.content_length: int = response["ContentLength"]
+        self.etag: str | None = response.get("ETag")
+        self._body = response["Body"]
+        self._lease = lease
+
+    def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        return self._body.iter_chunks(chunk_size)
+
+    async def aclose(self) -> None:
+        # An unfinished body drops its connection instead of returning it to the pool with unread bytes.
+        try:
+            self._body.close()
+        finally:
+            await self._lease.aclose()
+
+
 def _retire_shared_s3_clients(registry: dict[asyncio.AbstractEventLoop, _SharedS3Client]) -> None:
     for loop, shared in list(registry.items()):
         with contextlib.suppress(RuntimeError):  # the loop is already closed
@@ -1340,21 +1361,46 @@ class AsyncAWSClient:
         try:
             return await self._s3_with_retry("download", _op, uri=uri)
         except Exception as e:
-            # A missing object is terminal not-found, not a transient failure (e.g. first-run
-            # profile restore before any archive exists). Log once without a traceback so callers
-            # fall back immediately instead of surfacing repeated ERROR tracebacks.
-            if self._is_not_found_error(e):
-                if log_exception:
-                    LOG.info("S3 object not found", uri=uri)
-                return None
-            # An archived object stays unreadable until restored, so a traceback per request adds nothing.
-            if self._is_archived_object_error(e):
-                if log_exception:
-                    LOG.warning("S3 object is archived and not restored", uri=uri)
-                return None
             if log_exception:
-                LOG.exception("S3 download failed", uri=uri)
+                self.log_download_failure(e, uri)
             return None
+
+    def log_download_failure(self, error: Exception, uri: str) -> None:
+        """Log a failed object read; call it from the ``except`` block so a real failure keeps its traceback."""
+        # A missing object is terminal not-found, not a transient failure (e.g. first-run
+        # profile restore before any archive exists). Log once without a traceback so callers
+        # fall back immediately instead of surfacing repeated ERROR tracebacks.
+        if self._is_not_found_error(error):
+            LOG.info("S3 object not found", uri=uri)
+        # An archived object stays unreadable until restored, so a traceback per request adds nothing.
+        elif self._is_archived_object_error(error):
+            LOG.warning("S3 object is archived and not restored", uri=uri)
+        else:
+            LOG.exception("S3 download failed", uri=uri)
+
+    async def open_download_stream(
+        self, uri: str, *, byte_range: tuple[int, int] | None = None, if_match: str | None = None
+    ) -> S3ObjectStream:
+        """GetObject without reading the body, which the caller must ``aclose``; ``byte_range`` is inclusive, and an
+        ``if_match`` that no longer names the stored object raises ``PreconditionFailed`` like any get_object error."""
+        parsed_uri = S3Uri(uri)
+        params: dict[str, Any] = {"Bucket": parsed_uri.bucket, "Key": parsed_uri.key}
+        if byte_range is not None:
+            params["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
+        if if_match is not None:
+            params["IfMatch"] = if_match
+
+        async def _op() -> S3ObjectStream:
+            lease = contextlib.AsyncExitStack()
+            try:
+                client = await lease.enter_async_context(self._s3_client())
+                response = await client.get_object(**params)
+            except BaseException:
+                await lease.aclose()
+                raise
+            return S3ObjectStream(response, lease)
+
+        return await self._s3_with_retry("download", _op, uri=uri)
 
     async def delete_file(self, uri: str, log_exception: bool = True, raise_on_error: bool = False) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html

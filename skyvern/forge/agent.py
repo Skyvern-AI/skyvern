@@ -204,6 +204,11 @@ from skyvern.forge.taskv3.goal_check import (
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
 from skyvern.forge.taskv3.loop import ACTION_BLOCK_TARGET_ACTION_RESERVE, LoopOutcome, RoundAction
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
+from skyvern.forge.taskv3.provider_downloads import (
+    PROVIDER_BASELINE_TIMEOUT_SECONDS,
+    PROVIDER_DOWNLOAD_WAIT_SECONDS,
+    ProviderDownloadRecovery,
+)
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     LOGIN_PACE_FLAG,
@@ -2638,6 +2643,31 @@ class ForgeAgent:
                     super().add(name)
 
         staged_downloads: set[str] = _StagedDownloads()
+
+        # Frozen before the first action so a provider file an earlier block left is never this block's.
+        provider_recovery: ProviderDownloadRecovery | None = None
+        provider_source = (
+            browser_state.browser_artifacts.get_action_download_source()
+            if task_block is not None and task_block.complete_on_download and workflow_download_directory is not None
+            else None
+        )
+        if provider_source is not None and workflow_download_directory is not None:
+            provider_recovery = await ProviderDownloadRecovery.begin(
+                provider_source,
+                download_dir=workflow_download_directory,
+                browser_context=browser_state.browser_context,
+                deadline=time.monotonic() + min(PROVIDER_BASELINE_TIMEOUT_SECONDS, loop_deadline_at - time.monotonic()),
+            )
+            # A file that landed while the provider baseline was awaited predates this block's first action,
+            # whether or not the baseline read succeeded.
+            download_baseline_files = [
+                *(download_baseline_files or []),
+                *list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at),
+            ]
+
+        def _provider_wait_seconds(block: BaseTaskBlock) -> float:
+            return min(block.download_timeout or PROVIDER_DOWNLOAD_WAIT_SECONDS, loop_deadline_at - time.monotonic())
+
         completion_probe: CompletionProbe | None = None
         completion_blocker: CompletionBlocker | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
@@ -2662,6 +2692,16 @@ class ForgeAgent:
                 if cancelled:
                     # The run is being canceled; even if a file landed while we waited, don't
                     # finalize it into a `completed` result out from under the cancellation.
+                    return None
+                if provider_recovery is not None and await provider_recovery.recover(
+                    staged=staged,
+                    timeout=_provider_wait_seconds(complete_on_download_block),
+                    should_cancel=_should_cancel,
+                ):
+                    return None
+                # Either wait can return inside its first poll interval without having checked; a cancel that
+                # landed meanwhile must not be finalized into a `completed` result.
+                if await _should_cancel():
                     return None
                 staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
                 new_files = await self._finalize_downloaded_files_for_task(

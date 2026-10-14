@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERI
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3 import provider_downloads as taskv3_provider_downloads
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
@@ -102,6 +104,14 @@ from skyvern.webeye.actions.actions import (
     SelectOptionAction,
     SolveCaptchaAction,
     UploadFileAction,
+)
+from tests.unit._download_provider_fakes import (
+    _ActionDownloadSource,
+    _FakeActionDownloadObservation,
+    _FakeBrowserDownloadMonitor,
+    _GatedCleanupObservation,
+    _secret_bearing_validation_error,
+    _StallingActionDownloadObservation,
 )
 from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -2291,6 +2301,10 @@ async def _run_execute_task_v3_download(
     loop_fn: Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     complete_on_download: bool = True,
     browser_session_id: str | None = None,
+    provider_source: object | None = None,
+    download_monitor: object | None = None,
+    download_timeout: float | None = None,
+    cancel_after_checks: int | None = None,
 ) -> dict[str, Any]:
     """Drive _execute_task_v3 for a complete_on_download block, capturing the loop kwargs.
 
@@ -2321,9 +2335,30 @@ async def _run_execute_task_v3_download(
     browser_state.get_working_page = AsyncMock(return_value=page)
     browser_state.take_post_action_screenshot = AsyncMock(return_value=b"png-bytes")
 
-    block = _make_block(block_cls, complete_on_download=complete_on_download, download_suffix=download_suffix)
+    # A real session without a provider-owned download store attaches no source; the bare MagicMock
+    # default would otherwise look like one.
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=provider_source)
+    browser_state.browser_context._skyvern_cdp_download_interceptor = download_monitor
 
-    captured: dict[str, Any] = {}
+    block_overrides: dict[str, Any] = {"complete_on_download": complete_on_download, "download_suffix": download_suffix}
+    if download_timeout is not None:
+        block_overrides["download_timeout"] = download_timeout
+    block = _make_block(block_cls, **block_overrides)
+
+    cancel_checks = {"count": 0}
+
+    async def _get_task(**_kwargs: Any) -> Any:
+        cancel_checks["count"] += 1
+        canceled = cancel_after_checks is not None and cancel_checks["count"] > cancel_after_checks
+        return SimpleNamespace(status=TaskStatus.canceled if canceled else TaskStatus.running)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running)),
+    )
+
+    captured: dict[str, Any] = {"cancel_checks": cancel_checks}
 
     async def _default_loop_body(**kwargs: Any) -> LoopOutcome:
         if drop_file:
@@ -6776,3 +6811,545 @@ async def test_goal_judge_prompt_never_carries_a_registered_runtime_secret(monke
     for _ in range(3):
         assert redact("verification_code: 482913") == f"verification_code: {REDACTED_SECRET_PLACEHOLDER}"
     assert secret_set_builds == 1
+
+
+# ---------------------------------------------------------------------------
+# Provider-owned downloads: a vendor session can keep the browser's own save while the run's
+# out-of-band replay of the URL fails. The v3 download probe reads that file back into the run
+# download dir so the existing finalize/complete path sees it.
+# ---------------------------------------------------------------------------
+
+
+def _click_then_probe(
+    tmp_path: Path,
+    monitor: _FakeBrowserDownloadMonitor | None,
+    source: _ActionDownloadSource | None = None,
+    *,
+    local_file: str | None = None,
+    raise_event: bool = True,
+) -> Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]]:
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["begin_calls_at_loop_start"] = source.begin_calls if source is not None else None
+        if monitor is not None and raise_event:
+            monitor.browser_download_event_count += 1
+        if local_file is not None:
+            (tmp_path / local_file).write_bytes(b"local-bytes")
+        probe = kwargs["completion_probe"]
+        captured["probe_started_at"] = time.monotonic()
+        captured["probe_reason"] = await probe(frozenset())
+        captured["probe_returned_at"] = time.monotonic()
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    return _loop
+
+
+def _record_provider_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    sleeps: list[float] = []
+
+    async def _record(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(taskv3_provider_downloads, "asyncio", ScopedAsyncio(sleep=_record))
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_v3_download_reads_a_provider_owned_file_back_when_the_replay_saves_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")], empty_polls=2)
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        block_cls=FileDownloadBlock,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["begin_calls_at_loop_start"] == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+    assert len(observation.poll_deadlines) == 3
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_poll_the_provider_when_a_local_capture_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, local_file="report.pdf"),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert observation.poll_calls == 0
+    assert (tmp_path / "invoice.pdf").read_bytes() == b"local-bytes"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_waits_for_the_monitor_replay_before_polling_the_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A replay that is still in flight and then lands must win; polling the provider first would
+    # publish a second copy of the same download.
+    monitor = _FakeBrowserDownloadMonitor(
+        pending_checks=2, on_settle=lambda: (tmp_path / "report.pdf").write_bytes(b"replayed")
+    )
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert observation.poll_calls == 0
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["invoice.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_returns_promptly_without_polling_when_no_download_began(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = _record_provider_sleeps(monkeypatch)
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, raise_event=False),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_calls == 0
+    assert sleeps == [taskv3_provider_downloads.EVENT_ADMISSION_GRACE_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_keeps_distinct_provider_files_with_equal_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("summary.csv", b"same-bytes"), ("detail.csv", b"same-bytes")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (2 new file(s))"
+    landed = [p for p in tmp_path.iterdir() if p.is_file()]
+    assert len(landed) == 2
+    assert all(p.read_bytes() == b"same-bytes" for p in landed)
+
+
+@pytest.mark.asyncio
+async def test_v3_download_credits_only_files_new_since_the_block_began(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An earlier block's file is already in the run dir; it is neither a local capture for this
+    # block (which would suppress the provider read) nor a file this block delivered.
+    (tmp_path / "earlier.pdf").write_bytes(b"earlier")
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "earlier.pdf").read_bytes() == b"earlier"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_stops_reading_the_provider_when_the_run_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_calls == 1
+    # Returned well before the stalled poll's own deadline, so the cancel ended it.
+    assert captured["probe_returned_at"] < observation.poll_deadlines[0]
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_complete_from_a_provider_file_read_after_the_run_was_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The cancel lands during the action and the provider answers inside its first wait, so no cancel
+    # check runs between the read and finalize unless recover makes one.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_monitor_does_not_complete_from_a_provider_file_after_a_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, None, source),
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("baseline", ["listed", "unavailable", "failed"])
+async def test_v3_download_does_not_credit_a_file_that_landed_while_the_provider_baseline_was_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, baseline: str
+) -> None:
+    # An earlier block's download finishes while this block awaits the provider baseline, after the
+    # local baseline was already listed; the read may succeed, list nothing usable, or fail.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([])
+    source = _ActionDownloadSource(
+        None if baseline == "unavailable" else observation,
+        begin_error=RuntimeError("provider down") if baseline == "failed" else None,
+        on_begin=lambda: (tmp_path / "earlier.pdf").write_bytes(b"earlier-block"),
+    )
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, raise_event=False),
+    )
+
+    assert captured["probe_reason"] is None
+    assert (tmp_path / "earlier.pdf").read_bytes() == b"earlier-block"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_complete_from_a_local_file_after_the_run_was_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # No partial file means the in-flight wait never checks; the cancel must still win over finalize.
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=True, cancel_after_checks=0)
+
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"late")], empty_polls=10_000)
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=2.0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_deadlines
+    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
+        taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
+    )
+    assert all(
+        started < deadline
+        for started, deadline in zip(observation.poll_started_at, observation.poll_deadlines, strict=True)
+    )
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_keeps_the_local_path_when_the_provider_baseline_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    presigned = "https://downloads.example/file.csv?X-Amz-Signature=deadbeefsecret"
+    source = _ActionDownloadSource(
+        _StallingActionDownloadObservation(), begin_error=_secret_bearing_validation_error(presigned)
+    )
+    monitor = _FakeBrowserDownloadMonitor()
+
+    with capture_logs() as logs:
+        captured = await _run_execute_task_v3_download(
+            monkeypatch,
+            tmp_path,
+            drop_file=False,
+            provider_source=source,
+            download_monitor=monitor,
+            loop_fn=_click_then_probe(tmp_path, monitor, source, local_file="report.pdf"),
+        )
+
+    assert source.begin_calls == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert "deadbeefsecret" not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_take_a_staged_upload_for_the_admitted_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A file_upload staged into the run dir in the same round must not settle the provider read.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        (tmp_path / "upload.pdf").write_bytes(b"staged-upload")
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset({"upload.pdf"}))
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_loop,
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "upload.pdf").read_bytes() == b"staged-upload"
+
+
+@pytest.mark.asyncio
+async def test_v3_wait_only_download_does_not_read_the_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Only a complete_on_download block owns a provider read-back; a download_timeout-only block keeps its
+    # native in-flight wait.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        complete_on_download=False,
+        download_timeout=10.0,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["begin_calls_at_loop_start"] == 0
+    assert captured["probe_reason"] is None
+    assert observation.poll_deadlines == []
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_monitor_reads_the_provider_once_per_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=None,
+        loop_fn=_click_then_probe(tmp_path, None, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert len(observation.poll_deadlines) == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_provider_source_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = _record_provider_sleeps(monkeypatch)
+    monitor = _FakeBrowserDownloadMonitor()
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, None),
+    )
+
+    assert captured["probe_reason"] is None
+    assert sleeps == []
+
+
+def _probe_twice(
+    monitor: _FakeBrowserDownloadMonitor, between: Callable[[], None]
+) -> Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]]:
+    # One click, two probes: the second follows an unrelated billable tool, with no new download event.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        probe = kwargs["completion_probe"]
+        captured["first_reason"] = await probe(frozenset())
+        between()
+        captured["probe_reason"] = await probe(frozenset())
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    return _loop
+
+
+@pytest.mark.asyncio
+async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_the_first_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor(pending_checks=10**6)
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    def _settle() -> None:
+        monitor._pending_checks = 0
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=1.0,
+        loop_fn=_probe_twice(monitor, _settle),
+    )
+
+    assert captured["first_reason"] is None
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"late-export")], empty_polls=10**6)
+    source = _ActionDownloadSource(observation)
+
+    def _list_late() -> None:
+        observation._empty_polls = 0
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=1.0,
+        loop_fn=_probe_twice(monitor, _list_late),
+    )
+
+    assert captured["first_reason"] is None
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"late-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cleaned_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = asyncio.Event()
+    observation = _GatedCleanupObservation(gate)
+    source = _ActionDownloadSource(observation)
+    monitor = _FakeBrowserDownloadMonitor()
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        asyncio.get_running_loop().call_later(2.0, gate.set)
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        captured["cleanup_finished_at_return"] = observation.cleanup_finished
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_loop,
+    )
+
+    assert captured["probe_reason"] is None
+    assert captured["cleanup_finished_at_return"] is True

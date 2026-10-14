@@ -59,7 +59,8 @@ def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.fixture(scope="module")
 def moto_server() -> Generator[str]:
-    server = ThreadedMotoServer(port=0)
+    # Loopback, not 0.0.0.0: a macOS system proxy bypasses 127.0.0.1 but would otherwise relay the S3 traffic.
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0)
     server.start()
     host, port = server.get_host_and_port()
     yield f"http://{host}:{port}"
