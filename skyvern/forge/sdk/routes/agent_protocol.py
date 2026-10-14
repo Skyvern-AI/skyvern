@@ -361,7 +361,9 @@ async def run_task(
     current_org = caller.organization
     if run_request.webhook_url:
         run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
-    analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
+    analytics.capture(
+        "skyvern-oss-run-task", data={"url": run_request.url}, organization_id=current_org.organization_id
+    )
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     await _assert_files_attachable(run_request.file_ids, current_org.organization_id)
@@ -3960,7 +3962,9 @@ async def run_task_v1(
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
     current_org = caller.organization
-    analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
+    analytics.capture(
+        "skyvern-oss-agent-task-create", data={"url": task.url}, organization_id=current_org.organization_id
+    )
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     # Legacy TaskRequest has no engine field; CUA engine selection goes through /run/tasks.
@@ -6499,7 +6503,9 @@ async def run_task_v2(
         raise HTTPException(
             status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
         )
-    analytics.capture("skyvern-oss-agent-task-v2", data={"url": task_v2.url})
+    analytics.capture(
+        "skyvern-oss-agent-task-v2", data={"url": task_v2.url}, organization_id=organization.organization_id
+    )
     await AsyncExecutorFactory.get_executor().execute_task_v2(
         request=request,
         background_tasks=background_tasks,
