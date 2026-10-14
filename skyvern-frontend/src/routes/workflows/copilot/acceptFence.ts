@@ -62,6 +62,19 @@ export type GateFailure =
     } & AcceptAttempt)
   | { kind: "reload"; attempt: AcceptAttempt | null };
 
+// The gates that render a card but may never carry live actions: what Accept, Reject and Test
+// would write over is already saved (`saved`), may be saved (`recover`), or could not be re-read
+// (`reload`), so a write from one of them is an overwrite rather than a decision.
+const ACTIONLESS_GATE_KINDS: ReadonlySet<GateFailure["kind"]> = new Set([
+  "reload",
+  "recover",
+  "saved",
+]);
+
+export const gateFailureAllowsAction = (
+  kind: GateFailure["kind"] | null,
+): boolean => kind === null || !ACTIONLESS_GATE_KINDS.has(kind);
+
 // The one rule for "the server may still be writing this Accept", and the deadline the fence
 // ends at. A reported remainder is the server's own; an absent field (not an explicit null) is
 // an instance that predates it, which can only name the claim — and that claim can run for the
