@@ -222,7 +222,7 @@ const UPDATE_SKIP_OUTCOME = {
   detail: "Credential not updated — the workflow keeps its saved sign-in.",
 };
 const SIGNED_IN_DETAIL =
-  "No password stored · your sign-in is saved as browser cookies in this profile";
+  "For this test · later runs usually won't stay signed in · no password stored";
 const TIMEOUT_OUTCOME = {
   title: "Sign-in request timed out",
   meta: "test may stop at login",
@@ -995,10 +995,11 @@ function CredentialAskCard({
         return (
           <ResolvedCredentialCard
             tone="done"
-            title={
+            title="Signed in for this test only"
+            meta={
               resolvedOutcome.name
-                ? `Signed in, saved as '${resolvedOutcome.name}'`
-                : "Signed in, saved as a browser profile"
+                ? `saved as '${resolvedOutcome.name}'`
+                : "saved as a browser profile"
             }
             detail={SIGNED_IN_DETAIL}
           />
@@ -1181,9 +1182,9 @@ function CredentialAskCard({
             key="how"
             className="text-[11px] leading-relaxed text-muted-foreground"
           >
-            Use the browser to sign in, including any verification code, then
-            click Done. Skyvern saves the sign-in as a browser profile; no
-            password is stored.
+            {
+              "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored."
+            }
           </span>,
           ...(notFound
             ? [
@@ -1263,6 +1264,18 @@ function CredentialAskCard({
               </span>,
             ]
           : []),
+        ...(signIn
+          ? [
+              <span
+                key="sign-in-scope"
+                className="text-[11px] leading-relaxed text-muted-foreground"
+              >
+                {
+                  "Signing in yourself works for this test. Later runs usually won't stay signed in — connect a credential so every run can sign in."
+                }
+              </span>,
+            ]
+          : []),
         ...(mode === "terminal"
           ? [
               <span
@@ -1305,17 +1318,6 @@ function CredentialAskCard({
             </Button>
           ) : null}
           {connectButton}
-          {signIn ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={disabled || signIn.busy}
-              onClick={signIn.onStart}
-            >
-              Sign in myself
-            </Button>
-          ) : null}
           {orgCredentials.status === "ready" &&
           (pickable.length > 0 || pickerEngaged) ? (
             <CredentialPicker
@@ -1343,6 +1345,18 @@ function CredentialAskCard({
               </span>
               {retryButton}
             </>
+          ) : null}
+          {signIn ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="link"
+              className="text-blue-600 dark:text-blue-400"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onStart}
+            >
+              Sign in myself (this test only)
+            </Button>
           ) : null}
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={disabled} />
