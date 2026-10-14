@@ -1165,6 +1165,7 @@ async def _screenshot_post_hook(
             "screenshot_base64": data.get("data", ""),
             "url": url,
             "title": title,
+            **({"viewport": data["viewport"]} if "viewport" in data else {}),
         }
     return result
 

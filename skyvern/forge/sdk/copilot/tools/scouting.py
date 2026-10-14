@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     consume_screenshot_artifact,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -559,6 +560,7 @@ async def _capture_post_interaction_screenshot(
             dispatch_browser_session_id=frame.dispatch_session_id,
             producer_browser_session_id=frame.producer_session_id,
             session_binding=frame.session_binding,
+            viewport_css_px=frame.viewport_css_px,
         ),
         captured_at=frame.started_at,
     )
@@ -596,6 +598,7 @@ async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> 
         producer_session_id=producer_session_id,
         session_binding=session_binding,
         started_at=started_at,
+        viewport_css_px=screenshot_viewport_css_px(result),
     )
 
 
