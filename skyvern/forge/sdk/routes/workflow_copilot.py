@@ -4958,7 +4958,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 expected_proposal=proposal,
-                owner_turn_id=uuid.uuid4().hex,
+                owner_turn_id=apply_request.owner_turn_id or uuid.uuid4().hex,
             )
         else:
             claimed = await app.DATABASE.workflow_params.claim_workflow_copilot_candidate(
@@ -5058,8 +5058,8 @@ async def workflow_copilot_apply_proposed_workflow(
                 expected_disposition="accepting",
                 expected_claimed_at=claim.claimed_at,
                 auto_accept=apply_request.auto_accept,
-                # A minted token names no turn a client can match, so only a published one is a receipt.
-                record_acceptance=metadata is not None,
+                # A server-minted legacy claim is not a receipt unless the client can match it to a turn.
+                record_acceptance=metadata is not None or bool(apply_request.owner_turn_id),
             )
             break
         except Exception as e:
