@@ -15476,7 +15476,11 @@ class WorkflowService:
         elif policy_run and not attempt_lookup_failed and attempt_rows and need_call_webhook:
             # Never fall back to a newer attempt if a late cleanup cannot find its own row.
             terminal_decision = RetryDecision(False, attempt_number, 0, True, "attempt_not_found")
-        analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        analytics.capture(
+            "skyvern-oss-agent-workflow-status",
+            {"status": workflow_run.status},
+            organization_id=workflow_run.organization_id,
+        )
         capture_workflow_run_ids = [workflow_run.workflow_run_id]
         caller_cancelled = False
         try:
