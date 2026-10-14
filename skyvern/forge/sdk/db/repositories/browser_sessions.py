@@ -769,7 +769,8 @@ class BrowserSessionsRepository(BaseRepository):
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
 
-    @db_operation("get_persistent_browser_session")
+    @read_retry()
+    @db_operation("get_persistent_browser_session", log_errors=False)
     async def get_persistent_browser_session(
         self,
         session_id: str,

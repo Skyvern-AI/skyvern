@@ -474,6 +474,7 @@ export type FileUrlParserBlockYAML = BlockYAMLBase & {
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
   worksheet?: string | null;
+  force_ocr?: boolean;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {
@@ -581,6 +582,7 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   newer_than_days: number | null;
   max_results: number;
   include_body: boolean;
+  download_attachments: boolean;
   parameter_keys?: Array<string> | null;
 };
 

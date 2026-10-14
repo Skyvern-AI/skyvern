@@ -30,6 +30,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
@@ -4706,6 +4707,127 @@ async def test_get_all_runs_v2_does_not_cap_unmeasured_or_indexed_query_shapes(
 
     assert applied == []
     session.connection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workflow_runs_search_caps_only_the_unindexed_free_text_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The per-workflow runs list runs the same unindexed substring arms as the global list, so its
+    # free-text search has to hand the connection back instead of running to the statement timeout
+    # the connection itself carries.
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="no-such-term",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+    # An exact browser identifier resolves through indexed equality, and the other filter shapes have
+    # unmeasured plans; neither takes the cap.
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="pbs_123",
+    )
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        status=[WorkflowRunStatus.failed],
+        error_code="LOGIN_FAILED",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_key", "expected_indexed", "expected_budget"),
+    [
+        ("customer-private-search", False, workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS),
+        # Never capped, so it ran under the connection's own timeout rather than this budget.
+        ("pbs_123", True, None),
+    ],
+)
+async def test_cancelled_workflow_runs_search_is_typed_and_keeps_the_term_out_of_logs(
+    search_key: str,
+    expected_indexed: bool,
+    expected_budget: float | None,
+) -> None:
+    # The route reports this cancellation, so it is raised as its own type: logging it as a
+    # SQLAlchemyError would both double-report it and put the search term in reach of the log.
+    failure = OperationalError(
+        "SELECT ... WHERE workflow_run_parameters.value ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+
+    async def _execute(statement: Any, *_args: Any) -> _EmptyExecuteResult:
+        # Only the search statement is cancelled; the budget's own set_config has to succeed.
+        if "set_config" in str(statement):
+            return _EmptyExecuteResult()
+        raise failure
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(RunsListSearchCanceled) as exc_info:
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                search_key=search_key,
+            )
+
+    assert exc_info.value.indexed_search is expected_indexed
+    assert exc_info.value.statement_timeout_seconds == expected_budget
+    assert failure.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_workflow_runs_read_without_a_search_stays_a_logged_server_error() -> None:
+    # Only the search statement is capped and reported to the caller. Any other filter's
+    # cancellation keeps the operation-tagged error line that production triage queries.
+    failure = OperationalError(
+        "SELECT ... WHERE tasks.errors @> :error_code",
+        {"error_code": "LOGIN_FAILED"},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=failure)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError):
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                error_code="LOGIN_FAILED",
+            )
+
+    assert [log["operation"] for log in logs if log.get("event") == "SQLAlchemyError"] == [
+        "get_workflow_runs_for_workflow_permanent_id"
+    ]
 
 
 @pytest.mark.asyncio

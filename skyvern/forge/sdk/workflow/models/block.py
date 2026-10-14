@@ -97,6 +97,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
+    BlockTerminationError,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
@@ -200,7 +201,12 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -312,6 +318,7 @@ from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
+    FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
     BlockResult,
     BlockStatus,
@@ -648,8 +655,52 @@ def extract_file_url_from_block_output(value: Any) -> str | None:
 
 
 def sanitize_filename(filename: str, default: str = "document") -> str:
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]', "_", filename).strip(". ")
     return sanitized[:200] if sanitized else default
+
+
+async def register_workflow_downloads(
+    *,
+    organization_id: str | None,
+    run_download_id: str | None,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+) -> list[FileInfo]:
+    if not organization_id:
+        return []
+    try:
+        async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+            await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timeout saving workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        return []
+    except DownloadSaveIncompleteError:
+        pass
+    except Exception:
+        LOG.warning(
+            "Failed to register workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
+    try:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            return await app.STORAGE.get_current_attempt_downloaded_files(
+                organization_id=organization_id, run_id=run_download_id
+            )
+    except Exception:
+        LOG.warning(
+            "Failed to read registered workflow downloads",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
 
 
 class ParquetExportMixin:
@@ -677,50 +728,6 @@ class ParquetExportMixin:
         if isinstance(current_index, int) and not isinstance(current_index, bool):
             stem = f"{stem}-{current_index + 1:04d}"
         return f"{stem}.parquet"
-
-    async def _register_export_download(
-        self,
-        *,
-        organization_id: str | None,
-        run_download_id: str | None,
-        workflow_run_id: str,
-        workflow_run_block_id: str,
-    ) -> list[FileInfo]:
-        if not organization_id:
-            return []
-        try:
-            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "Timeout saving Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            return []
-        except DownloadSaveIncompleteError:
-            pass
-        except Exception:
-            LOG.warning(
-                "Failed to register Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
-        try:
-            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_current_attempt_downloaded_files(
-                    organization_id=organization_id, run_id=run_download_id
-                )
-        except Exception:
-            LOG.warning(
-                "Failed to read registered Parquet exports",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
 
     async def write_parquet_export(
         self,
@@ -766,7 +773,7 @@ class ParquetExportMixin:
             raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
 
         filename = path.name
-        downloaded_files = await self._register_export_download(
+        downloaded_files = await register_workflow_downloads(
             organization_id=organization_id,
             run_download_id=run_download_id,
             workflow_run_id=workflow_run_id,
@@ -9292,6 +9299,23 @@ async def wrapper({default_args}):
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
+        try:
+            await app.AGENT_FUNCTION.validate_block_execution(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except BlockTerminationError as e:
+            # Returned, not raised: execute() rewrites a raised error into a generic machinery failure.
+            return await self.build_block_result(
+                success=False,
+                failure_reason=get_user_facing_exception_message(e),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                can_continue_after_failure=False,
+            )
 
         block_context = skyvern_context.current()
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -13740,6 +13764,7 @@ class FileParserBlock(Block):
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
     worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
@@ -14120,32 +14145,52 @@ class FileParserBlock(Block):
     ) -> str:
         """Parse PDF file and return extracted text.
 
-        Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails. If text extraction
-        yields empty/minimal content (e.g. scanned or image-based PDFs),
-        renders pages as images and sends them to a vision LLM for OCR.
+        Uses the shared PDF parsing utility that tries pypdf first, then falls back to
+        pdfplumber if pypdf fails. When the text layer cannot be trusted — it is empty
+        (scanned or image-based PDF), its glyphs are scrambled by a broken embedded font,
+        or the block asks for OCR outright — renders pages as images and sends them to a
+        vision LLM for OCR instead.
         """
-        try:
-            extracted_text = await _run_blocking_parse_step(
-                "PDF text extraction",
-                self.file_url,
-                extract_pdf_file,
-                file_path,
-                file_identifier=self.file_url,
-            )
-        except PDFParsingError as e:
-            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+        extracted_text = ""
+        ocr_reason: str | None = None
+        if self.force_ocr:
+            ocr_reason = "the block is configured to always OCR PDFs"
+        else:
+            try:
+                extracted_text = await _run_blocking_parse_step(
+                    "PDF text extraction",
+                    self.file_url,
+                    extract_pdf_file,
+                    file_path,
+                    file_identifier=self.file_url,
+                )
+            except PDFParsingError as e:
+                raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
-        # If text extraction returned meaningful content, use it directly
-        if extracted_text.strip():
-            return extracted_text
+            if not extracted_text.strip():
+                ocr_reason = "PDF text extraction returned empty content"
+            else:
+                # A scrambled text layer is worse than an empty one: it reaches the extraction
+                # LLM as plausible text, which then invents values for the characters it cannot
+                # read. Only OCR recovers the real ones. The scan is per-character over a text
+                # layer that can reach a million characters, so it stays off the event loop.
+                ocr_reason = await _run_blocking_parse_step(
+                    "PDF text layer check",
+                    self.file_url,
+                    scrambled_text_layer_reason,
+                    extracted_text,
+                )
 
-        # Scanned / image-based PDF — render pages as images and OCR each page in
-        # its own vision-LLM call. A single call covering every page collapses a
-        # multi-page document down to the first page or two.
+            if ocr_reason is None:
+                return extracted_text
+
+        # Render pages as images and OCR each page in its own vision-LLM call. A single
+        # call covering every page collapses a multi-page document down to the first page
+        # or two.
         LOG.info(
-            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            "Falling back to vision LLM OCR for the PDF text layer",
             file_url=self.file_url,
+            ocr_reason=ocr_reason,
         )
         try:
             page_images = await _run_blocking_parse_step(
@@ -15585,7 +15630,69 @@ class HumanInteractionBlock(BaseTaskBlock):
                 )
                 log_that_we_are_waiting = False
 
-            # Check if timeout_seconds has elapsed
+            # Run status is read before the session because cancel paths also close the session.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                if workflow_run.status == WorkflowRunStatus.running:
+                    success, status = True, BlockStatus.completed
+                elif workflow_run.status == WorkflowRunStatus.canceled:
+                    success, status = False, BlockStatus.canceled
+                elif workflow_run.status == WorkflowRunStatus.terminated:
+                    success, status = False, BlockStatus.terminated
+                else:
+                    success, status = False, BlockStatus.failed
+                reason = f"status_changed:{workflow_run.status}"
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=None if success else reason,
+                    output_parameter_value=result_dict,
+                    status=status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if browser_session_id and organization_id:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    browser_session_id, organization_id
+                )
+                if browser_session and browser_session.completed_at:
+                    LOG.info(
+                        "Browser session closed while waiting for human interaction",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+
+                    workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                    reason = "Browser session was closed while waiting for human interaction"
+                    result_dict = {"success": False, "reason": reason}
+
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=reason,
+                        output_parameter_value=result_dict,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
             if elapsed_time_seconds >= self.timeout_seconds:
                 LOG.info(
                     "Human Interaction block timeout_seconds reached",
@@ -15606,33 +15713,6 @@ class HumanInteractionBlock(BaseTaskBlock):
                     failure_reason=reason,
                     output_parameter_value=result_dict,
                     status=BlockStatus.timed_out,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
-            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-
-            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
-                LOG.info(
-                    "Workflow run status changed from paused",
-                    workflow_run_id=workflow_run_id,
-                    new_status=workflow_run.status,
-                    browser_session_id=browser_session_id,
-                )
-
-                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
-
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-
-                return await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=result_dict,
-                    status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )

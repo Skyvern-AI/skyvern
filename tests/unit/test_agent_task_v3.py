@@ -4187,6 +4187,38 @@ async def test_execute_task_v3_a_vetoed_reask_conversion_restores_the_models_ver
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_type", "custom_key", "criteria"),
+    [
+        (TaskType.general, False, ("", "the statements link is missing")),
+        (TaskType.general, True, ("", "the statements link is missing")),
+        (TaskType.validation, False, None),
+    ],
+    ids=["navigation", "customer_key", "validation"],
+)
+async def test_execute_task_v3_gives_a_block_without_a_completion_criterion_its_stop_criteria(
+    monkeypatch: pytest.MonkeyPatch, task_type: TaskType, custom_key: bool, criteria: tuple[str, str] | None
+) -> None:
+    # The terminate-premise check needs no completion criterion; a validation's terminate is its answer.
+    monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda key: custom_key)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="terminated", reason="No statements link.", billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Open the statements"),
+        task_type=task_type,
+        complete_criterion=None,
+        terminate_criterion="the statements link is missing",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert loop_mock.await_args is not None
+    assert loop_mock.await_args.kwargs["unlisted_reask_criteria"] == criteria
+    # The check only measures, so it never bills a customer's own model key.
+    assert loop_mock.await_args.kwargs["terminate_premise_check"] is not custom_key
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_completed_on_a_blank_page_fails_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
     # A block whose page went blank during the loop has nothing a page-bound goal could have produced;
     # reporting it completed hands the failure to the next block (SKY-16924).

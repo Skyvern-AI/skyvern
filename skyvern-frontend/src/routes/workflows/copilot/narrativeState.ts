@@ -36,6 +36,8 @@ export interface BudgetExpiryState {
   reportProduced: boolean | null;
   stagedDraftId: string | null;
   drainFingerprint: string | null;
+  // Test runs the turn's hard time limit left to their worker; the backend saves only their blocks as unfinished.
+  leftRunIds: string[];
 }
 
 function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
@@ -58,6 +60,9 @@ function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
       typeof value.drainFingerprint === "string"
         ? value.drainFingerprint
         : null,
+    leftRunIds: Array.isArray(value.leftRunIds)
+      ? value.leftRunIds.filter((id): id is string => typeof id === "string")
+      : [],
   };
 }
 
@@ -77,6 +82,7 @@ function budgetExpiryFromOutcome(
     reportProduced: outcome.budget_expiry_report_produced ?? null,
     stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
     drainFingerprint: outcome.drain_fingerprint ?? null,
+    leftRunIds: [],
   };
 }
 
@@ -131,7 +137,8 @@ export type NarrativeEvent =
 // failed-style states (failed, terminated, timed_out) under one chip and
 // treats `skipped` and `stopped` as separate neutral states. `stopped` is a
 // user cancel: it ran and was interrupted, which is not a failure and must
-// never be rendered as one.
+// never be rendered as one. `unfinished` is a block still running when a turn
+// limit ended the turn; its run may still be going, so it is neither.
 export type BlockUIState =
   | "queued"
   | "drafted"
@@ -139,6 +146,7 @@ export type BlockUIState =
   | "completed"
   | "failed"
   | "stopped"
+  | "unfinished"
   | "skipped";
 
 // Recorded per-run outcome verdict, distinct from lifecycle state: a row can
@@ -1945,6 +1953,7 @@ export function hydrateNarrativeFromPayload(
             s === "completed" ||
             s === "failed" ||
             s === "stopped" ||
+            s === "unfinished" ||
             s === "skipped"
           )
             return s;
@@ -1973,23 +1982,21 @@ export function hydrateNarrativeFromPayload(
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
   const turnFacts = parseTurnFacts(payload.turnFacts);
-  // A deadline cuts a running block off; that is a stop, so it must not be swept
-  // to failed and then read back as the turn having failed.
+  // The backend saves a left run's blocks as unfinished; any other block
+  // cut off by a turn limit is a stop, never a failure.
   const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
-  const halted =
-    cancelled ||
-    turnFacts?.terminalCause === "deadline_expired" ||
-    budgetExpiry !== null;
+  const halted = budgetHalted({ turnFacts, budgetExpiry });
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: halted
-                ? "stopped"
-                : terminal === "error"
-                  ? "failed"
-                  : "completed",
+              state:
+                cancelled || halted
+                  ? "stopped"
+                  : terminal === "error"
+                    ? "failed"
+                    : "completed",
               endedAt: b.endedAt ?? endedAtIso,
             }
           : b,
@@ -2211,8 +2218,16 @@ export function notConfirmedOutcome(
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    (turn.turnFacts?.terminalCause === "deadline_expired" ||
-      turn.budgetExpiry !== null) &&
+    budgetHalted(turn) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+type TurnLimitFacts = Pick<TurnNarrativeState, "turnFacts" | "budgetExpiry">;
+
+function budgetHalted(turn: TurnLimitFacts): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" ||
+    turn.budgetExpiry !== null
   );
 }

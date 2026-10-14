@@ -433,7 +433,10 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
         turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
         pending
         verdict="untested"
-        actionsEnabled
+        // A failed gate reaches the card with its footer shown and its actions already withheld,
+        // which is the only thing that locks the row.
+        actionsShown
+        actionsEnabled={failure === null}
         hasProposal
         onAccept={noop}
         onAlwaysAccept={noop}

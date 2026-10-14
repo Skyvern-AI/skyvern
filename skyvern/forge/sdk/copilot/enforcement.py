@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import functools
+import io
 import json
+import math
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -20,6 +24,7 @@ from agents.run import Runner
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
 from openai.types.responses import ResponseFunctionToolCall
+from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
@@ -178,10 +183,7 @@ _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
-# OpenAI detail=high cost per resized image. If we support other providers,
-# pull from model config — this value will silently over/undercount otherwise.
-# See screenshot_utils.resize_screenshot_b64 for the dimension contract this
-# token count assumes.
+# Charged for an image whose pixel size cannot be read.
 TOKENS_PER_RESIZED_IMAGE = 765
 
 # Keep the last N function_call_output items at full (head-truncated) size.
@@ -481,7 +483,7 @@ def _same_page(left: str | None, right: str | None) -> bool:
     return left_path == right_path
 
 
-def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
+def pending_screenshot_message(ctx: Any, *, sharp: bool = False) -> dict[str, Any] | None:
     """Build the synthetic user message for the staged frame without draining it.
 
     Tool results stay text-only because OpenAI rejects images in tool
@@ -495,8 +497,12 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
+    images = [
+        (entry.sharp_b64, entry.sharp_px) if sharp and entry.sharp_b64 else (entry.b64, entry.image_px)
+        for entry in screenshots
+    ]
     provenance_lines: list[str] = []
-    for entry in screenshots:
+    for entry, (_, image_px) in zip(screenshots, images):
         provenance = entry.provenance
         fields = {
             "capture_id": entry.capture_id,
@@ -512,6 +518,8 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "session_binding": provenance.session_binding.value,
             "workflow_run_id": provenance.workflow_run_id or "unavailable",
             "action_relation": provenance.action_relation.value,
+            "image_px": _px(image_px),
+            "viewport_css_px": _px(provenance.viewport_css_px),
         }
         rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
         relation = (
@@ -533,15 +541,19 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
-    for entry in screenshots:
+    for entry, (b64, _) in zip(screenshots, images):
         content.append(
             {
                 "type": "input_image",
-                "image_url": f"data:{entry.mime};base64,{entry.b64}",
+                "image_url": f"data:{entry.mime};base64,{b64}",
                 "detail": "high",
             }
         )
     return {"role": "user", "content": content}
+
+
+def _px(size: tuple[int, int] | None) -> str:
+    return f"{size[0]}x{size[1]}" if size else "unavailable"
 
 
 def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
@@ -1115,32 +1127,49 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     return result
 
 
+@functools.lru_cache(maxsize=16)
+def _image_tokens(image_url: str) -> int:
+    """OpenAI's patch formula x 1.2, which matched terra's billing at 1024x576 (692) and 1600x900 (1,741).
+    `skyvern.utils.image_token_estimator` uses 1.0 for gpt-5.x and needs a model name, which this budget check lacks.
+    """
+    _, _, encoded = image_url.partition(";base64,")
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+            width, height = image.size
+    except Exception:
+        return TOKENS_PER_RESIZED_IMAGE
+    return math.floor(1.2 * math.ceil(width / 32) * math.ceil(height / 32)) + 1
+
+
 def _sanitize_for_token_estimation(value: Any) -> tuple[Any, int]:
     """Build a sanitized copy of *value*, replacing base64 image data with
     a short placeholder so blobs don't inflate the token count.
 
-    Returns ``(sanitized_value, image_count)``.
+    Returns ``(sanitized_value, image_tokens)``.
     """
     if isinstance(value, dict):
         is_image = value.get("type") == "input_image"
         sanitized: dict[str, Any] = {}
-        image_count = 1 if is_image else 0
+        image_tokens = 0
+        if is_image:
+            image_url = value.get("image_url")
+            image_tokens = _image_tokens(image_url) if isinstance(image_url, str) else TOKENS_PER_RESIZED_IMAGE
         for key, child in value.items():
             if is_image and key == "image_url":
                 sanitized[key] = "[image]"
                 continue
-            sanitized_child, child_images = _sanitize_for_token_estimation(child)
+            sanitized_child, child_tokens = _sanitize_for_token_estimation(child)
             sanitized[key] = sanitized_child
-            image_count += child_images
-        return sanitized, image_count
+            image_tokens += child_tokens
+        return sanitized, image_tokens
     if isinstance(value, list):
         sanitized_list: list[Any] = []
-        image_count = 0
+        image_tokens = 0
         for item in value:
-            sanitized_item, item_images = _sanitize_for_token_estimation(item)
+            sanitized_item, item_tokens = _sanitize_for_token_estimation(item)
             sanitized_list.append(sanitized_item)
-            image_count += item_images
-        return sanitized_list, image_count
+            image_tokens += item_tokens
+        return sanitized_list, image_tokens
     return value, 0
 
 
@@ -1148,9 +1177,9 @@ def estimate_tokens(items: list[Any]) -> int:
     """Token estimate for an input list using tiktoken."""
     if not items:
         return 0
-    sanitized, image_count = _sanitize_for_token_estimation(items)
+    sanitized, image_tokens = _sanitize_for_token_estimation(items)
     text = json.dumps(sanitized, separators=(",", ":"), ensure_ascii=False, default=str)
-    return count_tokens(text) + image_count * TOKENS_PER_RESIZED_IMAGE
+    return count_tokens(text) + image_tokens
 
 
 _AGGRESSIVE_PRUNE_TAIL = 7

@@ -114,6 +114,44 @@ def test_compare_text_never_accepts_extra_or_missing_alphanumerics() -> None:
             assert compare_text(changed, number) is EntryMatch.DIFFERENT, (changed, number)
 
 
+@pytest.mark.parametrize(
+    ("typed", "held", "match"),
+    [
+        # A national number the field read as international: same digits, a "+" the page added.
+        ("5550001234", "+55 50001234", EntryMatch.PLUS_ADDED),
+        ("(555) 000-1234", "+5 550001234", EntryMatch.PLUS_ADDED),
+        ("(555) 000-1234", "+(555) 000-1234", EntryMatch.PLUS_ADDED),
+        ("004455500012", "+004455500012", EntryMatch.PLUS_ADDED),
+        # The fix: the number retyped with its country code, regrouped by the field.
+        ("+1 5550001234", "+1 555 000 1234", EntryMatch.REFORMATTED),
+        ("+44 20 0000 1234", "+442000001234", EntryMatch.REFORMATTED),
+        # A decimal point still decides first, with "+" on both sides.
+        ("+15.00", "+1500", EntryMatch.DIFFERENT),
+        ("+1.5", "+15", EntryMatch.DIFFERENT),
+        # Too short to be a phone number: a sign the page added is a changed number, not a hint.
+        ("1500", "+1500", EntryMatch.DIFFERENT),
+        # A country code the page added is not the same digits.
+        ("5550001234", "+1 555 000 1234", EntryMatch.DIFFERENT),
+        # A mask placeholder is not a held value, with or without the picker's code left in it.
+        ("5550001234", "(___) ___-____", EntryMatch.NOT_HELD),
+        ("09/05/2026", "__/__/____", EntryMatch.NOT_HELD),
+        ("5550001234", "+1 (___) ___-____", EntryMatch.DIFFERENT),
+        # A field that masks what it holds is not empty.
+        ("555000123", "***-**-****", EntryMatch.DIFFERENT),
+        ("hello", "•••••", EntryMatch.DIFFERENT),
+    ],
+)
+def test_compare_text_phone_numbers(typed: str, held: str, match: EntryMatch) -> None:
+    assert compare_text(typed, held) is match
+
+
+def test_a_plus_added_entry_asks_for_the_country_code_without_naming_one() -> None:
+    r = entry_outcome("#tel", EntryMatch.PLUS_ADDED, shown="+55 50001234")
+    assert r.status == "ok" and r.ok_class == "held_international" and r.entry_unconfirmed
+    assert "'+55 50001234'" in r.content
+    assert "+1" not in r.content
+
+
 def test_an_exact_compare_never_folds_a_secret() -> None:
     assert compare_text("Ab C", "ab c") is EntryMatch.REFORMATTED
     assert compare_text("Ab C", "ab c", exact=True) is EntryMatch.DIFFERENT

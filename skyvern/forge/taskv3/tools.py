@@ -7008,19 +7008,6 @@ _SKINNED_CHECKBOX_PROBE_JS = (
 }"""
 )
 
-# Whether a picked radio or checkbox is still checked, native or ARIA; null when it cannot be read.
-_CHOICE_CHECKED_JS = (
-    r"""(arg) => {
-  const _q = """
-    + _ROOT_QUERY_JS
-    + r""";
-  const el = _q.find(arg.sel);
-  if (!el) return null;
-  if (el.type === 'radio' || el.type === 'checkbox') return !!el.checked;
-  const a = el.getAttribute('aria-checked');
-  return a === 'true' ? true : a === 'false' ? false : null;
-}"""
-)
 # Read twice (before and after the forced click): a proxy that does not sync from its native input
 # must fail loud, not read as a successful toggle.
 _CHECKBOX_CHECKED_JS = (
@@ -18450,7 +18437,7 @@ def build_browser_tools(
             return entry
         if password_anchor is not None:
             input_dispatch.note_secret_fill(page, password_anchor)
-        if press_enter and entry.ok_class == "held_differs":
+        if press_enter and entry.ok_class in ("held_differs", "held_international"):
             # Enter would submit a value the field shows is not the one typed, before the batch rule could hold it back;
             # an unreadable field is no such evidence, so Enter still goes there, as before.
             entry.content += " Enter was not pressed: check the field, then press Enter once it holds the value."
@@ -22008,26 +21995,6 @@ def build_browser_tools(
             return "", False
         return str(resolved.get("selector") or ""), bool((result.data or {}).get("menu_row"))
 
-    _pick_realms: dict[str, Any] = {}
-
-    def _click_choice(args: dict[str, Any]) -> tuple[str, str] | None:
-        # Read from observe's own record of the ref, so the answer is filed under the question observe showed.
-        ref = REF_SELECTOR_RE.match(str(args.get("selector") or "")) if args.get("mark") is None else None
-        entry = _observe_manifest.get(int(ref.group(1))) if ref else None
-        if not entry or not entry.get("question") or not entry.get("choice"):
-            return None
-        # A pick is read back in the frame and document it was observed in, under the selector the click leaves in its
-        # arguments; a selector seen in two live frames or documents is read nowhere, so its hold stays. A detached
-        # frame is replaced, not counted.
-        key, realm = str(entry.get("selector") or ""), (entry.get("owner"), str(entry.get("document") or ""))
-        prior: Any = _pick_realms.get(key, realm)
-        try:
-            gone = prior[0].is_detached() is True
-        except Exception:
-            gone = False
-        _pick_realms[key] = realm if prior == realm or gone else _UNKNOWN_REALM
-        return entry["question"], entry.get("option") or ""
-
     def _with_pick_echo(handler: ToolHandler) -> ToolHandler:
         # Names the question observe bound the clicked option to, so a wrong pairing is visible in the result.
         @functools.wraps(handler)
@@ -22057,19 +22024,6 @@ def build_browser_tools(
             return dataclasses.replace(result, content=f"{result.content}\n{line}")
 
         return wrapped
-
-    async def _choice_checked(selector: str) -> bool | None:
-        realm = _pick_realms.get(selector, (None, ""))
-        if realm is _UNKNOWN_REALM:
-            return None
-        try:
-            target = realm[0] or _current_page()
-            # A postback or a frame that navigated in place can put another control under the same marker.
-            if realm[1] and realm[1] != await _realm_document_id(target):
-                return None
-            return await _probe_evaluate(target, _CHOICE_CHECKED_JS, selector, {"sel": selector, "el": None})
-        except Exception:
-            return None
 
     async def _answer_target(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -22328,8 +22282,6 @@ def build_browser_tools(
             _tool_spec.handler = _with_pick_echo(_tool_spec.handler)
             _tool_spec.toggle_probe = _click_targets_toggle
             _tool_spec.address_probe = _click_address
-            _tool_spec.choice_probe = _click_choice
-            _tool_spec.choice_checked = _choice_checked
         elif _tool_spec.name == "type":
             _tool_spec.answer_probe = _answer_field
     # Inside the download signal, so a download notice stays the last thing in a result.

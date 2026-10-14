@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     ScrapingFailed,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
+    TaskTerminationError,
 )
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
@@ -56,6 +57,7 @@ def mock_organization() -> Any:
 @pytest.fixture
 def mock_app() -> Any:
     app = MagicMock()
+    app.AGENT_FUNCTION.validate_task_execution = AsyncMock()
     workflow_run = MagicMock(workflow_run_id="wr_test", workflow_id="w_test")
     workflow = MagicMock(workflow_id="w_test", workflow_permanent_id="wpid_test", title="t")
     task = MagicMock(task_id="tsk_test", organization_id="o_test", max_screenshot_scrolls=None)
@@ -830,6 +832,22 @@ async def test_action_over_the_concurrency_cap_is_rejected_before_any_run_is_cre
             await run_sdk_action(mock_request, organization=mock_organization)
 
     assert rejected.value.status_code == 429
+    mock_app.AGENT_FUNCTION.validate_task_execution.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_awaited()
     mock_app.DATABASE.tasks.create_task.assert_not_awaited()
     mock_app.DATABASE.tasks.create_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_credit_refusal_creates_no_task(mock_request: Any, mock_organization: Any, mock_app: Any) -> None:
+    mock_app.AGENT_FUNCTION.validate_task_execution = AsyncMock(
+        side_effect=TaskTerminationError(reason="Not enough credit balance.")
+    )
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert exc_info.value.status_code == 402
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()

@@ -221,7 +221,8 @@ def _run_context(data: CallModelData[Any]) -> Any:
 
 
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
-    items = list(data.model_data.input)
+    # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
+    items = _compact_tool_items(list(data.model_data.input))
     ctx = _run_context(data)
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
@@ -253,6 +254,12 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
                 input_fingerprint=fingerprint,
             )
     if screenshot_msg is not None:
+        sharp_msg = pending_screenshot_message(ctx, sharp=True)
+        # The sharp copy may cost older screenshots, which budget pruning drops first anyway, but nothing else.
+        if sharp_msg is not None and estimate_tokens(_drop_older_screenshots([*items, sharp_msg])) <= token_budget:
+            screenshot_msg = sharp_msg
+        else:
+            LOG.info("copilot_sharp_frame_over_budget")
         LOG.info(
             "Injecting screenshot user message",
             count=len(screenshot_msg["content"]) - 1,
@@ -379,13 +386,7 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         return ModelInputData(input=items, instructions=instructions)
 
     # Layer 2: Drop all screenshots except the most recent
-    screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
-    if len(screenshot_indices) > 1:
-        drop_indices = set(screenshot_indices[:-1])
-        items = [
-            {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
-            for i, item in enumerate(items)
-        ]
+    items = _drop_older_screenshots(items)
 
     est = estimate_tokens(items)
     if est <= token_budget:
@@ -435,6 +436,15 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     est = estimate_tokens(items)
     LOG.info("Final token estimate after aggressive prune", tokens=est)
     return ModelInputData(input=items, instructions=instructions)
+
+
+def _drop_older_screenshots(items: list[Any]) -> list[Any]:
+    screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
+    drop_indices = set(screenshot_indices[:-1])
+    return [
+        {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
+        for i, item in enumerate(items)
+    ]
 
 
 def _truncate_tool_output(item: Any, max_chars: int) -> Any:

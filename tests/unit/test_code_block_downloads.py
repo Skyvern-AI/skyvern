@@ -271,6 +271,7 @@ def _fake_storage_app(
         ),
         AGENT_FUNCTION=SimpleNamespace(
             validate_code_block=AsyncMock(),
+            validate_block_execution=AsyncMock(),
             # Secure CodeBlock runner gating — match the OSS base no-op so execute() runs legacy.
             should_use_codeblock_runner=AsyncMock(return_value=False),
             execute_code_block_override=AsyncMock(return_value=None),

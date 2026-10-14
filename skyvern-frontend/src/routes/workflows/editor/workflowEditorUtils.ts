@@ -1259,6 +1259,7 @@ function convertToNode(
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           worksheet: block.worksheet ?? "",
+          forceOcr: block.force_ocr ?? false,
           model: block.model,
         },
       };
@@ -1468,6 +1469,7 @@ function convertToNode(
           newerThanDays: block.newer_than_days ?? null,
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
+          downloadAttachments: block.download_attachments ?? false,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3741,6 +3743,7 @@ function getWorkflowBlock(
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         worksheet: node.data.worksheet || null,
+        force_ocr: node.data.forceOcr ?? false,
       };
     }
     case "textPrompt": {
@@ -3883,6 +3886,7 @@ function getWorkflowBlock(
         newer_than_days: node.data.newerThanDays,
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
+        download_attachments: node.data.downloadAttachments,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5332,6 +5336,7 @@ function convertBlocksToBlockYAML(
           file_type: block.file_type,
           json_schema: block.json_schema,
           worksheet: block.worksheet,
+          force_ocr: block.force_ocr,
         };
         return blockYaml;
       }
@@ -5487,6 +5492,7 @@ function convertBlocksToBlockYAML(
           newer_than_days: block.newer_than_days,
           max_results: block.max_results,
           include_body: block.include_body,
+          download_attachments: block.download_attachments,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;

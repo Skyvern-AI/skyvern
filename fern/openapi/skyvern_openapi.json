@@ -14564,6 +14564,11 @@
             "title": "Include Body",
             "default": true
           },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14766,6 +14771,11 @@
             "type": "boolean",
             "title": "Include Body",
             "default": true
+          },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "default": false
           },
           "parameter_keys": {
             "anyOf": [

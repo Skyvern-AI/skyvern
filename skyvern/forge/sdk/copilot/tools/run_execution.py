@@ -42,7 +42,12 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locat
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.budget_expiry import RecordedBlockState, RecordedRunState, budget_run_denial
+from skyvern.forge.sdk.copilot.budget_expiry import (
+    BudgetExpiryState,
+    RecordedBlockState,
+    RecordedRunState,
+    budget_run_denial,
+)
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
@@ -990,6 +995,8 @@ async def recorded_open_step_runs(ctx: CopilotContext) -> list[RecordedRunState]
             failure_reason=run.failure_reason if run is not None else None,
             blocks=shown,
             earlier_blocks_not_shown=len(blocks) - len(shown),
+            left_running=ctx.budget_expiry_state.hard_backstop_reached
+            and workflow_run_id in ctx.budget_expiry_state.leavable_run_ids,
         )
         # The same scrub a run tool's own result gets before the model reads it.
         runs.append(
@@ -2765,6 +2772,7 @@ async def _capture_and_store_post_run_page(
                     dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                     producer_browser_session_id=captured_frame.producer_browser_session_id,
                     session_binding=captured_frame.session_binding,
+                    viewport_css_px=captured_frame.viewport_css_px,
                 ),
                 captured_at=captured_frame.captured_at,
             )
@@ -2818,6 +2826,18 @@ def _origin_run_secrets_unregistered(registry: OriginRunRedactionRegistry | None
         and registry.contains_sensitive_values
         and not registry.contains_all_sensitive_values
     )
+
+
+def _unmark_leavable_run(ctx: CopilotContext, workflow_run_id: str) -> None:
+    marks = ctx.budget_expiry_state.leavable_run_ids
+    marks[:] = [run_id for run_id in marks if run_id != workflow_run_id]
+
+
+def _backstop_may_leave_run_running(
+    turn_deadline: asyncio.Timeout | None, budget_state: BudgetExpiryState, workflow_run_id: str
+) -> bool:
+    """Whether the turn's own backstop, not a Stop, ended the wait on the run the poll marked leavable."""
+    return turn_deadline is not None and turn_deadline.expired() and workflow_run_id in budget_state.leavable_run_ids
 
 
 def _sensitive_parameter_keys_requiring_resolved_values(workflow: Workflow) -> list[str]:
@@ -2994,6 +3014,7 @@ async def _capture_dispatched_terminal_page_evidence(
                 dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                 producer_browser_session_id=captured_frame.producer_browser_session_id,
                 session_binding=captured_frame.session_binding,
+                viewport_css_px=captured_frame.viewport_css_px,
             ),
             captured_at=captured_frame.captured_at,
         )
@@ -4708,15 +4729,8 @@ async def _run_blocks_and_collect_debug(
                 )
             )
     except BaseException:
-        # Run setup / submission failed OR the tool was cancelled after the dispatch version was
-        # created. The watchdog cleanup below never runs on this path, so soft-delete the version
-        # here so it does not linger as the latest-by-permanent-id pointer. Catch BaseException so
-        # asyncio.CancelledError (the SDK tool timeout) also cleans the draft up. The turn's own deadline
-        # leaves a submitted run's version in place, since the worker may already be loading it (ADR-0025).
-        deadline_left_run = run_submission_attempted and turn_deadline is not None and turn_deadline.expired()
-        if dispatch_draft_workflow_id is not None and not deadline_left_run:
-            await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
-            dispatch_draft_workflow_id = None
+        # Setup or submission failed or was cancelled, and the poll cleanup below never runs on this path.
+        # BaseException so a cancellation also releases the lock, cancels a submitted run and retires its draft.
         if secret_run_session_lock is not None:
             if run_submission_attempted:
                 # The start may have landed before this raised, so the run can still be filling secrets.
@@ -4725,6 +4739,13 @@ async def _run_blocks_and_collect_debug(
             secret_run_session_lock = None
         if interim_run_id is not None and not run_submission_attempted:
             _forget_interim_run_start(ctx, interim_run_id)
+        # The submission had not returned, so no worker owns the run yet, even at the backstop; cancel before
+        # retiring the draft so a start that did land sees a canceled row.
+        if run_submission_attempted:
+            await asyncio.shield(_cooperative_cancel_dispatched_run(workflow_run.workflow_run_id))
+        if dispatch_draft_workflow_id is not None:
+            await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+            dispatch_draft_workflow_id = None
         raise
     finally:
         if secret_run_session_lock is not None and not run_submission_attempted:
@@ -4737,53 +4758,51 @@ async def _run_blocks_and_collect_debug(
 
     active_run_association: ActiveRunSessionAssociation | None = None
     run_paused = False
-    run_left_running = False
+    leave_run_to_owner = False
+    left_by_backstop = False
+    final_status: str | None = None
+    run_cancelled_by_watchdog = False
     try:
-        # Inside this try so a cancellation while publishing still reaches the browser lock release below.
-        if run_detached_from_chat and debug_session_id and run_session_id:
-            try:
-                active_run_association = await publish_active_run_session(
-                    organization_id=ctx.organization_id,
-                    workflow_permanent_id=ctx.workflow_permanent_id,
-                    debug_browser_session_id=debug_session_id,
-                    run_browser_session_id=run_session_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    turn_id=ctx.turn_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to publish active Copilot run session",
-                    organization_id=ctx.organization_id,
-                    workflow_permanent_id=ctx.workflow_permanent_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    debug_browser_session_id=debug_session_id,
-                    run_browser_session_id=run_session_id,
-                    exc_info=True,
-                )
-
-        # The OpenAI Agents SDK wraps this tool in
-        # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``, so
-        # the poll loop leaves 10 s of headroom for the cancel-drain and
-        # post-drain reconcile to finish before the SDK's own cancel fires.
-        #
-        # Do NOT short-circuit on client disconnect: the agent loop runs to
-        # completion after the SSE stream is gone so its reply persists
-        # (SKY-8986); aborting mid-block would strand the run without debug
-        # output for the final chat message.
-        initial_run, initial_block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
-        started_monotonic = time.monotonic()
-        final_status: str | None = None
-        run: Any = initial_run
-        exit_reason: WatchdogExitReason | None = None
-        run_cancelled_by_watchdog = False
-        budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
-
-        narrator_state: NarratorState | None = ctx.narrator_state
-        progress_enabled = narrator_state is not None and ctx.stream is not None
-        seen_block_states: dict[str, str] = {}
-        prior_block_ts: datetime | None = initial_block_ts
-        last_block_fetch_monotonic = 0.0
         try:
+            # A run on the chat's browser or carrying secrets cannot outlive the turn: only this turn guards that
+            # browser and the scrubber. The mark is cleared once the run is final or the watchdog cancels it.
+            if run_detached_from_chat and not origin_registry.contains_sensitive_values:
+                ctx.budget_expiry_state.leavable_run_ids.append(workflow_run.workflow_run_id)
+            # Inside this try so a cancellation while publishing still reaches the browser lock release below.
+            if run_detached_from_chat and debug_session_id and run_session_id:
+                try:
+                    active_run_association = await publish_active_run_session(
+                        organization_id=ctx.organization_id,
+                        workflow_permanent_id=ctx.workflow_permanent_id,
+                        debug_browser_session_id=debug_session_id,
+                        run_browser_session_id=run_session_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        turn_id=ctx.turn_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to publish active Copilot run session",
+                        organization_id=ctx.organization_id,
+                        workflow_permanent_id=ctx.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        debug_browser_session_id=debug_session_id,
+                        run_browser_session_id=run_session_id,
+                        exc_info=True,
+                    )
+
+            # The SDK's tool timeout is RUN_BLOCKS_SAFETY_CEILING_SECONDS, so the poll keeps 10 s for the cancel
+            # drain and reconcile. A client disconnect does not end the poll: the turn finishes and persists its reply.
+            initial_run, initial_block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
+            started_monotonic = time.monotonic()
+            run: WorkflowRun | None = initial_run
+            exit_reason: WatchdogExitReason | None = None
+            budget_seconds = max(1, RUN_BLOCKS_SAFETY_CEILING_SECONDS - 10)
+
+            narrator_state: NarratorState | None = ctx.narrator_state
+            progress_enabled = narrator_state is not None and ctx.stream is not None
+            seen_block_states: dict[str, str] = {}
+            prior_block_ts: datetime | None = initial_block_ts
+            last_block_fetch_monotonic = 0.0
             while True:
                 await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
 
@@ -4810,6 +4829,7 @@ async def _run_blocks_and_collect_debug(
 
                 if run and WorkflowRunStatus(run.status).is_final():
                     final_status = run.status
+                    _unmark_leavable_run(ctx, workflow_run.workflow_run_id)
                     exit_reason = "success"
                     break
 
@@ -4840,6 +4860,7 @@ async def _run_blocks_and_collect_debug(
                 # has to exclude. Then cancel + reread +
                 # ``_trusted_post_drain_status`` applies SKY-9167's success-race
                 # recovery uniformly to both non-success exit reasons.
+                _unmark_leavable_run(ctx, workflow_run.workflow_run_id)
                 pre_cancel_run = await _safe_read_workflow_run(
                     workflow_run.workflow_run_id, ctx.organization_id, context="pre-cancel"
                 )
@@ -4972,21 +4993,26 @@ async def _run_blocks_and_collect_debug(
                     result["data"]["authored_locator_observations"] = watchdog_locator_observations
                 return _ExecutionResult(result, execution)
         except asyncio.CancelledError:
-            # A pause is detected several awaits before the result is returned, so a tool timeout
-            # landing in that window reaches here with the run alive and waiting on a person.
-            # Cancelling it would destroy the state the person was asked to act on, so leave the
-            # run to the ``finally`` below, which adopts the executor instead.
-            if run_paused:
+            # A paused run waits on a person, and a live run the backstop may leave is its owner's to finish, so the
+            # finally adopts either instead of cancelling it. Stop, shutdown and this tool's timeout still cancel.
+            left_by_backstop = _backstop_may_leave_run_running(
+                turn_deadline, ctx.budget_expiry_state, workflow_run.workflow_run_id
+            )
+            leave_run_to_owner = run_paused or left_by_backstop
+            LOG.info(
+                "copilot_build_test_cancellation_disposition",
+                left_to_owner=leave_run_to_owner,
+                run_paused=run_paused,
+                backstop_expired=turn_deadline is not None and turn_deadline.expired(),
+                run_detached_from_chat=run_detached_from_chat,
+                contains_sensitive_values=origin_registry.contains_sensitive_values,
+                dispatched=run_task is None,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            if leave_run_to_owner:
                 raise
-            # The turn's hard deadline ends the turn's wait for the run, never the run (ADR-0025): the
-            # run stays with its executor and the turn's final reply reads its record.
-            if turn_deadline is not None and turn_deadline.expired():
-                run_left_running = True
-                raise
-            # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
-            # the cleanup so the parent cancellation can't interrupt it mid-await.
-            # If the shield itself is cancelled, fall back to a detached task
-            # that outlives tool teardown and still reconciles workflow state.
+            # Shielded so the cancellation cannot interrupt the cancel write; a second cancellation hands it to a
+            # detached task that outlives tool teardown.
             cancel_cleanup = (
                 _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
                 if run_task is not None
@@ -5007,13 +5033,13 @@ async def _run_blocks_and_collect_debug(
                 fallback.add_done_callback(_log_detached_cleanup_failure)
             raise
         finally:
-            # If any exit path above missed a cancel — e.g. an unexpected exception bubbling out of the
-            # poll loop — signal the run_task so we don't leak it. Dispatched runs have no in-process
-            # task, so there is nothing to signal.
+            leave_run_to_owner = leave_run_to_owner or run_paused
+            # Only the backstop's own leave stays marked: a paused run that returned normally was not left by it.
+            if not left_by_backstop:
+                _unmark_leavable_run(ctx, workflow_run.workflow_run_id)
             if run_task is not None and not run_task.done():
-                if run_paused or run_left_running:
-                    # The inline executor coroutine is the run itself (and what observes a pause's
-                    # approval), so it has to outlive this tool call instead of being cancelled.
+                if leave_run_to_owner:
+                    # The inline executor coroutine is what finishes the run, so it outlives this tool call.
                     detached_task = asyncio.create_task(
                         _retire_snapshot_after_execution(
                             run_task,
@@ -5121,9 +5147,9 @@ async def _run_blocks_and_collect_debug(
         if execution.reused_origin_input_keys:
             result_data["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
         _attach_reused_origin_outputs(result_data, execution)
-        if not run_ok and run and getattr(run, "failure_reason", None):
+        if not run_ok and run and run.failure_reason:
             result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
-        if not run_ok and run and getattr(run, "failure_category", None):
+        if not run_ok and run and run.failure_category:
             failure_category = without_output_only_categories(run.failure_category)
             if failure_category:
                 result_data["failure_category"] = failure_category
@@ -5268,9 +5294,8 @@ async def _run_blocks_and_collect_debug(
 
         return response
     finally:
-        # A paused or still-running run keeps its association so the pane still follows it; the next
-        # run's generation replaces it.
-        if active_run_association is not None and not (run_paused or run_left_running):
+        # A run left to its owner keeps its association so the pane still follows it; the next run replaces it.
+        if active_run_association is not None and not leave_run_to_owner:
             try:
                 await clear_active_run_session(
                     organization_id=active_run_association.organization_id,

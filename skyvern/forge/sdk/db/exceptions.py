@@ -32,6 +32,20 @@ class NotFoundError(Exception):
     pass
 
 
+class RunsListSearchCanceled(Exception):
+    """A statement timeout cancelled the statement carrying a runs-list search filter.
+
+    Raised for that statement only, so a cancellation anywhere else in the same request keeps its
+    own error and its own logging. ``statement_timeout_seconds`` is the budget that applied, or
+    None when the read ran under the connection's own timeout.
+    """
+
+    def __init__(self, *, indexed_search: bool, statement_timeout_seconds: float | None) -> None:
+        super().__init__("A runs list search statement was cancelled")
+        self.indexed_search = indexed_search
+        self.statement_timeout_seconds = statement_timeout_seconds
+
+
 class DuplicateCopilotTurnError(Exception):
     def __init__(self, turn_id: str) -> None:
         super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")

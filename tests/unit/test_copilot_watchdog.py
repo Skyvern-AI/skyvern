@@ -45,7 +45,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
-from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
+from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML, adopted_detached_tasks
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
 from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
 
@@ -429,10 +429,6 @@ workflow_definition:
 """
 
 
-def _adopted_detached_tasks(before: set[Any]) -> list[Any]:
-    return [task for task in run_execution._DETACHED_CLEANUP_TASKS if task not in before]
-
-
 def _install_advancing_clock(monkeypatch: pytest.MonkeyPatch, step_seconds: float = 600.0) -> Callable[[], float]:
     elapsed = 0.0
 
@@ -493,8 +489,9 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     harness["cooperative_cancel"].assert_not_awaited()
     harness["clear"].assert_not_awaited()
     harness["publish"].assert_awaited_once()
+    assert ctx.budget_expiry_state.leavable_run_ids == []
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -530,7 +527,7 @@ async def test_tool_cancelled_while_paused_leaves_the_run_alive(monkeypatch: pyt
     harness["cancel_run_task"].assert_not_awaited()
     harness["cooperative_cancel"].assert_not_awaited()
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -607,7 +604,7 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
     assert result["data"]["browser_start"]["kind"] == "separate_context_continued_from_earlier_test"
     harness["cancel_run_task"].assert_awaited_once()
     harness["clear"].assert_awaited_once()
-    assert _adopted_detached_tasks(before) == []
+    assert adopted_detached_tasks(before) == []
 
     for relayed in (
         result["data"]["failure_reason"],
@@ -1064,7 +1061,7 @@ async def test_the_turn_deadline_ends_the_wait_and_leaves_the_run_with_its_execu
     assert harness["executor_cancelled"] is False
     assert ctx.open_step_run_ids == ["wr_paused"]
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     for task in adopted:
         task.cancel()
     await asyncio.gather(*adopted, return_exceptions=True)

@@ -11,6 +11,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    TaskTerminationError,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import uploaded_file_id_for_local_uri, validate_download_url
@@ -81,6 +82,11 @@ async def run_sdk_action(
     # The whole action runs on this process's event loop, so the cap is taken before any database
     # write or page work: an organization over its cap costs a rejected request, not a started one.
     async with app.RATE_LIMITER.limit_sdk_action_concurrency(organization.organization_id):
+        # Not the API permission checker: on older billing plans it demands a whole run's worth of credits.
+        try:
+            await app.AGENT_FUNCTION.validate_task_execution(organization_id=organization.organization_id)
+        except TaskTerminationError:
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Not enough credit balance.")
         return await _run_sdk_action(action_request, organization, created_by=user_id)
 
 

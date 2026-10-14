@@ -71,19 +71,15 @@ def _may_move_on(tool: str, args: dict[str, Any]) -> bool:
     return _may_submit(tool, args) and not (tool == "click" and _MENU_ROW.search(_selector(args)))
 
 
-def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | None) -> Callable[[], int] | None:
-    """Wraps the tools; returns 1 while the last moving action was refused, for the run's end (a hold never cleared)."""
+def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | None) -> None:
     if audit is None:
-        return None
+        return
     # Each answer's audit starts when it is recorded, so the call overlaps the model's next turns instead of delaying
     # the moving click.
     pending: dict[Field, tuple[str, asyncio.Task[list[RecordedAnswer]]]] = {}
     flagged: dict[Field, str] = {}
     refused: set[tuple[Field, str]] = set()
-    picks: set[Field] = set()
-    checked = next((spec.choice_checked for spec in tools if spec.choice_checked is not None), None)
     open_menu: dict[str, Field | None] = {"field": None}
-    holding = [0]
 
     def record(field: Field, value: str) -> None:
         previous = pending.pop(field, None)
@@ -101,18 +97,6 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             LOG.warning("taskv3 answer basis audit raised; not blocking", exc_info=True)
             return False
 
-    async def unpicked() -> None:
-        # A pick holds only while it is still checked: picking another option, or unchecking it, takes it back.
-        for pick in [f for f in flagged if f in picks]:
-            if checked is not None and await checked(pick[1]) is False:
-                del flagged[pick]
-
-    def unresolved(task: asyncio.Task[list[RecordedAnswer]]) -> bool:
-        return not task.done() or (not task.cancelled() and task.exception() is None and bool(task.result()))
-
-    def settled() -> list[Field]:
-        return [f for f, (_, task) in pending.items() if task.done() and unresolved(task)]
-
     async def hold(
         spec: ToolSpec, args: dict[str, Any], entering: tuple[Field, str] | None = None, appends: bool = False
     ) -> bool:
@@ -121,7 +105,6 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             field, (value, task) = pending.popitem()
             if await found(task):
                 flagged[field] = value
-        await unpicked()
         shown = dict(flagged)
         untyped = None
         # The answer a call enters is judged as if it had landed, recording nothing, and never twice once refused.
@@ -133,7 +116,6 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 refused.add(entering)
                 shown[entering[0]] = entering[1]
                 untyped = entering[0]
-        holding[0] = 0
         if not shown:
             return False
         # A click cannot be told from a submit before it lands, so only the flagged field's own control, or a row of an
@@ -142,7 +124,6 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             selector, menu_row = await spec.address_probe(args) if spec.address_probe else (_selector(args), False)
             if menu_row or any(selector == field[1] for field in flagged):
                 return True
-        holding[0] = 1
         LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown))
         named = "; ".join(
             f"'{q}' with '{v}' (field {s}; not typed, nothing was entered or pressed)"
@@ -178,14 +159,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                     entering = ((label.strip(), selector), text)
                 elif not selector:
                     LOG.info("taskv3 answer basis probe missed", tool=_tool)
-            # Read before the call, which rewrites a ref to its selector. A radio or checkbox click picks an answer, so it
-            # waits on no earlier answer; it is held only while another kind of answer is already flagged.
-            choice = _spec.choice_probe(args) if _spec.choice_probe is not None else None
-            repair = (
-                _may_move_on(_tool, args)
-                and (choice is None or any(f not in picks for f in [*flagged, *settled()]))
-                and await hold(_spec, args, entering, not args.get("clear", True))
-            )
+            repair = _may_move_on(_tool, args) and await hold(_spec, args, entering, not args.get("clear", True))
             result = await _handler(args)
             data = _data(result)
             picked = str(data.get(PICKED_OPTION_DATA_KEY) or "") if _tool == "click" and result.status == "ok" else ""
@@ -206,21 +180,6 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 return result
             # The ref resolver rewrites args["selector"] in place, so this is the selector the call acted on.
             field = (_label(result), _selector(args))
-            if choice is not None:
-                # Each picked option is its own answer under its group's question; picking it again is not a second
-                # chance at the judge.
-                field = (choice[0], field[1])
-                picks.add(field)
-                if data.get("page_transitioned"):
-                    # Only a flag still standing, or a judgment still running, counts.
-                    await unpicked()
-                    waiting = any(unresolved(task) for _, task in pending.values())
-                    LOG.info(
-                        "taskv3 answer basis pick advanced", pick_advanced=1, flag_pending=int(bool(flagged) or waiting)
-                    )
-                if flagged.get(field) != choice[1]:
-                    record(field, choice[1])
-                return result
             if entering is not None and field == entering[0]:
                 record(field, "")
                 return result
@@ -235,6 +194,3 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             return result
 
         spec.handler = wrapped
-
-    # A flag the model cleared after its last refused move is not a hold that persisted.
-    return lambda: int(bool(holding[0] and flagged))

@@ -47,7 +47,11 @@ from skyvern.forge.taskv3.engine import (
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
+from skyvern.forge.taskv3.goal_check import (
+    INSTRUCTIONS_MAX_CHARS,
+    TERMINATE_PREMISE_PROMPT_NAME,
+    UNLISTED_REASK_PROMPT_NAME,
+)
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
@@ -2534,6 +2538,182 @@ async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_go
     assert outcome.unlisted_reask["asked"] is True
     assert outcome.unlisted_reask["verdict"] == "not_completed"
     assert outcome.unlisted_reask["converted"] is False
+
+
+class _PremiseAnsweringCaller(_ScriptedCaller):
+    """The run's own caller, answering the terminate-premise check outside the scripted loop turns."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any]) -> None:
+        super().__init__(script)
+        self.answer = answer
+        self.premise_calls: list[dict[str, Any]] = []
+        self.reask_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+            self.premise_calls.append(kwargs)
+            return self.answer
+        if kwargs.get("prompt_name") == UNLISTED_REASK_PROMPT_NAME:
+            self.reask_calls.append(kwargs)
+            return {"verdict": "not_completed", "terminate_criterion_holds": True, "skipped_screen": "", "quote": ""}
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "scope", "checked"),
+    [
+        ("terminated", {}, True),
+        # The check reads a stop, so a block that asks for data or waits on a download is checked too.
+        ("terminated", {"extraction_requested": True}, True),
+        ("completed", {}, False),
+        ("failed", {}, False),
+        ("terminated", {"page_free": True}, False),
+    ],
+    ids=["terminated", "terminated_extraction", "completed", "failed", "page_free"],
+)
+async def test_a_terminate_on_a_block_without_a_completion_criterion_is_checked_and_logged_and_still_ends_the_run(
+    status: str, scope: dict[str, Any], checked: bool
+) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": status, "reason": "There is no 'View all statements' link."})]],
+        answer={
+            "cited": "instruction",
+            "condition": "unmet",
+            "stop_kind": "none",
+            "unmet_kind": "equivalent",
+            "quote": "See bill history",
+            "why": "The statements are linked under another name.",
+        },
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            extra_tools=[_fixed_read_tool("Account overview\nSee bill history\nPay now")],
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            **scope,
+        )
+
+    # Shadow only: the verdict is logged and the model's own status stands.
+    assert outcome.status == status
+    # No completion criterion, so no re-ask; the premise check does not need one.
+    assert caller.reask_calls == []
+    premise_logs = [log for log in logs if log["event"] == "taskv3 terminate premise"]
+    if not checked:
+        assert caller.premise_calls == [] and premise_logs == []
+        return
+    (premise_call,) = caller.premise_calls
+    assert premise_call["use_message_history"] is False
+    assert "See bill history" in premise_call["prompt"]
+    (log,) = premise_logs
+    assert log["would_overturn"] is True
+    assert log["why"] == "unmet_on_page"
+    assert log["never_overturn"] is None
+    assert log["unmet_kind"] == "equivalent"
+    # Never page text: the quote, the judge's sentence and the agent's reason stay in the LLM artifacts.
+    assert all(text not in str(log) for text in ("See bill history", "another name", "View all statements"))
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_on_a_customers_own_model_key_is_logged_as_never_overturned_without_a_call() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            terminate_premise_check=False,
+        )
+
+    assert caller.premise_calls == []
+    (log,) = (log for log in logs if log["event"] == "taskv3 terminate premise")
+    assert log["never_overturn"] == "customer_key" and log["would_overturn"] is False
+
+
+@pytest.mark.asyncio
+async def test_stop_criteria_for_a_block_without_a_completion_criterion_change_nothing_the_model_sees() -> None:
+    # The shadow check is their only new reader: every model-facing byte matches a run that never had them.
+    signed = "https://files.example.test/uploads/deadbeef/statement.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    terminate = f"the statement at {signed} is not listed"
+    seen = []
+    for criteria in (None, ("", terminate)):
+        caller = _PremiseAnsweringCaller(
+            [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "Not listed."})]],
+            answer={"cited": "none", "condition": "unclear", "stop_kind": "none", "quote": ""},
+        )
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal=f"Open the statements.\n\nIf this becomes true, stop and finish with status=terminated: {terminate}",
+            extra_tools=[_fixed_read_tool(f"Statements\n{signed}")],
+            unlisted_reask_criteria=criteria,
+        )
+        seen.append((json.dumps(caller.message_history, sort_keys=True), caller.sent_tools, outcome.status))
+
+    assert seen[0] == seen[1]
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_with_a_completion_criterion_asks_both_judges_once_each() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"cited": "goal", "condition": "met", "stop_kind": "none", "quote": ""},
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Create the account.",
+            extra_tools=[_fixed_read_tool("Create account\nEmail")],
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    assert outcome.status == "terminated"
+    assert len(caller.reask_calls) == 1 and len(caller.premise_calls) == 1
+    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["condition_met"]
+
+
+@pytest.mark.asyncio
+async def test_a_premise_check_that_fails_or_outlasts_its_timeout_still_ends_the_run_as_the_model_said(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_redactor() -> Any:
+        raise RuntimeError("redactor down")
+
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Open the statements.",
+        unlisted_reask_criteria=("", "the statements link is not on the page"),
+        goal_check_redactor=broken_redactor,
+    )
+    assert outcome.status == "terminated"
+
+    class _SlowCaller(_PremiseAnsweringCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+            if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+                await asyncio.sleep(5)
+            return await super().call(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "GOAL_CHECK_TIMEOUT_SECONDS", 0.05)
+    slow = _SlowCaller([[("finish", {"status": "terminated", "reason": "Not listed."})]], answer={})
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=slow,
+            goal="Open the statements.",
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+        )
+    assert outcome.status == "terminated"
+    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["skipped:timeout"]
 
 
 def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:

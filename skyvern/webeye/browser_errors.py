@@ -38,11 +38,19 @@ _CONTEXT_LOST_MESSAGE_MARKERS = (
     "execution context is not available",
     "uniquecontextid not found",
 )
+# Neither of the two conditions above: the target is alive and its context intact, but a navigation
+# in flight leaves a read unanswerable until the document settles.
+_CONTENT_NAVIGATING_MESSAGE_MARKERS = ("page is navigating",)
 
 
 def is_target_closed_message(message: str) -> bool:
     lowered = message.lower()
     return any(marker in lowered for marker in _TARGET_CLOSED_MESSAGE_MARKERS)
+
+
+def is_content_navigating_message(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _CONTENT_NAVIGATING_MESSAGE_MARKERS)
 
 
 def is_context_lost_message(message: str) -> bool:
