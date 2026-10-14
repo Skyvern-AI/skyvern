@@ -67,6 +67,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
@@ -422,6 +423,7 @@ async def _composition_capture_visual_summary(
             dispatch_browser_session_id=capture_session_id,
             producer_browser_session_id=producer_session_id,
             session_binding=session_binding,
+            viewport_css_px=screenshot_viewport_css_px(screenshot_result),
         )
         if screenshot_b64
         else None
@@ -1488,6 +1490,7 @@ async def _inspect_page_for_composition_under_custody(
                 dispatch_browser_session_id=visual_fallback_frame.dispatch_browser_session_id,
                 producer_browser_session_id=visual_fallback_frame.producer_browser_session_id,
                 session_binding=visual_fallback_frame.session_binding,
+                viewport_css_px=visual_fallback_frame.viewport_css_px,
             ),
             captured_at=visual_fallback_frame.captured_at,
         )

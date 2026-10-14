@@ -2772,6 +2772,7 @@ async def _capture_and_store_post_run_page(
                     dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                     producer_browser_session_id=captured_frame.producer_browser_session_id,
                     session_binding=captured_frame.session_binding,
+                    viewport_css_px=captured_frame.viewport_css_px,
                 ),
                 captured_at=captured_frame.captured_at,
             )
@@ -3013,6 +3014,7 @@ async def _capture_dispatched_terminal_page_evidence(
                 dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                 producer_browser_session_id=captured_frame.producer_browser_session_id,
                 session_binding=captured_frame.session_binding,
+                viewport_css_px=captured_frame.viewport_css_px,
             ),
             captured_at=captured_frame.captured_at,
         )

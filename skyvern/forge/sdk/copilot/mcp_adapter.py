@@ -87,6 +87,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     capturing_tool_call,
     enqueue_screenshot_from_result,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     encoded_secret_variants,
@@ -2236,6 +2237,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         if isinstance(workflow_run_id, str) and workflow_run_id
                         else None,
                         action_relation=ScreenshotActionRelation.TOOL_RESULT,
+                        viewport_css_px=screenshot_viewport_css_px(copilot_result),
                     ),
                 )
 
