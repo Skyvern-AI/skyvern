@@ -125,8 +125,6 @@ class CustomLLMConfig(BaseModel):
         if self.provider is CustomLLMProvider.OPENAI_COMPATIBLE:
             if not self.api_base:
                 raise ValueError("api_base is required for OpenAI-compatible models")
-            if not self.api_key:
-                raise ValueError("api_key is required for OpenAI-compatible models")
         elif self.provider is CustomLLMProvider.OPENROUTER:
             if not self.api_key:
                 raise ValueError("api_key is required for OpenRouter models")
