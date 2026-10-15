@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
     post_run_evidence_source_refused,
     stamp_page_evidence_provenance,
+    without_authoring_facts,
 )
 from skyvern.forge.sdk.copilot.context import SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP, SignedOutPageObservation
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -85,6 +86,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     consume_screenshot_artifact,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -558,6 +560,7 @@ async def _capture_post_interaction_screenshot(
             dispatch_browser_session_id=frame.dispatch_session_id,
             producer_browser_session_id=frame.producer_session_id,
             session_binding=frame.session_binding,
+            viewport_css_px=frame.viewport_css_px,
         ),
         captured_at=frame.started_at,
     )
@@ -595,6 +598,7 @@ async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> 
         producer_session_id=producer_session_id,
         session_binding=session_binding,
         started_at=started_at,
+        viewport_css_px=screenshot_viewport_css_px(result),
     )
 
 
@@ -602,7 +606,7 @@ def _model_visible_selector_candidates(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [
-        {key: item for key, item in candidate.items() if key != "match_count"}
+        {key: item for key, item in candidate.items() if key not in {"match_count", "visible_match_count"}}
         if isinstance(candidate, dict)
         else candidate
         for candidate in value
@@ -1062,7 +1066,9 @@ _PAGE_EVIDENCE_STATE_KEYS = (
 
 
 def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
-    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    """Return DOM-observed structure without visual augmentation, transport metadata or authoring facts:
+    pointer states change with scroll, and can tip the capture over its bound, which drops the visible counts."""
+    packet = without_authoring_facts(packet)
     state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
     page_obstructions = packet.get("page_obstructions")
     state["page_obstructions"] = (
@@ -2275,7 +2281,7 @@ def page_state_probe_allowed(
     )
 
 
-async def read_page_state(
+async def read_page_state_on_page(
     ctx: AgentContext,
     *,
     tool_name: str,
@@ -2284,12 +2290,11 @@ async def read_page_state(
     probe: bool = True,
     settle: bool = False,
     custody_lock: AbstractAsyncContextManager[None] | None = None,
-) -> PageState:
-    """What the call's browser shows now, scrubbed for the model, or the unread state without touching a browser
-    the call may not probe. A vendor frame that could not be measured makes the read fail rather than report no
-    challenge."""
+) -> tuple[PageState, Page | None]:
+    """What the call's browser shows now, scrubbed for the model, and the page read, or the unread state and None
+    without touching a browser the call may not probe. An unmeasured vendor frame fails the read, not "no challenge"."""
     if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
-        return unread_page_state(ctx)
+        return unread_page_state(ctx), None
     deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
     if settle:
         deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
@@ -2316,7 +2321,7 @@ async def read_page_state(
             }
             scrubbed = scrub_model_facing_tool_result(ctx, {"page_state": state}).get("page_state")
             if isinstance(scrubbed, dict):
-                return cast(PageState, scrubbed)
+                return cast(PageState, scrubbed), reading.page
             failure = "scrubbed_away"
     LOG.info(
         "copilot_page_state_read_failed",
@@ -2325,13 +2330,14 @@ async def read_page_state(
         reason=failure,
         duration_ms=round((time.monotonic() - started) * 1000),
     )
-    return unread_page_state(ctx)
+    return unread_page_state(ctx), None
 
 
 class _LivePageReading(NamedTuple):
     url: str
     title: str
     vendor: str | None
+    page: Page
 
 
 _PageStateReadFailure = Literal["no_page", "vendor_frame_unmeasured", "unreadable_location", "navigated_during_read"]
@@ -2360,7 +2366,7 @@ async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePage
     # A navigation between the vendor probe and the title read would pair one document's vendor with another's.
     if url != url_before:
         return "navigated_during_read"
-    return _LivePageReading(url, title, vendor)
+    return _LivePageReading(url, title, vendor, page)
 
 
 def _child_frames(page: Page) -> list[Frame]:

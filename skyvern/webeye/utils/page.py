@@ -36,7 +36,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.contained_effects import contained_effect
-from skyvern.webeye.action_deadline import under_action_deadline
+from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
@@ -447,6 +447,10 @@ def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSel
     return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or is_engine_timeout(
         exc, engine_selection
     )
+
+
+class BlobTooLargeError(Exception):
+    pass
 
 
 def _extract_playwright_screenshot_stage(exc: BaseException) -> str:
@@ -989,7 +993,9 @@ async def _bounded_page_screenshot(
     # The driver's own screenshot timeout has been seen not to fire for hours on an unresponsive page. The
     # action deadline also re-cancels a driver that swallows the first cancellation and rejects a late image.
     async with under_action_deadline(budget_ms=int(timeout)):
-        screenshot = await page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+        screenshot = await cancellable_driver_call(
+            lambda: page.screenshot(path=file_path, timeout=timeout, full_page=full_page, animations=animations)
+        )
     return screenshot
 
 
@@ -1488,12 +1494,27 @@ def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -
 
 def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:
     positions = [position for _, position in partial_frames]
+    frame_sizes: list[tuple[int, int]] = []
     try:
-        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames], positions)
+        for frame, _ in partial_frames:
+            with Image.open(BytesIO(frame)) as img:
+                img.load()
+                frame_sizes.append(img.size)
+        # The merge only lines up a viewport that scrolled forward, by no more than its height, and has the
+        # first viewport's size; keep frames up to the first seam that breaks this instead of reordering them.
+        retained = 1
+        while retained < len(partial_frames):
+            step = positions[retained] - positions[retained - 1]
+            if frame_sizes[retained] != frame_sizes[0] or not 0 < step <= frame_sizes[0][1]:
+                break
+            retained += 1
+        png = _stitch_screenshots_to_png([frame for frame, _ in partial_frames[:retained]], positions[:retained])
     except Exception:
         LOG.warning(
             "Failed to stitch the viewports captured before the scrolling screenshot timed out",
             frame_count=len(positions),
+            scroll_positions=positions,
+            frame_sizes=frame_sizes,
             exc_info=True,
         )
         return None
@@ -1501,7 +1522,9 @@ def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | N
         "Scrolling screenshot timed out; keeping the viewports captured so far",
         incomplete_reason="capture_timeout",
         frame_count=len(positions),
+        retained_frame_count=retained,
         scroll_positions=positions,
+        frame_sizes=frame_sizes,
     )
     return png
 
@@ -2027,7 +2050,7 @@ class SkyvernFrame:
         deadline = deadline if deadline is not None else loop.time() + timeout_ms / 1000
         try:
             async with asyncio.timeout_at(deadline):
-                result = await evaluate_expression()
+                result = await cancellable_driver_call(evaluate_expression)
         except asyncio.TimeoutError as error:
             skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
             # Re-raised and handled by the caller (scrape retries / failure classification),
@@ -2128,7 +2151,7 @@ class SkyvernFrame:
                     async with asyncio.timeout(inject_budget):
                         # Same dispatch helper so a prefixed Page re-injects
                         # JS_FUNCTION_DEFS via Runtime.evaluate (preserving the marker).
-                        await _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None)
+                        await cancellable_driver_call(lambda: _dispatch_evaluate(frame, JS_FUNCTION_DEFS, None))
                 except asyncio.TimeoutError as error:
                     LOG.warning(
                         "Skyvern timed out trying to analyze the page during domUtils.js re-injection",
@@ -2162,7 +2185,7 @@ class SkyvernFrame:
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    result = await evaluate_expression()
+                    result = await cancellable_driver_call(evaluate_expression)
                 # The final evaluate answered, so this run-wide health tally is no longer stale.
                 skyvern_context.record_browser_success()
                 return result
@@ -2195,6 +2218,7 @@ class SkyvernFrame:
         workflow_run_id: str | None = None,
         max_size_bytes: int | None = None,
         probe: bool = False,
+        raise_too_large: bool = False,
     ) -> bytes | None:
         # probe=True is for best-effort multi-page fallback where the caller tries every open
         # page; expected misses on non-owning pages shouldn't spam ERROR/WARN logs, so downgrade
@@ -2243,6 +2267,8 @@ class SkyvernFrame:
                     size=result.get("size"),
                     max_size_bytes=max_size_bytes,
                 )
+                if raise_too_large:
+                    raise BlobTooLargeError
                 return None
             if not isinstance(result, dict) or not result.get("ok"):
                 retry_log(

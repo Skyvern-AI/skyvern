@@ -43,7 +43,11 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     UpdateBrowserProfileRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import export_profile_storage_id
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    export_profile_storage_id,
+    is_external_cdp_session,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
@@ -84,6 +88,15 @@ def _normalize_proxy_pin_fields(
     if proxy_session_id:
         return proxy_location or ProxyLocation.RESIDENTIAL_ISP, proxy_session_id
     return proxy_location, None
+
+
+def _refuse_profile_from_external_session(browser_session: PersistentBrowserSession) -> None:
+    if is_external_cdp_session(browser_session):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Browser session {browser_session.persistent_browser_session_id} is a registered external "
+            "browser, and Skyvern does not save profiles from it.",
+        )
 
 
 def _handle_duplicate_profile_name(*, organization_id: str, name: str, exc: IntegrityError) -> NoReturn:
@@ -746,6 +759,7 @@ async def create_profile_from_running_session(
     )
     if browser_session is None:
         raise BrowserSessionNotFound(browser_session_id)
+    _refuse_profile_from_external_session(browser_session)
     browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(
         browser_session_id, organization_id
     )
@@ -950,6 +964,7 @@ async def _create_profile_from_session_locked(
             browser_session_id=browser_session_id,
         )
         raise BrowserSessionNotFound(browser_session_id)
+    _refuse_profile_from_external_session(browser_session)
 
     saved_profile = await _profile_already_saved_from_session(
         organization_id=organization_id, browser_session_id=browser_session_id, name=name

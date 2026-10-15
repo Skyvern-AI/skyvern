@@ -36,6 +36,7 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
+    StepTerminationError,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -118,6 +119,7 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
+from skyvern.services.credential_verdict_service import CredentialVerdictContext, confirm_credential_verdicts
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 from skyvern.utils.templating import reject_jinja_transformations_on_variable
@@ -782,6 +784,21 @@ async def _create_workflow_block_run_and_task(
             admitted = await app.AGENT_FUNCTION.admit_recipe_step_attempt(task, step, is_cached=True)
             if not admitted:
                 raise RuntimeError("Recipe step was not admitted")
+        else:
+            try:
+                await app.AGENT_FUNCTION.validate_step_execution(task, step)
+            except StepTerminationError as e:
+                await _update_workflow_block(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=e.message,
+                    step_id=step_id,
+                    step_status=StepStatus.failed,
+                    label=label,
+                )
+                raise
 
     # The agent path settles a prior failed block's owned capture in execute_safe; a cached
     # successor reaches the same browser here, so it settles it before its own reads. Kept above
@@ -1427,7 +1444,16 @@ async def _detect_user_defined_errors(
             errors=[e.error_code for e in user_defined_errors],
         )
 
-        return user_defined_errors
+        return await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=user_defined_errors,
+            context=CredentialVerdictContext(
+                current_url=current_url,
+                elements=elements,
+                screenshots=screenshots,
+            ),
+        )
 
     except Exception as e:
         LOG.exception(
@@ -4015,6 +4041,7 @@ async def parse_file(
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
     worksheet: str | None = None,
+    force_ocr: bool = False,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
@@ -4025,6 +4052,7 @@ async def parse_file(
         file_type=file_type,
         json_schema=schema,
         worksheet=worksheet,
+        force_ocr=force_ocr,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,

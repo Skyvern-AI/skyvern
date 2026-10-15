@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 from uuid import uuid4
 
@@ -23,6 +23,8 @@ class BudgetExpiryState:
     report_produced: bool | None = None
     staged_draft_id: str | None = None
     hard_backstop_reached: bool = False
+    # Set by the build tool before its poll, so the persisted reply reads it without waiting on the tool's cleanup.
+    leavable_run_ids: list[str] = field(default_factory=list)
 
     def begin_drain(self) -> None:
         self.drain_attempted = True
@@ -41,6 +43,46 @@ class BudgetExpiryObservation(BaseModel):
         "The normal turn budget has expired. headroom is the maximum number of model calls available to finish "
         "this turn, including this call; the hard time limit may stop it sooner. Your session history and any "
         "staged draft remain available. Choose how to use these calls. New build-test runs cannot be dispatched."
+    )
+
+
+class RecordedBlockState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    status: str
+    failure_reason: str | None = None
+
+
+class RecordedRunState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    workflow_run_id: str
+    status: str | None
+    failure_reason: str | None = None
+    blocks: list[RecordedBlockState] = []
+    earlier_blocks_not_shown: int = 0
+    left_running: bool = False
+
+
+class BudgetExpiredReplyObservation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    budget_expired: Literal[True] = True
+    source: BudgetExpirySource | None
+    staged_draft: str | None
+    stopped_waiting: bool
+    runs_not_in_history: list[RecordedRunState]
+    message: str = (
+        "This turn's time is spent and nothing more can run in it. Call `reply` now with your final response for "
+        "this turn; any other tool call will not run. staged_draft is the draft this turn holds. "
+        "stopped_waiting means the turn stopped waiting for the step still in progress: that step's model response "
+        "and tool results are not in your history, and the result of a browser action in it is unknown. "
+        "runs_not_in_history lists each run that step started, as its record reads now. left_running is true for a "
+        "run the time limit left going on its own browser. A final or paused status in a record is what happened. "
+        "When stopped_waiting is true, any other run whose record still shows it starting or running was cancelled "
+        "because it used this chat's browser, carried secret inputs, or had not finished starting, and its record "
+        "may not show the cancel yet."
     )
 
 

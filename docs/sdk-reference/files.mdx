@@ -1,0 +1,71 @@
+---
+title: "Files"
+description: "Upload files for tasks and agents to use."
+slug: sdk-reference/files
+keywords:
+  - "upload"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Upload a file to Skyvern storage and pass the returned URL to a task or agent.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## upload_file
+
+Upload a file
+
+<Warning>
+The `upload_file` method in the current Python and TypeScript SDKs does not send the file's contents: it posts `file` as a text field, and the API rejects the request with a 422 error. Until the SDKs are fixed, call the REST endpoint directly with a multipart upload:
+
+<CodeGroup>
+```bash curl
+curl -X POST https://api.skyvern.com/v1/upload_file \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -F file=@invoice.pdf
+```
+
+```python Python
+import httpx
+
+with open("invoice.pdf", "rb") as f:
+    response = httpx.post(
+        "https://api.skyvern.com/v1/upload_file",
+        headers={"x-api-key": "YOUR_API_KEY"},
+        files={"file": ("invoice.pdf", f)},
+    )
+response.raise_for_status()
+print(response.json())
+```
+</CodeGroup>
+</Warning>
+
+<CodeGroup>
+```python Python
+await skyvern.upload_file(*, file: str) -> UploadFileResponse
+```
+
+```typescript TypeScript
+skyvern.uploadFile(request: BodyUploadFileV1UploadFilePost): Promise<UploadFileResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `file` | `file` | `str` | Yes | — |  |
+
+**Returns** `UploadFileResponse` · TypeScript `Promise<UploadFileResponse>`
+
+<Accordion title="UploadFileResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `s3uri` | `str` | S3 URI where the file was uploaded |
+| `presigned_url` | `str` | Presigned URL to access the uploaded file |
+
+</Accordion>

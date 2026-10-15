@@ -100,6 +100,9 @@ class EntryMatch(str, Enum):
     REFORMATTED = "reformatted"
     # Nothing landed: the field is empty, or holds exactly what it held before.
     NOT_HELD = "not_held"
+    # A national phone number the field read as international: the same digits behind a "+" the page added, so its
+    # first digits now stand for a country code.
+    PLUS_ADDED = "plus_added"
     DIFFERENT = "different"
 
 
@@ -137,7 +140,36 @@ def _groups(text: str) -> list[str]:
     return [str(int(g)) if len(g) <= 2 else g for g in groups]
 
 
+# An input mask's empty slots, such as "(___) ___-____": nothing landed.
+# A field that hides its value ("***") is not empty.
+_MASK_PLACEHOLDER_RE = re.compile(r"[\s()\-/.]*_[\s()\-/._]*")
+# A phone number as typed or shown: digits and mask separators after an optional "+"; no point, so never a decimal.
+_PHONE_RE = re.compile(r"\+?[\d\s()\-/]+", re.ASCII)
+# Shorter digit runs are quantities or codes as often as phone numbers.
+_PHONE_MIN_DIGITS = 8
+
+
+def _phone_digits(text: str) -> str | None:
+    return re.sub(r"\D", "", text) if _PHONE_RE.fullmatch(text.strip()) else None
+
+
+def _plus_added(typed: str, held: str) -> bool:
+    digits = _phone_digits(typed)
+    return (
+        digits is not None
+        and len(digits) >= _PHONE_MIN_DIGITS
+        and not typed.strip().startswith("+")
+        and held.strip().startswith("+")
+        and _phone_digits(held) == digits
+    )
+
+
 def _masked_same(typed: str, held: str) -> bool:
+    if typed.strip().startswith("+") and held.strip().startswith("+"):
+        # An international number is its digits after the "+"; a field regroups them however its country formats them.
+        digits = _phone_digits(typed)
+        if digits and digits == _phone_digits(held):
+            return True
     if _number_changed(typed, held):
         return False
     if _MASK_SEPARATOR_RE.search(typed.strip()) and _MASK_SEPARATOR_RE.search(held.strip()):
@@ -160,6 +192,10 @@ def compare_text(typed: str, held: str | None, before: str | None = None, *, exa
         return EntryMatch.NOT_HELD
     if exact:
         return EntryMatch.NOT_HELD if before is not None and held == before else EntryMatch.DIFFERENT
+    if _MASK_PLACEHOLDER_RE.fullmatch(held) and re.search(r"[^\W_]", typed):
+        return EntryMatch.NOT_HELD
+    if _plus_added(typed, held):
+        return EntryMatch.PLUS_ADDED
     if _masked_same(typed, held) or _same_cell_value(held, typed) or ("," in typed and _same_cell_value(typed, held)):
         return EntryMatch.REFORMATTED
     if before is not None and held == before:
@@ -195,6 +231,18 @@ def entry_outcome(selector: str, match: EntryMatch | None, *, shown: str | None,
             error_class="text_not_held",
         )
     holds = f"'{shown}'" if shown is not None else "a different value"
+    if match is EntryMatch.PLUS_ADDED:
+        return ToolResult(
+            "ok",
+            f"{did} {selector}, but the field now holds {holds}: it put '+' in front of the digits, so it reads the "
+            "first of them as a country calling code. If the digits you typed began with the country calling code "
+            "(which never starts with 0), this is the right number, but it stays unconfirmed until you retype it "
+            "starting with '+'. If not, the number is wrong and typing the same digits again gives the same result: "
+            "retype the full number starting with '+' and the country calling code that matches the phone number or "
+            "country in the task data; if the data gives no country, say so instead of guessing a code.",
+            ok_class="held_international",
+            entry_unconfirmed=True,
+        )
     return ToolResult(
         "ok",
         f"{did} {selector}, but the field now holds {holds}, not what was entered: the page may have reformatted, "

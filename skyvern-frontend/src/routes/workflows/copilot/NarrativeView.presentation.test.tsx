@@ -159,6 +159,83 @@ describe("NarrativeView structured turn presentation", () => {
     const card = screen.getByRole("button", { name: /Stopped Open Site/ });
     expect(card.getAttribute("aria-expanded")).toBeNull();
   });
+
+  it.each([
+    [["wr_left"], "deadline"],
+    [[], "deadline"],
+    [[], "max_turns"],
+  ] as const)(
+    "names the runs left running (%j) after the %s limit",
+    (leftRunIds, source) => {
+      render(
+        <NarrativeView
+          turn={structuredTurn({
+            blocks: [{ ...completedBlock(), state: "unfinished" }],
+            budgetExpiry: {
+              budgetExpired: true,
+              source,
+              reportProduced: true,
+              stagedDraftId: null,
+              drainFingerprint: null,
+              leftRunIds: [...leftRunIds],
+            },
+            turnFacts: {
+              factsAvailable: true,
+              evaluationState: null,
+              runId: "wr_left",
+              runCompleted: false,
+              terminalCause: null,
+              blocksRunThisTurn: 1,
+              ranCleanOnCurrentSource: false,
+              authoredBlockCount: 1,
+              matchingSourceBlockCount: 1,
+            },
+          })}
+        />,
+      );
+
+      expect(
+        screen.getByRole("button", { name: /Unfinished Open Site/ }),
+      ).toBeTruthy();
+      expect(
+        screen.getByText(/the turn ended before this block finished/),
+      ).toBeTruthy();
+      expect(screen.queryByText(/Passed|Stopped|Failed/)).toBeNull();
+      const runPage = screen.queryByRole("link", { name: /its run page/ });
+      if (leftRunIds.length) {
+        expect(screen.getByText(/may still be going/)).toBeTruthy();
+        expect(runPage?.getAttribute("href")).toBe("/runs/wr_left");
+      } else {
+        expect(screen.queryByText(/may still be going/)).toBeNull();
+        expect(runPage).toBeNull();
+      }
+    },
+  );
+
+  it("links each run the time limit left", () => {
+    render(
+      <NarrativeView
+        turn={structuredTurn({
+          blocks: [{ ...completedBlock(), state: "unfinished" }],
+          budgetExpiry: {
+            budgetExpired: true,
+            source: "deadline",
+            reportProduced: true,
+            stagedDraftId: null,
+            drainFingerprint: null,
+            leftRunIds: ["wr_a", "wr_b"],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/test runs may still be going/)).toBeTruthy();
+    expect(
+      screen
+        .getAllByRole("link", { name: /wr_/ })
+        .map((link) => link.getAttribute("href")),
+    ).toEqual(["/runs/wr_a", "/runs/wr_b"]);
+  });
 });
 
 // codegen_progress frames are live-only and never persisted: the backend

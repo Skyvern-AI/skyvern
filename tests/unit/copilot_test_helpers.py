@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -28,6 +30,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 from playwright.sync_api import sync_playwright
 
@@ -58,8 +61,16 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    OriginRunRedactionRegistry,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+    ScreenshotProvenance,
+    resize_screenshot_b64,
 )
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
@@ -72,11 +83,14 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.routes.workflow_copilot import _assistant_execution_receipts
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotTitleUpdate,
 )
@@ -650,6 +664,99 @@ async def install_run_blocks_harness(
     return captured
 
 
+_REAL_CANCEL_RUN_TASK_IF_NOT_FINAL = run_execution_module._cancel_run_task_if_not_final
+_REAL_COOPERATIVE_CANCEL_DISPATCHED_RUN = run_execution_module._cooperative_cancel_dispatched_run
+_REAL_DELETE_DISPATCH_DRAFT_IF_RUN_FINAL = run_execution_module._delete_dispatch_draft_if_run_final
+
+OWNED_RUN_ID = "wr_build_test"
+
+
+class OwnedRunRow:
+    """One run row shared by the build tool's poll, the real conditional cancel and draft-retire paths and its
+    worker, installed over ``install_run_blocks_harness`` so a write lands on the row a later read reports."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, *, block_first_read: bool = False, block_first_cancel: bool = False
+    ) -> None:
+        self.row = _fake_workflow_run(status="running").model_copy(update={"workflow_run_id": OWNED_RUN_ID})
+        self.cancel_writes: list[str] = []
+        self.draft_deletes = AsyncMock()
+        self.polled = asyncio.Event()
+        self.cancel_started = asyncio.Event()
+        self._block_first_read = block_first_read
+        self._block_first_cancel = block_first_cancel
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=self.row.model_copy()))
+        monkeypatch.setattr(run_execution_module, "_cancel_run_task_if_not_final", _REAL_CANCEL_RUN_TASK_IF_NOT_FINAL)
+        monkeypatch.setattr(
+            run_execution_module, "_cooperative_cancel_dispatched_run", _REAL_COOPERATIVE_CANCEL_DISPATCHED_RUN
+        )
+        monkeypatch.setattr(
+            run_execution_module, "_delete_dispatch_draft_if_run_final", _REAL_DELETE_DISPATCH_DRAFT_IF_RUN_FINAL
+        )
+        monkeypatch.setattr(
+            forge_app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled_if_not_final", self._cancel_if_not_final
+        )
+        monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run", self._get_workflow_run)
+        monkeypatch.setattr(forge_app.DATABASE.workflows, "soft_delete_workflow_by_id", self.draft_deletes)
+        monkeypatch.setattr(run_execution_module, "_read_progress_sources", self._read_progress_sources)
+
+    def finish(self, status: str) -> None:
+        if not self.row.status.is_final():
+            self.row.status = WorkflowRunStatus(status)
+
+    async def _cancel_if_not_final(self, workflow_run_id: str) -> None:
+        self.cancel_started.set()
+        if self._block_first_cancel:
+            self._block_first_cancel = False
+            await asyncio.Event().wait()
+        if not self.row.status.is_final():
+            self.cancel_writes.append(workflow_run_id)
+            self.finish("canceled")
+
+    async def _get_workflow_run(self, **_kwargs: object) -> WorkflowRun:
+        return self.row
+
+    async def _read_progress_sources(self, _ctx: CopilotContext, _run_id: str) -> tuple[WorkflowRun, datetime]:
+        self.polled.set()
+        if self._block_first_read:
+            await asyncio.Event().wait()
+        return self.row, datetime.now(UTC)
+
+
+def make_build_test_ctx(
+    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch, *, on_chat_browser: bool = False, **overrides: object
+) -> CopilotContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat", **overrides)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_chat" if on_chat_browser else "pbs_run"
+    if on_chat_browser:
+        monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", AsyncMock(return_value=None))
+    return ctx
+
+
+def install_secret_carrying_run_registry(monkeypatch: pytest.MonkeyPatch, *, all_registered: bool = False) -> None:
+    async def _secret_carrying_registry(
+        _ctx: CopilotContext, *, workflow_run_id: str, **_kwargs: object
+    ) -> OriginRunRedactionRegistry:
+        return OriginRunRedactionRegistry(
+            workflow_run_id=workflow_run_id,
+            parameters={},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=all_registered,
+        )
+
+    monkeypatch.setattr(run_execution_module, "_bind_origin_run_redaction_registry", _secret_carrying_registry)
+
+
+def adopted_detached_tasks(before: set[asyncio.Task]) -> list[asyncio.Task]:
+    return [task for task in run_execution_module._DETACHED_CLEANUP_TASKS if task not in before]
+
+
+async def settle_cancelled_tools() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0.01)
+
+
 HANDBACK_WORKFLOW_YAML = """
 title: extraction example
 workflow_definition:
@@ -1221,27 +1328,11 @@ def two_page_login_yaml(*, submit_selector: str = "Login") -> str:
     """
 
 
-def straight_line_login_yaml() -> str:
-    """One always-executed code block with no branching: executing it reaches every call in it."""
-    return """
-    title: Sign in and read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          await page.fill("#user", "demo")
-          await page.get_by_role("button", name="Login", exact=True).click()
-          return {"visitors": "9.42K"}
-    """
-
-
 def failed_second_factor_run(run_id: str) -> RecordedBuildTestOutcome:
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label="sign_in_and_read",
-        attempted_call_ref="role:button:Login",
         verdict="repairable_failure",
         reason_code="runtime_block_failure",
         workflow_run_id=run_id,
@@ -1272,6 +1363,33 @@ def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
     The record is plain interaction dicts, so this only spares tests the brace noise.
     """
     return dict(fields)
+
+
+def captured_frame_entry(width: int = 1920, height: int = 947) -> ScreenshotEntry:
+    """A frame staged from a real PNG; each call is a new capture event."""
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (40, 90, 160)).save(buf, format="PNG")
+    return resize_screenshot_b64(
+        base64.b64encode(buf.getvalue()).decode("ascii"),
+        provenance=ScreenshotProvenance(
+            source_tool="get_browser_screenshot",
+            captured_url="https://example.com/page",
+            observation_step=None,
+            browser_session_id="pbs_123",
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.TOOL_RESULT,
+            viewport_css_px=(width, height),
+        ),
+    )
+
+
+def sent_image_px(message: Any) -> list[tuple[int, int]]:
+    content = message.get("content") if isinstance(message, dict) else None
+    return [
+        Image.open(io.BytesIO(base64.b64decode(part["image_url"].partition(";base64,")[2]))).size
+        for part in (content if isinstance(content, list) else [])
+        if part.get("type") == "input_image"
+    ]
 
 
 def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
@@ -1732,3 +1850,35 @@ async def run_production_loop(
         final_reply=final_reply,
     )
     return result, ctx, stream
+
+
+RECEIPT_WORKFLOW_YAML = """
+title: Metric
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: sign_in
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read the metric
+"""
+
+
+def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
+    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+
+
+def all_blocks_tested_message() -> MagicMock:
+    current = workflow_block_fingerprints(RECEIPT_WORKFLOW_YAML)
+    return receipt_message({"testedBlockFingerprints": {label: sorted(fps) for label, fps in current.items()}})
+
+
+def receipt_coverage_after(
+    messages: Sequence[WorkflowCopilotChatMessage], proposal: dict[str, Any] | None = None
+) -> dict[str, str]:
+    seed = _assistant_execution_receipts(list(messages), proposal)
+    projection = build_review_projection(RECEIPT_WORKFLOW_YAML, RECEIPT_WORKFLOW_YAML, seed)
+    assert projection is not None
+    return {block["label"]: block["coverage"] for block in projection["blocks"]}

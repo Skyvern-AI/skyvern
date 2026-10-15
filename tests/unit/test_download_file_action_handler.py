@@ -1,10 +1,12 @@
 import asyncio
 import contextlib
+import gc
 import io
 import logging
 import os
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,11 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 import pytest
 import structlog
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from pydantic import BaseModel, ValidationError
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT
+from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX
 from skyvern.exceptions import BlockedHost
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -39,6 +40,7 @@ from skyvern.webeye.actions.handler import (
     _browser_dispatch_committed,
     _cleanup_captured_download_popup,
     _collect_inline_iframe_src_candidates,
+    _DownloadProgressSampler,
     _EagerAdoptedBlobCapture,
     _looks_like_pdf,
     _PageDeltaBaseline,
@@ -58,6 +60,13 @@ from skyvern.webeye.browser_factory import (
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
+from tests.unit._download_provider_fakes import (
+    _ActionDownloadSource,
+    _FakeActionDownloadObservation,
+    _RaisingActionDownloadObservation,
+    _secret_bearing_validation_error,
+    _StallingActionDownloadObservation,
+)
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # Five seconds is only a test-side runaway guard. The behavior under test is
@@ -7079,87 +7088,6 @@ async def test_retention_torn_down_on_cancelled() -> None:
     result["teardown"].assert_awaited_once()
 
 
-class _FakeActionDownloadObservation:
-    """Neutral provider observation: drops completed remote files into the run dir on its first poll,
-    honoring the ``deadline`` (monotonic) contract strictly (a handler passing per-call ``timeout_seconds``
-    materializes nothing -- the anti-terminal-cleanup RED)."""
-
-    def __init__(self, files: list[tuple[str, bytes]], *, empty_polls: int = 0) -> None:
-        self._pending = list(files)
-        self._empty_polls = empty_polls
-        self.poll_deadlines: list[float] = []
-
-    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
-        self.poll_deadlines.append(deadline)
-        if len(self.poll_deadlines) <= self._empty_polls:
-            return
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        for name, data in self._pending:
-            (destination_dir / name).write_bytes(data)
-        self._pending = []
-
-
-class _RaisingActionDownloadObservation:
-    """Provider observation whose poll raises a schema/validation error embedding a presigned URL, mirroring
-    the real leak surface (the vendor list body is parsed into typed rows). When ``materialize_first`` is
-    set, the first poll drops a completed file (so the handler reaches its final poll) and a later poll raises."""
-
-    def __init__(self, error: BaseException, *, materialize_first: tuple[str, bytes] | None = None) -> None:
-        self._error = error
-        self._materialize_first = materialize_first
-        self.calls = 0
-
-    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
-        self.calls += 1
-        if self._materialize_first is not None and self.calls == 1:
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            name, data = self._materialize_first
-            (destination_dir / name).write_bytes(data)
-            return
-        raise self._error
-
-
-class _StallingActionDownloadObservation:
-    """Provider observation whose poll never returns on its own -- only the handler's deadline can end it, so
-    if the handler polls it once a local artifact already accounts for the action the stalled provider would
-    consume the whole download deadline; the fix must never poll it in that case."""
-
-    def __init__(self) -> None:
-        self.poll_calls = 0
-
-    async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
-        self.poll_calls += 1
-        await asyncio.Event().wait()
-
-
-class _ActionDownloadSource:
-    """Neutral provider source: hands back a fixed observation and records begin bookkeeping."""
-
-    def __init__(self, observation: object, *, begin_error: Exception | None = None) -> None:
-        self._observation = observation
-        self._begin_error = begin_error
-        self.begin_calls = 0
-        self.begin_deadline: float | None = None
-
-    async def begin_observation(self, *, deadline: float) -> object:
-        self.begin_calls += 1
-        self.begin_deadline = deadline
-        if self._begin_error is not None:
-            raise self._begin_error
-        return self._observation
-
-
-def _secret_bearing_validation_error(presigned_url: str) -> ValidationError:
-    class _Row(BaseModel):
-        size: int
-
-    try:
-        _Row.model_validate({"size": presigned_url})
-    except ValidationError as exc:
-        return exc
-    raise AssertionError("expected a ValidationError")
-
-
 @contextlib.contextmanager
 def _capture_handler_logs() -> Iterator[io.StringIO]:
     import skyvern.webeye.actions.handler as handler_module
@@ -7871,3 +7799,54 @@ async def test_provider_poll_cancellation_propagates_without_recording_error() -
     # not report a measured negative it never actually observed.
     assert logs[-1]["materialized_file_delta"] is None
     list_signal_files.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_download_progress_sampler_closed_before_its_first_step_is_not_orphaned(tmp_path: Path) -> None:
+    """A download that finishes without suspending closes the sampler in the event-loop iteration it was
+    started in. Under the OTel asyncio instrumentor that cancel dropped the polling coroutine un-awaited,
+    which reaches the logs as an error-tier "never awaited" RuntimeWarning on every such download.
+    """
+    # The instrumentor ships in the cloud dependency group only, so OSS CI skips this test.
+    instrumentation = pytest.importorskip("opentelemetry.instrumentation.asyncio")
+    partial = tmp_path / f"download{BROWSER_DOWNLOADING_SUFFIX}"
+    partial.write_bytes(b"x")
+    sampler = _DownloadProgressSampler(tmp_path, None, set())
+
+    instrumentor = instrumentation.AsyncioInstrumentor()
+    instrumentor.instrument()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sampler.start_if_partial_seen([str(partial)])
+            await sampler.aclose()
+            # The sampler still references its cancelled task; the warning is raised only when that is collected.
+            del sampler
+            for _ in range(5):
+                await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+    finally:
+        instrumentor.uninstrument()
+
+    assert [str(entry.message) for entry in caught if "never awaited" in str(entry.message)] == []
+
+
+@pytest.mark.asyncio
+async def test_download_progress_sampler_cancelled_while_closing_still_stops_its_task(tmp_path: Path) -> None:
+    """A second cancellation landing while aclose() yields must not leave the polling task running forever."""
+    partial = tmp_path / f"download{BROWSER_DOWNLOADING_SUFFIX}"
+    partial.write_bytes(b"x")
+    sampler = _DownloadProgressSampler(tmp_path, None, set())
+    sampler.start_if_partial_seen([str(partial)])
+    polling = sampler._task
+    assert polling is not None
+
+    closing = asyncio.create_task(sampler.aclose())
+    await asyncio.sleep(0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await asyncio.sleep(0)
+
+    assert polling.cancelled()

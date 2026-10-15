@@ -694,6 +694,13 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
         log_raw_request_exception(response.status_code)
         return response
 
+    @app.get("/ndjson-stream")
+    async def ndjson_stream() -> StreamingResponse:
+        async def lines() -> typing.AsyncIterator[bytes]:
+            yield b'{"task_id":"tsk_1"}\n'
+
+        return StreamingResponse(lines(), media_type="application/x-ndjson")
+
     @app.get("/heartbeat")
     async def heartbeat() -> dict:
         return {"ok": True}
@@ -835,6 +842,20 @@ class TestMiddlewareLogVolume:
         assert "x-api-key" not in fields["headers"]
         assert "SYNTHETIC_SECRET" not in repr(call)
         assert "sk-test-" not in repr(call)
+
+    def test_ndjson_stream_logs_once_without_reading_body(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+        read_body = AsyncMock(side_effect=AssertionError("NDJSON must not be buffered for logging"))
+        monkeypatch.setattr(request_logging, "_get_response_body_str", read_body)
+
+        response = TestClient(_make_app()).get("/ndjson-stream")
+
+        assert response.status_code == 200
+        assert response.content == b'{"task_id":"tsk_1"}\n'
+        read_body.assert_not_awaited()
+        assert log_mock.info.call_args.kwargs["response_body"] == "<streaming>"
 
     @pytest.mark.parametrize("method", ["POST", "GET"])
     def test_mcp_stream_logs_once_without_reading_body(

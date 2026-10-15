@@ -344,7 +344,16 @@ describe("CredentialCard sign in myself", () => {
     ...overrides,
   });
 
-  it("offers signing in yourself only when the chat passes an offer", () => {
+  const SIGN_IN_LABEL = "Sign in myself (this test only)";
+  const SCOPE_WARNING =
+    "Signing in yourself works for this test. Later runs usually won't stay signed in — connect a credential so every run can sign in.";
+  const follows = (later: Element, earlier: Element) =>
+    Boolean(
+      earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+  it("offers signing in yourself only when the chat passes an offer", async () => {
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
     const offer = signIn();
     render(
       <CredentialCard
@@ -355,7 +364,17 @@ describe("CredentialCard sign in myself", () => {
         signIn={offer}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Sign in myself" }));
+    const picker = await screen.findByRole("combobox");
+    const control = screen.getByRole("button", { name: SIGN_IN_LABEL });
+    expect(control.className).not.toContain("bg-cta");
+    expect(control.className).not.toContain("border-input");
+    const connect = screen.getByRole("button", { name: "Connect credential" });
+    const skip = screen.getByRole("button", { name: "Skip for now" });
+    expect(follows(control, connect)).toBe(true);
+    expect(follows(control, picker)).toBe(true);
+    expect(follows(skip, control)).toBe(true);
+    expect(screen.getByText(SCOPE_WARNING)).toBeTruthy();
+    fireEvent.click(control);
     expect(offer.onStart).toHaveBeenCalledTimes(1);
     cleanup();
 
@@ -367,7 +386,8 @@ describe("CredentialCard sign in myself", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(screen.queryByRole("button", { name: "Sign in myself" })).toBeNull();
+    expect(screen.queryByRole("button", { name: SIGN_IN_LABEL })).toBeNull();
+    expect(screen.queryByText(SCOPE_WARNING)).toBeNull();
   });
 
   it("while signing in, Done finishes, Cancel skips, and a Done that found nothing says so", () => {
@@ -385,6 +405,11 @@ describe("CredentialCard sign in myself", () => {
     expect(
       screen.getAllByText(/No sign-in found for portal\.example\.com/),
     ).not.toHaveLength(0);
+    expect(
+      screen.getByText(
+        "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored.",
+      ),
+    ).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(offer.onDone).toHaveBeenCalledTimes(1);
@@ -423,8 +448,13 @@ describe("CredentialCard sign in myself", () => {
         onSkip={vi.fn()}
       />,
     );
+    expect(screen.getByText("Signed in for this test only")).toBeTruthy();
+    expect(screen.getByText(/saved as 'Sign-in for portal'/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
     expect(
-      screen.getByText("Signed in, saved as 'Sign-in for portal'"),
+      screen.getByText(
+        "For this test · later runs usually won't stay signed in · no password stored",
+      ),
     ).toBeTruthy();
   });
 });

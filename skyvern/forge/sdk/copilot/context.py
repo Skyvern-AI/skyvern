@@ -248,6 +248,7 @@ class NarrativeBudgetExpiry(TypedDict):
     reportProduced: bool | None
     stagedDraftId: str | None
     drainFingerprint: str | None
+    leftRunIds: NotRequired[list[str]]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
@@ -1189,6 +1190,8 @@ class AgentResult:
     has_staged_proposal: bool = False
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
+    # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
+    proposal_adopted: bool = False
     proposal_workflow_run_id: str | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
@@ -1477,6 +1480,11 @@ class CopilotContext(AgentContext):
     proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
+    # A token this turn adopted but did not author never authorizes a turn-end write.
+    proposal_adopted: bool = False
+    proposal_adoptions: int = 0
+    # Adoptions the latest model response had seen; its tool calls were written before any later one.
+    proposal_adoptions_seen_by_model: int = 0
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
     # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch

@@ -12,6 +12,7 @@ import { useRef, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import type { StreamState } from "@/routes/streaming/streamState";
+import { EXTERNAL_BROWSER_DIAGNOSTIC } from "@/routes/streaming/StreamDiagnostics";
 
 import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
@@ -35,6 +36,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
@@ -58,9 +60,11 @@ const FINISHED_RUN_BROWSER_LABEL =
 function BrowserLiveStatus({
   state,
   stoppedHint,
+  stoppedLabel = "Browser stopped",
 }: {
   state: "starting" | "live" | "stopped";
   stoppedHint?: string;
+  stoppedLabel?: string;
 }) {
   return (
     <span
@@ -86,7 +90,7 @@ function BrowserLiveStatus({
         ? "Starting browser…"
         : state === "live"
           ? "Live"
-          : "Browser stopped"}
+          : stoppedLabel}
     </span>
   );
 }
@@ -116,6 +120,9 @@ export function BrowserPaneViewPills() {
   // alone stays true after the browser is up.
   const debugStream = useStudioBrowserStore((s) => s.debugStream);
   const runStream = useStudioBrowserStore((s) => s.runStream);
+  const { isExternal: runBrowserExternal } = useStreamTransport(
+    liveSurface === "run" ? visuals.workflowRun?.browser_session_id : null,
+  );
 
   // Recording and Screenshots only ever replay a workflow run; with none open
   // they would point at an old run or at nothing, and Live alone is no switch.
@@ -146,7 +153,13 @@ export function BrowserPaneViewPills() {
           </span>
           <BrowserLiveStatus
             state={runState}
-            stoppedHint="The run's browser stream ended"
+            stoppedHint={
+              runBrowserExternal
+                ? EXTERNAL_BROWSER_DIAGNOSTIC.title
+                : "The run's browser stream ended"
+            }
+            // External runs never stream, so "stopped" here is not a dead browser.
+            stoppedLabel={runBrowserExternal ? "No live view" : undefined}
           />
         </>
       );

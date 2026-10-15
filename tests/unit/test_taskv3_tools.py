@@ -57,6 +57,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.code_surface import (
     CodeToolSurface,
@@ -67,14 +68,18 @@ from skyvern.forge.taskv3.field_commit import Tier
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
+    PICKED_OPTION_DATA_KEY,
     SemanticCommitStats,
+    ToolRefusal,
     ToolResult,
     ToolSpec,
+    UnseenPageText,
     _navigate_record_fields,
 )
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
+    _NO_QUESTION_MARKER,
     _OPAQUE_ID_RUN_RE,
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
@@ -562,6 +567,8 @@ async def test_observe_renders_checkbox_checked_state() -> None:
     assert _ref_line(r.content, "I agree") and "checked=" in r.content
 
 
+_MARKER = f"group={_NO_QUESTION_MARKER}"
+
 _DISABLED_SHAPES_HTML = """
 <!doctype html><html><body>
   <input type="button" id="plain-on" value="Alpha plain">
@@ -602,6 +609,9 @@ _DISABLED_CLICK_HTML = """
   <button id="soon-on" disabled>Soon on</button>
   <button id="swap-off" disabled>Swap off</button>
   <button id="blink-on" disabled>Blink on</button>
+  <button id="aria-off" aria-disabled="true">Aria off</button>
+  <button id="aria-soon-on" aria-disabled="true">Aria soon on</button>
+  <div aria-disabled="true"><button id="aria-under-wrapper">Aria under wrapper</button></div>
   <div id="declared-off" aria-disabled="true" style="cursor:pointer;width:120px">Declared off</div>
 </body></html>
 """
@@ -636,8 +646,21 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
             " b.textContent = 'Blink on'; document.body.append(b); }, 500); }"
         )
         blinked = await click({"selector": "#blink-on"})
-        # Playwright ignores aria-disabled on a role-less element and clicks it, so the tool must too.
-        declared = await click({"selector": "#declared-off"})
+        # The gate stands in for the driver's own enabled check, so the contract is agreement with it,
+        # asserted against `is_enabled` rather than against a hardcoded rule. Which shapes the driver
+        # refuses is version-dependent (`aria-disabled` on an ANCESTOR is refused by 1.61 and clicked
+        # by 1.58), and a test naming the shapes pins the gate to whichever driver it was written on.
+        aria: dict[str, tuple[bool, str | None, str, float]] = {}
+        for selector in ("#aria-off", "#aria-under-wrapper", "#declared-off"):
+            driver_refuses = not await page.locator(selector).is_enabled()
+            start = time.monotonic()
+            r = await click({"selector": selector})
+            aria[selector] = (driver_refuses, r.error_class, r.status, time.monotonic() - start)
+        # The grace waits out a declared-disabled control the page releases, as it does a native one.
+        await page.evaluate(
+            "() => setTimeout(() => document.getElementById('aria-soon-on').removeAttribute('aria-disabled'), 500)"
+        )
+        aria_soon = await click({"selector": "#aria-soon-on"})
         downs = await page.evaluate("() => window.downs")
     assert off.error_class == "disabled", off.content
     assert "is disabled — it cannot be clicked until the page enables it" in off.content
@@ -647,8 +670,17 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
     assert swapped.error_class == "stale_selector", swapped.content
     assert swapped_seconds < 5, swapped_seconds
     assert blinked.status == "ok", blinked.content
-    assert declared.status == "ok", declared.content
-    assert downs == {"submit-on": 1, "soon-on": 1, "blink-on": 1, "declared-off": 1}, downs
+    # Refused exactly when the driver would refuse, told apart from every other failure by its own
+    # error class, and never at the cost of the full actionability wait.
+    for selector, (driver_refuses, error_class, status, seconds) in aria.items():
+        assert (status == "error") is driver_refuses, (selector, aria)
+        assert (error_class == "disabled") is driver_refuses, (selector, aria)
+        assert seconds < 5, (selector, aria)
+    # At least one shape must land on each side, or the agreement above is vacuous.
+    assert len({driver_refuses for driver_refuses, *_ in aria.values()}) == 2, aria
+    assert aria_soon.status == "ok", aria_soon.content
+    clicked_aria = {sel.lstrip("#"): 1 for sel, (refuses, *_) in aria.items() if not refuses}
+    assert downs == {"submit-on": 1, "soon-on": 1, "blink-on": 1, "aria-soon-on": 1, **clicked_aria}, (downs, aria)
 
 
 @_skip_no_browser
@@ -3502,6 +3534,8 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "modal_listed",
         "modal_truncated",
         "ready_state_when_empty",
+        "icons_listed",
+        "icons_truncated",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -4084,7 +4118,7 @@ def _assert_marked_not_guessed(data: dict[str, Any], content: str, markers: int,
         assert not e.get("group"), e
         for text in never:
             assert text not in json.dumps({k: v for k, v in e.items() if k != "placement"}), (text, e)
-    assert content.count("group=(no question found)") == markers, content
+    assert content.count(_MARKER) == markers, content
 
 
 @_skip_no_browser
@@ -4310,8 +4344,11 @@ async def test_observe_renders_the_no_question_marker_once_per_radio_group() -> 
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 4, r.content
-    assert r.content.count("group=(no question found)") == 2, r.content
-    assert "(no question found)" in radio_lines[0] and "(no question found)" in radio_lines[2], r.content
+    assert r.content.count(_MARKER) == 2, r.content
+    assert _NO_QUESTION_MARKER in radio_lines[0] and _NO_QUESTION_MARKER in radio_lines[2], r.content
+    # The marker points at a read, never at a position: the text beside an unbound group is often the wrong text.
+    assert "get_html" in _NO_QUESTION_MARKER, _NO_QUESTION_MARKER
+    assert not re.search(r"\b(look|above|below|beside|right|near)\b", _NO_QUESTION_MARKER), _NO_QUESTION_MARKER
 
 
 @_skip_no_browser
@@ -4452,8 +4489,13 @@ async def test_observe_radios_in_each_options_own_shadow_root_are_one_group(para
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radios = _radio_records(data)
     assert [e.get("label") for e in radios] == ["Light", "Medium", "Dark"], radios
+    if paragraph:
+        # The paragraph is the one text block of the card holding only these options.
+        assert [e.get("question") for e in radios] == [paragraph] * 3, radios
+        assert _NO_QUESTION_MARKER not in r.content, r.content
+        return
     assert len({e.get("group_missing") for e in radios}) == 1 and radios[0].get("group_missing"), radios
-    _assert_marked_not_guessed(data, r.content, 1, [paragraph] if paragraph else [])
+    _assert_marked_not_guessed(data, r.content, 1, [])
 
 
 @_skip_no_browser
@@ -5071,7 +5113,9 @@ def _aria_radio(caption: str) -> str:
     ],
 )
 async def test_observe_a_section_name_over_several_groups_is_never_their_question(body: str, section: str) -> None:
-    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+    # Without their own captions, the section name still never stands in for either group's question.
+    bare = re.sub(r"<p>[^<]*</p>", "", body)
+    async with _content_page(f"<!doctype html><html><body><form>{bare}</form></body></html>") as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     _assert_marked_not_guessed(data, r.content, 2, [section])
@@ -5107,9 +5151,10 @@ async def test_observe_a_section_holding_several_questions_gives_none_of_them_to
         items = "".join(
             f'<li><label><input type="{kind}" name="{k}" value="{k}-{v}">{v}</label></li>' for v in ("Yes", "No")
         )
-        return f'<div class="row"><p>{questions[k]}</p><ul>{items}</ul></div>'
+        return f'<div class="row"><ul>{items}</ul></div>'
 
-    html = f"<!doctype html><html><body><form><fieldset>{row('a')}{row('b')}</fieldset></form></body></html>"
+    captions = "".join(f"<p>{q}</p>" for q in questions.values())
+    html = f"<!doctype html><html><body><form><fieldset>{captions}{row('a')}{row('b')}</fieldset></form></body></html>"
     async with _content_page(html) as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
@@ -5126,16 +5171,16 @@ async def test_observe_a_section_holding_several_questions_gives_none_of_them_to
 @pytest.mark.asyncio
 async def test_observe_a_frames_radio_group_keeps_its_marker_beside_the_pages_own() -> None:
     # Each realm numbers its groups from 1, so the page's first group and the frame's share a number.
-    frame = "<form><div><p>Do you smoke?</p><div>{}</div></div></form>".format(_yes_no_radios("f").replace('"', "'"))
+    frame = "<form><div><div>{}</div></div></form>".format(_yes_no_radios("f").replace('"', "'"))
     html = (
-        f"<!doctype html><html><body><form><div><p>Do you drive?</p><div>{_yes_no_radios('m')}</div></div></form>"
+        f"<!doctype html><html><body><form><div><div>{_yes_no_radios('m')}</div></div></form>"
         f'<iframe srcdoc="{frame}" width="400" height="200"></iframe></body></html>'
     )
     async with _live_page(html) as page:
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 4, r.content
-    assert [("(no question found)" in line) for line in radio_lines] == [True, False, True, False], r.content
+    assert [(_NO_QUESTION_MARKER in line) for line in radio_lines] == [True, False, True, False], r.content
 
 
 def _two_realm_page(page_script: str, frame_script: str) -> str:
@@ -5244,7 +5289,7 @@ async def test_observe_a_radio_groups_description_never_puts_its_marker_mid_grou
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radio_lines = [line for line in r.content.splitlines() if "/radio" in line]
     assert len(radio_lines) == 2, r.content
-    assert "(no question found)" not in radio_lines[1], r.content
+    assert _NO_QUESTION_MARKER not in radio_lines[1], r.content
 
 
 @_skip_no_browser
@@ -5266,7 +5311,7 @@ async def test_observe_a_short_hint_never_silences_an_undeclared_radio_groups_ma
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     assert not any(e.get("group") for e in _radio_records(data)), _radio_records(data)
-    assert r.content.count("group=(no question found)") == 1, r.content
+    assert r.content.count(_MARKER) == 1, r.content
 
 
 _TWO_CHECKBOXES = (
@@ -5410,7 +5455,7 @@ async def test_observe_a_choice_groups_own_text_outranks_an_outer_declared_name(
     for e in choices.values():
         for text in wrong:
             assert text not in (e.get("group") or ""), choices
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5466,7 +5511,9 @@ async def test_observe_a_choice_groups_own_text_outranks_an_outer_declared_name(
 async def test_observe_a_declared_name_that_is_not_this_whole_groups_gets_the_marker(
     body: str, never: list[str]
 ) -> None:
-    async with _content_page(_choice_form(body)) as page:
+    # Without the group's own caption, the outer name still never stands in for its question.
+    bare = re.sub(r"<p>[^<]*</p>", "", body)
+    async with _content_page(_choice_form(bare)) as page:
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     _assert_marked_not_guessed(data, r.content, 1, never)
@@ -5509,7 +5556,7 @@ async def test_observe_a_per_option_name_defers_to_the_named_group_above_it(body
         return
     radios = {str(e.get("value")): e for e in _radio_records(data)}
     assert question in (radios["a-yes"].get("group") or ""), radios
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 def _aria_yes_no(k: str) -> str:
@@ -5525,9 +5572,9 @@ def _aria_yes_no(k: str) -> str:
     ("body", "question", "markers"),
     [
         pytest.param(
-            '<div class="q"><p id="q-label">Are you over 18?</p><div role="radiogroup" aria-labelledby="q-label">'
-            f'{_aria_yes_no("qa")}</div></div><div class="q"><p id="q-label">Have you ever been convicted of a felony?</p>'
-            f'<div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qb")}</div></div>',
+            '<p id="q-label">Are you over 18?</p><p id="q-label">Have you ever been convicted of a felony?</p>'
+            f'<div class="q"><div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qa")}</div></div>'
+            f'<div class="q"><div role="radiogroup" aria-labelledby="q-label">{_aria_yes_no("qb")}</div></div>',
             "Are you over 18?",
             2,
             id="templated-question-reusing-its-id",
@@ -5552,6 +5599,377 @@ async def test_observe_a_declared_name_that_may_be_another_questions_gets_the_ma
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_on_a_choice_option_names_the_question_observe_bound_it_to() -> None:
+    # Two adjacent caption cards, then a group with no question.
+    cards = "".join(
+        f"<div class='q'><div>{q}</div><div>{_yes_no_radios(k)}</div></div>"
+        for k, q in (("s", "Will you now or in the future require sponsorship?"), ("w", "Can you work here?"))
+    )
+    html = f"<!doctype html><html><body><form>{cards}<div>{_yes_no_radios('u')}</div></form></body></html>"
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        refs = [int(m.group(1)) for m in re.finditer(r"^ref=(\d+) .*/radio", r.content, re.M)]
+        assert len(refs) == 6, r.content
+        picked = [await _tool(tools, "click").handler({"selector": f"ref={refs[i]}"}) for i in (3, 5)]
+        by_selector = await _tool(tools, "click").handler({"selector": "input[value=s-no]"})
+    assert picked[0].status == "ok" and picked[0].content.endswith("\npicked 'No' for question 'Can you work here?'")
+    assert picked[1].content.endswith("\npicked 'No' for an unknown question"), picked[1].content
+    # A pick by a raw selector has no observe record to name the question from.
+    assert by_selector.content.endswith("\npicked this option for an unknown question"), by_selector.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_echo_stays_silent_when_the_pick_could_not_be_confirmed() -> None:
+    # The card leaves the page on click, so its state cannot be read back.
+    html = (
+        "<!doctype html><html><body><form><div class='q' id=card><div>Can you work here?</div>"
+        f"<div>{_yes_no_radios('w')}</div></div></form>"
+        "<script>document.getElementById('card').addEventListener('click', (e) => e.currentTarget.remove());</script>"
+        "</body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        ref = int(re.findall(r"^ref=(\d+) .*/radio", r.content, re.M)[1])
+        picked = await _tool(tools, "click").handler({"selector": f"ref={ref}"})
+    assert picked.entry_unconfirmed, picked
+    assert "picked" not in picked.content, picked.content
+
+
+_AUTH_Q = "Are you legally authorized to work in this country?"
+_FUTURE_SPONSOR_Q = "Will you now or in the future require visa sponsorship?"
+_EMAIL = "<label>Email <input type=text name=e></label>"
+
+
+def _list_radios(name: str) -> str:
+    return (
+        f"<ul><li><label><input type=radio name={name} value={name}-yes><span>Yes</span></label></li>"
+        f"<li><label><input type=radio name={name} value={name}-no><span>No</span></label></li></ul>"
+    )
+
+
+def _choice_records(data: dict[str, Any]) -> list[dict[str, Any]]:
+    kinds = ("radio", "checkbox")
+    return [e for e in data["elements"] if e.get("type") in kinds or e.get("role") in kinds]
+
+
+def _choice_lines(content: str) -> list[str]:
+    return [line for line in content.splitlines() if "/radio" in line or "/checkbox" in line]
+
+
+def _opts(name: str, extra: str = "") -> str:
+    return (
+        f"<div class='opts'><label><input type=radio name={name} value={name}-yes{extra}>Yes</label>"
+        f"<label><input type=radio name={name} value={name}-no{extra}>No</label></div>"
+    )
+
+
+def _required_card(name: str, question: str) -> str:
+    return (
+        f"<li class=item><div class=caption>{question}<span class=req>✱</span></div>"
+        f"<div class=answers>{_list_radios(name)}</div></li>"
+    )
+
+
+# The card rung: a group with no declared question takes the one text block of the largest ancestor that holds
+# nothing observe lists but this group's options.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "questions", "never"),
+    [
+        pytest.param(
+            f"<ul class=questions>{_required_card('s', _FUTURE_SPONSOR_Q)}{_required_card('a', _AUTH_Q)}</ul>" + _EMAIL,
+            [f"{_FUTURE_SPONSOR_Q} ✱"] * 2 + [f"{_AUTH_Q} ✱"] * 2,
+            [],
+            id="list-of-required-question-cards",
+        ),
+        pytest.param(
+            "<div class=page><h4>WORK AUTHORIZATION</h4><p>Answer every question below.</p>"
+            f"<ul class=questions>{_required_card('a', _AUTH_Q)}</ul><h4>SPONSORSHIP</h4>"
+            f"<ul class=questions>{_required_card('s', _FUTURE_SPONSOR_Q)}</ul></div>" + _EMAIL,
+            [f"{_AUTH_Q} ✱"] * 2 + [f"{_FUTURE_SPONSOR_Q} ✱"] * 2,
+            ["WORK AUTHORIZATION", "Answer every question", "SPONSORSHIP"],
+            id="question-card-under-a-section-heading-and-notice",
+        ),
+        pytest.param(
+            f"<div class=card>{_AUTH_Q}<div class=opts>{_yes_no_radios('t')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-as-a-bare-text-node-in-the-card",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p> * <span>✱</span><div class=opts>{_yes_no_radios('m')}</div></div>"
+            + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-beside-one-character-required-markers",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p><div role='alert status'>This field is required</div>"
+            f"<div class=opts>{_yes_no_radios('e')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["This field is required"],
+            id="question-then-an-error-with-two-roles",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q}</p><div class=error><span role=alert>Required</span></div>"
+            f"<div class=opts>{_yes_no_radios('n')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["Required"],
+            id="question-then-an-error-wrapping-its-alert",
+        ),
+        pytest.param(
+            f"<div class=card><p aria-live=off>{_AUTH_Q}</p><div class=opts>{_yes_no_radios('f')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            [],
+            id="question-in-a-region-whose-announcements-are-off",
+        ),
+        pytest.param(
+            f"<div class=card><p>{_AUTH_Q} <span role=status>(required)</span></p>"
+            f"<div class=opts>{_yes_no_radios('i')}</div></div>" + _EMAIL,
+            [f"{_AUTH_Q} (required)"] * 2,
+            [],
+            id="question-holding-an-inline-status",
+        ),
+        pytest.param(
+            f"<div class=q><p>{_AUTH_Q}</p><div role=alert>This field is required</div><div class=opts>"
+            f"{_yes_no_radios('a')}</div></div>" + _EMAIL,
+            [_AUTH_Q] * 2,
+            ["This field is required"],
+            id="question-then-alert-error",
+        ),
+        pytest.param(
+            "<div class=q><div>Do you require sponsorship?</div>"
+            "<label><input type=checkbox name=sy value=s-yes>Yes</label>"
+            "<label><input type=checkbox name=sn value=s-no>No</label></div>" + _EMAIL,
+            ["Do you require sponsorship?"] * 2,
+            [],
+            id="checkbox-list-under-its-question",
+        ),
+    ],
+)
+async def test_observe_binds_each_choice_group_to_exactly_its_own_question(
+    body: str, questions: list[str], never: list[str]
+) -> None:
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    choices = _choice_records(data)
+    assert [e.get("question") for e in choices] == questions, choices
+    for e, own in zip(choices, questions, strict=True):
+        record = json.dumps({k: v for k, v in e.items() if k != "placement"})
+        for text in [*never, "Email", *(q for q in set(questions) if q != own)]:
+            assert text not in record, (text, e)
+    lines = _choice_lines(r.content)
+    for q in set(questions):
+        assert any(q in line for line in lines), f"{q!r} is on no choice line:\n{r.content}"
+    assert _MARKER not in r.content, r.content
+
+
+# Known residual (SKY-18213), pinned as today's output because the browser gate fails on an xfail: the legacy
+# rung reads a whole fieldset, so its hint and captions fold into the legend's question. Invert when it closes.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_fieldset_read_whole_by_the_legacy_rung_still_folds_its_hint_and_captions_in() -> None:
+    body = (
+        "<fieldset><legend>Have you ever been excluded from a federal health care program?</legend><p>Select one</p>"
+        f"{_yes_no_radios('m1')}</fieldset>" + _EMAIL
+    )
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+    folded = "Have you ever been excluded from a federal health care program? Select one YesNo"
+    assert [e.get("question") for e in _choice_records(data)] == [folded] * 2
+
+
+# A section panel drawing its `label` attribute above its slotted content.
+_SECTION_COMPONENT_JS = """<script>
+customElements.define('x-section', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<div class=t></div><slot></slot>'; }
+  connectedCallback() {
+    this.style.display = 'block';
+    this.shadowRoot.querySelector('.t').textContent = this.getAttribute('label');
+  }
+});
+</script>"""
+
+
+# The marker, never a guess, when the card does not single out one question.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "never"),
+    [
+        pytest.param(
+            f"<div class=q><p>Do you accept the <a href='#'>policy</a>?</p><div class=opts>{_yes_no_radios('p')}"
+            "</div></div>" + _EMAIL,
+            ["Do you accept the", "policy"],
+            id="link-inside-the-question",
+        ),
+        pytest.param(
+            "<div class='card'><h4>VISA STATUS</h4><ul><li class='item'>"
+            "<div class='caption'>Will you require sponsorship?<span class='req'>*</span></div>"
+            f"<div class='answers'>{_list_radios('k')}</div></li></ul></div>",
+            ["VISA STATUS"],
+            id="single-question-card-under-a-heading",
+        ),
+        pytest.param(
+            f"<div class='q'><div class='step'>Step 3 of 5</div><p>{_AUTH_Q}</p><div>{_yes_no_radios('d')}</div>"
+            "</div>" + _EMAIL,
+            ["Step 3 of 5", _AUTH_Q],
+            id="step-counter-then-question",
+        ),
+        pytest.param(
+            f"{_SECTION_COMPONENT_JS}<x-section label='Work eligibility'><p>{_FUTURE_SPONSOR_Q}</p>"
+            f"{_yes_no_radios('s')}</x-section>" + _EMAIL,
+            ["Work eligibility", _FUTURE_SPONSOR_Q],
+            id="section-component-label-over-a-slotted-question",
+        ),
+        pytest.param(
+            f"<div class=blk><div class=row><span>{_AUTH_Q}</span> <a href='#help'>Help</a></div><div class=wrap>"
+            f"<small>Select one option</small><div class=opts>{_yes_no_radios('w')}</div></div></div>" + _EMAIL,
+            ["Select one option", _AUTH_Q],
+            id="hint-in-the-card-beside-a-question-row-holding-a-help-link",
+        ),
+        pytest.param(
+            f"<p>{_AUTH_Q}</p><label>Notes <input name=notes></label><div class=card><label for=cy>Yes</label>"
+            "<input type=radio id=cy name=c value=y><label for=cn>No</label><input type=radio id=cn name=c value=n></div>"
+            + _EMAIL,
+            [_AUTH_Q],
+            id="caption-placed-before-its-own-option",
+        ),
+        pytest.param(
+            f"<div class=wrap><div class=title><h4>CONTACT PREFERENCES</h4></div><div class=opts>{_yes_no_radios('h')}"
+            "</div></div>" + _EMAIL,
+            ["CONTACT PREFERENCES"],
+            id="section-title-nested-in-a-wrapper-block",
+        ),
+        pytest.param(
+            "<div class=wrap><div role='heading text' aria-level=4>CONTACT PREFERENCES</div>"
+            f"<div class=opts>{_yes_no_radios('k')}</div></div>" + _EMAIL,
+            ["CONTACT PREFERENCES"],
+            id="section-title-with-two-roles",
+        ),
+        pytest.param(
+            "<div class=card><span>Yes No</span><div><input type=radio name=t aria-label=Yes>"
+            "<input type=radio name=t aria-label=No></div></div>" + _EMAIL,
+            [],
+            id="card-text-that-is-only-its-options-captions",
+        ),
+    ],
+)
+async def test_observe_marks_a_choice_group_whose_card_does_not_single_out_its_question(
+    body: str, never: list[str]
+) -> None:
+    async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
+        data = await _observe_data(page)
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    _assert_marked_not_guessed(data, r.content, 1, never)
+
+
+# Each group's `group=` field in order: its question, or None for the marker.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "groups"),
+    [
+        pytest.param(
+            f"<div class=wrap><p>Tell us about your eligibility.</p><div class=card2><div id=qa>{_AUTH_Q}</div>"
+            f"{_opts('au', ' aria-describedby=qa')}</div></div>" + _EMAIL,
+            [_AUTH_Q],
+            id="described-question-under-a-wrapper-intro",
+        ),
+        pytest.param(
+            f"<div id=qa>{_AUTH_Q}</div><label>Notes <input></label>"
+            f"<div class=card><div>This field is required</div>{_opts('au', ' aria-describedby=qa')}</div>" + _EMAIL,
+            [_AUTH_Q],
+            id="question-described-from-outside-a-card-holding-an-error",
+        ),
+        pytest.param(
+            "<div class=wrap><p>Tell us about your eligibility.</p><div class=card2><div role=status>Required</div>"
+            f"{_opts('au')}</div></div>" + _EMAIL,
+            [None],
+            id="intro-above-a-card-holding-only-a-status-note",
+        ),
+        pytest.param(
+            f"<div class=card><div id=qa>{_AUTH_Q}</div><div>This field is required</div>"
+            f"{_opts('au', ' aria-describedby=qa')}</div>" + _EMAIL,
+            [_AUTH_Q],
+            id="question-described-inside-a-card-holding-an-error",
+        ),
+        pytest.param(
+            f"<div class=card>{_opts('au')}<div>This field is required</div></div>" + _EMAIL,
+            [None],
+            id="error-after-the-options-of-a-bare-group",
+        ),
+    ],
+)
+async def test_observe_prints_each_choice_group_its_own_question_or_the_marker(
+    body: str, groups: list[str | None]
+) -> None:
+    html = f"<!doctype html><html><body><form>{body}</form></body></html>"
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    printed = [line for line in _choice_lines(r.content) if " group=" in line]
+    assert len(printed) == len(groups), r.content
+    for line, question in zip(printed, groups, strict=True):
+        assert (_MARKER if question is None else f" group={question!r}") in line, (question, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_marks_a_choice_group_whose_question_the_group_budget_withholds() -> None:
+    filler = "".join(
+        f"<div class=q><div>Question {i}: please describe in your own words whether you have previously held a "
+        f"position that involved {'x' * 60} responsibilities of kind {i}?</div><div>{_yes_no_radios(f'f{i}')}</div></div>"
+        for i in range(30)
+    )
+    legal = "".join(
+        f"<div class=q><div>{q}</div><div>{_yes_no_radios(k)}</div></div>"
+        for k, q in (("au", _AUTH_Q), ("sp", _FUTURE_SPONSOR_Q))
+    )
+    async with _content_page(_choice_form(filler + legal)) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    firsts = [line for line in r.content.splitlines() if "/radio" in line][0::2]
+    assert len(firsts) == 32, r.content
+    # A group whose question the budget withheld still says so, rather than printing nothing.
+    assert all(" group=" in line for line in firsts), r.content
+    assert 0 < sum(_MARKER in line for line in firsts) < 32, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_echo_names_no_question_for_an_option_the_page_replaced_since_observe() -> None:
+    def screen(q: str) -> str:
+        return (
+            f"<div class='q'><p>{q}</p><div><label><input type=radio id='opt-yes' name='x' value='y'>Yes</label>"
+            "<label><input type=radio id='opt-no' name='x' value='n'>No</label></div></div>"
+        )
+
+    html = (
+        f"<!doctype html><html><body><form><div id='screen'>{screen(_FUTURE_SPONSOR_Q)}</div>{_EMAIL}</form>"
+        f"<script>function next(){{document.getElementById('screen').innerHTML = {json.dumps(screen(_AUTH_Q))};}}"
+        "</script></body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        refs = [int(m.group(1)) for m in re.finditer(r"^ref=(\d+) .*/radio", r.content, re.M)]
+        assert len(refs) == 2 and _FUTURE_SPONSOR_Q in r.content, r.content
+        await page.evaluate("next()")
+        click = _tool(tools, "click")
+        c = await click.handler({"selector": f"ref={refs[1]}"})
+        assert await page.evaluate("document.querySelector('#opt-no').checked"), c.content
+        again = await click.handler({"selector": f"ref={refs[1]}"})
+    for res in (c, again):
+        assert res.status == "ok" and "\npicked 'No' for an unknown question" in res.content, res.content
+        assert _FUTURE_SPONSOR_Q not in res.content, res.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_a_legend_never_names_a_radio_group_it_holds_only_part_of() -> None:
     body = (
         f"<fieldset><legend>Contact preference</legend><div class=opts>{_li_radios('x')}</div></fieldset>"
@@ -5561,7 +5979,7 @@ async def test_observe_a_legend_never_names_a_radio_group_it_holds_only_part_of(
         data = await _observe_data(page)
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     assert "Contact preference" not in json.dumps(_radio_records(data)), _radio_records(data)
-    assert "group=(no question found)" in r.content, r.content
+    assert _MARKER in r.content, r.content
 
 
 @_skip_no_browser
@@ -5623,7 +6041,7 @@ async def test_observe_a_later_members_question_drops_an_earlier_members_marker(
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
     radios = {str(e.get("value")): e for e in _radio_records(data)}
     assert "Extra fee applies" in (radios["express"].get("group") or ""), radios
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5697,7 +6115,7 @@ async def test_observe_a_legend_names_proxy_radios_whose_option_wrappers_hold_on
         if sel.startswith("#notify"):
             assert "Subscription Plan" not in text, groups
         assert text not in ("Basic", "Pro", "Email", "SMS"), groups
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -5748,7 +6166,7 @@ async def test_observe_an_options_only_field_container_gets_the_marker_not_its_c
         assert e.get("group") in (None, own), e
         if e.get("group"):
             shown.add(own)
-    assert r.content.count("group=(no question found)") == len(questions) - len(shown), r.content
+    assert r.content.count(_MARKER) == len(questions) - len(shown), r.content
     checkboxes = [e for e in data["elements"] if e.get("type") == "checkbox"]
     assert len(checkboxes) == 40, checkboxes
     assert all(e.get("group") in (None, "Language skills") for e in checkboxes), checkboxes
@@ -5791,7 +6209,7 @@ async def test_observe_a_declared_question_held_back_from_printing_is_not_marked
         )
     async with _content_page(f"<!doctype html><html><body><form>{body}</form></body></html>") as page:
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
-    assert "(no question found)" not in r.content, r.content
+    assert _NO_QUESTION_MARKER not in r.content, r.content
 
 
 @_skip_no_browser
@@ -6978,7 +7396,7 @@ async def test_navigate_is_recordable_and_reports_the_outcome_of_the_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # SKY-16374: a URL the model typed itself is an action the customer must see, so navigate is
-    # recordable (one action row + that round's screenshot) while staying out of billing and the
+    # recordable (one action row + its own screenshot) while staying out of billing and the
     # action-step budget. The row is only worth having if it says what HAPPENED, so the handler
     # reports where it asked to go, where it landed, what the page answered, and whether the page
     # moved -- the facts the caller persists on the row.
@@ -8725,7 +9143,7 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
     ]
     rounds: list[list[Any]] = []
 
-    async def _on_round(round_actions: list[Any], _turn_text: str | None) -> None:
+    async def _on_round(round_actions: list[Any], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(round_actions)
 
     outcome = await run_agent_tool_loop(
@@ -8951,6 +9369,7 @@ async def test_click_option_commit_verified_by_menu_close() -> None:
     assert r.status == "ok"
     assert "Selected option 'Most popular'" in r.content
     assert "menu closed" in r.content
+    assert (r.data or {}).get(PICKED_OPTION_DATA_KEY) == "Most popular"
     # commit judged against the POST-hover baseline: the handler hovered before clicking
     assert ("hover", '[data-tv3-menu="3"]') in page.calls
 
@@ -9322,6 +9741,7 @@ async def test_click_option_that_is_marked_and_also_grows_reports_both(monkeypat
     assert "Selected option 'Referral' — its state changed." in r.content
     assert "the menu stayed open" not in r.content
     assert "opened a menu of 2 options" in r.content
+    assert (r.data or {}).get(PICKED_OPTION_DATA_KEY) == "Referral"
 
 
 @pytest.mark.asyncio
@@ -9995,6 +10415,83 @@ async def test_dom_a_menu_note_lists_each_multi_element_option_row_whole() -> No
         assert "'Contoso Group' matches 2 rows" in r.content, r.content
         assert "200300400" in r.content and "400500600" in r.content, r.content
         assert await page.evaluate("() => window.__picked") is None
+
+
+class _FlagAnswers:
+    def __init__(self, flag: str) -> None:
+        self.flag = flag
+        self.calls = 0
+
+    async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+        self.calls += 1
+        return [a for a in answers if a.value == self.flag]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_held_answer_is_repaired_by_ref_while_a_submit_by_ref_stays_held() -> None:
+    # The hold compares a click with the field as recorded, after the ref resolver rewrote it to CSS.
+    html = (
+        _LONG_OPTION_MENU_FIXTURE_HTML.replace("__OPTIONS__", json.dumps(["Yes", "No", "I prefer not to answer"]))
+        .replace("__ROWS__", _PLAIN_OPTION_ROW_JS)
+        .replace('<button id="trigger"', '<button id="trigger" aria-label="Excluded from a federal program?"')
+        .replace(
+            "<script>",
+            '<button id="submit" style="position:absolute;top:400px;left:40px" '
+            'onclick="window.__submitted = true">Submit</button><script>',
+            1,
+        )
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        apply_answer_basis_audit(tools, _FlagAnswers("No"))
+        click = _tool(tools, "click").handler
+        seen = await _tool(tools, "observe").handler({})
+        opener, submit = _ref_line(seen.content, "federal program"), _ref_line(seen.content, "Submit")
+        opened = await click({"selector": opener})
+        row = {text: n for n, text in _menu_note_entries(opened.content)}["No"]
+        await click({"selector": f'[data-tv3-menu="{row}"]'})
+
+        with pytest.raises(ToolRefusal, match="Excluded from a federal program"):
+            await click({"selector": submit})
+        assert await page.evaluate("() => window.__submitted") is None
+        reopened = await click({"selector": opener})
+        assert "opened a menu of 3 options" in reopened.content, reopened.content
+        with pytest.raises(ToolRefusal):
+            await click({"selector": submit})
+        decline = _ref_line((await _tool(tools, "observe").handler({})).content, "option 'I prefer not to answer'")
+        await click({"selector": decline})
+        assert await page.evaluate("() => window.__picked") == "I prefer not to answer"
+        await click({"selector": submit})
+        assert await page.evaluate("() => window.__submitted") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_answer_typed_with_enter_is_held_before_enter_submits_the_form() -> None:
+    html = (
+        '<form onsubmit="window.__submitted = this.auth.value; return false">'
+        '<label for="auth">Are you legally authorized to work in the United States?</label>'
+        '<input id="auth" name="auth"></form>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        judge = _FlagAnswers("No")
+        apply_answer_basis_audit(tools, judge)
+        type_ = _tool(tools, "type").handler
+        auth = _ref_line((await _tool(tools, "observe").handler({})).content, "Are you legally authorized")
+
+        for clear in (True, False):
+            with pytest.raises(ToolRefusal, match="with 'No' .*not typed"):
+                await type_({"selector": auth, "text": "No", "press_enter": True, "clear": clear})
+            assert await page.evaluate("() => [window.__submitted, document.getElementById('auth').value]") == [
+                None,
+                "",
+            ]
+        await type_({"selector": auth, "text": "Yes", "press_enter": True})
+        assert await page.evaluate("() => window.__submitted") == "Yes"
+        # Each answer is judged once, under the field the call acted on, so "Yes" is not judged again after it lands.
+        assert judge.calls == 2
 
 
 @_skip_no_browser
@@ -11471,6 +11968,219 @@ async def test_observe_lists_delegated_pointer_div_trigger_and_its_menu_is_reach
         assert await page.evaluate("() => window.__commits") == 1
 
 
+# Cart tiles whose delete control is an unnamed <div> drawing only an svg, wired by a delegated listener, beside an
+# unnamed copy <button>. More tiles than the pointer-root cap, so a delete icon budgeted as a pointer root would be cut.
+_ICON_TILE_COUNT = OBSERVE_POINTER_ROOT_CAP + 20
+_ICON_TILES_HTML = (
+    "<!doctype html><html><body>"
+    + "".join(
+        f'<div class="tile" data-id="{i}"><a href="#cart-{i}">Cart {i}</a>'
+        '<div class="actions"><button type="button" class="copy">'
+        '<img alt="" aria-hidden="true" src="/icons/copy-cart.svg?v=2"></button>'
+        '<div class="trash" style="cursor:pointer;display:inline-block">'
+        '<svg width="16" height="16"><rect width="16" height="16"/></svg></div></div>'
+        f"<span>Products {i}</span></div>"
+        for i in range(_ICON_TILE_COUNT)
+    )
+    + "<script>window.__deleted = [];document.addEventListener('click', (e) => {"
+    " const t = e.target.closest('.trash'); if (t) window.__deleted.push(t.closest('.tile').dataset.id); });</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_every_unnamed_icon_control_and_its_ref_clicks_it() -> None:
+    async with _live_page(_ICON_TILES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        last = _ICON_TILE_COUNT - 1
+        link = next(i for i, line in enumerate(lines) if f"a 'Cart {last}'" in line)
+        assert lines[link + 1].split(" ", 1)[1].startswith("button/button ''"), lines[link : link + 3]
+        # Every tile's icon names the tile it sits in and its place there, so the trash reads apart from the copy.
+        assert lines[link + 2].endswith(f" div '' in='Cart {last} Products {last}' nth=2 of 2"), lines[link : link + 3]
+        assert sum(" div ''" in line for line in lines) == _ICON_TILE_COUNT, r.content
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+        click = await _tool(tools, "click").handler({"selector": _ref_line(lines[link + 2], "div ''")})
+        assert click.status == "ok", click.content
+        assert await page.evaluate("() => window.__deleted") == [str(last)]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_labels_an_icon_by_its_graphic_without_spending_a_named_root_slot() -> None:
+    # Clickable images named by their own alt are icons, labelled by it; as named roots they would fill the 40 slots
+    # named roots share and push out a control the page lists today.
+    photos = "".join(
+        f'<img alt="Photo {i}" src="/p{i}.png" width="20" height="20" style="cursor:pointer">' for i in range(45)
+    )
+    html = (
+        f"<!doctype html><html><body>{photos}"
+        '<div style="cursor:pointer;display:inline-block">Checkout</div>'
+        '<span style="cursor:pointer;display:inline-block">'
+        '<svg width="16" height="16"><title>Delete</title><rect width="16" height="16"/></svg></span>'
+        '<div style="cursor:pointer;display:inline-block">'
+        '<span role="img" aria-hidden="true" style="pointer-events:none">'
+        '<svg width="16" height="16"><title>Remove</title><rect width="16" height="16"/></svg></span></div>'
+        "</body></html>"
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "'Checkout'" in r.content, r.content
+        assert "'Photo 44'" in r.content and "'Delete'" in r.content, r.content
+        # An icon font's role=img span around its svg is one graphic, so the ref is the wrapper that takes the click.
+        assert " div 'Remove'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_keeps_every_card_line_and_tells_graphic_named_icons_apart_by_row() -> None:
+    # A card's alt-named child stands for the card, so it must not spend the held cap past the card's own line; an
+    # icon labelled only by its <svg><title> still needs its row's text, or ten trash icons read the same.
+    cards = "".join(
+        f'<div style="cursor:pointer"><span>Cart {i}</span><button>Open</button>'
+        f'<div><img alt="Delete" src="/d.png" width="12" height="12"></div></div>'
+        for i in range(40)
+    )
+    rows = "".join(
+        f'<div class="row"><span>Row {i}</span><span>{i} products</span>'
+        '<div style="cursor:pointer;display:inline-block">'
+        '<svg width="14" height="14"><title>Trash</title><rect width="14" height="14"/></svg></div></div>'
+        for i in range(10)
+    )
+    async with _live_page(f"<!doctype html><html><body>{cards}{rows}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert all(f"'Cart {i}'" in r.content for i in range(40)), r.content
+        trash = [line for line in r.content.splitlines() if " 'Trash'" in line]
+        assert len(trash) == 10 and len({line.split(" ", 1)[1] for line in trash}) == 10, trash
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_tells_row_icons_apart_by_row_text_then_place_and_says_what_it_could_not() -> None:
+    svg = '<svg width="14" height="14"><rect width="14" height="14"/></svg>'
+    icon = f'<span style="cursor:pointer;display:inline-block">{svg}</span>'
+
+    def row(name: str, products: int) -> str:
+        return (
+            f'<div class="row"><div class="head"><span>{name}</span><span>{icon}{icon}</span></div>'
+            f"<div>{products} products</div></div>"
+        )
+
+    html = (
+        "<!doctype html><html><body><div>"
+        + row("Cart A", 3)
+        + row("Cart A", 5)
+        + row("Cart B", 2)
+        + row("Cart C", 1)
+        + row("Cart C", 1)
+        + "</div></body></html>"
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        icons = [line for line in r.content.splitlines() if line.startswith("ref=") and " span ''" in line]
+        assert len(icons) == 10, r.content
+        cart_b = [line for line in icons if "in='Cart B'" in line]
+        # Two icons of one row: the row's text cannot split them, their place in it can.
+        assert [line.endswith("nth=1 of 2") for line in cart_b] == [True, False], cart_b
+        assert cart_b[1].endswith("nth=2 of 2"), cart_b
+        # Two rows sharing a name are split one level up, by what else the row says.
+        assert any("3 products" in line for line in icons) and any("5 products" in line for line in icons), icons
+        # Two identical rows stay identical, and the reading says so.
+        assert "read the same as another line" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_each_unnamed_icon_of_a_wrapper_and_never_an_image_name_that_is_a_token() -> None:
+    # A wrapper drawing two icons is not one control: its centre is between them. A signed image path is not a name.
+    svg = '<svg width="16" height="16"><rect width="16" height="16"/></svg>'
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
+    html = (
+        '<!doctype html><html><body><div id="row" style="cursor:pointer;display:inline-flex;gap:8px">'
+        f'<span class="copy">{svg}</span><span class="trash">{svg}</span></div>'
+        f'<div style="cursor:pointer;display:inline-block"><img src="/i/{token}.png" width="16" height="16"></div>'
+        '<div style="cursor:pointer;display:inline-block">'
+        '<img src="/share/x2fdbfm5enigxszehd4m563owg.png" width="16" height="16"></div>'
+        "<script>window.__hit = []; document.getElementById('row').addEventListener('click',"
+        " (e) => window.__hit.push(e.target.closest('span') ? e.target.closest('span').className : 'wrapper'));"
+        "</script></body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        icons = [line for line in lines if line.split(" ", 1)[1].startswith("span ''")]
+        assert len(icons) == 2, lines
+        click = await _tool(tools, "click").handler({"selector": _ref_line(icons[1], "span ''")})
+        assert click.status == "ok", click.content
+        assert await page.evaluate("() => window.__hit") == ["trash"]
+        assert "eyJ" not in r.content and "x2fdbfm5" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_the_named_parts_of_an_unnamed_pointer_wrapper_instead_of_one_icon() -> None:
+    svg = '<svg width="12" height="12"><rect width="12" height="12"/></svg>'
+    html = (
+        '<!doctype html><html><body><div style="cursor:pointer;display:inline-flex;gap:8px">'
+        f'<span title="Edit row">{svg}</span><span title="Delete row">{svg}</span></div></body></html>'
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert any("'Edit row'" in line for line in lines) and any("'Delete row'" in line for line in lines), lines
+        assert not any(line.endswith(" div ''") for line in lines), lines
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_a_clickable_graphic_itself_but_not_a_box_whose_graphic_is_hidden() -> None:
+    svg = '<svg width="14" height="14"><rect width="14" height="14"/></svg>'
+    html = (
+        "<!doctype html><html><body>"
+        '<svg id="bare" style="cursor:pointer" width="14" height="14"><rect width="14" height="14"/></svg>'
+        f'<div id="blank" style="cursor:pointer;width:20px;height:20px"><span style="display:none">{svg}</span></div>'
+        "</body></html>"
+    )
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert any(" svg ''" in line for line in lines), lines
+        assert not any(" div ''" in line for line in lines), lines
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_icon_controls_are_not_crowded_out_by_hidden_controls() -> None:
+    icon = (
+        '<div style="cursor:pointer;display:inline-block">'
+        '<svg width="9" height="9"><rect width="9" height="9"/></svg></div>'
+    )
+    hidden = "".join(f'<button type="button" style="display:none">Hidden {i}</button>' for i in range(249))
+    async with _live_page(f"<!doctype html><html><body>{hidden}{icon * 20}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert sum(line.endswith(" div ''") for line in lines) == 20, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_icon_controls_ahead_of_a_full_budget_never_cost_a_control_its_line() -> None:
+    icon = (
+        '<div style="cursor:pointer;display:inline-block">'
+        '<svg width="9" height="9"><rect width="9" height="9"/></svg></div>'
+    )
+    buttons = "".join(f'<button type="button">Control {i}</button>' for i in range(250))
+    async with _live_page(f"<!doctype html><html><body>{icon * 30}{buttons}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert sum("button/button 'Control " in line for line in lines) == 250, r.content
+        assert not any(line.endswith(" div ''") for line in lines), r.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_pointer_roots_skip_inherited_and_unnamed_boxes_and_list_a_holders_free_child() -> None:
@@ -12364,7 +13074,7 @@ async def test_every_uncharged_refusal_is_issued_before_the_page_is_touched(
         before = (page.url, await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS))
         rounds: list[list[taskv3_loop.RoundAction]] = []
 
-        async def _on_round(actions: list[taskv3_loop.RoundAction], _text: str | None) -> None:
+        async def _on_round(actions: list[taskv3_loop.RoundAction], _text: str | None, *, round_done: bool) -> None:
             rounds.append(list(actions))
 
         outcome = await taskv3_loop.run_agent_tool_loop(
@@ -15488,6 +16198,67 @@ async def test_type_says_a_disabled_field_is_disabled_instead_of_waiting_for_it(
         assert r.status == "error", r.content
         assert "disabled" in r.content
         assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_says_an_aria_disabled_field_is_disabled_instead_of_waiting_for_it() -> None:
+    # fill() waits on the driver's own rule, which is wider than `:disabled`, so a gate reading
+    # `:disabled` alone pays the full timeout on a field the driver was never going to fill. Asserted
+    # as agreement with `is_enabled` rather than per shape: which shapes it refuses moves between
+    # driver versions (`aria-disabled` on an ANCESTOR is refused by 1.61 and filled by 1.58).
+    html = (
+        '<input id="own" type="text" aria-disabled="true" style="width:200px;height:30px">'
+        '<div aria-disabled="true"><input id="under" type="text" style="width:200px;height:30px"></div>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        typed = {}
+        for name in ("own", "under"):
+            driver_refuses = not await page.locator(f"#{name}").is_enabled()
+            start = time.monotonic()
+            r = await _tool(tools, "type").handler({"selector": f"#{name}", "text": "Iowa City"})
+            typed[name] = (driver_refuses, r.status, "disabled" in r.content, time.monotonic() - start)
+    for name, (driver_refuses, status, says_disabled, elapsed) in typed.items():
+        assert (status == "error") is driver_refuses, (name, typed)
+        assert says_disabled is driver_refuses, (name, typed)
+        assert elapsed < 10, (name, typed)
+    # The own-attribute field is refused by every driver version we run, so this test always has a leg
+    # that exercises the gate rather than only agreeing with a driver that refuses nothing.
+    assert typed["own"][0] is True, typed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_waits_out_an_aria_disabled_field_the_page_releases() -> None:
+    # fill()'s own wait used to cover this, so asking the driver up front must hold the same grace the
+    # click gate does -- otherwise consulting it turns a fill that succeeded into an instant refusal.
+    html = '<input id="soon" type="text" aria-disabled="true" style="width:200px;height:30px">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate(
+            "() => setTimeout(() => document.getElementById('soon').removeAttribute('aria-disabled'), 500)"
+        )
+        r = await _tool(tools, "type").handler({"selector": "#soon", "text": "Iowa City"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#soon", "el => el.value") == "Iowa City"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reports_readonly_when_the_page_locks_the_field_during_the_grace() -> None:
+    # A page that answers the grace by making the field readonly has made it un-typable for a different
+    # reason, so the grace must re-read rather than only poll the driver's enabled answer.
+    html = '<input id="soon" type="text" aria-disabled="true" style="width:200px;height:30px">'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate(
+            "() => setTimeout(() => { const f = document.getElementById('soon');"
+            " f.readOnly = true; f.removeAttribute('aria-disabled'); }, 300)"
+        )
+        r = await _tool(tools, "type").handler({"selector": "#soon", "text": "Iowa City"})
+    assert r.error_class == "not_editable", r.content
+    assert "is readonly" in r.content, r.content
 
 
 # The skin is a link. Forcing the click follows it, and the selector may well match something on the
@@ -26395,6 +27166,78 @@ async def test_acting_on_a_new_mark_does_not_read_as_a_page_change() -> None:
         assert before == after
         await page.eval_on_selector("#a", "el => el.setAttribute('data-tv3-cover', '1')")
         assert await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS) == after
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mask_ticks", [False, True])
+async def test_a_first_click_that_does_nothing_leaves_the_page_fingerprint_untouched(mask_ticks: bool) -> None:
+    # A single-action block's step-cap completion needs evidence its action changed the page; the click gate's own
+    # pre-click stamping must not be that evidence for a control that does nothing.
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS
+
+    async with _content_page('<button id="a" type="button">A</button><p>Static</p>') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        before = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
+        assert (await _tool(tools, "click").handler({"selector": "#a"})).status == "ok"
+        after = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
+
+        assert await page.query_selector_all("[data-tv3-pre]")  # the gate really did stamp the page
+        assert before == after
+
+
+def test_the_page_fingerprint_scrubs_every_marker_name_our_tools_write() -> None:
+    # The scrub names our markers rather than a data-tv3 prefix, because page-authored data-tv3 values (a data-tv3-ref)
+    # are page content. A marker a tool starts writing must join it, or it reads as page change again.
+    import re  # noqa: PLC0415
+
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS  # noqa: PLC0415
+
+    taskv3_dir = Path(taskv3_tools.__file__).parent
+    written = {m for f in taskv3_dir.glob("*.py") for m in re.findall(r"data-tv3-([a-z][a-z-]*)", f.read_text())}
+    scrubbed = set(re.search(r"tv3-\(\?:([^)]*)\)", _PAGE_FINGERPRINT_PROBE_JS).group(1).split("|"))
+
+    assert written - {"ref"} <= scrubbed, sorted(written - {"ref"} - scrubbed)
+
+
+_TV3_MARKERS = ("data-tv3-pre", "data-tv3-menu", "data-tv3-close", "data-tv3-focus", "data-tv3-look", "data-tv3-act")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mask_ticks", [False, True], ids=["stall_detector", "settle_gate"])
+@pytest.mark.parametrize(
+    "change,moves",
+    [
+        ("tv3_markers", False),
+        ("observe_handle", False),
+        ("page_authored_tv3", True),
+        ("text", True),
+        ("node", True),
+        ("page_data_attribute", True),
+    ],
+)
+async def test_the_page_fingerprint_ignores_our_own_markers_but_not_the_pages_changes(
+    mask_ticks: bool, change: str, moves: bool
+) -> None:
+    # Both the stall detector (unmasked) and the finish settle gate (tick-masked) hash this probe. Our tools' markers
+    # are not page change; the page's own text, nodes and data attributes are.
+    from skyvern.forge.agent import _PAGE_FINGERPRINT_PROBE_JS
+
+    mutations = {
+        "tv3_markers": "; ".join(f"document.getElementById('a').setAttribute('{m}', '7')" for m in _TV3_MARKERS),
+        "observe_handle": "document.getElementById('a').setAttribute('data-tv3', 't12-3')",
+        "page_authored_tv3": "document.getElementById('a').setAttribute('data-tv3-ref', 'saved')",
+        "text": "document.getElementById('p').textContent = 'Saved'",
+        "node": "document.body.appendChild(document.createElement('section'))",
+        "page_data_attribute": "document.getElementById('a').setAttribute('data-state', 'open')",
+    }
+    async with _content_page('<button id="a" type="button">A</button><p id="p">Static</p>') as page:
+        before = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
+        await page.evaluate(f"() => {{ {mutations[change]}; }}")
+        after = await page.evaluate(_PAGE_FINGERPRINT_PROBE_JS, mask_ticks)
+
+        assert (before != after) is moves
 
 
 _TICK = "t.textContent = String(Number(t.textContent) - 1)"
@@ -41369,6 +42212,60 @@ async def test_text_delta_reports_what_a_partial_read_did_not_show_and_says_how_
         assert "(over your last 2 tool calls)" in clicked.content, clicked.content
 
 
+_SHADOW_CARTS_FIXTURE_HTML = """<!doctype html><html><body><h1>Open Carts</h1><div id="nav"></div><cart-list></cart-list><script>
+for (let i = 0; i < 30; i++) {
+  const p = document.createElement('p'); p.textContent = `Static navigation line ${i}`;
+  document.getElementById('nav').appendChild(p);
+}
+const root = document.querySelector('cart-list').attachShadow({mode: 'open'});
+window.__add = (name) => { const p = document.createElement('p'); p.textContent = name; root.appendChild(p); };
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_unreported_text_is_what_no_result_carried_and_counts_once_it_is_returned() -> None:
+    unseen = UnseenPageText()
+    async with _live_page(_SHADOW_CARTS_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page), unseen_text=unseen)
+        assert unseen.unreported is not None
+        # A finish before any browser call judged no page at all.
+        assert '"Open Carts"' in await unseen.unreported()
+        await page.reload()
+        # A page no read has shown the model is left to the action's own result.
+        await _tool(tools, "wait").handler({"time_ms": 0})
+        assert await unseen.unreported() == ""
+
+        await page.goto("about:blank")
+        await page.set_content(_SHADOW_CARTS_FIXTURE_HTML)
+        unseen.batch.clear()
+        await _tool(tools, "observe").handler({})
+        # The first observe of a document is evidence for a finish batched behind it.
+        assert any('"Open Carts"' in section for section in unseen.batch), unseen.batch
+        await page.evaluate("""() => { window.__add('Cart A'); window.__add('Cart "B"'); }""")
+        unreported = await unseen.unreported()
+        assert '"Cart A"' in unreported and '"Cart \\"B\\""' in unreported, unreported
+        assert await unseen.unreported() == ""
+
+        await page.evaluate("() => setTimeout(() => window.__add('Cart C'), 100)")
+        waited = await _tool(tools, "wait").handler({"time_ms": 400})
+        assert _delta_lines(waited) == ["Cart C"], waited.content
+        assert await unseen.unreported() == ""
+
+        await page.evaluate("() => window.__add('Cart D')")
+        read = await _tool(tools, "get_html").handler({"format": "text"})
+        assert "Cart D" in read.content
+        assert await unseen.unreported() == ""
+        # A finish in the same batch has not received the read yet; the read itself reports nothing it showed.
+        assert any('"Cart D"' in section for section in unseen.batch), unseen.batch
+        assert _delta_section(read) is None, read.content
+
+        await page.evaluate("() => window.__add('Cart 1043')")
+        await _tool(tools, "observe").handler({})
+        await page.evaluate("() => window.__add('Cart 1044')")
+        assert '"Cart 1044"' in await unseen.unreported()
+
+
 _PUSH_STATE_FIXTURE_HTML = """<!doctype html><html><body><ul id="rows"><li>Mara Holt</li></ul>
 <button id="add" type="button">Add Person</button><input id="q" aria-label="Search"><p id="count"></p>
 <script>
@@ -42533,6 +43430,25 @@ async def test_type_does_not_press_enter_on_a_value_the_field_did_not_keep() -> 
         submitted = await page.evaluate("() => window.__submitted === true")
     assert r.status == "ok" and r.entry_unconfirmed and "Enter was not pressed" in r.content, r.content
     assert not submitted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_phone_field_that_reads_a_national_number_as_international_asks_for_the_country_code() -> None:
+    html = '<form onsubmit="window.__submitted = true; return false"><input id="tel" type="tel"></form>'
+    html += "<script>document.getElementById('tel').addEventListener('input', (e) => {"
+    html += (
+        " const d = e.target.value.replace(/\\D/g, ''); e.target.value = '+' + d.slice(0, 2) + ' ' + d.slice(2); });"
+    )
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#tel", "text": "5550001234", "press_enter": True})
+        submitted = await page.evaluate("() => window.__submitted === true")
+        fixed = await _tool(tools, "type").handler({"selector": "#tel", "text": "+1 5550001234"})
+    assert r.ok_class == "held_international" and r.entry_unconfirmed, r.content
+    assert "Enter was not pressed" in r.content and not submitted
+    assert fixed.ok_class == "held_as" and not fixed.entry_unconfirmed, fixed.content
 
 
 @_skip_no_browser

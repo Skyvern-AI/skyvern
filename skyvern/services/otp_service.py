@@ -1085,6 +1085,7 @@ async def poll_otp_value(
                     workflow_run_id=workflow_run_id,
                     workflow_permanent_id=workflow_permanent_id,
                     context=webhook_otp_context,
+                    expected_otp_type=expected_otp_type,
                 )
             otp_value = _exclude_rejected_otp(
                 otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
@@ -1152,6 +1153,7 @@ async def _get_otp_value_from_url(
     workflow_run_id: str | None = None,
     workflow_permanent_id: str | None = None,
     context: WebhookOTPVerificationContext | None = None,
+    expected_otp_type: OTPType | None = None,
 ) -> OTPValue | None:
     request_data = {}
     if task_id:
@@ -1241,7 +1243,7 @@ async def _get_otp_value_from_url(
     otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     if isinstance(content, str) and len(content) > 10:
         try:
-            otp_value = await parse_otp_login(content, organization_id)
+            otp_value = await parse_otp_login(content, organization_id, enforced_otp_type=expected_otp_type)
         except InsufficientCreditsForOTPParse:
             return None
         except Exception as e:
@@ -1251,11 +1253,26 @@ async def _get_otp_value_from_url(
                 exception_type=type(e).__name__,
                 content_length=len(content),
             )
+        if otp_value is not None and expected_otp_type is not None and otp_value.get_otp_type() != expected_otp_type:
+            # The enforcement is only a prompt instruction, so a parse can still answer with the
+            # other kind of OTP. The expected one may still arrive within the polling budget.
+            LOG.warning(
+                "TOTP webhook returned an OTP of another type; continuing to poll",
+                expected_otp_type=expected_otp_type.value,
+                otp_type=otp_value.get_otp_type().value,
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+            )
+            return None
 
     if not otp_value:
         LOG.warning(
             "Failed to parse otp login from the totp url",
             content_length=len(content) if isinstance(content, str) else None,
+            expected_otp_type=expected_otp_type.value if expected_otp_type else None,
+            # An enforced parse reports "not found" rather than the type it did see, so a link
+            # answering a code poll is only visible by its shape.
+            content_is_bare_link=looks_like_magic_link(content) if isinstance(content, str) else None,
         )
         return None
 

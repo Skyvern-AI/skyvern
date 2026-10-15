@@ -515,6 +515,11 @@ class WorkflowRunOutputParameter(BaseModel):
     output_parameter_id: str
     value: dict[str, Any] | list | str | None
     created_at: datetime
+    # The extracted information collected from the whole value at write time, itself capped.
+    # Only a capping read may use it, since that read holds the capped copy in `value` and can
+    # no longer walk every iteration; an uncapped reader has the whole value and must collect
+    # from it. None means nothing was recorded, so every reader collects from `value`.
+    precomputed_extracted_information: list[Any] | None = None
 
 
 class WorkflowRunResponseBase(BaseModel):

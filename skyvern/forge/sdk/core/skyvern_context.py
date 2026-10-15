@@ -13,7 +13,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Literal, TypedDict
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,7 @@ from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from skyvern.config import settings
 from skyvern.schemas.run_enums import RunEngine
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
@@ -58,6 +59,18 @@ class MultiFieldTotpAttempt:
     external_code_obtained_at: float | None = None
     filled_group_identity: str | None = field(default=None, repr=False)
     observed_max_filled: int = 0
+
+
+@dataclass(frozen=True)
+class UnconsumedOTPCode:
+    """A polled verification code handed to a plan that did not type it.
+
+    ``obtained_at`` is the wall-clock time the code was fetched, not the time it was handed over, so
+    carrying it to a later plan cannot extend how long it is considered worth submitting.
+    """
+
+    value: str = field(repr=False)
+    obtained_at: float
 
 
 @dataclass
@@ -390,13 +403,11 @@ def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[s
     return redacted
 
 
-def action_for_multi_field_totp_persistence(action: Action) -> Action:
-    """Return a copy of a multi-box OTP action carrying only the seed-free timing metadata.
-
-    The digit typed into the box stays on the row: the one-time code is a record the customer has to
-    be able to read back, and only the seed that mints codes is a secret. The allowlist below is what
-    keeps a `totp_secret` out of `totp_timing_info`.
-    """
+def action_for_multi_field_totp_persistence(action: Action, one_time_codes: Collection[str] = ()) -> Action:
+    """Return the persisted copy of an action; the live action must stay unmarked for execution and policy."""
+    text = action.text.strip() if action.action_type == ActionType.INPUT_TEXT and action.text else ""
+    if text and text in one_time_codes:
+        action = action.model_copy(update={"totp_code_required": True})
     timing_info = action.totp_timing_info
     if not timing_info or not timing_info.get("is_totp_sequence"):
         return action
@@ -703,6 +714,9 @@ class SkyvernContext:
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    # Polled codes placed in totp_codes that no plan has typed yet. Only the single-field polling
+    # path records one, so every other producer keeps the historical discard-after-planning behavior.
+    unconsumed_otp_codes: dict[str, UnconsumedOTPCode] = field(default_factory=dict, repr=False)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
@@ -1076,6 +1090,7 @@ class SkyvernContext:
         return self.__repr__()
 
     def pop_totp_code(self, task_id: str) -> None:
+        self.unconsumed_otp_codes.pop(task_id, None)
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
@@ -1105,6 +1120,7 @@ class SkyvernContext:
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)
         self.seed_generated_totp_values.pop(task_id, None)
+        self.unconsumed_otp_codes.pop(task_id, None)
         self.totp_codes.pop(task_id, None)
         self.totp_codes.pop(f"{task_id}_secret", None)
         cached_code = self.totp_codes.pop(f"{task_id}_totp_cache", None)

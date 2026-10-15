@@ -126,13 +126,6 @@ function TaskDetails() {
         queryClient.invalidateQueries({
           queryKey: ["taskWorkflowRun", task.workflow_run_id],
         });
-        queryClient.invalidateQueries({
-          queryKey: [
-            "workflowRun",
-            workflow?.workflow_permanent_id,
-            task.workflow_run_id,
-          ],
-        });
       }
       toast({
         variant: "success",

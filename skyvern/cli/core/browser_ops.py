@@ -134,6 +134,7 @@ LOCALHOST_RECOVERY_HINT = (
 # reporting a failure for a page that is already loaded and usable.
 _LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
 _NAVIGATE_TITLE_TIMEOUT_SECONDS = 5.0
+_VIEWPORT_PROBE_TIMEOUT_SECONDS = 2.0
 _UNBOUNDED_LEG_TIMEOUT_MS = 1000
 
 
@@ -148,6 +149,7 @@ class NavigateResult:
 class ScreenshotResult:
     data: bytes
     full_page: bool = False
+    viewport_css_px: tuple[int, int] | None = None
 
 
 @dataclass
@@ -281,6 +283,8 @@ async def do_screenshot(
             data = await element.screenshot()
         else:
             data = await page.screenshot(full_page=full_page)
+        # Reported only when the image shows exactly the viewport, so image size over it is a valid scale.
+        viewport_css_px = None if selector or full_page else await _viewport_css_px(page)
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -293,7 +297,20 @@ async def do_screenshot(
             restore.add_done_callback(_CURSOR_RESTORES.discard)
             if not cancelled:
                 await restore
-    return ScreenshotResult(data=data, full_page=full_page)
+    return ScreenshotResult(data=data, full_page=full_page, viewport_css_px=viewport_css_px)
+
+
+async def _viewport_css_px(page: Any) -> tuple[int, int] | None:
+    # Screenshots are taken at device scale, so the image's pixel size is not the CSS viewport on a HiDPI display.
+    try:
+        size = await asyncio.wait_for(
+            page.evaluate("() => [window.innerWidth, window.innerHeight]"), timeout=_VIEWPORT_PROBE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return None
+    if isinstance(size, list) and len(size) == 2 and all(type(value) is int and value > 0 for value in size):
+        return size[0], size[1]
+    return None
 
 
 async def do_act(

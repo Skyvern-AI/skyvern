@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRun,
     BuildTestPacketScreenshot,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composition_evidence
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.output_utils import (
     _AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS,
@@ -774,6 +775,63 @@ def test_sanitize_run_blocks_debug_preserves_post_run_page_evidence() -> None:
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
 
     assert sanitized["data"]["post_run_page_evidence"] == evidence
+
+
+@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "get_run_results"])
+@pytest.mark.parametrize("room", [1_000, -200], ids=["fits", "over_the_bound"])
+def test_sanitize_gives_the_run_result_without_authoring_facts_before_the_model_bound_cuts_it(
+    tool_name: str, room: int
+) -> None:
+    shared = {"selector": "input.field", "source": "class", "match_count": 21, "visible_match_count": 20}
+    evidence = {
+        "page_title": "Forms",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "id": f"f{form}-{index}",
+                        "pointer_at_center": "reaches_other_element",
+                        "selector_candidates": [shared],
+                    }
+                    for index in range(20)
+                ],
+                "submit_controls": [{"id": f"go-{form}", "pointer_at_center": "reaches_control"}],
+            }
+            for form in range(4)
+        ],
+        "clickable_controls": [{"text": "Accept", "selector_candidates": [{"selector": "#accept", "source": "id"}]}],
+        "modal_overlays": [{"role": "dialog", "text": "Cookie preferences"}],
+        "page_obstructions": [{"kind": "interaction_blocking_layer", "source": "dom"}],
+    }
+    without_them = model_visible_composition_evidence(evidence)
+
+    def run_result(packet: dict[str, Any], excerpt_chars: int = 0) -> dict[str, Any]:
+        data = {
+            "workflow_run_id": "wr_123",
+            "blocks": [],
+            "post_run_page_evidence": {**packet, "visible_text_excerpt": "x" * excerpt_chars},
+            "final_fact": "kept",
+        }
+        return json.loads(json.dumps({"ok": True, "data": data}))
+
+    # With room to spare, the whole result fits; 200 under the bound, only the packet without them does.
+    full_size = len(json.dumps(run_result(evidence)))
+    stripped_size = len(json.dumps(run_result(without_them)))
+    cap = output_utils_module._RECENT_TOOL_OUTPUT_CHAR_CAP
+    result = run_result(evidence, (cap - room - full_size) if room > 0 else (cap + room - stripped_size))
+    stored = json.dumps(result)
+
+    sanitized = sanitize_tool_result_for_llm(tool_name, result)
+
+    assert json.dumps(result) == stored
+    serialized = json.dumps(sanitized)
+    assert len(serialized) <= cap and sanitized["data"]["final_fact"] == "kept"
+    captured = result["data"]["post_run_page_evidence"]
+    packet = sanitized["data"]["post_run_page_evidence"]
+    assert packet == (captured if room > 0 else model_visible_composition_evidence(captured))
+    assert (packet == captured) == (room > 0)
+    for key in ("modal_overlays", "page_obstructions", "clickable_controls"):
+        assert json.dumps({key: evidence[key]})[1:-1] in serialized
 
 
 def test_sanitize_edit_block_and_run_matches_run_blocks_debug_evidence() -> None:

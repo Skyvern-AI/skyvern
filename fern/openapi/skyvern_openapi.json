@@ -7949,7 +7949,7 @@
                     ],
                     "title": "Terminate Criterion",
                     "description": "Condition that stops Apply. Omit to use the recipe default; null or empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button, redirect, or HTTP 404 alone is insufficient."
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -8064,7 +8064,7 @@
                     ],
                     "title": "Terminate Criterion",
                     "description": "Condition that stops Apply. Omit for the recipe default; empty text disables it.",
-                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button, redirect, or HTTP 404 alone is insufficient."
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
                   },
                   "error_code_mapping": {
                     "anyOf": [
@@ -14564,6 +14564,11 @@
             "title": "Include Body",
             "default": true
           },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -14766,6 +14771,11 @@
             "type": "boolean",
             "title": "Include Body",
             "default": true
+          },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "default": false
           },
           "parameter_keys": {
             "anyOf": [

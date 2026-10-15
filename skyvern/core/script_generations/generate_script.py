@@ -2506,6 +2506,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             )
         )
 
+    if block.get("force_ocr"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("force_ocr"),
+                value=_value(True),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(

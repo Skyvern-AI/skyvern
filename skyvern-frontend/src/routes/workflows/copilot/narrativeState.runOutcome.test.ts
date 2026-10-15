@@ -42,6 +42,7 @@ describe("budget expiry narrative", () => {
       reportProduced: false,
       stagedDraftId: "wf_draft",
       drainFingerprint: "drain-1",
+      leftRunIds: [],
     });
   });
 
@@ -712,28 +713,44 @@ describe("canonical turn facts — pill and prose over one bundle", () => {
     expect(pill).toBe("untested");
   });
 
-  it("settles a block still running at the deadline as stopped, not failed", () => {
-    const turn = hydrateNarrativeFromPayload({
-      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
-        string,
-        unknown
-      >),
-      blocks: [
-        {
-          workflowRunBlockId: "wrb_1",
-          label: "append_star_count_to_sheet",
-          blockType: "code",
-          state: "running",
-          lastSeenIteration: 0,
-          activity: [],
+  it.each([
+    [false, "unfinished", "unfinished"],
+    [false, "running", "stopped"],
+    [true, "running", "stopped"],
+  ])(
+    "keeps a block saved at the deadline (cancelled: %s, saved as %s) as %s, not failed",
+    (cancelled, savedState, expected) => {
+      const turn = hydrateNarrativeFromPayload({
+        ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+          string,
+          unknown
+        >),
+        cancelled,
+        budgetExpiry: {
+          budgetExpired: true,
+          source: "deadline",
+          reportProduced: true,
+          stagedDraftId: null,
+          drainFingerprint: null,
+          leftRunIds: ["wr_left"],
         },
-      ],
-    });
-    if (!turn) throw new Error("fixture did not hydrate");
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "append_star_count_to_sheet",
+            blockType: "code",
+            state: savedState,
+            lastSeenIteration: 0,
+            activity: [],
+          },
+        ],
+      });
+      if (!turn) throw new Error("fixture did not hydrate");
 
-    expect(turn.blocks.map((block) => block.state)).toEqual(["stopped"]);
-    expect(isDeadlineHalt(turn)).toBe(true);
-  });
+      expect(turn.blocks.map((block) => block.state)).toEqual([expected]);
+      expect(isDeadlineHalt(turn)).toBe(true);
+    },
+  );
 
   it("keeps a failed block a failure even when the deadline expired", () => {
     const turn = hydrateNarrativeFromPayload({

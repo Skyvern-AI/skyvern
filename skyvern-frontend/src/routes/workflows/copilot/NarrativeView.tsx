@@ -68,6 +68,7 @@ import {
   toolCallKind,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
+import { workflowRunDetailPath } from "../studioNavigation";
 
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
@@ -134,6 +135,8 @@ function isQuestionTurn(turn: TurnNarrativeState): boolean {
   );
 }
 
+const UNFINISHED_BLOCK_NOTE = "the turn ended before this block finished";
+
 function blockIdentity(block: BlockState): string {
   return block.workflowRunBlockId || block.label;
 }
@@ -154,7 +157,11 @@ function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
 
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
-    if (block.state === "failed" || block.state === "stopped") {
+    if (
+      block.state === "failed" ||
+      block.state === "stopped" ||
+      block.state === "unfinished"
+    ) {
       return blockIdentity(block);
     }
   }
@@ -543,6 +550,7 @@ function FBlockRun({
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
   const isStopped = block.state === "stopped";
+  const isUnfinished = block.state === "unfinished";
   const isDraft = block.state === "drafted";
   const collapsedOutcomeReason =
     isOutcomeNotShown || ownsOutcomeNotConfirmed
@@ -603,7 +611,8 @@ function FBlockRun({
       ownsOutcomeReason ||
       isVerifying ||
       isRanNeutral ||
-      isStopped);
+      isStopped ||
+      isUnfinished);
   useTick(isRunning);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
@@ -619,9 +628,11 @@ function FBlockRun({
             ? "halted"
             : isStopped
               ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
-              : isDraft
-                ? "drafted"
-                : "queued";
+              : isUnfinished
+                ? UNFINISHED_BLOCK_NOTE
+                : isDraft
+                  ? "drafted"
+                  : "queued";
   const stateGlyph = isOk ? (
     "✓"
   ) : isOutcomeNotShown ? (
@@ -632,6 +643,8 @@ function FBlockRun({
     "✕"
   ) : isStopped ? (
     "■"
+  ) : isUnfinished ? (
+    "○"
   ) : isRunning ? (
     <Spinner />
   ) : (
@@ -1148,6 +1161,13 @@ function testCardStatus(block: BlockState, turnEnded: boolean): TestCardStatus {
         word: "Stopped",
         note: null,
         glyph: <StopIcon aria-hidden="true" className="size-3" />,
+      };
+    case "unfinished":
+      return {
+        tone: "neutral",
+        word: "Unfinished",
+        note: UNFINISHED_BLOCK_NOTE,
+        glyph: "○",
       };
     case "skipped":
       return { tone: "neutral", word: "Skipped", note: null, glyph: "–" };
@@ -2344,6 +2364,35 @@ function FBudgetLimitNote({ budget }: { budget: BudgetExpiryState }) {
   );
 }
 
+function FUnfinishedRunNote({ runIds }: { runIds: string[] }) {
+  const single = runIds.length === 1;
+  return (
+    <div
+      data-testid="copilot-unfinished-run"
+      className={`text-[12px] leading-[1.5] ${STEP_TEXT}`}
+    >
+      {single
+        ? "The test run may still be going. You can open or cancel it from "
+        : "The test runs may still be going. You can open or cancel them from their run pages: "}
+      {runIds.map((runId, index) => (
+        <Fragment key={runId}>
+          {index > 0 ? ", " : null}
+          <a
+            className="underline underline-offset-2"
+            href={workflowRunDetailPath(runId)}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {single ? "its run page" : runId}
+            <span className="sr-only"> (opens in new tab)</span>
+          </a>
+        </Fragment>
+      ))}
+      .
+    </div>
+  );
+}
+
 // Something that happened during a turn and renders where it happened: after the activity row
 // holding its tool call. When that row is not on screen (a long turn keeps only its newest
 // activity), `at` places it among the rows by time; without it, it sits above the reply.
@@ -2562,6 +2611,10 @@ function DetailView({
         turn.budgetExpiry !== null &&
         turn.budgetExpiry.reportProduced !== false ? (
           <FBudgetLimitNote budget={turn.budgetExpiry} />
+        ) : null}
+
+        {turn.terminal !== null && turn.budgetExpiry?.leftRunIds.length ? (
+          <FUnfinishedRunNote runIds={turn.budgetExpiry.leftRunIds} />
         ) : null}
 
         {/* terminalProseTone's question branch without its evidence gate: an

@@ -1,116 +1,269 @@
 ---
-title: Self-Hosted Overview
-subtitle: Run Skyvern on your own infrastructure
-description: Deploy Skyvern on your own infrastructure with Docker or Kubernetes. Configure LLM providers, browsers, proxies, and storage.
-slug: developers/self-hosted/overview
+title: Self-host
+description: Run the Skyvern server on your own machine or cluster with pip, Docker Compose, or Kubernetes, using your own LLM keys or a local model.
 keywords:
   - self-hosted
-  - on-premise
-  - infrastructure
-  - deployment
-  - architecture
-  - components
-  - requirements
+  - skyvern quickstart
+  - skyvern[server]
+  - Docker Compose
+  - Kubernetes
+  - LLM_KEY
+  - Ollama
+  - BROWSER_TYPE
+  - SKYVERN_STORAGE_TYPE
+  - upgrade
 ---
 
-Self-hosted Skyvern runs entirely on your infrastructure: your servers, your browsers, your LLM API keys. This guide helps you decide if self-hosting fits your needs and which deployment method to choose.
+Self-hosted Skyvern runs the API server, the browser, and the database on your infrastructure, with your own LLM keys. Every setting is an environment variable; the full list is in [configuration](/reference/configuration).
 
-## Architecture
+| You get | You run yourself |
+|---|---|
+| Data, recordings, and credentials stay on your infrastructure, except what goes to the LLM provider you configure | Servers, scaling, backups, upgrades |
+| Any LLM provider, including local models | LLM bills, paid to your provider |
+| Full control of the browser and extensions | Proxies. Skyvern Cloud's proxy network and CAPTCHA solving are not included. |
 
-Self-hosted Skyvern has four components running on your infrastructure:
+## Pick a path
 
-```mermaid
-flowchart LR
-    subgraph Your Infrastructure
-        API[Skyvern API Server<br/>+ Embedded Browser]
-        UI[Skyvern Web UI]
-        DB[(PostgreSQL)]
-    end
+| Path | Best for | Includes the web UI |
+|---|---|---|
+| [pip](#pip-local-server) | Calling a local server from code or MCP | No |
+| [Docker Compose](#docker-compose) | A full install on one machine | Yes |
+| [Kubernetes](#kubernetes) | Teams already running a cluster | Yes |
 
-    LLM[LLM Provider]
-    Sites[Target Websites]
+### pip: local server
 
-    UI <--> API
-    API <--> DB
-    API <--> LLM
-    API <--> Sites
+Requires Python 3.11 to 3.14.
+
+```bash
+pip install "skyvern[server]"
+skyvern quickstart --install-type server
 ```
 
-| Component | Role |
-|-----------|------|
-| **Skyvern API Server** | Orchestrates tasks, processes LLM responses, stores results. Includes an embedded Playwright-managed Chromium browser that executes web automation. |
-| **Skyvern Web UI** | Browser-based dashboard for building agents, running tasks, viewing recordings, and managing credentials. Docker Compose starts it alongside the API server. |
-| **PostgreSQL** | Stores task history, workflows, credentials, and organization data |
-| **LLM Provider** | Analyzes screenshots and determines actions. You provide the API key (OpenAI, Anthropic, Azure OpenAI, Google Vertex AI, Amazon Bedrock, Groq, OpenRouter, or local via Ollama) |
+`skyvern quickstart` asks for your LLM provider and key, installs Chromium, sets up the database, writes a local API key to `.env`, and can configure MCP for your coding agent. It then offers to start the server.
 
-### How a task executes
+Start it later with:
 
-Skyvern runs a perception-action loop for each task step:
+```bash
+skyvern run server
+```
 
-1. **Screenshot**: The browser captures the current page state
-2. **Analyze**: The screenshot is sent to your LLM, which identifies interactive elements and decides the next action
-3. **Execute**: Skyvern performs the action in the browser (click, type, scroll, extract data)
-4. **Repeat**: Steps 1-3 loop until the task goal is met or the step limit (`MAX_STEPS_PER_RUN`) is reached
+The API listens on `http://localhost:8000`.
 
-This loop is why LLM choice and browser configuration are the two most impactful self-hosting decisions. They affect every task step.
+Database choice:
 
-## What changes from Cloud
-
-| You gain | You manage |
-|----------|------------|
-| Full data control: browser sessions and results stay on your network | Infrastructure: servers, scaling, uptime |
-| Any LLM provider, including local models via Ollama | LLM API costs: pay your provider directly |
-| No per-task pricing | Proxies: bring your own provider |
-| Full access to browser configuration and extensions | Software updates: pull new Docker images manually |
-| Deploy in air-gapped or restricted networks | Database backups and maintenance |
+- If PostgreSQL is already running locally, quickstart uses it.
+- Otherwise it offers to start a PostgreSQL container, which needs Docker.
+- `--no-postgres` skips that and uses SQLite at `~/.skyvern/data.db`.
+- `--database-string=postgresql+psycopg://user:pass@host:5432/dbname` uses a database you already have.
 
 <Note>
-The most significant operational difference is **proxies**. Skyvern Cloud routes browser traffic through managed residential proxies to avoid bot detection. Self-hosted deployments need you to configure your own proxy provider.
+`pip install skyvern` without the `[server]` extra is the client SDK only. A pip install runs the API server without the web UI. For the UI, use Docker Compose or a source checkout.
 </Note>
 
-## Prerequisites
+### Docker Compose
 
-Before deploying, ensure you have:
+Starts PostgreSQL, the API server with its browser, and the web UI.
 
 <Steps>
-  <Step title="Docker and Docker Compose">
-    Required for containerized deployment. [Install Docker](https://docs.docker.com/get-docker/)
+  <Step title="Get the code and env files">
+    ```bash
+    git clone https://github.com/Skyvern-AI/skyvern.git
+    cd skyvern
+    cp .env.example .env
+    cp skyvern-frontend/.env.example skyvern-frontend/.env
+    ```
   </Step>
-  <Step title="4GB+ RAM">
-    Browser instances are memory-intensive. Production deployments benefit from 8GB+.
+  <Step title="Set your LLM key">
+    In `.env`, enable one provider (see [Set up an LLM provider](#set-up-an-llm-provider)).
   </Step>
-  <Step title="LLM API key">
-    From OpenAI, Anthropic, Azure OpenAI, Google Gemini, or AWS Bedrock. Alternatively, run local models with Ollama.
+  <Step title="Clear the UI's placeholder key">
+    In `skyvern-frontend/.env`, set `VITE_SKYVERN_API_KEY=` (empty). The UI then reads the key the server generates. If you leave `YOUR_API_KEY` there, the UI sends it as is and every request fails.
   </Step>
-  <Step title="Proxy provider (recommended)">
-    For automating external websites at scale. Not required for internal tools or development.
+  <Step title="Start">
+    ```bash
+    docker compose up -d
+    docker compose ps
+    ```
+    The first start runs migrations and creates your organization. Wait until `postgres` and `skyvern` show `healthy`.
+  </Step>
+  <Step title="Open the app">
+    Go to [http://localhost:8080](http://localhost:8080). The API is on port 8000. Your API key is the `cred` value in `.skyvern/credentials.toml`.
   </Step>
 </Steps>
 
-PostgreSQL 14+ is included in the Docker Compose setup. If you prefer an external database, configure `DATABASE_STRING` to point to your own instance.
+| Service | Ports | Role |
+|---|---|---|
+| `postgres` | internal | Database, stored in `./postgres-data` |
+| `skyvern` | 8000, 6080 | API server and browser (6080 is VNC streaming) |
+| `skyvern-ui` | 8080, 9090 | Web app and artifact server |
 
-For local server commands from PyPI, install the server extra: `pip install "skyvern[server]"`. The lightweight `pip install skyvern` package is for Skyvern Cloud / remote API SDK usage and does not include the local server stack. Guided quickstart and migrations currently require Docker Compose or a source checkout.
+Recordings, artifacts, HAR files, logs, and downloads are written to folders next to `docker-compose.yml`.
 
-For a full self-hosted deployment with the web UI, use Docker Compose. The Compose stack starts the API server, browser runtime, Postgres, and the Skyvern web UI together.
+<Warning>
+Leave `DATABASE_STRING` in `docker-compose.yml`. The value in `.env.example` points at `localhost`, which inside the container is the container itself. If an older `.env` has `DATABASE_STRING=...@localhost...`, delete that line.
+</Warning>
 
-For the source-checkout `pip install ".[server]"` path (Option A in the README), the default is a SQLite database at `~/.skyvern/data.db` — zero-config for local dev. To opt into Postgres for that path, run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`.
+If you have the CLI installed, `skyvern quickstart --docker-compose` from the repo folder creates the env files, asks for your LLM key, and runs `docker compose up -d` for you.
 
-## Choose your deployment method
+To serve it on a network, put a reverse proxy in front with authentication, and set `VITE_API_BASE_URL`, `VITE_WSS_BASE_URL`, and `VITE_ARTIFACT_API_BASE_URL` in `skyvern-frontend/.env` to the public URLs. Don't expose Skyvern to the internet without authentication.
 
-| Method | Best for |
-|--------|----------|
-| **Docker Compose** | Getting started, small teams, single-server deployments |
-| **Kubernetes** | Production at scale, teams with existing K8s infrastructure, high availability requirements |
+### Kubernetes
 
-Most teams start with Docker Compose. It's the fastest path to a working deployment. Move to Kubernetes when you need horizontal scaling or want to integrate with existing orchestration infrastructure.
+The repository has plain manifests in [`kubernetes-deployment/`](https://github.com/Skyvern-AI/skyvern/tree/main/kubernetes-deployment): a backend, a frontend, PostgreSQL, and a Traefik ingress. Fill in `backend/backend-secrets.yaml` (the same variables as `.env`) and `frontend/frontend-secrets.yaml`, then run `./k8s-deploy.sh`. Its README and [configuration](/reference/configuration#kubernetes) cover the API key, volumes, TLS, and scaling. The manifests have no authentication, so keep the cluster off the public internet.
 
-## Next steps
+## Set up an LLM provider
 
-<CardGroup cols={2}>
-  <Card title="Docker Setup" icon="docker" href="/developers/self-hosted/docker">
-    Get Skyvern running in 10 minutes with Docker Compose
-  </Card>
-  <Card title="Kubernetes Deployment" icon="dharmachakra" href="/developers/self-hosted/kubernetes">
-    Deploy to production with Kubernetes manifests
-  </Card>
-</CardGroup>
+Enable one provider and point `LLM_KEY` at a model. Quickstart writes these for you.
+
+```bash .env
+ENABLE_OPENAI=true
+OPENAI_API_KEY=sk-...
+LLM_KEY=OPENAI_GPT5_5
+```
+
+```bash .env
+ENABLE_ANTHROPIC=true
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+```
+
+`LLM_KEY` defaults to `OPENAI_GPT5_5`. `SECONDARY_LLM_KEY` sets a cheaper model for lighter calls. Azure OpenAI, Gemini, Vertex AI, Bedrock, OpenRouter, Groq, and others work the same way. The provider flags and every valid `LLM_KEY` are in [configuration](/reference/configuration). Restart the server after any change.
+
+### Use a local model
+
+**Ollama:**
+
+```bash .env
+ENABLE_OLLAMA=true
+LLM_KEY=OLLAMA
+OLLAMA_SERVER_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5vl:7b
+OLLAMA_SUPPORTS_VISION=true
+```
+
+Set `OLLAMA_SUPPORTS_VISION=true` only for a model that reads images. Skyvern works from screenshots, so a vision model gives much better results.
+
+**Any OpenAI-compatible endpoint** (LiteLLM, vLLM, LM Studio):
+
+```bash .env
+ENABLE_OPENAI_COMPATIBLE=true
+LLM_KEY=OPENAI_COMPATIBLE
+OPENAI_COMPATIBLE_MODEL_NAME=your-model
+OPENAI_COMPATIBLE_API_KEY=sk-anything
+OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+OPENAI_COMPATIBLE_SUPPORTS_VISION=true
+```
+
+<Warning>
+If Skyvern runs in Docker, `localhost` is the container. Use `http://host.docker.internal:11434` (or your port) to reach a model on the host. Without `LLM_KEY`, Skyvern keeps calling the default OpenAI model.
+</Warning>
+
+## Browser options
+
+`BROWSER_TYPE` sets how Skyvern runs Chromium.
+
+| Value | Behavior |
+|---|---|
+| `chromium-headful` | Visible window (default). In Docker it draws on a virtual display. |
+| `chromium-headless` | No window. Some sites block headless browsers. |
+| `cdp-connect` | Drive a Chrome you already run. Set `BROWSER_REMOTE_DEBUGGING_URL` (default `http://127.0.0.1:9222`), or set `CHROME_EXECUTABLE_PATH` and Skyvern starts your installed Chrome with a copy of your profile. |
+
+`skyvern init browser` walks you through `cdp-connect`. From Docker, reach Chrome on the host at `http://host.docker.internal:9222`. Other settings, including viewport, locale, timezone, timeouts and CDP details, are in [configuration](/reference/configuration#browser-settings). For reusable sessions and profiles, see [Browsers](/browsers).
+
+Each concurrent run needs its own browser, and browsers use a lot of memory. Size memory for the number of runs you expect at once, and add servers to scale.
+
+## Storage
+
+Artifacts (recordings, screenshots, HAR files, logs) go to local disk by default. For several servers, or for durability, set `SKYVERN_STORAGE_TYPE`.
+
+| `SKYVERN_STORAGE_TYPE` | Where | Main settings |
+|---|---|---|
+| `local` (default) | Server disk | `ARTIFACT_STORAGE_PATH`, `VIDEO_PATH`, `HAR_PATH`, `LOG_PATH` |
+| `s3` | AWS S3 | `AWS_REGION`, `AWS_S3_BUCKET_ARTIFACTS`, `AWS_S3_BUCKET_SCREENSHOTS`, `AWS_S3_BUCKET_BROWSER_SESSIONS`, `AWS_S3_BUCKET_UPLOADS`. Uses the standard AWS credential chain. |
+| `azureblob` | Azure Blob Storage | `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCOUNT_KEY` (required; managed identity is not supported), and one `AZURE_STORAGE_CONTAINER_*` per bucket type |
+| `gcs` | Google Cloud Storage | `GCS_PROJECT_ID`, one `GCS_BUCKET_*` per bucket type. Uses Application Default Credentials. |
+
+Create the S3 or GCS buckets before you start. Azure containers are created on first use. Links in run responses are signed. Screenshot and recording links expire after 1 hour; on S3, other links expire after `PRESIGNED_URL_EXPIRATION` seconds (default 86400, 24 hours). Switching storage doesn't move existing artifacts. Bucket setup, IAM policy and migration are in [configuration](/reference/configuration#storage).
+
+## URL validation
+
+Skyvern doesn't block requests to internal addresses by default, so it reaches an intranet portal or a service on your network without extra setup. Set `ENABLE_URL_VALIDATION=true` to refuse loopback, private-network and cloud-metadata addresses instead. What it blocks, and how to allow individual hosts, is in [configuration](/reference/configuration#url-validation).
+
+<Warning>
+Whoever can start a task chooses the URLs Skyvern opens and fetches. If you share a server with people you don't trust, turn URL validation on.
+</Warning>
+
+## Google integrations
+
+The Google Sheets, Gmail, and Google Drive integrations are off on a self-hosted server until you add a Google OAuth client.
+
+<Steps>
+  <Step title="Turn on encryption">
+    Set `ENABLE_ENCRYPTION=true` and `ENCRYPTOR_AES_SECRET_KEY` (generate it with `openssl rand -base64 32`), then restart. Don't change the key later: stored credentials become unreadable.
+  </Step>
+  <Step title="Create the OAuth client">
+    In Google Cloud, enable the Google Sheets, Google Drive, and Gmail APIs. Configure the **OAuth consent screen**; for an External app, add each user as a test user (or publish the app) before they can connect. Then create an OAuth client ID of type **Web application**. Add `https://<your-ui-host>/integrations/google/callback` as an authorized redirect URI. For local use, that's `http://localhost:8080/integrations/google/callback`.
+  </Step>
+  <Step title="Add it to Skyvern">
+    In the app, open the **Google OAuth** form on **Integrations** or **Settings**. Fill in **Client ID** and **Client Secret**, set **Redirect Hosts** (host name only) and **App Origins** (for example `https://skyvern.example.com`), and click **Save Configuration**. Or set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_HOSTS`, and `GOOGLE_OAUTH_APP_ORIGINS` on the server. The form wins over the variables.
+  </Step>
+</Steps>
+
+Skyvern asks Google for the scopes each integration needs. If your consent screen restricts scopes, add these so users can grant them:
+
+| Integration | Scopes |
+|---|---|
+| Google Sheets | `https://www.googleapis.com/auth/spreadsheets`, `https://www.googleapis.com/auth/drive.file`, `https://www.googleapis.com/auth/drive.metadata.readonly` |
+| Gmail, Read inbox | `https://www.googleapis.com/auth/gmail.readonly` |
+| Gmail, Send email | `https://www.googleapis.com/auth/gmail.send`, `openid`, `email` |
+| Google Drive | `https://www.googleapis.com/auth/drive` |
+
+`gmail.send` is a sensitive scope in Google Cloud. On the Gmail card, **Read inbox** is ticked by default and **Send email** is not; Google is asked only for what is ticked.
+
+Then click **Connect** on the integration card. If it fails, the redirect URI registered with Google must match **Redirect Hosts**, and **App Origins** must hold the exact origin the UI runs on.
+
+## Connect your code
+
+Point the SDK at your server with the local API key.
+
+<CodeGroup>
+```python Python
+from skyvern import Skyvern
+
+client = Skyvern(base_url="http://localhost:8000", api_key="YOUR_LOCAL_API_KEY")
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ baseUrl: "http://localhost:8000", apiKey: "YOUR_LOCAL_API_KEY" });
+```
+</CodeGroup>
+
+The API answers on both `/v1/` and `/api/v1/`.
+
+## Upgrade
+
+**Docker Compose:** the server runs database migrations on start.
+
+```bash
+git pull
+docker compose pull
+docker compose up -d
+```
+
+**pip:**
+
+```bash
+pip install --upgrade "skyvern[server]"
+skyvern init
+skyvern run server
+```
+
+`skyvern init` runs the database migrations. Back up the database before upgrading. Release notes are in the [changelog](/changelog).
+
+## Next
+
+- [Configuration](/reference/configuration): every environment variable and model key
+- [Going to production](/developers/production): webhooks, errors, cost limits
+- [Troubleshooting](/developers/troubleshooting#self-hosted)

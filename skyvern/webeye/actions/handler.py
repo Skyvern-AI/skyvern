@@ -50,6 +50,7 @@ from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
+    ExternalBrowserUnavailable,
     FailedToClearInputField,
     FailedToFetchSecret,
     FailedToTakeScreenshot,
@@ -114,7 +115,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
 )
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
@@ -152,6 +153,11 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.credential_verdict_service import (
+    CredentialVerdictContext,
+    confirm_credential_verdicts,
+    needs_credential_confirmation,
+)
 from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date as _canonical_iso_date
@@ -236,6 +242,7 @@ from skyvern.webeye.navigation import (
     record_task_nav_error_code,
     revalidate_redirect_chain,
 )
+from skyvern.webeye.real_browser_state import is_external_browser_state
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -397,6 +404,11 @@ class CustomSelectFamilyOutcome(StrEnum):
     terminal_unverified_toggle = "terminal_unverified_toggle"
 
 
+# Wall clock a date-related custom-select cascade may spend walking levels. Each level costs an LLM
+# round trip, so bounding the walk by time rather than by level count keeps a cheap deep walk (a
+# calendar stepped one month per click) while stopping a walk that cannot finish inside the action
+# execution deadline — the deadline cancels the action, which skips every recovery below.
+DATEPICKER_WALK_BUDGET_SECONDS = 300.0
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
@@ -525,7 +537,12 @@ class _DownloadProgressSampler:
 
     async def aclose(self) -> None:
         if self._task is not None:
-            self._task.cancel()
+            # A task cancelled before its first step is dropped un-awaited by the OTel asyncio instrumentor, which logs a
+            # "never awaited" RuntimeWarning at error level; yield once so it starts first.
+            try:
+                await asyncio.sleep(0)
+            finally:
+                self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
 
 
@@ -2421,6 +2438,9 @@ async def _recover_download_page(
             try:
                 recovered_page = await browser_state.new_page()
             except Exception:
+                # A registered external browser is attach-only, so there is no address to reconnect through.
+                if is_external_browser_state(browser_state):
+                    raise ExternalBrowserUnavailable.lost() from None
                 # A context that cannot open a page is unusable regardless of what the driver
                 # reports: the browser-close event has often not propagated yet when the pending
                 # newPage call rejects, so is_connected() still answers True here.
@@ -2460,6 +2480,8 @@ async def _recover_download_page(
                 recovery_context.retire_intentional_page(task.task_id, recovered_page)
             await browser_state.navigate_to_url(page=recovered_page, url=page_url_before_download)
             await browser_state.set_active_page(recovered_page)
+    except ExternalBrowserUnavailable:
+        raise
     except Exception:
         LOG.warning(
             "Failed to recreate working page after download action closed it",
@@ -4090,6 +4112,8 @@ async def _select_deterministic_normal_option(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
     locator: Locator,
+    task: Task,
+    target_value: str,
     matched_label: str | None,
     matched_value: str | None,
     matched_index: int | None,
@@ -4101,6 +4125,11 @@ async def _select_deterministic_normal_option(
 
     value = matched_value if matched_value is not None else matched_label
     if value is not None and not _select_value_is_ambiguous(skyvern_element.get_options(), value):
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value, matched_label=matched_label
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             await locator.select_option(
                 value=value,
@@ -4118,6 +4147,11 @@ async def _select_deterministic_normal_option(
             )
 
     if not is_success and matched_label is not None and matched_label != value:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value, matched_label=matched_label
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             await locator.select_option(
                 label=matched_label,
@@ -4143,6 +4177,11 @@ async def _select_deterministic_normal_option(
                 locator=locator,
             )
         else:
+            cancellation_failure = await _native_select_cancellation_failure(
+                task=task, target_value=target_value, matched_label=matched_label
+            )
+            if cancellation_failure is not None:
+                return [cancellation_failure]
             try:
                 await locator.select_option(
                     index=matched_index,
@@ -5163,7 +5202,9 @@ class ActionHandler:
                     )
             action.finished_at = naive_utc_now()
             persisted_action = await app.DATABASE.workflow_params.create_action(
-                action=skyvern_context.action_for_multi_field_totp_persistence(action)
+                action=skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
             )
             action.action_id = persisted_action.action_id
             return results
@@ -5979,7 +6020,9 @@ class ActionHandler:
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
             persisted_action = await app.DATABASE.workflow_params.create_action(
-                action=skyvern_context.action_for_multi_field_totp_persistence(action)
+                action=skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
             )
             action.action_id = persisted_action.action_id
 
@@ -10497,8 +10540,17 @@ async def handle_select_option_action(
                 # normal_select can raise before returning (e.g. an LLM/provider error). Don't lose
                 # the styled-dropdown fallback below — record the failure and keep going.
                 LOG.warning("normal_select raised; falling back to blocking-element detection", exc_info=True)
+                cancellation_failure = await _native_select_cancellation_failure(
+                    task=task,
+                    target_value=_select_option_target_value(action.option) or "",
+                    matched_label=None,
+                )
+                if cancellation_failure is not None:
+                    return [cancellation_failure]
                 normal_select_result = [ActionFailure(exception=e)]
             if _normal_select_successful(normal_select_result):
+                return normal_select_result
+            if normal_select_result and normal_select_result[-1].skip_remaining_actions:
                 return normal_select_result
 
         blocking_element: SkyvernElement | None = None
@@ -10894,7 +10946,11 @@ async def handle_terminate_action(
         skyvern_errors = [error for error in action.errors if error.is_skyvern_defined]
         try:
             extracted_errors = await extract_user_defined_errors(
-                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                reasoning=action.reasoning,
+                confirm_credentials=False,
             )
         except Exception:
             LOG.warning(
@@ -10909,6 +10965,20 @@ async def handle_terminate_action(
             action.errors = skyvern_errors + [
                 error for error in extracted_errors if error.error_code not in skyvern_codes
             ]
+    # Gate the merged set once: a system-attached verdict and the extraction pass can describe the same
+    # rejection, but must not independently reach the model or leave conflicting outcomes.
+    if any(needs_credential_confirmation(error) for error in action.errors):
+        action.errors = await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=action.errors,
+            context=CredentialVerdictContext(
+                current_url=scraped_page.url,
+                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
+                screenshots=scraped_page.screenshots,
+                agent_reasoning=action.reasoning,
+            ),
+        )
     return [ActionSuccess()]
 
 
@@ -10925,6 +10995,21 @@ async def handle_complete_action(
     # attribution (periodic vs handler-forced) lives on the child
     # complete_verify span as `verification.trigger`.
     _span = otel_trace.get_current_span()
+    if action.errors:
+        credential_context = None
+        if any(needs_credential_confirmation(error) for error in action.errors):
+            credential_context = CredentialVerdictContext(
+                current_url=scraped_page.url,
+                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
+                screenshots=scraped_page.screenshots,
+                agent_reasoning=action.reasoning,
+            )
+        action.errors = await confirm_credential_verdicts(
+            task=task,
+            step=step,
+            errors=action.errors,
+            context=credential_context,
+        )
     if action.verified or not task.navigation_goal:
         _span.set_attribute("verification_path", "already_verified")
         return [ActionSuccess()]
@@ -10950,6 +11035,8 @@ async def handle_complete_action(
         LOG.exception(
             "Failed to verify the complete action",
             workflow_run_id=task.workflow_run_id,
+            llm_key=e.llm_key if isinstance(e, BaseLLMError) else None,
+            prompt_name=e.prompt_name if isinstance(e, BaseLLMError) else None,
         )
         return [ActionFailure(exception=e)]
 
@@ -11698,7 +11785,7 @@ def generate_totp_value_from_secret(totp_secret: str | None) -> str:
         raise NoTOTPSecretFound() from exc
 
 
-def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str) -> None:
+def _register_runtime_otp_value_best_effort(workflow_run_id: str | None, code: str | None) -> None:
     if not workflow_run_id or not code:
         return
     try:
@@ -13052,10 +13139,16 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # TODO: only support the third-level dropdown selection now, but for date picker, we need to support more levels as it will move the month, year, etc.
+    # A date picker takes more levels than a plain cascade since a pick can just move the month, so
+    # the count here is only a backstop: DATEPICKER_WALK_BUDGET_SECONDS is what bounds the walk.
     MAX_DATEPICKER_DEPTH = 30
     MAX_SELECT_DEPTH = 3
     max_depth = MAX_DATEPICKER_DEPTH if input_or_select_context.is_date_related else MAX_SELECT_DEPTH
+    date_walk_deadline = (
+        asyncio.get_running_loop().time() + DATEPICKER_WALK_BUDGET_SECONDS
+        if input_or_select_context.is_date_related
+        else None
+    )
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
@@ -13100,6 +13193,14 @@ async def sequentially_select_from_dropdown(
             LOG.warning(
                 "Reaching the max selection depth",
                 depth=i,
+            )
+            break
+
+        if date_walk_deadline is not None and asyncio.get_running_loop().time() >= date_walk_deadline:
+            LOG.warning(
+                "Date selection spent its walk budget without finishing",
+                depth=i,
+                budget_seconds=DATEPICKER_WALK_BUDGET_SECONDS,
             )
             break
 
@@ -13177,27 +13278,87 @@ async def sequentially_select_from_dropdown(
         if json_response.get("is_mini_goal_finished", False):
             LOG.info("The user has finished the selection for the current opened dropdown")
             return single_select_result
-    else:
-        if input_or_select_context.is_date_related:
-            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
-                try:
-                    LOG.info("Try to input the date directly")
-                    await skyvern_element.input_sequentially(action.option.label)
-                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
-                    result.action_result = ActionSuccess()
-                    return result
 
-                except Exception:
-                    LOG.warning(
-                        "Failed to input the date directly",
-                        exc_info=True,
-                    )
-
-            if single_select_result and single_select_result.action_result:
-                single_select_result.action_result.skip_remaining_actions = True
-                return single_select_result
+    # Only a walk that ran out of budget or depth gets here: every other exit from the loop returns.
+    if input_or_select_context.is_date_related:
+        return await _give_up_date_walk(
+            skyvern_element=skyvern_element,
+            skyvern_frame=skyvern_frame,
+            date_label=action.option.label,
+            entry_action_type=entry_action_type,
+            target_value=target_value,
+            # is_done() is false for every level that got here, so the menu is still open. Carrying
+            # it is what makes the input_text caller close the picker before it types.
+            dropdown_menu=single_select_result.dropdown_menu if single_select_result else None,
+            task=task,
+            step=step,
+        )
 
     return select_history[-1] if len(select_history) > 0 else None
+
+
+async def _give_up_date_walk(
+    *,
+    skyvern_element: SkyvernElement,
+    skyvern_frame: SkyvernFrame,
+    date_label: str | None,
+    entry_action_type: str,
+    target_value: str,
+    dropdown_menu: SkyvernElement | None,
+    task: Task,
+    step: Step,
+) -> CustomSingleSelectResult:
+    """End an unfinished date cascade without claiming a date that was never set.
+
+    The levels already clicked leave the picker open over a field that may still hold its old
+    value, so the only safe way to report this is a failure, except where this function can both
+    clear and type the date itself.
+    """
+    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+    result.dropdown_menu = dropdown_menu
+
+    if entry_action_type == "input_text":
+        # The input_text handler resumes its own text path on a non-terminal failure: it closes the
+        # picker, refuses a readonly field and types with replace semantics. Typing here instead
+        # would append to whatever the picker left behind.
+        LOG.info("Date selection did not finish, leaving the date to the input_text fallback")
+        result.action_result = _no_element_matched_failure(
+            target_value, "Date selection did not finish within its walk budget"
+        )
+        return result
+
+    if date_label and skyvern_element.get_tag_name() == InteractiveElement.INPUT:
+        try:
+            if await skyvern_element.is_readonly(dynamic=True):
+                LOG.warning(
+                    "Try to input the date on a readonly element",
+                    element_id=skyvern_element.get_id(),
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                result.action_result = ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))
+                return result
+
+            LOG.info("Try to input the date directly")
+            # input_sequentially appends a value this short, so whatever the picker left in the
+            # field has to go first or the two dates concatenate.
+            await skyvern_element.input_clear()
+            await skyvern_element.input_sequentially(date_label)
+            result.action_result = ActionSuccess()
+            return result
+
+        except Exception:
+            LOG.warning(
+                "Failed to input the date directly",
+                exc_info=True,
+            )
+
+    result.action_result, _ = _terminal_custom_select_failure(
+        target_value=target_value,
+        matched_label=None,
+        reason="Date selection did not finish within its walk budget and the date could not be typed",
+    )
+    return result
 
 
 def build_sequential_select_history(history_list: list[CustomSingleSelectResult]) -> list[dict[str, Any]]:
@@ -13920,6 +14081,22 @@ def _is_terminal_custom_select_failure(action_result: ActionResult | None) -> bo
         and isinstance(action_result.data, dict)
         and action_result.data.get("_terminal_custom_select_failure") is True
     )
+
+
+async def _native_select_cancellation_failure(
+    *,
+    task: Task,
+    target_value: str,
+    matched_label: str | None,
+) -> ActionFailure | None:
+    if await read_run_cancellation(task) is None:
+        return None
+    action_failure, _ = _terminal_custom_select_failure(
+        target_value=target_value,
+        matched_label=matched_label,
+        reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+    )
+    return action_failure
 
 
 async def _select_deterministic_custom_option(
@@ -15592,14 +15769,26 @@ async def normal_select(
             organization_id=task.organization_id,
         )
         if not resolution.fallback_to_llm and resolution.matched_index is not None:
+            if await read_run_cancellation(task) is not None:
+                action_failure, _ = _terminal_custom_select_failure(
+                    target_value=target_value,
+                    matched_label=resolution.matched_label,
+                    reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+                )
+                return [action_failure]
+
             deterministic_result = await _select_deterministic_normal_option(
                 action=action,
                 skyvern_element=skyvern_element,
                 locator=locator,
+                task=task,
+                target_value=target_value,
                 matched_label=resolution.matched_label,
                 matched_value=resolution.matched_value,
                 matched_index=resolution.matched_index,
             )
+            if deterministic_result and _is_terminal_custom_select_failure(deterministic_result[-1]):
+                return deterministic_result
             if _normal_select_successful(deterministic_result) and not await _normal_select_readback_contradicts(
                 locator=locator,
                 matched_index=resolution.matched_index,
@@ -15635,6 +15824,14 @@ async def normal_select(
     json_response = await get_org_aware_secondary_llm_api_handler(default=app.NORMAL_SELECT_AGENT_LLM_API_HANDLER)(
         prompt=prompt, step=step, prompt_name="normal-select"
     )
+    if await read_run_cancellation(task) is not None:
+        action_failure, _ = _terminal_custom_select_failure(
+            target_value=target_value or "",
+            matched_label=None,
+            reason=RUN_STOPPED_BEFORE_SELECTING_REASON,
+        )
+        return [action_failure]
+
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
     _log_select_shadow_match(
@@ -15652,6 +15849,11 @@ async def normal_select(
     await _best_effort_focus_click_before_select(locator=locator, action=action)
 
     if not is_success and value is not None:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value or "", matched_label=None
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             # click by value (if it matches)
             await locator.select_option(
@@ -15670,6 +15872,11 @@ async def normal_select(
             )
 
     if not is_success and value is not None:
+        cancellation_failure = await _native_select_cancellation_failure(
+            task=task, target_value=target_value or "", matched_label=None
+        )
+        if cancellation_failure is not None:
+            return [cancellation_failure]
         try:
             # click by label (if it matches)
             await locator.select_option(
@@ -15696,6 +15903,11 @@ async def normal_select(
                 locator=locator,
             )
         else:
+            cancellation_failure = await _native_select_cancellation_failure(
+                task=task, target_value=target_value or "", matched_label=None
+            )
+            if cancellation_failure is not None:
+                return [cancellation_failure]
             try:
                 # This means the supplied index was for the select element, not a reference to the css dict
                 await locator.select_option(
@@ -16434,15 +16646,21 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
 
 
 async def extract_user_defined_errors(
-    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
+    task: Task,
+    step: Step,
+    scraped_page: ScrapedPage,
+    reasoning: str | None = None,
+    *,
+    confirm_credentials: bool = True,
 ) -> list[UserDefinedError]:
     action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
+    elements = scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML)
     prompt = prompt_engine.load_prompt(
         "surface-user-defined-errors",
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
-        elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
+        elements=elements,
         current_url=scraped_page_refreshed.url,
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
@@ -16466,5 +16684,18 @@ async def extract_user_defined_errors(
             allowed_codes=sorted((task.error_code_mapping or {}).keys()),
         )
     if not kept and reasoning:
-        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
-    return kept
+        kept = _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
+    if not confirm_credentials:
+        return kept
+    return await confirm_credential_verdicts(
+        task=task,
+        step=step,
+        errors=kept,
+        context=CredentialVerdictContext(
+            current_url=scraped_page_refreshed.url,
+            elements=elements,
+            screenshots=scraped_page_refreshed.screenshots,
+            action_history=json.dumps(action_history),
+            agent_reasoning=reasoning,
+        ),
+    )

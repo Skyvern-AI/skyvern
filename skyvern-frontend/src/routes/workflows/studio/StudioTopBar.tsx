@@ -429,9 +429,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         });
       }
       queryClient.invalidateQueries({ queryKey: ["workflowRun", activeRunId] });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRun", workflowPermanentId, activeRunId],
-      });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
       if (activeRunId) {
         claimRunCompletionNotice(activeRunId, () => {

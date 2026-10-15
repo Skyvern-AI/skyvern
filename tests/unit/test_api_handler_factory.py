@@ -33,6 +33,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
+from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1081,6 +1082,146 @@ async def test_openai_caching_injected_for_extract_actions(monkeypatch: pytest.M
     )
 
 
+@pytest.mark.parametrize(
+    ("model_name", "uses_anthropic_cache"),
+    [
+        ("anthropic/claude-sonnet-test", True),
+        ("gpt-test", False),
+        ("openai/claude-proxy", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_anthropic_prompt_caching_marks_static_user_content(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, uses_anthropic_cache: bool
+) -> None:
+    static_prompt = "static instructions"
+    dynamic_prompt = "dynamic context"
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = True
+    context.cached_static_prompt = static_prompt
+    context.hashed_href_map = {}
+    llm_config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+    captured_messages: list[dict[str, Any]] = []
+
+    async def mock_acompletion(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+        captured_messages.extend(kwargs["messages"])
+        return FakeLLMResponse(model_name)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", mock_acompletion)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler(f"TEST_PROMPT_CACHING_{model_name}")
+    await handler(
+        prompt=f"{static_prompt}\n\n{dynamic_prompt}",
+        prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+    )
+
+    user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
+    if uses_anthropic_cache:
+        assert LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(captured_messages, static_prompt)
+        assert user_content[:2] == [
+            {
+                "type": "text",
+                "text": static_prompt,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": dynamic_prompt},
+        ]
+        text_blocks = [
+            block["text"]
+            for message in captured_messages
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "text"
+        ]
+        assert text_blocks.count(static_prompt) == 1
+    else:
+        assert all("cache_control" not in block for block in user_content)
+
+
+@pytest.mark.parametrize(
+    ("provider_models", "uses_anthropic_cache"),
+    [
+        (["anthropic/claude-sonnet-test", "bedrock/us.anthropic.claude-test"], True),
+        (["anthropic/claude-sonnet-test", "openai/gpt-5.5"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
+    monkeypatch: pytest.MonkeyPatch, provider_models: list[str], uses_anthropic_cache: bool
+) -> None:
+    static_prompt = "static instructions"
+    dynamic_prompt = "dynamic context"
+    captured_messages: list[dict[str, Any]] = []
+
+    class _CapturingRouter:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: list[dict[str, Any]], **_: Any) -> FakeLLMResponse:
+            captured_messages.extend(messages)
+            return FakeLLMResponse(model)
+
+    llm_key = f"TEST_ANTHROPIC_CACHE_ROUTER_{uses_anthropic_cache}"
+    config = LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name=f"group-{index}",
+                litellm_params={"model": provider_model},
+            )
+            for index, provider_model in enumerate(provider_models)
+        ],
+        main_model_group="group-0",
+        fallback_model_group="group-1",
+    )
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    async def messages_builder(prompt: str, *_: Any) -> list[dict[str, Any]]:
+        return [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+    monkeypatch.setattr(api_handler_factory, "llm_messages_builder", messages_builder)
+    context = SkyvernContext()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = True
+    context.cached_static_prompt = static_prompt
+    context.hashed_href_map = {}
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+    await handler(
+        prompt=f"{static_prompt}\n\n{dynamic_prompt}",
+        prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+    )
+
+    user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
+    marked_blocks = [block for block in user_content if "cache_control" in block]
+    if uses_anthropic_cache:
+        assert marked_blocks == [user_content[0]]
+        assert user_content[0]["text"] == static_prompt
+        assert sum(block.get("text") == static_prompt for block in user_content) == 1
+    else:
+        assert not marked_blocks
+
+
+def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
+    assert not uses_only_anthropic_models(_custom_llm_config("openai/claude-proxy"))
+
+
 def test_normalize_llm_model_strips_provider_prefix() -> None:
     """LiteLLM returns model names with provider prefixes; dbt expects the bare name."""
     assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-2.5-flash") == "gemini-2.5-flash"
@@ -1605,12 +1746,12 @@ class TestGemini3ReasoningEffortExperiment:
     @pytest.mark.parametrize("value", ["minimal", "low", "medium", "high", "MEDIUM", " low "])
     def test_set_gemini_3_reasoning_effort_override_accepts_valid_values(self, value: str) -> None:
         LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
-        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override == value.strip().lower()
+        assert LLMAPIHandlerFactory.gemini_3_reasoning_effort_override() == value.strip().lower()
 
     @pytest.mark.parametrize("value", ["disable", "off", "high-er", 1024])
     def test_set_gemini_3_reasoning_effort_override_rejects_invalid_values(self, value: Any) -> None:
         LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
-        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override is None
+        assert LLMAPIHandlerFactory.gemini_3_reasoning_effort_override() is None
 
     def test_apply_gemini_thinking_optimization_overrides_when_thinking_level_pre_merged(self) -> None:
         """Single-handler path (api_handler_factory.py:1402-1404) merges
@@ -1724,12 +1865,16 @@ def _make_three_tier_router_config(
     fallback_groups: list[str],
     redis_max_connections: int | None = None,
     litellm_models: dict[str, str] | None = None,
+    content_filter_fallback_model_group: str | None = None,
 ) -> LLMRouterConfig:
     """Synthetic 3+ tier router config that doesn't depend on the cloud
     `LLMConfigRegistry` registration that's conditional on prod env vars.
     `litellm_models` overrides the per-group litellm model string (flex-style
-    routers point two groups at the same underlying model)."""
+    routers point two groups at the same underlying model).
+    `content_filter_fallback_model_group` adds a deployment that is reachable but
+    deliberately absent from the fallback chain, like the flex routers' escape hatch."""
     litellm_models = litellm_models or {}
+    escape_groups = [content_filter_fallback_model_group] if content_filter_fallback_model_group else []
     deployments = [
         LLMRouterModelConfig(
             model_name="primary-group",
@@ -1740,7 +1885,7 @@ def _make_three_tier_router_config(
             model_name=group,
             litellm_params={"model": litellm_models.get(group, f"openai/{group}"), "timeout": 60},
         )
-        for group in fallback_groups
+        for group in [*fallback_groups, *escape_groups]
     ]
     return LLMRouterConfig(
         model_name="test-router",
@@ -1754,6 +1899,7 @@ def _make_three_tier_router_config(
         redis_max_connections=redis_max_connections,
         main_model_group="primary-group",
         fallback_model_group=fallback_groups,
+        content_filter_fallback_model_group=content_filter_fallback_model_group,
         routing_strategy="simple-shuffle",
         num_retries=0,
         disable_cooldowns=True,
@@ -2048,6 +2194,69 @@ async def test_router_does_not_retry_content_filter_without_non_gemini_fallback(
         await handler(prompt='{"actions": []}', prompt_name="extract-actions")
 
     assert calls == ["primary-group"], f"must not retry when there is no non-Gemini fallback; got calls={calls}"
+
+
+@pytest.mark.asyncio
+async def test_router_retries_content_filter_on_dedicated_escape_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two-tier Gemini flex routers fall back flex -> standard, both Gemini, so a content_filter
+    block has no filter-free tier in the chain and used to surface as a parse failure. They now name
+    a non-Gemini escape group that stays OUT of the chain — litellm's ordinary failover and the flex
+    cost profile are untouched, and only this retry reaches it (SKY-18083)."""
+
+    calls: list[str] = []
+
+    class _FilterThenEscapeRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            calls.append(model)
+            if len(calls) == 1:
+                return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
+            return FakeLLMResponse("gpt-5", content='{"actions": []}')
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterThenEscapeRouter)
+
+    config = _make_three_tier_router_config(
+        fallback_groups=["vertex-gemini-standard-fallback"],
+        content_filter_fallback_model_group="gpt-5-fallback",
+    )
+    _stub_for_router_test(monkeypatch, llm_key="TEST_CONTENT_FILTER_ESCAPE_GROUP", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_CONTENT_FILTER_ESCAPE_GROUP")
+    result = await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert calls == ["primary-group", "gpt-5-fallback"], (
+        f"handler must retry the escape group named by the config, skipping the Gemini tier; got calls={calls}"
+    )
+    assert result == {"actions": []}
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_names_the_llm_key_and_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A response-shape failure is raised deep in parsing, so callers that only catch the exception
+    (the complete verification logs it as `Failed to verify the complete action`) could not say which
+    route produced it. The handler stamps the attribution on the way out (SKY-18083)."""
+    from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError
+
+    class _UnparseableContentRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            return FakeLLMResponse("gemini-3.1-flash-lite", content=None, finish_reason="content_filter")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _UnparseableContentRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=[])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_PARSE_FAILURE_ATTRIBUTION", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_PARSE_FAILURE_ATTRIBUTION")
+    with pytest.raises(BaseLLMError) as excinfo:
+        await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
+
+    assert excinfo.value.llm_key == "TEST_PARSE_FAILURE_ATTRIBUTION"
+    assert excinfo.value.prompt_name == "check-user-goal"
 
 
 @pytest.mark.asyncio

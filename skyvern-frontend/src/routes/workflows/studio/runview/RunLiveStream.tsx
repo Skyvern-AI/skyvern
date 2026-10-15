@@ -1,4 +1,7 @@
-import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+import {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
+  StreamStatusPanel,
+} from "@/routes/streaming/StreamDiagnostics";
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import type { Status, WorkflowRunRetryFields } from "@/api/types";
 import {
@@ -54,18 +57,28 @@ function RunLiveStreamTransport({
   onUrlChange,
   onStreamStateChange,
 }: RunLiveStreamProps) {
-  const { streamTransport } = useStreamTransport(browserSessionId);
+  const { streamTransport, isExternal } = useStreamTransport(browserSessionId);
   const [vncFailed, setVncFailed] = useState(false);
 
   useEffect(() => {
     setVncFailed(false);
   }, [browserSessionId]);
 
+  useEffect(() => {
+    if (browserSessionId && isExternal) {
+      onStreamStateChange?.("stopped", browserSessionId);
+    }
+  }, [browserSessionId, isExternal, onStreamStateChange]);
+
   if (browserSessionId) {
     if (!streamTransport) {
       // Defaulting to VNC here opens a socket an externally hosted session cannot serve, and the
       // failure is what swaps the transport — a visible drop rather than a first paint.
       return null;
+    }
+
+    if (isExternal) {
+      return <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />;
     }
 
     if (streamTransport !== "cdp" && !vncFailed) {

@@ -1,0 +1,149 @@
+---
+title: "Artifacts"
+description: "List the screenshots, recordings and logs a run produced."
+slug: sdk-reference/artifacts
+keywords:
+  - "artifact"
+  - "screenshot"
+  - "recording"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Artifacts are the files a run produces: screenshots, recordings, HTML snapshots and logs.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## get_run_artifacts
+
+Get artifacts for a run
+
+<CodeGroup>
+```python Python
+await skyvern.get_run_artifacts(
+    run_id: str,
+    *,
+    artifact_type: ArtifactType | Sequence[ArtifactType] | None = None,
+) -> list[Artifact]
+```
+
+```typescript TypeScript
+skyvern.getRunArtifacts(runId: string, request?: GetRunArtifactsRequest): Promise<Artifact[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
+| `artifact_type` | `artifact_type` | `ArtifactType \| Sequence[ArtifactType] \| None` | No | `None` |  |
+
+**Returns** `list[Artifact]` · TypeScript `Promise<Artifact[]>`
+
+<Accordion title="Artifact fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `created_at` | `str` | The creation datetime of the task. |
+| `modified_at` | `str` | The modification datetime of the task. |
+| `artifact_id` | `str` |  |
+| `artifact_type` | `"recording" \| "audio" \| "session_replay" \| "eval_score" \| "eval_trajectory" \| "eval_rubrics" \| "browser_console_log" \| "browser_session_action_log" \| "skyvern_log" \| "skyvern_log_raw" \| "screenshot" \| "screenshot_llm" \| "screenshot_action" \| "screenshot_final" \| "screenshot_proxy" \| "screenshot_pre_submit" \| "llm_prompt" \| "llm_request" \| "llm_response" \| "llm_response_parsed" \| "llm_response_rendered" \| "visible_elements_id_css_map" \| "visible_elements_id_frame_map" \| "visible_elements_tree" \| "visible_elements_tree_trimmed" \| "visible_elements_tree_in_prompt" \| "hashed_href_map" \| "visible_elements_id_xpath_map" \| "html" \| "html_scrape" \| "html_action" \| "html_pre_submit" \| "trace" \| "har" \| "script_file" \| "pdf" \| "step_archive" \| "task_archive" \| "download" \| "unknown"` |  |
+| `uri` | `str` |  |
+| `bundle_key` | `str \| None` |  |
+| `checksum` | `str \| None` |  |
+| `file_size` | `int \| None` |  |
+| `task_id` | `str \| None` |  |
+| `step_id` | `str \| None` |  |
+| `workflow_run_id` | `str \| None` |  |
+| `workflow_run_block_id` | `str \| None` |  |
+| `run_id` | `str \| None` |  |
+| `browser_session_id` | `str \| None` |  |
+| `observer_cruise_id` | `str \| None` |  |
+| `observer_thought_id` | `str \| None` |  |
+| `ai_suggestion_id` | `str \| None` |  |
+| `signed_url` | `str \| None` |  |
+| `archived` | `bool \| None` |  |
+| `organization_id` | `str` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_run_artifacts(run_id="tsk_v2_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getRunArtifacts("tsk_v2_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## artifacts.get_artifact_content
+
+Download the raw content of an artifact (supports bundled artifacts).
+
+<CodeGroup>
+```python Python
+await skyvern.artifacts.get_artifact_content(artifact_id: str) -> Any | None
+```
+
+```typescript TypeScript
+skyvern.artifacts.getArtifactContent(artifactId: string): Promise<unknown>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `artifact_id` | `artifactId` | `str` | Yes | — |  |
+
+**Returns** `Any \| None` · TypeScript `Promise<unknown>` — Raw artifact content
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.artifacts.get_artifact_content(artifact_id="a_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.artifacts.getArtifactContent("a_123");
+console.log(result);
+```
+</CodeGroup>

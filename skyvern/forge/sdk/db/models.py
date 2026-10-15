@@ -21,7 +21,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, deferred
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -1360,6 +1360,9 @@ class WorkflowRunOutputParameterModel(Base):
         index=True,
     )
     value = Column(JSON, nullable=False)
+    # SQL NULL marks an absent cache so COALESCE falls through to the authoritative value.
+    capped_value = deferred(Column(JSON(none_as_null=True), nullable=True))
+    capped_extracted_information = deferred(Column(JSON(none_as_null=True), nullable=True))
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
@@ -1487,6 +1490,7 @@ class WorkflowRunBlockModel(Base):
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)
+    capped_output = deferred(Column(JSON(none_as_null=True), nullable=True))
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
     # Page URL at the moment the block failed. Distinct from the task's target url, which is

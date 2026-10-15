@@ -1,0 +1,1006 @@
+---
+title: Configuration
+subtitle: Environment variables for self-hosted Skyvern
+description: Reference for self-hosted Skyvern settings - LLM providers and model keys, browser modes and timeouts, connecting your own Chrome over CDP, artifact storage on S3, Azure Blob or GCS, and Kubernetes deployment.
+slug: reference/configuration
+keywords:
+  - OpenAI
+  - xAI
+  - Grok
+  - Anthropic
+  - Azure OpenAI
+  - Google Gemini
+  - AWS Bedrock
+  - Ollama
+  - LiteLLM
+  - LLM_KEY
+  - SECONDARY_LLM_KEY
+  - BROWSER_TYPE
+  - cdp-connect
+  - SKYVERN_STORAGE_TYPE
+  - AWS S3
+  - Azure Blob Storage
+  - Google Cloud Storage
+  - Kubernetes
+  - CREDENTIAL_VAULT_TYPE
+  - Bitwarden
+  - Vaultwarden
+  - ENCRYPTOR_AES_SECRET_KEY
+  - ENABLE_URL_VALIDATION
+  - ALLOWED_HOSTS
+---
+
+Every setting for a self-hosted server is an environment variable in `.env`. This page covers [LLM providers](#how-skyvern-uses-llms), [browser settings](#browser-settings), [credentials and encryption](#credentials-and-encryption), [other server settings](#other-server-settings), [storage](#storage) and [Kubernetes](#kubernetes). For setup, start at [Self-host](/developers/self-hosted/overview).
+
+Skyvern uses LLMs to analyze screenshots and decide what actions to take. Configure at least one LLM provider before running tasks.
+
+## How Skyvern uses LLMs
+
+Skyvern makes multiple LLM calls per task step:
+1. **Screenshot analysis**: Identify interactive elements on the page
+2. **Action planning**: Decide what to click, type, or extract
+3. **Result extraction**: Parse data from the page into structured output
+
+A task that runs for 10 steps makes roughly 30+ LLM calls. Choose your provider and model tier with this in mind.
+
+For most deployments, configure a single provider using `LLM_KEY`. Skyvern also supports a `SECONDARY_LLM_KEY` for lighter tasks to reduce costs.
+
+---
+
+## Quick Start Recommendations
+
+**Best models for production (2026):**
+
+| Provider | Primary Model | Secondary Model | Notes |
+|----------|--------------|-----------------|-------|
+| **Anthropic** | `ANTHROPIC_CLAUDE4.7_OPUS` | `ANTHROPIC_CLAUDE4.6_SONNET` | Most capable |
+| **OpenAI** | `OPENAI_GPT5_5` | `OPENAI_GPT5_4` | Latest |
+| **xAI** | `XAI_GROK_4_5` | `XAI_GROK_4_5` | Grok 4.5 |
+| **Google** | `GEMINI_3_PRO` | `GEMINI_3.0_FLASH` | Latest |
+| **AWS Bedrock** | `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Latest Claude |
+
+---
+
+## OpenAI
+
+The most common choice. Requires an API key from [platform.openai.com](https://platform.openai.com/).
+
+```bash .env
+ENABLE_OPENAI=true
+OPENAI_API_KEY=sk-...
+LLM_KEY=OPENAI_GPT5_5
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **GPT-5.5** | |
+| `OPENAI_GPT5_5` | Latest flagship, recommended for complex tasks |
+| **GPT-5 Series** | |
+| `OPENAI_GPT5_4` | |
+| `OPENAI_GPT5` | |
+| `OPENAI_GPT5_MINI` | |
+| `OPENAI_GPT5_MINI_FLEX` | Flex service tier, 15min timeout |
+| `OPENAI_GPT5_NANO` | |
+| `OPENAI_GPT5_1` | |
+| `OPENAI_GPT5_2` | |
+| **GPT-4 Series** | |
+| `OPENAI_GPT4O` | |
+| `OPENAI_GPT4O_MINI` | |
+| `OPENAI_GPT4_1` | |
+| `OPENAI_GPT4_1_MINI` | |
+| `OPENAI_GPT4_1_NANO` | |
+| `OPENAI_GPT4_5` | |
+| `OPENAI_GPT4_TURBO` | Legacy |
+| `OPENAI_GPT4V` | Legacy alias |
+| **O-Series (Reasoning)** | |
+| `OPENAI_O4_MINI` | Vision support |
+| `OPENAI_O3` | Vision support |
+| `OPENAI_O3_MINI` | No vision |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint (for proxies or compatible services)
+OPENAI_API_BASE=https://your-proxy.com/v1
+
+# Specify organization ID
+OPENAI_ORGANIZATION=org-...
+```
+
+---
+
+## xAI Grok
+
+Grok models from [x.ai](https://x.ai/api). Requires an xAI API key.
+
+```bash .env
+ENABLE_XAI=true
+XAI_API_KEY=xai-...
+LLM_KEY=XAI_GROK_4_5
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `XAI_GROK_4_5` | Grok 4.5 for coding, agentic tasks, and general chat |
+
+### Optional settings
+
+```bash .env
+# Override the default API endpoint
+XAI_API_BASE=https://api.x.ai/v1
+
+# Supported values: low, medium, high. Unset to use xAI's default.
+XAI_REASONING_EFFORT=medium
+```
+
+---
+
+## Anthropic
+
+Claude models from [anthropic.com](https://www.anthropic.com/).
+
+```bash .env
+ENABLE_ANTHROPIC=true
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Claude 4.7** | |
+| `ANTHROPIC_CLAUDE4.7_OPUS` | Latest, most capable |
+| **Claude 4.6** | |
+| `ANTHROPIC_CLAUDE4.6_OPUS` | |
+| `ANTHROPIC_CLAUDE4.6_SONNET` | Recommended for secondary use |
+| **Claude 4.5** | |
+| `ANTHROPIC_CLAUDE4.5_OPUS` | |
+| `ANTHROPIC_CLAUDE4.5_SONNET` | |
+| `ANTHROPIC_CLAUDE4.5_HAIKU` | Fastest |
+| **Claude 4** | |
+| `ANTHROPIC_CLAUDE4_OPUS` | |
+| `ANTHROPIC_CLAUDE4_SONNET` | |
+
+---
+
+## Azure OpenAI
+
+Microsoft-hosted OpenAI models. Requires an Azure subscription with OpenAI service provisioned.
+
+```bash .env
+ENABLE_AZURE=true
+LLM_KEY=AZURE_OPENAI
+AZURE_DEPLOYMENT=your-deployment-name
+AZURE_API_KEY=your-azure-api-key
+AZURE_API_BASE=https://your-resource.openai.azure.com/
+AZURE_API_VERSION=2024-08-01-preview
+```
+
+### Setup steps
+
+1. Create an Azure OpenAI resource in the [Azure Portal](https://portal.azure.com)
+2. Open the Azure AI Foundry portal from your resource's overview page
+3. Go to **Shared Resources** → **Deployments**
+4. Click **Deploy Model** → **Deploy Base Model** → select GPT-4o or GPT-4
+5. Note the **Deployment Name**. Use this for `AZURE_DEPLOYMENT`
+6. Copy your API key and endpoint from the Azure Portal
+
+<Note>
+The `AZURE_DEPLOYMENT` is the name you chose when deploying the model, not the model name itself.
+</Note>
+
+---
+
+## Google Gemini
+
+Skyvern supports Gemini through two paths: the **Gemini API** (simpler, uses an API key) and **Vertex AI** (enterprise, uses a GCP service account).
+
+### Gemini API
+
+The quickest way to use Gemini. Get an API key from [Google AI Studio](https://aistudio.google.com/).
+
+```bash .env
+ENABLE_GEMINI=true
+GEMINI_API_KEY=your-gemini-api-key
+LLM_KEY=GEMINI_3_PRO
+```
+
+#### Available Gemini API models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Gemini 3** | |
+| `GEMINI_3_PRO` | Recommended for primary use |
+| `GEMINI_3.0_FLASH` | Recommended for secondary use |
+| `GEMINI_3.1_FLASH_LITE` | Fastest, most cost-efficient |
+| **Gemini 2.5** | |
+| `GEMINI_2.5_PRO` | |
+| `GEMINI_2.5_PRO_PREVIEW` | |
+| `GEMINI_2.5_PRO_EXP_03_25` | Experimental |
+| `GEMINI_2.5_FLASH` | |
+| `GEMINI_2.5_FLASH_PREVIEW` | |
+| **Gemini 2.0** | |
+| `GEMINI_FLASH_2_0` | |
+| `GEMINI_FLASH_2_0_LITE` | |
+| **Gemini 1.5 Legacy** | |
+| `GEMINI_PRO` | |
+| `GEMINI_FLASH` | |
+
+### Vertex AI
+
+For enterprise deployments through [Vertex AI](https://cloud.google.com/vertex-ai). Requires a GCP project with Vertex AI enabled.
+
+```bash .env
+ENABLE_VERTEX_AI=true
+LLM_KEY=VERTEX_GEMINI_3_PRO
+# Service account JSON content (or omit to use Application Default Credentials / Workload Identity)
+VERTEX_CREDENTIALS='{"type": "service_account", ...}'
+VERTEX_PROJECT_ID=your-gcp-project-id
+VERTEX_LOCATION=us-central1
+```
+
+<Note>
+If you're migrating from an older Skyvern version, `VERTEX_LOCATION` replaces the previous `GCP_REGION` variable. Update your `.env` accordingly.
+</Note>
+
+**Vertex AI setup steps:**
+
+1. Create a [GCP project](https://console.cloud.google.com/) with billing enabled
+2. Enable the **Vertex AI API** in your project
+3. Create a service account with the **Vertex AI User** role
+4. Download the service account JSON key file
+5. Set `VERTEX_CREDENTIALS` to the contents of that file as a JSON string. If you leave it unset, Skyvern falls back to Application Default Credentials (for example `GOOGLE_APPLICATION_CREDENTIALS` or Workload Identity)
+
+<Note>
+For global endpoint access, set `VERTEX_LOCATION=global` and ensure `VERTEX_PROJECT_ID` is set. Not all models support the global endpoint.
+</Note>
+
+#### Available Vertex AI models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Gemini 3** | |
+| `VERTEX_GEMINI_3_PRO` | Recommended for primary use |
+| `VERTEX_GEMINI_3.0_FLASH` | Recommended for secondary use |
+| `VERTEX_GEMINI_3.1_FLASH_LITE` | Fastest, most cost-efficient |
+| **Gemini 2.5** | |
+| `VERTEX_GEMINI_2.5_PRO` | |
+| `VERTEX_GEMINI_2.5_PRO_PREVIEW` | |
+| `VERTEX_GEMINI_2.5_FLASH` | |
+| `VERTEX_GEMINI_2.5_FLASH_LITE` | |
+| `VERTEX_GEMINI_2.5_FLASH_PREVIEW` | |
+| **Gemini 2.0** | |
+| `VERTEX_GEMINI_FLASH_2_0` | |
+| **Gemini 1.5 Legacy** | |
+| `VERTEX_GEMINI_PRO` | |
+| `VERTEX_GEMINI_FLASH` | |
+
+---
+
+## Amazon Bedrock
+
+Run Anthropic Claude through your AWS account.
+
+```bash .env
+ENABLE_BEDROCK=true
+LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE
+AWS_REGION=us-west-2
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+### Setup steps
+
+1. Create an IAM user with `AmazonBedrockFullAccess` policy
+2. Generate access keys for the IAM user
+3. In the [Bedrock console](https://console.aws.amazon.com/bedrock/), go to **Model Access**
+4. Enable access to Claude Opus 4.7
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **Amazon Nova (AWS Native)** | |
+| `BEDROCK_AMAZON_NOVA_PRO` | |
+| `BEDROCK_AMAZON_NOVA_LITE` | |
+| **Claude 4.7** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE` | Cross-region, latest |
+| **Claude 4.6** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.6_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4.6_SONNET_INFERENCE_PROFILE` | Cross-region |
+| **Claude 4.5** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE` | Cross-region |
+| **Claude 4** | |
+| `BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE` | Cross-region |
+| `BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE` | Cross-region |
+
+<Note>
+Bedrock inference profile keys (`*_INFERENCE_PROFILE`) use cross-region inference and require `AWS_REGION` only. No access keys needed if running on an IAM-authenticated instance.
+</Note>
+
+---
+
+## VolcEngine (ByteDance Doubao)
+
+[VolcEngine](https://www.volcengine.com/) provides access to ByteDance's Doubao models with vision support.
+
+```bash .env
+ENABLE_VOLCENGINE=true
+VOLCENGINE_API_KEY=your-volcengine-api-key
+LLM_KEY=VOLCENGINE_DOUBAO_SEED_1_6
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `VOLCENGINE_DOUBAO_SEED_1_6` | Recommended for general use |
+| `VOLCENGINE_DOUBAO_SEED_1_6_FLASH` | Faster variant |
+| `VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO` | Reasoning model |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+VOLCENGINE_API_BASE=https://ark.cn-beijing.volces.com/api/v3
+```
+
+---
+
+## Novita
+
+[Novita AI](https://novita.ai/) provides access to DeepSeek, Llama, and other open-source models.
+
+```bash .env
+ENABLE_NOVITA=true
+NOVITA_API_KEY=your-novita-api-key
+LLM_KEY=NOVITA_LLAMA_3_2_11B_VISION
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| **DeepSeek** | |
+| `NOVITA_DEEPSEEK_R1` | Reasoning model |
+| `NOVITA_DEEPSEEK_V3` | |
+| **Llama 3.3** | |
+| `NOVITA_LLAMA_3_3_70B` | |
+| **Llama 3.2** | |
+| `NOVITA_LLAMA_3_2_11B_VISION` | Vision support |
+| `NOVITA_LLAMA_3_2_3B` | |
+| `NOVITA_LLAMA_3_2_1B` | |
+| **Llama 3.1** | |
+| `NOVITA_LLAMA_3_1_405B` | |
+| `NOVITA_LLAMA_3_1_70B` | |
+| `NOVITA_LLAMA_3_1_8B` | |
+| **Llama 3** | |
+| `NOVITA_LLAMA_3_70B` | |
+| `NOVITA_LLAMA_3_8B` | |
+
+---
+
+## Moonshot
+
+[Moonshot AI](https://www.moonshot.cn/) provides the Kimi series models with long context support.
+
+```bash .env
+ENABLE_MOONSHOT=true
+MOONSHOT_API_KEY=your-moonshot-api-key
+LLM_KEY=MOONSHOT_KIMI_K2
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `MOONSHOT_KIMI_K2` | |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+MOONSHOT_API_BASE=https://api.moonshot.cn/v1
+```
+
+---
+
+## Inception
+
+[Inception AI](https://inception.ai/) provides the Mercury series models.
+
+```bash .env
+ENABLE_INCEPTION=true
+INCEPTION_API_KEY=your-inception-api-key
+LLM_KEY=INCEPTION_MERCURY_2
+```
+
+### Available models
+
+| LLM_KEY | Notes |
+|---------|-------|
+| `INCEPTION_MERCURY_2` | |
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+INCEPTION_API_BASE=https://api.inceptionlabs.ai/v1
+```
+
+---
+
+## Ollama (Local Models)
+
+Run open-source models locally with [Ollama](https://ollama.ai/). No API costs, but requires sufficient local compute.
+
+```bash .env
+ENABLE_OLLAMA=true
+LLM_KEY=OLLAMA
+OLLAMA_MODEL=gemma4
+OLLAMA_SERVER_URL=http://host.docker.internal:11434
+OLLAMA_SUPPORTS_VISION=false
+```
+
+### Setup steps
+
+1. [Install Ollama](https://ollama.ai/download)
+2. Pull a model: `ollama pull gemma4`
+3. Start Ollama: `ollama serve`
+4. Configure Skyvern to connect
+
+<Warning>
+Most Ollama models don't support vision. Set `OLLAMA_SUPPORTS_VISION=false`. Without vision, Skyvern relies on DOM analysis instead of screenshot analysis, which may reduce accuracy on complex pages.
+</Warning>
+
+### Docker networking
+
+When running Skyvern in Docker and Ollama on the host:
+
+| Host OS | OLLAMA_SERVER_URL |
+|---------|-------------------|
+| macOS/Windows | `http://host.docker.internal:11434` |
+| Linux | `http://172.17.0.1:11434` (Docker bridge IP) |
+
+---
+
+## OpenAI-Compatible Endpoints
+
+Connect to any service that implements the OpenAI API format, including LiteLLM, LocalAI, vLLM, and text-generation-inference.
+
+```bash .env
+ENABLE_OPENAI_COMPATIBLE=true
+OPENAI_COMPATIBLE_MODEL_NAME=gemma4
+OPENAI_COMPATIBLE_API_KEY=sk-test
+OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+LLM_KEY=OPENAI_COMPATIBLE
+```
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OPENAI_COMPATIBLE_REASONING_EFFORT` | unset | Reasoning effort sent to the model, for example `low`, `medium` or `high` |
+
+This is useful for:
+- Running local models with a unified API
+- Using LiteLLM as a proxy to switch between providers
+- Connecting to self-hosted inference servers
+
+---
+
+## OpenRouter
+
+Access multiple models through a single API at [openrouter.ai](https://openrouter.ai/).
+
+```bash .env
+ENABLE_OPENROUTER=true
+LLM_KEY=OPENROUTER
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
+```
+
+---
+
+## Groq
+
+Inference on open-source models at [groq.com](https://groq.com/).
+
+```bash .env
+ENABLE_GROQ=true
+LLM_KEY=GROQ
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.1-8b-instant
+```
+
+<Note>
+Groq specializes in fast inference for open-source models. Response times are typically much faster than other providers, but model selection is limited.
+</Note>
+
+---
+
+## Using multiple models
+
+### Primary and secondary models
+
+Configure a cheaper model for lightweight operations:
+
+```bash .env
+# Main model for complex decisions
+LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
+# or: OPENAI_GPT5_5
+# or: GEMINI_3_PRO
+
+# Faster model for simple tasks like dropdown selection
+SECONDARY_LLM_KEY=ANTHROPIC_CLAUDE4.6_SONNET
+# or: OPENAI_GPT5_4
+# or: GEMINI_3.0_FLASH
+```
+
+<Tip>
+**Recommended primary models (latest):**
+- **Anthropic Claude 4.7 Opus** (`ANTHROPIC_CLAUDE4.7_OPUS`) - Most capable
+- **OpenAI GPT-5.5** (`OPENAI_GPT5_5`) - Latest
+- **Google Gemini 3 Pro** (`GEMINI_3_PRO`) - Latest
+
+**Recommended secondary models (latest):**
+- **Claude 4.6 Sonnet** (`ANTHROPIC_CLAUDE4.6_SONNET`) - Balanced
+- **GPT-5.4** (`OPENAI_GPT5_4`) - Fast reasoning
+- **Gemini 3.0 Flash** (`GEMINI_3.0_FLASH`) - Faster Gemini 3
+</Tip>
+
+### Task-specific models
+
+For fine-grained control, you can override models for specific operations:
+
+```bash .env
+# Model for data extraction from pages (defaults to LLM_KEY if not set)
+EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE4.5_SONNET
+
+# Model for generating code/scripts in code blocks (defaults to LLM_KEY if not set)
+SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT5
+```
+
+Most deployments don't need task-specific models. Start with `LLM_KEY` and `SECONDARY_LLM_KEY`.
+
+---
+
+## Troubleshooting
+
+### "To enable svg shape conversion, please set the Secondary LLM key"
+
+Some operations require a secondary model. Set `SECONDARY_LLM_KEY` in your environment:
+
+```bash .env
+SECONDARY_LLM_KEY=OPENAI_GPT5_4
+```
+
+### "Context window exceeded"
+
+The page content is too large for the model's context window. Options:
+- Use a model with larger context support (GPT-5.5, Gemini 2.5 Pro, or Claude 4.7 Opus)
+- Simplify your prompt to require less page analysis
+- Start from a more specific URL with less content
+
+### "Environment variables LLM_API_KEY are required for LLMProvider ..."
+
+The configured `LLM_KEY` doesn't match any enabled provider, so Skyvern treats it as a generic model name and asks for `LLM_API_KEY`. Verify:
+1. The provider is enabled (`ENABLE_OPENAI=true`, etc.)
+2. The `LLM_KEY` value matches a supported model name exactly
+3. Model names are case-sensitive: `OPENAI_GPT5_5` not `openai_gpt5_5`
+
+### Container logs show authentication errors
+
+Check your API key configuration:
+- Ensure the key is set correctly without extra whitespace
+- Verify the key hasn't expired or been revoked
+- For Azure, ensure `AZURE_API_BASE` includes the full URL with `https://`
+
+### Slow response times
+
+LLM calls typically take 2-10 seconds. Longer times may indicate:
+- Network latency to the provider
+- Rate limiting (the provider may be throttling requests)
+- For Ollama, insufficient local compute resources
+
+---
+
+
+## Browser settings
+
+Set these in `.env` (or the backend secret on Kubernetes) and restart the server. For the choice between headful, headless and `cdp-connect`, see [Self-host](/developers/self-hosted/overview#browser-options).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BROWSER_TYPE` | `chromium-headful` | `chromium-headful`, `chromium-headless` or `cdp-connect` |
+| `BROWSER_STREAMING_MODE` | `vnc` (Docker Compose sets `cdp`) | How the app streams the live browser. An existing `.env` value wins. |
+| `BROWSER_LOCALE` | unset | Browser locale, for example `en-US` |
+| `BROWSER_TIMEZONE` | `America/New_York` | IANA timezone |
+| `BROWSER_WIDTH` / `BROWSER_HEIGHT` | `1920` / `1080` | Viewport size |
+| `BROWSER_ACTION_TIMEOUT_MS` | `5000` | Wait for one click or keystroke |
+| `BROWSER_SCREENSHOT_TIMEOUT_MS` | `20000` | Wait for a screenshot |
+| `BROWSER_LOADING_TIMEOUT_MS` | `60000` | Wait for a page load |
+| `BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS` | `60000` | Wait for DOM analysis on large pages |
+| `BROWSER_MAX_PAGES_NUMBER` | `10` | Open tabs per browser. Lower it to save memory. |
+| `BROWSER_LOGS_ENABLED` | `true` | Save the browser console log as an artifact |
+| `BROWSER_POLICY_FILE` | `/etc/chromium/policies/managed/policies.json` | Chrome enterprise policy file |
+| `VIDEO_PATH` | `./video` (`.env.example` sets `./videos`) | Where recordings are written while the browser runs |
+| `MAX_STEPS_PER_RUN` | `10` (`.env.example` sets `50`) | Step limit per run |
+| `MAX_SCRAPING_RETRIES` | `0` | Extra attempts when reading a page fails |
+| `EXTENSIONS_BASE_PATH` | `./extensions` | Folder that holds unpacked Chrome extensions |
+| `EXTENSIONS` | `[]` | Extension folder names inside `EXTENSIONS_BASE_PATH` to load into every browser, as a JSON list: `EXTENSIONS='["my-extension"]'` |
+
+Match `BROWSER_LOCALE` and `BROWSER_TIMEZONE` to the region the site expects. A mismatch can trigger bot detection.
+
+| Region | `BROWSER_LOCALE` | `BROWSER_TIMEZONE` |
+|---|---|---|
+| US East | `en-US` | `America/New_York` |
+| US West | `en-US` | `America/Los_Angeles` |
+| UK | `en-GB` | `Europe/London` |
+| Germany | `de-DE` | `Europe/Berlin` |
+| Japan | `ja-JP` | `Asia/Tokyo` |
+
+Each concurrent run uses its own browser. Approximate memory:
+
+| Concurrent runs | RAM |
+|---|---|
+| 1–2 | 4 GB |
+| 3–5 | 8 GB |
+| 6–10 | 16 GB |
+| 10+ | 32 GB+ |
+
+On out-of-memory errors, lower `BROWSER_MAX_PAGES_NUMBER`, shrink the viewport, switch to `chromium-headless`, or run fewer runs at once.
+
+### Connect your own Chrome (CDP)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CHROME_EXECUTABLE_PATH` | unset | With `cdp-connect`, Skyvern starts this Chrome with a copy of your profile |
+| `BROWSER_REMOTE_DEBUGGING_URL` | `http://127.0.0.1:9222` | HTTP CDP endpoint, or a full `ws://.../devtools/browser/<id>` URL |
+| `BROWSER_REMOTE_DEBUGGING_HOST_HEADER` | unset | Host header to send, for Chrome listeners that reject other host names |
+| `BROWSER_CDP_CONNECT_TIMEOUT_MS` | `120000` | Wait for the CDP connection |
+
+**Start your installed Chrome.** Set `BROWSER_TYPE=cdp-connect` and `CHROME_EXECUTABLE_PATH`. Skyvern copies your profile to `./tmp/user_data_dir`, launches Chrome with remote debugging on port 9222, and connects. Close every Chrome window first; if Chrome is already running, Skyvern returns an error. If port 9222 is already in use, Skyvern connects to that instance instead.
+
+| OS | `CHROME_EXECUTABLE_PATH` |
+|---|---|
+| macOS | `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` |
+| Windows | `"C:\Program Files\Google\Chrome\Application\chrome.exe"` |
+| Linux | `/usr/bin/google-chrome`, `/usr/bin/chromium` or `/usr/bin/chromium-browser` |
+
+**Connect to a Chrome that is already running.** In Chrome, open `chrome://inspect/#remote-debugging` and turn on remote debugging. Skyvern auto-discovers a local debugging server, or accepts a pasted `ws://.../devtools/browser/...` URL. `skyvern init browser` walks you through it.
+
+If Skyvern runs in Docker and can't reach Chrome's loopback listener, start a separate profile on a reachable address. Since Chrome 136, `--remote-debugging-port` is ignored for the default profile, so always pass `--user-data-dir`:
+
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=0.0.0.0 \
+  --user-data-dir="$HOME/chrome-cdp-profile" \
+  --no-first-run \
+  --no-default-browser-check
+```
+
+| Skyvern runs on | `BROWSER_REMOTE_DEBUGGING_URL` |
+|---|---|
+| Same host, outside Docker | `http://127.0.0.1:9222` |
+| Docker on macOS or Windows | `http://host.docker.internal:9222/` |
+| Docker on Linux | `http://172.17.0.1:9222/` |
+| A browser pool (Browserless, a Playwright grid) | That service's CDP URL, for example `http://browserless:3000/` |
+
+If Chrome rejects the `host.docker.internal` host name, Skyvern retries with the Docker host gateway IPv4 address.
+
+On Windows with Docker Desktop, the `chrome://inspect` listener is loopback only. From an Administrator PowerShell in the Skyvern repo, run `.\scripts\windows_chrome_inspect_cdp.ps1 -UpdateEnv`, then `docker compose up -d --force-recreate skyvern`. The helper proxies `0.0.0.0:9223` to Chrome, adds a firewall rule, and writes `BROWSER_REMOTE_DEBUGGING_URL=ws://host.docker.internal:9223/devtools/browser/<id>` and `BROWSER_REMOTE_DEBUGGING_HOST_HEADER` to `.env`. Click **Allow** if Chrome asks to allow the connection. If Windows Firewall blocks port 9222 for a classic endpoint:
+
+```powershell
+New-NetFirewallRule -DisplayName "Chrome Remote Debug 9222" -Direction Inbound -LocalPort 9222 -Protocol TCP -Action Allow
+```
+
+Check a classic endpoint with `curl http://localhost:9222/json/version`. It returns Chrome's version and a `webSocketDebuggerUrl`.
+
+<Warning>
+`--remote-debugging-address=0.0.0.0` exposes Chrome to the network. Use it only on a trusted network. Outside Docker, bind to `127.0.0.1`.
+</Warning>
+
+## Credentials and encryption
+
+`CREDENTIAL_VAULT_TYPE` picks where new credentials are stored. Restart the server after changing it.
+
+| Value | Store | Settings |
+|---|---|---|
+| `skyvern` (default) | Encrypted files on the server | `ENABLE_LOCAL_CREDENTIAL_VAULT` (on by default when self-hosted), `LOCAL_CREDENTIAL_VAULT_PATH` (default `~/.skyvern/credential_vault`), `LOCAL_CREDENTIAL_VAULT_KEY` (generated into that folder when unset; set it from a secret store in production) |
+| `bitwarden` | A Bitwarden or Vaultwarden organization, through a `bw serve` CLI server | See [Bitwarden and Vaultwarden](#bitwarden-and-vaultwarden) |
+| `azure_vault` | Azure Key Vault | `AZURE_CREDENTIAL_VAULT` (vault name). `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, or leave the secret unset to use Workload Identity. |
+| `gcp` | Google Secret Manager | `GCP_CREDENTIAL_VAULT_PROJECT_ID`, `GCP_CREDENTIAL_VAULT_PREFIX` (default `skyvern-cred-`, unique per deployment) |
+| `custom` | Your own HTTP service | `CUSTOM_CREDENTIAL_API_BASE_URL`, `CUSTOM_CREDENTIAL_API_TOKEN`. The API it must implement is on [Credentials](/credentials). |
+
+### Bitwarden and Vaultwarden
+
+Skyvern doesn't call Bitwarden directly. It talks to a Bitwarden CLI server (`bw serve`), which is logged in to your vault and unlocked.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID` | unset | Bitwarden organization that holds Skyvern's items |
+| `SKYVERN_AUTH_BITWARDEN_CLIENT_ID` / `_CLIENT_SECRET` | unset | Bitwarden API key (`user.…` client ID and secret) |
+| `SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD` | unset | Master password; Skyvern sends it to the CLI server's `/unlock` when the vault is locked |
+| `BITWARDEN_SERVER` | `http://localhost` | CLI server address, without the port |
+| `BITWARDEN_SERVER_PORT` | `8002` | CLI server port |
+| `BITWARDEN_TIMEOUT_SECONDS` / `BITWARDEN_MAX_RETRIES` | `60` / `3` | Per-operation timeout and retries |
+
+**Self-hosted Vaultwarden.** The open-source `docker-compose.yml` ships two commented-out services: `vaultwarden` (the server, on `127.0.0.1:11002`) and `bitwarden-cli` (built from `bitwarden-cli-server/`). To use them:
+
+1. Uncomment `vaultwarden`, start it, sign up, and create your master password and an organization. Then set `SIGNUPS_ALLOWED: "false"`.
+2. In Vaultwarden, copy the API client ID and secret.
+3. Uncomment `bitwarden-cli` and set its environment. It runs `bw config server`, logs in with the API key, unlocks, and serves on port `8087`, published as `127.0.0.1:8002`.
+
+   | Variable | Value |
+   |---|---|
+   | `BW_HOST` | Vaultwarden URL, for example `http://vaultwarden` |
+   | `BW_CLIENTID` / `BW_CLIENTSECRET` | The API client ID and secret |
+   | `BW_PASSWORD` | The master password |
+
+4. Set `CREDENTIAL_VAULT_TYPE=bitwarden` and the `SKYVERN_AUTH_BITWARDEN_*` values on the Skyvern server (same API key and password). Point `BITWARDEN_SERVER` at the CLI server: `http://localhost` and port `8002` from the host, or `http://bitwarden-cli` and port `8087` from another container in the same Compose project.
+5. Check it: `curl http://localhost:8002/status` returns the vault status.
+
+### Encryption at rest
+
+With `ENABLE_ENCRYPTION=true`, Skyvern encrypts stored secrets such as organization tokens and OAuth refresh tokens. The Google integrations require it.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ENABLE_ENCRYPTION` | `false` | Turn on AES encryption of stored secrets |
+| `ENCRYPTOR_AES_SECRET_KEY` | `fillmein` | AES key. Generate with `openssl rand -base64 32`. The server refuses to start with encryption on and this empty or still `fillmein`. |
+| `ENCRYPTOR_AES_SALT` | derived from the key | AES salt |
+| `ENCRYPTOR_AES_IV` | derived from the key | AES initialization vector |
+
+<Warning>
+Never change `ENCRYPTOR_AES_SECRET_KEY`, `ENCRYPTOR_AES_SALT` or `ENCRYPTOR_AES_IV` after secrets are stored. Skyvern can't decrypt anything stored under the old values.
+</Warning>
+
+## Other server settings
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Any other value means `INFO`. |
+| `CODE_BLOCK_MODE` | `enabled` | `disabled` rejects [Code blocks](/reference/blocks) in runs |
+| `TOTP_LIFESPAN_MINUTES` | `10` | How long a 2FA code sent to Skyvern stays usable. Older codes are ignored. |
+| `ENABLE_URL_VALIDATION` | `false` | `true` makes Skyvern refuse URLs that point at loopback, private-network or cloud-metadata addresses. Off by default. See [URL validation](#url-validation). |
+
+### URL validation
+
+URL validation is off by default, so Skyvern can open, fetch and call internal hosts without extra setup. That includes an intranet portal, a service on your network and `localhost`. Set `ENABLE_URL_VALIDATION=true` if people you don't trust can start tasks or workflows on your server, or if it runs next to internal services or a cloud metadata endpoint.
+
+When it is on, Skyvern refuses a URL if its host is `localhost`, a name ending in `.local`, `.localhost`, `.internal`, `.svc` or `.cluster.local`, or an address in a loopback, private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`, which includes the cloud metadata address), shared (`100.64.0.0/10`), reserved, multicast or unspecified range. Names are checked after DNS resolution, so a public name that resolves to a private address is refused too. The check covers the URLs a run or workflow gives Skyvern: page navigation and link clicks, downloads, webhooks, 2FA callbacks, and SFTP, SMTP and S3-compatible endpoints. SFTP, SMTP and S3 targets also have their own `ALLOW_SFTP_INTERNAL_HOSTS`, `ALLOW_SMTP_INTERNAL_HOSTS` and `ALLOW_S3_ENDPOINT_INTERNAL_HOSTS` switches (the S3 one also allows plain `http://` endpoints).
+
+With validation on, list the hosts you want to keep reachable in `ALLOWED_HOSTS`, a JSON list of exact host names or IP addresses such as `ALLOWED_HOSTS=["intranet.example.com"]`. `BLOCKED_HOSTS` adds hosts to refuse.
+
+<Warning>
+Whoever can start a task chooses the URLs Skyvern fetches. With validation off, they can point Skyvern at anything your server can reach. Turn it on before you share a server with people you don't trust.
+</Warning>
+
+## Storage
+
+`SKYVERN_STORAGE_TYPE` picks where artifacts go.
+
+| Value | Where | Use for |
+|---|---|---|
+| `local` (default) | Server disk | One server, development |
+| `s3` | AWS S3 | Production on AWS, several servers |
+| `azureblob` | Azure Blob Storage | Production on Azure |
+| `gcs` | Google Cloud Storage | Production on GCP |
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `ARTIFACT_STORAGE_PATH` | `artifacts/` inside the installed `skyvern` package (`/data/artifacts` in Docker) | `local` |
+| `VIDEO_PATH`, `HAR_PATH`, `LOG_PATH` | `./video`, `./har`, `./log` | All. Recordings are written here, then uploaded to the backend. |
+| `PRESIGNED_URL_EXPIRATION` | `86400` (24 hours) | `s3`, `azureblob`, `gcs`. Lifetime of the signed links in run responses (`recording_url`, `screenshot_urls`). |
+| `MAX_UPLOAD_FILE_SIZE` | `31457280` (30 MB) | All |
+
+Each cloud backend uses four buckets (containers on Azure). The defaults are `skyvern-artifacts`, `skyvern-screenshots`, `skyvern-browser-sessions` and `skyvern-uploads`.
+
+| Bucket | Holds |
+|---|---|
+| Artifacts | Extracted data, HTML snapshots, logs, recordings |
+| Screenshots | Page screenshots at each step |
+| Browser sessions | Saved browser state for profiles |
+| Uploads | Files uploaded for agent runs |
+
+Docker Compose mounts `./artifacts`, `./videos`, `./har` and `./log` next to `docker-compose.yml`. Local storage isn't shared between servers and is never cleaned up; delete old files yourself, for example `find ./artifacts -type f -mtime +30 -delete`.
+
+### AWS S3
+
+```bash .env
+SKYVERN_STORAGE_TYPE=s3
+AWS_REGION=us-east-1
+AWS_S3_BUCKET_ARTIFACTS=acme-skyvern-artifacts
+AWS_S3_BUCKET_SCREENSHOTS=acme-skyvern-screenshots
+AWS_S3_BUCKET_BROWSER_SESSIONS=acme-skyvern-browser-sessions
+AWS_S3_BUCKET_UPLOADS=acme-skyvern-uploads
+```
+
+Credentials come from the standard AWS chain: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, an IAM role on EC2, ECS or EKS, or `AWS_PROFILE` set in the container's environment.
+
+Create the buckets first. Bucket names are global, so add a unique prefix.
+
+```bash
+for b in artifacts screenshots browser-sessions uploads; do
+  aws s3 mb s3://acme-skyvern-$b --region us-east-1
+done
+```
+
+Minimum IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::acme-skyvern-artifacts",
+        "arn:aws:s3:::acme-skyvern-artifacts/*",
+        "arn:aws:s3:::acme-skyvern-screenshots",
+        "arn:aws:s3:::acme-skyvern-screenshots/*",
+        "arn:aws:s3:::acme-skyvern-browser-sessions",
+        "arn:aws:s3:::acme-skyvern-browser-sessions/*",
+        "arn:aws:s3:::acme-skyvern-uploads",
+        "arn:aws:s3:::acme-skyvern-uploads/*"
+      ]
+    }
+  ]
+}
+```
+
+Expire old artifacts with a lifecycle rule:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket acme-skyvern-artifacts \
+  --lifecycle-configuration '{"Rules":[{"ID":"DeleteOldArtifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
+```
+
+Turn on server-side encryption and access logging on the buckets as your policies require. On "Access Denied", check the policy, that the buckets exist, and that `AWS_REGION` matches the bucket region.
+
+### Azure Blob Storage
+
+```bash .env
+SKYVERN_STORAGE_TYPE=azureblob
+AZURE_STORAGE_ACCOUNT_NAME=acmeskyvern
+AZURE_STORAGE_ACCOUNT_KEY=your-storage-account-key
+AZURE_STORAGE_CONTAINER_ARTIFACTS=skyvern-artifacts
+AZURE_STORAGE_CONTAINER_SCREENSHOTS=skyvern-screenshots
+AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS=skyvern-browser-sessions
+AZURE_STORAGE_CONTAINER_UPLOADS=skyvern-uploads
+```
+
+The account key is required. Managed identity isn't supported, and Skyvern raises an error without the key.
+
+```bash
+az group create --name skyvern-rg --location eastus
+az storage account create --name acmeskyvern --resource-group skyvern-rg --location eastus --sku Standard_LRS
+az storage account keys list --account-name acmeskyvern --resource-group skyvern-rg --query '[0].value' -o tsv
+for c in artifacts screenshots browser-sessions uploads; do
+  az storage container create --name skyvern-$c --account-name acmeskyvern
+done
+```
+
+Use an Azure lifecycle management policy to expire old blobs.
+
+### Google Cloud Storage
+
+```bash .env
+SKYVERN_STORAGE_TYPE=gcs
+GCS_PROJECT_ID=your-gcp-project-id
+GCS_BUCKET_ARTIFACTS=skyvern-artifacts
+GCS_BUCKET_SCREENSHOTS=skyvern-screenshots
+GCS_BUCKET_BROWSER_SESSIONS=skyvern-browser-sessions
+GCS_BUCKET_UPLOADS=skyvern-uploads
+# Only under Workload Identity, where the runtime service account has no signing key
+GCS_SIGNER_SA_EMAIL=skyvern@your-gcp-project-id.iam.gserviceaccount.com
+```
+
+Authentication uses Application Default Credentials: Workload Identity on GKE, or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key. Create the buckets first.
+
+### Move existing local artifacts
+
+Changing `SKYVERN_STORAGE_TYPE` only affects new artifacts. To copy old ones, sync them once, then switch and restart:
+
+```bash
+# S3
+aws s3 sync ./artifacts s3://acme-skyvern-artifacts/
+# Azure
+azcopy copy './artifacts/*' 'https://acmeskyvern.blob.core.windows.net/skyvern-artifacts' --recursive
+
+docker compose restart skyvern
+```
+
+If artifacts don't appear, check `docker compose logs skyvern | grep -i storage`.
+
+## Kubernetes
+
+The manifests in [`kubernetes-deployment/`](https://github.com/Skyvern-AI/skyvern/tree/main/kubernetes-deployment) create a `skyvern` namespace with `postgres`, `skyvern-backend` (API and browser, port 8000) and `skyvern-frontend` (UI on 8080, artifacts on 9090), plus a Traefik ingress routing `/api` to the backend, `/artifacts` to 9090 and `/` to the UI. Any ingress controller works; change `ingressClassName`.
+
+| File | Set |
+|---|---|
+| `backend/backend-secrets.yaml` | The same variables as `.env`: LLM provider, `DATABASE_STRING`, `BROWSER_TYPE` |
+| `frontend/frontend-secrets.yaml` | `VITE_API_BASE_URL`, `VITE_WSS_BASE_URL`, `VITE_ARTIFACT_API_BASE_URL`, `ARTIFACT_ALLOWED_ORIGIN` (the UI's origin, not the artifact URL), `VITE_SKYVERN_API_KEY` (empty on first deploy) |
+| `ingress.yaml` | Your host name and TLS |
+
+After `./k8s-deploy.sh`, wait for the backend pod to show `1/1` (migrations take 1–2 minutes), then read the API key and give it to the UI:
+
+```bash
+kubectl exec -n skyvern deployment/skyvern-backend -- cat /app/.skyvern/credentials.toml
+# put the cred value in VITE_SKYVERN_API_KEY, then:
+kubectl apply -f frontend/frontend-secrets.yaml -n skyvern
+kubectl rollout restart deployment/skyvern-frontend -n skyvern
+```
+
+**Persistent volumes.** The backend uses `hostPath` volumes, which only work on a single node. For production, replace them with PVCs in `backend/backend-deployment.yaml`, or use S3, Azure Blob or GCS:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skyvern-artifacts-pvc
+  namespace: skyvern
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skyvern-videos-pvc
+  namespace: skyvern
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+```yaml
+volumes:
+  - name: artifacts
+    persistentVolumeClaim:
+      claimName: skyvern-artifacts-pvc
+  - name: videos
+    persistentVolumeClaim:
+      claimName: skyvern-videos-pvc
+```
+
+**Scaling and limits.** Raise `replicas` on the backend deployment to run more pods; each runs its own browser. With more than one pod, storage must be shared (S3, Azure Blob, GCS or `ReadWriteMany` volumes). Give each backend pod at least 2 GB:
+
+```yaml
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2000m"
+```
+
+**TLS.** Uncomment the `tls` section in `ingress.yaml` and create the secret (or use cert-manager), then switch the frontend URLs to `https://` and `wss://`:
+
+```bash
+kubectl create secret tls skyvern-tls-secret --cert=path/to/tls.crt --key=path/to/tls.key -n skyvern
+```
+
+**External database.** Drop the `postgres/` manifests and set `DATABASE_STRING: "postgresql+psycopg://user:password@your-db-host:5432/skyvern"` in the backend secret.
+
+| Symptom | Check |
+|---|---|
+| Pod stuck in `Pending` | `kubectl describe pod -n skyvern <pod>`: node resources, volumes, image pulls |
+| Backend crashes on start | `kubectl logs -n skyvern deployment/skyvern-backend`: LLM key, database connection |
+| UI shows "Unauthorized" | `VITE_SKYVERN_API_KEY` doesn't match the backend's key; copy it again |
+| Ingress not routing | `kubectl describe ingress skyvern-ingress -n skyvern` |
+
+The manifests have no authentication. Add it at the ingress, or keep the cluster off the public internet. `kubectl delete namespace skyvern` removes everything.

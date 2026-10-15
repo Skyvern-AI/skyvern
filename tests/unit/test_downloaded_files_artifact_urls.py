@@ -39,7 +39,7 @@ from skyvern.forge.sdk.workflow.models.block import PrintPageBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.runtime_completion import CompletionCriterion, grade_completion_contract
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository, fake_download_registration_app
 from tests.unit.forge.sdk.artifact.storage.test_azure_storage import AzureStorageForTests
 from tests.unit.forge.sdk.artifact.storage.test_gcs_storage import GcsStorageForTests
 
@@ -220,13 +220,7 @@ async def test_local_retry_snapshot_uri_survives_fragment_and_query_characters(t
             )
         )
 
-    fake_app = SimpleNamespace(
-        STORAGE=storage,
-        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
-        DATABASE=SimpleNamespace(
-            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
-        ),
-    )
+    fake_app = fake_download_registration_app(register, rows, storage)
     monkeypatch.setattr(local_module, "app", fake_app)
     monkeypatch.setattr(local_module, "get_download_dir", lambda *args, **kwargs: str(download_dir))
     started_at = datetime.now(UTC) - timedelta(minutes=1)
@@ -1170,13 +1164,7 @@ async def test_print_page_excludes_live_http_download_after_snapshot_registratio
             )
         )
 
-    fake_app = SimpleNamespace(
-        STORAGE=storage,
-        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
-        DATABASE=SimpleNamespace(
-            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
-        ),
-    )
+    fake_app = fake_download_registration_app(register, rows, storage)
     for module in (local_module, block_module):
         monkeypatch.setattr(module, "app", fake_app)
         monkeypatch.setattr(module, "get_download_dir", lambda *args, **kwargs: str(download_dir))

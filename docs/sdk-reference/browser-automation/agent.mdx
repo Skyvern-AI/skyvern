@@ -1,0 +1,513 @@
+---
+title: "Page agent"
+description: "Run a full AI task, login, download or agent in the current page."
+slug: sdk-reference/browser-automation/agent
+keywords:
+  - "page.agent"
+  - "run_task"
+  - "login"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+`page.agent` runs Skyvern's agents against the page you already have open, then returns control to your script on the same page.
+
+---
+
+## page.agent.run_task
+
+Run a task in the context of this page and wait for it to finish.
+
+<CodeGroup>
+```python Python
+await page.agent.run_task(
+    prompt: str,
+    engine: RunEngine = RunEngine.skyvern_v1,
+    model: dict[str, Any] | None = None,
+    url: str | None = None,
+    webhook_url: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    title: str | None = None,
+    error_code_mapping: dict[str, str] | None = None,
+    data_extraction_schema: dict[str, Any] | str | None = None,
+    max_steps: int | None = None,
+    timeout: float = 1800,
+    user_agent: str | None = None,
+) -> TaskRunResponse
+```
+
+```typescript TypeScript
+page.agent.runTask(prompt: string, options?: { engine?: RunEngine; model?: Record<string, unknown>; url?: string; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; title?: string; errorCodeMapping?: Record<string, string>; dataExtractionSchema?: Record<string, unknown> | string; maxSteps?: number; timeout?: number; }): Promise<TaskRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `prompt` | `prompt` | `str` | Yes | — | Natural language description of the task to perform. |
+| `engine` | `engine` | `RunEngine` | No | `RunEngine.skyvern_v1` | The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted. |
+| `model` | `model` | `dict[str, Any] \| None` | No | `None` | LLM model configuration options. |
+| `url` | `url` | `str \| None` | No | `None` | URL to navigate to. If not provided, uses the current page URL. |
+| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about task progress. |
+| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP (Time-based One-Time Password) authentication. |
+| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
+| `title` | `title` | `str \| None` | No | `None` | Human-readable title for this task run. |
+| `error_code_mapping` | `errorCodeMapping` | `dict[str, str] \| None` | No | `None` | Mapping of error codes to custom error messages. |
+| `data_extraction_schema` | `dataExtractionSchema` | `dict[str, Any] \| str \| None` | No | `None` | Schema defining what data to extract from the page. |
+| `max_steps` | `maxSteps` | `int \| None` | No | `None` | Maximum number of steps the agent can take. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for task completion. |
+| `user_agent` | — | `str \| None` | No | `None` | Custom user agent string to use. |
+
+**Returns** `TaskRunResponse` · TypeScript `Promise<TaskRunResponse>` — TaskRunResponse containing the task execution results.
+
+<Accordion title="TaskRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_request` | `TaskRunRequestOutput \| None` | The original request parameters used to start this task run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.agent.run_task(prompt="Find the top post and return its title")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.agent.runTask("Find the top post and return its title");
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## page.agent.login
+
+Run a login task in the context of this page and wait for it to finish.
+
+This method has multiple overloaded signatures for different credential types:
+
+1. Skyvern credentials (default):
+    ```python
+    await page.agent.login(credential_id="cred_123")
+    ```
+
+2. Bitwarden credentials:
+    ```python
+    await page.agent.login(
+        credential_type=CredentialType.bitwarden,
+        bitwarden_collection_id="collection_id",
+        bitwarden_item_id="item_id",
+    )
+    ```
+
+3. 1Password credentials:
+    ```python
+    await page.agent.login(
+        credential_type=CredentialType.onepassword,
+        onepassword_vault_id="vault_id",
+        onepassword_item_id="item_id",
+    )
+    ```
+
+4. Azure Vault credentials:
+    ```python
+    await page.agent.login(
+        credential_type=CredentialType.azure_vault,
+        azure_vault_name="vault_name",
+        azure_vault_username_key="username_key",
+        azure_vault_password_key="password_key",
+    )
+    ```
+
+<CodeGroup>
+```python Python
+await page.agent.login(
+    *,
+    credential_type: CredentialType | str = CredentialType.skyvern,
+    url: str | None = None,
+    credential_id: str | None = None,
+    bitwarden_collection_id: str | None = None,
+    bitwarden_item_id: str | None = None,
+    onepassword_vault_id: str | None = None,
+    onepassword_item_id: str | None = None,
+    azure_vault_name: str | None = None,
+    azure_vault_username_key: str | None = None,
+    azure_vault_password_key: str | None = None,
+    azure_vault_totp_secret_key: str | None = None,
+    prompt: str | None = None,
+    webhook_url: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    timeout: float = 1800,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+page.agent.login(credentialType: "skyvern", options: { credentialId: string; url?: string; prompt?: string; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; extraHttpHeaders?: Record<string, string>; timeout?: number; }): Promise<WorkflowRunResponse>
+page.agent.login(credentialType: "bitwarden", options: { bitwardenItemId: string; bitwardenCollectionId?: string; url?: string; prompt?: string; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; extraHttpHeaders?: Record<string, string>; timeout?: number; }): Promise<WorkflowRunResponse>
+page.agent.login(credentialType: "1password", options: { onepasswordVaultId: string; onepasswordItemId: string; url?: string; prompt?: string; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; extraHttpHeaders?: Record<string, string>; timeout?: number; }): Promise<WorkflowRunResponse>
+page.agent.login(credentialType: "azure_vault", options: { azureVaultName: string; azureVaultUsernameKey: string; azureVaultPasswordKey: string; azureVaultTotpSecretKey?: string; url?: string; prompt?: string; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; extraHttpHeaders?: Record<string, string>; timeout?: number; }): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `credential_type` | `credentialType` | `CredentialType \| str` | No | `CredentialType.skyvern` | Type of credential store to use. Defaults to CredentialType.skyvern. |
+| `url` | `url` | `str \| None` | No | `None` | URL to navigate to for login. If not provided, uses the current page URL. |
+| `credential_id` | `credentialId` | `str \| None` | No | `None` | ID of the Skyvern credential to use (required for skyvern credential_type). |
+| `bitwarden_collection_id` | `bitwardenCollectionId` | `str \| None` | No | `None` | Bitwarden collection ID (optional for bitwarden credential_type). |
+| `bitwarden_item_id` | `bitwardenItemId` | `str \| None` | No | `None` | Bitwarden item ID (required for bitwarden credential_type). |
+| `onepassword_vault_id` | `onepasswordVaultId` | `str \| None` | No | `None` | 1Password vault ID (required for onepassword credential_type). |
+| `onepassword_item_id` | `onepasswordItemId` | `str \| None` | No | `None` | 1Password item ID (required for onepassword credential_type). |
+| `azure_vault_name` | `azureVaultName` | `str \| None` | No | `None` | Azure Vault name (required for azure_vault credential_type). |
+| `azure_vault_username_key` | `azureVaultUsernameKey` | `str \| None` | No | `None` | Azure Vault username key (required for azure_vault credential_type). |
+| `azure_vault_password_key` | `azureVaultPasswordKey` | `str \| None` | No | `None` | Azure Vault password key (required for azure_vault credential_type). |
+| `azure_vault_totp_secret_key` | `azureVaultTotpSecretKey` | `str \| None` | No | `None` | Azure Vault TOTP secret key (optional for azure_vault credential_type). |
+| `prompt` | `prompt` | `str \| None` | No | `None` | Additional instructions for the login process. |
+| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about login progress. |
+| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
+| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
+| `extra_http_headers` | `extraHttpHeaders` | `dict[str, str] \| None` | No | `None` | Additional HTTP headers to include in requests. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for login completion. |
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the login workflow execution results.
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.agent.login(credential_id="cred_123", url="https://example.com/login")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.agent.login("skyvern", {
+    credentialId: "cred_123",
+    url: "https://example.com/login",
+});
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## page.agent.download_files
+
+Run a file download task in the context of this page and wait for it to finish.
+
+<CodeGroup>
+```python Python
+await page.agent.download_files(
+    prompt: str,
+    *,
+    url: str | None = None,
+    download_suffix: str | None = None,
+    download_timeout: float | None = None,
+    max_steps_per_run: int | None = None,
+    webhook_url: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    timeout: float = 1800,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+page.agent.downloadFiles(prompt: string, options?: { url?: string; downloadSuffix?: string; downloadTimeout?: number; maxStepsPerRun?: number; webhookUrl?: string; totpIdentifier?: string; totpUrl?: string; extraHttpHeaders?: Record<string, string>; timeout?: number; }): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `prompt` | `prompt` | `str` | Yes | — | Instructions for navigating to and downloading the file. |
+| `url` | `url` | `str \| None` | No | `None` | URL to navigate to for file download. If not provided, uses the current page URL. |
+| `download_suffix` | `downloadSuffix` | `str \| None` | No | `None` | Complete filename for the downloaded file. Supports \{\{ original_filename \}\} to keep the name the site gave the file. |
+| `download_timeout` | `downloadTimeout` | `float \| None` | No | `None` | Timeout in seconds for the download operation. |
+| `max_steps_per_run` | `maxStepsPerRun` | `int \| None` | No | `None` | Maximum number of steps to execute. |
+| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about download progress. |
+| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
+| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
+| `extra_http_headers` | `extraHttpHeaders` | `dict[str, str] \| None` | No | `None` | Additional HTTP headers to include in requests. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for download completion. |
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the file download workflow execution results.
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.agent.download_files(prompt="Download the latest invoice")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.agent.downloadFiles("Download the latest invoice");
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+## page.agent.run_workflow
+
+Run a workflow in the context of this page and wait for it to finish.
+
+<CodeGroup>
+```python Python
+await page.agent.run_workflow(
+    workflow_id: str,
+    parameters: dict[str, Any] | None = None,
+    template: bool | None = None,
+    title: str | None = None,
+    webhook_url: str | None = None,
+    totp_url: str | None = None,
+    totp_identifier: str | None = None,
+    max_elapsed_time_minutes: int | None = None,
+    run_metadata: dict[str, str] | None = None,
+    timeout: float = 1800,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+page.agent.runWorkflow(workflowId: string, options?: { parameters?: Record<string, unknown>; template?: boolean; title?: string; webhookUrl?: string; totpUrl?: string; totpIdentifier?: string; timeout?: number; }): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `workflow_id` | `workflowId` | `str` | Yes | — | ID of the workflow to execute. |
+| `parameters` | `parameters` | `dict[str, Any] \| None` | No | `None` | Dictionary of parameters to pass to the workflow. |
+| `template` | `template` | `bool \| None` | No | `None` | Whether this is a workflow template. |
+| `title` | `title` | `str \| None` | No | `None` | Human-readable title for this workflow run. |
+| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about workflow progress. |
+| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
+| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
+| `max_elapsed_time_minutes` | — | `int \| None` | No | `None` | Timeout this workflow run after the configured elapsed runtime in minutes. |
+| `run_metadata` | — | `dict[str, str] \| None` | No | `None` | String key/value metadata to attach to this workflow run. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for workflow completion. |
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the workflow execution results.
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.agent.run_workflow(workflow_id="wpid_123")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.agent.runWorkflow("wpid_123");
+console.log(result);
+await browser.close();
+```
+</CodeGroup>

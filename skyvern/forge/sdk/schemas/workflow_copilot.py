@@ -626,7 +626,9 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
         False,
         description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
     )
-    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    owner_turn_id: str | None = Field(
+        None, description="Owner turn for the proposal; used to match typed proposals and record tokenless Accepts"
+    )
     revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 

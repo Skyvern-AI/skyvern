@@ -75,10 +75,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestFailedOperation,
     RecordedBuildTestOutcome,
     TerminalCause,
-    history_has_runtime_block_failure,
     observed_value_extraction_scaffold_lines,
-    unresolved_runtime_block_failure,
-    unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_steps import (
@@ -133,6 +130,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
+    budget_expired_reply_observation,
     outcome_fully_verified,
     raw_secret_reply_withheld_observation,
     run_final_reply_drain,
@@ -249,13 +247,14 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     WatchdogExitReason,
     finalize_build_test_result,
     hydrate_prior_run_packet,
+    recorded_open_step_runs,
     reusable_origin_input_keys,
     run_workflow_end_to_end,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
     hydrate_prior_carried_trajectory,
-    read_page_state,
+    read_page_state_on_page,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _candidate_proposal_data,
@@ -306,7 +305,6 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     DeliveredOutputFile,
     ResponseKind,
     TurnOutcome,
-    UnresolvedRuntimeFailure,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -1737,13 +1735,14 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
                     else f"connected your saved credential {name}, which the draft does not bind yet"
                 )
                 return (
-                    f"I drafted the workflow with the pasted secret redacted and {binding}. "
+                    f"I drafted the workflow, withheld a value that may be a secret, and {binding}. "
                     "This draft is untested; ask me to test it in a later message."
                 )
             not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
             return (
-                f"I drafted the workflow with the pasted secret redacted. {not_connected}"
-                "Store the secret as a saved credential before testing; this draft has not been verified end-to-end."
+                f"I drafted the workflow and withheld a value that may be a secret. {not_connected}"
+                "If it was a saved login's name, choose that login; otherwise store the value as a saved "
+                "credential before testing. This draft has not been verified end-to-end."
             )
         if ctx.allow_untested_workflow_draft:
             return (
@@ -1814,17 +1813,15 @@ def _authored_review_blocks(review: NarrativeReviewProjection | None) -> list[Na
     return [block for block in review["blocks"] if block.get("change") != "removed"]
 
 
-def _draft_ran_on_current_source(
-    facts: NarrativeTurnFacts, unresolved_failure: UnresolvedRuntimeFailure | None
-) -> bool:
+def _draft_ran_on_current_source(facts: NarrativeTurnFacts) -> bool:
     """A tested draft claims full current-source coverage and a lifecycle that contradicts nothing:
-    a halted turn, an unfinished, unresolved or unconfirmed run, or an open block failure each
-    disqualify it. ``runCompleted`` is None both when no run is anchored to this turn and when a
-    started run never resolved, so only the former leaves the source-bound receipts as the claim."""
+    a halted turn or an unfinished, unresolved or unconfirmed run each disqualify it. ``runCompleted``
+    is None both when no run is anchored to this turn and when a started run never resolved, so only
+    the former leaves the source-bound receipts as the claim."""
     authored = facts.get("authoredBlockCount")
     if not facts["factsAvailable"] or not authored or facts.get("matchingSourceBlockCount") != authored:
         return False
-    if facts["terminalCause"] is not None or unresolved_failure is not None:
+    if facts["terminalCause"] is not None:
         return False
     if facts["runId"] is not None and facts["runCompleted"] is None:
         return False
@@ -1848,14 +1845,8 @@ def _tested_draft_reply(
     tested_reply: str,
     unvalidated_reply: str,
 ) -> str:
-    """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill.
-
-    Takes the proposal rather than a built projection so the projection and the open-failure check
-    cannot end up describing two different documents.
-    """
-    tested = _turn_facts_for_context(ctx, _review_projection_for(ctx, proposal_yaml), proposal_yaml)[
-        "ranCleanOnCurrentSource"
-    ]
+    """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill."""
+    tested = _turn_facts_for_context(ctx, _review_projection_for(ctx, proposal_yaml))["ranCleanOnCurrentSource"]
     return tested_reply if tested else unvalidated_reply
 
 
@@ -1864,7 +1855,6 @@ def _turn_fact_bundle(
     run_outcome: RecordedRunOutcome | None,
     terminal_cause: TerminalCause | None,
     blocks_run_this_turn: int | None,
-    unresolved_failure: UnresolvedRuntimeFailure | None = None,
 ) -> NarrativeTurnFacts:
     run_id = run_outcome.workflow_run_id if run_outcome is not None else None
     # A run start with no result behind it names a run without adjudicating one, so the
@@ -1889,27 +1879,19 @@ def _turn_fact_bundle(
         authored = _authored_review_blocks(review)
         facts["authoredBlockCount"] = len(authored)
         facts["matchingSourceBlockCount"] = sum(1 for block in authored if block.get("coverage") == "current_source")
-    facts["ranCleanOnCurrentSource"] = _draft_ran_on_current_source(facts, unresolved_failure)
+    facts["ranCleanOnCurrentSource"] = _draft_ran_on_current_source(facts)
     return facts
 
 
 def _turn_facts_for_context(
     ctx: CopilotContext,
     review: NarrativeReviewProjection | None,
-    proposal_yaml: str | None,
 ) -> NarrativeTurnFacts:
     return _turn_fact_bundle(
         review,
         select_run_outcome_anchor(_run_outcome_trace(ctx)),
         _terminal_cause_for_context(ctx),
         _blocks_run_this_turn(ctx),
-        # The proposal these facts describe, not the turn-start persisted workflow. The terminal
-        # seam asks whether the workflow the user can run today still carries the failure and is
-        # right to read persistence; this pill claims the draft ran clean, so a failure the draft
-        # still carries must keep it, and a repair the draft made must clear it. Reading the
-        # turn-start snapshot inverts both: a block authored this turn is always absent from it,
-        # and a call the turn only just introduced always reads as already removed.
-        unresolved_runtime_block_failure(ctx, reported_workflow_yaml=proposal_yaml),
     )
 
 
@@ -1941,16 +1923,6 @@ def _turn_output_files(ctx: CopilotContext) -> list[DeliveredOutputFile]:
 def _terminal_connect_failure(ctx: CopilotContext) -> BuildTestConnectFailure | None:
     outcome = ctx.latest_recorded_build_test_outcome
     return outcome.connect_failure if isinstance(outcome, RecordedBuildTestOutcome) else None
-
-
-def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
-    label = failure.block_label or "an earlier step"
-    note = (
-        f'One thing to flag: an earlier test run failed at "{label}". A later run passed, but the '
-        "retained evidence does not establish that the earlier failure was resolved, so that step "
-        "remains unproven."
-    )
-    return f"{user_response.rstrip()}\n\n{note}" if user_response.strip() else note
 
 
 def _concrete_narrative_response_kind(
@@ -2032,7 +2004,7 @@ def _make_agent_result(
     review_projection: NarrativeReviewProjection | None = (
         narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
     )
-    turn_facts = _turn_facts_for_context(ctx, review_projection, proposal_yaml) if ctx is not None else None
+    turn_facts = _turn_facts_for_context(ctx, review_projection) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
     if ctx is not None:
@@ -2146,59 +2118,6 @@ def _make_agent_result(
             ]
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
-    note_eligible = (
-        ctx is not None
-        and turn_outcome is not None
-        and response_type != "ASK_QUESTION"
-        and result_has_workflow_attempt
-        and ctx.budget_expiry_state.source is None
-    )
-    unresolved_failure = None
-    detector_disposition = "not_evaluated"
-    if ctx is not None and note_eligible:
-        # Only the workflow the user can actually run clears a failure, and while one is saved a
-        # staged proposal is not it: this terminal is assembled before the route commits the proposal,
-        # and `workflow_was_persisted` records a mid-turn write that can still be rolled back. With
-        # nothing saved there is no such workflow, so a run's own receipts stand in -- hence the
-        # persisted flag below, which says that is what an absent report means here.
-        # Deliberately a different question from the tested pill above, which judges the proposal:
-        # both can hold at once, and a turn that repairs a block it authored this turn will say the
-        # draft tested clean while its saved workflow still carries the failure.
-        reported_workflow_yaml = ctx.persisted_workflow_yaml
-        unresolved_failure, detector_disposition = unresolved_runtime_block_failure_with_disposition(
-            ctx, reported_workflow_yaml=reported_workflow_yaml, reported_workflow_is_persisted=True
-        )
-    if ctx is not None and history_has_runtime_block_failure(ctx):
-        # A turn that sets a runtime failure aside otherwise leaves no record of having done so, which
-        # makes a wrong clearance untraceable after the fact. Bounded to turns carrying a failure.
-        LOG.info(
-            "copilot unresolved runtime failure disposition",
-            response_type=response_type,
-            turn_outcome_present=turn_outcome is not None,
-            genuine_workflow_attempt=result_has_workflow_attempt,
-            note_eligible=note_eligible,
-            detector_disposition=detector_disposition,
-            note_applied=unresolved_failure is not None,
-        )
-    if turn_outcome is not None and note_eligible:
-        if unresolved_failure is not None:
-            turn_outcome = turn_outcome.model_copy(update={"unresolved_runtime_failure": unresolved_failure})
-            kwargs["user_response"] = _with_unresolved_runtime_failure_note(
-                str(kwargs.get("user_response") or ""), unresolved_failure
-            )
-            # A reloaded chat renders the narrative card, and hydration prefers narrativeSummary over
-            # terminalMessage, so the qualification has to ride every surface or it survives the
-            # turn and disappears on refresh.
-            narrative = kwargs.get("narrative_payload")
-            if isinstance(narrative, dict):
-                kwargs["narrative_payload"] = {
-                    **narrative,
-                    **{
-                        key: _with_unresolved_runtime_failure_note(narrative[key], unresolved_failure)
-                        for key in ("terminalMessage", "narrativeSummary")
-                        if isinstance(narrative.get(key), str) and narrative[key].strip()
-                    },
-                }
     if turn_facts is not None:
         payload = kwargs.get("narrative_payload")
         if isinstance(payload, dict):
@@ -2219,6 +2138,7 @@ def _make_agent_result(
         result.resolved_model = ctx.resolved_model
         result.proposal_owner_turn_id = ctx.proposal_owner_turn_id
         result.proposal_revision = ctx.proposal_revision
+        result.proposal_adopted = ctx.proposal_adopted
         result.proposal_workflow_run_id = ctx.proposal_workflow_run_id
         result.clear_persisted_completion_contract = ctx.clear_persisted_completion_contract
         result.work_plan = ctx.work_plan if ctx.work_plan is None else list(ctx.work_plan)
@@ -2289,12 +2209,16 @@ def _build_narrative_payload(
             if not isinstance(label, str) or not label:
                 continue
             block_labels.append(label)
+    left_run_ids = ctx.budget_expiry_state.leavable_run_ids if ctx.budget_expiry_state.hard_backstop_reached else []
     for attempt in ctx.narrative_block_attempts.values():
+        block_state = _block_ui_state(attempt["rawStatus"], drafted_fallback=False)
+        if block_state == "running" and attempt["workflowRunId"] in left_run_ids:
+            block_state = "unfinished"
         block_entry: NarrativeBlock = {
             "label": attempt["label"],
             "workflowRunBlockId": attempt["workflowRunBlockId"],
             "blockType": attempt["blockType"],
-            "state": _block_ui_state(attempt["rawStatus"], drafted_fallback=False),
+            "state": block_state,
             "lastSeenIteration": attempt["lastSeenIteration"],
             "activity": list(block_activity.get(attempt["workflowRunBlockId"], [])),
             "startedAt": attempt["startedAt"],
@@ -2343,6 +2267,7 @@ def _build_narrative_payload(
             "reportProduced": budget_state.report_produced,
             "stagedDraftId": budget_state.staged_draft_id,
             "drainFingerprint": budget_state.drain_fingerprint,
+            "leftRunIds": list(budget_state.leavable_run_ids) if budget_state.hard_backstop_reached else [],
         }
     if ctx.google_connection_notices:
         payload["googleConnectionNotices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
@@ -2354,8 +2279,7 @@ def _build_narrative_payload(
         )
         if review is not None:
             payload["review"] = review
-    if ctx.executed_block_fingerprints:
-        payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
+    payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
     return payload
 
 
@@ -3337,6 +3261,11 @@ def _build_budget_expiry_exit_result(ctx: CopilotContext, global_llm_context: st
         attempted_kind=stopped_exit_response_kind(terminal_reason),
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason,
+        tool_calls=[
+            str(entry.get("tool") or entry.get("name") or "")
+            for entry in ctx.tool_activity
+            if isinstance(entry, dict) and (entry.get("tool") or entry.get("name"))
+        ],
     )
     staged_workflow = ctx.staged_workflow if ctx.has_staged_proposal else None
     staged_workflow_yaml = ctx.staged_workflow_yaml if staged_workflow is not None else None
@@ -3399,7 +3328,7 @@ def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | 
     return result
 
 
-def _handle_budget_drain_exhausted(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+def _record_budget_drain_exhausted(ctx: CopilotContext) -> None:
     ctx.copilot_max_turns_exceeded = True
     start_monotonic = ctx.copilot_run_start_monotonic
     LOG.warning(
@@ -3409,7 +3338,6 @@ def _handle_budget_drain_exhausted(ctx: CopilotContext, global_llm_context: str 
         elapsed_seconds=round(_elapsed_run_seconds(ctx, start_monotonic), 3) if start_monotonic is not None else 0.0,
         model_call_count=ctx.model_calls_this_turn,
     )
-    return _build_budget_expiry_exit_result(ctx, global_llm_context)
 
 
 def _build_unexpected_error_exit_result(
@@ -3672,7 +3600,9 @@ async def _translate_to_agent_result(
     # Deferred tools.py imports here and below: tools.py -> routes.workflow_copilot -> this module (circular at import time).
     from skyvern.forge.sdk.copilot.tools import _process_workflow_yaml
 
-    budget_drain = ctx.budget_expiry_state.drain_attempted
+    budget_drain = ctx.budget_expiry_state.drain_attempted or (
+        final_reply and ctx.budget_expiry_state.source is not None
+    )
     text = extract_final_text(result)
     if not text and budget_drain:
         return _build_budget_expiry_exit_result(ctx, global_llm_context)
@@ -3885,6 +3815,7 @@ async def _translate_to_agent_result(
                 LOG.info(
                     "copilot_inline_replace_candidate_publication_conflict",
                     workflow_permanent_id=ctx.workflow_permanent_id,
+                    reason=publication_conflict.reason,
                     error=str(publication_conflict),
                 )
                 user_response = _with_inline_reject_note(
@@ -4314,7 +4245,7 @@ async def _run_agent_loop_with_surface(
             dispatch_allowlist_enforced(ctx.tool_surface_identity)
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
-        page_state_reader=read_page_state,
+        page_state_reader=read_page_state_on_page,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
@@ -4982,6 +4913,7 @@ async def run_copilot_agent(
     eval_entrypoint_url: str | None = None,
     auto_accept: bool | None = None,
     private_workflow_settings: dict[str, Any] | None = None,
+    ctx_sink: list[CopilotContext] | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4989,7 +4921,8 @@ async def run_copilot_agent(
     if turn_id is None:
         turn_id = uuid.uuid4().hex
     normalized_turn_index = turn_index if turn_index is not None else 0
-    ctx_sink: list[CopilotContext] = []
+    if ctx_sink is None:
+        ctx_sink = []
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
@@ -5216,6 +5149,7 @@ async def _run_copilot_turn_impl(
                 workflow_yaml=chat_request.workflow_yaml or None,
                 turn_outcome=missing_sdk_outcome,
                 turn_id=turn_id,
+                executed_block_fingerprints=prior_executed_block_fingerprints or {},
             )
         raise
 
@@ -5813,6 +5747,39 @@ async def _run_copilot_turn_impl(
             LOG.warning("copilot_raw_secret_reply_reask_failed", error_type=type(reask_error).__name__)
             return _output_policy_blocked(exc)
 
+    async def _reply_after_budget_expiry() -> AgentResult:
+        # The hard backstop or an exhausted drain otherwise ends the turn with no reply at all,
+        # so the model gets one final-reply call to report what it did before the turn ends.
+        try:
+            state = ctx.budget_expiry_state
+            runs_not_in_history = await recorded_open_step_runs(ctx) if state.hard_backstop_reached else []
+            reply = await _run_attempt(
+                model_name,
+                run_config,
+                llm_key,
+                is_fallback=False,
+                final_reply=True,
+                final_reply_observation=budget_expired_reply_observation(
+                    _budget_expiry_state_with_staged_draft(ctx), runs_not_in_history
+                ),
+            )
+            return await _translate_to_agent_result(
+                reply,
+                ctx,
+                global_llm_context,
+                chat_request,
+                organization_id,
+                final_reply=True,
+            )
+        except asyncio.CancelledError:
+            LOG.info("Copilot run cancelled")
+            return _build_cancelled_exit_result(ctx, global_llm_context)
+        except OutputGuardrailTripwireTriggered as reply_exc:
+            return _output_policy_blocked(reply_exc)
+        except Exception as reply_error:
+            LOG.warning("copilot_budget_expiry_reply_failed", error_type=type(reply_error).__name__)
+            return _build_budget_expiry_exit_result(ctx, global_llm_context)
+
     try:
         from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
 
@@ -5900,9 +5867,10 @@ async def _run_copilot_turn_impl(
                 )
                 return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
-                return _handle_budget_drain_exhausted(ctx, global_llm_context)
+                _record_budget_drain_exhausted(ctx)
+                return await _reply_after_budget_expiry()
             except CopilotTotalTimeoutError:
-                return _build_budget_expiry_exit_result(ctx, global_llm_context)
+                return await _reply_after_budget_expiry()
             except CopilotEmptyCompletionError as empty_error:
                 if (
                     (empty_error.retry_allowed and ctx.tool_calls_this_turn == 0)

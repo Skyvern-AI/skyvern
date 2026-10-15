@@ -150,7 +150,9 @@ class SecurityHeadersMiddleware:
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
-        **cors_middleware_kwargs(settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX),
+        **cors_middleware_kwargs(
+            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor"]
+        ),
     )
 
 

@@ -1,0 +1,292 @@
+---
+title: Troubleshooting
+description: Find out why a run failed or returned the wrong result, from its status, failure category, recording and logs, and fix it.
+keywords:
+  - failed run
+  - failure_reason
+  - failure_category
+  - Reached the maximum steps
+  - recording
+  - artifacts
+  - login failure
+  - CAPTCHA
+  - element not found
+  - self-hosted errors
+---
+
+## Start here
+
+<Steps>
+  <Step title="Read the run">
+    Call `get_run` and look at `status`, `failure_reason`, and `errors`. Agent runs also have `failure_category`.
+  </Step>
+  <Step title="Watch it">
+    Open `app_url` in the app, or download the `recording`. Most failures are obvious once you see the page the agent saw.
+  </Step>
+  <Step title="Find the cause below">
+    Match the failure category or the symptom, then apply the fix.
+  </Step>
+</Steps>
+
+<CodeGroup>
+```python Python
+import os
+from skyvern import Skyvern
+
+client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+
+run = await client.get_run("tsk_v2_490440779503357994")
+print(run.status, run.failure_reason, run.errors, run.step_count, run.app_url)
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+const run = await client.getRun("tsk_v2_490440779503357994");
+console.log(run.status, run.failure_reason, run.errors, run.step_count, run.app_url);
+```
+
+```bash cURL
+curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  | jq '{status, failure_reason, errors, step_count, app_url}'
+```
+</CodeGroup>
+
+What each status means, and whether to retry, is on [Going to production](/developers/production#statuses).
+
+## Failure categories
+
+When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classifies the cause. The app shows the label as a badge on the run. The API and webhooks return the code in `failure_category[0].category`.
+
+| Code | Label in the app | Cause | Fix |
+|---|---|---|---|
+| `ANTI_BOT_DETECTION` | Blocked by bot protection | A CAPTCHA or bot check the run couldn't pass. | See [Anti-bot and CAPTCHA](/developers/production#anti-bot-and-captcha). |
+| `PROXY_ERROR` | Proxy connection failed | The run couldn't connect through its proxy. | Retry, or use another `proxy_location`. |
+| `BROWSER_ERROR` | Browser error | The browser crashed or the page closed. | Retry. |
+| `BROWSER_SESSION_EXPIRED` | Browser session expired | The browser session had already timed out, so the run never started. | Create a new browser session, or run without one. Retrying with the same session fails the same way. |
+| `NAVIGATION_FAILURE` | Couldn't open the page | The page didn't load or redirected, for example to a 404. | Check the URL. |
+| `PAGE_LOAD_TIMEOUT` | Page load timed out | The page didn't finish loading in time. | Check the URL, or retry if the site is slow. |
+| `ELEMENT_STATE_TIMEOUT` | Element never became ready | An element never became visible or clickable. | Describe the element better, or add a wait. |
+| `AUTH_FAILURE` | Login failed | The site rejected the login or a 2FA step. | See [Login and 2FA](#login-and-2fa). |
+| `CREDENTIAL_ERROR` | Credential problem | The run's credentials are missing or unusable. | Check the credential the run uses. |
+| `LLM_ERROR` | AI model error | The model returned an error or didn't answer. | Retry. Usually temporary. |
+| `LLM_REASONING_ERROR` | AI chose the wrong action | The AI misread the page or took the wrong action. | Make the goal more specific. |
+| `DATA_EXTRACTION_FAILURE` | Couldn't extract data | The data couldn't be read from the page. | Check the page loaded, and the goal and schema. |
+| `ELEMENT_NOT_FOUND` | Element not found | The element the run needed wasn't there. | See [Element not found](#page-and-element-problems). |
+| `WRONG_PAGE_STATE` | Unexpected page | The site showed a different page than expected. | Add a step that gets back to the right page. |
+| `MAX_STEPS_EXCEEDED` | Step limit reached | The run used all its steps. | Raise `max_steps`, or narrow the goal. |
+| `BUDGET_EXHAUSTED` | Step or time limit reached | A step or time cap was hit. Not a billing issue. | Raise the limit, or narrow the goal. |
+| `WEBSITE_ERROR` | Website error | The site failed on its side, such as a 502 or maintenance. | Retry later. Nothing is wrong with your agent. |
+| `INFRASTRUCTURE_ERROR` | Temporary system issue | A network or capacity problem on Skyvern's side. | Retry. |
+| `PARAMETER_BINDING_ERROR` | Parameter setup failed | An internal setup step for the run's inputs failed. | Retry, then contact support. |
+| `UNKNOWN` | Unknown failure | Skyvern couldn't tell. | Read `failure_reason` and watch the recording. |
+
+A category that isn't in this table is one of your own `error_code_mapping` codes, shown as is.
+
+## Common problems
+
+### Run results
+
+<AccordionGroup>
+<Accordion title="Run completed, but the output is wrong or empty">
+**Cause:** the agent ended on the wrong page, picked a similar element, or the goal was ambiguous.
+
+**Fix:** check `screenshot_final` to confirm the page. Add descriptions to your schema fields, such as `"description": "Price in USD, without the currency symbol"`. Add a visual hint: "The price is in bold under the product title."
+</Accordion>
+
+<Accordion title="Output contains data that isn't on the page">
+**Fix:** add "Only extract values visibly shown on the page. Return null if a value is missing." Make schema fields that can be absent optional.
+</Accordion>
+
+<Accordion title='"Reached the maximum steps"'>
+**Cause:** the run used its `max_steps` budget. Status is `failed` and `errors` contains `REACH_MAX_STEPS`. Common reasons: the goal has no clear finish line, the agent is looping, or the task really needs more steps.
+
+**Fix:** add a completion rule ("COMPLETE when you see 'Order confirmed'"). Watch the recording for a repeating pattern. Raise `max_steps` (tasks) or `max_steps_override` (agent runs), or split the work into several blocks.
+</Accordion>
+
+<Accordion title="Run timed out">
+**Cause:** an agent run passed `max_elapsed_time_minutes` (default 240).
+
+**Fix:** narrow the goal, split the agent, or raise the limit (maximum 480).
+</Accordion>
+
+<Accordion title="Agent stops too early, or never stops">
+**Fix:** state the finish line, including the final click: "COMPLETE when you have clicked Submit AND see a confirmation." Add a stop rule: "TERMINATE if you have tried this three times." If a Task block clicks through every page when you wanted one click, use an Action or Navigation block.
+</Accordion>
+
+<Accordion title="Run stays in queued">
+**Cause:** your organization is at its concurrency limit, or the agent has **Prevent Overlapping Runs** on and an earlier run with the same **Sequential Key (optional)** is still running.
+
+**Fix:** wait for earlier runs to finish, or cancel stuck ones.
+</Accordion>
+
+<Accordion title="API returns 400 and no run is created">
+**Cause:** the request can never start: a required input has no value, a credential ID doesn't exist in your organization, or a value has the wrong type. The `detail` message names the input.
+
+**Fix:** correct the request. Retrying unchanged returns the same `400`.
+</Accordion>
+</AccordionGroup>
+
+### Page and element problems
+
+<AccordionGroup>
+<Accordion title="Element not found, or the wrong element clicked">
+**Cause:** the element loads late, sits in an iframe or below the fold, or several elements look alike.
+
+**Fix:** describe it by what's visible: "the blue Download button in the row for January 2026." Set `max_screenshot_scrolls` so the agent scrolls before reading. Check `visible_elements_tree` to see whether Skyvern detected the element at all. If a visible, standard element is never detected, report it.
+</Accordion>
+
+<Accordion title="Autocomplete field keeps changing">
+**Fix:** "Type 'Toronto', select the first matching suggestion, then move to the next field without changing it."
+</Accordion>
+
+<Accordion title="Dates entered in the wrong format">
+**Fix:** give the exact format: "Enter 15/01/2026 (DD/MM/YYYY)." For pickers: "Open the date picker and select January 15, 2026."
+</Accordion>
+
+<Accordion title="Download didn't happen, or the wrong file downloaded">
+**Fix:** name the exact control: "Click the PDF button, not the Excel one." Check `downloaded_files` on the run.
+</Accordion>
+
+<Accordion title="A keyboard shortcut is needed">
+The agent presses single keys such as Enter, Tab, and Escape. It can't use browser or OS shortcuts. Prefer a visible button ("click the X to close the dialog"). If the site has no alternative, use a Code block: `await page.keyboard.press("Escape")`.
+</Accordion>
+
+<Accordion title="Site shows the wrong language or region">
+**Cause:** the site localizes by IP.
+
+**Fix:** pick a matching `proxy_location`, or open a language-specific URL such as `https://example.com/en/`.
+</Accordion>
+</AccordionGroup>
+
+### Login and 2FA
+
+<AccordionGroup>
+<Accordion title="Login never happened">
+**Cause:** the credential isn't linked to the agent's Login block, the credential ID is wrong, or the password manager connection failed.
+
+**Fix:** confirm the credential exists with `GET /v1/credentials/{credential_id}`, and that the Login block uses it. For Bitwarden or 1Password, check the vault connection. See [Credentials and 2FA](/credentials).
+</Accordion>
+
+<Accordion title='"Invalid username or password"'>
+**Fix:** log in by hand with the same values. Check whether the site wants an email or a username, and remove trailing spaces from the stored values.
+</Accordion>
+
+<Accordion title="2FA code rejected or expired">
+Skyvern already waits for a fresh TOTP code when fewer than 20 seconds are left and the code goes into several boxes. A pushed code stays usable for 10 minutes, but the site's own code may expire sooner, so forward codes as soon as they arrive. Self-hosted servers need an accurate clock (NTP). `errors` shows `OTP_EXPIRED` in this case.
+</Accordion>
+
+<Accordion title="2FA code never arrives">
+**Cause:** the push never reached Skyvern, `totp_identifier` differs between the run and the push, or your `totp_url` endpoint returns errors. `errors` shows `OTP_TIMEOUT` or `OTP_ERROR`.
+
+**Fix:** list received codes with `GET /v1/credentials/totp?totp_identifier=...`. Make sure the identifier matches exactly. See [Credentials and 2FA](/credentials).
+</Accordion>
+
+<Accordion title="Sign in with Google or Microsoft fails">
+**Fix:** use a direct username and password if the site offers one. Otherwise sign in once in a [browser session or profile](/browsers) and reuse it.
+</Accordion>
+</AccordionGroup>
+
+### Bot checks, proxies, and sessions
+
+<AccordionGroup>
+<Accordion title="Blocked by a CAPTCHA or bot check">
+See [Anti-bot and CAPTCHA](/developers/production#anti-bot-and-captcha). In short: residential or ISP proxy, a saved browser profile, more steps, slower actions, or **Take control** to solve it yourself.
+</Accordion>
+
+<Accordion title="City or state proxy unavailable">
+**Fix:** widen the `GeoTarget` from city to state to country, or retry later.
+</Accordion>
+
+<Accordion title="504 when creating a browser session">
+**Fix:** retry after a few seconds. On self-hosted servers, check CPU and memory. If it persists, contact support with the session or run IDs.
+</Accordion>
+
+<Accordion title="Webhook never arrived">
+**Fix:** call `get_run`, since the result is stored either way. Then fix the endpoint and call `retry_run_webhook`. See [Retries and replay](/developers/production#retries-and-replay).
+</Accordion>
+</AccordionGroup>
+
+### Self-hosted
+
+<AccordionGroup>
+<Accordion title='API returns 403 "Invalid credentials"'>
+**Fix:** send the key in the `x-api-key` header, exactly as generated, with no trailing newline. With Docker Compose, the key is the `cred` value in `.skyvern/credentials.toml`.
+</Accordion>
+
+<Accordion title="Container exits right after starting">
+**Fix:** run `docker compose logs skyvern`. The usual causes are a missing LLM key or a database that isn't healthy yet (`docker compose ps`).
+</Accordion>
+
+<Accordion title="UI is blank or can't reach the API">
+**Fix:** check `VITE_API_BASE_URL` and `VITE_WSS_BASE_URL` in `skyvern-frontend/.env`, then `docker compose restart skyvern-ui`.
+</Accordion>
+
+<Accordion title="Server keeps calling OpenAI after switching models">
+**Fix:** set `LLM_KEY` to your provider's key (for example `OLLAMA`) and enable that provider, then restart. See [Self-host](/developers/self-hosted/overview#use-a-local-model).
+</Accordion>
+
+<Accordion title="Connection refused to a model or browser on the host">
+**Cause:** inside a container, `localhost` is the container.
+
+**Fix:** use `http://host.docker.internal:<port>`.
+</Accordion>
+</AccordionGroup>
+
+## Use artifacts
+
+Every run records what happened: a video, screenshots, the AI's prompts and answers, the page structure it saw, logs, and network traffic. Fetch them with `get_run_artifacts`, optionally filtered by type.
+
+<CodeGroup>
+```python Python
+artifacts = await client.get_run_artifacts(
+    "tsk_v2_490440779503357994",
+    artifact_type=["recording", "screenshot_final", "skyvern_log"],
+)
+for artifact in artifacts:
+    print(artifact.artifact_type, artifact.signed_url)
+```
+
+```typescript TypeScript
+const artifacts = await client.getRunArtifacts("tsk_v2_490440779503357994", {
+  artifact_type: ["recording", "screenshot_final", "skyvern_log"],
+});
+for (const artifact of artifacts) {
+  console.log(artifact.artifact_type, artifact.signed_url);
+}
+```
+
+```bash cURL
+curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994/artifacts?artifact_type=recording&artifact_type=screenshot_final" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+`signed_url` links for screenshots and recordings expire after 1 hour; other links follow your organization's **Artifact URL Expiry** (12 hours by default). Call again for fresh ones. On a self-hosted server with local storage, `signed_url` is the file's location on the server's disk.
+
+| Question | Artifact |
+|---|---|
+| Where did it stop? | `screenshot_final` |
+| What happened along the way? | `recording`, `screenshot_action` |
+| What did the AI see? | `screenshot_llm`, `visible_elements_tree_in_prompt` |
+| Why did it act that way? | `llm_prompt`, `llm_response_parsed` |
+| Which URL did it pick? | `llm_response_rendered` (URLs are shortened to placeholders in `llm_response_parsed`) |
+| Was the element detected at all? | `visible_elements_tree`, `visible_elements_id_frame_map` for iframes |
+| What ran, step by step? | `skyvern_log` (readable), `skyvern_log_raw` (JSON) |
+| Did a request fail? | `har`, `browser_console_log` |
+| Can I replay it? | `trace` (open in Playwright Trace Viewer) |
+
+To see which block failed in an agent run, call `get_run_timeline`.
+
+## Get help
+
+Send support the `run_id`, what you expected, and what happened. Use the chat in the app, email [support@skyvern.com](mailto:support@skyvern.com), or ask on [Discord](https://discord.gg/skyvern).
+
+## Next
+
+- [Going to production](/developers/production): webhooks, error codes, proxies
+- [Credentials and 2FA](/credentials)
+- [Browsers](/browsers): sessions and profiles

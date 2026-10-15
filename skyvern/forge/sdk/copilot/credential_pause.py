@@ -751,8 +751,8 @@ def credential_pause_reason(ctx: Any) -> str | None:
 
 
 RAW_SECRET_CONNECTED_NEXT = (
-    "Bind this credential as the workflow's credential parameter in the draft. This turn contains a "
-    "redacted secret, so do not run, test, or use the browser; the draft stays untested until a later "
+    "Bind this credential as the workflow's credential parameter in the draft. This turn withheld a value "
+    "that may be a secret, so do not run, test, or use the browser; the draft stays untested until a later "
     "message asks to test it."
 )
 
@@ -862,7 +862,10 @@ def signed_in_facts(signed_in: SignedInProfile) -> str:
     return (
         f"The user signed in to {signed_in.site} themselves in the live browser via the credential card. "
         f"Skyvern saved that sign-in as browser profile {defang_card_text(signed_in.profile_name)} "
-        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. No credential was provided."
+        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. No credential was provided. "
+        "This profile seeds this turn's tests only. Later turns and saved runs start from it only if it is set as "
+        "the workflow's browser profile and the user accepts. Sites often end cookie-only sign-ins within minutes "
+        "or hours, so saved runs may start signed out."
     )
 
 

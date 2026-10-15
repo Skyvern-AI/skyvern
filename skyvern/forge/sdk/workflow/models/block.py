@@ -28,7 +28,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -81,12 +81,14 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
+    FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
     PDF_OCR_PAGE_CONCURRENCY,
+    PDF_OCR_TOTAL_TIMEOUT_SECONDS,
     PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -95,6 +97,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
+    BlockTerminationError,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
@@ -198,7 +201,12 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -310,6 +318,7 @@ from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
+    FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
     BlockResult,
     BlockStatus,
@@ -367,7 +376,7 @@ from skyvern.webeye.navigation import (
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
@@ -646,8 +655,52 @@ def extract_file_url_from_block_output(value: Any) -> str | None:
 
 
 def sanitize_filename(filename: str, default: str = "document") -> str:
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]', "_", filename).strip(". ")
     return sanitized[:200] if sanitized else default
+
+
+async def register_workflow_downloads(
+    *,
+    organization_id: str | None,
+    run_download_id: str | None,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+) -> list[FileInfo]:
+    if not organization_id:
+        return []
+    try:
+        async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+            await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timeout saving workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        return []
+    except DownloadSaveIncompleteError:
+        pass
+    except Exception:
+        LOG.warning(
+            "Failed to register workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
+    try:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            return await app.STORAGE.get_current_attempt_downloaded_files(
+                organization_id=organization_id, run_id=run_download_id
+            )
+    except Exception:
+        LOG.warning(
+            "Failed to read registered workflow downloads",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
 
 
 class ParquetExportMixin:
@@ -675,50 +728,6 @@ class ParquetExportMixin:
         if isinstance(current_index, int) and not isinstance(current_index, bool):
             stem = f"{stem}-{current_index + 1:04d}"
         return f"{stem}.parquet"
-
-    async def _register_export_download(
-        self,
-        *,
-        organization_id: str | None,
-        run_download_id: str | None,
-        workflow_run_id: str,
-        workflow_run_block_id: str,
-    ) -> list[FileInfo]:
-        if not organization_id:
-            return []
-        try:
-            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "Timeout saving Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            return []
-        except DownloadSaveIncompleteError:
-            pass
-        except Exception:
-            LOG.warning(
-                "Failed to register Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
-        try:
-            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_current_attempt_downloaded_files(
-                    organization_id=organization_id, run_id=run_download_id
-                )
-        except Exception:
-            LOG.warning(
-                "Failed to read registered Parquet exports",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
 
     async def write_parquet_export(
         self,
@@ -764,7 +773,7 @@ class ParquetExportMixin:
             raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
 
         filename = path.name
-        downloaded_files = await self._register_export_download(
+        downloaded_files = await register_workflow_downloads(
             organization_id=organization_id,
             run_download_id=run_download_id,
             workflow_run_id=workflow_run_id,
@@ -2614,6 +2623,14 @@ class BaseTaskBlock(Block):
                         workflow_run_id=workflow_run_id,
                         detected_at=datetime.now(UTC),
                         failure_reason="browser_state_registry_lookup_miss",
+                    )
+                if browser_session_id and is_external_browser_state(browser_state) and not browser_state.is_connected():
+                    # Re-acquiring a lost registered browser fails the run with the registration's own reason.
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run,
+                        url=None,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
 
                 working_page = await browser_state.must_get_working_page()
@@ -9282,6 +9299,23 @@ async def wrapper({default_args}):
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
+        try:
+            await app.AGENT_FUNCTION.validate_block_execution(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except BlockTerminationError as e:
+            # Returned, not raised: execute() rewrites a raised error into a generic machinery failure.
+            return await self.build_block_result(
+                success=False,
+                failure_reason=get_user_facing_exception_message(e),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                can_continue_after_failure=False,
+            )
 
         block_context = skyvern_context.current()
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -11415,14 +11449,16 @@ class UploadToS3Block(Block):
                     if attempt_started_at is None
                     or is_file_from_retry_attempt(os.path.join(resolved_path, name), attempt_started_at)
                 ]
-                if len(files) > MAX_UPLOAD_FILE_COUNT:
-                    raise ValueError("Too many files in the directory, not uploading")
+                file_paths = []
                 for file in files:
-                    # if the file is a directory, we will not upload it
-                    if os.path.isdir(os.path.join(resolved_path, file)):
+                    file_path = os.path.join(resolved_path, file)
+                    if os.path.isdir(file_path):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
-                    file_path = os.path.join(resolved_path, file)
+                    file_paths.append(file_path)
+                if len(file_paths) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file_path in file_paths:
                     s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
@@ -12085,13 +12121,13 @@ class FileDestinationBlock(Block):
                 if attempt_started_at is None
                 or is_file_from_retry_attempt(os.path.join(download_files_path, name), attempt_started_at)
             ]
-            if len(files) > max_file_count:
-                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
             for file in files:
                 if os.path.isdir(os.path.join(download_files_path, file)):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
         return files_to_upload
 
     async def _select_files_to_upload_with_prompt(
@@ -13605,6 +13641,32 @@ async def _run_blocking_parse_step(
         raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
 
 
+class _FileParserLLMTimeout(TimeoutError):
+    pass
+
+
+@contextlib.asynccontextmanager
+async def _file_parser_llm_deadline(step: str, file_url: str, llm_key: str | None) -> AsyncIterator[None]:
+    """Bound one file-parser LLM call by wall-clock time, so a stalled provider fails the block."""
+    try:
+        async with asyncio.timeout(FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS) as deadline:
+            yield
+    except TimeoutError:
+        # A TimeoutError this scope did not raise came from inside the handler; relabelling it would bury its cause.
+        if not deadline.expired():
+            raise
+        LOG.warning(
+            "File parser LLM call exceeded its time budget",
+            step=step,
+            timeout_seconds=FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
+            file_url=_log_safe_url(file_url),
+            llm_key=llm_key,
+        )
+        raise _FileParserLLMTimeout(
+            f"The model did not answer within {FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS} seconds during {step}."
+        ) from None
+
+
 # csv.field_size_limit is process-global. Raising it once at import (rather than
 # set/restore around each parse) avoids a race between concurrent CSV parses on
 # separate worker threads stepping on each other's limit.
@@ -13702,6 +13764,7 @@ class FileParserBlock(Block):
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
     worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
@@ -14082,32 +14145,52 @@ class FileParserBlock(Block):
     ) -> str:
         """Parse PDF file and return extracted text.
 
-        Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails. If text extraction
-        yields empty/minimal content (e.g. scanned or image-based PDFs),
-        renders pages as images and sends them to a vision LLM for OCR.
+        Uses the shared PDF parsing utility that tries pypdf first, then falls back to
+        pdfplumber if pypdf fails. When the text layer cannot be trusted — it is empty
+        (scanned or image-based PDF), its glyphs are scrambled by a broken embedded font,
+        or the block asks for OCR outright — renders pages as images and sends them to a
+        vision LLM for OCR instead.
         """
-        try:
-            extracted_text = await _run_blocking_parse_step(
-                "PDF text extraction",
-                self.file_url,
-                extract_pdf_file,
-                file_path,
-                file_identifier=self.file_url,
-            )
-        except PDFParsingError as e:
-            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+        extracted_text = ""
+        ocr_reason: str | None = None
+        if self.force_ocr:
+            ocr_reason = "the block is configured to always OCR PDFs"
+        else:
+            try:
+                extracted_text = await _run_blocking_parse_step(
+                    "PDF text extraction",
+                    self.file_url,
+                    extract_pdf_file,
+                    file_path,
+                    file_identifier=self.file_url,
+                )
+            except PDFParsingError as e:
+                raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
-        # If text extraction returned meaningful content, use it directly
-        if extracted_text.strip():
-            return extracted_text
+            if not extracted_text.strip():
+                ocr_reason = "PDF text extraction returned empty content"
+            else:
+                # A scrambled text layer is worse than an empty one: it reaches the extraction
+                # LLM as plausible text, which then invents values for the characters it cannot
+                # read. Only OCR recovers the real ones. The scan is per-character over a text
+                # layer that can reach a million characters, so it stays off the event loop.
+                ocr_reason = await _run_blocking_parse_step(
+                    "PDF text layer check",
+                    self.file_url,
+                    scrambled_text_layer_reason,
+                    extracted_text,
+                )
 
-        # Scanned / image-based PDF — render pages as images and OCR each page in
-        # its own vision-LLM call. A single call covering every page collapses a
-        # multi-page document down to the first page or two.
+            if ocr_reason is None:
+                return extracted_text
+
+        # Render pages as images and OCR each page in its own vision-LLM call. A single
+        # call covering every page collapses a multi-page document down to the first page
+        # or two.
         LOG.info(
-            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            "Falling back to vision LLM OCR for the PDF text layer",
             file_url=self.file_url,
+            ocr_reason=ocr_reason,
         )
         try:
             page_images = await _run_blocking_parse_step(
@@ -14170,6 +14253,7 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id), default=default_handler
         )
+        llm_key = _handler_llm_key(llm_api_handler)
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
         async def _ocr_page(page_image: bytes) -> str:
@@ -14179,15 +14263,16 @@ class FileParserBlock(Block):
                     try:
                         # OCR transcription intentionally skips system_prompt; it still applies
                         # to the downstream extract-information-from-file-text call.
-                        llm_response = await llm_api_handler(
-                            prompt=prompt_for_attempt,
-                            prompt_name="extract-text-from-image",
-                            screenshots=[page_image],
-                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                            force_dict=False,
-                            workflow_run_block_id=workflow_run_block_id,
-                            organization_id=organization_id,
-                        )
+                        async with _file_parser_llm_deadline("PDF page OCR", self.file_url, llm_key=llm_key):
+                            llm_response = await llm_api_handler(
+                                prompt=prompt_for_attempt,
+                                prompt_name="extract-text-from-image",
+                                screenshots=[page_image],
+                                # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                                force_dict=False,
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
+                            )
                     except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                         failure_reason = _llm_response_format_failure_reason(e)
                         will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -14222,11 +14307,31 @@ class FileParserBlock(Block):
                     prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
                 raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
-        page_results = await asyncio.gather(
-            *(_ocr_page(page_image) for page_image in page_images),
-            return_exceptions=True,
-        )
+        try:
+            async with asyncio.timeout(PDF_OCR_TOTAL_TIMEOUT_SECONDS) as ocr_deadline:
+                page_results = await asyncio.gather(
+                    *(_ocr_page(page_image) for page_image in page_images),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            if not ocr_deadline.expired():
+                raise
+            LOG.warning(
+                "File parser PDF OCR exceeded its time budget",
+                timeout_seconds=PDF_OCR_TOTAL_TIMEOUT_SECONDS,
+                pages=len(page_images),
+                file_url=_log_safe_url(self.file_url),
+                llm_key=llm_key,
+            )
+            raise _FileParserLLMTimeout(
+                f"The model did not transcribe the PDF's {len(page_images)} pages within "
+                f"{PDF_OCR_TOTAL_TIMEOUT_SECONDS} seconds."
+            ) from None
 
+        # A page the model never answered would silently drop its text from the extraction, so it fails the block.
+        stalled_pages = [r for r in page_results if isinstance(r, _FileParserLLMTimeout)]
+        if stalled_pages:
+            raise stalled_pages[0]
         # A total OCR outage must fail the block, not record an empty success — match the
         # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
         errors = [r for r in page_results if isinstance(r, BaseException)]
@@ -14295,20 +14400,22 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key_for_organization(organization_id), default=default_handler
             )
+            llm_key = _handler_llm_key(llm_api_handler)
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
             prompt_for_attempt = llm_prompt
             for attempt in range(self.ocr_validation_max_attempts):
                 try:
-                    llm_response = await llm_api_handler(
-                        prompt=prompt_for_attempt,
-                        prompt_name="extract-text-from-image",
-                        screenshots=[image_bytes],
-                        # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                        force_dict=False,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
+                    async with _file_parser_llm_deadline("image OCR", self.file_url, llm_key=llm_key):
+                        llm_response = await llm_api_handler(
+                            prompt=prompt_for_attempt,
+                            prompt_name="extract-text-from-image",
+                            screenshots=[image_bytes],
+                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                            force_dict=False,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
                 except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                     failure_reason = _llm_response_format_failure_reason(e)
                     will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -14663,15 +14770,16 @@ class FileParserBlock(Block):
         for attempt in range(self.schema_validation_max_attempts):
             telemetry.extraction_attempts = attempt + 1
             try:
-                llm_response = await llm_api_handler(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=telemetry.llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
             except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                 failure_reason = _llm_response_format_failure_reason(e)
                 will_retry = attempt + 1 < self.schema_validation_max_attempts
@@ -15163,15 +15271,27 @@ class PDFParserBlock(Block):
         )
 
         llm_response: dict[str, Any] | list | str | None = None
+        llm_api_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
+        llm_key = _handler_llm_key(llm_api_handler)
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:
-                llm_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+            except _FileParserLLMTimeout as e:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=str(e),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
@@ -15510,7 +15630,69 @@ class HumanInteractionBlock(BaseTaskBlock):
                 )
                 log_that_we_are_waiting = False
 
-            # Check if timeout_seconds has elapsed
+            # Run status is read before the session because cancel paths also close the session.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                if workflow_run.status == WorkflowRunStatus.running:
+                    success, status = True, BlockStatus.completed
+                elif workflow_run.status == WorkflowRunStatus.canceled:
+                    success, status = False, BlockStatus.canceled
+                elif workflow_run.status == WorkflowRunStatus.terminated:
+                    success, status = False, BlockStatus.terminated
+                else:
+                    success, status = False, BlockStatus.failed
+                reason = f"status_changed:{workflow_run.status}"
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=None if success else reason,
+                    output_parameter_value=result_dict,
+                    status=status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if browser_session_id and organization_id:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    browser_session_id, organization_id
+                )
+                if browser_session and browser_session.completed_at:
+                    LOG.info(
+                        "Browser session closed while waiting for human interaction",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+
+                    workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                    reason = "Browser session was closed while waiting for human interaction"
+                    result_dict = {"success": False, "reason": reason}
+
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=reason,
+                        output_parameter_value=result_dict,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
             if elapsed_time_seconds >= self.timeout_seconds:
                 LOG.info(
                     "Human Interaction block timeout_seconds reached",
@@ -15531,33 +15713,6 @@ class HumanInteractionBlock(BaseTaskBlock):
                     failure_reason=reason,
                     output_parameter_value=result_dict,
                     status=BlockStatus.timed_out,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
-            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-
-            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
-                LOG.info(
-                    "Workflow run status changed from paused",
-                    workflow_run_id=workflow_run_id,
-                    new_status=workflow_run.status,
-                    browser_session_id=browser_session_id,
-                )
-
-                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
-
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-
-                return await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=result_dict,
-                    status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )

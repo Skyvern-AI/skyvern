@@ -606,6 +606,84 @@ class TestGetOtpValueFromUrl:
         assert result == OTPValue(value="654321", type="totp")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("expected_otp_type", "resolved"),
+        [
+            pytest.param(OTPType.TOTP, OTPValue(value="654321", type="totp"), id="code_poll_gets_the_code"),
+            pytest.param(
+                OTPType.MAGIC_LINK,
+                OTPValue(value="https://example.com/signin?token=abc", type="magic_link"),
+                id="link_poll_gets_the_link",
+            ),
+        ],
+    )
+    async def test_webhook_parse_enforces_the_expected_otp_type(
+        self, monkeypatch: pytest.MonkeyPatch, expected_otp_type: OTPType, resolved: OTPValue
+    ) -> None:
+        """A relayed email carrying both a code and a sign-in link resolved to whichever the
+        unenforced parse happened to pick, so a code-entry login could be handed the link. The
+        expected type must reach the parser, as it already does on the stored-code path."""
+        from skyvern.services import otp_service
+
+        raw_email = "Your passcode is 654321. Or sign in directly: https://example.com/signin?token=abc"
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": raw_email},
+            is_json_response=True,
+        )
+
+        async def fake_parse_otp_login(
+            content: str, organization_id: str, enforced_otp_type: OTPType | None = None
+        ) -> OTPValue | None:
+            assert enforced_otp_type is expected_otp_type
+            if enforced_otp_type is OTPType.MAGIC_LINK:
+                return OTPValue(value="https://example.com/signin?token=abc", type="magic_link")
+            return OTPValue(value="654321", type="totp")
+
+        monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+            expected_otp_type=expected_otp_type,
+        )
+
+        assert result == resolved
+
+    @pytest.mark.asyncio
+    async def test_webhook_otp_of_another_type_keeps_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A parse that answers with the other OTP type despite the enforcement must not be handed
+        back as the caller's answer: the code may still arrive within the polling budget."""
+        from skyvern.services import otp_service
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": "Sign in here: https://example.com/signin?token=abc"},
+            is_json_response=True,
+        )
+        monkeypatch.setattr(
+            otp_service,
+            "parse_otp_login",
+            AsyncMock(return_value=OTPValue(value="https://example.com/signin?token=abc", type="magic_link")),
+        )
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+            expected_otp_type=OTPType.TOTP,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_parse_failure_warning_omits_raw_content_keeps_length(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.services import otp_service
 

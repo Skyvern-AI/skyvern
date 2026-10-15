@@ -787,6 +787,8 @@ def test_execution_receipts_round_trip_for_durable_proposal_storage() -> None:
 
     assert wire == {"step": ["version_a", "version_b"]}
     assert parse_execution_receipts(wire) == receipts
+    assert parse_execution_receipts(serialize_execution_receipts({"step": set()})) == {"step": set()}
+    assert parse_execution_receipts(serialize_execution_receipts({})) == {}
 
 
 def test_run_scoped_write_outputs_abstain_from_duplicate_claims() -> None:

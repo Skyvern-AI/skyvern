@@ -1915,6 +1915,20 @@ def _stub_credential_lookup(
 
 
 @pytest.mark.asyncio
+async def test_a_card_pick_fills_on_a_turn_whose_named_login_was_not_saved(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    _stub_credential_lookup(monkeypatch, _make_credential())
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.request_policy.record_named_login_not_found()
+
+    result = await _ask(ctx)
+    grant, error = await tools_module.credential_fill._credential_fill_origin_grant(ctx, "cred_1")
+
+    assert result["status"] == "connected"
+    assert error is None and grant is not None
+
+
+@pytest.mark.asyncio
 async def test_the_tool_call_raises_the_card_and_returns_the_connected_credential_to_the_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2985,6 +2999,9 @@ def test_the_raw_secret_card_sees_only_the_origin(user_url: str, origin: str) ->
     assert credential_pause_module.raw_secret_card_origin(user_url) == origin
 
 
+_SIGNED_IN_SCOPE_PHRASES = ("this turn's tests only", "start signed out")
+
+
 @pytest.mark.asyncio
 async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_does_not_fire_again(
     monkeypatch: pytest.MonkeyPatch,
@@ -3015,7 +3032,9 @@ async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_
     resume_msgs = await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config)
 
     assert resume_msgs is not None
-    assert credential_pause_module.signed_in_facts(signed_in) in json.dumps(resume_msgs)
+    resume_text = json.dumps(resume_msgs)
+    assert credential_pause_module.signed_in_facts(signed_in) in resume_text
+    assert all(phrase in resume_text for phrase in _SIGNED_IN_SCOPE_PHRASES)
     assert ctx.credential_pause_outcome == "signed_in"
     assert _turn_credential_prompt_reason(ctx) is None
     assert await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config) is None
@@ -3038,7 +3057,7 @@ async def test_a_card_answered_by_signing_in_tells_the_tool_what_happened(monkey
     result = await _call_ask_tool(ctx)
 
     assert (result["status"], result["browser_profile_id"]) == ("signed_in", "bp_signed_in")
-    assert result["detail"]
+    assert all(phrase in result["detail"] for phrase in _SIGNED_IN_SCOPE_PHRASES)
 
 
 _REGISTRATION = {
