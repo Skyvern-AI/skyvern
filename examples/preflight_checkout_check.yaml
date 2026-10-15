@@ -1,30 +1,37 @@
-# Sample workflow: pre-flight "can an agent reach checkout?" check before a purchase flow.
-# Block 1 calls a public, no-key API (ARC, arcreport.ai). Results are advisory; ARC stops before payment.
-# If the check says checkout is not reachable (or the saved check is stale), the run stops early.
+# Sample workflow: optional pre-flight "can an agent reach checkout?" check before a purchase flow.
+# Block 1 calls a pre-flight check service you choose (precheck_api_url). ARC (arcreport.ai) is one
+# example of such a service; any endpoint that returns JSON with `reachable_checkout` and `stale` works.
+# If the check says checkout is not reachable, the saved check is stale, or the call fails, the run stops early.
 title: Pre-flight checkout check, then purchase
-description: Calls a reach-checkout pre-flight API first and stops early when an agent likely can't reach checkout.
+description: Calls a pre-flight check API first and stops early when an agent likely can't reach checkout.
 workflow_definition:
   parameters:
     - key: store_url
       parameter_type: workflow
       workflow_parameter_type: string
       description: Store or product URL, e.g. https://www.allbirds.com
+    - key: precheck_api_url
+      parameter_type: workflow
+      workflow_parameter_type: string
+      description: >-
+        Pre-flight check endpoint; the store URL is appended as ?url=<encoded store_url>. It must return JSON
+        with boolean `reachable_checkout` and `stale`. Example: https://www.arcreport.ai/api/precheck (ARC, arcreport.ai).
+        Note that the store URL is sent to this service.
     - key: purchase_goal
       parameter_type: workflow
       workflow_parameter_type: string
       description: What the agent should do once checkout looks reachable
   blocks:
-    - label: arc_precheck
+    - label: preflight_check
       block_type: http_request
       method: GET
-      url: "https://www.arcreport.ai/api/precheck?url={{ store_url | urlencode }}&ref=skyvern"
+      url: "{{ precheck_api_url }}?url={{ store_url | urlencode }}"
       headers:
-        User-Agent: skyvern-agent/1.0
-        X-ARC-Client: skyvern
         Accept: application/json
       timeout: 15
       continue_on_failure: true
       parameter_keys:
+        - precheck_api_url
         - store_url
     - label: checkout_gate
       block_type: conditional
@@ -32,14 +39,14 @@ workflow_definition:
         - description: Checkout looks reachable and the saved check is fresh
           criteria:
             criteria_type: jinja2_template
-            expression: "{{ arc_precheck_output.response_body.reachable_checkout == true and arc_precheck_output.response_body.stale == false }}"
+            expression: "{{ preflight_check_output.response_body is defined and preflight_check_output.response_body.reachable_checkout is defined and preflight_check_output.response_body.reachable_checkout == true and preflight_check_output.response_body.stale is defined and preflight_check_output.response_body.stale == false }}"
           next_block_label: purchase
-        - description: Not reachable, stale, unknown or the check failed
+        - description: Not reachable, stale, unknown, or the check failed or timed out
           is_default: true
           next_block_label: stop_early
     - label: stop_early
       block_type: terminate
-      reason: "Pre-flight check: an agent likely can't reach checkout at {{ store_url }} (advisory). Stopped before running the purchase steps."
+      reason: "Pre-flight check: an agent likely can't reach checkout at {{ store_url }}, or the check was unavailable (advisory). Stopped before running the purchase steps."
     - label: purchase
       block_type: navigation
       url: "{{ store_url }}"

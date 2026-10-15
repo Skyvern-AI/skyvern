@@ -70,6 +70,7 @@
               "developers/getting-started/mcp",
               "developers/browser-automation",
               "developers/production",
+              "developers/preflight-checkout-check",
               "developers/troubleshooting",
               "developers/self-hosted/overview"
             ]
