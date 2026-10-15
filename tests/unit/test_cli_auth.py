@@ -75,6 +75,8 @@ def test_run_signup_defaults_to_cloud_write_path(tmp_path, monkeypatch) -> None:
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # Path.home() on Windows (py3.8+) reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     monkeypatch.delenv("SKYVERN_ENV_FILE", raising=False)
     (tmp_path / ".env").write_text("SKYVERN_API_KEY=server-key\n")
 
