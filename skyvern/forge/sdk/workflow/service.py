@@ -64,7 +64,6 @@ from skyvern.exceptions import (
     BrowserSessionStartupTimeout,
     DisabledBlockExecutionError,
     DownloadSaveIncompleteError,
-    ExternalBrowserSessionNotRunnable,
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
@@ -73,6 +72,7 @@ from skyvern.exceptions import (
     SequentialCredentialLimitExceeded,
     SkyvernException,
     SkyvernHTTPException,
+    StepTerminationError,
     UnrecognizedWorkflowParameters,
     WorkflowAttemptDispatchSuperseded,
     WorkflowHasNoBlocks,
@@ -149,8 +149,11 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
     SESSION_RETIREMENT_RUNNABLE_TYPE,
     PersistentBrowserSession,
+    PersistentBrowserSessionStatus,
+    external_browser_failure_reason,
     is_external_cdp_session,
     is_final_status,
+    lost_external_browser_error,
     unusable_browser_session_error,
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -251,6 +254,13 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_identifier,
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
+)
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    capped_loop_values,
+    capped_text_list,
+    collect_extracted_information,
+    truncate_oversized_response_text,
+    truncate_oversized_response_value,
 )
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_SAFETY_MARGIN_SECONDS,
@@ -371,16 +381,23 @@ from skyvern.services.workflow_script_service import (  # noqa: F401 -- re-expor
     engine_only_loop_child_types,
     is_block_type_cacheable,
 )
+from skyvern.utils.action_redaction import (
+    REDACTED_INPUT_VALUE,
+    REDACTED_OTP_VALUE,
+    is_otp_input_payload,
+    redact_input_text_payload_for_log,
+)
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
-from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes
+from skyvern.utils.secret_redaction import redact_console_log_bytes, redact_har_bytes, redact_secrets_from_text
 from skyvern.utils.strings import is_uuid
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, InputTextAction, VerificationCodeAction
+from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
@@ -390,6 +407,7 @@ from skyvern.webeye.real_browser_manager import (
     ensure_runtime_supports_browser_type,
     to_persistent_session_browser_type,
 )
+from skyvern.webeye.real_browser_state import is_external_browser_state
 from skyvern.webeye.session_cookies import (
     persist_session_cookies,
     read_persisted_session_cookies,
@@ -479,7 +497,15 @@ def partition_reuse_bound_key_by_timezone(reuse_bound_key: str, timezone_id: str
 
 
 def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
-    if type(value) is not dict or set(value) != _USER_DEFINED_ERROR_KEYS:
+    if type(value) is not dict:
+        return None
+    # `credential_check` is written only by the credential confirmation gate, which never runs on a
+    # code block's declared error. Tolerate the serialized null so the field's mere existence on
+    # UserDefinedError does not reject every typed block error, and drop the key so the merged rows
+    # stay exactly as they were; a non-null value is a claim this payload is not allowed to make.
+    if value.get("credential_check") is not None:
+        return None
+    if set(value) - {"credential_check"} != _USER_DEFINED_ERROR_KEYS:
         return None
     if (
         type(value["error_code"]) is not str
@@ -496,7 +522,7 @@ def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
         or value["error_type"] != "USER_DEFINED_ERROR"
     ):
         return None
-    return dict(value)
+    return {key: entry for key, entry in value.items() if key != "credential_check"}
 
 
 def _merge_workflow_run_errors(
@@ -664,64 +690,6 @@ DEBUG_SESSION_PROFILE_INCOMPATIBLE_CODE = "debug_session_profile_incompatible"
 DEBUG_SESSION_PROFILE_REASON_NO_PROFILE = "pbs_no_profile"
 DEBUG_SESSION_PROFILE_REASON_DIFFERENT = "pbs_different_profile"
 
-# Per-value cap for run-detail API responses. One block output — a sheet or
-# file read — is echoed verbatim into every run-detail read (app run page, MCP get_run,
-# run timeline); observed values reach 78MB, which wedges the browser's JSON view and
-# overruns MCP's result limits. OUTPUT_PARAMETER_MAX_VALUE_BYTES stays the storage-side
-# net; this is the far lower bound a synchronous JSON response can actually carry.
-RUN_RESPONSE_MAX_VALUE_BYTES = 2 * 1024 * 1024
-
-# Each level of sibling-preserving trim re-serializes its whole subtree, so unbounded
-# recursion costs O(depth x size): a 2.5MB value nested 400 deep serializes 1.27GB and
-# blocks the event loop for ~2s. Real block outputs need one or two levels; past this
-# the whole value is marked instead of descending further.
-RUN_RESPONSE_MAX_TRIM_DEPTH = 4
-
-LOOP_VALUE_TRUNCATED_PLACEHOLDER = "[truncated]"
-
-
-def _response_value_size_bytes(value: Any, log_context: dict[str, Any]) -> int | None:
-    """Serialized size as FastAPI would put it on the wire, or None if it can't be measured."""
-    try:
-        # Mirrors FastAPI's JSONResponse.render. ensure_ascii=False because the default
-        # escapes non-ASCII to \uXXXX (double-counting CJK); the compact separators because
-        # the defaults add ", " and ": ", ~12% on a wide row-array.
-        return len(json.dumps(value, default=str, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    except Exception:
-        LOG.warning("Failed to measure run response value size; passing through", exc_info=True, **log_context)
-        return None
-
-
-# Room reserved so the trailing marker still fits inside the cap alongside kept entries.
-_TRUNCATION_MARKER_RESERVE_BYTES = 512
-
-TRUNCATION_MARKER_KEY = "_truncated"
-
-
-def _truncation_marker(
-    size_bytes: int,
-    *,
-    limit_bytes: int | None = None,
-    original_count: int | None = None,
-    kept_count: int | None = None,
-) -> dict:
-    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
-    marker = {
-        "truncated": True,
-        "reason": "exceeded_max_run_response_value_size",
-        "original_size_bytes": size_bytes,
-        "limit_bytes": effective_limit,
-    }
-    if original_count is not None:
-        marker["original_count"] = original_count
-        marker["kept_count"] = kept_count
-    return marker
-
-
-def _string_wire_size(value: str) -> int:
-    """Serialized size of a string including JSON quoting and escapes."""
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-
 
 def capped_task_v2(task_v2: Any) -> Any:
     """Cap the output on an embedded TaskV2, which rides the workflow run response."""
@@ -787,6 +755,134 @@ def cap_action_payloads(action: Action, **log_context: Any) -> None:
         )
 
 
+def redact_one_time_code_action(action: Action, *, withhold_untyped_input: bool = True) -> Action:
+    payload = action.model_dump()
+    marked = (
+        action.action_type == ActionType.VERIFICATION_CODE
+        or is_otp_input_payload(payload)
+        or action.text == REDACTED_OTP_VALUE
+    )
+    # A base-Action INPUT_TEXT from an action_json hydration fallback has lost its subclass markers, so it is
+    # withheld too. Step output always reads back as base Action, so step callers opt in per saved row instead.
+    untyped_input = action.action_type == ActionType.INPUT_TEXT and not isinstance(action, InputTextAction)
+    if not (marked or (withhold_untyped_input and untyped_input)):
+        return action
+    placeholder = REDACTED_OTP_VALUE if marked else REDACTED_INPUT_VALUE
+    log_safe = redact_input_text_payload_for_log(payload, value_key="text")
+    context = action.input_or_select_context
+    return action.model_copy(
+        update={
+            **{
+                field: log_safe[field]
+                for field in ("totp_identifier", "totp_url", "totp_timing_info")
+                if field in log_safe
+            },
+            "text": placeholder if action.text else action.text,
+            "response": placeholder if action.response else action.response,
+            "reasoning": "Input value withheld.",
+            "intention": None,
+            "description": None,
+            "output": None,
+            "skyvern_element_data": None,
+            "input_or_select_context": (
+                context.model_copy(update={k: None for k, v in context.model_dump().items() if isinstance(v, str)})
+                if context
+                else None
+            ),
+        }
+    )
+
+
+def _withhold_result_text(results: list[ActionResult], *, keep_data: bool = False) -> list[ActionResult]:
+    # Playwright fill and type errors quote the typed value in their call log, e.g. `fill("<value>")`.
+    withheld = ("exception_message",) if keep_data else ("exception_message", "data")
+    return [result.model_copy(update=dict.fromkeys(withheld)) for result in results]
+
+
+def one_time_code_markers(actions: Sequence[Action]) -> tuple[set[str], set[str]]:
+    """The ids of the rows withheld as one-time codes, and the code values those rows hold."""
+    marked_ids: set[str] = set()
+    values: set[str] = set()
+    digits_by_step: dict[str | None, dict[int, str]] = {}
+    for action in actions:
+        if redact_one_time_code_action(action) is action:
+            continue
+        if action.action_id:
+            marked_ids.add(action.action_id)
+        # A fallback row is withheld without being known to hold a code, so its text is not scrubbed elsewhere.
+        if redact_one_time_code_action(action, withhold_untyped_input=False) is action:
+            continue
+        if isinstance(action, VerificationCodeAction):
+            values.add(action.verification_code.strip())
+        text = (action.text or "").strip()
+        timing_info = action.totp_timing_info or {}
+        if text and timing_info.get("is_totp_sequence") and isinstance(timing_info.get("action_index"), int):
+            digits_by_step.setdefault(action.step_id, {})[timing_info["action_index"]] = text
+        elif text and text != REDACTED_OTP_VALUE:
+            values.add(text)
+    values.update("".join(digit for _, digit in sorted(digits.items())) for digits in digits_by_step.values())
+    # A lone multi-field digit would erase every matching digit in unrelated text, so only whole codes are scrubbed.
+    return marked_ids, {value for value in values if len(value) > 1}
+
+
+def _scrub_one_time_codes(action: Action, values: set[str]) -> Action:
+    texts = {
+        "text": action.text,
+        "reasoning": action.reasoning,
+        "intention": action.intention,
+        "response": action.response,
+    }
+    scrubbed = {
+        field: redact_secrets_from_text(text, values, boundary_all_lengths=True)
+        for field, text in texts.items()
+        if text
+    }
+    changed = {field: text for field, text in scrubbed.items() if text != texts[field]}
+    return action.model_copy(update=changed) if changed else action
+
+
+def redact_one_time_code_actions(actions: Sequence[Action]) -> list[Action]:
+    _, values = one_time_code_markers(actions)
+    projected = []
+    for action in actions:
+        masked = redact_one_time_code_action(action)
+        projected.append(_scrub_one_time_codes(action, values) if masked is action else masked)
+    return projected
+
+
+def redact_one_time_code_step(step: Step, marked_action_ids: set[str], values: set[str]) -> Step:
+    output = step.output
+    if output is None:
+        return step
+    if not output.actions_and_results:
+        if not output.action_results or not (marked_action_ids or values):
+            return step
+        withheld = _withhold_result_text(output.action_results, keep_data=True)
+        return step.model_copy(update={"output": output.model_copy(update={"action_results": withheld})})
+    actions_and_results: list[tuple[Action, list[ActionResult]]] = []
+    masked_results: list[ActionResult] = []
+    for action, results in output.actions_and_results:
+        masked = redact_one_time_code_action(action, withhold_untyped_input=action.action_id in marked_action_ids)
+        if masked is not action:
+            masked_results.extend(results)
+            results = _withhold_result_text(results)
+        else:
+            masked = _scrub_one_time_codes(action, values)
+        actions_and_results.append((masked, results))
+    legacy_results = output.action_results
+    if masked_results and legacy_results:
+        legacy_results = [
+            _withhold_result_text([result])[0] if result in masked_results else result for result in legacy_results
+        ]
+    return step.model_copy(
+        update={
+            "output": output.model_copy(
+                update={"actions_and_results": actions_and_results, "action_results": legacy_results}
+            )
+        }
+    )
+
+
 # Every WorkflowRunBlock field that can hold unbounded model- or user-supplied content.
 # Enumerated rather than extended one reviewer comment at a time; test_timeline_block_field
 # _coverage fails if a new field on the model is neither capped here nor explicitly exempt.
@@ -822,299 +918,6 @@ UNBOUNDED_BLOCK_TEXT_FIELDS = (
     "current_value",
     "final_url",
 )
-
-
-@overload
-def truncate_oversized_response_text(current_value: None, *, limit_bytes: int | None = None) -> None: ...
-
-
-@overload
-def truncate_oversized_response_text(current_value: str, *, limit_bytes: int | None = None) -> str: ...
-
-
-def truncate_oversized_response_text(current_value: str | None, *, limit_bytes: int | None = None) -> str | None:
-    """Cap one unbounded text field on a timeline block.
-
-    Prompts, email bodies, rendered branch expressions and ``str(loop_over_value)`` are all
-    persisted without a size guard. Stays a string, since every one of these is typed
-    ``str | None``, keeping a readable prefix in the same shape as the DecisionBlock cap.
-    """
-    if current_value is None:
-        return current_value
-    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if limit_bytes is None else limit_bytes
-    if _string_wire_size(current_value) <= effective_limit:
-        return current_value
-    # JSON escaping inflates quotes, backslashes and control characters — up to 6x for a
-    # control character — so a raw byte count understates the serialized size by as much as
-    # half. Shrink until the encoded form actually fits rather than trusting len().
-    keep = min(len(current_value), effective_limit)
-    while keep > 0:
-        candidate = f"{current_value[:keep]}...[truncated {len(current_value) - keep} chars]"
-        if _string_wire_size(candidate) <= effective_limit:
-            return candidate
-        keep //= 2
-    return "...[truncated]"
-
-
-def _capped_text_list(values: list[str] | None, **log_context: Any) -> list[str] | None:
-    """Cap a ``list[str]`` without inserting a JSON marker object into it."""
-    if not values:
-        return values
-    size_bytes = _response_value_size_bytes(values, log_context)
-    if size_bytes is None or size_bytes <= RUN_RESPONSE_MAX_VALUE_BYTES:
-        return values
-
-    kept: list[str] = []
-    running_size = 2
-    for value in values:
-        values_after_current = len(values) - len(kept) - 1
-        if values_after_current == 0:
-            item_separator = 1 if kept else 0
-            available_for_item = RUN_RESPONSE_MAX_VALUE_BYTES - running_size - item_separator
-            capped_value = truncate_oversized_response_text(value, limit_bytes=available_for_item)
-            item_size = _string_wire_size(capped_value)
-            if running_size + item_separator + item_size <= RUN_RESPONSE_MAX_VALUE_BYTES:
-                kept.append(capped_value)
-            break
-
-        remaining_count = len(values) - len(kept)
-        marker = f"...[truncated {remaining_count} values]"
-        marker_size = _string_wire_size(marker)
-        item_separator = 1 if kept else 0
-        available_for_item = RUN_RESPONSE_MAX_VALUE_BYTES - running_size - item_separator - marker_size - 1
-        if available_for_item <= _string_wire_size("...[truncated]"):
-            break
-        capped_value = truncate_oversized_response_text(value, limit_bytes=available_for_item)
-        item_size = _string_wire_size(capped_value)
-        if running_size + item_separator + item_size + 1 + marker_size > RUN_RESPONSE_MAX_VALUE_BYTES:
-            break
-        kept.append(capped_value)
-        running_size += item_separator + item_size
-
-    if len(kept) == len(values):
-        return kept
-
-    marker = f"...[truncated {len(values) - len(kept)} values]"
-    LOG.warning(
-        "Trimming oversized run response string list",
-        original_size_bytes=size_bytes,
-        kept_count=len(kept),
-        original_count=len(values),
-        **log_context,
-    )
-    return [*kept, marker]
-
-
-def _capped_loop_values(loop_values: list[Any] | None, **log_context: Any) -> list[Any] | None:
-    """Cap ``loop_values`` without changing how many iterations it reports.
-
-    The run-detail page reads the iteration count off ``loop_values.length`` and resolves a
-    selected iteration by index, so collapsing the list would render a finished 200-iteration
-    loop as 200/1 and strand every selection past the first.
-    """
-    if not loop_values:
-        return loop_values
-
-    capped = truncate_oversized_response_value(loop_values, field="loop_values", **log_context)
-    # A same-length list means every iteration survived (some trimmed in place). A shorter
-    # one is the partial-plus-marker shape, which would misreport the iteration count here.
-    if isinstance(capped, list) and len(capped) == len(loop_values):
-        return capped
-    # Per-element trimming could not fit either. Repeat a compact placeholder so the count
-    # and index lookups still line up; repeating the full marker would re-exceed the cap on
-    # a long list. The sizes are on the warning the call above already emitted.
-    placeholders = [LOOP_VALUE_TRUNCATED_PLACEHOLDER] * len(loop_values)
-    placeholder_size = _response_value_size_bytes(placeholders, log_context)
-    if placeholder_size is not None and placeholder_size <= RUN_RESPONSE_MAX_VALUE_BYTES:
-        return placeholders
-    # Even one placeholder per iteration overruns the cap (~150k entries). The count has to
-    # move into bounded metadata rather than stay encoded as list length.
-    size_bytes = _response_value_size_bytes(loop_values, log_context) or 0
-    return [_truncation_marker(size_bytes, original_count=len(loop_values), kept_count=0)]
-
-
-def truncate_oversized_response_value(
-    value: Any,
-    _remaining_trim_depth: int | None = None,
-    _loop_payload_budget_granted: bool = False,
-    _limit_bytes: int | None = None,
-    **log_context: Any,
-) -> Any:
-    """Fail-open cap for one value echoed into a run-detail API response.
-
-    A dict or list keeps every element that fits; only oversized ones are replaced, so
-    structure the UI reads survives alongside the one huge field — a block's
-    ``downloaded_file_urls``, a trigger block's ``workflow_run_id``, and the per-iteration
-    entries of a for-loop's ``list[list[dict]]`` output. A replaced element becomes an
-    opaque marker rather than a partial value: a truncated list is indistinguishable from
-    a complete one to an SDK caller.
-    """
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-
-    effective_limit = RUN_RESPONSE_MAX_VALUE_BYTES if _limit_bytes is None else _limit_bytes
-    remaining_trim_depth = RUN_RESPONSE_MAX_TRIM_DEPTH if _remaining_trim_depth is None else _remaining_trim_depth
-    size_bytes = _response_value_size_bytes(value, log_context)
-    if size_bytes is None or size_bytes <= effective_limit:
-        return value
-
-    if isinstance(value, (dict, list)) and remaining_trim_depth > 0:
-        is_loop_output_envelope = (
-            isinstance(value, dict)
-            and "output_value" in value
-            and ("output_parameter" in value or "loop_value" in value)
-        )
-        if is_loop_output_envelope and isinstance(value, dict):
-            # The transport wrapper is cheap and the UI needs all of it. Reserve its
-            # encoded bytes, then trim only output_value to what remains; otherwise a
-            # marginally oversized entry can keep loop metadata and drop the payload.
-            trimmed_envelope = {
-                key: truncate_oversized_response_value(
-                    entry,
-                    _remaining_trim_depth=remaining_trim_depth - 1,
-                    _loop_payload_budget_granted=_loop_payload_budget_granted,
-                    _limit_bytes=effective_limit,
-                    **log_context,
-                )
-                for key, entry in value.items()
-                if key != "output_value"
-            }
-            envelope_size = _response_value_size_bytes(trimmed_envelope, log_context)
-            output_key_size = _response_value_size_bytes("output_value", log_context)
-            if envelope_size is not None and output_key_size is not None:
-                output_overhead = (1 if trimmed_envelope else 0) + output_key_size + 1
-                output_limit = effective_limit - envelope_size - output_overhead
-                if output_limit > 0:
-                    grants_loop_payload_budget = not _loop_payload_budget_granted
-                    trimmed_output = truncate_oversized_response_value(
-                        value["output_value"],
-                        _remaining_trim_depth=(
-                            RUN_RESPONSE_MAX_TRIM_DEPTH if grants_loop_payload_budget else remaining_trim_depth - 1
-                        ),
-                        _loop_payload_budget_granted=True,
-                        _limit_bytes=output_limit,
-                        **log_context,
-                    )
-                    candidate = {
-                        key: trimmed_output if key == "output_value" else trimmed_envelope[key] for key in value
-                    }
-                    candidate_size = _response_value_size_bytes(candidate, log_context)
-                    if candidate_size is not None and candidate_size <= effective_limit:
-                        return candidate
-
-        # Reserve the encoded size of every sibling before trimming one child. Without this,
-        # a trimmable child can consume nearly the entire parent budget, after which the
-        # parent falls back to one bare marker and drops UI metadata such as screenshot URLs.
-        # This mirrors the loop-envelope allocation above, but applies to ordinary dicts
-        # and lists too. The direct formula is the child size that would make the original
-        # collection fit: cap - original collection size + original child size. Attempt it
-        # lazily while accumulating: pre-scanning a many-row list would reintroduce the
-        # synchronous breadth work this cap is meant to avoid.
-        items: Iterable[tuple[Any, Any]]
-        if isinstance(value, dict):
-            items = value.items()
-            is_dict = True
-        else:
-            items = enumerate(value)
-            is_dict = False
-
-        # Accumulate as we go and stop once the kept elements fill the cap. Entries that
-        # fit are kept and a trailing marker records what was dropped, so a table 1% over
-        # the limit still renders instead of vanishing. The marker is what keeps this from
-        # being a silent truncation — a bare prefix would be indistinguishable from the
-        # whole value to an SDK caller.
-        # Start at the enclosing braces/brackets and charge each entry its separators —
-        # and, for a dict, its quoted key. Summing child values alone under-counts a
-        # key-heavy dict by roughly half, which would let a payload through at ~2x the cap.
-        running_size = 2
-        trimmed_pairs: list[tuple[Any, Any]] = []
-        dropped_any = False
-        # The loop's list/list/entry wrappers are transport structure, not payload depth.
-        # Give output_value one fresh, bounded trim budget so nested extracted data and
-        # links survive while the one heavy sub-value is replaced. The grant flag prevents
-        # nested or model-produced envelopes from resetting the budget repeatedly.
-        for key, entry in items:
-            raw_entry_size = _response_value_size_bytes(entry, log_context)
-            entry_limit = effective_limit - size_bytes + raw_entry_size if raw_entry_size is not None else 0
-            grants_loop_payload_budget = (
-                is_loop_output_envelope and key == "output_value" and not _loop_payload_budget_granted
-            )
-            child_remaining_trim_depth = (
-                RUN_RESPONSE_MAX_TRIM_DEPTH if grants_loop_payload_budget else remaining_trim_depth - 1
-            )
-            if raw_entry_size is not None and 0 < entry_limit < raw_entry_size:
-                sibling_reserved_entry = truncate_oversized_response_value(
-                    entry,
-                    _remaining_trim_depth=child_remaining_trim_depth,
-                    _loop_payload_budget_granted=_loop_payload_budget_granted or grants_loop_payload_budget,
-                    _limit_bytes=entry_limit,
-                    **log_context,
-                )
-                sibling_candidate: dict[Any, Any] | list[Any]
-                if isinstance(value, dict):
-                    sibling_candidate = {**value, key: sibling_reserved_entry}
-                else:
-                    sibling_candidate = list(value)
-                    sibling_candidate[key] = sibling_reserved_entry
-                candidate_size = _response_value_size_bytes(sibling_candidate, log_context)
-                if candidate_size is not None and candidate_size <= effective_limit:
-                    return sibling_candidate
-            trimmed_entry = truncate_oversized_response_value(
-                entry,
-                _remaining_trim_depth=child_remaining_trim_depth,
-                _loop_payload_budget_granted=_loop_payload_budget_granted or grants_loop_payload_budget,
-                _limit_bytes=effective_limit,
-                **log_context,
-            )
-            entry_size = _response_value_size_bytes(trimmed_entry, log_context)
-            if entry_size is None:
-                dropped_any = True
-                break
-            # +1 for the comma; for a dict also the serialized key and its colon.
-            running_size += entry_size + 1
-            if is_dict:
-                key_size = _response_value_size_bytes(key, log_context)
-                if key_size is None:
-                    dropped_any = True
-                    break
-                running_size += key_size + 1
-            if running_size > effective_limit - _TRUNCATION_MARKER_RESERVE_BYTES:
-                dropped_any = True
-                break
-            trimmed_pairs.append((key, trimmed_entry))
-        # `dropped_any`, not the running total: the loop stops a marker's width below the
-        # cap, so a size check here would call a partial result complete and drop entries
-        # with nothing recording it.
-        if not dropped_any:
-            if is_dict:
-                return dict(trimmed_pairs)
-            return [entry for _, entry in trimmed_pairs]
-        if trimmed_pairs:
-            marker = _truncation_marker(
-                size_bytes,
-                limit_bytes=effective_limit,
-                original_count=len(value),
-                kept_count=len(trimmed_pairs),
-            )
-            LOG.warning(
-                "Trimming oversized run response collection",
-                original_size_bytes=size_bytes,
-                kept_count=len(trimmed_pairs),
-                original_count=len(value),
-                **log_context,
-            )
-            if is_dict:
-                return {**dict(trimmed_pairs), TRUNCATION_MARKER_KEY: marker}
-            return [*(entry for _, entry in trimmed_pairs), marker]
-        # Nothing fit at all — fall through to replacing the whole value.
-
-    LOG.warning(
-        "Truncating oversized run response value",
-        original_size_bytes=size_bytes,
-        limit_bytes=effective_limit,
-        **log_context,
-    )
-    return _truncation_marker(size_bytes, limit_bytes=effective_limit)
 
 
 @dataclass(frozen=True)
@@ -2545,25 +2348,6 @@ class WorkflowService:
             cleared_block_count=cleared_count,
             deduped_block_count=len(blocks_by_id),
         )
-
-    @staticmethod
-    def _collect_extracted_information(value: Any) -> list[Any]:
-        """Recursively collect extracted_information values from nested outputs."""
-        results: list[Any] = []
-        if isinstance(value, dict):
-            if "extracted_information" in value and value["extracted_information"] is not None:
-                extracted = value["extracted_information"]
-                if isinstance(extracted, list):
-                    results.extend(extracted)
-                else:
-                    results.append(extracted)
-            else:
-                for v in value.values():
-                    results.extend(WorkflowService._collect_extracted_information(v))
-        elif isinstance(value, list):
-            for item in value:
-                results.extend(WorkflowService._collect_extracted_information(item))
-        return results
 
     async def _generate_urls_from_artifact_ids(
         self,
@@ -5400,29 +5184,27 @@ class WorkflowService:
             )
         )
         session_id = browser_session.persistent_browser_session_id
-        if is_external_cdp_session(browser_session):
-            raise ExternalBrowserSessionNotRunnable(session_id)
         if is_final_status(browser_session.status):
-            raise BrowserSessionClosed(session_id)
-        status = getattr(browser_session.status, "value", browser_session.status)
-        readiness_timeout = (
-            app.PERSISTENT_SESSIONS_MANAGER.get_browser_session_startup_timeout_seconds()
-            if status == "created"
-            else 0.0
-        )
-        readiness_started_at = time.monotonic()
-        browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
-            session_id,
-            organization_id,
-            timeout=readiness_timeout,
-        )
-        if browser_address is None:
-            if status == "created" and time.monotonic() - readiness_started_at < readiness_timeout:
-                raise BrowserSessionAlreadyOccupiedError(
-                    session_id,
-                    browser_session.runnable_id or "starting",
-                )
-            raise BrowserSessionClosed(session_id)
+            raise BrowserSessionClosed(session_id, registered=is_external_cdp_session(browser_session))
+        # A registered external browser never gets a client address; begin_session judges its row instead.
+        if not is_external_cdp_session(browser_session):
+            starting = browser_session.status == PersistentBrowserSessionStatus.created
+            readiness_timeout = (
+                app.PERSISTENT_SESSIONS_MANAGER.get_browser_session_startup_timeout_seconds() if starting else 0.0
+            )
+            readiness_started_at = time.monotonic()
+            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
+                session_id,
+                organization_id,
+                timeout=readiness_timeout,
+            )
+            if browser_address is None:
+                if starting and time.monotonic() - readiness_started_at < readiness_timeout:
+                    raise BrowserSessionAlreadyOccupiedError(
+                        session_id,
+                        browser_session.runnable_id or "starting",
+                    )
+                raise BrowserSessionClosed(session_id)
         lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
             **browser_dispatch,
             browser_session_id=session_id,
@@ -7103,7 +6885,10 @@ class WorkflowService:
         except WorkflowAttemptDispatchSuperseded:
             raise
         except Exception as error:
-            LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
+            if isinstance(error, SkyvernHTTPException) and error.status_code == 402:
+                LOG.info("Workflow run refused at admission", workflow_run_id=workflow_run_id, reason=str(error))
+            else:
+                LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
             failed_run = await self._mark_workflow_run_as_failed_for_dispatch(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -7866,6 +7651,8 @@ class WorkflowService:
             # stale-owner release must defer from this point until browser teardown releases it.
             mark_stream_closing(workflow_run_id)
             if pre_finally_status is not None:
+                # Browser cleanup evicts the run's browser, so whether it was lost must be read before it.
+                run_lost_external_browser = self._lost_external_browser(workflow_run)
                 browser_persistence_status = pre_finally_browser_persistence_status
                 if browser_persistence_status is not None and not browser_persistence_status.is_final():
                     browser_persistence_status = WorkflowRunStatus.completed
@@ -7953,6 +7740,7 @@ class WorkflowService:
                             pre_finally_failure_reason=pre_finally_failure_reason,
                             pre_finally_failure_category=pre_finally_failure_category,
                             run_minutes_recorded_through=run_minutes_recorded_through,
+                            lost_external_browser=run_lost_external_browser,
                         )
                     )
                 except BaseException:
@@ -9459,7 +9247,8 @@ class WorkflowService:
                         duration_ms=block_exec_duration_ms,
                     )
                     block_executed_with_code = False
-            except _WorkflowRunDispatchScopeError:
+            # A refused step is not a script failure: AI fallback would re-run the block into the same refusal.
+            except (_WorkflowRunDispatchScopeError, StepTerminationError):
                 raise
             except Exception as e:
                 block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
@@ -13564,6 +13353,31 @@ class WorkflowService:
             run_with=run_with,
         )
 
+    @staticmethod
+    def _lost_external_browser(workflow_run: WorkflowRun) -> bool:
+        if not workflow_run.browser_session_id:
+            return False
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run.workflow_run_id)
+        return is_external_browser_state(browser_state) and not browser_state.is_connected()
+
+    @staticmethod
+    async def _ended_external_registration_reason(
+        workflow_run: WorkflowRun, *, lost_external_browser: bool
+    ) -> str | None:
+        """A registered browser that expired, closed or died under the run fails it, even when no later step used it."""
+        if not workflow_run.browser_session_id:
+            return None
+        try:
+            row = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                workflow_run.browser_session_id, workflow_run.organization_id
+            )
+        except Exception:
+            LOG.warning("Could not read the browser session at finalization", exc_info=True)
+            return (
+                get_user_facing_exception_message(lost_external_browser_error(None)) if lost_external_browser else None
+            )
+        return external_browser_failure_reason(row, browser_connected=not lost_external_browser)
+
     async def _finalize_workflow_run_status(
         self,
         workflow_run_id: str,
@@ -13575,6 +13389,7 @@ class WorkflowService:
         requested_completion_contract: dict[str, Any] | None = None,
         run_minutes_recorded_through: datetime | None = None,
         workflow: Workflow | None = None,
+        lost_external_browser: bool = False,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -13591,6 +13406,18 @@ class WorkflowService:
             WorkflowRunStatus.terminated,
             WorkflowRunStatus.timed_out,
         ):
+            registration_end = await self._ended_external_registration_reason(
+                workflow_run, lost_external_browser=lost_external_browser
+            )
+            if registration_end is not None:
+                updated = await self._update_workflow_run_status_if_not_final(
+                    workflow_run_id=workflow_run_id,
+                    status=WorkflowRunStatus.failed,
+                    failure_reason=registration_end,
+                )
+                if updated is None:
+                    return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
+                return updated
             contract_verdict = await self._grade_completion_contract(
                 workflow_run,
                 is_partial_run=is_partial_run,
@@ -14394,10 +14221,11 @@ class WorkflowService:
         workflow_run_id: str,
         workflow: Workflow | None = None,
         workflow_run_output_parameters: list[WorkflowRunOutputParameter] | None = None,
+        prefer_capped: bool = False,
     ) -> list[tuple[OutputParameter, WorkflowRunOutputParameter]]:
         if workflow_run_output_parameters is None:
             workflow_run_output_parameters = await app.DATABASE.workflow_runs.get_workflow_run_output_parameters(
-                workflow_run_id=workflow_run_id
+                workflow_run_id=workflow_run_id, prefer_capped=prefer_capped
             )
         output_parameters = await app.DATABASE.workflow_params.get_workflow_output_parameters_by_ids(
             output_parameter_ids=[
@@ -14960,6 +14788,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 workflow=workflow,
                 workflow_run_output_parameters=historical_outputs,
+                prefer_capped=cap_output_values,
             ),
             self._fetch_recording_urls(
                 workflow_run,
@@ -14993,13 +14822,18 @@ class WorkflowService:
                     return value
                 return truncate_oversized_response_value(value, workflow_run_id=workflow_run_id, output_key=output_key)
 
-            # Collect from the raw values, not the capped ones: a loop output whose entries
+            # Collect from the whole value, not the capped one: a loop output whose entries
             # are individually small but collectively over the cap still has every
-            # iteration's extracted_information, and only the collected list gets capped.
+            # iteration's extracted_information, and only the collected list gets capped. A
+            # capped read never loads the whole value, so it reuses what the write recorded.
             extracted_information: list[Any] = []
             for _, output in output_parameter_tuples:
-                if output.value is not None:
-                    extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
+                # Only a capping read may use the precomputed list: it is itself capped, and an
+                # uncapped reader loaded the whole value and must collect from that for fidelity.
+                if cap_output_values and output.precomputed_extracted_information is not None:
+                    extracted_information.extend(output.precomputed_extracted_information)
+                elif output.value is not None:
+                    extracted_information.extend(collect_extracted_information(output.value))
 
             outputs = {
                 output_parameter.key: _cap(output.value, output_parameter.key)
@@ -15642,7 +15476,11 @@ class WorkflowService:
         elif policy_run and not attempt_lookup_failed and attempt_rows and need_call_webhook:
             # Never fall back to a newer attempt if a late cleanup cannot find its own row.
             terminal_decision = RetryDecision(False, attempt_number, 0, True, "attempt_not_found")
-        analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
+        analytics.capture(
+            "skyvern-oss-agent-workflow-status",
+            {"status": workflow_run.status},
+            organization_id=workflow_run.organization_id,
+        )
         capture_workflow_run_ids = [workflow_run.workflow_run_id]
         caller_cancelled = False
         try:
@@ -17350,6 +17188,7 @@ class WorkflowService:
         workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
+            prefer_capped=cap_output_values,
         )
         if cap_output_values:
             for block in workflow_run_blocks:
@@ -17372,13 +17211,13 @@ class WorkflowService:
                     setattr(
                         block,
                         list_field,
-                        _capped_text_list(
+                        capped_text_list(
                             getattr(block, list_field),
                             workflow_run_id=workflow_run_id,
                             field=list_field,
                         ),
                     )
-                block.loop_values = _capped_loop_values(
+                block.loop_values = capped_loop_values(
                     block.loop_values,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=block.workflow_run_block_id,
@@ -17389,7 +17228,7 @@ class WorkflowService:
             block.task_id: block for block in workflow_run_blocks if block.task_id
         }
         actions = await app.DATABASE.tasks.get_tasks_actions(task_ids=task_ids, organization_id=organization_id)
-        for action in actions:
+        for action in redact_one_time_code_actions(actions):
             if not action.task_id:
                 continue
             # Actions ride the block they hydrate, and a completion/extraction action can

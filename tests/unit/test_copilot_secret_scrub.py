@@ -498,12 +498,31 @@ class TestPersistenceSeam:
             assert form not in scrubbed
         assert REDACTED_SECRET_PLACEHOLDER in scrubbed
 
-    def test_browser_style_url_encoding_is_a_registered_form(self) -> None:
-        """encodeURIComponent leaves `!*'()` literal where Python's quote does not."""
+    @pytest.mark.parametrize(
+        ("password", "browser_encoded"),
+        [
+            ("Sp1r!t&Level<2026>", "Sp1r!t%26Level%3C2026%3E"),
+            ("p@ss word", "p@ss%20word"),
+            ('a"b:c', "a%22b:c"),
+            ("Tr0ub4dor&3 x", "Tr0ub4dor&3%20x"),
+            ("50%off now", "50%off%20now"),
+            ("foo\\bar x", "foo/bar%20x"),
+            ("tab\tline\nbreak", "tablinebreak"),
+        ],
+        ids=[
+            "encodeURIComponent-query",
+            "chromium-path-space",
+            "chromium-path-quote",
+            "chromium-path-ampersand",
+            "chromium-path-percent",
+            "chromium-path-backslash",
+            "chromium-path-tab-newline",
+        ],
+    )
+    def test_browser_style_url_encoding_is_a_registered_form(self, password: str, browser_encoded: str) -> None:
+        """encodeURIComponent leaves `!*'()` literal in a query, and Chromium leaves `@&:` literal in a path."""
         ctx = _agent_ctx()
-        password = "Sp1r!t&Level<2026>"
         register_secret_scrub_value(ctx, password)
-        browser_encoded = "Sp1r!t%26Level%3C2026%3E"
 
         assert browser_encoded in registered_scrub_values(ctx)
         assert scrub_secrets_from_text(ctx, f"?next={browser_encoded}") == f"?next={REDACTED_SECRET_PLACEHOLDER}"

@@ -1,14 +1,19 @@
 import asyncio
+import base64
+import binascii
 import json
 import random
+import re
 import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, urlparse
 
+import orjson
 import structlog
 import yaml
 from fastapi import (
@@ -25,10 +30,11 @@ from fastapi import (
     UploadFile,
 )
 from fastapi import status as http_status
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from opentelemetry import trace
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from starlette.types import Receive, Scope, Send
 
 from skyvern import analytics
 from skyvern._version import __version__
@@ -61,7 +67,12 @@ from skyvern.forge.sdk.artifact.signing import (
     parse_keyring,
     verify_artifact_signature,
 )
-from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.base import (
+    StoredObjectChangedError,
+    StoredObjectStream,
+    StreamingArtifactStorage,
+    artifact_filename_from_uri,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
@@ -71,13 +82,19 @@ from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
     is_job_recipe_workflow_run_trigger_type,
 )
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagValueAlreadyExists,
     TagValueRenameCollision,
     TagValueRenameResult,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+    is_indexed_runs_list_search_key,
+)
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
+from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.experimentation.workflow_block_engine import effective_default_engine
@@ -120,6 +137,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     OrganizationUpdate,
 )
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_external_cdp_session
 from skyvern.forge.sdk.schemas.prompts import CreateFromPromptRequest
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request
@@ -156,7 +174,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
-from skyvern.forge.sdk.workflow.service import cap_action_payloads, capped_task_v1_response, capped_task_v2
+from skyvern.forge.sdk.workflow.service import (
+    cap_action_payloads,
+    capped_task_v1_response,
+    capped_task_v2,
+    one_time_code_markers,
+    redact_one_time_code_actions,
+    redact_one_time_code_step,
+)
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
@@ -342,7 +367,9 @@ async def run_task(
     current_org = caller.organization
     if run_request.webhook_url:
         run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
-    analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
+    analytics.capture(
+        "skyvern-oss-run-task", data={"url": run_request.url}, organization_id=current_org.organization_id
+    )
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     await _assert_files_attachable(run_request.file_ids, current_org.organization_id)
@@ -3412,6 +3439,67 @@ def _artifact_content_response_headers(
     }
 
 
+# The most one storage read returns, so a response holds about this much however large the object is.
+_ARTIFACT_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+class _StoredArtifactResponse(StreamingResponse):
+    """Streams a stored artifact and closes its storage read however the response ends, disconnects included."""
+
+    def __init__(self, stream: StoredObjectStream, **kwargs: Any) -> None:
+        super().__init__(stream.iter_chunks(_ARTIFACT_STREAM_CHUNK_BYTES), **kwargs)
+        self._stream = stream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._stream.aclose()
+
+
+async def _stream_artifact_content(
+    storage: StreamingArtifactStorage,
+    artifact: Artifact,
+    range_header: str | None,
+    media_type: str,
+    headers: dict[str, str],
+) -> Response:
+    # A Range header resolves against the stored size exactly as it does against whole bytes, and the read is
+    # pinned to the version that was sized; an object replaced in between is sized again.
+    for _ in range(2):
+        byte_range: tuple[int, int] | None = None
+        etag: str | None = None
+        content_range: str | None = None
+        if range_header:
+            version = await storage.stat_artifact(artifact)
+            if version is None:
+                break
+            parsed_range = _parse_range_header(range_header, version.size)
+            if parsed_range == _RANGE_UNSATISFIABLE:
+                headers["Content-Range"] = f"bytes */{version.size}"
+                return Response(status_code=http_status.HTTP_416_RANGE_NOT_SATISFIABLE, headers=headers)
+            if parsed_range is not None:
+                byte_range, etag = parsed_range, version.etag
+                content_range = f"bytes {parsed_range[0]}-{parsed_range[1]}/{version.size}"
+        try:
+            stream = await storage.open_artifact_stream(artifact, byte_range=byte_range, etag=etag)
+        except StoredObjectChangedError:
+            continue
+        if stream is None:
+            break
+        headers["Content-Length"] = str(stream.content_length)
+        if content_range is None:
+            return _StoredArtifactResponse(stream, media_type=media_type, headers=headers)
+        headers["Content-Range"] = content_range
+        return _StoredArtifactResponse(
+            stream, status_code=http_status.HTTP_206_PARTIAL_CONTENT, media_type=media_type, headers=headers
+        )
+    raise HTTPException(
+        status_code=http_status.HTTP_404_NOT_FOUND,
+        detail="Artifact content not available",
+    )
+
+
 @base_router.get(
     "/artifacts/{artifact_id}/content",
     tags=["Artifacts"],
@@ -3484,12 +3572,6 @@ async def get_artifact_content(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-    if content is None:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail="Artifact content not available",
-        )
     media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
     signed_expiry_unix: int | None = None
@@ -3506,6 +3588,15 @@ async def get_artifact_content(
     headers["Accept-Ranges"] = "bytes"
     if artifact.artifact_type in _HTML_ARTIFACT_TYPES:
         headers["Content-Security-Policy"] = _HTML_ARTIFACT_CSP
+    storage = app.STORAGE
+    if isinstance(storage, StreamingArtifactStorage) and storage.can_stream_artifact(artifact):
+        return await _stream_artifact_content(storage, artifact, request.headers.get("range"), media_type, headers)
+    content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+    if content is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
     content_length = len(content)
     parsed_range = _parse_range_header(request.headers.get("range"), content_length)
     if parsed_range == _RANGE_UNSATISFIABLE:
@@ -3941,7 +4032,9 @@ async def run_task_v1(
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
     current_org = caller.organization
-    analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
+    analytics.capture(
+        "skyvern-oss-agent-task-create", data={"url": task.url}, organization_id=current_org.organization_id
+    )
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
     # Legacy TaskRequest has no engine field; CUA engine selection goes through /run/tasks.
@@ -3969,6 +4062,160 @@ async def run_task_v1(
         caller_type=caller.caller_type,
     )
     return CreateTaskResponse(task_id=created_task.task_id)
+
+
+@dataclass(frozen=True)
+class TaskListFilters:
+    """The task filters shared by GET /tasks and GET /tasks/export, named as the repository's get_tasks takes them."""
+
+    task_status: list[TaskStatus] | None
+    workflow_run_id: str | None
+    only_standalone_tasks: bool
+    application: str | None
+    order_by_column: OrderBy
+    order: SortDirection
+
+
+def task_list_filters(
+    task_status: Annotated[list[TaskStatus] | None, Query()] = None,
+    workflow_run_id: Annotated[str | None, Query()] = None,
+    only_standalone_tasks: bool = Query(False),
+    application: Annotated[str | None, Query()] = None,
+    sort: OrderBy = Query(OrderBy.created_at),
+    order: SortDirection = Query(SortDirection.desc),
+) -> TaskListFilters:
+    if only_standalone_tasks and workflow_run_id:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+        )
+    return TaskListFilters(
+        task_status=sorted(task_status) if task_status else None,
+        workflow_run_id=workflow_run_id,
+        only_standalone_tasks=only_standalone_tasks,
+        application=application,
+        order_by_column=sort,
+        order=order,
+    )
+
+
+_TASK_CURSOR_MAX_LENGTH = 1024
+# A client can edit a decoded cursor, and a NUL or lone surrogate in the id would fail in the driver as a 500.
+_CURSOR_TASK_ID_PATTERN = re.compile(r"tsk_[A-Za-z0-9_]+")
+TASK_NEXT_CURSOR_HEADER = "X-Next-Cursor"
+
+
+def _task_cursor_scope(organization_id: str, filters: TaskListFilters) -> str:
+    # The positional layout is the cursor wire format; changing it rejects every cursor already handed out.
+    scope = [
+        organization_id,
+        filters.order_by_column,
+        filters.order,
+        filters.task_status or [],
+        filters.workflow_run_id,
+        filters.only_standalone_tasks,
+        filters.application,
+    ]
+    return calculate_sha256(json.dumps(scope))[:16]
+
+
+def _task_keyset_position(task: Task, sort: OrderBy) -> tuple[datetime, str]:
+    sort_value = task.created_at if sort == OrderBy.created_at else task.modified_at
+    if sort_value.tzinfo is not None:
+        sort_value = sort_value.astimezone(UTC).replace(tzinfo=None)
+    return sort_value, task.task_id
+
+
+def _encode_task_cursor(scope: str, task: Task, sort: OrderBy) -> str:
+    sort_value, task_id = _task_keyset_position(task, sort)
+    payload = json.dumps({"scope": scope, "after": [sort_value.isoformat(), task_id]}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _decode_task_cursor(cursor: str, scope: str) -> tuple[datetime, str] | None:
+    if cursor == "":
+        return None
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        cursor_scope = decoded["scope"]
+        sort_value_raw, task_id = decoded["after"]
+        if not isinstance(sort_value_raw, str) or not isinstance(task_id, str):
+            raise ValueError
+        if not _CURSOR_TASK_ID_PATTERN.fullmatch(task_id):
+            raise ValueError
+        sort_value = datetime.fromisoformat(sort_value_raw)
+        if sort_value.tzinfo is not None:
+            raise ValueError
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Invalid cursor") from exc
+    if cursor_scope != scope:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="cursor was issued for a different organization, sort, order or filters; restart with cursor=''",
+        )
+    return sort_value, task_id
+
+
+TASK_EXPORT_BATCH_SIZE = 500
+
+
+def _ndjson_line(content: Any) -> bytes:
+    line = orjson.dumps(content, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)
+    # orjson leaves U+2028, U+2029 and U+0085 raw, and str.splitlines() splits on them. They can only occur inside
+    # JSON strings, so escaping them keeps each record on one line for any line reader.
+    return (
+        line.replace(b"\xe2\x80\xa8", b"\\u2028").replace(b"\xe2\x80\xa9", b"\\u2029").replace(b"\xc2\x85", b"\\u0085")
+        + b"\n"
+    )
+
+
+def _serialize_task_export_batch(tasks: list[Task]) -> bytes:
+    return b"".join(_ndjson_line(task.to_task_response().model_dump()) for task in tasks)
+
+
+# Registered before /tasks/{task_id}, which would otherwise match "export" as a task id.
+@legacy_base_router.get("/tasks/export", tags=["agent"])
+@legacy_base_router.get("/tasks/export/", include_in_schema=False)
+async def export_tasks(
+    filters: Annotated[TaskListFilters, Depends(task_list_filters)],
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
+) -> StreamingResponse:
+    """
+    Stream every task matching the GET /tasks filters as newline-delimited JSON, one task per line.
+
+    After each full batch a {"cursor": "..."} line marks a checkpoint, and the stream ends with
+    {"export_complete": true, "task_count": N}. A stream without that last line was cut off: drop the task lines after
+    its last checkpoint and resume by passing that cursor back. Cursors from GET /tasks with the same filters also work.
+    Each batch is a fresh query, so an export is not a snapshot: with sort=modified_at or a task_status filter, a task
+    that changes during the export (or before a resume) can be skipped or written twice.
+    """
+    analytics.capture("skyvern-oss-agent-tasks-export")
+    organization_id = current_org.organization_id
+    scope = _task_cursor_scope(organization_id, filters)
+    start_after = _decode_task_cursor(cursor or "", scope)
+
+    async def batches() -> AsyncIterator[bytes]:
+        after = start_after
+        task_count = 0
+        while True:
+            tasks = await app.DATABASE.tasks.get_tasks(
+                page_size=TASK_EXPORT_BATCH_SIZE,
+                organization_id=organization_id,
+                keyset=True,
+                after=after,
+                **asdict(filters),
+            )
+            if tasks:
+                task_count += len(tasks)
+                yield await asyncio.to_thread(_serialize_task_export_batch, tasks)
+            if len(tasks) < TASK_EXPORT_BATCH_SIZE:
+                yield _ndjson_line({"export_complete": True, "task_count": task_count})
+                return
+            after = _task_keyset_position(tasks[-1], filters.order_by_column)
+            yield _ndjson_line({"cursor": _encode_task_cursor(scope, tasks[-1], filters.order_by_column)})
+
+    return StreamingResponse(batches(), media_type="application/x-ndjson")
 
 
 @legacy_base_router.get(
@@ -4031,7 +4278,13 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
-    if workflow_run.browser_session_id:
+    # A caller's registered browser is freed only by the worker's own release, so no new run can drive it while
+    # the canceled worker is still attached.
+    if workflow_run.browser_session_id and not is_external_cdp_session(
+        await app.DATABASE.browser_sessions.get_persistent_browser_session(
+            workflow_run.browser_session_id, organization_id
+        )
+    ):
         await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
             workflow_run.browser_session_id,
             organization_id,
@@ -4373,18 +4626,19 @@ async def retry_webhook(
     include_in_schema=False,
 )
 async def get_tasks(
+    filters: Annotated[TaskListFilters, Depends(task_list_filters)],
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
-    task_status: Annotated[list[TaskStatus] | None, Query()] = None,
-    workflow_run_id: Annotated[str | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    only_standalone_tasks: bool = Query(False),
-    application: Annotated[str | None, Query()] = None,
-    sort: OrderBy = Query(OrderBy.created_at),
-    order: SortDirection = Query(SortDirection.desc),
+    cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
 ) -> Response:
     """
     Get all tasks.
+    :param cursor: Opt-in keyset pagination. Pass an empty cursor to start, then the X-Next-Cursor response header
+        to continue; the header is absent on the last page. Rows are ordered by (sort, task_id) and page must stay 1.
+        A cursor only works with the organization, sort, order and filters it was issued for. Each page is a fresh
+        query, so a walk is not a snapshot: with sort=modified_at or a task_status filter, a task that changes during
+        the walk can be skipped or returned twice.
     :param page: Starting page, defaults to 1
     :param page_size: Page size, defaults to 10
     :param task_status: Task status filter
@@ -4396,25 +4650,34 @@ async def get_tasks(
         get_agent_task endpoint.
     """
     analytics.capture("skyvern-oss-agent-tasks-get")
-    if only_standalone_tasks and workflow_run_id:
+    if cursor is None:
+        tasks = await app.DATABASE.tasks.get_tasks(
+            page, page_size, organization_id=current_org.organization_id, **asdict(filters)
+        )
+        # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
+        # in a thread keeps it from stalling every other request on the event loop.
+        return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+
+    if page != 1:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
-            detail="only_standalone_tasks and workflow_run_id cannot be used together",
+            detail="page cannot be combined with cursor",
         )
+    scope = _task_cursor_scope(current_org.organization_id, filters)
     tasks = await app.DATABASE.tasks.get_tasks(
-        page,
-        page_size,
-        task_status=task_status,
-        workflow_run_id=workflow_run_id,
+        page_size=page_size + 1,
         organization_id=current_org.organization_id,
-        only_standalone_tasks=only_standalone_tasks,
-        order=order,
-        order_by_column=sort,
-        application=application,
+        keyset=True,
+        after=_decode_task_cursor(cursor, scope),
+        **asdict(filters),
     )
-    # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
-    # in a thread keeps it from stalling every other request on the event loop.
-    return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+    page_tasks = tasks[:page_size]
+    response = await asyncio.to_thread(
+        lambda: ORJSONResponse([task.to_task_response().model_dump() for task in page_tasks])
+    )
+    if len(tasks) > page_size:
+        response.headers[TASK_NEXT_CURSOR_HEADER] = _encode_task_cursor(scope, page_tasks[-1], filters.order_by_column)
+    return response
 
 
 _RUN_IDENTIFIER_SEARCH_DESCRIPTION = (
@@ -4545,6 +4808,36 @@ async def _parse_and_gate_tag_filter_terms(
     return parsed_tags
 
 
+_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS = 15
+_RUNS_LIST_SEARCH_TIMEOUT_DETAIL = (
+    "Free-text run search exceeded its time limit. Try an exact browser profile or session ID."
+)
+_WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL = (
+    "Free-text run search exceeded its time limit. Retry with a created_at_start/created_at_end "
+    "window of a few weeks or less, or search an exact browser profile or session ID."
+)
+
+
+def _runs_list_filter_names(**filters: object | None) -> list[str]:
+    """Names of the filters the request carried. Never the values: a search term, tag or agent id can
+    be customer data, and the name alone identifies which query shape was slow."""
+    return sorted(name for name, value in filters.items() if value)
+
+
+def _runs_list_timeout_error(*, indexed_search: bool, search_detail: str) -> HTTPException:
+    """The client-facing form of a runs-list search that ran out of time. An unindexed free-text
+    search is the caller's to narrow; an exact browser identifier resolves through indexed equality
+    lookups, so its timeout is transient and retryable."""
+    if not indexed_search:
+        # Do not suggest a rarer substring: the unindexed search can still walk the whole org.
+        return HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=search_detail)
+    return HTTPException(
+        status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="This run list could not be computed in time. Please retry shortly.",
+        headers={"Retry-After": str(_RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS)},
+    )
+
+
 # NOTE: v2 returns TaskRunListItem from the unified task_runs table,
 # replacing the v1 response type (list[WorkflowRun | Task]) which
 # merged two separate queries. The v1 endpoint is preserved for
@@ -4629,17 +4922,44 @@ async def get_runs_v2(
 
     run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
-    rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
-        current_org.organization_id,
-        page=page,
-        page_size=page_size,
-        status=[s.value for s in status] if status else None,
-        search_key=search_key,
-        run_type=[r.value for r in run_type] if run_type else None,
-        workflow_permanent_ids=workflow_permanent_id,
-        run_tags=run_tags or None,
-        failure_category=failure_category,
-    )
+    try:
+        rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
+            current_org.organization_id,
+            page=page,
+            page_size=page_size,
+            status=[s.value for s in status] if status else None,
+            search_key=search_key,
+            run_type=[r.value for r in run_type] if run_type else None,
+            workflow_permanent_ids=workflow_permanent_id,
+            run_tags=run_tags or None,
+            failure_category=failure_category,
+        )
+    except SQLAlchemyError as exc:
+        if not is_statement_timeout(exc) or not search_key:
+            raise
+        indexed_search = is_indexed_runs_list_search_key(search_key)
+        LOG.warning(
+            "runs_list_statement_timeout",
+            organization_id=current_org.organization_id,
+            # Names, never values: a search term, tag or agent id can carry customer data.
+            filters=_runs_list_filter_names(
+                status=status,
+                search_key=search_key,
+                run_type=run_type,
+                workflow_permanent_id=workflow_permanent_id,
+                tags=tags,
+                failure_category=failure_category,
+            ),
+            page=page,
+            page_size=page_size,
+            # Null for an indexed identifier search: it is not capped, so it ran under the
+            # connection's own timeout rather than this budget.
+            statement_timeout_seconds=None if indexed_search else RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+        )
+        raise _runs_list_timeout_error(
+            indexed_search=indexed_search,
+            search_detail=_RUNS_LIST_SEARCH_TIMEOUT_DETAIL,
+        ) from exc
     items = [TaskRunListItem.model_validate(row) for row in rows]
     workflow_run_ids = [row["run_id"] for row in rows if row["task_run_type"] == RunType.workflow_run.value]
     latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
@@ -4689,7 +5009,11 @@ async def get_steps(
     """
     analytics.capture("skyvern-oss-agent-task-steps-get")
     steps = await app.DATABASE.tasks.get_task_steps(task_id, organization_id=current_org.organization_id)
-    return ORJSONResponse([step.model_dump(exclude_none=True) for step in steps])
+    actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    marked_ids, values = one_time_code_markers(actions)
+    return ORJSONResponse(
+        [redact_one_time_code_step(step, marked_ids, values).model_dump(exclude_none=True) for step in steps]
+    )
 
 
 @legacy_base_router.get(
@@ -4806,7 +5130,8 @@ async def get_actions(
     analytics.capture("skyvern-oss-agent-task-actions-get")
     # Hydrated, not the base read: the typed value of an INPUT_TEXT lives only in action_json, so
     # Action.model_validate on the ORM row returns text=None for every row.
-    actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    hydrated = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    actions = redact_one_time_code_actions(hydrated)
     if caps_run_response_values(x_user_agent):
         # Hydration puts a completion action's whole response/output on the wire, which the app
         # renders with JSON.stringify on the main thread. Same bound the run-detail reads apply.
@@ -5057,19 +5382,45 @@ async def _get_workflow_runs_by_id(
     run_tags: Sequence[tuple[str | None, str | None]] | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
-    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
-        workflow_permanent_id=workflow_id,
-        organization_id=organization_id,
-        page=page,
-        page_size=page_size,
-        status=status,
-        search_key=search_key,
-        error_code=error_code,
-        exclude_child_runs=exclude_child_runs,
-        created_at_start=created_at_start,
-        created_at_end=created_at_end,
-        run_tags=run_tags,
-    )
+    try:
+        return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id=workflow_id,
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            exclude_child_runs=exclude_child_runs,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
+            run_tags=run_tags,
+        )
+    except RunsListSearchCanceled as exc:
+        # Only the search statement raises this, so a cancellation in the attempt lookup that
+        # follows it stays a server error instead of being reported as a slow search.
+        LOG.warning(
+            "runs_list_statement_timeout",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_id,
+            # Names, never values: a search term or tag can carry customer data.
+            filters=_runs_list_filter_names(
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
+                tags=run_tags,
+                exclude_child_runs=exclude_child_runs,
+            ),
+            page=page,
+            page_size=page_size,
+            statement_timeout_seconds=exc.statement_timeout_seconds,
+        )
+        raise _runs_list_timeout_error(
+            indexed_search=exc.indexed_search,
+            search_detail=_WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL,
+        ) from exc
 
 
 @base_router.get(
@@ -6222,7 +6573,9 @@ async def run_task_v2(
         raise HTTPException(
             status_code=500, detail="Skyvern LLM failure to initialize task v2. Please try again later."
         )
-    analytics.capture("skyvern-oss-agent-task-v2", data={"url": task_v2.url})
+    analytics.capture(
+        "skyvern-oss-agent-task-v2", data={"url": task_v2.url}, organization_id=organization.organization_id
+    )
     await AsyncExecutorFactory.get_executor().execute_task_v2(
         request=request,
         background_tasks=background_tasks,

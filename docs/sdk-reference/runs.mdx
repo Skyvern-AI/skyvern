@@ -1,0 +1,522 @@
+---
+title: "Tasks and runs"
+description: "Run a browser task and inspect, cancel or retry any run."
+slug: sdk-reference/runs
+keywords:
+  - "run_task"
+  - "get_run"
+  - "cancel_run"
+  - "runs"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Start a one-off browser task with `run_task`, then use the run methods with the `run_id` it returns. The run methods work for task runs (`tsk_…`) and agent runs (`wr_…`) alike.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+## Run a task
+
+### run_task
+
+Run a task
+
+<CodeGroup>
+```python Python
+await skyvern.run_task(
+    prompt: str,
+    engine: RunEngine = RunEngine.skyvern_v1,
+    model: dict[str, Any] | None = None,
+    url: str | None = None,
+    webhook_url: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    title: str | None = None,
+    error_code_mapping: dict[str, str] | None = None,
+    data_extraction_schema: dict[str, Any] | str | None = None,
+    proxy_location: ProxyLocationInput = None,
+    max_steps: int | None = None,
+    wait_for_completion: bool = False,
+    timeout: float = 1800,
+    browser_session_id: str | None = None,
+    user_agent: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    publish_workflow: bool = False,
+    include_action_history_in_verification: bool | None = None,
+    max_screenshot_scrolls: int | None = None,
+    browser_address: str | None = None,
+) -> TaskRunResponse
+```
+
+```typescript TypeScript
+skyvern.runTask(request: RunTaskOptions): Promise<TaskRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `prompt` | `prompt` | `str` | Yes | — | The goal or task description for Skyvern to accomplish |
+| `engine` | `engine` | `RunEngine` | No | `RunEngine.skyvern_v1` | The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted. |
+| `model` | `model` | `dict[str, Any] \| None` | No | `None` | Optional model configuration. |
+| `url` | `url` | `str \| None` | No | `None` | The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL |
+| `webhook_url` | `webhook_url` | `str \| None` | No | `None` | After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details. |
+| `totp_identifier` | `totp_identifier` | `str \| None` | No | `None` | Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details. |
+| `totp_url` | `totp_url` | `str \| None` | No | `None` | URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details. |
+| `title` | `title` | `str \| None` | No | `None` | The title for the task |
+| `error_code_mapping` | `error_code_mapping` | `dict[str, str] \| None` | No | `None` | Custom mapping of error codes to error messages if Skyvern encounters an error. |
+| `data_extraction_schema` | `data_extraction_schema` | `dict[str, Any] \| str \| None` | No | `None` | The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/. |
+| `proxy_location` | `proxy_location` | `ProxyLocationInput` | No | `None` | Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
+| `max_steps` | `max_steps` | `int \| None` | No | `None` | Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing. |
+| `wait_for_completion` | `waitForCompletion` | `bool` | No | `False` | Wait for the run to reach a final status before returning. |
+| `timeout` | `timeout` | `float` | No | `1800` | Maximum time to wait for completion, in seconds. |
+| `browser_session_id` | `browser_session_id` | `str \| None` | No | `None` | Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off. |
+| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
+| `extra_http_headers` | `extra_http_headers` | `dict[str, str] \| None` | No | `None` | The extra HTTP headers for the requests in browser. |
+| `publish_workflow` | `publish_workflow` | `bool` | No | `False` | Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs. |
+| `include_action_history_in_verification` | `include_action_history_in_verification` | `bool \| None` | No | `None` | Whether to include action history when verifying that the task is complete |
+| `max_screenshot_scrolls` | `max_screenshot_scrolls` | `int \| None` | No | `None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. |
+| `browser_address` | `browser_address` | `str \| None` | No | `None` | The CDP address for the task. |
+| — | `cdp_connect_headers` | `Record<string, string \| undefined>` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites. |
+| — | `run_with` | `string` | No | — | Whether to run the task with agent or code. Null means use the default. |
+
+**Returns** `TaskRunResponse` · TypeScript `Promise<TaskRunResponse>`
+
+<Accordion title="TaskRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_request` | `TaskRunRequestOutput \| None` | The original request parameters used to start this task run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.run_task(prompt="Find the top post on Hacker News and return its title")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.runTask({
+    prompt: "Find the top post on Hacker News and return its title",
+});
+console.log(result);
+```
+</CodeGroup>
+
+## Inspect and manage runs
+
+### get_run
+
+Get run information (task run, workflow run)
+
+<CodeGroup>
+```python Python
+await skyvern.get_run(run_id: str) -> GetRunResponse
+```
+
+```typescript TypeScript
+skyvern.getRun(runId: string): Promise<GetRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
+
+**Returns** `GetRunResponse` · TypeScript `Promise<GetRunResponse>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_run(run_id="tsk_v2_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getRun("tsk_v2_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_runs_v2
+
+List runs
+
+<CodeGroup>
+```python Python
+await skyvern.get_runs_v2(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    status: RunStatus | Sequence[RunStatus] | None = None,
+    search_key: str | None = None,
+    run_type: RunType | Sequence[RunType] | None = None,
+) -> list[TaskRunListItem]
+```
+
+```typescript TypeScript
+skyvern.getRunsV2(request?: GetRunsV2Request): Promise<TaskRunListItem[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `page` | `page` | `int \| None` | No | `None` |  |
+| `page_size` | `page_size` | `int \| None` | No | `None` |  |
+| `status` | `status` | `RunStatus \| Sequence[RunStatus] \| None` | No | `None` |  |
+| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search (min 3 chars for trigram index). |
+| `run_type` | `run_type` | `RunType \| Sequence[RunType] \| None` | No | `None` |  |
+
+**Returns** `list[TaskRunListItem]` · TypeScript `Promise<TaskRunListItem[]>`
+
+<Accordion title="TaskRunListItem fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `task_run_id` | `str` |  |
+| `run_id` | `str` |  |
+| `task_run_type` | `str` |  |
+| `status` | `str` |  |
+| `title` | `str \| None` |  |
+| `started_at` | `datetime \| None` |  |
+| `finished_at` | `datetime \| None` |  |
+| `created_at` | `datetime` |  |
+| `workflow_permanent_id` | `str \| None` |  |
+| `workflow_deleted` | `bool \| None` |  |
+| `script_run` | `bool \| None` |  |
+| `trigger_type` | `"manual" \| "mcp" \| "api" \| "scheduled" \| "webhook" \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_runs_v2()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getRunsV2();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### get_run_timeline
+
+Get timeline for a run (workflow run or task_v2 run)
+
+<CodeGroup>
+```python Python
+await skyvern.get_run_timeline(run_id: str) -> list[WorkflowRunTimeline]
+```
+
+```typescript TypeScript
+skyvern.getRunTimeline(runId: string): Promise<WorkflowRunTimeline[]>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_id` | `runId` | `str` | Yes | — | The id of the workflow run or task_v2 run. |
+
+**Returns** `list[WorkflowRunTimeline]` · TypeScript `Promise<WorkflowRunTimeline[]>`
+
+<Accordion title="WorkflowRunTimeline fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | `"thought" \| "block"` |  |
+| `block` | `WorkflowRunBlock \| None` |  |
+| `thought` | `Thought \| None` |  |
+| `children` | `list[WorkflowRunTimeline] \| None` |  |
+| `created_at` | `datetime` |  |
+| `modified_at` | `datetime` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_run_timeline(run_id="tsk_v2_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getRunTimeline("tsk_v2_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### cancel_run
+
+Cancel a run (task or workflow)
+
+<CodeGroup>
+```python Python
+await skyvern.cancel_run(run_id: str) -> Any | None
+```
+
+```typescript TypeScript
+skyvern.cancelRun(runId: string): Promise<unknown>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run to cancel. |
+
+**Returns** `Any \| None` · TypeScript `Promise<unknown>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.cancel_run(run_id="tsk_v2_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.cancelRun("tsk_v2_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### bulk_cancel_runs
+
+Cancel multiple runs (tasks or workflows) in a single request
+
+<CodeGroup>
+```python Python
+await skyvern.bulk_cancel_runs(*, run_ids: Sequence[str]) -> BulkCancelRunsResponse
+```
+
+```typescript TypeScript
+skyvern.bulkCancelRuns(request: BulkCancelRunsRequest): Promise<BulkCancelRunsResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_ids` | `run_ids` | `Sequence[str]` | Yes | — | List of run IDs to cancel |
+
+**Returns** `BulkCancelRunsResponse` · TypeScript `Promise<BulkCancelRunsResponse>`
+
+<Accordion title="BulkCancelRunsResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `cancelled` | `list[str]` | Run IDs that were successfully cancelled |
+| `failed` | `list[str]` | Run IDs that could not be cancelled |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.bulk_cancel_runs(run_ids=["tsk_v2_123", "wr_456"])
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.bulkCancelRuns({ run_ids: ["tsk_v2_123", "wr_456"] });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+### retry_run_webhook
+
+Retry sending the webhook for a run
+
+<CodeGroup>
+```python Python
+await skyvern.retry_run_webhook(
+    run_id: str,
+    *,
+    request: RetryRunWebhookRequest | None = None,
+) -> RunWebhookReplayResponse
+```
+
+```typescript TypeScript
+skyvern.retryRunWebhook(runId: string, request?: RetryRunWebhookRequest): Promise<RunWebhookReplayResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+| Parameter | TypeScript | Type | Required | Default | Description |
+|---|---|---|---|---|---|
+| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
+| `request` | — | `RetryRunWebhookRequest \| None` | No | `None` |  |
+| — | `webhook_url` | `string` | No | — | Optional webhook URL to send the payload to instead of the stored configuration |
+
+**Returns** `RunWebhookReplayResponse` · TypeScript `Promise<RunWebhookReplayResponse>`
+
+<Accordion title="RunWebhookReplayResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Identifier of the run that was replayed |
+| `run_type` | `str` | Run type associated with the payload |
+| `default_webhook_url` | `str \| None` | Webhook URL stored on the original run configuration |
+| `target_webhook_url` | `str \| None` | Webhook URL that the replay attempted to reach |
+| `payload` | `str` | JSON payload that was delivered during the replay attempt |
+| `headers` | `dict[str, str]` | Signed headers that were generated for the replay attempt |
+| `status_code` | `int \| None` | HTTP status code returned by the webhook receiver, if available |
+| `latency_ms` | `int \| None` | Round-trip latency in milliseconds for the replay attempt |
+| `response_body` | `str \| None` | Body returned by the webhook receiver (truncated to 2KB) |
+| `error` | `str \| None` | Error message if the replay attempt failed |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.retry_run_webhook(run_id="tsk_v2_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.retryRunWebhook("tsk_v2_123");
+console.log(result);
+```
+</CodeGroup>

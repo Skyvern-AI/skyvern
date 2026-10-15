@@ -39,11 +39,20 @@ async def _address(args: dict[str, Any]) -> tuple[str, bool]:
     return _REFS.get(selector, (selector, False))
 
 
+async def _answer(args: dict[str, Any]) -> tuple[str, str, str]:
+    # What the field reads as before the call acts; `_probed` stands in for a probe that resolves elsewhere or fails.
+    if args.get("_probed") == "":
+        return "", "", ""
+    return str(args.get("_probed", args.get("selector"))), str(args.get("_label", "")), args.get("_kind", "textbox")
+
+
 def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
     def make(name: str) -> ToolSpec:
         async def handler(args: dict[str, Any]) -> ToolResult:
             dispatched.append((name, args))
             sel = str(args.get("selector") or "")
+            if args.get("_fail"):
+                return ToolResult("error", f"{name} failed", {}, error_class="not_editable")
             if name == "click" and "_row" in args:
                 return ToolResult("ok", f"clicked {sel}", {PICKED_OPTION_DATA_KEY: args["_row"]})
             if name == "click" and sel.startswith("#q"):
@@ -56,7 +65,10 @@ def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
                 return ToolResult("error", content, {TARGET_LABEL_DATA_KEY: label}, error_class="list_no_match")
             return ToolResult("ok", f"{name} done", {TARGET_LABEL_DATA_KEY: label, TARGET_KIND_DATA_KEY: "textbox"})
 
-        return ToolSpec(name=name, description="", parameters={}, handler=handler, address_probe=_address)
+        probe = _answer if name == "type" else None
+        return ToolSpec(
+            name=name, description="", parameters={}, handler=handler, address_probe=_address, answer_probe=probe
+        )
 
     names = ("click", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME, "observe")
     return [make(n) for n in names]
@@ -198,3 +210,101 @@ def test_no_audit_leaves_every_handler_untouched() -> None:
     before = [t.handler for t in tools]
     apply_answer_basis_audit(tools, None)
     assert [t.handler for t in tools] == before
+
+
+WORK_AUTH = "Are you legally authorized to work in the United States?"
+TYPED = {"selector": "#work-auth", "text": "No", "press_enter": True, "_label": WORK_AUTH}
+
+
+@pytest.mark.asyncio
+async def test_an_answer_typed_with_enter_is_judged_before_the_call_acts() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+
+    # The call's own Enter could submit the form, so a flagged answer never reaches the page, and nothing is recorded
+    # for a value the field never held.
+    message = await _held(tools, "type", dict(TYPED))
+    assert f"'{WORK_AUTH}' with 'No' (field #work-auth; not typed" in message
+    assert dispatched == [] and audit.seen == [[RecordedAnswer(WORK_AUTH, "No")]]
+    # Retrying the refused answer is not a second chance at the judge.
+    audit.flag = set()
+    await _held(tools, "type", dict(TYPED))
+    assert dispatched == [] and len(audit.seen) == 1
+    audit.flag = {"No"}
+    await _by_name(tools, "click").handler({"selector": "#next"})
+
+    # A supported answer goes through once, with the call's own arguments, and is not audited a second time.
+    supported = {**TYPED, "text": "Yes"}
+    await _by_name(tools, "type").handler(dict(supported))
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert [args for _, args in dispatched] == [{"selector": "#next"}, supported, {"selector": "#submit"}]
+    assert len(audit.seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_typed_enter_that_does_not_land_leaves_the_fields_flag_in_place() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    type_ = _by_name(tools, "type").handler
+    await type_({**TYPED, "press_enter": False})
+    await _held(tools, "click", {"selector": "#submit"})
+
+    # Typing the held value again is not a second chance at the judge.
+    audit.flag = set()
+    await _held(tools, "type", dict(TYPED))
+    audit.flag = {"No"}
+
+    # A supported answer whose call fails, and an empty one, change nothing on the page: the held "No" still holds.
+    await type_({**TYPED, "text": "Yes", "_fail": True})
+    for unchanged in ("", " because of my visa"):
+        message = await _held(tools, "type", {**TYPED, "text": unchanged, "clear": False})
+        assert "answered 'No'" in message
+    message = await _held(tools, "type", {**TYPED, "text": ""})
+    assert "answered 'No'" in message
+    await _held(tools, "click", {"selector": "#submit"})
+    # A supported answer that lands replaces the held one, so the submit goes through.
+    await type_({**TYPED, "text": "Yes"})
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert dispatched[-1] == ("click", {"selector": "#submit"})
+
+    # A typed answer the audit never reads (here a password-like field) is entered as before, unjudged.
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "selector": "#pin", "_kind": "password", "_label": "PIN"})
+    assert [args.get("selector") for _, args in dispatched][-1] == "#pin" and audit.seen == []
+
+
+@pytest.mark.asyncio
+async def test_an_answer_appended_with_enter_into_an_empty_field_is_judged_before_the_call_acts() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    apply_answer_basis_audit(tools, _Audit(flag={"No"}))
+
+    assert "not typed" in await _held(tools, "type", {**TYPED, "clear": False})
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_a_typed_enter_the_probe_cannot_place_is_still_recorded_after_the_call() -> None:
+    # Unread: the call acts as it did before this check, and its answer is recorded from the result and held.
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "_probed": ""})
+    await _held(tools, "click", {"selector": "#submit"})
+    assert [name for name, _ in dispatched] == ["type"] and len(audit.seen) == 1
+
+    # Read as another field: judged before, and recorded again as the field the call reports.
+    dispatched.clear()
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    apply_answer_basis_audit(tools, audit)
+    await _by_name(tools, "type").handler({**TYPED, "_probed": "#elsewhere", "text": "Yes"})
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+    assert [name for name, _ in dispatched] == ["type", "click"] and len(audit.seen) == 2

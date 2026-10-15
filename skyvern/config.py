@@ -113,10 +113,11 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
-    # Configurable safety caps. The defaults are rollout candidates, not capacity-calibrated policy.
+    # Uncalibrated rollout defaults: the byte limits bound worker disk and memory per run, and the file limit bounds
+    # per-file save cost within the 180 s save timeout.
     BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES: int = Field(default=100 * 1024 * 1024, gt=0)
     BROWSER_DOWNLOAD_MAX_RUN_SIZE_BYTES: int = Field(default=512 * 1024 * 1024, gt=0)
-    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=64, gt=0)
+    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=300, gt=0)
     # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
     # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
     # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
@@ -321,6 +322,9 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
+    # Off by default on purpose, so self-hosted and open-source installs reach internal hosts without setup; set true to refuse
+    # loopback, private-network and metadata addresses. Skyvern's staging and production deployments set it to true.
+    ENABLE_URL_VALIDATION: bool = False
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
@@ -428,6 +432,11 @@ class Settings(BaseSettings):
     # model keeps the click->labeled-draft latency low. Falls back to the default
     # LLM_API_HANDLER when the key is unset or not registered in this environment.
     RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
+    # A login that the same credential completed on the same workflow inside this window contradicts
+    # a credential-rejection verdict on a later run.
+    CREDENTIAL_VERDICT_LOGIN_HISTORY_HOURS: int = 24
+    # Additional login-block parameter keys that carry credential references as plain strings.
+    CREDENTIAL_VERDICT_HISTORY_PARAMETER_KEYS: list[str] = []
     # Server-side kill switch for delta interpretation updates. Deltas are also
     # gated per-connection on the client declaring support (begin-exfiltration
     # supports_interpretation_deltas); this only force-disables them everywhere.

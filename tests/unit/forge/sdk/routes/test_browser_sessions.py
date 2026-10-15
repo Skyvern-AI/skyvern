@@ -36,6 +36,7 @@ from skyvern.webeye.persistent_sessions_manager import (
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.schemas import BrowserSessionResponse
 from tests.unit._external_cdp_fakes import CDP_URL as EXTERNAL_CDP_URL
+from tests.unit._external_cdp_fakes import ORG_A, ORG_B
 from tests.unit._external_cdp_fakes import TOKEN as EXTERNAL_TOKEN
 from tests.unit._external_cdp_fakes import external_browser_state, external_cdp_stack, register_external
 
@@ -421,6 +422,37 @@ async def test_an_invalid_external_registration_never_echoes_the_submitted_addre
             response = await external_stack.client.post("/v1/browser_sessions/external", json=body)
             assert response.status_code == 422
             assert EXTERNAL_TOKEN not in response.text
+    assert EXTERNAL_TOKEN not in repr(logs)
+
+
+@pytest.mark.asyncio
+async def test_a_registration_is_listed_to_its_org_as_external_with_its_remaining_lifetime(
+    external_stack: SimpleNamespace,
+) -> None:
+    with capture_logs() as logs:
+        session_id = (await register_external(external_stack.client, timeout=30)).json()["browser_session_id"]
+        fetched = await external_stack.client.get(f"/v1/browser_sessions/{session_id}")
+        listed = await external_stack.client.get("/v1/browser_sessions")
+        history = await external_stack.client.get("/v1/browser_sessions/history")
+        external_stack.caller.organization_id = ORG_B
+        foreign_get = await external_stack.client.get(f"/v1/browser_sessions/{session_id}")
+        foreign_list = await external_stack.client.get("/v1/browser_sessions")
+        foreign_history = await external_stack.client.get("/v1/browser_sessions/history")
+    external_stack.caller.organization_id = ORG_A
+
+    listed_rows = [row for row in listed.json() if row["browser_session_id"] == session_id]
+    history_rows = [row for row in history.json() if row["browser_session_id"] == session_id]
+    assert len(listed_rows) == len(history_rows) == 1
+    for body in (fetched.json(), listed_rows[0], history_rows[0]):
+        assert body["source"] == "external"
+        assert body["status"] == "running"
+        assert body["browser_address"] is None
+        assert 29 * 60 < body["remaining_lifetime_seconds"] <= 30 * 60
+    assert foreign_get.status_code == 404
+    assert foreign_list.json() == [] and foreign_history.json() == []
+    for response in (fetched, listed, history, foreign_get):
+        for leaked in (EXTERNAL_TOKEN, "devtools/browser/b1", "9333"):
+            assert leaked not in response.text
     assert EXTERNAL_TOKEN not in repr(logs)
 
 

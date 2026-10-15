@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import _request_settled_credential
 from skyvern.forge.sdk.copilot.tools.credentials import _resolve_exact_credential, _serialize_credential
@@ -183,6 +183,118 @@ async def test_the_user_naming_another_credential_settles_the_fill_on_that_one()
     assert data["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == {"cred_other"}
     assert _request_settled_credential(policy, "cred_other")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_by", ["page_after_lookup", "page_before_lookup", "carry_from_last_turn"])
+async def test_a_named_login_that_is_not_saved_leaves_no_unnamed_login_bound(bound_by: str) -> None:
+    unnamed = _password_credential(credential_id="cred_page", name="site login", tested_url="https://a.example/login")
+    message = 'log in to https://a.example/login with "my other login"'
+    policy = RequestPolicy(canonical_user_message=message)
+
+    async def observe_page() -> None:
+        await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test_org",
+            page_url="https://a.example/login",
+            load_org_credentials=AsyncMock(return_value=[unnamed]),
+        )
+
+    if bound_by == "page_before_lookup":
+        await observe_page()
+    if bound_by == "carry_from_last_turn":
+        policy = _proposal_hydrated_policy(unnamed, message)
+        policy.seeded_proposal_credential_ids = {unnamed.credential_id}
+        policy.live_page_admitted_urls = {unnamed.credential_id: "https://a.example/login"}
+        # The model citing the carry is not the user naming it.
+        policy.carry_cited_credential_ids = {unnamed.credential_id}
+    bound_before_lookup = list(policy.resolved_credentials)
+    data = await _resolve("my other login", policy, [unnamed])
+    if bound_by == "page_after_lookup":
+        await observe_page()
+
+    assert bound_before_lookup == ([] if bound_by == "page_after_lookup" else [unnamed])
+    assert data["status"] == "not_found"
+    assert data["withdrawn_credential_ids"] == [credential.credential_id for credential in bound_before_lookup]
+    assert policy.resolved_credentials == []
+    assert policy.auto_bound_credentials == []
+    assert policy.live_page_admitted_urls == {}
+    assert policy.seeded_proposal_credential_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_a_lookup_that_lands_while_the_page_is_loading_logins_still_stops_the_bind() -> None:
+    page_login = _password_credential(
+        credential_id="cred_page", name="site login", tested_url="https://a.example/login"
+    )
+    policy = RequestPolicy(canonical_user_message='log in to https://a.example/login with "my other login"')
+
+    async def load_while_the_lookup_lands() -> list[Credential]:
+        await _resolve("my other login", policy, [page_login])
+        return [page_login]
+
+    await resolve_credential_for_live_page(
+        policy,
+        organization_id="o_test_org",
+        page_url="https://a.example/login",
+        load_org_credentials=load_while_the_lookup_lands,
+    )
+
+    assert policy.resolved_credentials == []
+    assert policy.live_page_admitted_urls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_by", ["named_this_turn", "approved_earlier", "saved_workflow"])
+async def test_a_login_that_is_the_users_survives_another_name_that_is_not_saved(settled_by: str) -> None:
+    theirs = _password_credential(credential_id="cred_theirs", name="site login", tested_url="https://a.example/login")
+    policy = RequestPolicy(canonical_user_message='use cred_theirs on https://a.example/login and "my other login"')
+    await resolve_credential_for_live_page(
+        policy,
+        organization_id="o_test_org",
+        page_url="https://a.example/login",
+        load_org_credentials=AsyncMock(return_value=[theirs]),
+    )
+    if settled_by == "named_this_turn":
+        await _resolve("cred_theirs", policy, [theirs])
+    elif settled_by == "approved_earlier":
+        policy.prior_approved_credential_ids = {"cred_theirs"}
+    else:
+        policy.persisted_workflow_credential_ids = ["cred_theirs"]
+
+    data = await _resolve("my other login", policy, [theirs])
+
+    assert data["withdrawn_credential_ids"] == []
+    assert policy.resolved_credentials == [theirs]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "status"),
+    [("dup login", "ambiguous"), ("unwritten login", "denied")],
+)
+async def test_a_lookup_that_is_ambiguous_or_denied_leaves_the_page_free_to_bind(reference: str, status: str) -> None:
+    page_login = _password_credential(
+        credential_id="cred_page", name="site login", tested_url="https://a.example/login"
+    )
+    inventory = [
+        page_login,
+        _password_credential(credential_id="cred_a", name="dup login"),
+        _password_credential(credential_id="cred_b", name="dup login"),
+        _password_credential(credential_id="cred_c", name="unwritten login"),
+    ]
+    policy = RequestPolicy(canonical_user_message='log in to https://a.example/login with "dup login"')
+
+    data = await _resolve(reference, policy, inventory)
+    await resolve_credential_for_live_page(
+        policy,
+        organization_id="o_test_org",
+        page_url="https://a.example/login",
+        load_org_credentials=AsyncMock(return_value=inventory),
+    )
+
+    assert data["status"] == status
+    assert policy.resolved_credentials == [page_login]
 
 
 @pytest.mark.asyncio

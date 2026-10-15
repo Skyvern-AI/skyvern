@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -15,9 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import yaml
+from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
@@ -58,6 +62,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _summary_disclosure_control,
     _summary_entry,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import proposal_workflow_fingerprint
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
@@ -817,7 +822,9 @@ class TestMCPFailedStepLoopDetection:
             observed_session_ids.append(current.context.session_id if current.context else None)
             observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
             assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
-            return SimpleNamespace(data=b"fake-png")
+            png = io.BytesIO()
+            Image.new("RGB", (1920, 947)).save(png, format="PNG")
+            return ScreenshotResult(data=png.getvalue(), viewport_css_px=(1920, 947))
 
         monkeypatch.setattr(browser_tools, "do_screenshot", fake_do_screenshot)
 
@@ -856,6 +863,7 @@ class TestMCPFailedStepLoopDetection:
         assert result.isError is False
         assert parsed["ok"] is True
         assert parsed["data"]["screenshot_base64"]
+        assert [entry.provenance.viewport_css_px for entry in ctx.pending_screenshots] == [(1920, 947)]
         assert observed_session_ids == ["pbs_copilot"]
         assert observed_localhost_access == [True]
         fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
@@ -3687,7 +3695,9 @@ class TestScoutPageSummary:
         def element(selector: str, **facts: Any) -> dict[str, Any]:
             return {
                 **facts,
-                "selector_candidates": [{"selector": selector, "source": "test_fixture", "match_count": 1}],
+                "selector_candidates": [
+                    {"selector": selector, "source": "test_fixture", "match_count": 2, "visible_match_count": 1}
+                ],
             }
 
         return {
@@ -3900,6 +3910,7 @@ def test_browser_overlays_are_covered_by_session_classification() -> None:
 async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> None:
     ctx = make_copilot_ctx()
     hooks = CopilotRunHooks(ctx)
+    ctx.open_step_run_ids.append("wr_saved_with_its_step")
 
     await hooks.on_agent_start(MagicMock(), MagicMock())
     await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
@@ -3907,6 +3918,8 @@ async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> Non
 
     assert ctx.enforcement_pass_count == 1
     assert ctx.model_calls_this_turn == 2
+    # The SDK saves a step before it starts the next model call, so that step's runs are in the session.
+    assert ctx.open_step_run_ids == []
 
 
 @pytest.mark.asyncio
@@ -4113,3 +4126,41 @@ class TestSensitiveOriginActionContinuation:
         assert not set(recorded) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
         assert recorded["source_url"] == f"http://pathfold.test/app?code={REDACTED_SECRET_PLACEHOLDER}"
         assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
+
+
+@pytest.mark.asyncio
+async def test_schedule_pre_hook_only_blocks_chat_history_visible_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    canonical = SimpleNamespace(model_dump=lambda **_: {"title": "Saved workflow"})
+    current_fingerprint = proposal_workflow_fingerprint(canonical)
+    monkeypatch.setattr(mcp_hooks, "_schedule_parameters_credential_pre_hook", AsyncMock(return_value=None))
+    ctx = make_copilot_ctx(workflow_copilot_chat_id="chat-test")
+
+    for fingerprint, disposition, expected_pending in (
+        ("", "accepting", False),
+        ("stale", "review_untested", False),
+        (None, None, True),
+        (current_fingerprint, "accepting", True),
+    ):
+        proposal: dict[str, Any] = {"_copilot_yaml": "title: Draft\n"}
+        if fingerprint is not None:
+            proposal["_copilot_proposal"] = {
+                "owner_turn_id": "turn-test",
+                "revision": 1,
+                "canonical_fingerprint": fingerprint,
+                "disposition": disposition,
+            }
+        chat = SimpleNamespace(proposed_workflow=proposal, workflow_permanent_id="wfp-test")
+        monkeypatch.setattr(
+            app.DATABASE.workflow_params,
+            "get_workflow_copilot_chat_by_id",
+            AsyncMock(return_value=chat),
+        )
+        monkeypatch.setattr(
+            app.DATABASE.workflows,
+            "get_workflow_by_permanent_id",
+            AsyncMock(return_value=canonical),
+        )
+
+        result = await mcp_hooks._create_workflow_schedule_pre_hook({}, ctx)
+
+        assert (result is not None) is expected_pending

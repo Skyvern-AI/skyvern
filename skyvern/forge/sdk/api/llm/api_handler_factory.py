@@ -8,6 +8,7 @@ import time
 import warnings
 from asyncio import CancelledError
 from collections.abc import Collection
+from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
@@ -64,6 +65,7 @@ from skyvern.forge.sdk.api.llm.utils import (
     llm_messages_builder_with_history,
     loads_with_repair,
     parse_api_response,
+    uses_only_anthropic_models,
 )
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -1083,6 +1085,16 @@ def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> Allow
 # can validate against the same set instead of duplicating the values.
 VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
 
+# A run's LLM experiment settings. A worker running several activities in one process shares the factory, so each run
+# keeps its own values in its context rather than on the class.
+_THINKING_BUDGET_SETTINGS: ContextVar[dict[str, int] | None] = ContextVar("llm_thinking_budget_settings", default=None)
+_PROMPT_CACHING_SETTINGS: ContextVar[dict[str, bool] | None] = ContextVar("llm_prompt_caching_settings", default=None)
+# When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to `thinkingLevel` in Vertex) instead of the legacy
+# `thinking={budget_tokens:N}` payload, which litellm silently drops for Gemini 3 (SKY-9785).
+_GEMINI_3_REASONING_EFFORT_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "llm_gemini_3_reasoning_effort_override", default=None
+)
+
 
 def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
     """Build a litellm.Router from a router config.
@@ -1164,13 +1176,6 @@ class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
-    _thinking_budget_settings: dict[str, int] | None = None
-    _prompt_caching_settings: dict[str, bool] | None = None
-    # When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to
-    # `thinkingLevel` in Vertex) instead of the legacy `thinking={budget_tokens:N}`
-    # payload — which litellm silently drops for Gemini 3, leaving the model at
-    # its default HIGH thinking level (SKY-9785).
-    _gemini_3_reasoning_effort_override: str | None = None
 
     @staticmethod
     def _strip_static_prompt_from_messages(messages: list[dict[str, Any]], static_prompt: str) -> bool:
@@ -1205,6 +1210,27 @@ class LLMAPIHandlerFactory:
                         break
 
         return prompt_stripped
+
+    @staticmethod
+    def _cache_static_prompt_for_anthropic(messages: list[dict[str, Any]], static_prompt: str) -> bool:
+        marked_static_block = {
+            "type": "text",
+            "text": static_prompt.rstrip(),
+            "cache_control": {"type": "ephemeral"},
+        }
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                return False
+            if content and content[0] == marked_static_block:
+                return True
+            if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
+                return False
+            content.insert(0, marked_static_block)
+            return True
+        return False
 
     @staticmethod
     def _models_equivalent(left: str | None, right: str | None) -> bool:
@@ -1674,7 +1700,7 @@ class LLMAPIHandlerFactory:
         # into `parameters`. Without this ordering, the guard would fire and the
         # override would silently skip direct Gemini 3 configs (task/workflow-level
         # model overrides that bypass the router).
-        override = LLMAPIHandlerFactory._gemini_3_reasoning_effort_override
+        override = _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
         if override and LLMAPIHandlerFactory._is_gemini_3_model(llm_config):
             parameters["reasoning_effort"] = override
             # litellm raises 400 if both reasoning_effort and thinking_budget land
@@ -1692,7 +1718,14 @@ class LLMAPIHandlerFactory:
 
         # Models that use thinking_level (e.g. Gemini 3 Pro/Flash) don't support budget_tokens.
         # Their reasoning is already bounded by the thinking_level set in their config, so skip.
-        if "thinking_level" in parameters:
+        # A router whose primary is not Gemini keeps thinking_level on the Gemini deployment, not in `parameters`,
+        # and the request-level budget would reach that deployment and be rejected by litellm.
+        if "thinking_level" in parameters or (
+            isinstance(llm_config, LLMRouterConfig)
+            and any(
+                "thinking_level" in deployment.litellm_params for deployment in _dispatchable_deployments(llm_config)
+            )
+        ):
             return
 
         if "thinking" in parameters and isinstance(parameters["thinking"], dict):
@@ -1978,11 +2011,9 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             # Apply thinking budget optimization if settings are available
-            if (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
+            if thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, new_budget, llm_config, prompt_name
                 )
@@ -2099,6 +2130,16 @@ class LLMAPIHandlerFactory:
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
                 # (e.g., check-user-goal) with the extract-action schema
                 try:
+                    if (
+                        context
+                        and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages, redacted_cached_static_prompt
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
                         context
                         and redacted_cached_static_prompt
@@ -2835,13 +2876,11 @@ class LLMAPIHandlerFactory:
             # nested dict retained in llm_config.litellm_params via the shallow merge above). SKY-13345.
             customer_owns_thinking = LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters)
             # Apply thinking budget optimization if settings are available
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
             if customer_owns_thinking:
                 pass
-            elif (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            elif thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, new_budget, llm_config, prompt_name
                 )
@@ -2943,6 +2982,16 @@ class LLMAPIHandlerFactory:
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
                 # (e.g., check-user-goal) with the extract-action schema
                 try:
+                    if (
+                        context
+                        and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages, redacted_cached_static_prompt
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
                         context
                         and redacted_cached_static_prompt
@@ -3474,14 +3523,46 @@ class LLMAPIHandlerFactory:
     @classmethod
     def set_thinking_budget_settings(cls, settings: dict[str, int] | None) -> None:
         """Set thinking budget optimization settings for the current task/workflow."""
-        cls._thinking_budget_settings = settings
+        _THINKING_BUDGET_SETTINGS.set(settings)
         if settings:
             LOG.info("Thinking budget optimization settings applied", settings=settings)
+
+    @staticmethod
+    def begin_run_settings() -> tuple[Token[Any], ...]:
+        """Start a run with no thinking budget, prompt caching or Gemini 3 effort settings; see end_run_settings."""
+        return (
+            _THINKING_BUDGET_SETTINGS.set(None),
+            _PROMPT_CACHING_SETTINGS.set(None),
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None),
+        )
+
+    @staticmethod
+    def end_run_settings(tokens: tuple[Token[Any], ...]) -> None:
+        """Drop the run's settings, restoring those of any run that encloses it on the same task."""
+        thinking_budget, prompt_caching, gemini_3_effort = tokens
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.reset(gemini_3_effort)
+        _PROMPT_CACHING_SETTINGS.reset(prompt_caching)
+        _THINKING_BUDGET_SETTINGS.reset(thinking_budget)
+
+    @staticmethod
+    def thinking_budget_settings() -> dict[str, int] | None:
+        """The current run's thinking budget settings, if any were set."""
+        return _THINKING_BUDGET_SETTINGS.get()
+
+    @staticmethod
+    def gemini_3_reasoning_effort_override() -> str | None:
+        """The current run's Gemini 3 reasoning_effort override, if one was set."""
+        return _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
+
+    @staticmethod
+    def prompt_caching_settings() -> dict[str, bool] | None:
+        """The current run's prompt caching settings, if any were set."""
+        return _PROMPT_CACHING_SETTINGS.get()
 
     @classmethod
     def set_prompt_caching_settings(cls, settings: dict[str, bool] | None) -> None:
         """Set prompt caching optimization settings for the current task/workflow."""
-        cls._prompt_caching_settings = settings
+        _PROMPT_CACHING_SETTINGS.set(settings)
         if settings:
             LOG.info("Prompt caching optimization settings applied", settings=settings)
 
@@ -3494,7 +3575,7 @@ class LLMAPIHandlerFactory:
         and logged.
         """
         if not value:
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
         normalized = value.strip().lower() if isinstance(value, str) else None
         if normalized not in VALID_GEMINI_3_REASONING_EFFORTS:
@@ -3503,9 +3584,9 @@ class LLMAPIHandlerFactory:
                 value=value,
                 valid_values=list(VALID_GEMINI_3_REASONING_EFFORTS),
             )
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
-        cls._gemini_3_reasoning_effort_override = normalized
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(normalized)
         LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
 
 

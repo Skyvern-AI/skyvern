@@ -78,6 +78,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
     # the moving click.
     pending: dict[Field, tuple[str, asyncio.Task[list[RecordedAnswer]]]] = {}
     flagged: dict[Field, str] = {}
+    refused: set[tuple[Field, str]] = set()
     open_menu: dict[str, Field | None] = {"field": None}
 
     def record(field: Field, value: str) -> None:
@@ -89,18 +90,33 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
         if field[0] and value:
             pending[field] = (value, asyncio.create_task(audit.unsupported([RecordedAnswer(field[0], value)])))
 
-    async def hold(spec: ToolSpec, args: dict[str, Any]) -> bool:
+    async def found(job: Awaitable[list[RecordedAnswer]]) -> bool:
+        try:
+            return bool(await job)
+        except Exception:
+            LOG.warning("taskv3 answer basis audit raised; not blocking", exc_info=True)
+            return False
+
+    async def hold(
+        spec: ToolSpec, args: dict[str, Any], entering: tuple[Field, str] | None = None, appends: bool = False
+    ) -> bool:
         """Refuse the moving action while a flagged answer is unchanged; True when it passes as that field's repair."""
         while pending:
             field, (value, task) = pending.popitem()
-            try:
-                found = await task
-            except Exception:
-                LOG.warning("taskv3 answer basis audit raised; not blocking", exc_info=True)
-                found = []
-            if found:
+            if await found(task):
                 flagged[field] = value
-        if not flagged:
+        shown = dict(flagged)
+        untyped = None
+        # The answer a call enters is judged as if it had landed, recording nothing, and never twice once refused.
+        # Appended text leaves the field's earlier answer, and its flag, in place.
+        if entering is not None and flagged.get(entering[0]) != entering[1]:
+            if not appends:
+                shown.pop(entering[0], None)
+            if entering in refused or await found(audit.unsupported([RecordedAnswer(entering[0][0], entering[1])])):
+                refused.add(entering)
+                shown[entering[0]] = entering[1]
+                untyped = entering[0]
+        if not shown:
             return False
         # A click cannot be told from a submit before it lands, so only the flagged field's own control, or a row of an
         # open list, goes through: that is the repair. A ref or mark is compared as the field was recorded, resolved.
@@ -108,13 +124,18 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             selector, menu_row = await spec.address_probe(args) if spec.address_probe else (_selector(args), False)
             if menu_row or any(selector == field[1] for field in flagged):
                 return True
-        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(flagged))
-        named = "; ".join(f"'{q}' answered '{v}' (field {s})" for (q, s), v in flagged.items())
+        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown))
+        named = "; ".join(
+            f"'{q}' with '{v}' (field {s}; not typed, nothing was entered or pressed)"
+            if (q, s) == untyped
+            else f"'{q}' answered '{v}' (field {s})"
+            for (q, s), v in shown.items()
+        )
         raise ToolRefusal(
             f"Not done: nothing in the data supports these answers: {named}. For each, choose the field's decline "
             "option, such as prefer not to say, if it offers one. Otherwise, if the question is required, stop, naming "
-            "it; if it is optional, clear it and continue. Until each is changed, only a click on that field or on a "
-            "row of its open list goes through.",
+            "it; if it is optional, clear it and continue. Until each answered one is changed, only a click on that field "
+            "or on a row of its open list goes through.",
             error_class="answer_without_basis",
         )
 
@@ -128,7 +149,17 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             _spec: ToolSpec = spec,
         ) -> ToolResult:
             _tool = _spec.name
-            repair = _may_move_on(_tool, args) and await hold(_spec, args)
+            entering: tuple[Field, str] | None = None
+            text = str(args.get("text") or "")
+            # Its own Enter can submit the form, so the text is judged first, appended (clear=false) or not.
+            enters = args.get("press_enter") and 0 < len(text.split()) <= _MAX_AUDITED_WORDS
+            if _spec.answer_probe is not None and enters:
+                selector, label, kind = await _spec.answer_probe(args)
+                if label.strip() and kind in _FREE_TEXT_KINDS:
+                    entering = ((label.strip(), selector), text)
+                elif not selector:
+                    LOG.info("taskv3 answer basis probe missed", tool=_tool)
+            repair = _may_move_on(_tool, args) and await hold(_spec, args, entering, not args.get("clear", True))
             result = await _handler(args)
             data = _data(result)
             picked = str(data.get(PICKED_OPTION_DATA_KEY) or "") if _tool == "click" and result.status == "ok" else ""
@@ -147,7 +178,11 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 open_menu["field"] = None
             if result.status != "ok" or picked:
                 return result
+            # The ref resolver rewrites args["selector"] in place, so this is the selector the call acted on.
             field = (_label(result), _selector(args))
+            if entering is not None and field == entering[0]:
+                record(field, "")
+                return result
             if _tool == "select_combobox":
                 record(field, str(args.get("value") or ""))
             elif _tool == "select_option":

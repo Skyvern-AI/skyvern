@@ -61,6 +61,10 @@ class RequestPrincipal:
     token_has_organization_claim: bool | None = None
 
 
+def synthetic_user_id(organization_id: str) -> str:
+    return f"{organization_id}_user"
+
+
 _ResolutionKey = tuple[str, str | None, bytes | None]
 _request_principal: ContextVar[tuple[_ResolutionKey, RequestPrincipal, BearerIdentityStatus] | None] = ContextVar(
     "request_principal", default=None

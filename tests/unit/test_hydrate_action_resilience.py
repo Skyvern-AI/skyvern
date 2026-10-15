@@ -18,15 +18,26 @@ from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS, hydrate_action
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import SKYVERN_UI_USER_AGENT
-from skyvern.forge.sdk.workflow.service import RUN_RESPONSE_MAX_VALUE_BYTES
-from skyvern.utils.action_redaction import REDACTED_OTP_VALUE
+from skyvern.forge.sdk.workflow.response_value_caps import RUN_RESPONSE_MAX_VALUE_BYTES
+from skyvern.forge.sdk.workflow.service import redact_one_time_code_step
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
     ActionType,
     MoveAction,
 )
+from tests.unit.helpers import (
+    ONE_TIME_CODE,
+    assert_code_click_scrubbed,
+    assert_one_time_code_withheld,
+    assert_step_code_withheld,
+)
 from tests.unit.helpers import make_action_row as _action_row
+from tests.unit.helpers import (
+    make_fetched_code_action_rows,
+    make_one_time_code_action_rows,
+    make_one_time_code_steps,
+)
 from tests.unit.helpers import make_session_factory_yielding as _session_yielding
 
 
@@ -106,38 +117,57 @@ def _get_task_actions(*rows: SimpleNamespace, headers: dict[str, str] | None = N
         )
 
 
-def test_task_actions_endpoint_serves_the_typed_value_and_the_one_time_code() -> None:
+def test_task_actions_endpoint_serves_the_typed_value_and_withholds_the_one_time_code() -> None:
     # Driven through the route, because the defect is which repository read it calls: `text` has no
-    # ActionModel column, so validating the ORM row resolves it to None on every row. A one-time code
-    # is single use and the customer needs to see what was typed into the page, so it rides the wire
-    # like any other typed value -- even though create_action wrote the column redacted.
-    otp_row = _action_row(
-        action_id="act_otp",
-        action_type=ActionType.INPUT_TEXT,
-        element_id="otp",
-        response=REDACTED_OTP_VALUE,
-        action_json={
-            "element_id": "otp",
-            "text": "314159",
-            "response": "314159",
-            "totp_identifier": "inbox@example.test",
-        },
-    )
-    typed_row = _action_row(
-        action_id="act_typed",
-        action_type=ActionType.INPUT_TEXT,
-        element_id="street",
-        action_json={"element_id": "street", "text": "Meridian Ave"},
-    )
+    # ActionModel column, so validating the ORM row resolves it to None on every row.
+    rows = make_one_time_code_action_rows()
 
-    from_app = _get_task_actions(otp_row, typed_row, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
-    from_sdk = _get_task_actions(otp_row, typed_row)
+    from_app = _get_task_actions(*rows, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
+    from_sdk = _get_task_actions(*rows)
 
     for response in (from_app, from_sdk):
         assert response.status_code == 200, response.text
-        actions = response.json()
-        assert [action["text"] for action in actions] == ["314159", "Meridian Ave"]
-        assert actions[0]["response"] == "314159"
+        assert_one_time_code_withheld(response.text, response.json(), [hydrate_action(row) for row in rows])
+
+
+def test_task_actions_endpoint_scrubs_a_fetched_code_from_a_click_with_no_input_row() -> None:
+    response = _get_task_actions(*make_fetched_code_action_rows())
+
+    assert response.status_code == 200, response.text
+    assert ONE_TIME_CODE not in response.text
+    assert_code_click_scrubbed(response.json()[1])
+
+
+def test_task_steps_endpoint_withholds_the_one_time_code_and_leaves_the_stored_step_unchanged() -> None:
+    steps = make_one_time_code_steps()
+    repo = TasksRepository.__new__(TasksRepository)
+    test_app = FastAPI()
+    test_app.include_router(legacy_base_router, prefix="/api/v1")
+
+    with (
+        patch.object(TasksRepository, "Session", _session_yielding(make_one_time_code_action_rows()), create=True),
+        patch.object(repo, "get_task_steps", AsyncMock(return_value=steps), create=True),
+        patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+        patch(
+            "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+            new=AsyncMock(return_value=_organization()),
+        ),
+    ):
+        app_module.DATABASE.tasks = repo
+        response = TestClient(test_app).get("/api/v1/tasks/tsk_test/steps", headers={"x-api-key": "key"})
+
+    assert response.status_code == 200, response.text
+    assert_step_code_withheld(response.text, steps)
+
+
+def test_legacy_step_keeps_its_failure_message_when_the_task_has_no_one_time_code() -> None:
+    legacy = make_one_time_code_steps()[1]
+    assert legacy.output is not None and legacy.output.action_results
+
+    served = redact_one_time_code_step(legacy, set(), set())
+
+    assert served is legacy
+    assert served.output is not None and served.output.action_results[0].exception_message
 
 
 def test_task_actions_endpoint_caps_for_the_app_and_keeps_the_stored_value_for_the_sdk() -> None:

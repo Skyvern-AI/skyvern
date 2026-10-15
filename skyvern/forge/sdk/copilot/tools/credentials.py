@@ -1051,15 +1051,17 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             },
         }
     if len(matches) != 1:
-        status = "not_found" if not matches else "ambiguous"
-        return {
-            "ok": False,
-            "data": {
-                "status": status,
-                "reference": reference,
-                "candidates": [_serialize_credential(credential) for credential in matches],
-            },
+        data: dict[str, Any] = {
+            "status": "ambiguous" if matches else "not_found",
+            "reference": reference,
+            "candidates": [_serialize_credential(credential) for credential in matches],
         }
+        if not matches:
+            withdrawn = policy.record_named_login_not_found()
+            data["page_login_binding"] = "off_for_this_turn"
+            data["withdrawn_credential_ids"] = withdrawn
+            LOG.info("copilot_named_login_not_found", withdrawn_credential_ids=withdrawn)
+        return {"ok": False, "data": data}
 
     credential = matches[0]
     policy.resolved_credentials = [

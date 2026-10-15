@@ -281,6 +281,7 @@ function makeEmailInboxBlock(
     newer_than_days: null,
     max_results: 25,
     include_body: true,
+    download_attachments: false,
     parameters,
   };
 }
@@ -427,6 +428,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     const emailNode = nodes.find((node) => node.type === "emailInbox");
     expect(emailNode?.data).toMatchObject({
       parameterKeys: ["microsoft_credential_id"],
+      downloadAttachments: false,
     });
 
     const saved = getWorkflowBlocks(nodes, edges);
@@ -434,6 +436,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(saved[0]).toMatchObject({
       block_type: "email_inbox",
       parameter_keys: ["microsoft_credential_id"],
+      download_attachments: false,
     });
   });
 

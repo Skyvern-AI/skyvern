@@ -4553,7 +4553,7 @@ async def test_navigating_paired_tools_invalidate_refs_around_navigation(
         return NavigateResult(url="https://example.test", title="Example", load_state="load")
 
     monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
     monkeypatch.setattr(
         mcp_browser,
@@ -4618,7 +4618,7 @@ async def test_navigating_paired_tools_surface_the_degraded_load_state(
         "do_navigate",
         AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
     )
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(
         mcp_browser,
         "save_artifact",
@@ -4940,7 +4940,7 @@ async def test_paired_read_failure_keeps_screenshot_and_reports_failure(
 @pytest.mark.asyncio
 async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
     _sdk_equivalent_page(monkeypatch)
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     artifact = Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)
     monkeypatch.setattr(mcp_browser, "save_artifact", Mock(return_value=artifact))
 
@@ -5376,7 +5376,7 @@ async def test_screenshot_page_change_retry(monkeypatch: pytest.MonkeyPatch, mes
     ctx = BrowserContext(mode="local")
     state = session_manager.SessionState(context=ctx, _active_page=page)
     patch_get_page(monkeypatch, mcp_browser, page, ctx)
-    read = AsyncMock(side_effect=[RuntimeError(message), SimpleNamespace(data=b"png")])
+    read = AsyncMock(side_effect=[RuntimeError(message), browser_ops.ScreenshotResult(data=b"png")])
     monkeypatch.setattr(mcp_browser, "do_screenshot", read)
     monkeypatch.setattr(
         mcp_browser,
@@ -5481,7 +5481,7 @@ async def test_read_tools_retry_backoff(monkeypatch: pytest.MonkeyPatch, tool: s
         if attempts <= 6:
             raise RuntimeError("Execution context was destroyed")
         if tool == "screenshot":
-            return SimpleNamespace(data=b"png")
+            return browser_ops.ScreenshotResult(data=b"png")
         if tool == "get_html":
             return "<p>fresh</p>"
         return {"ok": True, "data": {"fresh": True}}

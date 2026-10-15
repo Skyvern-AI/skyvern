@@ -9,6 +9,7 @@ import {
   type AcceptAttempt,
   applyWroteNothing,
   type GateFailure,
+  gateFailureAllowsAction,
   proposalTokenOf,
   definitiveAcceptRejection,
 } from "./acceptFence";
@@ -220,7 +221,11 @@ import {
 } from "./credentialRecovery";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { shouldShowDiffCard } from "./cards/DiffCard";
-import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
+import {
+  ReviewGateCard,
+  getPendingReviewGateVerdict,
+  getReviewGateVerdict,
+} from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
@@ -1554,6 +1559,7 @@ type CanonicalRecovery = {
   keepProposalTurnId?: string;
   // The turn whose proposal this Accept took, kept for a proposal with no token to say it.
   acceptedTurnId?: string | null;
+  acceptedOutcomeConfirmed?: boolean;
   acceptAttempt?: Pick<
     CopilotProposalMetadata,
     "owner_turn_id" | "revision" | "disposition"
@@ -4678,21 +4684,28 @@ export function WorkflowCopilotChat({
     if (!workflowPermanentId || !row.workflow_copilot_chat_id) return;
     const remaining = row.proposed_claim_expires_in_seconds;
     const metadata = row.proposed_workflow_metadata;
-    // The marker counts only for the proposal it was written for, so one that outlived its own
-    // Accept cannot claim a later proposal; a tokenless Accept's marker never matches.
+    // A tokenless marker is recoverable only when history positively records its turn as accepted.
     const stored = readStoredAccept(workflowPermanentId);
+    const sameChatStored =
+      stored?.chatId === row.workflow_copilot_chat_id ? stored : null;
+    const storedTurnId = sameChatStored?.acceptAttempt?.owner_turn_id;
+    const storedTurnAccepted =
+      storedTurnId != null && row.accepted_turn_ids?.includes(storedTurnId);
+    const storedReceiptMatchesProposal =
+      storedTurnAccepted &&
+      (!row.proposed_workflow || metadata?.owner_turn_id === storedTurnId);
     const ownStored =
-      stored !== null &&
+      sameChatStored !== null &&
       metadata != null &&
-      stored.chatId === row.workflow_copilot_chat_id &&
-      stored.acceptAttempt?.owner_turn_id === metadata.owner_turn_id &&
-      stored.acceptAttempt?.revision === metadata.revision
-        ? stored
+      sameChatStored.acceptAttempt?.owner_turn_id === metadata.owner_turn_id &&
+      sameChatStored.acceptAttempt?.revision === metadata.revision
+        ? sameChatStored
         : null;
     if (
       !(typeof remaining === "number" && remaining > 0) &&
       metadata?.disposition !== "accepting" &&
-      !ownStored
+      !ownStored &&
+      !storedReceiptMatchesProposal
     )
       return;
     const parked =
@@ -4711,6 +4724,10 @@ export function WorkflowCopilotChat({
       chatId: row.workflow_copilot_chat_id,
       acceptChatId: row.workflow_copilot_chat_id,
       acceptAttempt: ownStored?.acceptAttempt ?? metadata ?? null,
+      acceptedTurnId:
+        existing?.acceptedTurnId ??
+        sameChatStored?.acceptAttempt?.owner_turn_id ??
+        null,
       // History reports a live claim from any chat on the workflow, and a proposal can stay
       // accepting after its own claim died, so only this tab's stored Accept makes the claim its own.
       unattributedClaim: !ownStored,
@@ -4954,6 +4971,7 @@ export function WorkflowCopilotChat({
   // gate until it settles (New chat stays usable during a turn only to abort it).
   const headerControlsDisabled =
     isLoading || isLoadingHistory || acceptHoldReason !== null;
+  const newChatDisabled = isLoadingHistory || acceptHoldReason !== null;
   useEffect(() => {
     if (!docked) {
       return;
@@ -4966,7 +4984,7 @@ export function WorkflowCopilotChat({
         headerHandlersRef.current.handleSelectHistoryChat(chat),
       onNewChat: () => headerHandlersRef.current.handleNewChat(),
       disabled: headerControlsDisabled,
-      newChatDisabled: acceptHoldReason !== null,
+      newChatDisabled,
       navigationLockedReason: acceptHoldReason,
     });
     return () => store.setControls(null);
@@ -4975,6 +4993,7 @@ export function WorkflowCopilotChat({
     workflowPermanentId,
     workflowCopilotChatId,
     headerControlsDisabled,
+    newChatDisabled,
     acceptHoldReason,
   ]);
 
@@ -5151,10 +5170,7 @@ export function WorkflowCopilotChat({
     [credentialGetter],
   );
 
-  // Clears the staged proposal unless it is provably another (another token, or another owner turn
-  // when the Accept had no token); missing identity clears, since keeping a replaced proposal is a
-  // false receipt. Without a token an accepting proposal never counts, as a tokenless one gets a
-  // fresh owner when its Accept claims it.
+  // Keep a staged proposal only when its token or legacy owner turn proves it is different.
   const settleAcceptedProposal = useCallback(
     (
       ownerTurnId: string | null,
@@ -5167,17 +5183,20 @@ export function WorkflowCopilotChat({
         setAcceptedTurnIds(accepted);
       }
       const staged = stagedProposalMetadata.current;
-      if (
-        staged !== null &&
-        (acceptedToken !== null
-          ? proposalTokenOf(staged) !== acceptedToken
-          : acceptedTurnId !== null &&
-            staged.disposition !== "accepting" &&
-            staged.owner_turn_id !== acceptedTurnId)
-      ) {
+      const differentProposal =
+        staged === null
+          ? acceptedTurnId !== null &&
+            pendingProposalTurnIdRef.current !== null &&
+            pendingProposalTurnIdRef.current !== acceptedTurnId
+          : acceptedToken !== null
+            ? proposalTokenOf(staged) !== acceptedToken
+            : acceptedTurnId !== null &&
+              staged.disposition !== "accepting" &&
+              staged.owner_turn_id !== acceptedTurnId;
+      if (differentProposal) {
         // Staging skips retagging while an Accept is pending, so the kept proposal still carries
         // the accepted one's tag, and with it that proposal's title and graph edits.
-        if (workflowPermanentId)
+        if (workflowPermanentId && staged !== null)
           useWorkflowTitleStore
             .getState()
             .trackCopilotMetadata(
@@ -5354,7 +5373,8 @@ export function WorkflowCopilotChat({
           );
           if (!applied) return false;
           const observedSave =
-            pending.savedFromApply === true &&
+            (pending.savedFromApply === true ||
+              pending.acceptedOutcomeConfirmed === true) &&
             !pending.gateAttempt?.wroteNothing;
           if (
             settleAcceptedProposal(
@@ -5442,6 +5462,16 @@ export function WorkflowCopilotChat({
               )
                 throw new Error("Accept recovery read cancelled");
               proposal = history.data.proposed_workflow;
+              pending.acceptedOutcomeConfirmed ||= Boolean(
+                !pending.gateAttempt?.wroteNothing &&
+                pending.acceptedTurnId &&
+                history.data.accepted_turn_ids?.includes(
+                  pending.acceptedTurnId,
+                ),
+              );
+              if (pending.acceptedOutcomeConfirmed && stillOnRecoveryChat()) {
+                applyChatRowProposal(history.data, autoAcceptWritesAtRead);
+              }
               const metadata = history.data.proposed_workflow_metadata;
               const attempt = pending.acceptAttempt;
               const remaining = history.data.proposed_claim_expires_in_seconds;
@@ -5666,6 +5696,17 @@ export function WorkflowCopilotChat({
               variant: "destructive",
             });
         }
+        if (
+          pending.acceptedOutcomeConfirmed &&
+          pending.acceptedTurnId &&
+          stillOnRecoveryChat() &&
+          settleAcceptedProposal(
+            pending.acceptedTurnId,
+            pending.gateAttempt?.token ?? null,
+            pending.acceptedTurnId,
+          )
+        )
+          setAcceptReceiptAnchor(gateReceiptAnchorRef.current);
         clearRecoveryProposal();
         if (pending.acceptChatId && stillOnRecoveryChat())
           setGateFailure(
@@ -5776,7 +5817,13 @@ export function WorkflowCopilotChat({
             revision: pendingProposalMetadata.revision,
             disposition: pendingProposalMetadata.disposition,
           }
-        : null;
+        : pendingProposalTurnId
+          ? {
+              owner_turn_id: pendingProposalTurnId,
+              revision: 1,
+              disposition: "review_untested" as const,
+            }
+          : null;
       const preservedSettings =
         structuredClone(saveData?.settings) ??
         (proposalPreservedSettings.current?.workflow === workflow
@@ -10289,19 +10336,19 @@ export function WorkflowCopilotChat({
     gateFailure?.kind === "saved" ||
     gateFailure?.kind === "recover" ||
     gateFailure?.kind === "changed";
-  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate's
-  // footer waits for idle. Another writer's claim holds the workflow, and an Accept now would only
-  // be refused.
-  const gateActionsShown =
-    gateHasSubject && !isLoading && !isLoadingHistory && !unattributedClaim;
-  // Accept, Reject and Test write over the proposal, so they wait out an Accept whose outcome is
-  // unresolved, and a proposal that could not be re-read.
+  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate waits
+  // for idle. Another writer's claim holds the workflow, and an Accept now would only be refused.
+  const gateIdleAndUnclaimed =
+    !isLoading && !isLoadingHistory && !unattributedClaim;
+  const gateActionsShown = gateHasSubject && gateIdleAndUnclaimed;
+  // A different question from the one above, asked from its own subject: Accept, Reject and Test
+  // write over a staged proposal, so they need one in hand, they wait out an Accept whose outcome
+  // is unresolved, and they stay dark in the gates that may not write at all.
   const gateActionable =
-    gateActionsShown &&
+    Boolean(proposedWorkflow) &&
+    gateIdleAndUnclaimed &&
     !isAccepting &&
-    gateFailureKind !== "reload" &&
-    gateFailureKind !== "recover" &&
-    gateFailureKind !== "saved";
+    gateFailureAllowsAction(gateFailureKind);
   // The chip jumps to the gate, so it waits for the gate's footer rather than pointing at a card
   // with nothing to click.
   const pendingChipVisible = Boolean(
@@ -10613,7 +10660,7 @@ export function WorkflowCopilotChat({
                 >
                   <button
                     type="button"
-                    disabled={acceptHoldReason !== null}
+                    disabled={newChatDisabled}
                     onClick={handleNewChat}
                     className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
                   >
@@ -11078,10 +11125,18 @@ export function WorkflowCopilotChat({
                           <ReviewGateCard
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
-                            verdict={getReviewGateVerdict(
-                              message.narrative,
-                              proposedWorkflow,
-                            )}
+                            verdict={
+                              index === gateIndex && gateHasSubject
+                                ? getPendingReviewGateVerdict(
+                                    message.narrative,
+                                    proposedWorkflow,
+                                    pendingProposalMetadata,
+                                  )
+                                : getReviewGateVerdict(
+                                    message.narrative,
+                                    proposedWorkflow,
+                                  )
+                            }
                             settled={
                               turnId && acceptedTurnIds.has(turnId)
                                 ? "accepted"
@@ -11177,10 +11232,18 @@ export function WorkflowCopilotChat({
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
                               pending={isGateOwnerOrLast}
-                              verdict={getReviewGateVerdict(
-                                gateOwnerNarrative,
-                                proposedWorkflow,
-                              )}
+                              verdict={
+                                isGateOwnerOrLast
+                                  ? getPendingReviewGateVerdict(
+                                      gateOwnerNarrative,
+                                      proposedWorkflow,
+                                      pendingProposalMetadata,
+                                    )
+                                  : getReviewGateVerdict(
+                                      gateOwnerNarrative,
+                                      proposedWorkflow,
+                                    )
+                              }
                               settled={acceptedReceiptHere ? "accepted" : null}
                               actionsShown={gateActionsShown}
                               actionsEnabled={gateActionable}
@@ -11253,7 +11316,15 @@ export function WorkflowCopilotChat({
                 ) : null}
                 <ReviewGateCard
                   pending={!detachedReceiptShown}
-                  verdict={getReviewGateVerdict(undefined, proposedWorkflow)}
+                  verdict={
+                    detachedReceiptShown
+                      ? getReviewGateVerdict(undefined, proposedWorkflow)
+                      : getPendingReviewGateVerdict(
+                          undefined,
+                          proposedWorkflow,
+                          pendingProposalMetadata,
+                        )
+                  }
                   settled={detachedReceiptShown ? "accepted" : null}
                   actionsShown={gateActionsShown}
                   actionsEnabled={gateActionable}

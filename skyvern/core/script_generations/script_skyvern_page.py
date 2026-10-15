@@ -65,6 +65,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.handler import (
     ActionHandler,
+    _register_runtime_otp_value_best_effort,
     generate_totp_value,
     get_actual_value_of_parameter_if_secret,
     handle_complete_action,
@@ -625,7 +626,11 @@ class ScriptSkyvernPage(SkyvernPage):
                     )
                     action = Action(**common_fields)
 
-            created_action = await app.DATABASE.workflow_params.create_action(action)
+            created_action = await app.DATABASE.workflow_params.create_action(
+                skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
+            )
             # Skip LLM reasoning in script mode — use static string instead.
             # Build a descriptive label from the selector for the timeline.
             if action_type == ActionType.TERMINATE and isinstance(call_error, ScriptTerminationException):
@@ -941,6 +946,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 if totp_value:
                     # use the totp verification code
                     value = totp_value.value
+                    context.register_secret_value(value)
+                    _register_runtime_otp_value_best_effort(workflow_run_id, value)
 
         return value
 

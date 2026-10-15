@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -921,16 +921,20 @@ class TasksRepository(BaseRepository):
         application: str | None = None,
         order_by_column: OrderBy = OrderBy.created_at,
         order: SortDirection = SortDirection.desc,
+        keyset: bool = False,
+        after: tuple[datetime, str] | None = None,
     ) -> list[Task]:
         """
         Get all tasks.
-        :param page: Starts at 1
+        :param page: Starts at 1; ignored when keyset is set
         :param page_size:
         :param task_status:
         :param workflow_run_id:
         :param only_standalone_tasks:
         :param order_by_column:
         :param order:
+        :param keyset: order by (order_by_column, task_id) and return the rows strictly after `after`
+        :param after: the (sort timestamp, task_id) of the last row already read, or None to start
         :return:
         """
         if page < 1:
@@ -952,11 +956,26 @@ class TasksRepository(BaseRepository):
             if application:
                 query = query.filter(TaskModel.application == application)
             order_by_col = getattr(TaskModel, order_by_column)
-            query = (
-                query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())
-                .limit(page_size)
-                .offset(db_page * page_size)
-            )
+            descending = order == SortDirection.desc
+            if keyset:
+                if after is not None:
+                    after_ts, after_task_id = after
+                    row = tuple_(order_by_col, TaskModel.task_id)
+                    # The single-column bound lets the (organization_id, created_at) index range-scan;
+                    # the row comparison alone is not always used as an index condition.
+                    query = query.filter(
+                        order_by_col <= after_ts if descending else order_by_col >= after_ts,
+                        row < tuple_(after_ts, after_task_id) if descending else row > tuple_(after_ts, after_task_id),
+                    )
+                query = query.order_by(
+                    *(col.desc() if descending else col.asc() for col in (order_by_col, TaskModel.task_id))
+                ).limit(page_size)
+            else:
+                query = (
+                    query.order_by(order_by_col.desc() if descending else order_by_col.asc())
+                    .limit(page_size)
+                    .offset(db_page * page_size)
+                )
 
             results = (await session.execute(query)).all()
 

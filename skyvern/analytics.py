@@ -6,6 +6,7 @@ import importlib.metadata
 import platform
 import threading
 import traceback
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -52,6 +53,15 @@ posthog: Posthog | None = _build_posthog_client(
 _custom_posthog_clients: dict[tuple[str, str], Posthog] = {}
 
 DISTINCT_ID = "oss"
+
+CaptureGate = Callable[[Mapping[str, Any], str | None], bool]
+_capture_gate: CaptureGate | None = None
+
+
+def set_capture_gate(gate: CaptureGate | None) -> None:
+    """Let a deployment veto events before they are sent; with no gate set, nothing is filtered."""
+    global _capture_gate
+    _capture_gate = gate
 
 
 def get_oss_version() -> str:
@@ -132,7 +142,9 @@ def capture(
     distinct_id: str | None = None,
     api_key: str | None = None,
     host: str | None = None,
+    organization_id: str | None = None,
 ) -> None:
+    """``organization_id`` is only handed to the capture gate; it is never added to the event."""
     if not settings.SKYVERN_TELEMETRY:
         return
 
@@ -142,6 +154,8 @@ def capture(
             return
         resolved_distinct_id = distinct_id or settings.ANALYTICS_ID
         payload: dict[str, Any] = {**dynamic_analytics_metadata(), **(data or {})}
+        if _capture_gate is not None and not _capture_gate(payload, organization_id):
+            return
         client.capture(distinct_id=resolved_distinct_id, event=event, properties=payload)
     except Exception:
         LOG.debug("analytics capture failed", event=event, exc_info=True)

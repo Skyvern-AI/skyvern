@@ -1719,6 +1719,11 @@ async def skyvern_screenshot(
         session_id=ctx.session_id,
     )
 
+    viewport = (
+        {"viewport": {"width": result.viewport_css_px[0], "height": result.viewport_css_px[1]}}
+        if result.viewport_css_px
+        else {}
+    )
     if inline:
         data_b64 = base64.b64encode(result.data).decode("utf-8")
         return action_result(
@@ -1731,6 +1736,7 @@ async def skyvern_screenshot(
                 "mime": "image/png",
                 "bytes": len(result.data),
                 "sdk_equivalent": "await page.screenshot()",
+                **viewport,
             },
             artifacts=[artifact],
             timing_ms=timer.timing_ms,
@@ -1740,7 +1746,7 @@ async def skyvern_screenshot(
     return action_result(
         "skyvern_screenshot",
         browser_context=ctx,
-        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')"},
+        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')", **viewport},
         artifacts=[artifact],
         timing_ms=timer.timing_ms,
     )

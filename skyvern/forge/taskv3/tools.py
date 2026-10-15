@@ -97,6 +97,7 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    UnseenPageText,
     current_tool_call_seq,
     mark_is_filler,
     record_click_dispatched,
@@ -119,7 +120,7 @@ from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
@@ -1450,6 +1451,25 @@ _WITH_POINTER_ROOTS_JS = (
   const parentOf = getter(Node.prototype, 'parentElement');
   const localNameOf = getter(Element.prototype, 'localName');
   const innerTextOf = getter(HTMLElement.prototype, 'innerText');
+  const textContentOf = getter(Node.prototype, 'textContent');
+  const textOf = (el) => { try { return String(innerTextOf.call(el) || '').trim(); } catch (e) { return ''; } };
+  // An unnamed root drawing exactly one rendered graphic is an icon control, listed unnamed like an unnamed <button>,
+  // up to the scan ceiling. A wrapper drawing two (copy and trash) is not one control: a click lands between them.
+  const drawsOneGraphic = (el) => {
+    const graphic = 'svg,img,canvas,[role="img" i]';
+    if (matches.call(el, graphic)) return true;
+    const checkVisibility = Element.prototype.checkVisibility;
+    let drawn = 0;
+    const found = qsa.call(el, graphic);
+    for (const g of found) {
+      if (checkVisibility && !checkVisibility.call(g, { opacityProperty: true, visibilityProperty: true })) continue;
+      // An icon font's <span role="img"><svg> is one graphic: one nested in another counts with it.
+      const outer = closest.call(parentOf.call(g), graphic);
+      if (outer && Array.prototype.indexOf.call(found, outer) >= 0) continue;
+      if (++drawn > 1) return false;
+    }
+    return drawn === 1;
+  };
   const shadowRootOf = getter(Element.prototype, 'shadowRoot');
   const closest = Element.prototype.closest;
   const matches = Element.prototype.matches;
@@ -1583,7 +1603,13 @@ _WITH_POINTER_ROOTS_JS = (
         for (let a = parent, i = 0; a && i < 64 && isPointer(a); a = parentOf.call(a), i++) {
           if (state.holders.has(a)) { holder = a; break; }
         }
-        if (holder && (state.represented.has(holder) || state.heldCount >= state.heldCap)) { state.covered.add(el); continue; }
+        // An icon in a pointer card is its own control (the card's trash), not a stand-in for the card, so a card
+        // already represented still lists it.
+        const iconInCard = holder !== null && drawsOneGraphic(el) && !textOf(el);
+        if (holder && !iconInCard && (state.represented.has(holder) || state.heldCount >= state.heldCap)) {
+          state.covered.add(el);
+          continue;
+        }
         // A decorative child (an icon font's ligature) does not name the row.
         if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
         const r = bcr.call(el);
@@ -1611,13 +1637,40 @@ _WITH_POINTER_ROOTS_JS = (
             if (name) break;
           }
         }
-        if (!name) continue;
+        const icon = !name && state.iconCount < state.ceiling && drawsOneGraphic(el)
+          && !qsa.call(el, '[aria-label],[title]').length;
+        if (!name && !icon) continue;
+        // A named child of a card is the card's stand-in, not its icon, so it keeps the represented and cap rule.
+        if (iconInCard && !icon && (state.represented.has(holder) || state.heldCount >= state.heldCap)) {
+          state.covered.add(el);
+          continue;
+        }
         if (!painted(el, r) || offRight(el, r)) continue;
-        state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
+        // An icon names itself through its graphic (an <img alt>, an <svg><title>). Read only as the icon's label:
+        // as a name it would move the icon out of the icon budget and into the 40 slots named roots share.
+        let graphicName = '';
+        if (icon) {
+          try {
+            if (matches.call(el, 'img[alt]')) graphicName = String(getAttr.call(el, 'alt') || '');
+            else {
+              const checkVisibility = Element.prototype.checkVisibility;
+              for (const svg of matches.call(el, 'svg') ? [el] : qsa.call(el, 'svg')) {
+                if (checkVisibility && !checkVisibility.call(svg, { opacityProperty: true, visibilityProperty: true })) continue;
+                const t = qsa.call(svg, ':scope > title')[0];
+                if (t) graphicName = String(textContentOf.call(t) || '');
+                break;
+              }
+            }
+          } catch (e) { graphicName = ''; }
+        }
+        state.roots.set(el, (name || graphicName.trim()).replace(/\s+/g, ' ').slice(0, retain));
         state.covered.add(el);
         // A holder's child ranks below every other pointer root for the listing cap, so it neither
         // spends the scan ceiling nor displaces a root the reading lists without holders.
-        if (holder) {
+        if (icon) {
+          state.icons.add(el);
+          state.iconCount++;
+        } else if (holder) {
           state.held.add(el);
           state.heldCount++;
           for (let a = holder, i = 0; a && i < 64 && state.holders.has(a); a = parentOf.call(a), i++) state.represented.add(a);
@@ -8024,6 +8077,15 @@ _OBSERVE_WITHIN_KINDS = tuple(f"within.{attr}" for attr in _OBSERVE_OWN_IDENTITY
 # to the same row a field does, but the task names the field, never `lookupRow1`, so a set told apart
 # only by a framework-minted wrapper id leaves the model exactly where it started.
 _OBSERVE_FIELD_KIND = "field"
+# The text of the row, tile or list item the control sits in: where it is, not what it is called. Ranked under
+# `field`, which names the one field it sits with, and over `within`, whose framework-minted wrapper ids the task
+# never names; a row is what a task names its target by ("the cart named X, 8 products").
+_OBSERVE_UNIT_KIND = "in"
+# The control's place among the listed controls of that unit, for the set the page declares nothing else about:
+# two unlabeled icons in one row. Last, so it prints only where nothing the page wrote tells the lines apart.
+_OBSERVE_NTH_KIND = "nth"
+# Printed unquoted, so a value a page bent through a patched builtin must not pass for one.
+_OBSERVE_NTH_RE = re.compile(r"\d{1,4} of \d{1,4}")
 # Each pass appends at most one qualifier per line, so a set that only splits in stages -- a tier
 # that separates a group of three into a pair and a single, then a deeper tier that separates the
 # pair -- still converges. This bounds work, not correctness: whatever is left after the last pass
@@ -8041,15 +8103,26 @@ def _disambiguate_digest_bodies(
     set apart. Returns the bodies and how many lines are still identical to
     another afterwards, which is what production has to be able to see."""
     parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None, str | None]] = []
+    located: list[tuple[list[str], str | None]] = []
     for e in elements:
         owns: list[tuple[str, str]] = []
         within: list[tuple[str, str]] = []
         field_label: str | None = None
         section: str | None = None
+        units: list[str] = []
+        nth: str | None = None
         for entry in e.get("placement") or []:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
                 continue
             kind, value = str(entry[0]), str(entry[1])
+            # Read text and a count, not identifiers: a row's text is not an id, however many digits it holds.
+            if kind == _OBSERVE_UNIT_KIND:
+                if value:
+                    units.append(value)
+                continue
+            if kind == _OBSERVE_NTH_KIND:
+                nth = nth or value or None
+                continue
             # An opaque identifier names nothing to a reader and does not survive a copy -- the screen
             # look()'s legend applies, for the same reason.
             if not value or _OPAQUE_ID_RUN_RE.search(value):
@@ -8067,11 +8140,14 @@ def _disambiguate_digest_bodies(
             elif kind == "section" and section is None:
                 section = value
         parsed.append((owns, within, field_label, section))
+        located.append((units, nth))
 
     tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _, _ in parsed), default=1) or 1)]
     tiers.append((_OBSERVE_FIELD_KIND, 0))
+    tiers += [(_OBSERVE_UNIT_KIND, i) for i in range(max((len(u) for u, _ in located), default=0))]
     tiers += [("within", i) for i in range(max((len(w) for _, w, _, _ in parsed), default=0))]
     tiers.append(("section", 0))
+    tiers.append((_OBSERVE_NTH_KIND, 0))
 
     def candidate(index: int, tier: tuple[str, int]) -> tuple[str, str] | None:
         owns, within, field_label, section = parsed[index]
@@ -8082,6 +8158,12 @@ def _disambiguate_digest_bodies(
             return within[depth] if depth < len(within) else None
         if kind == _OBSERVE_FIELD_KIND:
             return (_OBSERVE_FIELD_KIND, field_label) if field_label else None
+        if kind == _OBSERVE_UNIT_KIND:
+            units = located[index][0]
+            return (kind, units[depth]) if depth < len(units) else None
+        if kind == _OBSERVE_NTH_KIND:
+            nth = located[index][1]
+            return (kind, nth) if nth else None
         return ("section", section) if section else None
 
     def suffix(index: int, tier: tuple[str, int]) -> str:
@@ -8092,6 +8174,9 @@ def _disambiguate_digest_bodies(
         found = candidate(index, tier)
         if found is None:
             return ""
+        if found[0] == _OBSERVE_NTH_KIND:
+            # Ours, not page text: a count, printed bare.
+            return f" nth={found[1]}" if _OBSERVE_NTH_RE.fullmatch(found[1]) else ""
         return f" {found[0]}={field(found[1], OBSERVE_DISPLAY_WIDTHS['qualifier'])}"
 
     final = list(bodies)
@@ -8115,6 +8200,10 @@ def _disambiguate_digest_bodies(
                 # takes the groups it left behind to a deeper one.
                 if best is None and distinct > 1:
                     best = rendered
+                    # A row's shortest text first: a wider unit repeats it, and the next pass widens only
+                    # the rows it left tied (two carts with one name), not every row of the list.
+                    if tier[0] == _OBSERVE_UNIT_KIND:
+                        break
             if best is None:
                 continue
             for i, appended in zip(ix, best):
@@ -8128,6 +8217,9 @@ def _disambiguate_digest_bodies(
 
 
 OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
+# Points at a read, never at a position: the text beside an unbound group is often a hint, an error or another
+# question.
+_NO_QUESTION_MARKER = "(no question found; read the question in get_html before answering)"
 # Display width of each masked-then-capped field of the observe digest. Every render site reads its
 # width here, so the retain margin below is always sized for the widest window.
 OBSERVE_DISPLAY_WIDTHS = {
@@ -8232,6 +8324,8 @@ async (__tv3TextArgs) => {
   // Field text is retained at this width and masked, then capped for display, in Python. Substituted
   // per call from the payload refs: any minted URL that starts inside a display window fits whole.
   const _RETAIN_WIDTH = __OBSERVE_RETAIN_WIDTH__;
+  const _UNIT_TEXT_MAX = 2000;
+  const _INVISIBLE_MARKS = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g;
   const _GROUP_TEXT_TOTAL_CAP = """
     + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
     + r""";
@@ -8722,11 +8816,107 @@ async (__tv3TextArgs) => {
     }
     return _normText(out);
   };
+  const _TITLE_SEL = 'h1,h2,h3,h4,h5,h6,[role~=heading],legend';
+  const _NOTE_SEL = '[role~=alert],[role~=status],[aria-live]:not([aria-live=off])';
+  const _END = {};
+  const _NOTE = {};
+  // Every visible character, no depth cap: a capped read of a deep question looks empty and the walk moves on.
+  const _allText = (el) => {
+    if (_unseen(el)) return '';
+    let out = '';
+    for (let c = _firstChildOf.call(el); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1) out += ' ' + _allText(c);
+    }
+    return _normText(out);
+  };
+  const _noteIds = (g, el) => {
+    const ids = new Set();
+    const add = (n) => { for (const a of ['aria-describedby', 'aria-errormessage']) for (const id of (n.getAttribute(a) || '').split(/\s+/)) if (id) ids.add(id); };
+    add(el);
+    if (g.box) { add(g.box); for (const c of _qsa.call(g.box, _CHOICE_SEL)) add(c); }
+    return ids;
+  };
+
+  // Built once per call: under each composed ancestor, every control observe enumerated (those it counts as
+  // omitted included).
+  let _listedUnder = null;
+  const _listedIn = (n) => {
+    if (_listedUnder) return _listedUnder.get(n) || [];
+    const m = new Map();
+    for (const e of els) {
+      for (let p = _composedParent(e.el); p; p = _composedParent(p)) {
+        const l = m.get(p);
+        if (l) l.push(e.el); else m.set(p, [e.el]);
+      }
+    }
+    // Published only once whole, so a throw mid-build leaves it null for the next call.
+    return (_listedUnder = m).get(n) || [];
+  };
+  const _holdsAnotherControl = (card, el, g, kin) =>
+    _listedIn(card).some((c) => !_matches.call(c, kin) || !(_inGroup(c, el, g, kin) || _proxied(c, kin)));
+  // One block of a card: null when absent or empty, _NOTE for a live region (or a block that is only one), _END
+  // for a heading, else its text.
+  const _cardBlock = (c) => {
+    const kind = _nodeTypeOf.call(c);
+    if (kind === 3) { const t = _normText(_contentOf.call(c)); return t.length < 2 ? null : t; }
+    if (kind !== 1) return null;
+    const t = _allText(c);
+    if (t.length < 2) return null;
+    const note = _matches.call(c, _NOTE_SEL) ? c : _qs.call(c, _NOTE_SEL);
+    if (note && (note === c || _allText(note) === t)) return _NOTE;
+    return _matches.call(c, _TITLE_SEL) || _qs.call(c, _TITLE_SEL) ? _END : t;
+  };
+  const _fieldOrChoice = (c) => { const k = _controlsOf(c); return k.nonChoice || k.choices.length > 0; };
+  // A label placed before the option it names is that option's caption, not a question.
+  const _beforeOwnOption = (c, el, g, kin) => {
+    if (_nodeTypeOf.call(c) !== 1 || !_matches.call(c, 'label')) return false;
+    try { const x = c.control; return !!x && _matches.call(x, kin) && _inGroup(x, el, g, kin); } catch (e) { return false; }
+  };
+  // Exactly one candidate block across the whole card, read in order from the options box up to the largest
+  // ancestor holding nothing but this group. At the box, content after the first option is its captions, and a
+  // level with content but no candidate is never climbed past.
+  const _cardQuestion = (el, g) => {
+    const kin = g.radio ? _RADIO_SEL : _CHECK_SEL;
+    if (_noteIds(g, el).size) return '';
+    let found = '';
+    let below = false;
+    for (let card = g.box, inner = null; card; inner = card, card = _parentOf.call(card)) {
+      if (_openShadowOf(card)) break;
+      if (_holdsAnotherControl(card, el, g, kin)) {
+        // The level that ends the card: text beside its own link or button, back to the previous answered field, may be
+        // a question row the control split off the card.
+        for (let c = inner && _prevOf.call(inner); c && !(_nodeTypeOf.call(c) === 1 && _fieldOrChoice(c)); c = _prevOf.call(c)) {
+          if (_nodeTypeOf.call(c) === 1 && _listedIn(c).length && _cardBlock(c) !== null) return '';
+        }
+        break;
+      }
+      let after = false;
+      let here = false;
+      for (let c = _firstChildOf.call(card); c; c = _nextOf.call(c)) {
+        if (!after && (inner ? c === inner : _nodeTypeOf.call(c) === 1 && _hasChoice(c))) { after = true; continue; }
+        if (after && !inner) break;
+        if (!inner && _beforeOwnOption(c, el, g, kin)) continue;
+        const b = _cardBlock(c);
+        if (b === null) continue;
+        if (b === _END || (b !== _NOTE && (after || found || below))) return '';
+        here = true;
+        if (b !== _NOTE) found = b;
+      }
+      below = below || here;
+    }
+    return found && !_captionsOnly(g.box, found) ? found : '';
+  };
   const _choiceQuestion = (el, g) => {
     const declared = _declaredGroupName(el, g);
     if (declared || !g.box || g.multi) return declared;
     const t = _boxQuestion(g.box, g);
-    if (!t || _matches.call(g.box, 'tr,[role=row]')) return t;
+    if (_matches.call(g.box, 'tr,[role=row]')) return t;
+    if (!t) {
+      if (g.entry) g.entry.nearby = true;
+      return _cardQuestion(el, g);
+    }
     return _namesOnlyThisGroup(g.box, el, g) && !_captionsOnly(g.box, t) ? t : '';
   };
   const _isAutocomplete = """
@@ -8896,7 +9086,7 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
@@ -9643,6 +9833,7 @@ async (__tv3TextArgs) => {
   let offViewportUnnamedHostExempt = 0;
   let phantomDropped = 0;
   let truncated = 0;
+  let iconsTruncated = 0;
   let truncatedInComponents = 0;
   // Counts only, for the log record: how often the element budget cuts controls inside an open
   // blocking dialog. Read lazily, after every root is known, and only from typed declarations: a plain
@@ -9805,6 +9996,25 @@ async (__tv3TextArgs) => {
   // Places the cap keeps for the pointer roots not yet reached that no holder expansion produced
   // (`count` tallies exactly those).
   let pointerReserved = _pointerState.count;
+  // Icon controls get only the budget every semantic candidate leaves over, so listing one never cuts a control.
+  // Screening every candidate is paid only when the raw count and the icons together could fill the budget.
+  let controlCount = 0;
+  for (const e of els) if (!_pointerState.roots.has(e.el)) controlCount++;
+  if (_pointerState.iconCount > 0 && controlCount + _pointerState.iconCount > 250) {
+    controlCount = 0;
+    let hiddenCounted = 0;
+    for (const e of els) {
+      if (_pointerState.roots.has(e.el)) continue;
+      let screened = null;
+      try { screened = _screen(e.el, false); } catch (err) { screened = null; }
+      if (!screened || screened.why !== null) continue;
+      // The listing keeps at most 40 hidden-native proxies, so only those take a place from the icons.
+      if (screened.hidden && ++hiddenCounted > 40) continue;
+      controlCount++;
+    }
+  }
+  let iconRoom = 250 - controlCount;
+  let iconsListed = 0;
   for (let idx = 0; idx < els.length; idx++) {
    const el = els[idx].el;
    const host = els[idx].host;
@@ -9819,7 +10029,9 @@ async (__tv3TextArgs) => {
    try {
     // The collector screened a pointer root with these same visibility gates, so none of the hidden
     // counters below ever describes one: a pointer root is listed or counted as one.
-    pointerRoot = _pointerState.roots.has(el);
+    const iconRoot = _pointerState.icons.has(el);
+    if (iconRoot && iconsListed >= iconRoom) { iconsTruncated++; continue; }
+    pointerRoot = _pointerState.roots.has(el) && !iconRoot;
     if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
@@ -9937,7 +10149,7 @@ async (__tv3TextArgs) => {
     let label = strongLabel || placeholder;
     if (!label) label = (secretValue ? '' : el.value || '').trim();
     if (!label) label = (el.getAttribute('title') || '').trim();
-    if (!label && pointerRoot) label = _pointerState.roots.get(el) || '';
+    if (!label && (pointerRoot || iconRoot)) label = _pointerState.roots.get(el) || '';
     const role = el.getAttribute('role');
     // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
     // and SELECT it is a reflected enum; on <a>, <link>, <embed>, <object> and <source> it hands
@@ -9950,6 +10162,7 @@ async (__tv3TextArgs) => {
     // recognition and leak its signing tail.
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (pointerRoot) rec.pointerRoot = true;
+    if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
@@ -10003,6 +10216,8 @@ async (__tv3TextArgs) => {
       const takesValue = isChoice || _isFieldControl(el) || rec.autocomplete === true
         || el.hasAttribute('aria-checked') || el.hasAttribute('aria-pressed');
       const ownGroup = takesValue ? _groupText(el, isChoice) : '';
+      // Every member keeps its group's question, though the digest prints it on the first member only.
+      if (isChoice && ownGroup) rec.question = ownGroup.slice(0, _RETAIN_WIDTH);
       const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
       // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
@@ -10030,9 +10245,10 @@ async (__tv3TextArgs) => {
       if (el.type === 'radio' || role === 'radio') {
         // A fresh object per element on purpose: a control with no group entry is its own group.
         const entry = (g && g.entry) || {};
-        // Found means the page gave a question, printed or not: the page budget or the same-text dedupe
-        // may hold it back. A description is a hint or an error, never the group's question.
-        if (ownGroup) entry.found = true;
+        // Found means the page gave a question, even one the budget or the same-text dedupe held back; a question read
+        // from the card counts only once shown, so a withheld one keeps the marker.
+        const withheld = !rec.group && groupTotal + gt.length > _GROUP_TEXT_TOTAL_CAP;
+        if (ownGroup && !(withheld && entry.nearby)) entry.found = true;
         else if (!entry.found) {
           if (!entry.missing) entry.missing = ++radioGroupsMissing;
           rec.group_missing = entry.missing;
@@ -10070,12 +10286,13 @@ async (__tv3TextArgs) => {
     rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
     if (pointerRoot) pointerListed++;
+    if (iconRoot) iconsListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
     i++;
     // Pointer roots ride outside the budget (they have their own cap), so listing one never costs
     // the page a semantic control.
-    if (!pointerRoot && ++semanticListed > 250) {
+    if (!pointerRoot && !iconRoot && ++semanticListed > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
       // have been skipped anyway, and counting it overstates the loss on any page carrying a hidden
       // dialog. Shadow matches are tallied separately because they are appended last and are
@@ -10084,6 +10301,7 @@ async (__tv3TextArgs) => {
         try {
           const r2 = els[k].el.getBoundingClientRect();
           if (r2.width === 0 || r2.height === 0) continue;
+          if (_pointerState.icons.has(els[k].el)) { iconsTruncated++; continue; }
           if (_pointerState.roots.has(els[k].el)) {
             if (pointerListed + pointerTruncated < _POINTER_ROOT_CAP) pointerTruncated++;
             else pointerCapped++;
@@ -10245,10 +10463,91 @@ async (__tv3TextArgs) => {
   // reads OTHER records' controls. Computed inside that loop, a record at a lower index had not been
   // swept yet, so a field about to be dropped could still name a survivor -- printing `field='X'`
   // with no line for X anywhere in the digest.
+  // The row, tile or list item a control sits in: its nearest ancestor whose text says more than the control's
+  // own, read once per ancestor and given up on past a size no single row has. Printed as where the control is
+  // (in=, on a collision) and its place among that unit's unnamed controls (nth=, always), never as a name.
+  const unitText = new Map();
+  // Up to three, each saying more than the last, so two rows that share a name are told apart one level up
+  // by what else the row says (its count, its total).
+  const unitsOf = (el) => {
+    const found = [];
+    let last = '';
+    try { last = _normText(_innerTextOf.call(el)); } catch (e) { last = ''; }
+    let n = el;
+    for (let d = 0; d < 8 && found.length < 3; d++) {
+      n = _parentOf.call(n);
+      if (!n) break;
+      if (!unitText.has(n)) {
+        let t = '';
+        try {
+          // Zero-width joiners and direction marks are ordinary in emoji, right-to-left text and some prices:
+          // dropped, not treated as forgery, so a row holding one still names its controls.
+          t = String(_contentOf.call(n) || '').length > _UNIT_TEXT_MAX
+            ? null : _normText(String(_innerTextOf.call(n) || '').replace(_INVISIBLE_MARKS, ''));
+        } catch (e) { t = ''; }
+        unitText.set(n, t);
+      }
+      const t = unitText.get(n);
+      if (t === null || (t && _FORGEABLE.test(t))) break;
+      if (t && t !== last) { found.push(n); last = t; }
+    }
+    return found;
+  };
+  const unitMembers = new Map();
+  const unitsOfEl = new Map();
+  // Fail open as a whole: a page that poisons the builtins this uses loses the row qualifiers, never the listing.
+  try {
+  for (const rec of out) {
+    const el = elOfRec.get(rec);
+    // Unnamed command controls only, the icon in a row. A field is named by its label and question, which a form's
+    // wider text would hand another question's words; a named control keeps the ladder's rules for when lines stay tied.
+    if (!el || !_isCommandControl(el) || (rec.label && !rec.icon)) continue;
+    let us = [];
+    try { us = unitsOf(el); } catch (e) { us = []; }
+    if (!us.length) continue;
+    unitsOfEl.set(el, us);
+    const members = unitMembers.get(us[0]);
+    if (members) members.push(el); else unitMembers.set(us[0], [el]);
+  }
+  // A wider unit is kept only while it holds this one row: one that holds a second row is the list, and its text
+  // is mostly the neighbours'.
+  const rowsUnder = new Map();
+  for (const first of unitMembers.keys()) {
+    let a = first;
+    for (let d = 0; d < 10 && a; d++, a = _parentOf.call(a)) rowsUnder.set(a, (rowsUnder.get(a) || 0) + 1);
+  }
+  const byUnit = new Map();
+  for (const [el, us] of unitsOfEl) {
+    let keep = 1;
+    while (keep < us.length && (rowsUnder.get(us[keep]) || 0) <= 1) keep++;
+    const kept = us.slice(0, keep);
+    unitsOfEl.set(el, kept);
+    // Counted within the widest unit printed, so `nth=` and the widest `in=` describe the same box.
+    const widest = kept[kept.length - 1];
+    const members = byUnit.get(widest);
+    if (members) members.push(el); else byUnit.set(widest, [el]);
+  }
+  unitMembers.clear();
+  for (const [unit, members] of byUnit) {
+    // Document order, not listing order: icons are listed after every other control.
+    members.sort((a, b) => (_cmpPos.call(a, b) & _POS_PRECEDING ? 1 : -1));
+    unitMembers.set(unit, members);
+  }
+  } catch (e) { unitsOfEl.clear(); }
   for (const rec of out) {
     const el = elOfRec.get(rec);
     if (!el) continue;
     const place = _placement(el);
+    const us = unitsOfEl.get(el);
+    if (us) {
+      try {
+        const where = [];
+        for (const u of us) where.push(['in', String(unitText.get(u)).slice(0, _RETAIN_WIDTH)]);
+        const members = unitMembers.get(us[us.length - 1]);
+        if (members.length > 1) where.push(['nth', `${members.indexOf(el) + 1} of ${members.length}`]);
+        for (const w of where) place.push(w);
+      } catch (e) { /* fail open: this control keeps the qualifiers it had */ }
+    }
     if (place.length) rec.placement = place;
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
@@ -10638,7 +10937,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -11906,6 +12205,8 @@ async def _observable_child_frames(page: Any) -> tuple[list[Any], int, int]:
 # "the main frame" and must not decay into it: the main frame is a real document a selector will happily
 # resolve in.
 _UNKNOWN_REALM = object()
+# Set by the click echo for one call; the click path records the kind of choice control it found under the target.
+_CLICK_CHOICE_KIND: ContextVar[list[str] | None] = ContextVar("taskv3_click_choice_kind", default=None)
 
 
 class _RealmChangedDuringRead(Exception):
@@ -11978,6 +12279,7 @@ _OBSERVE_SUMMED_KEYS = (
     "textDropped",
     "dropped",
     "truncated",
+    "iconsTruncated",
     "truncatedInComponents",
     "pointerCapped",
     "pointerTruncated",
@@ -12049,7 +12351,7 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     incoming = other.get("elements") or []
     # Pointer roots ride outside the element budget here as in each realm, under their own cap applied
     # page-wide, so neither limit ever costs the other kind a place.
-    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not e.get("pointerRoot")))
+    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
     pointer_room = max(
         0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
     )
@@ -12057,7 +12359,7 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerHeld"):
+        if e.get("pointerHeld") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
         elif e.get("pointerRoot"):
             if pointer_room == 0:
@@ -12098,21 +12400,31 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
 
 
 def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
-    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root.
-    Returns the kept indices, which the caller applies to its handle and owner lists."""
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, and an
+    icon only in the page-wide element budget left after every control. Returns the kept indices, which the caller
+    applies to its handle and owner lists."""
     elements = data.get("elements") or []
     room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
     kept: list[int] = []
+    held_over = 0
+    icons_over = 0
     for i, e in enumerate(elements):
         if e.get("pointerHeld"):
             if room <= 0:
+                held_over += 1
                 continue
             room -= 1
+        elif e.get("icon"):
+            if icon_room <= 0:
+                icons_over += 1
+                continue
+            icon_room -= 1
         kept.append(i)
-    over = len(elements) - len(kept)
     data["elements"] = [elements[i] for i in kept]
-    data["pointerCapped"] = int(data.get("pointerCapped") or 0) + over
-    data["pointerListed"] = int(data.get("pointerListed") or 0) - over
+    data["pointerCapped"] = int(data.get("pointerCapped") or 0) + held_over
+    data["pointerListed"] = int(data.get("pointerListed") or 0) - held_over
+    data["iconsTruncated"] = int(data.get("iconsTruncated") or 0) + icons_over
     return kept
 
 
@@ -12209,6 +12521,7 @@ def build_browser_tools(
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
     semantic_commit_stats: SemanticCommitStats | None = None,
+    unseen_text: UnseenPageText | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
 
@@ -12732,6 +13045,10 @@ def build_browser_tools(
                 # frame-shaped to mistranscribe.
                 "owner": _owner,
                 "document": _realm_documents.get(_owner, ""),
+                # A radio or checkbox's question and caption as observe read them, for a click's answer.
+                "question": _mask_refs(str(e.get("question") or "")),
+                "option": _mask_refs(str(e.get("label") or "")),
+                "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), ""),
             }
         omitted_anonymous = data.get("unnamedAnonymous") or 0
         omitted_duplicated = data.get("unnamedDuplicated") or 0
@@ -13054,7 +13371,7 @@ def build_browser_tools(
                 extra += f" group={_field(e['group'], OBSERVE_DISPLAY_WIDTHS['group'])}"
             elif e.get("group_missing") and missing_key not in missing_groups_shown:
                 missing_groups_shown.add(missing_key)
-                extra += " group=(no question found)"
+                extra += f" group={_NO_QUESTION_MARKER}"
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page
@@ -13079,9 +13396,45 @@ def build_browser_tools(
         # between, and a form that repeats a section renders one caption many times over. Qualified
         # here rather than at the record build: whether a line is ambiguous is a property of the
         # whole reading, and it is not knowable until every line of it has been rendered.
+        unqualified = list(bodies)
         bodies, _ = _disambiguate_digest_bodies(elements, bodies, _field)
+        # An unnamed control's place in its row is printed even when its line is already unique: the icons of one row
+        # differ by tag alone (a copy <button>, a trash <div>), and which is which is said by position ("the right icon").
+        for index, e in enumerate(elements):
+            if e.get("label") and not e.get("icon"):
+                continue
+            place = next(
+                (
+                    str(entry[1])
+                    for entry in e.get("placement") or []
+                    if isinstance(entry, (list, tuple)) and len(entry) == 2 and entry[0] == _OBSERVE_NTH_KIND
+                ),
+                "",
+            )
+            # Only what the ladder appended is searched: page text earlier on the line can read "nth=" too.
+            added = bodies[index][len(unqualified[index]) :]
+            if _OBSERVE_NTH_RE.fullmatch(place) and f" nth={place}" not in added:
+                bodies[index] += f" nth={place}"
+        still_identical = sum(
+            n
+            for n in Counter(
+                _observe_line_identity(b) for e, b in zip(elements, bodies) if not e.get("pointerRoot")
+            ).values()
+            if n > 1
+        )
         for e, body in zip(elements, bodies):
             lines.append(f"ref={e['ref']} {body}")
+        icons_cut = int(data.get("iconsTruncated") or 0)
+        if icons_cut:
+            lines.append(
+                f"({icons_cut} more icon-only control(s) were left off past this reading's budget; "
+                "get_html shows them, and click takes a selector.)"
+            )
+        if still_identical:
+            lines.append(
+                f"({still_identical} of {len(bodies)} listed controls read the same as another line here; "
+                "look() shows them apart on screen.)"
+            )
         if shows_omitted:
             lines.append(_shows_omitted_note(shows_omitted))
         # Counts only, for the per-call log record: every perception change that alters only what
@@ -13106,7 +13459,8 @@ def build_browser_tools(
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
             "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
-            # Semantic lines only, as before pointer roots were listed; theirs ride pointer_* below.
+            # Every line but pointer roots', as before those were listed; theirs ride pointer_* below. Icons count:
+            # they are lines the model reads, and the gate holds this to the digest's own duplicates.
             "duplicate_digest_lines": sum(
                 n
                 for n in Counter(
@@ -13133,7 +13487,10 @@ def build_browser_tools(
             # report being truncated: a truncated digest is a SUCCESS. `elements_listed` is the
             # denominator the cap-hit rate needs, so it rides every observe, truncating or not.
             # Semantic controls only, so the rate keeps its denominator; pointer roots are counted apart.
-            "elements_listed": sum(1 for e in elements if not e.get("pointerRoot")),
+            "elements_listed": sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))),
+            "icons_listed": sum(1 for e in elements if e.get("icon")),
+            # Icons the budget left over cut, apart from `elements_truncated`, whose denominator leaves icons out.
+            "icons_truncated": int(data.get("iconsTruncated") or 0),
             "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
@@ -13157,7 +13514,7 @@ def build_browser_tools(
             # The main document's load state when `elements_listed` is 0: 1 loading, 2 interactive, 3 complete,
             # 4 unreadable, else 0. An int because the record keeps only ints.
             "ready_state_when_empty": 0
-            if any(not e.get("pointerRoot") for e in elements)
+            if any(not (e.get("pointerRoot") or e.get("icon")) for e in elements)
             else _READY_STATE_CODES.get(str(data.get("readyState") or ""), 4),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
@@ -13264,6 +13621,11 @@ def build_browser_tools(
     # Per tab: the line counts at the last reporting read on that tab's document. A same-document url
     # change (pushState, a hash) keeps it; a new document resets it.
     text_baselines: dict[Any, _TextBaseline] = {}
+    # Documents an observe or whole-page text read showed the model, by read nonce.
+    # Hashed: the nonce is page-forgeable and unbounded, and every one is kept for the run.
+    perceived: set[int] = set()
+    # The page the last call that resolved one acted on, for a finish-time read that must not resolve a tab.
+    last_page: list[Any] = []
     # Held lines that can no longer rise on their document, with the call their span starts at; the next ok
     # result reports them, so a held line is shown exactly once either way.
     flushed: list[tuple[Counter[str], int]] = []
@@ -13630,10 +13992,34 @@ def build_browser_tools(
                             None,
                             over_bound=read_page is not None and unread.get(read_page) == "over_bound",
                         )
+                credit: tuple[Any, _PageText | Literal["over_bound"] | None] | None = None
+                if (
+                    unseen_text is not None
+                    and spec_name == "get_html"
+                    and str(args.get("format") or "").strip().lower() == "text"
+                    and not args.get("selector")
+                    and str(args.get("offset") or 0).strip() == "0"
+                ):
+                    # Read before the tool runs, so text that renders during it is reported later, not counted as shown.
+                    try:
+                        credit_page = await page_provider()
+                    except Exception:
+                        credit_page = None
+                    if credit_page is not None:
+                        _prefetched_page[:] = [credit_page]
+                        frames = _reads_frames(credit_page, credit_page in navigated)
+                        credit = (credit_page, await _read_page_text(credit_page, frames=frames))
+                        if credit[1] is None:
+                            _read_failed(credit_page, False)
+                        elif isinstance(credit[1], str):
+                            unread[credit_page] = credit[1]
                 try:
                     result = await _handler(args)
                 finally:
                     _prefetched_page.clear()
+                    # In the finally, so a handler that resolved a tab and then raised still moves the finish's tab.
+                    if (acted := _current_page()) is not None:
+                        last_page[:] = [acted]
                 page = _current_page()
                 if spec_name in ("observe", "get_html", "look"):
                     if result.status == "ok" and page is not None:
@@ -13650,6 +14036,18 @@ def build_browser_tools(
                     last_action[:] = [(spec_name, key, page, browser_calls[0])] if page is not None else []
                 if result.status != "ok":
                     return result
+                if (
+                    unseen_text is not None
+                    and credit is not None
+                    and credit[0] is page
+                    and isinstance(credit[1], _PageText)
+                    and (result.data or {}).get("rendered_text")
+                ):
+                    # The page's text from its top, cut only by the window the model can page through. A finish batched
+                    # behind this call has not received it yet, so what it newly showed stays evidence for that finish.
+                    _read_succeeded(page)
+                    if section := _take_unreported(page, credit[1], seq, shown_whole=True):
+                        unseen_text.batch.append(section)
                 if not _reports or page is None:
                     if page is not None:
                         _release_held(page)
@@ -13710,6 +14108,15 @@ def build_browser_tools(
                     )
                     return _with_delta_section(result, flush + before_section)
                 _read_succeeded(page)
+                if spec_name == "observe":
+                    if unseen_text is not None and hash(read.nonce) not in perceived:
+                        # A finish batched behind this first observe of the document has not received it yet.
+                        first = _risen_lines(Counter(), read.lines + (read.frame_lines or []), set())
+                        if first:
+                            shown_first, _ = _text_delta_cut(first, 1, _render_delta_line, before_this_call=True)
+                            unseen_text.batch.append("\n" + shown_first)
+                    if unseen_text is not None:
+                        perceived.add(hash(read.nonce))
                 prior = text_baselines.get(page)
                 risen, since = _remember(page, read, seq)
                 # Flushed lines and what the pending read found were on the page before this call ran, so
@@ -13736,6 +14143,69 @@ def build_browser_tools(
                 return _with_delta_section(result, section)
 
             spec.handler = wrapped
+
+    def _take_unreported(page: Any, read: _PageText, seq: int, *, shown_whole: bool = False) -> str:
+        """The section for `read`'s lines no report carried, which then count as reported. A document no observe or
+        whole-page text read showed the model counts every line, since seeding its baseline showed none of them."""
+        prior = text_baselines.get(page)
+        same = prior if prior is not None and prior.nonce == read.nonce else None
+        risen, since = _remember(page, read, seq)
+        if same is None or hash(read.nonce) not in perceived:
+            risen, since, same = _risen_lines(Counter(), read.lines + (read.frame_lines or []), set()), seq - 1, None
+        elif same.frame_counts is None and read.frame_lines:
+            # The baseline takes frames read for the first time unreported, but no read showed them to the model.
+            risen = risen + _risen_lines(Counter(), read.frame_lines, set())
+        perceived.add(hash(read.nonce))
+        if not risen or since is None:
+            return ""
+        shown, cut = _text_delta_cut(risen, seq - since, _render_delta_line, before_this_call=True)
+        # Cut lines are held for the next report only when they rose on a document the model has seen. A whole
+        # unseen document is quoted once, its count telling the model to read the rest, rather than 300 characters
+        # per hold; a whole-page read already showed every line.
+        if cut and same is not None and not shown_whole:
+            _defer(page, [risen[i][0] for i in cut], same, since)
+        return "\n" + shown
+
+    async def _unreported_text() -> str:
+        """The section for the current tab's lines no report carried; "" when there are none or the read fails."""
+        loop_seq = current_tool_call_seq()
+        seq = loop_seq if loop_seq is not None else browser_calls[0] + 1
+        # Resolved like any call, so a popup the last click opened is the page read, but not once every tab is gone:
+        # resolving then would reopen and navigate one during a finish.
+        if last_page and _page_is_closed(last_page[0]):
+            try:
+                survivors = [
+                    tab
+                    for tab in last_page[0].context.pages
+                    if not _page_is_closed(tab) and is_selectable_page_url(tab.url)
+                ]
+            except Exception:
+                survivors = []
+            if not survivors:
+                return ""
+        page = await page_provider()
+        if page is None or _page_is_closed(page) or (page in unread and page not in navigated):
+            return ""
+        last_page[:] = [page]
+        _watch_navigations(page)
+        was_dirty = page in navigated
+        navigated.discard(page)
+        read = await _read_page_text(page, frames=_reads_frames(page, was_dirty))
+        if read is None:
+            _read_failed(page, was_dirty)
+            return ""
+        if isinstance(read, str):
+            unread[page] = read
+            return ""
+        _read_succeeded(page)
+        prior = text_baselines.get(page)
+        if browser_calls[0] and (prior is None or prior.nonce != read.nonce or hash(read.nonce) not in perceived):
+            # A page no read showed the model (one an action just landed on) is judged from that action's result,
+            # as before this check: holding there would cost a turn on nearly every submit-then-finish. A finish
+            # before any browser call judged no page at all, so it is held on the whole page.
+            return ""
+        section = _take_unreported(page, read, seq)
+        return _take_flushed(seq)[0] + section
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -14616,6 +15086,8 @@ def build_browser_tools(
             await asyncio.sleep(0.1)
             # Enabling can re-render or move the control, so the label point is measured again after the wait.
             pre_click_arg = await _probe_arg(page, selector)
+        if isinstance(skin_probe, dict) and "radio" in skin_probe and (kinds := _CLICK_CHOICE_KIND.get()) is not None:
+            kinds.append("radio" if skin_probe["radio"] else "checkbox")
         if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
             # A drawn input under its own label is already force-clicked below, and a frame's label point is
             # frame-relative, so neither takes the label route.
@@ -17965,7 +18437,7 @@ def build_browser_tools(
             return entry
         if password_anchor is not None:
             input_dispatch.note_secret_fill(page, password_anchor)
-        if press_enter and entry.ok_class == "held_differs":
+        if press_enter and entry.ok_class in ("held_differs", "held_international"):
             # Enter would submit a value the field shows is not the one typed, before the batch rule could hold it back;
             # an unreadable field is no such evidence, so Enter still goes there, as before.
             entry.content += " Enter was not pressed: check the field, then press Enter once it holds the value."
@@ -21237,6 +21709,7 @@ def build_browser_tools(
             except Exception:
                 pass
         entry["handle"] = matches[0]
+        entry["reresolved"] = True
         return selector, None
 
     async def _realm_for_typed_selector(page: Any, selector: str) -> tuple[Any, ToolResult | None]:
@@ -21522,6 +21995,57 @@ def build_browser_tools(
             return "", False
         return str(resolved.get("selector") or ""), bool((result.data or {}).get("menu_row"))
 
+    def _with_pick_echo(handler: ToolHandler) -> ToolHandler:
+        # Names the question observe bound the clicked option to, so a wrong pairing is visible in the result.
+        @functools.wraps(handler)
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            ref = REF_SELECTOR_RE.match(str(args.get("selector") or "")) if args.get("mark") is None else None
+            entry = (_observe_manifest.get(int(ref.group(1))) if ref else None) or {}
+            kinds: list[str] = []
+            token = _CLICK_CHOICE_KIND.set(kinds)
+            try:
+                result = await handler(args)
+            finally:
+                _CLICK_CHOICE_KIND.reset(token)
+            kind = entry.get("choice") or (kinds[0] if kinds else "")
+            question = None if entry.get("reresolved") else entry.get("question")
+            # A lone checkbox is mostly a consent that names itself; an unknown question there says nothing.
+            if result.status != "ok" or result.entry_unconfirmed or not kind or (kind == "checkbox" and not question):
+                return result
+            mark = args.get("mark")
+            option = entry.get("option") or _mask_refs(
+                str(_look_manifest.get(mark, {}).get("label") or "") if isinstance(mark, int) else ""
+            )
+            width = OBSERVE_DISPLAY_WIDTHS["group"]
+            what = repr(str(option)[:width]) if option else "this option"
+            line = f"{'picked' if kind == 'radio' else 'clicked'} {what} for " + (
+                f"question {question[:width]!r}" if question else "an unknown question"
+            )
+            return dataclasses.replace(result, content=f"{result.content}\n{line}")
+
+        return wrapped
+
+    async def _answer_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        raw = await asyncio.wait_for(
+            _evaluate_isolated(page, _TARGET_NAME_JS, str(args.get("selector") or "")), _TARGET_NAME_TIMEOUT_SECONDS
+        )
+        return ToolResult.ok("", data=raw if isinstance(raw, dict) else {})
+
+    _resolve_answer_target = _with_act_by_mark(
+        _with_ref_resolution("answer_probe", _with_selector_guard(_answer_target))
+    )
+
+    async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str]:
+        resolved = dict(args)
+        try:
+            data = (await _resolve_answer_target(resolved)).data or {}
+        except Exception:
+            return "", "", ""
+        return str(resolved.get("selector") or ""), str(data.get("name") or ""), str(data.get("kind") or "")
+
     tools = [
         _spec(
             "observe",
@@ -21755,11 +22279,16 @@ def build_browser_tools(
         # Again outermost, for the refusals the mark and ref resolvers raise themselves.
         _tool_spec.handler = _with_refusal_result(_tool_spec.handler)
         if _tool_spec.name == "click":
+            _tool_spec.handler = _with_pick_echo(_tool_spec.handler)
             _tool_spec.toggle_probe = _click_targets_toggle
             _tool_spec.address_probe = _click_address
+        elif _tool_spec.name == "type":
+            _tool_spec.answer_probe = _answer_field
     # Inside the download signal, so a download notice stays the last thing in a result.
     _apply_text_delta(tools)
     _apply_download_signal(tools, downloads_dir)
+    if unseen_text is not None:
+        unseen_text.unreported = _unreported_text
     return tools
 
 

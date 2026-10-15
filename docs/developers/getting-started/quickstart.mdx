@@ -1,35 +1,41 @@
 ---
 title: Quickstart
-subtitle: Run your first browser automation in 5 minutes
-description: Launch a cloud browser, go to a webpage, and extract structured data with Python, TypeScript, or cURL in under 5 minutes.
+subtitle: Run your first browser automation from code
+description: Get a Skyvern API key, install the Python or TypeScript SDK, run a browser task from code or cURL, and watch the run in the Skyvern app.
 slug: developers/getting-started/quickstart
 keywords:
   - quickstart
+  - API key
+  - pip install skyvern
+  - npm install @skyvern/client
+  - run_task
   - launch_cloud_browser
-  - get_working_page
   - page.extract
-  - page.agent.run_task
   - cURL
-  - Python
-  - Typescript
-  - pip install
-  - npm install
-  - installation
+  - coding agent
 ---
 
-Run your first browser automation in 5 minutes. By the end of this guide, you'll launch a cloud browser, navigate to Hacker News, and extract the top post title using Skyvern SDK's Page, Agent and Browser methods.
+import { ApiKeyPrompt } from "/snippets/api-key-prompt.jsx";
 
-<Note>
-Prefer a visual interface? Try the [Cloud UI](/cloud/getting-started/overview) instead. No code required.
-</Note>
+This page takes you from zero to a finished run in Skyvern Cloud. You send Skyvern a prompt and a URL, Skyvern runs a cloud browser, and you get structured output back.
 
-## Step 1: Get your API key
+Prefer to build without code? Start with the [app quickstart](/cloud/quickstart). Using Claude Code, Cursor or another coding agent? Skip to [Hand it to your coding agent](#hand-it-to-your-coding-agent).
 
-<img src="/images/get-api-key.png" alt="Get Skyvern API key" />
+## Get your API key
 
-Sign up at [app.skyvern.com](https://app.skyvern.com) and go to [Settings](https://app.skyvern.com/settings) to copy your API key.
+Sign in at [app.skyvern.com](https://app.skyvern.com), open [**Settings → API keys**](https://app.skyvern.com/settings/api-keys) and copy the key.
 
-## Step 2: Install the SDK
+<Frame>
+  <img src="/images/get-api-key.png" alt="Settings page with API keys selected, showing a masked key with reveal and copy buttons and a Rotate API Key button" />
+</Frame>
+
+Set it in your shell:
+
+```bash
+export SKYVERN_API_KEY="your-api-key"
+```
+
+## Install the SDK
 
 <CodeGroup>
 ```bash Python
@@ -41,48 +47,40 @@ npm install @skyvern/client
 ```
 </CodeGroup>
 
-<Info>
-`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install the local extra: `pip install "skyvern[local]"`. For a local Skyvern server, self-hosted instance, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
-</Info>
+The Python SDK supports Python 3.11, 3.12, 3.13 and 3.14. The plain `skyvern` package covers the REST API: running tasks and agents, reading runs, managing credentials. To drive a browser page from your own code, you also need the `local` extra; see [Drive the browser from code](#drive-the-browser-from-code).
 
-<Accordion title="Troubleshooting: Python version errors">
-The Skyvern SDK requires Python 3.11, 3.12, or 3.13. If you encounter version errors, try using pipx:
+## Run your first task
 
-```bash
-pipx install skyvern
-```
-
-pipx installs Python packages in isolated environments while making them globally available.
-</Accordion>
-
-## Step 3: Launch a browser and extract data
-
-When you call `launch_cloud_browser()`, Skyvern spins up a Chromium instance in the cloud. Your code drives that browser via a Playwright `Page` that also has AI methods (`act`, `extract`, `validate`, `prompt`) layered on top. You can watch the browser live at any time.
+A task is one prompt plus a starting URL. Skyvern opens a cloud browser, works toward the goal and returns the result. The SDK samples wait for the run to finish; the REST API returns immediately and you poll.
 
 <CodeGroup>
 ```python Python
-import os
 import asyncio
+import os
+
 from skyvern import Skyvern
 
+
 async def main():
-    skyvern = Skyvern(api_key=os.getenv("SKYVERN_API_KEY"))
+    skyvern = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
 
-    # 1. Launch a cloud browser and get a page
-    browser = await skyvern.launch_cloud_browser()
-    page = await browser.get_working_page()
-    print(f"Watch live: https://app.skyvern.com/browser-session/{browser.browser_session_id}")
+    result = await skyvern.run_task(
+        prompt="Get the title and points of the #1 post",
+        url="https://news.ycombinator.com",
+        data_extraction_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title of the top post"},
+                "points": {"type": "integer", "description": "Points of the top post"},
+            },
+        },
+        wait_for_completion=True,
+    )
 
-    try:
-        # 2. Navigate
-        await page.goto("https://news.ycombinator.com")
+    print(f"Status: {result.status}")
+    print(f"Output: {result.output}")
+    print(f"View run: {result.app_url}")
 
-        # 3. Extract data with an AI prompt
-        result = await page.extract("Get the title of the #1 post")
-        print(f"Extracted: {result}")
-    finally:
-        # 4. Always close the browser to free cloud resources
-        await browser.close()
 
 asyncio.run(main())
 ```
@@ -91,265 +89,321 @@ asyncio.run(main())
 import { Skyvern } from "@skyvern/client";
 
 async function main() {
-  const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY });
+  const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
-  // 1. Launch a cloud browser and get a page
-  const browser = await skyvern.launchCloudBrowser();
-  const page = await browser.getWorkingPage();
-  console.log(`Watch live: https://app.skyvern.com/browser-session/${browser.browserSessionId}`);
+  const result = await skyvern.runTask({
+    prompt: "Get the title and points of the #1 post",
+    url: "https://news.ycombinator.com",
+    data_extraction_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Title of the top post" },
+        points: { type: "integer", description: "Points of the top post" },
+      },
+    },
+    waitForCompletion: true,
+  });
 
-  try {
-    // 2. Navigate
-    await page.goto("https://news.ycombinator.com");
-
-    // 3. Extract data with an AI prompt
-    const result = await page.extract("Get the title of the #1 post");
-    console.log("Extracted:", result);
-  } finally {
-    // 4. Always close the browser to free cloud resources
-    await browser.close();
-  }
+  console.log(`Status: ${result.status}`);
+  console.log("Output:", result.output);
+  console.log(`View run: ${result.app_url}`);
 }
 
 main();
 ```
 
 ```bash cURL
-# The SDK's browser/page pattern is a client-side abstraction over several
-# REST calls. For a single curl example, use the task API, which handles
-# browser + navigation + extraction as one request:
-
+# Start the run. The response includes a run_id.
 curl -X POST "https://api.skyvern.com/v1/run/tasks" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Go to news.ycombinator.com and get the title of the #1 post",
-    "url": "https://news.ycombinator.com"
+    "prompt": "Get the title and points of the #1 post",
+    "url": "https://news.ycombinator.com",
+    "data_extraction_schema": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "description": "Title of the top post"},
+        "points": {"type": "integer", "description": "Points of the top post"}
+      }
+    }
   }'
-```
-</CodeGroup>
 
-<Info>
-**Why `page.extract` is enough here.** For a one-shot read on a single page, `page.extract(prompt, schema=...)` returns the extracted data directly (a `dict` in Python, `object` in TS). For multi-step goals like *"log in, navigate to billing, download the invoice"*, use `page.agent.run_task(prompt)` instead; it runs a full AI task loop on the page and returns a [`TaskRunResponse`](/sdk-reference/tasks/run-task#returns-taskrunresponse). See [Build a Browser Automation](/developers/browser-automations/overview) for the full walkthrough.
-</Info>
-
-## Step 4: Understand the output
-
-`page.extract` returns the extracted data as a dict. For the Hacker News example you'll see something like:
-
-```text
-Watch live: https://app.skyvern.com/browser-session/pbs_519891155782767800
-Extracted: {'top_post_title': 'Linux kernel framework for PCIe device emulation, in userspace'}
-```
-
-- **`Watch live: ...`** is printed before any AI calls. Open it in another tab to watch the browser navigate and extract in real time.
-- **`Extracted: {...}`** appears after `page.extract` returns. The key names come from the AI (unless you pass a `schema`, in which case they match your schema). For typed, predictable output, see [Extract Structured Data](/developers/browser-automations/extract-structured-data).
-
-### If you used the cURL path
-
-The task API is asynchronous. The POST returns a `run_id`; poll for the final result:
-
-```bash
-RUN_ID="tsk_..."  # from the POST response above
-
+# Poll until the status is final, then read "output".
+RUN_ID="tsk_..."  # from the response above
 while true; do
-  RESPONSE=$(curl -s -X GET "https://api.skyvern.com/v1/runs/$RUN_ID" \
-    -H "x-api-key: $SKYVERN_API_KEY")
-
+  RESPONSE=$(curl -s "https://api.skyvern.com/v1/runs/$RUN_ID" -H "x-api-key: $SKYVERN_API_KEY")
   STATUS=$(echo "$RESPONSE" | jq -r '.status')
   echo "Status: $STATUS"
-
-  if [[ "$STATUS" == "completed" || "$STATUS" == "failed" || "$STATUS" == "terminated" || "$STATUS" == "timed_out" || "$STATUS" == "canceled" ]]; then
-    echo "$RESPONSE" | jq '.output'
-    break
-  fi
+  case "$STATUS" in
+    completed|failed|terminated|timed_out|canceled) echo "$RESPONSE" | jq '.output'; break ;;
+  esac
   sleep 5
 done
 ```
+</CodeGroup>
 
-**Run states:**
-- `created`, `queued`: Waiting for an available browser
-- `running`: AI is navigating and executing
-- `completed`: Task finished successfully
-- `failed` / `terminated` / `timed_out` / `canceled`: Non-success terminal states
+When the run finishes, you get something like:
 
-## Step 5: Watch the recording
+```text
+Status: completed
+Output: {'title': 'Show HN: ...', 'points': 312}
+View run: https://app.skyvern.com/runs/tsk_...
+```
 
-Every run is recorded. Two ways to access it:
+**Run statuses:**
+- `created`, `queued`: waiting for a browser.
+- `running`: the agent is working.
+- `paused`: waiting on a person (agent runs with a human interaction step).
+- `completed`: finished successfully.
+- `failed`, `terminated`, `timed_out`, `canceled`: finished without success. Read `failure_reason` on the run.
 
-### Live
+`wait_for_completion` (Python) and `waitForCompletion` (TypeScript) poll for up to 30 minutes by default. Pass `timeout` in seconds to change that.
 
-While the script runs, the `Watch live: ...` URL printed in Step 3 streams the browser in real time.
+## See the run in the app
 
-### After the run
+Open the `app_url` from the output, or go to **Agents → Runs** in the app. Each run shows the browser recording, every step the agent took with its screenshot and reasoning, and the extracted output.
 
-Open [Runs](https://app.skyvern.com/runs) and click on your run to see the Recording tab, step-by-step actions with screenshots, and AI reasoning for each decision.
+<img src="/images/cloud/cloud-first-run-outputs.png" alt="A completed run with the Run pane on Outputs showing the extracted data" />
 
-<img src="/images/view-recording.png" alt="Recording tab in Skyvern Cloud" />
+When a run does something unexpected, this page is the first place to look. See [Runs and schedules](/cloud/runs) for what each panel shows.
 
-This is invaluable for debugging and understanding how Skyvern interprets your prompts.
+## Drive the browser from code
 
----
+`run_task` hands the whole goal to Skyvern. To control each step yourself, launch a cloud browser and work with its page. The page is a Playwright page with AI methods added: `act`, `extract`, `validate` and `prompt`.
 
-## Run with a local server
-
-You can run Skyvern with a browser on your own machine. This is useful for development, debugging, or automating internal tools on your local network.
-
-**Prerequisites:**
-- Skyvern server extra installed (`pip install "skyvern[server]"`)
-- Source checkout or Docker Compose for guided quickstart and database migrations
-- PostgreSQL database (local install or Docker)
-- An LLM API key (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, or any OpenAI-compatible provider)
-
-<Note>
-Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately. The PyPI wheel installs the local-server dependencies, but guided quickstart currently needs repository migration files from a source checkout.
-</Note>
-
-### Set up local Skyvern
+In Python, these browser methods need the `local` extra, which adds Playwright. You need it even though the browser runs in Skyvern Cloud. The TypeScript package already includes Playwright.
 
 ```bash
-# Run this from your app or repo root if you want Claude Code + /qa set up in-place
-skyvern quickstart
-
-# Or use setup-only mode if you do not want to start services yet
-skyvern init
+pip install "skyvern[local]"
 ```
 
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/Skyvern-AI/skyvern-docs-media@383c5fb7f1c10a89e57a34e503b05b7ee4e80a6a/media/quickstart/8d8dc46d95f62f20c9ee6e433a1dcca0e2bb7b074fe93a2d56bc4fcd7ac85d4a-skyvern-init.gif" alt="Skyvern init interactive setup wizard" />
-</p>
-
-
-This interactive wizard will:
-1. Set up your database (detects local PostgreSQL or uses Docker)
-2. Configure your LLM provider
-3. Choose browser mode (headless, headful, or connect to existing Chrome)
-4. Generate local API credentials
-5. Optionally configure local MCP for Claude Code, Claude Desktop, Cursor, or Windsurf
-6. Download the Chromium browser
-
-If you choose **Claude Code** during the MCP step and you run the wizard inside a project or repo, Skyvern will:
-
-- write a project-local `.mcp.json`
-- pin the MCP command to the active Python interpreter (`/path/to/python -m skyvern run mcp`)
-- install bundled Claude Code skills into `.claude/skills/`, including `/qa`
-- keep the whole path local, so Claude Code can test `localhost` directly without Skyvern Cloud or browser tunneling
-
-This will generate a .env file that stores your local configuration, LLM api keys and your local `BASE_URL` and `SKYVERN_API_KEY`:
-```.env
-ENV='local'
-ENABLE_OPENAI='true'
-OPENAI_API_KEY='<API_KEY>'
-...
-LLM_KEY='OPENAI_GPT5_5'
-SECONDARY_LLM_KEY=''
-BROWSER_TYPE='chromium-headful'
-MAX_SCRAPING_RETRIES='0'
-VIDEO_PATH='./videos'
-BROWSER_ACTION_TIMEOUT_MS='5000'
-MAX_STEPS_PER_RUN='50'
-LOG_LEVEL='INFO'
-LITELLM_LOG='CRITICAL'
-DATABASE_STRING='postgresql+psycopg://skyvern@localhost/skyvern'
-PORT='8000'
-...
-SKYVERN_BASE_URL='http://localhost:8000'
-SKYVERN_API_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.....hSo3YA'
-```
-
-### Start the local server
-
-If you used `skyvern quickstart` and chose to start services, Skyvern is already running. If you used `skyvern init`, start the server with:
-
-```bash
-skyvern run server
-```
-
-<p align="center">
-  <img src="/images/skyvern-run-server.gif" alt="Skyvern local server logs" />
-</p>
-
-### Run locally
-
-The only difference from cloud is the `base_url` parameter pointing to your local server. The Page/Agent/Browser API is identical, so the same code works in both environments. Develop locally, deploy to cloud without changes.
-
-```python
-import os
+<CodeGroup>
+```python Python
 import asyncio
+import os
+
 from skyvern import Skyvern
 
+
 async def main():
-    skyvern = Skyvern(
-        base_url="http://localhost:8000",
-        api_key=os.getenv("SKYVERN_API_KEY"),
-    )
+    skyvern = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
 
-    browser = await skyvern.launch_local_browser()
-    page = await browser.get_working_page()
-
+    browser = await skyvern.launch_cloud_browser()
     try:
+        page = await browser.get_working_page()
         await page.goto("https://news.ycombinator.com")
-        result = await page.extract("Get the title of the #1 post")
-        print(f"Extracted: {result}")
+
+        title = await page.extract("Get the title of the #1 post")
+        print(f"Extracted: {title}")
     finally:
+        # Close the browser to end the cloud session.
         await browser.close()
+
 
 asyncio.run(main())
 ```
 
-A browser window will open on your machine (if you chose headful mode). Recordings and logs are saved in the directory where you started the server.
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
 
-If you also selected Claude Code during setup, start your local frontend dev server and run `/qa http://localhost:3000` in Claude Code to validate the app against your local environment.
+async function main() {
+  const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
-<video style={{ aspectRatio: '16 / 9', width: '100%' }} controls>
-  <source src="https://cdn.jsdelivr.net/gh/Skyvern-AI/skyvern-docs-media@383c5fb7f1c10a89e57a34e503b05b7ee4e80a6a/media/quickstart/56f8b625b7ac6324f44e76fb13c14ebd546350ee97aa3ba76bceec62f579dc15-skyvern-agent-local.mp4" type="video/mp4" />
-</video>
+  const browser = await skyvern.launchCloudBrowser();
+  try {
+    const page = await browser.getWorkingPage();
+    await page.goto("https://news.ycombinator.com");
 
----
+    const title = await page.extract({ prompt: "Get the title of the #1 post" });
+    console.log("Extracted:", title);
+  } finally {
+    // Close the browser to end the cloud session.
+    await browser.close();
+  }
+}
 
-## Next steps
+main();
+```
+</CodeGroup>
 
-<CardGroup cols={2}>
-  <Card
-    title="Build a Browser Automation"
-    icon="browser"
-    href="/developers/browser-automations/overview"
-  >
-    The full Page/Agent/Browser walkthrough: AI actions, Playwright selectors, and agent tasks
+When the browser launches, the SDK logs a `Launched new cloud browser session` line with a `https://app.skyvern.com/browser-session/pbs_...` link. Open it to watch the browser live while your script runs.
+
+[Browser automation](/developers/browser-automation) covers the full page model: selectors with AI fallback, schemas, logins, downloads and tabs.
+
+## Hand it to your coding agent
+
+Paste your API key into the box, then copy the prompt into Claude Code, Cursor, Codex or another coding agent. The agent installs the SDK, asks what you want to automate, writes the script and runs it.
+
+To give the agent browser tools directly instead of writing SDK code, connect the [MCP server](/developers/getting-started/mcp).
+
+<Tabs>
+<Tab title="Python">
+
+<ApiKeyPrompt>{`Set up Skyvern for browser automation:
+
+1. Install the Skyvern Python SDK with the local extra (requires Python 3.11-3.14).
+   The browser methods below need it, even with a cloud browser:
+   pip install "skyvern[local]"
+   If you hit Python version errors, use: pipx install "skyvern[local]"
+
+2. Install the Skyvern skills into this project:
+   skyvern skill copy --output .claude/skills/
+
+3. Set my API key:
+   export SKYVERN_API_KEY="PASTE_YOUR_API_KEY_HERE"
+
+Now ask me what I want to automate in the browser. Suggest this as a default:
+"Go to Hacker News and get the top comment of the #1 post"
+
+After I respond, create a skyvern-tasks/ folder and save a Python file there
+using this template. Replace <URL>, <TASK> and the schema fields with what I
+asked for.
+
+    import asyncio
+    import os
+
+    from skyvern import Skyvern
+
+    async def main():
+        skyvern = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+        browser = await skyvern.launch_cloud_browser()
+        try:
+            page = await browser.get_working_page()
+            await page.goto("<URL>")
+
+            # Multi-step goal: let the agent navigate and extract
+            result = await page.agent.run_task(
+                "<TASK>",
+                data_extraction_schema={
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                },
+            )
+
+            print(f"Status: {result.status}")
+            print(f"View run: {result.app_url}")
+            if result.output is not None:
+                print(f"Output: {result.output}")
+            elif result.failure_reason:
+                print(f"Failed: {result.failure_reason}")
+        finally:
+            await browser.close()
+
+    asyncio.run(main())
+
+Run the file and show me the output.
+
+Notes:
+- For a one-shot read of the current page, use page.extract() instead of page.agent.run_task().
+- For sites that need a login, store a credential in Skyvern and call page.agent.login() first.
+- Always close the browser in a finally block.
+
+Reference docs you can fetch as needed:
+- https://www.skyvern.com/docs/llms.txt (page index for LLMs)
+- https://www.skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
+
+</Tab>
+<Tab title="TypeScript">
+
+<ApiKeyPrompt>{`Set up Skyvern for browser automation:
+
+1. Initialize a Node.js project if needed (Node 18 or later) and install the Skyvern SDK:
+   npm init -y
+   npm install @skyvern/client
+
+2. Set my API key:
+   export SKYVERN_API_KEY="PASTE_YOUR_API_KEY_HERE"
+
+Now ask me what I want to automate in the browser. Suggest this as a default:
+"Go to Hacker News and get the top comment of the #1 post"
+
+After I respond, create a skyvern-tasks/ folder and save a TypeScript file there
+using this template. Replace <URL>, <TASK> and the schema fields with what I
+asked for.
+
+    import { Skyvern } from "@skyvern/client";
+
+    async function main() {
+      const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+      const browser = await skyvern.launchCloudBrowser();
+      try {
+        const page = await browser.getWorkingPage();
+        await page.goto("<URL>");
+
+        // Multi-step goal: let the agent navigate and extract
+        const result = await page.agent.runTask("<TASK>", {
+          dataExtractionSchema: {
+            type: "object",
+            properties: { answer: { type: "string" } },
+          },
+        });
+
+        console.log(\`Status: \${result.status}\`);
+        console.log(\`View run: \${result.app_url}\`);
+        if (result.output != null) {
+          console.log("Output:", result.output);
+        } else if (result.failure_reason) {
+          console.log(\`Failed: \${result.failure_reason}\`);
+        }
+      } finally {
+        await browser.close();
+      }
+    }
+
+    main();
+
+Run the file with npx tsx and show me the output.
+
+Notes:
+- For a one-shot read of the current page, use page.extract({ prompt }) instead of page.agent.runTask().
+- For sites that need a login, store a credential in Skyvern and call page.agent.login() first.
+- Response fields are snake_case: result.app_url, result.failure_reason, result.downloaded_files.
+- Always close the browser in a finally block.
+
+Reference docs you can fetch as needed:
+- https://www.skyvern.com/docs/llms.txt (page index for LLMs)
+- https://www.skyvern.com/docs/api-reference/openapi.json (OpenAPI spec for the REST API)`}</ApiKeyPrompt>
+
+</Tab>
+</Tabs>
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="Error: ... requires local embedded/browser support">
+You called a browser method (`launch_cloud_browser`, `get_working_page`, `page.extract`) with only the base package installed. Install the local extra:
+
+```bash
+pip install "skyvern[local]"
+```
+</Accordion>
+
+<Accordion title="Python version errors">
+The SDK requires Python 3.11 to 3.14. Check with `python3 --version`. To install into an isolated environment instead, use `pipx install "skyvern[local]"`.
+</Accordion>
+
+<Accordion title="401 or invalid API key">
+Copy the key again from [**Settings → API keys**](https://app.skyvern.com/settings/api-keys) and check for stray spaces or newlines. If someone clicked **Rotate API Key**, the old key no longer works.
+</Accordion>
+
+<Accordion title="I want to run Skyvern on my own machine">
+Running against your own Skyvern server and a local browser is covered in [Self-host](/developers/self-hosted/overview). The SDK code stays the same; you point it at your server.
+</Accordion>
+</AccordionGroup>
+
+More fixes are in [Troubleshooting](/developers/troubleshooting).
+
+## Next
+
+<CardGroup cols={3}>
+  <Card title="Browser automation" icon="browser" href="/developers/browser-automation">
+    Selectors with AI fallback, schemas, logins, downloads and tabs.
   </Card>
-  <Card
-    title="Actions Reference"
-    icon="list"
-    href="/developers/browser-automations/actions-reference"
-  >
-    Every page action and agent method with parameters and return types
+  <Card title="MCP and coding agents" icon="robot" href="/developers/getting-started/mcp">
+    Give Claude Code, Cursor and other agents Skyvern's browser tools.
   </Card>
-  <Card
-    title="Extract Structured Data"
-    icon="database"
-    href="/developers/browser-automations/extract-structured-data"
-  >
-    Define a schema to get typed JSON output from your automations
-  </Card>
-  <Card
-    title="Handle Logins"
-    icon="key"
-    href="/sdk-reference/credentials/create-credential"
-  >
-    Store credentials securely for sites that require authentication
-  </Card>
-  <Card
-    title="Build Agents"
-    icon="diagram-project"
-    href="/cloud/building-agents/build-an-agent"
-  >
-    Chain multiple steps together for complex automations
-  </Card>
-  <Card
-    title="Use Webhooks"
-    icon="webhook"
-    href="/developers/going-to-production/webhooks"
-  >
-    Get notified when tasks complete instead of polling
+  <Card title="Going to production" icon="rocket" href="/developers/production">
+    Webhooks, retries, proxies and cost control.
   </Card>
 </CardGroup>

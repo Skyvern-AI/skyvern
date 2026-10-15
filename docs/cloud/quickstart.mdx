@@ -1,0 +1,118 @@
+---
+title: Your first agent with Copilot
+description: Describe a browser task in plain words on the Skyvern Home page, let Copilot build the agent in Studio, accept its changes, run it and read the results.
+keywords:
+  - quickstart
+  - Copilot
+  - Studio
+  - first agent
+  - Home
+  - prompt
+  - template
+---
+
+You describe a task in plain words. Copilot turns it into an agent, tests it in a live browser and hands it back for you to accept. Then you run it and read the results.
+
+## Build and run your first agent
+
+<Steps>
+  <Step title="Sign up and open Home">
+    Create an account at [app.skyvern.com](https://app.skyvern.com). A new account answers a few short questions first (you can click **Skip for now**), then lands on **Home**.
+
+    If you described a task in those questions, it is already in the prompt box.
+  </Step>
+  <Step title="Describe the task">
+    In the box under **What task would you like to accomplish?**, write the task the way you would brief a colleague. Name the site, say what to do there, and say what you want back.
+
+    ```text
+    Go to news.ycombinator.com, open the top 5 posts on the front page, and return each post's title, URL and point count.
+    ```
+
+    Click the arrow to send.
+
+    - **Try an example** below the box fills in a ready-made prompt you can edit.
+    - The **+** menu attaches files to the prompt (**Upload document**) or starts a recording of you doing the task yourself (**Record task**).
+    - The microphone button lets you dictate the prompt.
+
+    <img src="/images/cloud/cloud-home-prompt.png" alt="Home with the Hacker News task typed in the What task would you like to accomplish box and the Try an example cards below" />
+  </Step>
+  <Step title="Let Copilot build the agent">
+    Skyvern creates a new agent and opens it in **Studio**, with your prompt sent to **Copilot**. You don't need to do anything yet.
+
+    Copilot names the agent, plans the steps, opens the site in the **Browser** pane and adds blocks one by one. It runs each block to test it, so you see the browser move while it works.
+
+    If Copilot only answers in the chat without proposing blocks, ask it to turn the work into an agent you can run again.
+
+    Copilot stops to ask when it needs you:
+
+    - **A question.** Pick an answer or type your own in the message box.
+    - **A login.** The **Copilot needs to sign in** card lets you pick a saved login under **Saved logins** or add one. See [Credentials and 2FA](/credentials).
+
+    <img src="/images/cloud/cloud-copilot-building.png" alt="Studio with Copilot showing its plan and working status on the left and the Browser pane on Hacker News on the right" />
+  </Step>
+  <Step title="Accept the proposed changes">
+    When Copilot finishes, it shows a **Proposed changes** card listing the blocks it added, changed or removed. A pill tells you whether the blocks were **Tested**, **Untested** or **Test failed**.
+
+    - Click **Accept** to apply the changes. They are saved to the agent.
+    - Click **Review** to compare the proposed agent with the previous version before you decide.
+    - Click **Reject** to discard them. The agent goes back to the previous version.
+
+    Nothing is saved until you accept. To stop reviewing every change in this chat, open the arrow next to **Accept** and choose **Always accept**. The message area then shows **Auto-accepting** with a **Turn off** link.
+
+    <img src="/images/cloud/cloud-copilot-proposal.png" alt="Copilot reply with the extracted posts and a Proposed changes card marked Tested, with Accept, its Always accept option, Review and Reject" />
+
+    <Warning>
+    **Test end-to-end** (in the card's **⋯** menu, or in the card itself) runs every block together on the real site. It can submit forms, place orders or send messages for real.
+    </Warning>
+  </Step>
+  <Step title="Run the agent">
+    Click **Run** in the Studio top bar. The run form opens.
+
+    Fill in any inputs the agent needs, then click **Run agent**. The default settings work for a first run. [Runs and schedules](/cloud/runs#run-an-agent) explains every setting.
+  </Step>
+  <Step title="Watch it and read the results">
+    Studio switches to the run. The **Browser** pane shows the browser live, and the **Run** pane's **Timeline** shows each block as it runs.
+
+    When the run ends, open **Outputs** in the Run pane. You'll find the data the agent returned (**Extracted information** and **Run outputs**), any **Errors**, and links to **Downloaded files**.
+
+    <img src="/images/cloud/cloud-first-run-outputs.png" alt="A completed run with the Run pane on Outputs showing the extracted Hacker News posts" />
+  </Step>
+</Steps>
+
+You now have a saved agent. Find it any time under **Agents** → **All Agents**, run it again, or [put it on a schedule](/cloud/runs#schedule-an-agent).
+
+## Change the agent by chatting
+
+Keep talking to Copilot in the same pane. Ask for changes the way you asked for the agent:
+
+```text
+Also return the number of comments for each post, and skip posts that are job ads.
+```
+
+Each request ends in another **Proposed changes** card to accept or reject. **New chat** at the top of the Copilot pane starts a fresh conversation, and **History** reopens earlier ones.
+
+If a run fails, the Run pane shows what went wrong with a **Fix with Copilot** button. Click it to hand the failure to Copilot, then review its fix like any other change.
+
+## Other ways to start
+
+| Start from | How | What you get |
+|---|---|---|
+| A template | On Home, scroll to **Start from a template** and click a card | A copy of the template named "*template name* (copy)", open in Studio. Copilot posts what it does and which inputs it needs. |
+| Your own template | **Agents** → **All Agents** → **Create** → **From Template** | A copy of an agent your team saved with **Save as Template** |
+| Nothing | **Start with a blank canvas** under the Home prompt, or **New Agent** in the sidebar | An empty agent in Studio. Ask Copilot or add blocks by hand. |
+| A file | **Import** on the **All Agents** page | An agent from a YAML, JSON or ZIP export, or generated from a PDF procedure |
+
+[Build in Studio](/cloud/studio) covers editing blocks by hand, inputs, versions and organizing agents.
+
+## Tips for a good first prompt
+
+- **Name the site.** A full URL saves Copilot a search.
+- **Say what "done" looks like.** "Return the title, URL and point count" works better than "look at the posts".
+- **Say what varies between runs.** "The search term changes each time" tells Copilot to make it an input.
+- **Mention logins up front.** If the site needs an account, say so, so Copilot asks for a saved login early.
+
+## Next
+
+- [Build in Studio](/cloud/studio): edit blocks, inputs and versions yourself.
+- [Runs and schedules](/cloud/runs): run settings, live control, run history and schedules.
+- [Credentials and 2FA](/credentials): save logins and 2FA codes your agents can use.

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from agents.run_config import ModelInputData
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.ask_user import (
@@ -19,7 +20,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     QuestionResponse,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import estimate_tokens
+from skyvern.forge.sdk.copilot.enforcement import estimate_tokens, pending_screenshot_message
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -30,8 +31,9 @@ from skyvern.forge.sdk.copilot.session_factory import (
     copilot_session_input_callback,
     make_copilot_call_model_input_filter,
 )
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import captured_frame_entry, make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
+from tests.unit.copilot_test_helpers import sent_image_px
 
 
 def _unread_run_results_batch() -> list[dict[str, Any]]:
@@ -704,6 +706,45 @@ class TestStagedScreenshotBinding:
 
         assert len(_image_parts(delivered.input[-1])) == 1
         assert ctx.pending_frame_lease.capture_event_id == recaptured.capture_event_id
+
+    def test_a_sharp_frame_over_budget_costs_older_screenshots_first_and_then_falls_back_to_the_small_copy(
+        self,
+    ) -> None:
+        older_frame = pending_screenshot_message(
+            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        )
+        items = [
+            {"role": "user", "content": "what does the page say"},
+            older_frame,
+            {"type": "function_call", "call_id": "read-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "read-1", "output": '{"text":"order 4412 shipped"}'},
+        ]
+
+        def call(token_budget: int) -> ModelInputData:
+            ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+            return make_copilot_call_model_input_filter(token_budget=token_budget)(_mk_input_data(items, context=ctx))
+
+        for token_budget, new_frame_px in ((2_200, (1600, 789)), (1_200, (1024, 505))):
+            result = call(token_budget)
+            assert [sent_image_px(item) for item in result.input] == [[], [], [], [], [new_frame_px]]
+            assert result.input[2:4] == items[2:4]
+
+    def test_the_pending_frame_is_sent_sharp_on_every_call_that_carries_it(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        initial = [{"role": "user", "content": "what does the page say"}]
+        advanced = [
+            *initial,
+            {"type": "function_call", "call_id": "read-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "read-1", "output": '{"ok":true}'},
+        ]
+
+        first = copilot_call_model_input_filter(_mk_input_data(initial, context=ctx))
+        later = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
+
+        for result in (first, later):
+            message = result.input[-1]
+            assert sent_image_px(message) == [(1600, 789)]
+            assert "image_px=1600x789; viewport_css_px=1920x947" in message["content"][0]["text"]
 
     def test_paired_message_has_machine_readable_marker(self) -> None:
         ctx = _ctx_with_staged_frame()

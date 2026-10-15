@@ -33,7 +33,7 @@ from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import CredentialCheckEvidence, LoginUnconfirmedError, UserDefinedError
 from skyvern.exceptions import (
     IllegitCompleteScriptTermination,
     NoTOTPSecretFound,
@@ -631,7 +631,7 @@ async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scr
 
 
 @pytest.mark.asyncio
-async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
+async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
     """
     When context, task, and step are available, terminate() should call
     handle_terminate_action and then raise ScriptTerminationException.
@@ -660,9 +660,14 @@ async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
         mapped_error = UserDefinedError(
             error_code="unavailable", reasoning="The requested item is unavailable", confidence_float=1.0
         )
+        gate_error = (
+            LoginUnconfirmedError()
+            .to_user_defined_error()
+            .with_credential_check(CredentialCheckEvidence(confirmed=False))
+        )
 
         async def classify(action, *_args):
-            action.errors = [mapped_error]
+            action.errors = [mapped_error, gate_error]
             return [MagicMock(success=True)]
 
         mock_step = MagicMock()
@@ -692,7 +697,7 @@ async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
             with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2") as raised:
                 await script_page.terminate(errors=["error1", "error2"])
 
-            assert raised.value.user_defined_errors == [mapped_error]
+            assert raised.value.user_defined_errors == [mapped_error, gate_error]
 
             # Verify handler was called with correct arguments
             mock_handler.assert_called_once()
@@ -4113,3 +4118,30 @@ async def test_click_progress_ignores_retained_partial_rename(tmp_path, mock_scr
     assert record.await_args.kwargs["download_triggered"] is (attempt != 2)
     assert record.await_args.kwargs["downloaded_files"] == (None if attempt == 2 else ["previous.pdf"])
     assert (tmp_path / "previous.pdf").stat().st_mtime == 100
+
+
+@pytest.mark.asyncio
+async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.core.script_generations.script_skyvern_page as module
+    from skyvern.forge import app
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+    from skyvern.services.otp_service import OTPValue
+    from skyvern.webeye.actions.actions import InputTextAction
+
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_1"] = WorkflowRunContext("title", "workflow-id", "permanent-id", "wr_1", None)
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager, raising=False)
+    monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
+    monkeypatch.setattr(module, "render_template", lambda value: value)
+    monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
+    script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+    script_page.page = SimpleNamespace()
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
+        value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
+        codes = manager.get_one_time_codes_for_run("wr_1")
+
+    typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
+    assert value == "482913"
+    assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required

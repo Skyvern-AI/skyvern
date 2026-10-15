@@ -26,6 +26,7 @@ from skyvern.cli.core.client import (
 )
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import (
+    RequestFailureLog,
     SessionState,
     register_copilot_session,
     scoped_session,
@@ -343,6 +344,7 @@ class ScoutedSelectorCandidate(TypedDict):
     selector: str
     source: str
     match_count: int | None
+    visible_match_count: NotRequired[int]
 
 
 class ScoutedInteraction(TypedDict):
@@ -459,6 +461,9 @@ class AgentContext:
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
     # that parks on a user decision can suspend it instead of being cancelled mid-question.
     model_stream_deadline: asyncio.Timeout | None = None
+    # Runs started since the current model call began. The SDK saves a step to the session only once all of
+    # its tools return, so after the hard backstop cuts a step these are the runs the session has no result for.
+    open_step_run_ids: list[str] = field(default_factory=list)
     # True from on_llm_start to on_llm_end: no tool of that response has started, so aborting the
     # stream then discards only the call itself.
     model_call_in_flight: bool = False
@@ -476,6 +481,9 @@ class AgentContext:
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
     )
+    # Shared by this turn's per-dispatch SessionStates, whose page listeners keep writing between calls. Those listeners
+    # keep a log alive past the turn, but only this turn reads it.
+    request_failure_logs_by_browser_session: dict[str, RequestFailureLog] = field(default_factory=dict)
     browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_session_recovery_owner: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     browser_session_recovery_depth: int = field(default=0, init=False, repr=False)
@@ -969,7 +977,7 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
 
 BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
 RAW_SECRET_BROWSER_ERROR = (
-    "This turn contains a redacted raw secret. Do not use the browser; persist only the redacted draft and call "
+    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
     "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
 )
 
@@ -1530,6 +1538,9 @@ async def _mcp_browser_context_impl(
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
             organization_id=ctx.organization_id,
+            request_failures=ctx.request_failure_logs_by_browser_session.setdefault(
+                browser_session_id, RequestFailureLog()
+            ),
         )
         if working_page is not None:
             # The browser state's pin outlives this per-call SessionState, so every tool call

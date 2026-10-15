@@ -180,9 +180,15 @@ function WorkflowPage() {
     }
   }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
 
-  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+  const {
+    data: workflow,
+    isLoading: workflowIsLoading,
+    isError: workflowIsError,
+  } = useWorkflowQuery({
     workflowPermanentId,
   });
+  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
+  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
 
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
@@ -260,6 +266,14 @@ function WorkflowPage() {
     return null; // this should never happen
   }
 
+  const analyticsWorkflow =
+    workflow?.workflow_permanent_id === workflowPermanentId
+      ? workflow
+      : undefined;
+  // A disabled or placeholder workflow query is not loading, but its data is not this agent's yet.
+  const analyticsWorkflowIsLoading =
+    !analyticsWorkflow && !workflowIsError && !globalWorkflowsIsError;
+
   return (
     <div className="space-y-8">
       <header className="flex flex-col gap-4">
@@ -331,7 +345,11 @@ function WorkflowPage() {
           </div>
         </div>
         {WorkflowAnalyticsPanel ? (
-          <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
+          <WorkflowAnalyticsPanel
+            workflowPermanentId={workflowPermanentId}
+            workflow={analyticsWorkflow}
+            workflowIsLoading={analyticsWorkflowIsLoading}
+          />
         ) : null}
         <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
       </header>

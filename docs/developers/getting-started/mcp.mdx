@@ -1,27 +1,430 @@
 ---
-title: MCP Server
-subtitle: Connect AI assistants to browser automation via Model Context Protocol
-description: Install and configure Skyvern's MCP server so Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Hermes, OpenClaw, and other AI tools can run browser automations against Skyvern Cloud or a self-hosted instance over OAuth, API key, or local stdio.
+title: MCP and coding agents
+subtitle: Give Claude Code, Cursor, Codex, Grok Build and other AI clients a real browser
+description: Connect Skyvern's hosted MCP server to Claude Code, Cursor, Codex, Grok Build, Claude Desktop, ChatGPT, Windsurf and other clients with browser sign-in or an API key, run it locally over stdio, or give coding agents the Skyvern skill and CLI.
 slug: developers/getting-started/mcp
 keywords:
   - MCP
   - Model Context Protocol
-  - OAuth
-  - Claude Desktop
   - Claude Code
+  - Claude Desktop
   - Cursor
-  - Windsurf
   - Codex
+  - ChatGPT
+  - Windsurf
+  - Grok Build
   - Hermes
   - OpenClaw
-  - MCPorter
-  - AI assistant
-  - tools
+  - OAuth
   - stdio
-  - streamable-http
-  - self-hosted
+  - MCP scopes
+  - skyvern setup
+  - Skyvern skill
+  - coding agent
 ---
 
-import McpContent from "/snippets/mcp-content.mdx";
+Skyvern's MCP server gives your AI client 117 browser and automation tools. Your assistant can open a cloud browser, click and type, extract data, log in with stored credentials, and build and run agents, all from a chat or a coding session.
 
-<McpContent />
+The hosted server is at:
+
+```text
+https://api.skyvern.com/mcp/
+```
+
+Most clients connect with browser sign-in (OAuth) and need no API key or install. The rest use your API key.
+
+## Fastest setup: the MCP page in the app
+
+In the app, go to **Integrations → MCP** ([app.skyvern.com/integrations/mcp](https://app.skyvern.com/integrations/mcp)). Pick your client and follow the steps. The page marks the recommended method for each client, and API-key snippets come pre-filled with your key.
+
+<img src="/images/cloud/cloud-integrations-mcp.png" alt="Connect Skyvern with MCP with Claude Code selected and the Browser sign-in steps" />
+
+The sections below show the same setups.
+
+## Sign in with your browser (OAuth)
+
+Use this for Claude Code, Cursor, Codex CLI, Grok Build, ChatGPT and Claude custom connectors. There is no API key in the config. The client opens your browser, you sign in to Skyvern, and the client stores the token.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add --transport http skyvern https://api.skyvern.com/mcp/ --scope user
+```
+
+Run `/mcp` in Claude Code and follow the authentication prompt. Run `/mcp` again to confirm Skyvern is authenticated.
+
+If you set Skyvern up earlier with an `x-api-key` header, run `claude mcp remove skyvern` first. A static key makes Claude Code skip the sign-in.
+
+</Tab>
+<Tab title="Cursor">
+
+[Install Skyvern in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=Skyvern&config=eyJ0eXBlIjoic3RyZWFtYWJsZS1odHRwIiwidXJsIjoiaHR0cHM6Ly9hcGkuc2t5dmVybi5jb20vbWNwLyJ9) (Cursor 0.43 or later). Cursor opens and prompts you to sign in.
+
+Or add the server to `~/.cursor/mcp.json` yourself:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/"
+    }
+  }
+}
+```
+
+Restart Cursor, open MCP settings, and authenticate Skyvern when prompted. If an older entry has a `headers` field with `x-api-key`, delete it so the sign-in can start.
+
+</Tab>
+<Tab title="Codex CLI">
+
+Requires Codex 0.125.0 or later.
+
+```bash
+codex mcp add skyvern --url https://api.skyvern.com/mcp/
+```
+
+Codex opens your browser for sign-in and stores the token. Check with `codex mcp get skyvern`: `http_headers` should be empty (`-`).
+
+If the command fails with `resource is not allowed for this authorization server`, pass the resource without the trailing slash:
+
+```bash
+codex mcp add skyvern --url https://api.skyvern.com/mcp/ --oauth-resource https://api.skyvern.com/mcp
+```
+
+If Skyvern already has an `x-api-key` header, run `codex mcp remove skyvern` first.
+
+</Tab>
+<Tab title="Grok Build">
+
+Install the Skyvern plugin from the Grok Build marketplace. In [Grok Build](https://docs.x.ai/build/overview), run `/marketplace`, search for **skyvern** and press `i`. Or from a terminal:
+
+```bash
+grok plugin install skyvern --trust
+```
+
+Open `/mcps` in Grok, select **skyvern**, and sign in with your Skyvern account in the browser.
+
+The plugin connects the `browser` scope (`https://api.skyvern.com/mcp/x/browser`, 54 tools), so it has no `skyvern_run_task`, `skyvern_extract`, `skyvern_validate`, agent or credential tools. For every tool, change the `url` in the installed plugin's `.mcp.json` to `https://api.skyvern.com/mcp/`. See [Limit the tool list with scopes](#limit-the-tool-list-with-scopes).
+
+Grok Build also loads MCP servers from `~/.claude.json` and `.mcp.json`. If one of them already defines a server named `skyvern`, Grok may use that one instead. Run `grok mcp doctor skyvern` to see which URL is in use, and rename or remove the other entry to use the plugin's.
+
+</Tab>
+<Tab title="ChatGPT">
+
+1. In ChatGPT, open **Settings → Connectors**. Depending on your plan, Connectors may appear under **Integrations** or **Beta features**.
+2. Click **Add connector** and choose the MCP type.
+3. Enter `https://api.skyvern.com/mcp/` as the connector URL.
+4. Follow the browser sign-in prompt with your Skyvern account.
+
+Skyvern tools then appear in ChatGPT's tool panel.
+
+</Tab>
+<Tab title="Claude (custom connector)">
+
+In Claude on the web or in Claude Desktop, add a custom connector with the URL `https://api.skyvern.com/mcp/` and sign in with your Skyvern account when prompted.
+
+This is separate from the Claude Desktop bundle under [Use an API key](#use-an-api-key).
+
+</Tab>
+</Tabs>
+
+## Use an API key
+
+Use this for Windsurf, Hermes, OpenClaw, the Claude Desktop bundle, headless servers and CI, or any client without MCP sign-in support. Copy your key from [**Settings → API keys**](https://app.skyvern.com/settings/api-keys).
+
+<Tabs>
+<Tab title="Claude Code">
+
+```bash
+claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/","headers":{"x-api-key":"YOUR_SKYVERN_API_KEY"}}' --scope user
+```
+
+</Tab>
+<Tab title="Claude Desktop">
+
+**macOS and Windows** (no Node.js needed):
+
+1. Download [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb).
+2. Double-click the file. If that is blocked, open Claude Desktop **Settings → Extensions → Install Extension** and select it.
+3. Click **Install**, paste your Skyvern API key in **Configure Skyvern**, leave **Skyvern MCP URL** set to `https://api.skyvern.com/mcp/`, and click **Save**.
+4. Ask Claude to "Create a Skyvern browser session". A working setup returns a browser session id.
+
+If Claude says Skyvern needs authorization, the key is missing: open **Settings → Extensions → Skyvern → Configure** and paste it. The bundle does not update itself; download and install it again to upgrade.
+
+**Linux** (Node.js 20 or later). Add to `~/.config/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://api.skyvern.com/mcp/", "--header", "x-api-key:${SKYVERN_API_KEY}"],
+      "env": { "SKYVERN_API_KEY": "YOUR_SKYVERN_API_KEY" }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Cursor">
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": { "x-api-key": "YOUR_SKYVERN_API_KEY" }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Windsurf">
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "Skyvern": {
+      "type": "streamable-http",
+      "url": "https://api.skyvern.com/mcp/",
+      "headers": { "x-api-key": "YOUR_SKYVERN_API_KEY" }
+    }
+  }
+}
+```
+
+</Tab>
+<Tab title="Codex CLI">
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.skyvern]
+url = "https://api.skyvern.com/mcp/"
+
+[mcp_servers.skyvern.http_headers]
+x-api-key = "YOUR_SKYVERN_API_KEY"
+```
+
+</Tab>
+<Tab title="Hermes">
+
+```bash
+pip install "skyvern[local]"
+export SKYVERN_API_KEY="YOUR_SKYVERN_API_KEY"
+skyvern setup hermes
+```
+
+This writes `~/.hermes/config.yaml` and every profile under `~/.hermes/profiles/`. To do it by hand:
+
+```yaml
+mcp_servers:
+  skyvern:
+    url: "https://api.skyvern.com/mcp/"
+    headers:
+      x-api-key: "YOUR_SKYVERN_API_KEY"
+```
+
+Check with `hermes mcp test skyvern`.
+
+</Tab>
+<Tab title="OpenClaw">
+
+```bash
+pip install "skyvern[local]"
+export SKYVERN_API_KEY="YOUR_SKYVERN_API_KEY"
+skyvern setup openclaw
+```
+
+Or add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "skyvern": {
+        "url": "https://api.skyvern.com/mcp/",
+        "transport": "streamable-http",
+        "headers": { "x-api-key": "YOUR_SKYVERN_API_KEY" }
+      }
+    }
+  }
+}
+```
+
+`skyvern setup openclaw` rewrites the file as standard JSON, so JSON5 comments are not kept. Check with `openclaw mcp show skyvern`.
+
+</Tab>
+<Tab title="Other clients">
+
+Any client that supports remote MCP servers over streamable HTTP works. Point it at `https://api.skyvern.com/mcp/` and send your key in the `x-api-key` header. If the client supports MCP OAuth, leave the header out and sign in instead.
+
+</Tab>
+</Tabs>
+
+Restart the client after editing its config.
+
+### Configure clients from the CLI
+
+The `skyvern` CLI detects the AI tools on your machine and writes their config for you:
+
+```bash
+pip install "skyvern[local]"
+skyvern setup
+```
+
+To configure one client, name it: `skyvern setup claude-code`, `skyvern setup claude` (Claude Desktop), `cursor`, `windsurf`, `hermes`, `openclaw`, `opencode` or `mcporter`. Add `--dry-run` to preview the change.
+
+To change the API key or server in configs you already have, run `skyvern mcp switch`. It shows which apps have a Skyvern entry, lets you pick which to update, and writes a backup first. Restart your client afterwards.
+
+## What the tools do
+
+Your assistant picks tools from your request. "Go to Hacker News and get the top post title" becomes `skyvern_browser_session_create`, `skyvern_navigate`, `skyvern_extract` and `skyvern_browser_session_close`.
+
+| Area | Example tools | What they do |
+|---|---|---|
+| Browser sessions | `skyvern_browser_session_create`, `skyvern_browser_session_close`, `skyvern_browser_session_connect` | Open, reuse and close cloud browsers |
+| Page actions | `skyvern_navigate`, `skyvern_act`, `skyvern_click`, `skyvern_type`, `skyvern_select_option` | Act with natural language, selectors, or both |
+| Reading pages | `skyvern_extract`, `skyvern_validate`, `skyvern_screenshot` | Structured JSON, yes/no checks, screenshots |
+| Logins | `skyvern_login`, `skyvern_credential_list` | Log in with stored credentials, including 2FA |
+| Agents | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status` | Build, run and monitor agents |
+| Schedules and code | `skyvern_schedule_create`, `skyvern_script_get_code` | Schedule agents and inspect cached code |
+
+Other tools cover tabs, iframes, file upload, network and console inspection, browser profiles, folders and stored browser state.
+
+### Limit the tool list with scopes
+
+117 tools is a lot of context for some clients. A scope serves a smaller set:
+
+| Scope | Tools | Use it to |
+|---|---:|---|
+| `all` (default) | 117 | Everything |
+| `operate` | 30 | Run, monitor and inspect agents that already exist. No browser tools. |
+| `build` | 62 | Create and edit agents, with a browser for inspecting pages |
+| `browser` | 54 | Drive a browser directly |
+| `lean` | 33 | A small browser set with direct actions and schema-constrained output |
+
+On the hosted server, use a scoped URL such as `https://api.skyvern.com/mcp/x/operate`, or keep the normal URL and send the header `X-Skyvern-Scope: operate`. For a local server, pass `--scope operate` to `skyvern run mcp`.
+
+## Run the server locally (stdio)
+
+Use local mode when you self-host Skyvern and want the MCP server to talk to your own instance. Set up the server first with [Self-host](/developers/self-hosted/overview), then install the server extra in the same Python environment:
+
+```bash
+pip install "skyvern[server]"
+skyvern setup claude-code --local
+```
+
+`--local` writes a stdio config that runs `python -m skyvern run mcp` with the active Python interpreter. To write the config by hand:
+
+```json
+{
+  "mcpServers": {
+    "skyvern": {
+      "command": "/path/to/python",
+      "args": ["-m", "skyvern", "run", "mcp"],
+      "env": {
+        "SKYVERN_BASE_URL": "http://localhost:8000",
+        "SKYVERN_API_KEY": "YOUR_LOCAL_SKYVERN_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Use the full path from `which python3` in the environment where Skyvern is installed. Append `"--scope", "operate"` (or another scope) to `args` to narrow the tools. Because the browser runs on your machine, `localhost` sites work directly.
+
+To drive the Chrome you already use, with its logins, see [Browsers](/browsers).
+
+## Coding agents: the Skyvern skill and CLI
+
+Besides MCP, coding agents can drive Skyvern through the `skyvern` CLI. The bundled **skyvern** skill teaches the agent which command to use for each kind of task and to log in with stored credentials instead of typing passwords.
+
+<Steps>
+  <Step title="Install the CLI with browser support">
+    The `skyvern browser` commands need the local extra:
+
+    ```bash
+    pip install "skyvern[local]"
+    ```
+  </Step>
+  <Step title="Sign in">
+    ```bash
+    skyvern login
+    ```
+
+    This opens your browser, and after you sign in it saves `SKYVERN_API_KEY` to a local `.env` file. You can also export `SKYVERN_API_KEY` yourself.
+  </Step>
+  <Step title="Copy the skills into your project">
+    ```bash
+    skyvern skill copy --output .claude/skills/
+    ```
+
+    Run `skyvern skill list` to see the bundled skills. Point other agents at the copied folder, or at the path from `skyvern skill path skyvern`.
+  </Step>
+</Steps>
+
+The agent then runs commands such as:
+
+```bash
+skyvern browser session create --timeout 30
+skyvern browser navigate --url "https://news.ycombinator.com"
+skyvern browser extract --prompt "Get the title of the top post"
+skyvern browser session close
+```
+
+`skyvern setup claude-code`, run inside a project, also installs the bundled skills into `.claude/skills/`, including `/qa`. `/qa` reads your git diff, writes browser tests for the change and runs them against your dev server.
+
+To have a coding agent write SDK code instead, use the prompt in [Hand it to your coding agent](/developers/getting-started/quickstart#hand-it-to-your-coding-agent).
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="401 or invalid API key">
+Copy the key again from [**Settings → API keys**](https://app.skyvern.com/settings/api-keys) and check for spaces or newlines. After a key rotation, run `skyvern mcp switch` or update the config by hand, then restart the client.
+</Accordion>
+
+<Accordion title="Browser sign-in never starts or never finishes">
+A static `x-api-key` header stops the client from starting OAuth. Remove the old entry (`claude mcp remove skyvern`, `codex mcp remove skyvern`, or delete it from `~/.cursor/mcp.json`) and add it again without headers.
+
+If the browser opens but the client stays unauthenticated, check that you can sign in to [app.skyvern.com](https://app.skyvern.com) in that browser, then start authentication again from the client rather than reloading the page. Strict privacy extensions can interrupt the flow.
+
+Tokens expire. When they do, run the client's authentication flow again.
+</Accordion>
+
+<Accordion title="Tools time out">
+A new browser session takes a few seconds to start, so the first call is the slowest. Retry once. If timeouts continue, check that your account has credits on the [**Billing**](https://app.skyvern.com/settings/billing) page.
+</Accordion>
+
+<Accordion title="Local mode: client doesn't see Skyvern, or connection refused">
+Use the absolute path to a Python 3.11 to 3.14 interpreter in `command`, not just `python3`. Re-running `skyvern setup <client> --local` from the right environment rewrites it.
+
+Connection refused means the Skyvern server isn't running. Start it (`skyvern run server`) and check that `SKYVERN_BASE_URL` matches its port.
+</Accordion>
+</AccordionGroup>
+
+## Privacy
+
+To run what you ask, Skyvern processes your prompts, URLs, page content, screenshots, files, agent definitions and any credentials you connect, and stores runs, artifacts and browser state as needed. Connect only accounts and sites you are allowed to automate. See the [Privacy Policy](https://app.termly.io/policy-viewer/policy.html?policyUUID=1d7aaa1b-5565-415a-8984-7146d254f738).
+
+## Next
+
+<CardGroup cols={3}>
+  <Card title="Credentials and 2FA" icon="key" href="/credentials">
+    Store logins so your assistant never handles passwords.
+  </Card>
+  <Card title="Browser automation" icon="browser" href="/developers/browser-automation">
+    Write the same automations as SDK code.
+  </Card>
+  <Card title="Build in Studio" icon="diagram-project" href="/cloud/studio">
+    Open and edit agents your assistant created.
+  </Card>
+</CardGroup>

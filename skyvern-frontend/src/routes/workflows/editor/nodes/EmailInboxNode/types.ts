@@ -14,6 +14,7 @@ export type EmailInboxNodeData = NodeBaseData & {
   newerThanDays: number | null;
   maxResults: number;
   includeBody: boolean;
+  downloadAttachments: boolean;
   parameterKeys: Array<string>;
 };
 
@@ -34,6 +35,7 @@ export const emailInboxNodeDefaultData: EmailInboxNodeData = {
   newerThanDays: null,
   maxResults: 25,
   includeBody: true,
+  downloadAttachments: false,
   parameterKeys: [],
 };
 

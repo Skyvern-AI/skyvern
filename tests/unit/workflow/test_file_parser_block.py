@@ -32,6 +32,7 @@ from skyvern.core.script_generations.generate_script import _build_file_url_pars
 from skyvern.forge import app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -778,6 +779,25 @@ class TestPDFParserSchemaValidation:
         assert "expected type object, got array" in prompts[1]
         record_output_parameter_value.assert_awaited_once()
 
+    async def test_stalled_model_fails_the_block_at_the_deadline(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/resume.pdf")
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_execute_dependencies(mp, block, AsyncMock(side_effect=stalled_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute("workflow-run", "workflow-run-block", organization_id="org-1"), timeout=10
+            )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "did not answer within" in (result.failure_reason or "")
+
 
 @pytest.mark.asyncio
 class TestOcrPdfPages:
@@ -903,6 +923,31 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError, match="vision model outage"):
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
 
+    @pytest.mark.parametrize(
+        ("call_timeout", "pass_timeout", "expected_reason"),
+        [(0.05, 10, "did not answer within"), (10, 0.05, "did not transcribe")],
+        ids=["page_deadline", "whole_pass_deadline"],
+    )
+    async def test_stalled_page_fails_the_pass_instead_of_being_skipped(
+        self, call_timeout: float, pass_timeout: float, expected_reason: str
+    ) -> None:
+        """Skipping a page the model never answered would hand extraction a document with that page missing."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"stalled":
+                await asyncio.Event().wait()
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", call_timeout)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.PDF_OCR_TOTAL_TIMEOUT_SECONDS", pass_timeout)
+
+            with pytest.raises(TimeoutError, match=expected_reason):
+                await asyncio.wait_for(block._ocr_pdf_pages([b"good-1", b"stalled", b"good-3"]), timeout=5)
+
     async def test_empty_pages_contribute_nothing(self) -> None:
         """Pages that OCR to empty text add neither a marker nor content."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -1007,6 +1052,240 @@ class TestOcrPdfPages:
         assert "page A" in result and "page B" in result
 
 
+# digit d -> U+0111 + d, ':' -> U+0146, '.' -> U+0144
+_DIGIT_REMAP = {ord(str(digit)): 0x0111 + digit for digit in range(10)} | {ord(":"): 0x0146, ord("."): 0x0144}
+
+_INVOICE_LINES = (
+    "Mobile Manager Invoice",
+    "Account Number: 7249163085",
+    "Date: 17 Aug 26",
+    "Invoice Total: 1234.56 GBP",
+    "Billing Period: 01 Jul 26 to 31 Jul 26",
+    "Please remit payment using the reference above.",
+)
+
+# An itemised page is mostly digits, so the scrambled glyphs outnumber the English labels.
+_ITEMISED_INVOICE_LINES = _INVOICE_LINES + tuple(
+    f"07700 9000{index % 10:02d}  17 Aug 26  09:1{index % 10}  00:0{index % 6}:12  0.0{index % 9} GBP"
+    for index in range(40)
+)
+
+
+def _build_pdf(lines: tuple[str, ...], remap: dict[int, int] | None = None) -> bytes:
+    """Build a one-page PDF, optionally giving its font a ToUnicode map that lies.
+
+    The page always draws ordinary ASCII character codes, so with ``remap`` set only the
+    ToUnicode map is wrong — which is what makes a subset font's text layer extract as
+    plausible-looking garbage instead of failing outright.
+    """
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
+    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        font + (b" /ToUnicode 6 0 R >>" if remap else b" >>"),
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    if remap:
+        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+        cmap = (
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Broken def\n"
+            "/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            f"{len(remap)} beginbfchar\n{entries}\nendbfchar\nendcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\nend"
+        ).encode()
+        objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+class TestScrambledTextLayerFallback:
+    """A text layer the embedded font has scrambled must reach OCR, not the extraction LLM.
+
+    Without this, every digit in the document arrives as an unrelated glyph and the
+    extraction LLM invents plausible values for dates and account numbers.
+    """
+
+    @staticmethod
+    def _patch_ocr(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+            lambda *a, **kw: [b"page-1"],
+        )
+
+    async def test_remapped_digits_route_to_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES, remap=_DIGIT_REMAP))
+        # The real extractors run against the real broken font: no digit survives them.
+        text_layer = extract_pdf_file(str(pdf_path))
+        assert "17 Aug 26" not in text_layer and "7249163085" not in text_layer
+
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        assert handler.await_count == 1
+        assert "17 Aug 26" in result
+
+    async def test_readable_text_layer_is_returned_without_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "transcribed"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        handler.assert_not_awaited()
+        assert "17 Aug 26" in result
+
+    async def test_force_ocr_skips_the_text_layer(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        block.force_ocr = True
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+        extract = MagicMock(return_value="text layer that must not be read")
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", extract)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        extract.assert_not_called()
+        assert result == "--- Page 1 ---\nDate: 17 Aug 26"
+
+
+class TestScrambledTextLayerDetection:
+    """Text layers that must stay trusted, so a real document is never re-read by OCR."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param(
+                "Dear Sir or Madam,\nThank you for your continued business. Please find enclosed the "
+                "statement for your account.\nShould you have any questions, contact our support team.",
+                id="english_prose_without_digits",
+            ),
+            pytest.param(
+                "Faktura VAT nr 12/2026\nNabywca: Zakład Usług Łącznościowych\nKwota brutto: 1234,56 zł\n"
+                "Termin płatności: 17 sierpnia 2026\nDziękujemy za współpracę. Życzymy miłego dnia.",
+                id="polish_invoice",
+            ),
+            pytest.param(
+                "Zakład Usług Łącznościowych\nDziękujemy za współpracę i życzymy miłego dnia.\n"
+                "Prosimy o zapłatę należności w terminie wskazanym w umowie.\nPozdrawiamy serdecznie.",
+                id="polish_prose_without_digits",
+            ),
+            pytest.param(
+                "Děkujeme za vaši důvěru. Přejeme příjemný den.\nVáš účet byl úspěšně aktivován.\n"
+                "V případě dotazů se obraťte na naši zákaznickou linku.",
+                id="czech_prose_without_digits",
+            ),
+            pytest.param(
+                "Sayın müşterimiz, faturanız hazırlanmıştır. İlginiz için teşekkür ederiz.\n"
+                "Sorularınız için müşteri hizmetlerimize başvurabilirsiniz.",
+                id="turkish_prose_without_digits",
+            ),
+            pytest.param(
+                "Kính gửi quý khách hàng, hóa đơn của quý khách đã được lập và đã gửi tới địa chỉ đăng ký.\n"
+                "Để thanh toán, quý khách vui lòng chuyển khoản tới số tài khoản được ghi ở dưới.\n"
+                "Nếu quý khách đã thanh toán rồi thì xin vui lòng bỏ qua thông báo này.",
+                id="vietnamese_prose",
+            ),
+            pytest.param(
+                "Application for Service\n I confirm the details above are correct\n"
+                " I agree to the terms and conditions of supply\n"
+                " Please send my statements by email\n I am over 18 years of age\n"
+                " I would like marketing updates\n I have read the privacy notice\n"
+                " Direct debit\n Card payment\nSignature: ______  Date: 17 Aug 26",
+                id="icon_font_checkboxes",
+            ),
+            pytest.param("尊敬的客户，您的账单已经生成。请在到期日前付款。感谢您的支持。", id="chinese_prose"),
+            pytest.param("Уважаемый клиент, ваш счет сформирован. Оплатите до указанной даты.", id="russian_prose"),
+            pytest.param("Date: 17 Aug 26", id="too_short_to_judge"),
+        ],
+    )
+    def test_trustworthy_text_layers_are_not_flagged(self, text: str) -> None:
+        assert scrambled_text_layer_reason(text) is None
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            pytest.param(_INVOICE_LINES, id="label_heavy_header"),
+            # The real document is an itemised invoice. Its scrambled digits are Latin letters
+            # to str.isalpha, so counting them as the document's own script sank the ASCII share
+            # below the Latin-script floor and the page escaped every check.
+            pytest.param(_ITEMISED_INVOICE_LINES, id="page_of_call_rows"),
+        ],
+    )
+    def test_remapped_digits_are_flagged(self, lines: tuple[str, ...]) -> None:
+        scrambled = "\n".join(line.translate(_DIGIT_REMAP) for line in lines)
+        assert scrambled_text_layer_reason(scrambled) is not None
+
+
+class TestForceOcrOnTheCachedScriptPath:
+    """A cached run must honor force OCR, or the fix only holds while the block runs via the agent."""
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_force_ocr(self) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/invoice.pdf",
+                file_type=FileType.PDF,
+                label="parse_invoice",
+                force_ocr=True,
+            )
+
+        (block,) = built
+        assert block.force_ocr is True
+
+    def test_generated_script_carries_force_ocr(self) -> None:
+        base = {"file_url": "https://example.com/invoice.pdf", "file_type": "pdf", "label": "parse_invoice"}
+        module = cst.Module([])
+
+        with_force_ocr = module.code_for_node(_build_file_url_parser_statement({**base, "force_ocr": True}))
+        without_force_ocr = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "force_ocr = True" in with_force_ocr
+        assert "force_ocr" not in without_force_ocr
+
+
 BLOCKING_PARSE_SECONDS = 0.3
 TICK_INTERVAL_SECONDS = 0.01
 
@@ -1097,6 +1376,20 @@ class TestParsingDoesNotBlockEventLoop:
             text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
 
         assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_text_layer_scramble_check_yields_to_event_loop(self) -> None:
+        """The check walks every character of a text layer that can reach a million of them."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+        text_layer = "Account Number: 7249163085 Date: 17 Aug 26 Please remit payment.\n" * 20_000
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                lambda *a, **kw: text_layer,
+            )
+            _, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
         assert ticks > 0
 
     async def test_docx_parse_yields_to_event_loop(self) -> None:
@@ -1253,6 +1546,62 @@ class TestParseStepTimeout:
         assert result.success is False
         assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
         assert "timed out" in captured["failure_reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("handler_error", "expected_reason"),
+        [
+            (None, "did not answer within"),
+            (TimeoutError("gateway gave up on the request"), "gateway gave up on the request"),
+        ],
+        ids=["stalled_model_hits_the_deadline", "handler_timeout_keeps_its_own_cause"],
+    )
+    async def test_stalled_extraction_model_fails_the_block_at_the_deadline(
+        self, handler_error: Exception | None, expected_reason: str
+    ) -> None:
+        """A provider that never answers fails the block at the deadline instead of holding the run's slot."""
+        block = _make_file_parser_block("https://example.com/resume.pdf", FileType.PDF)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        mock_ctx = _mock_workflow_run_context()
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            if handler_error is not None:
+                raise handler_error
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/resume.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "Jane Doe, engineer"
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: stalled_handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"),
+                timeout=10,
+            )
+
+        assert result.success is False
+        assert expected_reason in captured["failure_reason"]
 
     async def test_validation_timeout_fails_the_block(self) -> None:
         block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)

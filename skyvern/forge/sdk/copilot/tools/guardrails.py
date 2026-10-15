@@ -22,7 +22,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     output_policy_verdict_to_trace_data,
 )
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import AgentContext, raw_secret_browser_denied
+from skyvern.forge.sdk.copilot.runtime import RAW_SECRET_BROWSER_ERROR, AgentContext, raw_secret_browser_denied
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import tool_call_submitted_yaml
@@ -181,13 +181,10 @@ def _authority_tool_error(
                 blocked_tool=tool_name,
                 classifier_mode="raw_secret_safety",
                 internal_reason_code="raw_secret_browser_action_blocked",
-                agent_steering_text=(
-                    "This turn contains a redacted raw secret. Do not use the browser; persist only the "
-                    "redacted draft and call `request_credential` with the user's sign-in URL so they can "
-                    "connect a saved credential before testing."
-                ),
+                agent_steering_text=RAW_SECRET_BROWSER_ERROR,
                 user_facing_reason=(
-                    "I saved only a redacted draft and did not use the browser because the request contained a raw secret."
+                    "I saved only a redacted draft and did not use the browser because the request contained a "
+                    "value that may be a secret."
                 ),
                 recovery_hint="retry_with_different_tool",
                 renders_final_reply=False,

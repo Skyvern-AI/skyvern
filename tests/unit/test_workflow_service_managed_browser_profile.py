@@ -12,7 +12,7 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.exceptions import BrowserSessionExpired, ExternalBrowserSessionNotRunnable
+from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
@@ -2544,13 +2544,11 @@ async def test_submission_refuses_a_session_past_its_lifetime_and_accepts_a_live
 
     assert refused.value.status_code == 410
     assert "pbs_expired" in refused.value.message
-    with pytest.raises(ExternalBrowserSessionNotRunnable) as refused_external:
-        await submit("pbs_external")
-    assert refused_external.value.status_code == 409
     async with database.Session() as session:
         assert (await session.scalars(select(WorkflowRunModel))).all() == []
         assert (await session.scalars(select(TaskModel))).all() == []
     assert await submit("pbs_live") == "pbs_live"
+    assert await submit("pbs_external") == "pbs_external"
 
 
 @pytest.mark.asyncio

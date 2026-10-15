@@ -1271,6 +1271,7 @@ async def test_inline_declared_error_failure_preserves_download_metadata(monkeyp
         "reasoning": "report generation failed",
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
+        "credential_check": None,
     }
     download_output = {
         "errors": [typed_error],
@@ -1287,10 +1288,11 @@ async def test_inline_declared_error_failure_preserves_download_metadata(monkeyp
         error_code_mapping={"report_unavailable": "The report could not be generated"},
     )
 
+    serialized_error = {key: value for key, value in typed_error.items() if key != "credential_check"}
     assert result.output_parameter_value == download_output
     assert result.output_parameter_value["errors"] == [typed_error]
     assert result.error_codes == ["report_unavailable"]
-    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == [typed_error]
+    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == [serialized_error]
     record_output.assert_not_awaited()
 
 

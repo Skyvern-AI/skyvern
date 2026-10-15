@@ -81,7 +81,7 @@ _ROUTINE_CLIENT_ERROR_STATUSES = frozenset({404, 405})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
-_STREAMING_CONTENT_TYPE = "text/event-stream"
+_STREAMING_CONTENT_TYPES = ("text/event-stream", "application/x-ndjson")
 _ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
 _raw_request_exception_logger: ContextVar[typing.Callable[[int], None] | None] = ContextVar(
     "raw_request_exception_logger", default=None
@@ -414,7 +414,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     response = await call_next(request)
     resp_content_type = response.headers.get("content-type", "")
-    is_streaming_response = _STREAMING_CONTENT_TYPE in resp_content_type
+    is_streaming_response = any(content_type in resp_content_type for content_type in _STREAMING_CONTENT_TYPES)
 
     # Skip successful reads before buffering the response body; 4xx/5xx and
     # mutating paths keep logging, and sensitive endpoints always keep

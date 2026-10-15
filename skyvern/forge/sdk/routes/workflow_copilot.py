@@ -7,7 +7,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Coroutine, Iterator
+from collections.abc import Awaitable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypeVar, cast, get_args
@@ -76,7 +76,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     start_manual_sign_in,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import EXPIRED_TURN_REPLY_SECONDS, TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.goal_suggestion import suggest_goal_from_code
 from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_REASON,
@@ -102,6 +102,8 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import credential_delet
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
     private_workflow_settings_from_proposal,
+    proposal_is_displayable,
+    proposal_workflow_fingerprint,
     proposal_workflow_fingerprint_matches,
     strip_copilot_yaml_headers,
 )
@@ -225,7 +227,10 @@ _process_workflow_yaml = _copilot_process_workflow_yaml
 # Wall clock, unlike TOTAL_TIMEOUT_SECONDS: that budget excludes time parked in a
 # credential pause, so a legitimately live turn can outlast it in real time.
 RECONCILE_ABANDON_AFTER_SECONDS = (
-    TOTAL_TIMEOUT_SECONDS + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 120
+    TOTAL_TIMEOUT_SECONDS
+    + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+    + EXPIRED_TURN_REPLY_SECONDS
+    + 120
 )
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
@@ -530,15 +535,29 @@ def _latest_assistant_turn_outcome(chat_messages: list[WorkflowCopilotChatMessag
 
 def _assistant_execution_receipts(
     chat_messages: list[WorkflowCopilotChatMessage],
+    proposal: dict[str, Any] | None,
 ) -> dict[str, set[str]]:
-    receipts: dict[str, set[str]] = {}
-    for message in chat_messages:
+    # Each turn writes a cumulative snapshot that already retracts failed runs, so the newest one wins.
+    for message in reversed(chat_messages):
         payload = message.narrative_payload
-        if message.sender != WorkflowCopilotChatSender.AI or not isinstance(payload, dict):
-            continue
-        for label, fingerprints in parse_execution_receipts(payload.get("testedBlockFingerprints")).items():
-            receipts.setdefault(label, set()).update(fingerprints)
-    return receipts
+        if (
+            message.sender == WorkflowCopilotChatSender.AI
+            and isinstance(payload, dict)
+            and "testedBlockFingerprints" in payload
+        ):
+            return parse_execution_receipts(payload["testedBlockFingerprints"])
+    if proposal is not None:
+        return parse_execution_receipts(proposal.get("_copilot_tested_block_fingerprints"))
+    return {}
+
+
+def _turn_receipts(agent_result: AgentResult | None, ctx_sink: Sequence[CopilotContext]) -> dict[str, set[str]] | None:
+    # None means the agent never built a context, so this turn changed no receipts.
+    if agent_result is not None:
+        return agent_result.executed_block_fingerprints
+    if ctx_sink:
+        return ctx_sink[0].executed_block_fingerprints
+    return None
 
 
 def _should_emit_copilot_code_mode_opt_out(
@@ -900,6 +919,7 @@ def _build_recoverable_route_agent_result(
     turn_id: str | None = None,
     turn_index: int | None = None,
     prior_turn_outcome: TurnOutcome | None = None,
+    executed_block_fingerprints: dict[str, set[str]] | None = None,
 ) -> tuple[AgentResult, RecoverableFailure]:
     failure = build_recoverable_failure(error, workflow_modified=workflow_modified)
     user_response = format_recoverable_failure_reply(failure)
@@ -909,6 +929,8 @@ def _build_recoverable_route_agent_result(
         narrative_payload["connectedAccountChoices"] = [
             choice.model_dump(mode="json") for choice in connected_account_choices
         ]
+    if executed_block_fingerprints is not None:
+        narrative_payload["testedBlockFingerprints"] = serialize_execution_receipts(executed_block_fingerprints)
     agent_result = AgentResult(
         user_response=user_response,
         updated_workflow=None,
@@ -919,6 +941,7 @@ def _build_recoverable_route_agent_result(
         authoring_barred=authoring_barred,
         turn_id=turn_id,
         narrative_payload=narrative_payload,
+        executed_block_fingerprints=executed_block_fingerprints or {},
         turn_outcome=build_minimal_turn_outcome(
             user_response,
             response_kind=ResponseKind.RECOVER,
@@ -999,10 +1022,9 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
         proposed_data["_copilot_code_artifact_metadata"] = code_artifact_metadata
     if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
-    if agent_result.executed_block_fingerprints:
-        proposed_data["_copilot_tested_block_fingerprints"] = serialize_execution_receipts(
-            agent_result.executed_block_fingerprints
-        )
+    proposed_data["_copilot_tested_block_fingerprints"] = serialize_execution_receipts(
+        agent_result.executed_block_fingerprints
+    )
     return proposed_data
 
 
@@ -1075,10 +1097,14 @@ def _discard_superseded_proposal(agent_result: AgentResult) -> None:
 
 
 async def _persist_proposed_workflow_state(
-    chat: Any, agent_result: AgentResult, restored: bool, keep_pending_proposal: bool = False
+    chat: Any,
+    agent_result: AgentResult,
+    restored: bool,
+    keep_pending_proposal: bool = False,
+    opening_workflow_title: str | None = None,
 ) -> None:
     updated_workflow = agent_result.updated_workflow
-    if not await _proposal_ownership_is_current(chat, agent_result):
+    if agent_result.proposal_adopted or not await _proposal_ownership_is_current(chat, agent_result):
         _discard_superseded_proposal(agent_result)
         return
     auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
@@ -1166,19 +1192,71 @@ async def _persist_proposed_workflow_state(
                 proposed_workflow_data = stored_proposal
         else:
             try:
-                await app.DATABASE.workflow_params.update_workflow_copilot_chat(
+                canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                    organization_id=chat.organization_id,
+                )
+                if canonical is None:
+                    LOG.warning(
+                        "copilot_candidate_publication_skipped_missing_canonical_workflow",
+                        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                        workflow_permanent_id=chat.workflow_permanent_id,
+                    )
+                    _discard_superseded_proposal(agent_result)
+                    notice = "This draft was not saved because the workflow no longer exists."
+                    agent_result.user_response = (
+                        f"{agent_result.user_response.rstrip()}\n\n{notice}"
+                        if agent_result.user_response.strip()
+                        else notice
+                    )
+                    agent_result.narrative_summary = agent_result.user_response
+                    if agent_result.narrative_payload is not None:
+                        agent_result.narrative_payload = {
+                            **agent_result.narrative_payload,
+                            "terminalMessage": agent_result.user_response,
+                            "narrativeSummary": agent_result.user_response,
+                        }
+                    return
+                if opening_workflow_title is not None and canonical.title and canonical.title != opening_workflow_title:
+                    proposed_workflow_data["title"] = canonical.title
+                    stored_yaml = proposed_workflow_data.get("_copilot_yaml")
+                    if isinstance(stored_yaml, str):
+                        proposed_workflow_data["_copilot_yaml"] = strip_copilot_yaml_headers(
+                            with_workflow_yaml_title(stored_yaml, canonical.title)
+                        )
+                    updated_workflow.title = canonical.title
+                    if isinstance(agent_result.workflow_yaml, str):
+                        agent_result.workflow_yaml = with_workflow_yaml_title(
+                            agent_result.workflow_yaml, canonical.title
+                        )
+                updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
                     organization_id=chat.organization_id,
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    proposed_workflow=proposed_workflow_data,
+                    proposal=proposed_workflow_data,
+                    owner_turn_id=agent_result.turn_id or uuid.uuid4().hex,
+                    canonical_fingerprint=proposal_workflow_fingerprint(canonical),
+                    canonical_title=canonical.title,
+                    disposition=_proposal_disposition(agent_result),
+                    expected_owner_turn_id=None,
+                    expected_revision=None,
                 )
             except CopilotProposalConflictError:
                 LOG.info(
-                    "copilot_candidate_enrich_conflict",
+                    "copilot_candidate_publication_conflict",
                     workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                    branch="untyped",
                 )
                 _discard_superseded_proposal(agent_result)
                 return
+            published_proposal = updated_chat.proposed_workflow
+            if published_proposal is None:
+                raise RuntimeError("Candidate publication returned no proposal")
+            metadata = copilot_proposal_metadata(published_proposal)
+            if metadata is None:
+                raise RuntimeError("Candidate publication returned no ownership token")
+            agent_result.proposal_owner_turn_id = metadata.owner_turn_id
+            agent_result.proposal_revision = metadata.revision
+            agent_result.proposal_workflow_run_id = metadata.workflow_run_id
+            proposed_workflow_data = published_proposal
         # Keep the in-memory chat in sync — a same-turn recovery retry reads
         # chat.proposed_workflow again and must not see the pre-write value.
         chat.proposed_workflow = proposed_workflow_data
@@ -1451,6 +1529,7 @@ async def _persist_interrupted_turn(
     effective_mode: PersistedCopilotComposerMode | None = None,
     code_available: bool | None = None,
     request_cancel_token: str | None = None,
+    executed_block_fingerprints: dict[str, set[str]] | None = None,
 ) -> None:
     """Write the assistant row for a turn that stopped before it finished.
 
@@ -1464,8 +1543,11 @@ async def _persist_interrupted_turn(
     message = render_interrupted_message(
         facts, preserved_draft=_preserved_draft_disposition(draft_present=chat.proposed_workflow is not None)
     )
+    error_payload = _make_error_narrative_payload(turn_id, None, message)
+    if executed_block_fingerprints is not None:
+        error_payload["testedBlockFingerprints"] = serialize_execution_receipts(executed_block_fingerprints)
     narrative_payload = _with_terminal_narrative_metadata(
-        _make_error_narrative_payload(turn_id, None, message),
+        error_payload,
         # An interrupted turn halted; it did not fail. The FE reads this flag to
         # keep the row out of failure treatment.
         cancelled=True,
@@ -1510,6 +1592,7 @@ async def _persist_cancel_turn(
     effective_mode: PersistedCopilotComposerMode | None = None,
     code_available: bool | None = None,
     request_cancel_token: str | None = None,
+    ctx_sink: Sequence[CopilotContext] = (),
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -1579,12 +1662,17 @@ async def _persist_cancel_turn(
             agent_result.updated_workflow is None
             and chat.proposed_workflow is not None
             and not effective_keep_pending_proposal
+            and not agent_result.proposal_adopted
         ):
             await asyncio.shield(_clear_proposed_workflow(chat))
         else:
             await asyncio.shield(
                 _persist_proposed_workflow_state(
-                    chat, agent_result, restored, keep_pending_proposal=effective_keep_pending_proposal
+                    chat,
+                    agent_result,
+                    restored,
+                    keep_pending_proposal=effective_keep_pending_proposal,
+                    opening_workflow_title=getattr(original_workflow, "title", None),
                 )
             )
         user_response = agent_result.user_response
@@ -1652,6 +1740,9 @@ async def _persist_cancel_turn(
             if narrative_payload is not None
             else _make_error_narrative_payload(turn_id or response_turn_id, None, user_response)
         )
+    receipts = _turn_receipts(agent_result, ctx_sink)
+    if narrative_payload is not None and receipts is not None:
+        narrative_payload = {**narrative_payload, "testedBlockFingerprints": serialize_execution_receipts(receipts)}
 
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
@@ -1815,7 +1906,8 @@ async def _finalise_normal_turn(
                 "copilot.auto_accept_deferred_reason", "workflow_run_group_running"
             )
             agent_result.proposal_disposition = "review_tested"
-            user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP}"
+            agent_result.user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP}"
+            user_response = agent_result.user_response
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
             # atomically instead of leaving canonical on a partial intermediate.
@@ -1831,7 +1923,10 @@ async def _finalise_normal_turn(
         # A failed rollback means canonical may still hold the mid-turn write —
         # don't honor keep_pending_proposal against an unverified "nothing changed" state.
         keep_pending_proposal=chat_request.keep_pending_proposal and not restore_failed,
+        opening_workflow_title=getattr(original_workflow, "title", None),
     )
+    # Proposal persistence can add a reason when no safe candidate could be published.
+    user_response = agent_result.user_response
     # Read after persisting, never before: persisting drops this turn's proposal when a newer
     # candidate owns the row, and the frame below must not pair a dropped draft with that
     # candidate's token.
@@ -2343,6 +2438,7 @@ async def _new_copilot_chat_post(
         # is what failed", which agent_result.updated_workflow alone can't.
         proposed_workflow_at_turn_start: Any = None
         agent_result: AgentResult | None = None
+        turn_ctx_sink: list[CopilotContext] = []
         global_llm_context: str | None = None
         terminal_frame_emitted = False
         # Set before the shielded _finalise_normal_turn. A cancel arriving mid-write
@@ -2550,6 +2646,7 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     turn_index=turn_index,
                     prior_turn_outcome=prior_turn_outcome,
+                    executed_block_fingerprints=_turn_receipts(agent_result, turn_ctx_sink),
                 )
                 recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
                     recovered_result.turn_outcome,
@@ -2564,6 +2661,9 @@ async def _new_copilot_chat_post(
                     # the row holds now, so its clear would take a candidate another turn published.
                     recovered_result.proposal_owner_turn_id = agent_result.proposal_owner_turn_id
                     recovered_result.proposal_revision = agent_result.proposal_revision
+                    recovered_result.proposal_adopted = agent_result.proposal_adopted
+                elif turn_ctx_sink and turn_ctx_sink[0].proposal_adopted:
+                    recovered_result.proposal_adopted = True
                 LOG.error(
                     translated_log_message,
                     organization_id=organization.organization_id,
@@ -2776,14 +2876,7 @@ async def _new_copilot_chat_post(
                 proposed_workflow=validated_proposal,
                 persisted_workflow_yaml=persisted_workflow_yaml,
             )
-            prior_executed_block_fingerprints = _assistant_execution_receipts(chat_messages)
-            proposal_receipts = parse_execution_receipts(
-                validated_proposal.get("_copilot_tested_block_fingerprints")
-                if isinstance(validated_proposal, dict)
-                else None
-            )
-            for label, fingerprints in proposal_receipts.items():
-                prior_executed_block_fingerprints.setdefault(label, set()).update(fingerprints)
+            prior_executed_block_fingerprints = _assistant_execution_receipts(chat_messages, validated_proposal)
 
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id
@@ -2968,6 +3061,7 @@ async def _new_copilot_chat_post(
                     eval_entrypoint_url=eval_entrypoint_url,
                     auto_accept=chat.auto_accept,
                     private_workflow_settings=private_workflow_settings,
+                    ctx_sink=turn_ctx_sink,
                     untrusted_evidence=(
                         chat_request.recording_evidence.model_dump_json()
                         if chat_request.recording_evidence is not None
@@ -3129,9 +3223,8 @@ async def _new_copilot_chat_post(
                         exc_info=True,
                     )
             if user_cancel_observed[0] and chat is not None and agent_result is None:
-                # User cancel landed before the agent started running, so
-                # the agent_result.cancelled branch above couldn't run.
-                # _persist_cancel_turn skips rollback when agent_result is None.
+                # No agent_result reached the route: the cancel landed before the agent started or after it
+                # built its ctx, so receipts come from the ctx sink and rollback is skipped.
                 try:
                     await tracked_write(
                         _persist_cancel_turn(
@@ -3151,6 +3244,7 @@ async def _new_copilot_chat_post(
                             effective_mode=effective_mode,
                             code_available=current_code_available,
                             request_cancel_token=chat_request.cancel_token,
+                            ctx_sink=turn_ctx_sink,
                         )
                     )
                 except Exception as writer_exc:
@@ -3164,7 +3258,7 @@ async def _new_copilot_chat_post(
                     return
                 terminal_frame_emitted = True
                 LOG.info(
-                    "Workflow copilot agent cancelled by user during pre-agent setup",
+                    "Workflow copilot agent cancelled by user before returning a result",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     turn_id=turn_id,
@@ -3211,6 +3305,7 @@ async def _new_copilot_chat_post(
                                 effective_mode=effective_mode,
                                 code_available=current_code_available,
                                 request_cancel_token=chat_request.cancel_token,
+                                executed_block_fingerprints=_turn_receipts(agent_result, turn_ctx_sink),
                             )
                         )
                 raise
@@ -3716,6 +3811,8 @@ async def _recover_interrupted_copilot_turn(
         effective_mode=entry.copilot_effective_mode,
         code_available=entry.copilot_code_available,
         request_cancel_token=entry.cancel_token,
+        # No context survives to read, so fail closed: every block reads untested until rerun.
+        executed_block_fingerprints={},
     )
     LOG.info(
         "Recovered an interrupted copilot turn on read",
@@ -3884,22 +3981,15 @@ async def _history_proposal_state(
     if not isinstance(chat.proposed_workflow, dict):
         return None, None, None, claim_expires_in
     metadata = copilot_proposal_metadata(chat.proposed_workflow)
-    if metadata is None:
-        # Safe to show unfingerprinted: Accept gives a tokenless proposal a token before it writes.
-        return chat.proposed_workflow, None, None, claim_expires_in
-    # A live claim is reported, not hidden. A server that dies mid-accept leaves the claim behind
-    # for the length of the lease, and withholding the card for that long is the invisible-work
-    # problem this store exists to remove; Accept meanwhile answers 409 and the client refetches.
-    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=chat.workflow_permanent_id,
-        organization_id=organization_id,
-    )
-    if canonical is None or not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint):
+    if not await proposal_is_displayable(chat.proposed_workflow, chat.workflow_permanent_id, organization_id):
         # Canonical moved, so the proposal is no longer displayable - but a concurrent Accept may
         # still be writing under this claim, and that is exactly when a client must not save over
         # it. Hiding the proposal here MUST NOT hide the claim; reporting no claim while one is
         # live is not ambiguity, it is a client-trusted lie.
         return None, None, None, claim_expires_in
+    if metadata is None:
+        # Safe to show unfingerprinted: Accept gives a tokenless proposal a token before it writes.
+        return chat.proposed_workflow, None, None, claim_expires_in
     run_facts = await _proposal_run_facts(metadata, chat.workflow_permanent_id, organization_id)
     return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 
@@ -4868,7 +4958,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 organization_id=organization.organization_id,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 expected_proposal=proposal,
-                owner_turn_id=uuid.uuid4().hex,
+                owner_turn_id=apply_request.owner_turn_id or uuid.uuid4().hex,
             )
         else:
             claimed = await app.DATABASE.workflow_params.claim_workflow_copilot_candidate(
@@ -4968,8 +5058,8 @@ async def workflow_copilot_apply_proposed_workflow(
                 expected_disposition="accepting",
                 expected_claimed_at=claim.claimed_at,
                 auto_accept=apply_request.auto_accept,
-                # A minted token names no turn a client can match, so only a published one is a receipt.
-                record_acceptance=metadata is not None,
+                # A server-minted legacy claim is not a receipt unless the client can match it to a turn.
+                record_acceptance=metadata is not None or bool(apply_request.owner_turn_id),
             )
             break
         except Exception as e:

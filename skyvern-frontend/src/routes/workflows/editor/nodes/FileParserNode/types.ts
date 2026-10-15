@@ -20,6 +20,7 @@ export type FileParserNodeData = NodeBaseData & {
   fileType: FileParserFileType;
   jsonSchema: string;
   worksheet: string;
+  forceOcr: boolean;
   model: WorkflowModel | null;
 };
 
@@ -35,6 +36,7 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   nextLoopOnFailure: false,
   jsonSchema: "null",
   worksheet: "",
+  forceOcr: false,
   model: null,
   ignoreWorkflowSystemPrompt: false,
 } as const;

@@ -161,6 +161,13 @@ PDF_OCR_PAGE_CONCURRENCY = 5
 # alone cannot bound it; this keeps a pathological document to one failed block instead of
 # letting it consume the run's whole activity budget.
 FILE_PARSE_STEP_TIMEOUT_SECONDS = 300
+# Wall-clock ceiling for one file-parser LLM call (page OCR or structured extraction); the slowest legitimate call seen
+# is a ~245 s large-output extraction. The LLM client's timeout only bounds the gap between received bytes, which a
+# gateway's keep-alive bytes keep resetting on a stalled call.
+FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS = 250
+# Wall-clock ceiling for OCR'ing every page of one scanned PDF: MAX_PDF_OCR_PAGES in rounds of PDF_OCR_PAGE_CONCURRENCY,
+# one retry per page, at the ~30 s a slow OCR call takes. It, not the per-call ceiling, bounds a scan whose pages stall.
+PDF_OCR_TOTAL_TIMEOUT_SECONDS = 600
 MAX_IMAGE_MESSAGES = 10
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt

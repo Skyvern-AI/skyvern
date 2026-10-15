@@ -39,6 +39,7 @@ from skyvern.exceptions import (
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionOwnershipConflict,
+    ExternalBrowserUnavailable,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -52,13 +53,16 @@ from skyvern.exceptions import (
     UnknownErrorWhileCreatingBrowserContext,
     UnsupportedActionType,
     UnsupportedTaskType,
+    get_user_facing_exception_message,
 )
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
+from tests.unit._external_cdp_fakes import external_session_row
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # ``clean_up_task``'s real signature defaults; handlers that omit these kwargs get them.
@@ -99,6 +103,7 @@ async def _drive_execute_step(
     exc: BaseException,
     *,
     fail_task_result: bool = True,
+    browser_session_id: str | None = None,
 ) -> ExecuteStepOutcome:
     """Run ``execute_step`` so that ``exc`` is raised at the first in-``try`` await."""
     agent = ForgeAgent()
@@ -137,6 +142,7 @@ async def _drive_execute_step(
             step=step,
             api_key="api-key",
             download_baseline_files=[],
+            browser_session_id=browser_session_id,
         )
     except BaseException as caught:  # noqa: BLE001 - we characterize which exceptions propagate
         raised = caught
@@ -820,3 +826,37 @@ async def test_cancellation_inside_the_recovery_still_clears_the_context(
 
     assert isinstance(outcome.raised, asyncio.CancelledError)
     assert outcome.context_cleared is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: MissingBrowserStatePage(task_id="task-123"),
+        lambda: BrowserTargetClosedError("target closed"),
+        lambda: ExternalBrowserUnavailable("the browser is no longer reachable"),
+    ],
+    ids=["missing_page", "target_closed", "external_unavailable"],
+)
+@pytest.mark.parametrize("session", ["external_closed", "external_open", "managed"])
+async def test_a_lost_registered_browser_fails_the_step_with_the_registrations_fact(
+    monkeypatch: pytest.MonkeyPatch, exc_factory: Callable[[], BaseException], session: str
+) -> None:
+    row: PersistentBrowserSession = external_session_row(session_id="pbs_1")
+    if session == "external_closed":
+        row = row.model_copy(update={"status": "completed", "completed_at": datetime.now(UTC)})
+    if session == "managed":
+        row = row.model_copy(update={"browser_vendor": None, "upstream_cdp_url": None})
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.browser_sessions.get_persistent_browser_session",
+        AsyncMock(return_value=row),
+    )
+    exc = exc_factory()
+
+    outcome = await _drive_execute_step(monkeypatch, exc, browser_session_id="pbs_1")
+
+    reason = outcome.fail_task.await_args.args[2]
+    if session == "managed":
+        assert reason == get_user_facing_exception_message(exc)
+    else:
+        assert ("is no longer usable" if session == "external_closed" else "no longer reachable") in reason

@@ -19,6 +19,8 @@ from litellm.main import responses_api_bridge_check
 from litellm.types.llms.openai import ChatCompletionTextObject
 from litellm.utils import peek_reasoning_summary_aliases
 
+from skyvern.forge.sdk.api.llm.utils import is_anthropic_model
+
 _GPT_ROUTE_PREFIXES = ("openai/responses/", "azure/responses/", "openai/", "azure/")
 _GPT_VERSION = re.compile(r"gpt-(\d+)(?:\.(\d+))?(?:-|$)")
 _EXPLICIT_BREAKPOINT = {"mode": "explicit"}
@@ -171,14 +173,6 @@ def model_chain(model: str, model_settings: ModelSettings) -> list[str]:
     return [model, *(hop["model"] if isinstance(hop, dict) else hop for hop in fallbacks)]
 
 
-def _is_anthropic_model(model: str) -> bool:
-    try:
-        provider_model, provider, _, _ = litellm.get_llm_provider(model)
-    except litellm.exceptions.BadRequestError:
-        return False
-    return provider == "anthropic" or (provider == "bedrock" and "anthropic." in provider_model)
-
-
 def anthropic_cached_system_blocks(
     *,
     model: str,
@@ -189,7 +183,7 @@ def anthropic_cached_system_blocks(
         return None
     if (model_settings.extra_args or {}).get("cache_control_injection_points"):
         return None
-    if not all(_is_anthropic_model(candidate) for candidate in model_chain(model, model_settings)):
+    if not all(is_anthropic_model(candidate) for candidate in model_chain(model, model_settings)):
         return None
     blocks: list[ChatCompletionTextObject] = [
         {

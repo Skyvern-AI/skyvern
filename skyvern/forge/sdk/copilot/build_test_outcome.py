@@ -30,11 +30,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import page_evidence_source_matches_run, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    selector_identities_in_text,
-    selector_identity_from_failure,
-    selector_identity_from_literal,
-)
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
@@ -44,7 +39,6 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     parse_workflow_yaml,
     workflow_blocks,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
@@ -803,7 +797,6 @@ class RecordedBuildTestOutcome(BaseModel):
     attempted_tool: str = ""
     attempted_target: str = ""
     attempted_block_label: str = ""
-    attempted_call_ref: str = ""
     verdict: BuildTestOutcomeVerdict
     reason_code: BuildTestOutcomeReasonCode
     observed_evidence_summary: str = ""
@@ -912,7 +905,6 @@ def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuild
         "attempted_block_label": outcome.attempted_block_label,
         "attempted_block_signature": _attempted_block_signature(ctx, outcome),
         "attempted_block_code_hash": _attempted_block_code_hash(ctx, outcome),
-        "attempted_call_ref": outcome.attempted_call_ref,
         "code_safety_rejection_facts": [fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts],
         "failed_operation": (
             outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
@@ -1008,7 +1000,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
     # A merged record adds no block outcome -- the prior entry already holds this failure, snapshotted
     # against the code the run executed. Appending would re-snapshot it against the current draft,
-    # so a later clearance check would compare the failure to code it never ran.
+    # so a later comparison would read the failure against code it never ran.
     if not merged_into_prior_failure:
         history.append(_history_entry(ctx, outcome))
     del history[:-_HISTORY_LIMIT]
@@ -1024,10 +1016,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
         is_authoritative=outcome.is_authoritative,
         workflow_run_id=outcome.workflow_run_id,
         authored_structure_signature=outcome.authored_structure_signature,
-        # The three fields `unresolved_runtime_block_failure` branches on. Without them a suppressed
-        # honesty note cannot be attributed to a branch from the logs alone.
         attempted_block_label=outcome.attempted_block_label,
-        attempted_call_ref=outcome.attempted_call_ref,
         attempted_block_signature=_attempted_block_signature(ctx, outcome),
     )
 
@@ -1051,23 +1040,15 @@ def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str | None
     return ctx.staged_workflow_yaml or ctx.workflow_yaml
 
 
-_EXECUTED_CALL_REF_LIMIT = 64
-
-
 class ExecutedBlockEvidence(BaseModel):
     """Source binding for a block a run actually executed, captured when that run was recorded."""
 
     model_config = ConfigDict(extra="ignore")
 
-    signature: str = ""
-    call_refs: list[str] = Field(default_factory=list)
-    call_refs_truncated: bool = False
-    removal_provable: bool = False
     yaml_digest: str = "absent"
 
 
 def _failed_block_labels(blocks: Sequence[Mapping[str, object]]) -> list[str]:
-    """Every failed block, not just the first: the block being judged may be a later one."""
     return [
         label
         for block in blocks
@@ -1085,41 +1066,8 @@ def _executed_block_evidence(
     executed_yaml = _executed_workflow_yaml(ctx)
     if not executed_yaml:
         return {}
-    yaml_digest = _yaml_digest(executed_yaml)
-    signatures = authored_block_signatures_from_workflow(executed_yaml)
-    code_by_label = _code_blocks_by_label(executed_yaml)
-    failed = set(outcome.failed_block_labels)
-    evidence: dict[str, dict[str, object]] = {}
-    for label in outcome.executed_block_labels:
-        # A block that failed in this run proves nothing about its own repair.
-        if label in failed:
-            continue
-        code = code_by_label.get(label)
-        call_refs = sorted(selector_identities_in_text(code)) if code else []
-        truncated = len(call_refs) > _EXECUTED_CALL_REF_LIMIT
-        evidence[label] = ExecutedBlockEvidence(
-            signature=signatures.get(label, ""),
-            # Stored whole rather than shortened: absence is what clears a failure, and a shortened
-            # ref would read as absent while the call it names is still there.
-            call_refs=call_refs[:_EXECUTED_CALL_REF_LIMIT],
-            call_refs_truncated=truncated,
-            removal_provable=(not truncated and _selector_removal_is_provable(code)) if code else False,
-            yaml_digest=yaml_digest,
-        ).model_dump(mode="json")
-    return evidence
-
-
-def _executed_block_evidence_for_label(entry: Mapping[str, object], label: str) -> ExecutedBlockEvidence | None:
-    raw = entry.get("executed_block_evidence")
-    if not isinstance(raw, Mapping):
-        return None
-    value = raw.get(label)
-    if not isinstance(value, Mapping):
-        return None
-    try:
-        return ExecutedBlockEvidence.model_validate(dict(value))
-    except ValidationError:
-        return None
+    evidence = ExecutedBlockEvidence(yaml_digest=_yaml_digest(executed_yaml)).model_dump(mode="json")
+    return {label: dict(evidence) for label in outcome.executed_block_labels}
 
 
 def _code_for_runner_association(
@@ -1190,12 +1138,6 @@ def _failed_operation_call_signature(code: str | None, failing_line: int | None)
     return _stable_hash(ast.dump(outermost, include_attributes=False))
 
 
-# Every construct that can reach the end of a block without running something inside it, including
-# expression-level ones: a zero-length comprehension skips its body exactly as an unentered loop does.
-# Over-detection only costs a redundant note; a miss silently drops a real failure.
-_SELECTOR_CALL_ATTRS = frozenset({"locator", "get_by_role", "get_by_text", "get_by_label", "get_by_placeholder"})
-
-
 def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
     """Block code is an async body, so it only parses inside a wrapper; None means unparseable."""
     try:
@@ -1207,175 +1149,9 @@ def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
     return wrapper if isinstance(wrapper, ast.AsyncFunctionDef) else None
 
 
-def _selector_removal_is_provable(code: str) -> bool:
-    """Whether every selector in the block is a literal, so a scan that misses one proves removal.
-
-    A selector built at runtime (an f-string, a variable, a concatenation) is invisible to the
-    literal scan, so its absence would otherwise read as the failing call having been edited away.
-    """
-    wrapper = _parse_block_code(code)
-    if wrapper is None:
-        return False
-    scanned = selector_identities_in_text(code)
-    for node in ast.walk(wrapper):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr not in _SELECTOR_CALL_ATTRS:
-            continue
-        selector_args = [*node.args, *(kw.value for kw in node.keywords if kw.arg == "name")]
-        literals = [arg.value for arg in selector_args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
-        if len(literals) != len(selector_args):
-            return False
-        # The scan and this proof must read the same selector. Adjacent literals ("#a" "#b") and
-        # triple quotes parse to one constant the text scan spells differently, so a selector the
-        # scan never recorded would read as one the edit removed.
-        identity = selector_identity_from_literal(
-            node.func.attr,
-            literals[0] if literals else "",
-            literals[1] if len(literals) > 1 else "",
-        )
-        if identity and identity not in scanned:
-            return False
-    return True
-
-
 def _yaml_digest(text: str | None) -> str:
     """Identity of a workflow's bytes, so sources can be compared without logging their content."""
     return hashlib.sha256((text or "").encode()).hexdigest()[:16] if text else "absent"
-
-
-def _executed_snapshot_clearance(
-    later_runs: Sequence[object],
-    *,
-    label: str,
-    signature: str,
-    call_ref: str,
-    source_digest: str,
-) -> str | None:
-    """Clearance from a run's own receipts: the run executed this block, and the snapshot it ran
-    carries the same proof of change the delivered workflow would have to carry."""
-    for entry_after in later_runs:
-        if not isinstance(entry_after, Mapping):
-            continue
-        # A run that completed without evaluating its outputs still carries a failed_operation when one
-        # of its blocks re-failed; admitting that would clear the failure and record no new one.
-        completed_unevaluated = (
-            entry_after.get("verdict") == "not_authoritative"
-            and entry_after.get("reason_code") == "run_completed_unevaluated"
-            and entry_after.get("failed_operation") is None
-        )
-        if not (entry_after.get("verdict") == "progress_observed" or completed_unevaluated):
-            continue
-        evidence = _executed_block_evidence_for_label(entry_after, label)
-        if evidence is None:
-            continue
-        # The snapshot that ran has to still be the source being judged. Any edit after that run --
-        # a revert to the code that failed included -- leaves the run proving nothing about it.
-        if evidence.yaml_digest != source_digest:
-            continue
-        run_id = _safe_str(entry_after.get("workflow_run_id"))
-        if call_ref:
-            if call_ref not in evidence.call_refs and evidence.removal_provable:
-                return f"executed_snapshot_call_removed:{run_id}:{label}"
-        elif signature and evidence.signature and evidence.signature != signature:
-            return f"executed_snapshot_signature_changed:{run_id}:{label}"
-    return None
-
-
-def unresolved_runtime_block_failure(
-    ctx: _RecordedBuildTestOutcomeContext,
-    *,
-    reported_workflow_yaml: str | None = None,
-    pending_later_run_id: str | None = None,
-) -> UnresolvedRuntimeFailure | None:
-    return unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=reported_workflow_yaml, pending_later_run_id=pending_later_run_id
-    )[0]
-
-
-def unresolved_runtime_block_failure_with_disposition(
-    ctx: _RecordedBuildTestOutcomeContext,
-    *,
-    reported_workflow_yaml: str | None = None,
-    pending_later_run_id: str | None = None,
-    reported_workflow_is_persisted: bool = False,
-) -> tuple[UnresolvedRuntimeFailure | None, str]:
-    """The newest runtime block failure the retained evidence does not show was resolved.
-
-    A later run of the same block is not clearance. It proves the code executed again, not that it met
-    the condition that failed: a login step can fail against an already-authenticated page and pass
-    against a signed-out one, same lines, opposite precondition. Only evidence that the code itself
-    changed -- the failing call removed, or the block's signature changed -- clears the failure.
-
-    ``reported_workflow_is_persisted`` says what an absent ``reported_workflow_yaml`` means. Callers
-    reading persistence pass it, so absence means nothing is saved and the run's own receipts may
-    stand in; a caller judging a proposal leaves it false, where absence only means it has none.
-    """
-    raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
-    history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
-    for index in range(len(history) - 1, -1, -1):
-        entry = history[index]
-        if entry.get("reason_code") != "runtime_block_failure":
-            continue
-        label = _safe_str(entry.get("attempted_block_label"))
-        signature = _safe_str(entry.get("attempted_block_signature"))
-        run_id = _safe_str(entry.get("workflow_run_id"))
-        call_ref = _safe_str(entry.get("attempted_call_ref"))
-        # Scout evaluations and author-time rejects share this history, so a later *run* has to be
-        # identified by phase and a different run id -- otherwise author-time work after the failure
-        # would read as a later run that skipped the block.
-        later_runs: list[object] = [
-            entry_after
-            for entry_after in history[index + 1 :]
-            if entry_after.get("phase") == "persisted_block_run"
-            and _safe_str(entry_after.get("workflow_run_id")) not in ("", run_id)
-        ]
-        # A run asking mid-flight is its own later run: its outcome reaches the history only after the
-        # result it is about has been handed back, so without this it would see nothing after the
-        # failure and decline.
-        if pending_later_run_id and pending_later_run_id != run_id:
-            later_runs.append({"workflow_run_id": pending_later_run_id})
-        if label and run_id and later_runs and (reported_workflow_yaml or reported_workflow_is_persisted):
-            executed_snapshot_disposition = _executed_snapshot_clearance(
-                later_runs,
-                label=label,
-                signature=signature,
-                call_ref=call_ref,
-                source_digest=_yaml_digest(reported_workflow_yaml or _executed_workflow_yaml(ctx)),
-            )
-            if executed_snapshot_disposition is not None:
-                return None, executed_snapshot_disposition
-        # Absence answers a different question per caller: the run-level carrier reads the snapshot
-        # the run executed, the terminal reads what is saved. reported_workflow_is_persisted says which.
-        delivered_yaml = reported_workflow_yaml
-        code = _code_blocks_by_label(delivered_yaml).get(label) if delivered_yaml else None
-        if not (label and run_id and later_runs and code):
-            if not (label and run_id):
-                return None, "incomplete_failure_record"
-            # `no_later_run` is not a suppression: with nothing after it, the failure is the turn's
-            # own headline and needs no separate qualification.
-            if not later_runs:
-                return None, "no_later_run"
-            # Nothing to read the failing block from: either no delivered candidate at all, or the
-            # block is absent from the one we have because it was authored after the snapshot was
-            # taken. Absence is not proof of repair, so the failure stands.
-            return (
-                UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label),
-                "no_reported_candidate" if not delivered_yaml else "block_absent_from_delivered",
-            )
-        if call_ref:
-            if call_ref not in selector_identities_in_text(code) and _selector_removal_is_provable(code):
-                LOG.info(
-                    "copilot unresolved runtime failure cleared by call removal",
-                    delivered_digest=_yaml_digest(delivered_yaml),
-                    draft_digest=_yaml_digest(ctx.workflow_yaml),
-                    delivered_is_the_draft=delivered_yaml == ctx.workflow_yaml,
-                )
-                return None, f"failing_call_removed:{run_id}:{label}"
-        elif signature and authored_block_signatures_from_workflow(delivered_yaml).get(label) != signature:
-            return None, f"block_signature_changed:{run_id}:{label}"
-        return UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label), "unresolved"
-    return None, "no_runtime_failure"
 
 
 class PriorAttemptChangeIdentity(BaseModel):
@@ -2213,7 +1989,6 @@ def _recorded_outcome_from_run_blocks_result(
         attempted_block_label=_redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
         if failed_block is not None
         else "",
-        attempted_call_ref=_attempted_call_ref(failed_block),
         verdict=verdict,
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
@@ -2665,24 +2440,8 @@ def _runtime_failure_identity(
     )
 
 
-def _attempted_call_ref(failed_block: Mapping[str, object] | None) -> str:
-    """The selector whose removal clears this failure, and only when the failure is about it.
-
-    Clearance treats a call ref as the one thing that must change, so a reason that merely mentions
-    a locator must not carry one: a code-execution failure is repaired by rewriting the block, which
-    the block signature already witnesses, and demanding the selector be dropped strands a repair
-    that correctly kept it.
-    """
-    if failed_block is None:
-        return ""
-    if not _locator_wait_failure_identity(failed_block) and _code_execution_failure_identity(failed_block):
-        return ""
-    return selector_identity_from_failure(_safe_str(failed_block.get("failure_reason")))
-
-
 def _is_code_block_failure(failed_block: Mapping[str, object] | None) -> bool:
-    """A native block's failure is the agent's run, not authored code, and has no code signature to
-    change, so it has no route out of an unresolved-failure note."""
+    """A native block's failure is the agent's run, not authored code, and has no code signature."""
     return failed_block is not None and _safe_str(failed_block.get("block_type")).upper() == BlockType.CODE.name
 
 
@@ -3586,11 +3345,3 @@ def _value_shape(value: object, *, depth: int = 0) -> object:
     if value is None:
         return "none"
     return type(value).__name__
-
-
-def history_has_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> bool:
-    """Whether this turn recorded any runtime block failure, resolved or not."""
-    history = getattr(ctx, "recorded_build_test_outcome_history", [])
-    return isinstance(history, list) and any(
-        isinstance(entry, dict) and entry.get("reason_code") == "runtime_block_failure" for entry in history
-    )

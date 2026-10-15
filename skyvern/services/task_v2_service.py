@@ -70,6 +70,10 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    truncate_oversized_response_text,
+    truncate_oversized_response_value,
+)
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
     ProxyLocationInput,
@@ -2180,11 +2184,6 @@ async def _generate_goto_url_task(
 async def get_thought_timelines(
     *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
 ) -> list[WorkflowRunTimeline]:
-    from skyvern.forge.sdk.workflow.service import (  # noqa: PLC0415
-        truncate_oversized_response_text,
-        truncate_oversized_response_value,
-    )
-
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
@@ -2786,7 +2785,6 @@ async def _summarize_task_v2(
 
 async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = False) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
-    from skyvern.forge.sdk.workflow.service import truncate_oversized_response_value  # noqa: PLC0415
     from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None

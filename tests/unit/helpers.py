@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
+from playwright.async_api import Error as PlaywrightError
 from pytest import MonkeyPatch  # type: ignore[import-not-found]
 
 from skyvern.exceptions import MissingBrowserStatePage, get_user_facing_exception_message
@@ -21,7 +22,20 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.webeye.actions.actions import ActionStatus, ActionType
+from skyvern.schemas.steps import AgentStepOutput
+from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, REDACTED_OTP_VALUE
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ActionType,
+    ClickAction,
+    CompleteAction,
+    InputOrSelectContext,
+    InputTextAction,
+    VerificationCodeAction,
+)
+from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -365,6 +379,282 @@ def make_action_row(**overrides: Any) -> SimpleNamespace:
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+ONE_TIME_CODE = "314159"
+WITHHELD_LABEL = "Input value withheld."
+CLICK_REASONING = f"Typed {ONE_TIME_CODE} into the code field; clicking Verify."
+_IDENTITY_FIELDS = (
+    "action_id",
+    "action_type",
+    "status",
+    "step_id",
+    "action_order",
+    "created_at",
+    "started_at",
+    "finished_at",
+)
+
+
+def _fetched_code_action(**overrides: Any) -> VerificationCodeAction:
+    # Shaped as parse_actions writes it, with the code in reasoning and intention.
+    reasoning = f"Received verification code: {ONE_TIME_CODE}"
+    return VerificationCodeAction(
+        verification_code=ONE_TIME_CODE,
+        reasoning=reasoning,
+        intention=reasoning,
+        status=ActionStatus.completed,
+        **overrides,
+    )
+
+
+def _marked_code_input(status: ActionStatus = ActionStatus.completed, **overrides: Any) -> InputTextAction:
+    return InputTextAction(
+        element_id="otp",
+        text=ONE_TIME_CODE,
+        response=ONE_TIME_CODE,
+        reasoning=f"The page asks for the code {ONE_TIME_CODE}.",
+        intention=f"Enter {ONE_TIME_CODE}",
+        input_or_select_context=InputOrSelectContext(
+            field=f"One-time code {ONE_TIME_CODE}", intention=f"Enter {ONE_TIME_CODE}"
+        ),
+        totp_identifier="inbox@example.test",
+        status=status,
+        **overrides,
+    )
+
+
+def _code_click_row(**overrides: Any) -> SimpleNamespace:
+    return make_action_row(
+        action_id="act_click",
+        action_type=ActionType.CLICK,
+        element_id="verify",
+        action_json={"element_id": "verify", "reasoning": CLICK_REASONING, "intention": CLICK_REASONING},
+        **{"action_order": 5, **overrides},
+    )
+
+
+def make_fetched_code_action_rows() -> list[SimpleNamespace]:
+    """A fetched code, then a failed click that quotes it before any input row exists."""
+    fetched = make_action_row(
+        action_id="act_code_fetch",
+        action_type=ActionType.VERIFICATION_CODE,
+        action_json=_fetched_code_action().model_dump(mode="json"),
+    )
+    return [fetched, _code_click_row(status=ActionStatus.failed, action_order=1)]
+
+
+def make_one_time_code_action_rows() -> list[SimpleNamespace]:
+    """Marked, untyped and saved-only code inputs, a fetched code, an input, a result, a click quoting the code."""
+    entered_at = datetime(2026, 9, 18, 12, 0, 5)
+    marked = make_action_row(
+        action_id="act_otp",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="otp",
+        response=REDACTED_OTP_VALUE,
+        started_at=entered_at,
+        finished_at=entered_at,
+        action_json=_marked_code_input().model_dump(mode="json"),
+    )
+    untyped = make_action_row(
+        action_id="act_otp_untyped",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="otp_retry",
+        status=ActionStatus.failed,
+        action_order=1,
+        action_json={"totp_code_required": True, "response": ONE_TIME_CODE, "reasoning": f"Retyped {ONE_TIME_CODE}."},
+    )
+    fetched = make_action_row(
+        action_id="act_code_fetch",
+        action_type=ActionType.VERIFICATION_CODE,
+        action_order=2,
+        started_at=entered_at,
+        finished_at=entered_at,
+        action_json=_fetched_code_action().model_dump(mode="json"),
+    )
+    typed = make_action_row(
+        action_id="act_typed",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="street",
+        action_json={"element_id": "street", "text": "Meridian Ave"},
+    )
+    result = make_action_row(
+        action_id="act_complete",
+        action_type=ActionType.COMPLETE,
+        action_json={"output": {"failure_rate": "4.2%"}},
+    )
+    saved_only = make_action_row(
+        action_id="act_otp_saved_only",
+        action_type=ActionType.INPUT_TEXT,
+        element_id="otp_again",
+        action_order=6,
+        action_json={"element_id": "otp_again", "text": ONE_TIME_CODE, "totp_code_required": True},
+    )
+    return [marked, untyped, fetched, typed, result, _code_click_row(), saved_only]
+
+
+def _identity(action: dict[str, Any]) -> dict[str, Any]:
+    return {key: action.get(key) for key in _IDENTITY_FIELDS}
+
+
+def assert_one_time_code_withheld(body: str, served: list[dict[str, Any]], sources: Sequence[Action]) -> None:
+    assert ONE_TIME_CODE not in body
+    by_id = {action["action_id"]: action for action in served}
+    masked_ids = ("act_otp", "act_otp_untyped", "act_code_fetch")
+    for source in sources:
+        if source.action_id in masked_ids:
+            assert _identity(by_id[source.action_id]) == _identity(json.loads(source.model_dump_json()))
+    assert by_id["act_otp"]["text"] == REDACTED_OTP_VALUE
+    assert by_id["act_otp_untyped"]["response"] == REDACTED_INPUT_VALUE
+    assert {by_id[action_id]["reasoning"] for action_id in masked_ids} == {WITHHELD_LABEL}
+    assert by_id["act_typed"]["text"] == "Meridian Ave"
+    assert by_id["act_complete"]["output"] == {"failure_rate": "4.2%"}
+    assert_code_click_scrubbed(by_id["act_click"])
+
+
+def assert_code_click_scrubbed(click: dict[str, Any]) -> None:
+    for field in ("reasoning", "intention"):
+        assert click[field] == CLICK_REASONING.replace(ONE_TIME_CODE, REDACTED_SECRET_PLACEHOLDER)
+
+
+# Captured from a headless Chromium Locator.fill on a disabled input: the call log quotes the typed value.
+_FILL_ERROR = (
+    'Locator.fill: Timeout 5000ms exceeded.\nCall log:\nwaiting for locator("#otp")\n'
+    f'  -   locator resolved to <input id="otp" disabled/>\n  -   fill("{ONE_TIME_CODE}")\n'
+    "  - attempting fill action\n  -   waiting for element to be visible, enabled and editable\n"
+)
+_CLICK_ERROR = 'Locator.click: Timeout 5000ms exceeded.\nCall log:\nwaiting for locator("#submit")\n'
+_TYPE_ERROR = f'elementHandle.type: Target closed\nCall log:\n  -   elementHandle.type("{ONE_TIME_CODE}")\n'
+
+
+def _step(step_id: str, order: int, output: dict[str, Any]) -> Step:
+    created_at = datetime(2026, 9, 18, 12, 0, 0)
+    return Step.model_validate(
+        {
+            "task_id": "tsk_test",
+            "step_id": step_id,
+            "created_at": created_at,
+            "modified_at": created_at,
+            "status": StepStatus.failed,
+            "output": output,
+            "order": order,
+            "is_last": order == 1,
+            "organization_id": "o_test",
+        }
+    )
+
+
+def make_one_time_code_steps() -> list[Step]:
+    """Steps as get_task_steps reads back what update_step wrote, in the current and the legacy output format."""
+    entered_at = datetime(2026, 9, 18, 12, 0, 5)
+    pairs: list[tuple[Action, list[ActionResult]]] = [
+        (
+            _fetched_code_action(action_id="act_code_fetch", step_id="stp_test", action_order=0),
+            [ActionSuccess(data={"totp_group_filled": True})],
+        ),
+        (
+            _marked_code_input(
+                action_id="act_otp",
+                step_id="stp_test",
+                action_order=1,
+                started_at=entered_at,
+                finished_at=entered_at,
+                status=ActionStatus.failed,
+            ),
+            [ActionFailure(PlaywrightError(_FILL_ERROR))],
+        ),
+        (
+            ClickAction(action_id="act_submit", element_id="submit", step_id="stp_test", action_order=2),
+            [ActionFailure(PlaywrightError(_CLICK_ERROR))],
+        ),
+        (
+            CompleteAction(
+                action_id="act_complete", step_id="stp_test", action_order=3, output={"failure_rate": "4.2%"}
+            ),
+            [ActionSuccess(data={"failure_rate": "4.2%"})],
+        ),
+        (
+            InputTextAction(
+                action_id="act_typed", element_id="street", text="Meridian Ave", step_id="stp_test", action_order=4
+            ),
+            [ActionSuccess()],
+        ),
+        (
+            ClickAction(
+                action_id="act_click",
+                element_id="verify",
+                step_id="stp_test",
+                action_order=5,
+                reasoning=CLICK_REASONING,
+                intention=CLICK_REASONING,
+            ),
+            [ActionFailure(PlaywrightError(_CLICK_ERROR))],
+        ),
+    ]
+    # Only the saved rows of these inputs carry a marker, so the step copy holds the plain code.
+    pairs += [
+        (
+            InputTextAction(
+                action_id=action_id,
+                element_id="otp_again",
+                text=ONE_TIME_CODE,
+                reasoning=f"Retyping {ONE_TIME_CODE}.",
+                step_id="stp_test",
+                action_order=order,
+            ),
+            [ActionFailure(PlaywrightError(_FILL_ERROR))],
+        )
+        for action_id, order in (("act_otp_saved_only", 6), ("act_otp_untyped", 7))
+    ]
+    current = AgentStepOutput(
+        actions_and_results=pairs, action_results=[result for _, results in pairs for result in results]
+    )
+    legacy = AgentStepOutput(
+        actions_and_results=[],
+        action_results=[
+            ActionFailure(PlaywrightError(_FILL_ERROR)),
+            ActionFailure(PlaywrightError(_TYPE_ERROR)),
+            ActionSuccess(data={"failure_rate": "4.2%"}),
+        ],
+    )
+    return [
+        _step("stp_test", 0, current.model_dump(exclude_none=True)),
+        _step("stp_legacy", 1, legacy.model_dump(exclude_none=True)),
+    ]
+
+
+def assert_step_code_withheld(body: str, sources: Sequence[Step]) -> None:
+    assert ONE_TIME_CODE not in body
+    current_source, legacy_source = sources
+    assert current_source.output is not None and current_source.output.actions_and_results is not None
+    assert ONE_TIME_CODE in (current_source.output.actions_and_results[1][1][0].exception_message or "")
+    source_pairs = current_source.output.actions_and_results
+    current, legacy = (step["output"] for step in json.loads(body))
+    served = [action for action, _ in current["actions_and_results"]]
+    served_results = [results for _, results in current["actions_and_results"]]
+    assert [_identity(action) for action in served] == [
+        _identity(json.loads(action.model_dump_json())) for action, _ in source_pairs
+    ]
+    assert served[0]["reasoning"] == served[1]["reasoning"] == WITHHELD_LABEL
+    assert served[1]["text"] == REDACTED_OTP_VALUE
+    assert "data" not in served_results[0][0]
+    assert (served_results[1][0]["success"], served_results[1][0]["exception_type"]) == (False, "Error")
+    assert "exception_message" not in served_results[1][0]
+    assert served_results[2][0]["exception_message"] == source_pairs[2][1][0].exception_message
+    assert "Locator.click" in served_results[2][0]["exception_message"]
+    assert served[3]["output"] == {"failure_rate": "4.2%"}
+    assert served[4]["text"] == "Meridian Ave"
+    assert_code_click_scrubbed(served[5])
+    assert "Locator.click" in served_results[5][0]["exception_message"]
+    for action, results in zip(served[6:], served_results[6:], strict=True):
+        assert (action["text"], action["reasoning"]) == (REDACTED_INPUT_VALUE, WITHHELD_LABEL)
+        assert "exception_message" not in results[0]
+    flat = current["action_results"]
+    assert "data" not in flat[0] and "exception_message" not in flat[1]
+    assert flat[2]["exception_message"] == served_results[2][0]["exception_message"]
+    assert flat[3]["data"] == served_results[3][0]["data"] == {"failure_rate": "4.2%"}
+    assert [result.get("exception_type") for result in legacy["action_results"]] == ["Error", "Error", None]
+    assert legacy["action_results"][2]["data"] == {"failure_rate": "4.2%"}
 
 
 def make_session_factory_yielding(rows: list[Any]) -> Any:

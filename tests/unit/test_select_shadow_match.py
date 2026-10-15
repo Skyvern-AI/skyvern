@@ -78,6 +78,7 @@ async def _run_normal_select_with_shadow_log(
     )
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", lambda *_args, **_kwargs: "prompt")
     monkeypatch.setattr(handler.app, "NORMAL_SELECT_AGENT_LLM_API_HANDLER", AsyncMock(return_value=llm_response))
+    monkeypatch.setattr(handler, "read_run_cancellation", AsyncMock(return_value=None))
     monkeypatch.setattr(handler.settings, "SKYVERN_SELECT_SHADOW_MATCH", True)
 
     context = SkyvernContext(tz_info=ZoneInfo("UTC"))
@@ -86,9 +87,7 @@ async def _run_normal_select_with_shadow_log(
             results = await handler.normal_select(
                 action=action,
                 skyvern_element=_FakeSelectElement(options),
-                task=SimpleNamespace(
-                    navigation_goal="goal", navigation_payload={}, organization_id=None, workflow_permanent_id=None
-                ),
+                task=_shadow_task(),
                 step=SimpleNamespace(step_id="step-1"),
                 builder=SimpleNamespace(),
             )

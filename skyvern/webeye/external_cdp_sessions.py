@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import structlog
@@ -14,16 +13,19 @@ from skyvern.exceptions import (
     ExternalBrowserEndpointNotEncrypted,
     ExternalBrowserUnavailable,
 )
+from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     EXTERNAL_CDP_BROWSER_VENDOR,
     PersistentBrowserSession,
-    is_final_status,
+    is_external_cdp_session_expired,
+    is_external_cdp_session_open,
+    seconds_until_external_deadline,
 )
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT
 from skyvern.utils.url_validators import (
     is_allowed_local_browser_host,
     is_tls_or_local_browser_address,
@@ -32,33 +34,123 @@ from skyvern.utils.url_validators import (
 )
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.cdp_discovery import resolve_websocket_url
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 LOG = structlog.get_logger()
 
 EXTERNAL_CDP_CONNECT_TIMEOUT_MS = 10_000
+EXTERNAL_CDP_CLOSE_POLL_SECONDS = 15.0
 
 
-def seconds_until_external_deadline(browser_session: PersistentBrowserSession) -> float:
-    """The deadline is fixed at registration: activity never extends it."""
-    started_at = browser_session.started_at or browser_session.created_at
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    deadline = started_at + timedelta(minutes=browser_session.timeout_minutes or DEFAULT_TIMEOUT)
-    return (deadline - datetime.now(timezone.utc)).total_seconds()
+async def _close_at_external_deadline(
+    manager: PersistentSessionsManager,
+    browser_sessions: BrowserSessionsRepository,
+    browser_session: PersistentBrowserSession,
+    deadlines: dict[str, asyncio.Task[None]],
+    runnable_id: str,
+    runnable_generation_id: str,
+) -> None:
+    """Detach the holder at the fixed deadline, within one poll of a close another process wrote to the row, or
+    once the row names a different owner than the lease this watcher was armed for."""
+    session_id = browser_session.persistent_browser_session_id
+    organization_id = browser_session.organization_id
+    reason = BrowserSessionCloseReason.expired
+    while (remaining := seconds_until_external_deadline(browser_session)) > 0:
+        await asyncio.sleep(min(EXTERNAL_CDP_CLOSE_POLL_SECONDS, remaining))
+        # The raw row, not manager.get_session, which closes an expired registration inline and would cancel this task.
+        try:
+            row = await browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        except Exception:
+            LOG.warning("Failed to re-read a leased external CDP session", session_id=session_id, exc_info=True)
+            continue
+        if row is None:
+            continue
+        if row.close_requested_at is not None or not is_external_cdp_session_open(row):
+            reason = BrowserSessionCloseReason.user_requested
+            break
+        if row.runnable_id != runnable_id or row.runnable_generation_id != runnable_generation_id:
+            await _detach_lost_lease(manager, deadlines, session_id, organization_id)
+            return
+    while True:
+        # Unregistered while closing, so the close path's own disarm cannot cancel the retry.
+        if deadlines.get(session_id) is asyncio.current_task():
+            deadlines.pop(session_id)
+        try:
+            await manager.close_session(organization_id, session_id, reason=reason)
+        except Exception:
+            LOG.warning("Failed to close an external CDP session at its deadline", session_id=session_id, exc_info=True)
+        try:
+            row = await browser_sessions.get_persistent_browser_session(session_id, organization_id)
+            if row is None or not is_external_cdp_session_open(row):
+                return
+        except Exception:
+            LOG.warning("Failed to confirm an external CDP session closed", session_id=session_id, exc_info=True)
+        if session_id in deadlines:
+            return
+        current = asyncio.current_task()
+        assert current is not None
+        deadlines[session_id] = current
+        await asyncio.sleep(EXTERNAL_CDP_CLOSE_POLL_SECONDS)
 
 
-def is_external_cdp_session_expired(browser_session: PersistentBrowserSession) -> bool:
-    return seconds_until_external_deadline(browser_session) <= 0
+async def _detach_lost_lease(
+    manager: PersistentSessionsManager,
+    deadlines: dict[str, asyncio.Task[None]],
+    session_id: str,
+    organization_id: str,
+) -> None:
+    # A same-process reacquire re-arms this slot, so a slot still holding this task means another process owns the
+    # lease and this process's driver must not keep acting on the browser.
+    if deadlines.get(session_id) is not asyncio.current_task():
+        return
+    deadlines.pop(session_id)
+    try:
+        await manager.evict_cached_browser_state(session_id, organization_id, detach_remote_driver=True)
+    except Exception:
+        LOG.warning(
+            "Failed to detach an external CDP session after losing its lease", session_id=session_id, exc_info=True
+        )
 
 
-def is_external_cdp_session_open(browser_session: PersistentBrowserSession) -> bool:
-    return (
-        browser_session.completed_at is None
-        and not is_final_status(browser_session.status)
-        and bool(browser_session.upstream_cdp_url)
+def arm_external_deadline(
+    manager: PersistentSessionsManager,
+    browser_sessions: BrowserSessionsRepository,
+    browser_session: PersistentBrowserSession,
+    deadlines: dict[str, asyncio.Task[None]],
+    *,
+    runnable_id: str,
+    runnable_generation_id: str,
+) -> None:
+    """A leased registration closes at its fixed deadline, or after another process closes it, even while the run
+    holding it never touches the row. Arm with the owner the lease CAS just wrote, not the row read before it."""
+    session_id = browser_session.persistent_browser_session_id
+    disarm_external_deadline(deadlines, session_id)
+    deadlines[session_id] = asyncio.create_task(
+        _close_at_external_deadline(
+            manager, browser_sessions, browser_session, deadlines, runnable_id, runnable_generation_id
+        ),
+        name=f"external_cdp_deadline_{session_id}",
     )
+
+
+def disarm_external_deadline(deadlines: dict[str, asyncio.Task[None]], session_id: str) -> None:
+    task = deadlines.pop(session_id, None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+
+def disarm_released_deadline(
+    deadlines: dict[str, asyncio.Task[None]], session_id: str, released: asyncio.Task[None] | None
+) -> None:
+    """Cancel only the watcher captured when the release CAS ran; a newer owner may already have armed the slot."""
+    if released is None:
+        return
+    if deadlines.get(session_id) is released:
+        deadlines.pop(session_id)
+    if released is not asyncio.current_task():
+        released.cancel()
 
 
 async def renew_external_cdp_session(
@@ -164,9 +256,21 @@ async def connect_external_cdp_browser(cdp_url: str) -> RealBrowserState:
     if not browser.contexts:
         await _stop_driver(pw)
         raise ExternalBrowserUnavailable("the browser exposes no default context")
+    browser_context = browser.contexts[0]
+    browser_context._skyvern_external_browser = True  # type: ignore[attr-defined]
+    # Ownership only, as for an adopted session: page-level Fetch would put a fail-closed request gate on the
+    # caller's own tabs. A run rebinds it to its download scope when it acquires the browser.
+    await bind_download_interceptor_to_context(
+        CDPDownloadInterceptor(
+            network_egress_monitor=BrowserNetworkEgressMonitor.unenrolled(),
+            redirect_hop_authorizer=deny_unenrolled_redirect_hop,
+        ),
+        browser_context,
+        enable_page_interception=False,
+    )
     return RealBrowserState(
         pw=pw,
-        browser_context=browser.contexts[0],
+        browser_context=browser_context,
         browser_artifacts=BrowserArtifacts(),
         release_driver_on_close=True,
         external_browser=True,

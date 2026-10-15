@@ -111,6 +111,7 @@ class CopilotRunHooks(RunHooksBase):
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
                 self._ctx.eval_prompt_sha256 = prompt_sha256(system_prompt)
+            self._ctx.open_step_run_ids.clear()
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
@@ -120,6 +121,7 @@ class CopilotRunHooks(RunHooksBase):
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
         self._ctx.model_call_in_flight = False
         self._ctx.last_model_response = response
+        self._ctx.proposal_adoptions_seen_by_model = self._ctx.proposal_adoptions
         if self._ctx.check_model_work_deadline is not None:
             self._ctx.check_model_work_deadline()
         try:

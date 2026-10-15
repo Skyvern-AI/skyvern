@@ -4,19 +4,22 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.cli.core import browser_ops
 from skyvern.cli.core.result import BrowserContext
-from skyvern.cli.core.session_manager import SessionState
+from skyvern.cli.core.session_manager import RequestFailure, RequestFailureLog, SessionState
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.webeye import action_deadline
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
 
 HANGING_PAGE_URL = "https://fixture.test/metrics"
 HANGING_BOUND_MS = 200
@@ -55,6 +58,38 @@ def make_session_state(**overrides: Any) -> SessionState:
     for key, value in overrides.items():
         setattr(state, key, value)
     return state
+
+
+def make_request_failure(
+    page: object,
+    path: str = "/report",
+    *,
+    resource_type: str = "xhr",
+    method: str = "POST",
+    failure_text: str = "net::ERR_EMPTY_RESPONSE",
+    url: str | None = None,
+    page_url: str = "https://app.test/",
+) -> RequestFailure:
+    return RequestFailure(
+        url=url or f"https://app.test{path}",
+        method=method,
+        resource_type=resource_type,
+        failure_text=failure_text,
+        page_url=page_url,
+        tab_id=str(id(page)),
+        timestamp=0.0,
+    )
+
+
+def seed_request_failures(ctx: AgentContext, session_id: str, *entries: RequestFailure) -> RequestFailureLog:
+    log = ctx.request_failure_logs_by_browser_session.setdefault(session_id, RequestFailureLog())
+    for entry in entries:
+        log.append(entry)
+    return log
+
+
+def logged_request_failures(log: RequestFailureLog) -> list[RequestFailure]:
+    return [entry for tab in log.entries.values() for entry in tab]
 
 
 def make_page(raw: MagicMock | None = None) -> SimpleNamespace:

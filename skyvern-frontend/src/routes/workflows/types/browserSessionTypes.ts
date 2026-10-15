@@ -18,6 +18,8 @@ interface BrowserSession {
   vnc_streaming_supported: boolean;
   stream_transport?: string | null;
   created_by?: string | null;
+  source: "managed" | "external";
+  remaining_lifetime_seconds?: number | null;
 }
 
 interface Recording {

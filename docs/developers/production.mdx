@@ -1,0 +1,454 @@
+---
+title: Going to production
+description: Get run results by webhook, verify signatures, handle failures by error code, get past bot checks with proxies, and cap the cost of every run.
+keywords:
+  - webhook_url
+  - webhook signature
+  - HMAC-SHA256
+  - retry_run_webhook
+  - error_code_mapping
+  - failure_reason
+  - CAPTCHA
+  - bot detection
+  - proxy_location
+  - GeoTarget
+  - max_steps
+  - run_with
+  - Laminar
+---
+
+import WebhookSignatureVerification from "/snippets/webhook-signature-verification.mdx";
+
+Runs are asynchronous. A production integration starts a run, gets told when it finishes, checks the result, and decides what to do on failure. This page covers each part.
+
+## Webhooks
+
+Pass `webhook_url` when you start a run. Skyvern sends one POST to that URL when the run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
+
+Job recipe runs (the [Apply](/api-reference/recipes/apply-to-a-job) and [Extract](/api-reference/recipes/extract-a-job-application-posting) recipe endpoints) take the same top-level `webhook_url`, and `proxy_location` too. A recipe request without `webhook_url` sends no webhook; blank or null counts as absent.
+
+<CodeGroup>
+```python Python
+import os
+from skyvern import Skyvern
+
+client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+
+# A task
+task = await client.run_task(
+    prompt="Get the title of the top post",
+    url="https://news.ycombinator.com",
+    webhook_url="https://your-server.example.com/skyvern-webhook",
+)
+
+# An agent
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    parameters={"invoice_month": "2026-09"},
+    webhook_url="https://your-server.example.com/skyvern-webhook",
+)
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+
+// A task
+const task = await client.runTask({
+  prompt: "Get the title of the top post",
+  url: "https://news.ycombinator.com",
+  webhook_url: "https://your-server.example.com/skyvern-webhook",
+});
+
+// An agent
+const run = await client.runWorkflow({
+  agent_id: "wpid_123456789",
+  parameters: { invoice_month: "2026-09" },
+  webhook_url: "https://your-server.example.com/skyvern-webhook",
+});
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Get the title of the top post",
+    "url": "https://news.ycombinator.com",
+    "webhook_url": "https://your-server.example.com/skyvern-webhook"
+  }'
+```
+</CodeGroup>
+
+To give an agent a default webhook for every run, set `webhook_callback_url` in the agent definition. A `webhook_url` on a run overrides it.
+
+<Warning>
+The names differ by place. `webhook_url` goes on a run request. `webhook_callback_url` goes inside the agent definition. Putting `webhook_url` in an agent definition returns no error, and no webhook is ever sent.
+</Warning>
+
+### Payload
+
+The body is the same run object that `get_run` returns. The fields you use most:
+
+```json
+{
+  "run_id": "tsk_v2_490440779503357994",
+  "status": "completed",
+  "output": { "top_post_title": "Show HN: A tiny Lisp in 200 lines" },
+  "failure_reason": null,
+  "errors": [],
+  "step_count": 4,
+  "run_type": "task_v2",
+  "recording_url": "https://.../recording.webm",
+  "screenshot_urls": ["https://.../screenshot_final.png"],
+  "downloaded_files": [],
+  "app_url": "https://app.skyvern.com/runs/wr_490440779503358000",
+  "created_at": "2026-09-30T15:20:42.160725",
+  "finished_at": "2026-09-30T15:23:34.992815"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | Terminal status of the run. |
+| `output` | Extracted data. Still present when webhook delivery fails. |
+| `failure_reason` | Free-text reason the run failed. For logs, not for branching. |
+| `errors` | Structured errors. Your mapped codes appear here as `errors[].error_code`. |
+| `recording_url`, `screenshot_urls` | Signed links, valid for 1 hour. Fetch the run again for fresh ones. |
+| `app_url` | The run in the Skyvern app. |
+| `attempt`, `retry_pending`, `attempts` | Agent runs only. See [Retries and replay](#retries-and-replay). |
+
+Agent runs also carry `failure_category`, described in [Error handling](#error-handling). The full schema is in the [API reference](/api-reference).
+
+### Verify the signature
+
+<WebhookSignatureVerification />
+
+### Respond fast
+
+- Return a `2xx` within 30 seconds. Slower responses count as a failed attempt even if you process the payload. Queue the work and reply right away.
+- The URL must be reachable from the internet. `localhost` does not work from Skyvern Cloud.
+- Treat duplicates as normal. Skyvern can deliver the same payload more than once (see below).
+
+## Retries and replay
+
+### When delivery fails
+
+Delivery and the run are independent. Each attempt times out after 30 seconds. Skyvern makes up to 3 attempts, waiting about 1 second, then 2 seconds, in between. If you return a `Retry-After` header, Skyvern waits that long instead, up to 30 seconds.
+
+| Response | Retried |
+|---|---|
+| Timeout, connection error, `5xx`, `403`, `408`, `425`, `429` | Yes |
+| Any other `4xx` | No, the attempt is final |
+
+For an agent run with a [retry policy](#retry-an-agent-run-automatically), the final webhook gets up to 15 of these 3-attempt deliveries. If every attempt fails, the run keeps its `status` and `output`. Nothing is lost.
+
+Keep a fallback: if you expect a run to be done and have no webhook, call `get_run`.
+
+<CodeGroup>
+```python Python
+run = await client.get_run("tsk_v2_490440779503357994")
+print(run.status, run.output)
+```
+
+```typescript TypeScript
+const run = await client.getRun("tsk_v2_490440779503357994");
+console.log(run.status, run.output);
+```
+
+```bash cURL
+curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+</CodeGroup>
+
+### Replay a webhook
+
+After you fix the endpoint, send the payload again with `retry_run_webhook`. Pass a different `webhook_url` to send it somewhere else.
+
+<CodeGroup>
+```python Python
+from skyvern.client import RetryRunWebhookRequest
+
+result = await client.retry_run_webhook("tsk_v2_490440779503357994")
+
+# Or to a different URL
+result = await client.retry_run_webhook(
+    "tsk_v2_490440779503357994",
+    request=RetryRunWebhookRequest(webhook_url="https://your-server.example.com/new-hook"),
+)
+print(result.status_code, result.error)
+```
+
+```typescript TypeScript
+const result = await client.retryRunWebhook("tsk_v2_490440779503357994");
+
+// Or to a different URL
+const redirected = await client.retryRunWebhook("tsk_v2_490440779503357994", {
+  webhook_url: "https://your-server.example.com/new-hook",
+});
+console.log(redirected.status_code, redirected.error);
+```
+
+```bash cURL
+curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994/retry_webhook" \
+  -H "x-api-key: $SKYVERN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"webhook_url": "https://your-server.example.com/new-hook"}'
+```
+</CodeGroup>
+
+A replay makes one attempt and waits up to 60 seconds. The response reports `status_code`, `latency_ms`, `response_body`, and `error`. It does not retry, so check `status_code` and call again if needed. A replay is signed with the API key you call it with.
+
+### Retry an agent run automatically
+
+Add `retry_policy` to an agent definition to re-run it on chosen outcomes. The run keeps its `run_id` and records each try in `attempts`.
+
+```json
+{
+  "retry_policy": {
+    "max_retries": 2,
+    "delay_seconds": 10,
+    "webhook_on_retry": "final_only",
+    "retry_on": [
+      { "status": "terminated", "error_codes": ["portal_timeout"] },
+      { "status": "failed" }
+    ]
+  }
+}
+```
+
+- `max_retries` is 1 to 5. `delay_seconds` is 0 to 3600.
+- `webhook_on_retry` is `final_only` (default, one webhook after the last attempt) or `every_attempt`.
+- While `retry_pending` is `true`, the result can still change. Act on the payload with `retry_pending: false`.
+- `retry_run_webhook` returns `409` while a retry is pending.
+
+<Warning>
+Use `run_id`, `attempt`, and `retry_pending` together as your idempotency key. Every attempt shares one `run_id`, so keying on `run_id` alone drops the final attempt. A run canceled during its retry delay sends two payloads for the same attempt, first with `retry_pending: true`, then `false`.
+</Warning>
+
+## Error handling
+
+### Statuses
+
+| Status | Meaning | Retry as is? |
+|---|---|---|
+| `completed` | Finished. Check `output`. | No need |
+| `failed` | Something broke: browser, network, or the run used all its steps (`failure_reason` starts with "Reached the maximum steps"). | Often helps |
+| `terminated` | The agent decided the goal can't be reached, for example a rejected login. | No. Change the input first. |
+| `timed_out` | The run passed its time limit. | After simplifying the goal |
+| `canceled` | Stopped by you or a teammate. | Only if you meant it to run |
+
+`created`, `queued`, `running`, and `paused` (waiting for a person at a Human Interaction block) are not terminal.
+
+### Map failures to your own codes
+
+`failure_reason` is free text written by the AI. To branch in code, pass `error_code_mapping`: your code as the key, a plain-language description as the value. When the run fails, Skyvern matches the page against your descriptions and puts the matching code in `errors[].error_code`.
+
+<CodeGroup>
+```python Python
+run = await client.run_task(
+    prompt="Log in and download the invoice for September 2026",
+    url="https://vendor-portal.example.com",
+    error_code_mapping={
+        "login_failed": "The login is rejected, the account is locked, or MFA is required",
+        "invoice_not_found": "No invoice exists for the requested month",
+        "maintenance": "The site is down for maintenance",
+    },
+    wait_for_completion=True,
+)
+
+codes = [e.get("error_code") for e in (run.errors or [])]
+if run.status == "completed":
+    save(run.output)
+elif "login_failed" in codes:
+    alert_owner("vendor-portal login rejected")
+elif "maintenance" in codes:
+    schedule_retry(minutes=60)
+else:
+    log_failure(run.run_id, run.failure_reason)
+```
+
+```typescript TypeScript
+const run = await client.runTask({
+  prompt: "Log in and download the invoice for September 2026",
+  url: "https://vendor-portal.example.com",
+  error_code_mapping: {
+    login_failed: "The login is rejected, the account is locked, or MFA is required",
+    invoice_not_found: "No invoice exists for the requested month",
+    maintenance: "The site is down for maintenance",
+  },
+  waitForCompletion: true,
+});
+
+const codes = (run.errors ?? []).map((e) => e.error_code);
+if (run.status === "completed") {
+  save(run.output);
+} else if (codes.includes("login_failed")) {
+  alertOwner("vendor-portal login rejected");
+} else if (codes.includes("maintenance")) {
+  scheduleRetry(60);
+} else {
+  logFailure(run.run_id, run.failure_reason);
+}
+```
+</CodeGroup>
+
+Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...", "confidence_float": 0.95}`. In an agent, set `error_code_mapping` on a block instead. A Validation block with `complete_criterion`, `terminate_criterion`, and `error_code_mapping` works like an assertion: it stops the agent with your code as soon as the page shows the wrong state. See [blocks](/reference/blocks).
+
+Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, `MISSING_TOTP_SOURCE`, `CREDENTIAL_LOGIN_UNCONFIRMED`, and `CREDENTIAL_ACCOUNT_LOCKED`.
+
+When the organization-scoped credential-verdict confirmation flag is enabled, a credential rejection can instead be reported as `CREDENTIAL_LOGIN_UNCONFIRMED` or `CREDENTIAL_ACCOUNT_LOCKED`. Handle these system-defined codes explicitly anywhere you branch, retry, or filter by the original credential code. The login-request-status check is not available yet; keep this flag disabled until that check, the follow-up evaluation, and the human audit are complete.
+
+### Failure categories
+
+Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
+
+| `category` | Usual next step |
+|---|---|
+| `ANTI_BOT_DETECTION` | See [Anti-bot and CAPTCHA](#anti-bot-and-captcha). |
+| `PROXY_ERROR` | Retry, or pick another `proxy_location`. |
+| `AUTH_FAILURE`, `CREDENTIAL_ERROR` | Check the credential and 2FA setup. |
+| `MAX_STEPS_EXCEEDED`, `BUDGET_EXHAUSTED` | Raise the step limit or narrow the goal. |
+| `NAVIGATION_FAILURE`, `PAGE_LOAD_TIMEOUT`, `WEBSITE_ERROR` | Check the URL, or retry later. |
+| `BROWSER_ERROR`, `INFRASTRUCTURE_ERROR`, `LLM_ERROR` | Retry. These are usually transient. |
+| `BROWSER_SESSION_EXPIRED` | Create a new browser session, or run without one. |
+
+The [troubleshooting](/developers/troubleshooting#failure-categories) page lists every category.
+
+### Requests rejected before a run starts
+
+Some agent run requests can never start. The API answers `400` with a `detail` message and creates no run, so there is nothing to poll and no webhook. Causes: a required input with no value, a credential ID that doesn't exist in your organization, a value of the wrong type, or an undeclared key that looks like a misspelled credential input. Fix the request and send it again.
+
+## Anti-bot and CAPTCHA
+
+Skyvern Cloud solves common CAPTCHAs during a run: reCAPTCHA, hCaptcha, Cloudflare Turnstile, FunCaptcha, MTCaptcha, and text CAPTCHAs. Solving is not guaranteed. Every browser also launches with automation flags removed, and its timezone follows the proxy location so the IP and the clock agree.
+
+When a site still blocks runs, work down this list:
+
+1. **Use a residential proxy.** Datacenter IPs are the most common block signal. `RESIDENTIAL` is the default on Cloud. For logins, use `RESIDENTIAL_ISP`, which keeps one static IP.
+2. **Keep the same browser.** A [browser session](/browsers) keeps cookies and IP across steps. A [browser profile](/browsers) brings back a browser that already passed the check.
+3. **Raise `max_steps`.** Some challenges, Cloudflare especially, loop through several pages.
+4. **Slow down.** Add a Wait block between rapid actions.
+5. **Hand it to a person.** Open the run in the app, click **Take control** on the live browser, solve the challenge, then click **Stop controlling**. The run continues where it was.
+
+<img src="/images/cloud/run-take-control.png" alt="Live browser view with the Take control button over the stream" />
+
+To count blocked runs, look for `ANTI_BOT_DETECTION` in `failure_category`.
+
+<Note>
+Self-hosted Skyvern does not solve CAPTCHAs. When the agent sees one, it waits 30 seconds so you can solve it in the browser window, then continues. Self-hosted servers can load Chrome extensions with the `EXTENSIONS` and `EXTENSIONS_BASE_PATH` settings. See [browser settings](/reference/configuration#browser-settings).
+</Note>
+
+## Proxies and geo-targeting
+
+Set `proxy_location` on a task, an agent run, an agent definition (the default for its runs), or a browser session (every run in the session shares the IP). Proxies are a Skyvern Cloud feature.
+
+<CodeGroup>
+```python Python
+run = await client.run_task(
+    prompt="Get the listed price in local currency",
+    url="https://shop.example.co.uk/product/123",
+    proxy_location="RESIDENTIAL_GB",
+)
+
+# State or city level
+run = await client.run_task(
+    prompt="Get the local delivery estimate",
+    url="https://shop.example.com/product/123",
+    proxy_location={"country": "US", "subdivision": "CA", "city": "San Francisco"},
+)
+```
+
+```typescript TypeScript
+const run = await client.runTask({
+  prompt: "Get the listed price in local currency",
+  url: "https://shop.example.co.uk/product/123",
+  proxy_location: "RESIDENTIAL_GB",
+});
+
+// State or city level
+const local = await client.runTask({
+  prompt: "Get the local delivery estimate",
+  url: "https://shop.example.com/product/123",
+  proxy_location: { country: "US", subdivision: "CA", city: "San Francisco" },
+});
+```
+</CodeGroup>
+
+| Value | Routes through |
+|---|---|
+| `RESIDENTIAL` | Random US residential IP. The default. |
+| `RESIDENTIAL_ISP` | Static US ISP IP. Best for logins and multi-step flows. |
+| `RESIDENTIAL_AR`, `_AU`, `_BR`, `_CA`, `_DE`, `_ES`, `_FR`, `_GB`, `_IE`, `_IN`, `_IT`, `_JP`, `_KR`, `_MX`, `_NL`, `_NZ`, `_PH`, `_SA`, `_TR`, `_ZA` | Residential IP in that country, for example `RESIDENTIAL_DE`. |
+| `NONE` | No proxy. |
+
+`US-CA`, `US-NY`, `US-TX`, `US-FL`, and `US-WA` are deprecated and route through `RESIDENTIAL_ISP`. For a US state or a city, pass a `GeoTarget` object instead: `country` (ISO code, required), `subdivision` (for example `CA`), and `city` (English name). Geo targets accept the same 21 countries: US plus the country codes above. City and state pools are smaller. If one is unavailable, widen the target from city to state to country.
+
+<Note>
+A browser profile does not keep the proxy it was created with. To reach a site from the same IP on every run, pin a proxy on the profile. See [Browsers](/browsers).
+</Note>
+
+## Reliability tips
+
+- **Say when it's done.** End every goal with a completion rule, such as "COMPLETE when the confirmation number is shown," and a stop rule, such as "TERMINATE if the login is rejected." Name the submit step: agents sometimes stop after filling a form.
+- **Describe what's visible.** "The blue Submit button under the form" beats an element ID. The agent works from screenshots.
+- **Use the narrowest block.** An Action block does one thing. A Navigation block reaches one goal. A Task block keeps going until it thinks the whole goal is met, so it may click **Next** on every page.
+- **Spell out tricky inputs.** For autocomplete fields: "Type 'Toronto', pick the first matching suggestion, and move on." For dates: give the exact format.
+- **Assert at checkpoints.** Add a Validation block after login and before submitting. It reads the current page, not earlier block outputs. To compare extracted values, use a Code block or check `output` in your own code.
+- **Make loops recoverable.** Set `continue_on_failure: true` on loops, and start each iteration with a step that returns to the list page. A While loop needs an exit condition that the page itself can show.
+- **Load lazy pages.** Set `max_screenshot_scrolls` so the agent scrolls before it reads the page.
+
+## Cost control
+
+- **Cap steps.** `max_steps` on a task, or `max_steps_override` on an agent run (`x-max-steps-override` in TypeScript), limits steps for each task in the run. A run that hits the cap ends `failed` with "Reached the maximum steps" in `failure_reason`. Compare `step_count` with your cap and lower it if you have room.
+- **Cap time.** `max_elapsed_time_minutes` on an agent run times it out (`timed_out`) after that many minutes. The default is 240 and the maximum is 480.
+- **Run cached code.** After a successful agent run, Skyvern can replay the recorded actions as code instead of calling the AI at every step. Pass `run_with="code"` to use it, or `"agent"` to force the AI. If the code fails and `ai_fallback` is on, the AI takes over.
+- **Skip the login.** A [browser profile](/browsers) that is already signed in saves the steps a login takes on every run.
+- **Start on the right page.** Pass the deepest `url` you can and a `data_extraction_schema` so the agent doesn't wander.
+
+<CodeGroup>
+```python Python
+run = await client.run_workflow(
+    workflow_id="wpid_123456789",
+    max_steps_override=30,
+    max_elapsed_time_minutes=30,
+    run_with="code",
+)
+```
+
+```typescript TypeScript
+const run = await client.runWorkflow({
+  agent_id: "wpid_123456789",
+  "x-max-steps-override": 30,
+  max_elapsed_time_minutes: 30,
+  run_with: "code",
+});
+```
+</CodeGroup>
+
+Plans and credit prices are on [skyvern.com/pricing](https://www.skyvern.com/pricing). Self-hosted servers set the default step limit with `MAX_STEPS_PER_RUN` and choose the model with `LLM_KEY`. See [configuration](/reference/configuration).
+
+## Observability
+
+Artifacts explain one run (see [troubleshooting](/developers/troubleshooting#use-artifacts)). For trends across runs, such as failure rate, latency, and slow tasks, send traces to [Laminar](https://laminar.sh).
+
+**With the SDK.** Initialize Laminar before you create the Skyvern client so it can trace your SDK calls.
+
+```python
+import os
+from lmnr import Laminar  # pip install 'lmnr[all]'
+from skyvern import Skyvern
+
+Laminar.initialize()  # reads LMNR_PROJECT_API_KEY
+client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+```
+
+**On a self-hosted server.** Install `lmnr` in the server's Python environment and set `LMNR_PROJECT_API_KEY`. The server then traces every LLM call (prompt, response, tokens), every browser action, and every block. For a self-hosted Laminar, also set `LMNR_BASE_URL`, `LMNR_GRPC_PORT` (default `8001`), and `LMNR_HTTP_PORT` (default `8000`).
+
+## Next
+
+- [Troubleshooting](/developers/troubleshooting): symptoms, causes, and fixes
+- [Credentials and 2FA](/credentials): logins that keep working
+- [API reference](/api-reference)
