@@ -1,0 +1,26 @@
+---
+title: Pre-flight checkout check
+description: Stop a purchase workflow early when an agent likely can't reach checkout
+---
+
+Purchase workflows can run many steps before they fail on a store that blocks agents at checkout (captcha, login wall, bot block). A pre-flight check as the **first block** lets the workflow stop early and save time and credits.
+
+This page uses [ARC](https://www.arcreport.ai) (arcreport.ai) as the example data source: a public API that needs no key. Any source that returns JSON works the same way. *Disclosure: this example was contributed by the ARC team.*
+
+## How it works
+
+1. **HTTP Request** block (`arc_precheck`): `GET https://www.arcreport.ai/api/precheck?url={{ store_url | urlencode }}&ref=skyvern` with header `User-Agent: skyvern-agent/1.0`. Turn on **Continue on Failure** so an API error doesn't fail the run.
+2. **Conditional** block (`checkout_gate`): one branch with the Jinja2 expression
+   `{{ arc_precheck_output.response_body.reachable_checkout == true and arc_precheck_output.response_body.stale == false }}` goes to the purchase steps. The **Else** branch goes to the Terminate block.
+3. **Terminate** block (`stop_early`): ends the run with a reason.
+4. Your purchase blocks (here a single Navigation block).
+
+The full YAML is at `examples/preflight_checkout_check.yaml`. Import it from the workflow editor, or create it through the API.
+
+## What the check tells you
+
+The response includes `reachable_checkout`, `stale`, `last_checked` and `rails[]` (for example UCP, ACP, MCP and WebMCP signals), each with a `proves` note.
+
+- Results are **advisory**. They estimate whether an agent can **reach checkout** at that store, based on ARC's last saved check. They don't prove a checkout will succeed.
+- ARC stops before payment. It never places orders.
+- Treat `stale: true`, an error or a timeout as **unknown**, not as "no". This sample stops on unknown to be safe. Change the default branch if you'd rather continue.
