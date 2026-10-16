@@ -764,12 +764,17 @@ async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
+@pytest.mark.parametrize("canvas_app", [False, True])
+async def test_non_timeout_scraping_reason_stays_data_extraction(canvas_app: bool) -> None:
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
 
-    generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
+    generic_reason = await build_scraping_failed_reason(
+        browser_state, "https://example.com/path", timed_out=False, canvas_app=canvas_app
+    )
     assert "timeout" not in generic_reason.lower()
+    # The page-load log filter and reporting queries match this phrase, so the canvas wording must keep it.
+    assert "failed to load the website" in generic_reason
     assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
 
 
