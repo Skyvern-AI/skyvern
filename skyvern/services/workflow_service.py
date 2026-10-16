@@ -8,6 +8,7 @@ from fastapi import BackgroundTasks, Request
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
+from skyvern.forge.request_logging import get_request_principal_state
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -167,6 +168,7 @@ async def _prepare_workflow(
     created_by: str | None = None,
     refuse_unusable_parameters_before_create: bool = False,
     post_dispatch_effects: list[Callable[[], Awaitable[None]]] | None = None,
+    integration_platform: str | None = None,
 ) -> tuple[WorkflowRun, Workflow]:
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
@@ -196,6 +198,7 @@ async def _prepare_workflow(
             workflow_run_id=workflow_run_id,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            integration_platform=integration_platform,
             workflow_schedule_id=workflow_schedule_id,
             retried_from_workflow_run_id=retried_from_workflow_run_id,
             fallback_attempt=fallback_attempt,
@@ -308,6 +311,7 @@ async def run_workflow_returning_owned_workflow(
     # Best-effort bookkeeping that no dispatch gate reads is written after the Temporal submit, off the
     # created-to-queued path; it still runs if the submit fails, as it did when it ran before the submit.
     post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
+    request_identity = get_request_principal_state()
     try:
         workflow_run, workflow = await _prepare_workflow(
             workflow_id=workflow_id,
@@ -319,6 +323,7 @@ async def run_workflow_returning_owned_workflow(
             request_id=request_id,
             parent_workflow_run_id=parent_workflow_run_id,
             trigger_type=trigger_type,
+            integration_platform=request_identity.integration_platform if request_identity else None,
             workflow_schedule_id=workflow_schedule_id,
             retried_from_workflow_run_id=retried_from_workflow_run_id,
             fallback_attempt=fallback_attempt,
