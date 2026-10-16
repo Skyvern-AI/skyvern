@@ -16245,6 +16245,7 @@ async def test_type_waits_out_an_aria_disabled_field_the_page_releases() -> None
         assert await page.eval_on_selector("#soon", "el => el.value") == "Iowa City"
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_type_reports_readonly_when_the_page_locks_the_field_during_the_grace() -> None:
