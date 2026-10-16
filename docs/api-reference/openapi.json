@@ -13129,74 +13129,6 @@
         ],
         "title": "CreateScriptResponse"
       },
-      "CredentialCheck": {
-        "type": "string",
-        "enum": [
-          "site_rejected_credentials",
-          "no_recent_login_with_same_credential",
-          "login_request_not_5xx_or_429"
-        ],
-        "title": "CredentialCheck",
-        "description": "The confirmations a credential-rejection verdict has to clear before it is returned as one."
-      },
-      "CredentialCheckEvidence": {
-        "properties": {
-          "confirmed": {
-            "type": "boolean",
-            "title": "Confirmed",
-            "description": "True only when every credential confirmation check passed. The login-request status check is not available yet, so the organization-scoped confirmation flag must remain disabled until that check is implemented."
-          },
-          "checks_passed": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Passed"
-          },
-          "checks_failed": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Failed"
-          },
-          "checks_skipped": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Skipped"
-          },
-          "site_message": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Site Message"
-          },
-          "login_request_status": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Login Request Status"
-          }
-        },
-        "type": "object",
-        "required": [
-          "confirmed"
-        ],
-        "title": "CredentialCheckEvidence",
-        "description": "Why a credential-rejection verdict was or was not confirmed. Reaches the caller on the run\nresponse and the webhook, so a customer can tell a confirmed rejection from an unconfirmed one\nbefore blocking the credential."
-      },
       "CredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -28730,17 +28662,6 @@
             "const": "USER_DEFINED_ERROR",
             "title": "Error Type",
             "default": "USER_DEFINED_ERROR"
-          },
-          "credential_check": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CredentialCheckEvidence"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Confirmation evidence set by Skyvern; request input is ignored. This field remains unconfirmed until all required checks, including login-request status, are available."
           }
         },
         "type": "object",
