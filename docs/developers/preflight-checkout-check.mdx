@@ -1,0 +1,26 @@
+---
+title: Pre-flight checkout check
+description: Optionally stop a purchase workflow early when an agent likely can't reach checkout
+---
+
+Purchase workflows can run many steps before they fail on a store that blocks agents at checkout (captcha, login wall, bot block). An optional pre-flight check as the **first block** lets the workflow stop early and save time and credits.
+
+The check service is a workflow parameter, `precheck_api_url`, with no default. You choose which service to call. Any endpoint that takes `?url=<store URL>` and returns JSON with boolean `reachable_checkout` and `stale` fields works. One example of such a service is ARC (`https://www.arcreport.ai/api/precheck`), a public API that needs no key. The store URL you pass is sent to whichever service you configure.
+
+*Disclosure: this example was contributed by the ARC team. It is not an endorsement by Skyvern.*
+
+## How it works
+
+1. **HTTP Request** block (`preflight_check`): `GET {{ precheck_api_url }}?url={{ store_url | urlencode }}`. Turn on **Continue on Failure** so an API error or timeout doesn't fail the run.
+2. **Conditional** block (`checkout_gate`): one branch goes to the purchase steps when this expression is true:
+   `{{ preflight_check_output.response_body is defined and preflight_check_output.response_body.reachable_checkout is defined and preflight_check_output.response_body.reachable_checkout == true and preflight_check_output.response_body.stale is defined and preflight_check_output.response_body.stale == false }}`
+   The `is defined` guards matter: after a timeout or connection error the block output has no `response_body`, and the run should fall through to the default branch instead of raising an error. The same goes for a 200 response whose body isn't the expected JSON, which is why `reachable_checkout` and `stale` are each guarded too. The **Else** branch goes to the Terminate block.
+3. **Terminate** block (`stop_early`): ends the run with a reason.
+4. Your purchase blocks (here a single Navigation block).
+
+The full YAML is at `examples/preflight_checkout_check.yaml`. Import it from the workflow editor, or create it through the API.
+
+## Reading the result
+
+- Results are **advisory**. They estimate whether an agent can **reach checkout**, based on the service's last saved check. They don't prove a checkout will succeed.
+- Treat `stale: true`, an error or a timeout as **unknown**, not as "no". This sample stops on unknown to be safe. Change the default branch if you'd rather continue.
