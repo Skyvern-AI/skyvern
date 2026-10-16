@@ -68,6 +68,8 @@ def create_forge_stub_app() -> ForgeApp:
     # would otherwise auto-mock it as an (awaitable) AsyncMock, breaking sync callers.
     fake_app_module.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
     fake_app_module.PERSISTENT_SESSIONS_MANAGER = _LazyNamespace()
+    # A synchronous capability check; auto-mocked, its un-awaited coroutine leaks into later tests.
+    fake_app_module.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)
     fake_app_module.ARTIFACT_MANAGER = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)

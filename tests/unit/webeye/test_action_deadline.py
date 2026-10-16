@@ -23,6 +23,8 @@ async def test_a_caller_cancelled_before_the_call_takes_its_first_step_still_sta
 
     instrumentation = pytest.importorskip("opentelemetry.instrumentation.asyncio")
     instrumentor = instrumentation.AsyncioInstrumentor()
+    # Finalized here rather than inside the recording window: garbage an earlier test left behind.
+    gc.collect()
     instrumentor.instrument()
     try:
         with warnings.catch_warnings(record=True) as caught:

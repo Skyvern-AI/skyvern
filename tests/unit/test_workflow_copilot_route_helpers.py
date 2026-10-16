@@ -47,6 +47,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _should_restore_persisted_workflow,
     _turn_attachment_ids,
     _workflow_copilot_ingress_log_fields,
+    convert_to_history_messages,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
@@ -658,6 +659,21 @@ def _persisted_message(narrative_payload: dict[str, Any]) -> WorkflowCopilotChat
         created_at=now,
         modified_at=now,
     )
+
+
+def test_chat_history_keeps_demonstration_items_in_the_narrative_payload_only() -> None:
+    message = _persisted_message(
+        {
+            **_non_error_narrative_payload(),
+            "demonstrationItems": ["Navigate to example.com", "Click Submit"],
+        }
+    )
+
+    history = convert_to_history_messages([message])
+
+    assert history[0].narrative_payload is not None
+    assert history[0].narrative_payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
+    assert "demonstration_items" not in history[0].model_dump()
 
 
 def _non_error_narrative_payload() -> dict[str, Any]:

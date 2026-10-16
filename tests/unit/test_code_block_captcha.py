@@ -2257,6 +2257,7 @@ async def test_failure_on_a_sign_in_form_is_recorded_without_changing_any_other_
             await failure_tab.set_content(failure_tab_html)
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=PlaywrightTimeoutError("timeout"),
             failing_line=1,
             build_failure_result=build_failure,

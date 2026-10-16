@@ -848,7 +848,7 @@ async def test_a_card_answered_after_the_seed_still_wins_the_fill_seam(
         organization_id="org-1",
         global_llm_context=_ask_turn_context(proposed) or "",
     )
-    credential_pause_module._apply_connected_credential_to_policy(
+    credential_pause_module.apply_connected_credential_to_policy(
         SimpleNamespace(test_after_update_done=True, credential_pause_connected_credential_id=None), policy, picked
     )
 

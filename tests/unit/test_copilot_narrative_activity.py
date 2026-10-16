@@ -217,6 +217,7 @@ def test_tool_activity_display_label_covers_discovery_tools() -> None:
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     ctx = _ctx()
+    ctx.demonstration_items = ["Navigate to example.com", "Click Submit"]
     ctx.staged_workflow = _staged("step_1", "step_2")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
     for workflow_run_block_id, label, status in (
@@ -252,6 +253,7 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
 
     assert payload["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page"]}
+    assert payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
 
     assert payload["designActivity"] == [
         {

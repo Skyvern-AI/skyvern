@@ -3961,7 +3961,6 @@ async def test_library_page_reads_response_snapshot_with_trusted_organization(
     transport: httpx.AsyncBaseTransport = httpx.MockTransport(authenticate)
     if organization_source == "embedded":
         monkeypatch.setattr(settings, "OTEL_ENABLED", False)
-        monkeypatch.delenv("LMNR_PROJECT_API_KEY", raising=False)
         monkeypatch.setattr(api_app_module, "start_forge_app", lambda: SimpleNamespace(setup_api_app=None))
         api = api_app_module.create_api_app()
 

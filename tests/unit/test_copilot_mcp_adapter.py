@@ -70,10 +70,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
+    DemonstratedAction,
     OriginRunRedactionRegistry,
     bound_call_browser_session,
     browser_session_lock,
     mcp_to_copilot,
+    staged_demonstrated_action,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -2102,9 +2104,8 @@ class TestMCPToolTiming:
 
         server = _browser_server(_advance)
 
-        with capture_logs() as captured:
-            with pytest.raises(asyncio.CancelledError):
-                await _call(server, call_path)
+        with capture_logs() as captured, pytest.raises(asyncio.CancelledError):
+            await _call(server, call_path)
 
         record = _timing_records(captured)[0]
         assert record["call_status"] == "cancelled"
@@ -2833,6 +2834,59 @@ def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> Skyvern
     return _overlay_server(ctx, _FakeClient(payload), "click", _build_skyvern_mcp_overlays()["click"])
 
 
+@pytest.mark.asyncio
+async def test_staged_click_uses_normal_adapter_path_without_browser_dispatch(_stub_browser_session: None) -> None:
+    dispatched: list[bool] = []
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    server = _overlay_server(
+        ctx,
+        _FakeClient({"ok": False}, on_call=lambda: dispatched.append(True)),
+        "click",
+        _build_skyvern_mcp_overlays()["click"],
+    )
+    action = DemonstratedAction(
+        selector="#continue",
+        source_url="https://example.test/form",
+        packet={
+            "role_name": {"role": "button", "accessible_name": "Continue"},
+            "selector_match_count": 1,
+            "role_name_match_count": 1,
+        },
+        synthesized_result={
+            "ok": True,
+            "data": {"selector": "#continue"},
+            "browser_context": {"url": "https://example.test/next", "title": ""},
+        },
+    )
+
+    with staged_demonstrated_action(action):
+        result = await server.call_tool("click", {"selector": "#continue"})
+
+    assert result.isError is False
+    assert dispatched == []
+    interaction = ctx.scout_trajectory[-1]
+    assert interaction["actor"] == "user"
+    assert interaction["source_url"] == "https://example.test/form"
+    assert (interaction["role"], interaction["accessible_name"]) == ("button", "Continue")
+
+
+@pytest.mark.asyncio
+async def test_internal_browser_call_refuses_during_demonstration_replay() -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    server = _click_overlay_server(ctx, {"ok": True})
+    action = DemonstratedAction(
+        selector="#continue",
+        source_url="https://example.test/start",
+        packet=None,
+        synthesized_result={"ok": True},
+    )
+
+    with staged_demonstrated_action(action):
+        result = await server._call_internal_tool("skyvern_click", {"selector": "#continue"})
+
+    assert result.result == {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
+
+
 def _real_action_overlay(overlay_id: str) -> tuple[str, SchemaOverlay]:
     if overlay_id == "click_no_browser":
         return "click", replace(_build_skyvern_mcp_overlays()["click"], requires_browser=False)
@@ -3449,6 +3503,54 @@ class TestPageStateOnBrowserResults:
             result = await server.call_tool("evaluate", {"expression": "1"})
 
         assert _page_state(result) == _CATALOG_PAGE_STATE
+
+    @pytest.mark.asyncio
+    async def test_demonstration_handoff_precedes_the_first_model_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        history = [
+            {
+                "type": "function_call",
+                "call_id": "call_demo_turn-1_1",
+                "name": "navigate_browser",
+                "arguments": '{"url":"https://example.test"}',
+            },
+            {"type": "function_call_output", "call_id": "call_demo_turn-1_1", "output": '{"ok":true}'},
+            {"role": "user", "content": "[copilot:nudge] demonstration complete"},
+        ]
+        order: list[str] = []
+
+        async def replay_demonstration(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            order.append("demonstration")
+            return history
+
+        async def run_with_enforcement(*args: Any, **kwargs: Any) -> None:
+            order.append("model")
+            assert kwargs["initial_input"] == [{"role": "user", "content": "opener"}, *history]
+            raise CopilotTotalTimeoutError()
+
+        monkeypatch.setattr(copilot_agent, "replay_demonstration", replay_demonstration)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+        ctx = make_copilot_ctx(browser_session_id="pbs_1", turn_id="turn-1", demonstration_requested=True)
+
+        with pytest.raises(CopilotTotalTimeoutError):
+            await copilot_agent._run_agent_loop_with_surface(
+                ctx=ctx,
+                stream=MagicMock(),
+                chat_id="chat-1",
+                initial_input="opener",
+                system_prompt="system prompt",
+                model_name="model-PRIMARY",
+                run_config=MagicMock(),
+                llm_key="PRIMARY",
+                copilot_config=CopilotConfig(),
+                native_tools=[],
+                alias_map={},
+                overlays={},
+                output_guardrails=[],
+            )
+
+        assert order == ["demonstration", "model"]
+        assert ctx.demonstration_ran is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

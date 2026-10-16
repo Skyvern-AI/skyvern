@@ -98,7 +98,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _seed_prior_approved_credentials,
     _seed_proposed_credential,
 )
-from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery, CredentialOriginRecoveryState
+from skyvern.forge.sdk.copilot.runtime import (
+    CredentialOriginRecovery,
+    CredentialOriginRecoveryState,
+)
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.credential_fill import _request_credential
@@ -1706,7 +1709,7 @@ async def _ask(ctx: CopilotContext, login_page_url: str = "https://portal.exampl
 def test_connected_resume_stamps_the_single_ask_origin() -> None:
     policy = _ask_origin_policy("https://portal.example.com/login")
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
 
@@ -1714,7 +1717,7 @@ def test_connected_resume_stamps_the_single_ask_origin() -> None:
 def test_connected_resume_stamps_nothing_when_the_ask_spans_several_origins() -> None:
     policy = _ask_origin_policy("https://portal.example.com/login", "https://other.example.com/login")
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.live_page_admitted_urls == {}
 
@@ -1728,7 +1731,7 @@ async def test_generated_credential_connected_from_a_multi_origin_ask_gets_no_fi
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.org_credentials_for_turn = []
 
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential("cred_new"))
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential("cred_new"))
     grant, error = await tools_module.credential_fill._credential_fill_origin_grant(ctx, "cred_new")
 
     assert ctx.request_policy.live_page_admitted_urls == {}
@@ -1741,7 +1744,7 @@ def test_connected_resume_names_the_picked_credential_superseding_an_earlier_men
     policy = _ask_origin_policy("https://portal.example.com/login")
     policy.current_turn_named_credential_ids = {"cred_earlier"}
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.current_turn_named_credential_ids == {"cred_1"}
 
@@ -1751,7 +1754,7 @@ def test_connected_resume_does_not_duplicate_an_already_resolved_credential() ->
     credential = _make_credential()
     policy.resolved_credentials = [credential]
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
 
     assert [resolved.credential_id for resolved in policy.resolved_credentials] == ["cred_1"]
 
@@ -1765,7 +1768,7 @@ def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval(login
     policy = _ask_origin_policy(*login_urls)
     ctx.request_policy = policy
 
-    credential_pause_module._apply_connected_credential_to_policy(ctx, policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
 
     assert [record.credential_id for record in StructuredContext.from_json_str(carried).approved_credentials] == [
@@ -1791,7 +1794,7 @@ async def test_card_selection_keeps_its_origin_on_the_next_turn(
     previous = StructuredContext()
     if previous_origin is not None:
         previous.approved_credentials = [ApprovedCredential(credential_id="cred_1", admitted_url=previous_origin)]
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, previous.to_json_str())
     assert carried is not None
     records = StructuredContext.from_json_str(carried).approved_credentials
@@ -1831,7 +1834,7 @@ async def test_invalid_card_origin_cannot_create_cross_turn_approval(
 
     # Retained state must also fail closed if it predates validation at the card boundary.
     ctx.request_policy = _ask_origin_policy(login_url)
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
     assert StructuredContext.from_json_str(carried).approved_credentials == []
 
@@ -1860,7 +1863,7 @@ async def test_saved_workflow_resolution_requires_user_selection_for_chat_approv
 async def test_card_approval_preserves_explicit_port_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = make_copilot_context()
     ctx.request_policy = _ask_origin_policy("https://portal.example.com:0/login?code=synthetic-code")
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
     next_policy = RequestPolicy()
     _stub_credential_lookup(monkeypatch, _make_credential())

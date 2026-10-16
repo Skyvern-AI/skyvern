@@ -1724,6 +1724,7 @@ class ScriptedModel(Model):
         self.inputs: list[list[Any]] = []
         self.served_instructions: str | None = None
         self.served_tools: list[Any] = []
+        self.served_tool_names_by_call: list[set[str]] = []
 
     async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
         raise AssertionError("streamed execution required")
@@ -1739,6 +1740,7 @@ class ScriptedModel(Model):
     ):
         self.served_instructions = system_instructions
         self.served_tools = tools
+        self.served_tool_names_by_call.append({tool.name for tool in tools})
         self.inputs.append(list(input))
         output = self.script[len(self.inputs) - 1]
         if output is None:
@@ -1761,8 +1763,9 @@ async def run_scripted_turn(
     max_turns: int = 10,
     output_guardrails: list[OutputGuardrail[CopilotContext]] | None = None,
     saved_items: list[TResponseInputItem] | None = None,
+    ctx: CopilotContext | None = None,
 ) -> tuple[RunResultStreaming, CopilotContext, FakeCopilotStream]:
-    ctx = make_copilot_ctx(
+    ctx = ctx or make_copilot_ctx(
         organization_id="org_test", workflow_permanent_id="wpid_test", workflow_id=None, workflow_yaml=None, stream=None
     )
     stream = FakeCopilotStream()

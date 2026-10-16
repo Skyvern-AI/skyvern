@@ -418,7 +418,7 @@ async def test_messages_keep_their_send_order_when_screens_finish_out_of_order(s
         await screened[text].wait()
         return SimpleNamespace(status="clean", canonical_user_message=text)
 
-    monkeypatch.setattr(routes, "_screen_raw_secret_safety", screen_when_released)
+    monkeypatch.setattr(routes, "screen_raw_secret_safety", screen_when_released)
     body = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id, "cancel_token": "stop"}
     async with client:
         first = asyncio.create_task(client.post("/steer", json={**body, "steer_id": "steer-1", "message": "first"}))

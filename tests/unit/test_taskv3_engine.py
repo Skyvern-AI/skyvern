@@ -244,6 +244,31 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marks", [False, True])
+async def test_engine_passes_claude_cache_marks_through_to_the_loop(
+    monkeypatch: pytest.MonkeyPatch, marks: bool
+) -> None:
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        anthropic_cache_markers=marks,
+    )
+
+    assert captured["anthropic_cache_markers"] is marks
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("page_free", [False, True])
 async def test_engine_samples_a_single_actions_effect_with_the_action_effect_fingerprint(
     monkeypatch: pytest.MonkeyPatch, page_free: bool

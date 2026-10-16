@@ -10480,42 +10480,51 @@ async def test_model_observe_repeated_identical_snapshots_arms_perception_stall_
     assert activity.perception_stall_imminent is True
 
 
-class _ReasoningDictSensitiveCaller(_ScriptedCaller):
-    """Rejects any call carrying a dict reasoning_effort, as a provider without the responses
-    bridge would."""
+class _ParamRejectingCaller(_ScriptedCaller):
+    """Rejects any call carrying `param`, as a provider that does not accept it would."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], param: str) -> None:
         super().__init__(script)
-        self.reasoning_per_call: list[Any] = []
+        self.param = param
+        self.sent_param: list[bool] = []
 
     async def call(self, **kwargs: Any) -> dict[str, Any]:
-        self.reasoning_per_call.append(kwargs.get("reasoning_effort"))
-        if isinstance(kwargs.get("reasoning_effort"), dict):
+        self.sent_param.append(self.param in kwargs)
+        if self.param in kwargs:
             raise LLMProviderErrorRetryableTask("TEST_KEY")
         return await super().call(**kwargs)
 
 
 @pytest.mark.asyncio
-async def test_loop_drops_reasoning_dict_and_retries_the_turn_after_a_call_failure() -> None:
-    # A bridge-gate false positive must degrade to the config's own reasoning_effort, not end the
-    # run on turn 1.
-    caller = _ReasoningDictSensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
+@pytest.mark.parametrize(
+    ("param", "loop_kwargs"),
+    [
+        ("reasoning_effort", {"call_kwargs": {"reasoning_effort": {"effort": "high", "summary": "auto"}}}),
+        ("cache_control_injection_points", {"anthropic_cache_markers": True}),
+    ],
+)
+async def test_loop_drops_a_rejected_optional_param_for_the_rest_of_the_run(
+    param: str, loop_kwargs: dict[str, Any]
+) -> None:
+    # A bridge-gate false positive, or a provider refusing Claude cache marks, must cost one retry and leave the
+    # run going without the param, not end it on turn 1.
+    caller = _ParamRejectingCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]], param)
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
         system_prompt="sys",
         user_prompt="goal",
-        tools=[make_finish_tool()],
+        tools=[_recording_tool("observe", []), make_finish_tool()],
         max_turns=5,
         max_tool_calls=10,
-        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
         retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
         max_call_retries=2,
         call_retry_base_delay=0.0,
+        **loop_kwargs,
     )
 
     assert outcome.status == "completed"
-    dict_calls = [r for r in caller.reasoning_per_call if isinstance(r, dict)]
-    assert dict_calls and caller.reasoning_per_call[-1] is None
+    first_without = caller.sent_param.index(False)
+    assert first_without > 0 and not any(caller.sent_param[first_without:])
 
 
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
@@ -12222,9 +12231,11 @@ class _RequestRecordingCaller(_ScriptedCaller):
     def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
         super().__init__(script)
         self.requests: list[list[str]] = []
+        self.cache_points: list[list[int]] = []
 
     async def call(self, **kwargs: Any) -> dict[str, Any]:
         self.requests.append([json.dumps(m, sort_keys=True, default=str) for m in self.message_history])
+        self.cache_points.append([p["index"] for p in kwargs.pop("cache_control_injection_points", None) or []])
         return await super().call(**kwargs)
 
 
@@ -12402,6 +12413,44 @@ async def test_loop_keeps_one_observe_across_tabs() -> None:
     assert len(observes) == 3
     assert [o for o in observes if not o.startswith("[superseded ")] == [observes[2]]
     assert observes[2].startswith("OBSERVE[a]")
+
+
+@pytest.mark.asyncio
+async def test_loop_claude_cache_marks_let_a_call_after_a_rewrite_read_what_an_earlier_call_wrote() -> None:
+    # Claude reads cache only at a message an earlier call marked with the same prefix. After an observe is
+    # elided, the longest prefix still intact ends just before it, so an earlier call must have marked there.
+    look = _look_tool([])
+    look.issues_handles = True
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "b"})],
+        [("click", {"selector": "c"}), ("observe", {})],
+        [("get_html", {"selector": "#total"})],
+        [("look", {})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run_recording(script, [*_tabbed_page_tools(), look], anthropic_cache_markers=True)
+    assert outcome.status == "completed"
+
+    rewrites = 0
+    for k, (request, points) in enumerate(zip(caller.requests, caller.cache_points)):
+        roles = [json.loads(m)["role"] for m in request]
+        # The last transcript message, not -1: a look image is appended after it for one call only.
+        assert len(points) <= 4 and {0, len(request) - 1} <= set(points), (k, points)
+        assert all(0 <= i < len(request) and roles[i] != "assistant" for i in points), (k, points)
+        previous = caller.requests[k - 1] if k else []
+        changed = next((i for i, m in enumerate(previous) if request[i] != m), None)
+        if changed is None:
+            continue
+        rewrites += 1
+        read_at = max(i for i in range(changed) if roles[i] != "assistant")
+        assert read_at in points, (k, read_at, points)
+        assert any(
+            read_at in caller.cache_points[j] and caller.requests[j][: read_at + 1] == request[: read_at + 1]
+            for j in range(k)
+        ), (k, read_at)
+    assert rewrites == 2
 
 
 @pytest.mark.asyncio
