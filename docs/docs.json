@@ -653,7 +653,7 @@
     },
     {
       "source": "/debugging/observability-with-laminar",
-      "destination": "/developers/production#observability"
+      "destination": "/developers/troubleshooting#use-artifacts"
     },
     {
       "source": "/debugging/troubleshooting-guide",
@@ -1025,7 +1025,7 @@
     },
     {
       "source": "/developers/debugging/observability-with-laminar",
-      "destination": "/developers/production#observability"
+      "destination": "/developers/troubleshooting#use-artifacts"
     },
     {
       "source": "/developers/debugging/using-artifacts",

@@ -65,7 +65,7 @@ The snippets on this page run inside an async function; the [worked example](#wo
 
 - `launch_cloud_browser` starts a new cloud session and logs a link to watch it live.
 - **`timeout`**: session length in minutes, from 5 to 240, default 60. Values above 240 are capped at 240.
-- **`proxy_location`**: route traffic through a proxy, for example `"RESIDENTIAL"` (US) or `"RESIDENTIAL_GB"`. See [Browsers](/browsers) for locations.
+- **`proxy_location`**: route traffic through a proxy, for example `"RESIDENTIAL"` (US) or `"RESIDENTIAL_GB"`. See [Proxies and geo-targeting](/developers/production#proxies-and-geo-targeting) for locations.
 - **`browser_profile_id`** (Python): start with a saved profile's cookies and storage, so you skip the login.
 - `browser.close()` closes the browser and ends the cloud session. Always call it in `finally`.
 

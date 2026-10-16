@@ -257,18 +257,18 @@ Specific prompts use fewer actions. "Extract the monthly price from the pricing 
 
 ### Plans
 
-| Plan | Price | Credits | About | Concurrent runs |
-|---|---|---|---|---|
-| **Free** | $0 | 5,000, one time | 165 actions | 1 |
-| **Hobby** | $29/month | 30,000/month | 1,000 actions | 10 |
-| **Pro** | $149/month | 150,000/month | 5,000 actions | 25 |
-| **Enterprise** | Custom | Unlimited | Unlimited | Unlimited |
+| Plan | Price | Credits | Concurrent runs |
+|---|---|---|---|
+| **Free** | $0 | 5,000 one time (about 165 actions) | 1 |
+| **Hobby** | $29/month | 30,000/month (about 1,000 actions) | 10 |
+| **Pro** | $149/month | 150,000/month (about 5,000 actions) | 25 |
+| **Enterprise** | Custom | Unlimited | Unlimited |
 
 Free credits are a one-time grant and don't reset. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
 
 ### Extra credits and payment
 
-On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase ($10, $25, $50, $100 or a custom amount). Some plans also offer monthly add-on credit packs under **Add more credits**. Click **Manage Payment Methods** to update your card, see invoices and change billing details.
+On a paid plan, **Buy Extra Credits** lets you top up with a one-time purchase (\$10, \$25, \$50, \$100 or a custom amount). Some plans also offer monthly add-on credit packs under **Add more credits**. Click **Manage Payment Methods** to update your card, see invoices and change billing details.
 
 ### Runs refused for credits
 
@@ -277,7 +277,7 @@ Skyvern checks credits before it starts a run and returns `402` if they don't co
 | Message | Why | Fix |
 |---|---|---|
 | `Credits exhausted. Upgrade your plan in Billing.` | No credits left this period | Buy extra credits or upgrade |
-| `Insufficient credit balance` | Older accounts without a plan. A run needs $0.10 per step of **Max Steps Per Run** ($1.00 when it's blank), and charges on your upcoming invoice count against your balance, so you can be refused while still showing credit. | Add credit, or lower **Max Steps Per Run** |
+| `Insufficient credit balance` | Older accounts without a plan. A run needs \$0.10 per step of **Max Steps Per Run** (\$1.00 when it's blank), and charges on your upcoming invoice count against your balance, so you can be refused while still showing credit. | Add credit, or lower **Max Steps Per Run** |
 | `Not enough credit balance.` | The balance is too low at run start, at a Code block, at a cached action, at an AI step, or on an SDK browser action | Buy extra credits or upgrade |
 
 ## Members

@@ -34,19 +34,22 @@ mode: custom
           <span className="sk-dot sk-dot-green"></span>
           <span className="sk-terminal-title">first_run.py</span>
         </div>
-        <div className="sk-terminal-body">
-          <p className="sk-mono">import asyncio</p>
-          <p className="sk-mono">from skyvern import Skyvern</p>
-          <p className="sk-mono">async def main():</p>
-          <p className="sk-mono" style={{ paddingLeft: "2em" }}>skyvern = Skyvern(api_key="YOUR_API_KEY")</p>
-          <p className="sk-mono" style={{ paddingLeft: "2em" }}>run = await skyvern.run_task(</p>
-          <p className="sk-mono sk-t-teal" style={{ paddingLeft: "4em" }}>prompt="Get the title of the top post",</p>
-          <p className="sk-mono sk-t-teal" style={{ paddingLeft: "4em" }}>url="https://news.ycombinator.com",</p>
-          <p className="sk-mono sk-t-teal" style={{ paddingLeft: "4em" }}>wait_for_completion=True,</p>
-          <p className="sk-mono" style={{ paddingLeft: "2em" }}>)</p>
-          <p className="sk-mono sk-t-orange" style={{ paddingLeft: "2em" }}>print(run.output)</p>
-          <p className="sk-mono">asyncio.run(main())</p>
-        </div>
+        {/* Lines are JS strings so Markdown never turns the quotes into curly quotes. */}
+        <pre className="sk-terminal-body sk-terminal-code"><code>
+          <span className="sk-code-line">{'import asyncio'}</span>
+          <span className="sk-code-line">{'from skyvern import Skyvern'}</span>
+          <span className="sk-code-line">{''}</span>
+          <span className="sk-code-line">{'async def main():'}</span>
+          <span className="sk-code-line">{'    skyvern = Skyvern(api_key="YOUR_API_KEY")'}</span>
+          <span className="sk-code-line">{'    run = await skyvern.run_task('}</span>
+          <span className="sk-code-line sk-t-teal">{'        prompt="Get the title of the top post",'}</span>
+          <span className="sk-code-line sk-t-teal">{'        url="https://news.ycombinator.com",'}</span>
+          <span className="sk-code-line sk-t-teal">{'        wait_for_completion=True,'}</span>
+          <span className="sk-code-line">{'    )'}</span>
+          <span className="sk-code-line sk-t-orange">{'    print(run.output)'}</span>
+          <span className="sk-code-line">{''}</span>
+          <span className="sk-code-line">{'asyncio.run(main())'}</span>
+        </code></pre>
       </div>
     </div>
   </div>

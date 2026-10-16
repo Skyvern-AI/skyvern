@@ -34,7 +34,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 | [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
 | [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
 | [Files](#files) | File Download, Cloud Storage Upload |
-| [Communication](#communication) | Send Email, HTTP Request, Human Interaction |
+| [Communication](#communication) | Send Email, HTTP Request, Human Interaction, Email Inbox |
 
 ---
 
@@ -46,7 +46,7 @@ These fields appear on most blocks:
 |-------|-------------|
 | **Label** | Display name on the canvas. Also determines how downstream blocks reference this block's output (`{{ label_output }}`). |
 | **Continue on Failure** | Allow the agent to continue if this block fails |
-| **Next Loop on Failure** | Only inside loops. Skip to the next iteration on failure. |
+| **On block failure** | Only inside loops, where it replaces **Continue on Failure**. Choose **Stop the loop**, **Continue to next block in this iteration** or **Skip to next iteration**. |
 | **Model** | Override the default LLM model for this block (Advanced Settings on most blocks) |
 
 Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Download) share these additional fields:
@@ -54,15 +54,15 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 | Field | Description |
 |-------|-------------|
 | **URL** | Starting URL. Leave blank to continue from the previous block's page. |
-| **Engine** | AI engine. Skyvern 1.0 is the default for new browser blocks. |
+| **Engine** | AI engine for this block. **Default** runs on Skyvern 3.0 in agents created since October 1, 2026. The selector labels Skyvern 3.0 **Recommended** and Skyvern 1.0 **Legacy**. See [Choose an engine per block](/cloud/studio#choose-an-engine-per-block). |
 | **Max Steps Override** | Cap the number of AI reasoning steps |
 | **Disable Cache** | Skip cached script execution |
-| **TOTP Identifier** | Link TOTP credentials for 2FA handling |
-| **TOTP Verification URL** | Endpoint this block polls when it needs a 2FA code |
-| **Error Code Mapping** | Map error conditions to custom error codes (JSON) |
+| **2FA Identifier** | ID that links 2FA codes to this block. When empty, the block uses the selected credential's identifier, if it has one. |
+| **2FA Verification URL** | Endpoint this block polls when it needs a 2FA code |
+| **Error Messages** | Map error conditions to custom error codes (JSON) |
 
 <Note>
-Set **TOTP Verification URL** on the block that may encounter 2FA. Top-level workflow run `totp_url` values do not automatically populate empty block fields.
+Set **2FA Verification URL** on the block that may encounter 2FA. A `totp_url` set on the run does not fill empty block fields.
 </Note>
 
 ---
@@ -73,16 +73,16 @@ Set **TOTP Verification URL** on the block that may encounter 2FA. Top-level wor
 
 The primary block for browser automation. Accepts a natural-language prompt and autonomously navigates the browser to accomplish the goal.
 
-The block uses Skyvern 1.0 by default. Existing agents that already contain V2 browser blocks remain editable and may show a reduced field set.
+The block shows the same fields for every engine except Skyvern 2.0. Skyvern 2.0 is offered only on blocks that already use it; those blocks stay editable with a reduced field set.
 
-**Skyvern 1.0:**
+**Every engine except Skyvern 2.0:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **URL** | text | Starting URL (optional) |
 | **Prompt** | text | Natural language instructions for the AI |
 
-**Existing V2 blocks:**
+**Existing Skyvern 2.0 blocks:**
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -91,12 +91,12 @@ The block uses Skyvern 1.0 by default. Existing agents that already contain V2 b
 | **Max Steps** | number | Maximum AI steps |
 | **Disable Cache** | boolean | Skip cached script execution |
 
-Additional fields in **Advanced Settings** (Skyvern 1.0 only):
+Additional fields in **Advanced Settings** (not on Skyvern 2.0 blocks):
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Complete if...** | text | Condition that signals the block is done |
-| **Include Action History in Verification** | boolean | Include prior actions when verifying completion |
+| **Include Action History** | switch | Include prior actions when verifying completion |
 | **Complete on Download** | switch | Mark the block as complete when a file download occurs |
 | **File Name** | text | Custom filename for downloaded files |
 
@@ -359,7 +359,7 @@ Additional fields in **Advanced Settings:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Error Code Mapping** | JSON | Custom error codes for failure reasons |
+| **Error Messages** | JSON | Custom error codes for failure reasons |
 | **Input Parameters** | select | Parameters to evaluate |
 
 <Frame>
@@ -396,7 +396,7 @@ values. Before string values in a successful block output or a surfaced failure
 reason are persisted, Skyvern masks exact registered-secret matches; registered
 secrets of at least five characters are also masked inside larger strings. Derived
 or transformed values may no longer match. Do not expose credentials through output
-or errors. Opaque credential containment is tracked separately in SKY-11771.
+or errors.
 
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
@@ -408,10 +408,10 @@ Pause agent execution for a specified duration.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Wait in Seconds** | number | Seconds to wait (0–300) |
+| **Wait Time (in seconds)** | number | Seconds to wait, from 1 to 1800 |
 
 <Frame>
-<img width="400" src="/images/cloud/wait_block.png" alt="Wait block configuration with Wait in Seconds field" />
+<img width="400" src="/images/cloud/wait_block.png" alt="Wait block configuration with Wait Time (in seconds) field" />
 </Frame>
 
 ---
@@ -484,11 +484,25 @@ Send an email notification, optionally with file attachments from previous block
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **Recipients** | text | Comma-separated email addresses |
+| **Send with** | select | `SMTP` (default) sends through Skyvern's sender or your own SMTP server. `Connected Gmail account` sends from a Gmail account connected on [Integrations](/cloud/integrations) with **Send email** turned on. |
+| **Gmail account** | selector | Only with `Connected Gmail account`. The account the email is sent from. |
+| **Recipients** / **To** | text | Comma-separated email addresses. The label reads **To** when sending with Gmail. |
+| **Cc** | text | Only with `Connected Gmail account`. Comma-separated email addresses. |
+| **Bcc** | text | Only with `Connected Gmail account`. Comma-separated email addresses. A Gmail send needs at least one address in To, Cc or Bcc. |
 | **Subject** | text | Email subject line. Supports [parameter references](/cloud/studio#inputs) — add `{{workflow_run_id}}` to tag the subject with the run, e.g. `Your Run is Finished {{workflow_run_id}}`. |
 | **Body** | text | Email body. Supports [parameter references](/cloud/studio#inputs). |
 | **Body format** | select | `Text` (default) sends the body exactly as written. `HTML` renders the body as a formatted email and adds a plain-text version for clients that cannot show HTML; `<script>`, `<iframe>`, `<object>`, `<embed>`, `<svg>`, `<math>`, meta refresh directives, event-handler attributes and links whose scheme is not `http`, `https`, `mailto`, `tel` or `cid` (inline `data:image` sources are kept) are removed before sending. Mail clients strip inline SVG anyway, so use a raster image instead. `{{ }}` and `{% %}` are parameter syntax, so wrap literal braces in `{% raw %}…{% endraw %}`. |
-| **File Attachments** | text | Path to files to attach |
+| **File Attachments** | text | With SMTP, fixed to the run's download folder, so files that earlier blocks downloaded are attached. With Gmail, comma-separated file paths from this run, uploaded files or file URLs, up to 25 MB in total. Folders and the download folder are not attached. |
+
+Fields in **Advanced Settings** (SMTP only):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Sender (From)** | text | The From address. With a custom SMTP server, use an address that server may send as. |
+| **SMTP Host** | text | Your SMTP server. Leave blank to use Skyvern's default sender. |
+| **SMTP Port** | number | Defaults to 587. Port 465 uses implicit TLS; other ports use STARTTLS. |
+| **SMTP Username** | text | Login for your SMTP server |
+| **SMTP Password** | password | Password for your SMTP server, or a secret input reference. For Gmail over SMTP, use an App Password. |
 
 <Frame>
 <img width="400" src="/images/cloud/email_block.png" alt="Send Email block configuration with Recipients, Subject, Body, and File Attachments fields" />
@@ -527,7 +541,7 @@ Pause the agent and request human input. Optionally sends an email notification 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Instructions For Human** | text | Instructions displayed to the reviewer |
-| **Timeout (minutes)** | number | Minutes to wait before auto-continuing (default: 120 minutes / 2 hours) |
+| **Timeout (minutes)** | number | Minutes to wait for a response (default: 120 minutes / 2 hours). The block times out when nobody responds in that time. |
 
 **Email notification fields:**
 
@@ -545,6 +559,36 @@ Additional fields in **Advanced Settings:**
 | **Positive Button Label** | text | Label for the approval action (default: "Approve") |
 | **Negative Button Label** | text | Label for the rejection action (default: "Reject") |
 
+The wait also ends before the timeout when the run itself stops. Canceling the run marks the block canceled, and closing the run's [browser session](/browsers) fails the block with "Browser session was closed while waiting for human interaction".
+
 <Frame>
 <img width="400" src="/images/cloud/human_block.png" alt="Human Interaction block configuration with Instructions For Human and Timeout fields" />
 </Frame>
+
+### Email Inbox
+
+Read messages from a connected Gmail or Outlook account and keep the ones a prompt describes. Connect the account on [Integrations](/cloud/integrations) first.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Email Client** | select | `Gmail` or `Outlook` |
+| **Google Account** / **Microsoft Account** | selector | The connected account to read from. The label follows the Email Client. |
+| **Folder** | text | Gmail label or Outlook folder to read. Defaults to the inbox. |
+| **Match prompt** | text | Describes which emails to keep. Leave it blank to keep every email the filters return. |
+
+Fields under **Optional Filters:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Sender** | text | Only include emails from this sender |
+| **Subject** | text | Only include emails matching this subject |
+| **Newer Than Days** | number | Only include emails newer than this many days |
+| **Max Results** | number | Maximum number of emails to return (default: 25, max: 100) |
+| **Include Body** | switch | Include email body text in the results (default: on). When off, **Match prompt** cannot see message bodies either. |
+| **Download Attachments** | switch | Download attachments from matched emails (default: off) |
+
+Folder, Match prompt, Sender and Subject support [parameter references](/cloud/studio#inputs).
+
+The output holds `email_client`, `folder`, `candidate_count`, `matched_count` and `emails`.
+
+Turn on **Download Attachments** to pass files from matched emails to later blocks. Skyvern saves each matched email's attachments as run downloads and adds `downloaded_files` and `downloaded_file_urls` to the output. A saved attachment also carries its `file_name`, `file_path` and `url` in `emails`. Inline images are skipped. Attachments count toward the same per-file size, per-run size and file-count limits as browser downloads; an attachment that exceeds a limit or cannot be saved carries a `download_error` instead of failing the block.
