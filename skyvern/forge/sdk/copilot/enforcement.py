@@ -2174,13 +2174,15 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
-    # A retry after a failed drain would otherwise restart the full tool set on a fresh clock.
+    # A retry after a failed drain would otherwise restart the full tool set.
     if ctx.budget_expiry_state.drain_attempted:
         raise MaxTurnsExceeded("Budget drain already attempted")
     session = runner_kwargs.pop("session", None)
     copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
     current_input: str | list = initial_input
-    start_time = time.monotonic()
+    # A fallback or model-lookup retry resumes the turn's clock, so the turn keeps one deadline and one backstop.
+    resumed = ctx.copilot_run_start_monotonic is not None
+    start_time = ctx.copilot_run_start_monotonic if resumed else time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
     install_pending_operation_slot(ctx)
     iteration = 0
@@ -2193,7 +2195,7 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
+        if (iteration > 0 or resumed) and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             return await _run_budget_drain(
                 agent,
