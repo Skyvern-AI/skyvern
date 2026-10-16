@@ -7899,7 +7899,23 @@ async def wrapper({default_args}):
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
-        return workflow is not None and await code_block_ai_fallback_flag_enabled(workflow.organization_id)
+        if workflow is None or not await code_block_ai_fallback_flag_enabled(workflow.organization_id):
+            return False
+        try:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_context.workflow_run_id,
+                organization_id=workflow.organization_id,
+            )
+        except Exception:  # noqa: BLE001 - preserve the block failure if run settings are unavailable.
+            LOG.warning(
+                "AI fallback run-configuration lookup failed; failing closed",
+                workflow_run_id=workflow_run_context.workflow_run_id,
+            )
+            return False
+        ai_fallback = workflow_run.ai_fallback if workflow_run is not None else None
+        if ai_fallback is None:
+            ai_fallback = workflow.ai_fallback
+        return ai_fallback is not False
 
     async def _is_authoring_run(self, workflow_run_id: str, organization_id: str) -> bool | None:
         """Whether this run or an ancestor run is a Copilot build test or an editor block run; None when the

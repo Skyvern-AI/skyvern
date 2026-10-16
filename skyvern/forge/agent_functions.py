@@ -987,6 +987,14 @@ class AgentFunction:
     ) -> str | None:
         return None
 
+    async def should_redact_organization_credential_secrets(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+    ) -> bool:
+        # OSS has no cloud role policy; preserve its existing response behavior.
+        return False
+
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
     async def resolve_run_engine(

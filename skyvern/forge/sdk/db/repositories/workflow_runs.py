@@ -12,7 +12,6 @@ from typing import cast as typing_cast
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import (
-    JSON,
     ColumnElement,
     Integer,
     Label,
@@ -118,24 +117,9 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
-from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.schemas.workflows import BlockStatus
 
 LOG = structlog.get_logger()
-
-# Values a credential parameter holds once its content has been dropped. Equality on them would match
-# unrelated runs, so they are not a credential identity.
-_REDACTED_PARAMETER_VALUES = frozenset({"[removed]", "null", "None"})
-
-
-@dataclass(frozen=True)
-class RecentCredentialLogin:
-    """Whether a credential this run used already logged in on the same workflow inside the window.
-    ``credential_known`` is False when the run exposes no credential parameter to compare, which is a
-    different answer from "it never logged in"."""
-
-    credential_known: bool
-    logged_in_at: datetime | None = None
-
 
 # Well under the connection's own DATABASE_STATEMENT_TIMEOUT_MS, so an unanswerable free-text search
 # hands the connection back rather than holding it until that expires. Budget for the whole read, not
@@ -3436,185 +3420,6 @@ class WorkflowRunsRepository(BaseRepository):
             result = convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
             await session.commit()
             return result
-
-    @db_operation("get_recent_completed_login_for_run_credentials")
-    @read_retry()
-    async def get_recent_completed_login_for_run_credentials(
-        self,
-        *,
-        organization_id: str,
-        workflow_run_id: str,
-        since: datetime,
-        credential_parameter_keys: Collection[str],
-    ) -> RecentCredentialLogin:
-        """The most recent run on the same workflow that completed a login block with a credential this
-        run also used, no earlier than ``since``.
-
-        A credential is identified by the stored parameter value compared against other runs' values of
-        that same login-block parameter, so nothing in the vault is read.
-        """
-        keys = sorted(set(credential_parameter_keys))
-        if not keys:
-            return RecentCredentialLogin(credential_known=False)
-
-        current_run = aliased(WorkflowRunModel)
-        current_identity = (
-            select(current_run.workflow_id, current_run.workflow_permanent_id)
-            .where(current_run.workflow_run_id == workflow_run_id)
-            .where(current_run.organization_id == organization_id)
-            .cte("current_run")
-        )
-        current_run_parameter = aliased(WorkflowRunParameterModel)
-        current_parameter = aliased(WorkflowParameterModel)
-        current_selection = aliased(WorkflowRunCredentialSelectionModel)
-        current_static_credential = aliased(CredentialParameterModel)
-        current_credentials = union_all(
-            select(
-                current_parameter.key.label("parameter_key"),
-                current_run_parameter.value.label("credential_id"),
-            )
-            .select_from(current_run_parameter)
-            .join(
-                current_parameter,
-                and_(
-                    current_parameter.workflow_parameter_id == current_run_parameter.workflow_parameter_id,
-                    current_parameter.deleted_at.is_(None),
-                    current_parameter.key.in_(keys),
-                ),
-            )
-            .where(current_run_parameter.workflow_run_id == workflow_run_id)
-            .where(current_run_parameter.value.is_not(None))
-            .where(current_run_parameter.value.not_in(_REDACTED_PARAMETER_VALUES)),
-            select(current_selection.parameter_key, current_selection.credential_id)
-            .where(current_selection.workflow_run_id == workflow_run_id)
-            .where(current_selection.organization_id == organization_id)
-            .where(current_selection.parameter_key.in_(keys)),
-            select(current_static_credential.key, current_static_credential.credential_id)
-            .select_from(current_static_credential)
-            .join(current_identity, current_static_credential.workflow_id == current_identity.c.workflow_id)
-            .where(current_static_credential.deleted_at.is_(None))
-            .where(current_static_credential.key.in_(keys))
-            .where(
-                or_(
-                    current_static_credential.credential_ids.is_(None),
-                    current_static_credential.credential_ids == JSON.NULL,
-                )
-            )
-            .where(
-                ~exists(
-                    select(literal(1))
-                    .select_from(current_selection)
-                    .where(current_selection.workflow_run_id == workflow_run_id)
-                    .where(current_selection.parameter_key == current_static_credential.key)
-                )
-            ),
-        ).cte("current_credentials")
-
-        prior_run = aliased(WorkflowRunModel)
-        prior_block = aliased(WorkflowRunBlockModel)
-        prior_runs = (
-            select(
-                prior_run.workflow_run_id.label("workflow_run_id"),
-                prior_run.workflow_id.label("workflow_id"),
-                prior_run.created_at.label("created_at"),
-            )
-            .select_from(prior_run)
-            .join(current_identity, prior_run.workflow_permanent_id == current_identity.c.workflow_permanent_id)
-            .where(prior_run.organization_id == organization_id)
-            .where(prior_run.created_at >= to_naive_utc(since))
-            .where(prior_run.workflow_run_id != workflow_run_id)
-            .where(
-                exists(
-                    select(literal(1))
-                    .select_from(prior_block)
-                    .where(prior_block.workflow_run_id == prior_run.workflow_run_id)
-                    .where(prior_block.organization_id == organization_id)
-                    .where(prior_block.block_type == BlockType.LOGIN.value)
-                    .where(prior_block.status == BlockStatus.completed.value)
-                )
-            )
-            .distinct()
-            .cte("prior_runs")
-        )
-        prior_run_parameter = aliased(WorkflowRunParameterModel)
-        prior_parameter = aliased(WorkflowParameterModel)
-        prior_selection = aliased(WorkflowRunCredentialSelectionModel)
-        prior_static_credential = aliased(CredentialParameterModel)
-        prior_credentials = union_all(
-            select(
-                prior_run_parameter.workflow_run_id.label("workflow_run_id"),
-                prior_parameter.key.label("parameter_key"),
-                prior_run_parameter.value.label("credential_id"),
-            )
-            .select_from(prior_run_parameter)
-            .join(prior_runs, prior_runs.c.workflow_run_id == prior_run_parameter.workflow_run_id)
-            .join(
-                prior_parameter,
-                and_(
-                    prior_parameter.workflow_parameter_id == prior_run_parameter.workflow_parameter_id,
-                    prior_parameter.deleted_at.is_(None),
-                    prior_parameter.key.in_(keys),
-                ),
-            )
-            .where(prior_run_parameter.value.is_not(None))
-            .where(prior_run_parameter.value.not_in(_REDACTED_PARAMETER_VALUES)),
-            select(
-                prior_selection.workflow_run_id.label("workflow_run_id"),
-                prior_selection.parameter_key.label("parameter_key"),
-                prior_selection.credential_id.label("credential_id"),
-            )
-            .select_from(prior_selection)
-            .join(prior_runs, prior_runs.c.workflow_run_id == prior_selection.workflow_run_id)
-            .where(prior_selection.organization_id == organization_id)
-            .where(prior_selection.parameter_key.in_(keys)),
-            select(
-                prior_runs.c.workflow_run_id,
-                prior_static_credential.key.label("parameter_key"),
-                prior_static_credential.credential_id.label("credential_id"),
-            )
-            .select_from(prior_static_credential)
-            .join(prior_runs, prior_runs.c.workflow_id == prior_static_credential.workflow_id)
-            .where(prior_static_credential.deleted_at.is_(None))
-            .where(prior_static_credential.key.in_(keys))
-            .where(
-                or_(
-                    prior_static_credential.credential_ids.is_(None),
-                    prior_static_credential.credential_ids == JSON.NULL,
-                )
-            )
-            .where(
-                ~exists(
-                    select(literal(1))
-                    .select_from(prior_selection)
-                    .where(prior_selection.workflow_run_id == prior_runs.c.workflow_run_id)
-                    .where(prior_selection.parameter_key == prior_static_credential.key)
-                )
-            ),
-        ).cte("prior_credentials")
-        logged_in_at = (
-            select(prior_runs.c.created_at)
-            .select_from(prior_runs)
-            .join(prior_credentials, prior_credentials.c.workflow_run_id == prior_runs.c.workflow_run_id)
-            .join(
-                current_credentials,
-                and_(
-                    current_credentials.c.parameter_key == prior_credentials.c.parameter_key,
-                    current_credentials.c.credential_id == prior_credentials.c.credential_id,
-                ),
-            )
-            .order_by(prior_runs.c.created_at.desc())
-            .limit(1)
-            .scalar_subquery()
-        )
-        async with self.Session() as session:
-            result = await session.execute(
-                select(
-                    exists(select(literal(1)).select_from(current_credentials)).label("credential_known"),
-                    logged_in_at.label("logged_in_at"),
-                )
-            )
-            row = result.one()
-            return RecentCredentialLogin(credential_known=row.credential_known, logged_in_at=row.logged_in_at)
 
     @db_operation("create_workflow_run_parameter")
     async def create_workflow_run_parameter(
