@@ -306,6 +306,7 @@ class Settings(BaseSettings):
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
+    RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -1086,6 +1087,13 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    @field_validator("RUN_HEARTBEAT_TIMEOUT_MINUTES")
+    @classmethod
+    def _run_heartbeat_timeout_minutes_bounds(cls, value: int) -> int:
+        if value != 0 and not 2 <= value <= 1440:
+            raise ValueError("RUN_HEARTBEAT_TIMEOUT_MINUTES must be 0 (off) or between 2 and 1440 minutes")
+        return value
 
     @field_validator("API_LIMIT_CONCURRENCY", mode="before")
     @classmethod

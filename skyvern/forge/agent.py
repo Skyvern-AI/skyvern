@@ -157,6 +157,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.executor.run_liveness import note_run_finalized, run_lease_lost
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -2199,11 +2200,14 @@ class ForgeAgent:
             task_retry=task_retry,
         )
         # Update task status to running
-        task = await app.DATABASE.tasks.update_task(
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-            status=TaskStatus.running,
-        )
+        if await run_lease_lost(workflow_run.workflow_run_id):
+            task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
+        else:
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                status=TaskStatus.running,
+            )
 
         step = await app.DATABASE.tasks.create_step(
             task.task_id,
@@ -2244,11 +2248,14 @@ class ForgeAgent:
                 order=task_order,
                 retry=task_retry,
             )
-            task = await app.DATABASE.tasks.update_task(
-                task_id=task.task_id,
-                organization_id=organization_id,
-                status=TaskStatus.running,
-            )
+            if await run_lease_lost(workflow_run_id):
+                task = await app.DATABASE.tasks.get_task(task.task_id, organization_id) or task
+            else:
+                task = await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.running,
+                )
             step = await app.DATABASE.tasks.create_step(
                 task.task_id,
                 order=0,
@@ -9820,11 +9827,21 @@ class ForgeAgent:
             diff=skyvern_context.mask_multi_field_totp_data(update_comparison, task_id=task.task_id),
             sampling=True,
         )
+        registered_run_id = task.workflow_run_id or task.task_id
+        lease_lost = await run_lease_lost(registered_run_id)
+        if lease_lost and not status.is_final():
+            return await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id) or task
         updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
             task.task_id,
             organization_id=task.organization_id,
+            keep_final_status=lease_lost,
             **updates,
         )
+        if lease_lost and updated_task.status != status:
+            note_run_finalized(task.task_id)
+            return updated_task
+        if status.is_final():
+            note_run_finalized(task.task_id)
         # Minutes emit only when THIS write atomically flipped finished_at from NULL
         # -- the shared claim every task_v1 finalizer rides -- so a concurrent
         # finalizer (the stuck-task sweep's CAS, the temporal timeout activity, a

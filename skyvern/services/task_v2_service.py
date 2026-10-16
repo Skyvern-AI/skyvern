@@ -4,6 +4,7 @@ import copy
 import json
 import string
 import textwrap
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +40,13 @@ from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.executor.run_liveness import (
+    acquire_run_lease,
+    note_run_finalized,
+    run_lease_lost,
+    run_lease_tasks_enabled,
+    track_run,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.task_v2 import (
@@ -630,7 +638,12 @@ async def run_task_v2(
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
+    with (
+        skyvern_context.scoped(context, propagate_captcha_timeout=True),
+        track_run(task_v2.workflow_run_id, "workflow_run") if task_v2.workflow_run_id else nullcontext(),
+    ):
+        if task_v2.workflow_run_id:
+            await acquire_run_lease(task_v2.workflow_run_id)
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
@@ -829,6 +842,9 @@ async def run_task_v2_helper(
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
 
+    if await run_lease_lost(workflow_run_id):
+        current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+        return None, None, current or task_v2
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
@@ -2235,6 +2251,13 @@ async def _update_task_v2_status(
     output: dict[str, Any] | None = None,
     failure_category: list[dict] | None = None,
 ) -> TaskV2:
+    keep_final_status = False
+    if run_lease_tasks_enabled():
+        current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+        if current is not None and current.workflow_run_id and await run_lease_lost(current.workflow_run_id):
+            if not status.is_final():
+                return await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or current
+            keep_final_status = True
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id,
         organization_id=organization_id,
@@ -2242,7 +2265,12 @@ async def _update_task_v2_status(
         summary=summary,
         output=output,
         failure_category=failure_category,
+        keep_final_status=keep_final_status,
     )
+    if keep_final_status and task_v2.status != status:
+        if task_v2.workflow_run_id:
+            note_run_finalized(task_v2.workflow_run_id)
+        return task_v2
     if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
         start_time = (
             task_v2.started_at.replace(tzinfo=UTC) if task_v2.started_at else task_v2.created_at.replace(tzinfo=UTC)
@@ -2259,6 +2287,11 @@ async def _update_task_v2_status(
             organization_id=organization_id,
         )
     return task_v2
+
+
+def _task_v2_final_write_refused(task_v2: TaskV2, status: TaskV2Status) -> bool:
+    # Without leases, a concurrent writer's post-commit refresh must preserve the existing side effects.
+    return run_lease_tasks_enabled() and task_v2.status != status
 
 
 async def mark_task_v2_as_failed(
@@ -2313,6 +2346,8 @@ async def mark_task_v2_as_failed(
         output=output,
         failure_category=failure_category,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.failed):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id,
@@ -2341,6 +2376,8 @@ async def mark_task_v2_as_completed(
         summary=summary,
         output=output,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.completed):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
@@ -2373,6 +2410,8 @@ async def mark_task_v2_as_canceled(
         organization_id=organization_id,
         status=TaskV2Status.canceled,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.canceled):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
@@ -2396,6 +2435,8 @@ async def mark_task_v2_as_terminated(
         status=TaskV2Status.terminated,
         failure_category=failure_category,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.terminated):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(
             workflow_run_id,
@@ -2423,6 +2464,8 @@ async def mark_task_v2_as_timed_out(
         organization_id=organization_id,
         status=TaskV2Status.timed_out,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.timed_out):
+        return task_v2
 
     async def repair_workflow_run() -> None:
         nonlocal fallback_workflow_run

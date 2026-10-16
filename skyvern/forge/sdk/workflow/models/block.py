@@ -184,6 +184,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -1150,6 +1151,8 @@ class Block(BaseModel, abc.ABC):
             value=value,
         )
         self._output_recorded_this_execution = True
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -8214,11 +8217,16 @@ async def wrapper({default_args}):
                 await record_task_nav_error_code(escalation_task.task_id, escalation_nav_error, escalation_url)
             elif failed_nav_error_code and not escalation_navigated:
                 skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
-            escalation_task = await app.DATABASE.tasks.update_task(
-                task_id=escalation_task.task_id,
-                organization_id=organization_id,
-                status=TaskStatus.running,
-            )
+            if await run_lease_lost(workflow_run_id):
+                escalation_task = (
+                    await app.DATABASE.tasks.get_task(escalation_task.task_id, organization_id) or escalation_task
+                )
+            else:
+                escalation_task = await app.DATABASE.tasks.update_task(
+                    task_id=escalation_task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.running,
+                )
             escalation_step = await app.DATABASE.tasks.create_step(
                 escalation_task.task_id,
                 order=0,
@@ -15587,6 +15595,15 @@ class HumanInteractionBlock(BaseTaskBlock):
             browser_session_id=browser_session_id,
         )
 
+        if await run_lease_lost(workflow_run_id):
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Another server already finalized this run",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.paused,

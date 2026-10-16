@@ -37,6 +37,7 @@ from skyvern.exceptions import (
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
+    TaskNotFound,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -58,6 +59,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -998,6 +1000,7 @@ async def _update_workflow_block(
 
         final_output = output
         if task_id:
+            lease_lost = await run_lease_lost(context.workflow_run_id)
             if step_id:
                 # Build step output from script actions similar to agent flow
                 step_output = None
@@ -1016,6 +1019,30 @@ async def _update_workflow_block(
                         errors=errors,
                     )
 
+                if not lease_lost:
+                    await app.DATABASE.tasks.update_step(
+                        step_id=step_id,
+                        task_id=task_id,
+                        organization_id=context.organization_id,
+                        status=step_status,
+                        is_last=is_last,
+                        output=step_output,
+                    )
+            if lease_lost and not task_status.is_final():
+                updated_task = await app.DATABASE.tasks.get_task(task_id, context.organization_id)
+                if updated_task is None:
+                    raise TaskNotFound(task_id)
+            else:
+                updated_task = await app.DATABASE.tasks.update_task(
+                    task_id=task_id,
+                    organization_id=context.organization_id,
+                    status=task_status,
+                    failure_reason=failure_reason,
+                    extracted_information=output,
+                    errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
+                    keep_final_status=lease_lost,
+                )
+            if lease_lost and step_id and updated_task.status == task_status:
                 await app.DATABASE.tasks.update_step(
                     step_id=step_id,
                     task_id=task_id,
@@ -1024,14 +1051,8 @@ async def _update_workflow_block(
                     is_last=is_last,
                     output=step_output,
                 )
-            updated_task = await app.DATABASE.tasks.update_task(
-                task_id=task_id,
-                organization_id=context.organization_id,
-                status=task_status,
-                failure_reason=failure_reason,
-                extracted_information=output,
-                errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
-            )
+            if run_lease_tasks_enabled() and lease_lost:
+                return
             downloaded_files: list[FileInfo] = []
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -1095,6 +1116,8 @@ async def _update_workflow_block(
             # final_output is already set to `output` at line 596.
             pass
 
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
         updated_block = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=context.organization_id if context else None,
@@ -1115,6 +1138,8 @@ async def _update_workflow_block(
                     "Failed to record cached block outcome", workflow_run_block_id=workflow_run_block_id, exc_info=True
                 )
 
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
         recorded_output_parameter = await _record_output_parameter_value(
             context.workflow_run_id,
             context.workflow_id,
