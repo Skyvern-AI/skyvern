@@ -1407,7 +1407,13 @@ async def _read_task_v3_llm_name_override(
         return None
     # get_config synthesizes a config for unknown keys, so require an explicitly registered,
     # non-custom (not org-owned BYO) llm_key.
-    if is_custom_llm_key(variant) or not LLMConfigRegistry.is_registered(variant):
+    # A non-router ANTHROPIC key takes LLMCaller's native Anthropic message path, which cannot build a Task V3
+    # transcript.
+    if (
+        is_custom_llm_key(variant)
+        or not LLMConfigRegistry.is_registered(variant)
+        or (not LLMConfigRegistry.is_router_config(variant) and "ANTHROPIC" in variant)
+    ):
         LOG.warning("TASK_V3_LLM_NAME is not a usable registered llm_key; ignoring", variant=variant)
         return None
     return variant
@@ -3327,6 +3333,8 @@ class ForgeAgent:
                 target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
+                anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config)
+                and not (context is not None and await self._is_anthropic_prompt_caching_disabled(context)),
             )
         finally:
             input_dispatch.end_login_pace()

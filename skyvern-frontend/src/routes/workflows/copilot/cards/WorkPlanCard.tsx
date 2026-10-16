@@ -5,6 +5,7 @@ import { CardBody, CardHeader, CopilotCard, GutterRow } from "./cardChrome";
 
 interface WorkPlanCardProps {
   items: string[];
+  label?: string;
   // The plan this one replaced. A step counts as new only when no earlier step reads exactly the
   // same: a reworded step is not recognizable without guessing, so it shows as new plus removed.
   previous?: string[] | null;
@@ -18,6 +19,7 @@ function stepCount(count: number): string {
 
 export function WorkPlanCard({
   items,
+  label,
   previous = null,
   current = true,
 }: WorkPlanCardProps) {
@@ -51,12 +53,12 @@ export function WorkPlanCard({
   ].filter(Boolean);
   return (
     <CopilotCard>
-      <div role="group" aria-label="Copilot's plan">
+      <div role="group" aria-label={label ?? "Copilot's plan"}>
         <CardHeader
           icon={
             <ListBulletIcon className="h-3.5 w-3.5 text-muted-foreground" />
           }
-          title={changes.length > 0 ? "Plan updated" : "Plan"}
+          title={label ?? (changes.length > 0 ? "Plan updated" : "Plan")}
           meta={[stepCount(items.length), ...changes].join(" · ")}
           expanded={expanded}
           onToggle={() => setExpanded((value) => !value)}

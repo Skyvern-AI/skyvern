@@ -326,6 +326,7 @@ async def run_task_v3_agent_loop(
     block_completion_judge: GoalJudge | None = None,
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
+    anthropic_cache_markers: bool = False,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -728,6 +729,7 @@ async def run_task_v3_agent_loop(
             target_action_reserve=target_action_reserve,
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
+            anthropic_cache_markers=anthropic_cache_markers,
         )
     finally:
         # The context outlives this run; a signal raised as the loop was cancelled must not fire

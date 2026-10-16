@@ -785,3 +785,27 @@ class TestStagedScreenshotBinding:
         result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=ctx))
 
         assert not any(_image_parts(item) for item in result.input)
+
+    def test_aggressive_prune_reports_omitted_demonstration_fact_packets(self) -> None:
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build the demonstrated workflow"}]
+        for i in range(12):
+            call_id = f"call_demo_turn-1_{i}"
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "click",
+                    "arguments": json.dumps({"selector": "x" * 4000}),
+                }
+            )
+            items.append({"type": "function_call_output", "call_id": call_id, "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items))
+
+        notices = [
+            item["content"]
+            for item in result.input
+            if item.get("role") == "user" and "demonstrated step fact packet" in item.get("content", "")
+        ]
+        assert len(notices) == 1
+        assert notices[0].startswith("[copilot:nudge] ")

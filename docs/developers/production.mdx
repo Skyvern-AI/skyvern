@@ -14,7 +14,6 @@ keywords:
   - GeoTarget
   - max_steps
   - run_with
-  - Laminar
 ---
 
 import WebhookSignatureVerification from "/snippets/webhook-signature-verification.mdx";
@@ -299,7 +298,7 @@ Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...",
 
 Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, `MISSING_TOTP_SOURCE`, `CREDENTIAL_LOGIN_UNCONFIRMED`, and `CREDENTIAL_ACCOUNT_LOCKED`.
 
-When the organization-scoped credential-verdict confirmation flag is enabled, a credential rejection can instead be reported as `CREDENTIAL_LOGIN_UNCONFIRMED` or `CREDENTIAL_ACCOUNT_LOCKED`. Handle these system-defined codes explicitly anywhere you branch, retry, or filter by the original credential code. The login-request-status check is not available yet; keep this flag disabled until that check, the follow-up evaluation, and the human audit are complete.
+A rejected login with a stored credential can be reported as `CREDENTIAL_LOGIN_UNCONFIRMED` or `CREDENTIAL_ACCOUNT_LOCKED` instead of your own code. Handle both anywhere you branch, retry or filter on login failures.
 
 ### Failure categories
 
@@ -429,23 +428,6 @@ const run = await client.runWorkflow({
 </CodeGroup>
 
 Plans and credit prices are on [skyvern.com/pricing](https://www.skyvern.com/pricing). Self-hosted servers set the default step limit with `MAX_STEPS_PER_RUN` and choose the model with `LLM_KEY`. See [configuration](/reference/configuration).
-
-## Observability
-
-Artifacts explain one run (see [troubleshooting](/developers/troubleshooting#use-artifacts)). For trends across runs, such as failure rate, latency, and slow tasks, send traces to [Laminar](https://laminar.sh).
-
-**With the SDK.** Initialize Laminar before you create the Skyvern client so it can trace your SDK calls.
-
-```python
-import os
-from lmnr import Laminar  # pip install 'lmnr[all]'
-from skyvern import Skyvern
-
-Laminar.initialize()  # reads LMNR_PROJECT_API_KEY
-client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
-```
-
-**On a self-hosted server.** Install `lmnr` in the server's Python environment and set `LMNR_PROJECT_API_KEY`. The server then traces every LLM call (prompt, response, tokens), every browser action, and every block. For a self-hosted Laminar, also set `LMNR_BASE_URL`, `LMNR_GRPC_PORT` (default `8001`), and `LMNR_HTTP_PORT` (default `8000`).
 
 ## Next
 

@@ -257,10 +257,13 @@ import {
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
 import {
   applySopResultAtCurrentAppend,
+  demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
 } from "./workspaceAuthoringActions";
@@ -1782,6 +1785,11 @@ function Workspace({
   const setStartRecordingAtEnd = useRecordingLauncherStore(
     (s) => s.setStartRecordingAtEnd,
   );
+  const startDemonstration = useRecordingLauncherStore(
+    (s) => s.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   // Stable action ref (vs the whole-store `recordingStore` object, which gets a
   // new reference on every store write and would re-register the launcher).
   const setIsRecording = useRecordingStore((s) => s.setIsRecording);
@@ -1833,6 +1841,26 @@ function Workspace({
   );
   const startRecordingAtEnd = useCallback(() => {
     if (!authoringActionAvailability.canRecordTask) return;
+    if (demonstrationEnabled) {
+      if (!startDemonstration) return;
+      const insertion = demonstrationInsertionFromNodes(
+        getNodes() as Array<AppNode>,
+        getAppendInsertionPoint(),
+      );
+      if (!insertion) return;
+      startDemonstration({ insertion });
+      if (autoRecordRequested) {
+        setRecordSearchParams(
+          (current) => {
+            const next = new URLSearchParams(current);
+            next.delete("record");
+            return next;
+          },
+          { replace: true },
+        );
+      }
+      return;
+    }
     // Consume ?record=1 up front so a dismissed prompt does not re-fire auto-record.
     if (autoRecordRequested) {
       setRecordSearchParams(
@@ -1875,6 +1903,9 @@ function Workspace({
     authoringActionAvailability.canRecordTask,
     autoRecordRequested,
     setRecordSearchParams,
+    demonstrationEnabled,
+    startDemonstration,
+    getNodes,
   ]);
   const uploadSOPAtEnd = useCallback(
     (file: File) => {
@@ -1906,7 +1937,10 @@ function Workspace({
       return;
     }
     setStartRecordingAtEnd(
-      authoringActionAvailability.canRecordTask ? startRecordingAtEnd : null,
+      authoringActionAvailability.canRecordTask &&
+        (!demonstrationEnabled || startDemonstration)
+        ? startRecordingAtEnd
+        : null,
     );
     return () => setStartRecordingAtEnd(null);
   }, [
@@ -1914,6 +1948,8 @@ function Workspace({
     embedded,
     startRecordingAtEnd,
     setStartRecordingAtEnd,
+    demonstrationEnabled,
+    startDemonstration,
   ]);
 
   // Listen for conditional branch changes to trigger re-layout

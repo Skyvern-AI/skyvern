@@ -1,23 +1,24 @@
-function dedent(text) {
-  if (typeof text !== "string") return String(text);
-  var lines = text.split("\n");
-  var indents = [];
-  for (var i = 1; i < lines.length; i++) {
-    if (lines[i].trim().length > 0) {
-      var match = lines[i].match(/^(\s*)/);
-      indents.push(match ? match[1].length : 0);
-    }
-  }
-  var min = indents.length > 0 ? Math.min.apply(null, indents) : 0;
-  if (min === 0) return text;
-  return lines
-    .map(function (line, i) {
-      return i === 0 ? line : line.slice(min);
-    })
-    .join("\n");
-}
-
 export const ApiKeyPrompt = ({ children }) => {
+  // Mintlify only keeps the exported component, so helpers live inside it.
+  function dedent(text) {
+    if (typeof text !== "string") return String(text);
+    var lines = text.split("\n");
+    var indents = [];
+    for (var i = 1; i < lines.length; i++) {
+      if (lines[i].trim().length > 0) {
+        var match = lines[i].match(/^(\s*)/);
+        indents.push(match ? match[1].length : 0);
+      }
+    }
+    var min = indents.length > 0 ? Math.min.apply(null, indents) : 0;
+    if (min === 0) return text;
+    return lines
+      .map(function (line, i) {
+        return i === 0 ? line : line.slice(min);
+      })
+      .join("\n");
+  }
+
   const [apiKey, setApiKey] = React.useState("");
   const [copied, setCopied] = React.useState(false);
 

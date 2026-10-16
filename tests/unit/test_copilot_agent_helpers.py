@@ -98,7 +98,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import AgentResult, CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    EDIT_BLOCK_TOOL_NAME,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+    AgentResult,
+    CodeAuthoringRepairContext,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -148,10 +154,6 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTIO
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.copilot.tools._shared import (
-    EDIT_BLOCK_TOOL_NAME,
-    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
-)
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _completion_verification_criteria,
@@ -649,6 +651,43 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     assert build_context.call_args.kwargs["debug_run_info_text"] == (
         '{"reusable_origin_inputs":{"workflow_run_id":"wr_recorded","input_keys":["resume"]}}'
     )
+
+
+@pytest.mark.asyncio
+async def test_demonstrate_product_action_triggers_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", AsyncMock(return_value=SimpleNamespace(finished=True)))
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", AsyncMock(return_value=None))
+    replay = AsyncMock(return_value=[])
+    monkeypatch.setattr(agent_module, "replay_demonstration", replay)
+    stub_copilot_agent_loop(
+        monkeypatch, AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"}))
+    )
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="I've shown you the task in the browser. Build a workflow that does it.",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+            product_action="demonstrate",
+            demonstration_id="demo-1",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == "ok"
+    replay.assert_awaited_once()
 
 
 class TestFailedTestResponseNormalization:

@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
     KEEP_RECENT_TOOL_OUTPUTS,
+    NUDGE_SENTINEL,
     SCREENSHOT_PLACEHOLDER,
     TOKEN_BUDGET,
     _summarize_tool_arguments,
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     is_screenshot_message,
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
+    pending_screenshot_entry,
     pending_screenshot_message,
     unread_tool_output_indices,
 )
@@ -227,8 +229,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
     screenshot_msg = pending_screenshot_message(ctx)
-    pending = getattr(ctx, "pending_screenshots", None)
-    entry = pending[0] if isinstance(pending, list) and pending else None
+    entry = pending_screenshot_entry(ctx)
     if (
         screenshot_msg is not None
         and entry is not None
@@ -238,8 +239,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
         lease = getattr(ctx, "pending_frame_lease", None)
         if isinstance(lease, PendingFrameLease) and lease.capture_event_id == entry.capture_event_id:
             if lease.input_fingerprint != fingerprint:
-                if isinstance(pending, list):
-                    pending.clear()
+                ctx.pending_screenshots.clear()
                 ctx.pending_frame_lease = None
                 screenshot_msg = None
                 LOG.info(
@@ -264,6 +264,9 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
             "Injecting screenshot user message",
             count=len(screenshot_msg["content"]) - 1,
             path="model_input_filter",
+            source_tool=entry.provenance.source_tool if entry else None,
+            capture_id=entry.capture_id if entry else None,
+            capture_event_id=entry.capture_event_id if entry else None,
         )
         items.append(screenshot_msg)
 
@@ -431,7 +434,33 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         budget=token_budget,
         unread_count=len(unread_tool_output_indices(items)),
     )
+    demonstration_call_ids = {
+        call_id
+        for item in items
+        if isinstance(call_id := get_agent_message_field(item, "call_id"), str)
+        and call_id.startswith("call_demo_")
+        and get_agent_message_field(item, "type") == "function_call"
+    }
     items = aggressive_prune(items)
+    retained_demonstration_call_ids = {
+        call_id
+        for item in items
+        if isinstance(call_id := get_agent_message_field(item, "call_id"), str)
+        and call_id in demonstration_call_ids
+        and get_agent_message_field(item, "type") == "function_call"
+    }
+    omitted_demonstration_calls = len(demonstration_call_ids - retained_demonstration_call_ids)
+    if omitted_demonstration_calls:
+        items.append(
+            {
+                "role": "user",
+                "content": (
+                    NUDGE_SENTINEL
+                    + f"{omitted_demonstration_calls} earlier demonstrated step fact packet(s) were omitted "
+                    "because the model input exceeded its token budget."
+                ),
+            }
+        )
 
     est = estimate_tokens(items)
     LOG.info("Final token estimate after aggressive prune", tokens=est)

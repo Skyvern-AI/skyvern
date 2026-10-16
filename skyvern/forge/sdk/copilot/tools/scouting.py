@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse, urlsplit
 import structlog
 from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
+from skyvern.cli.core.browser_ops import do_screenshot
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    CANDIDATE_COUNT_KEYS,
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
@@ -59,6 +61,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_SESSION_LOSS_ERROR_CODES,
+    is_redaction_withheld,
     scrub_model_facing_tool_result,
     service_worker_blocked_context,
 )
@@ -74,12 +77,14 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     current_call_browser_session_override,
+    current_demonstrated_action,
     effective_browser_session_id,
     live_working_page,
     raw_secret_browser_denied,
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ProvenanceBinding,
     ScreenshotActionRelation,
     ScreenshotProvenance,
     ViewportFrame,
@@ -177,6 +182,10 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None:
+        ctx.pending_scout_source_url = demonstrated_action.source_url
+        return
     source_url = await _live_working_page_url(ctx)
     ctx.pending_scout_source_url = source_url
 
@@ -392,6 +401,11 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
     selector = _selector_text(selector)
     if not selector:
         return
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None and selector == demonstrated_action.selector:
+        if demonstrated_action.packet is not None:
+            _apply_scout_pre_action_packet(ctx, selector, demonstrated_action.packet, source="demonstration")
+        return
     parsed = _role_name_from_selector(selector)
     source = "selector" if parsed is not None else "page_read"
     parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
@@ -546,17 +560,23 @@ async def _capture_post_interaction_screenshot(
         frame = await _take_viewport_frame(ctx, timeout_seconds=timeout_seconds)
         if frame is None:
             return False
+    # The provenance reaches the model as text, so its URLs pass the same scrub as a tool result's.
+    urls = scrub_model_facing_tool_result(
+        ctx, {"captured_url": frame.producer_url, "dispatch_url": captured_url}, tool_name=source_tool
+    )
+    if is_redaction_withheld(urls):
+        urls = {}
     return enqueue_screenshot(
         ctx,
         base64.b64encode(frame.png).decode("ascii"),
         provenance=ScreenshotProvenance(
             source_tool=source_tool,
-            captured_url=frame.producer_url,
+            captured_url=urls.get("captured_url"),
             observation_step=observation_step,
             browser_session_id=frame.producer_session_id,
             workflow_run_id=None,
             action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
-            dispatch_url=captured_url,
+            dispatch_url=urls.get("dispatch_url"),
             dispatch_browser_session_id=frame.dispatch_session_id,
             producer_browser_session_id=frame.producer_session_id,
             session_binding=frame.session_binding,
@@ -566,15 +586,33 @@ async def _capture_post_interaction_screenshot(
     )
 
 
-async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> ViewportFrame | None:
-    """Read the viewport without staging it; withheld during self-heal."""
+async def _take_viewport_frame(
+    ctx: AgentContext, *, timeout_seconds: float, page: Page | None = None
+) -> ViewportFrame | None:
+    """Read the viewport without staging it; withheld during self-heal. A given `page` is shot directly,
+    because the broker's current tab does not follow a worker's `switch_tab`."""
     if ctx.codeblock_redaction_parameters:
-        return None
-    server = ctx.discovery_mcp_server
-    if server is None:
         return None
     started_at = time.monotonic()
     dispatch_session_id = effective_browser_session_id(ctx)
+    if page is not None:
+        try:
+            shot = await asyncio.wait_for(do_screenshot(page), timeout=timeout_seconds)
+        except Exception as exc:
+            LOG.debug("Copilot viewport frame of the given page failed", error_type=type(exc).__name__)
+            return None
+        return ViewportFrame(
+            png=shot.data,
+            dispatch_session_id=dispatch_session_id,
+            producer_url=page.url,
+            producer_session_id=dispatch_session_id,
+            session_binding=ProvenanceBinding.AGREE,
+            started_at=started_at,
+            viewport_css_px=shot.viewport_css_px,
+        )
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return None
     screenshot_arguments = {"session_id": dispatch_session_id} if dispatch_session_id else {}
     try:
         result = await asyncio.wait_for(
@@ -606,7 +644,7 @@ def _model_visible_selector_candidates(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [
-        {key: item for key, item in candidate.items() if key not in {"match_count", "visible_match_count"}}
+        {key: item for key, item in candidate.items() if key not in CANDIDATE_COUNT_KEYS}
         if isinstance(candidate, dict)
         else candidate
         for candidate in value
@@ -700,6 +738,45 @@ def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteractio
     trajectory.append(recorded)
     ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
     return recorded
+
+
+def record_scouted_interaction_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> None:
+    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
+    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
+        return
+    artifact = cast(ScoutedInteraction, redacted_artifact)
+    interactions = [
+        item
+        for item in ctx.scouted_interactions
+        if not (
+            item.get("tool_name") == artifact["tool_name"]
+            and item.get("selector") == artifact.get("selector")
+            and item.get("source_url") == artifact.get("source_url")
+            and item.get("credential_field") == artifact.get("credential_field")
+        )
+    ]
+    interactions.append(artifact)
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
+
+    recorded = _record_scout_trajectory_fact(ctx, artifact)
+    if artifact["tool_name"] == "click":
+        click_records: list[ScoutedInteraction] = [artifact]
+        if recorded is not None:
+            click_records.append(recorded)
+        ctx.pending_scout_click_records = click_records
+
+    LOG.info(
+        "copilot_scout_interaction_captured",
+        tool_name=artifact["tool_name"],
+        selector=artifact.get("selector"),
+        source_url=artifact.get("source_url"),
+        role=artifact.get("role"),
+        credential_field=artifact.get("credential_field"),
+        credential_id=artifact.get("credential_id"),
+        total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
+    )
+    record_reached_terminal_action_observation(ctx)
 
 
 def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: str) -> tuple[bool, bool]:
@@ -917,44 +994,7 @@ def _record_scouted_interaction(
         artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
-    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
-    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
-        return
-    artifact = cast(ScoutedInteraction, redacted_artifact)
-    interactions = [
-        item
-        for item in ctx.scouted_interactions
-        if not (
-            item.get("tool_name") == artifact["tool_name"]
-            and item.get("selector") == artifact.get("selector")
-            and item.get("source_url") == artifact.get("source_url")
-            and item.get("credential_field") == artifact.get("credential_field")
-        )
-    ]
-    interactions.append(artifact)
-    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
-
-    recorded = _record_scout_trajectory_fact(ctx, artifact)
-    if artifact["tool_name"] == "click":
-        # Both collections hold their own object for this click, and an effect observed after the
-        # fact updates these rather than re-finding them by an identity the scrub may have removed.
-        click_records: list[ScoutedInteraction] = [artifact]
-        if recorded is not None:
-            click_records.append(recorded)
-        ctx.pending_scout_click_records = click_records
-
-    LOG.info(
-        "copilot_scout_interaction_captured",
-        tool_name=artifact["tool_name"],
-        selector=artifact.get("selector"),
-        source_url=artifact.get("source_url"),
-        role=artifact.get("role"),
-        credential_field=artifact.get("credential_field"),
-        credential_id=artifact.get("credential_id"),
-        total_scouted_interactions=len(ctx.scouted_interactions),
-        total_scout_trajectory=len(ctx.scout_trajectory),
-    )
-    record_reached_terminal_action_observation(ctx)
+    record_scouted_interaction_fact(ctx, artifact)
 
 
 def _attach_scout_observation_step(

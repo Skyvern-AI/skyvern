@@ -1467,6 +1467,20 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
     return merged_img
 
 
+# The browser driver's per-call stack capture can leave caller frames (and the screenshot bytes they hold) in a
+# reference cycle until a full collection. That collection pauses the whole event loop, so rate-limit it.
+_last_stitch_gc_at = float("-inf")
+
+
+def _collect_after_stitch() -> None:
+    global _last_stitch_gc_at
+    now = time.monotonic()
+    if now - _last_stitch_gc_at < SettingsManager.get_settings().SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS:
+        return
+    _last_stitch_gc_at = now
+    gc.collect()
+
+
 def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -> bytes:
     images: list[Image.Image] = []
     merged_img: Image.Image | None = None
@@ -1484,12 +1498,9 @@ def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -
         buffer.seek(0)
         return buffer.read()
     finally:
-        # The decoded images, stitched image, and PNG buffer land in reference cycles that
-        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
-        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
         _close_screenshot_stitch_resources(images, merged_img, buffer)
         if len(images) > 1:
-            gc.collect()
+            _collect_after_stitch()
 
 
 def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:

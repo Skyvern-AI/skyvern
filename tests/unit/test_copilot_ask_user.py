@@ -708,7 +708,7 @@ async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monke
     ctx.request_policy = RequestPolicy()
     monkeypatch.setattr(
         routes,
-        "_screen_raw_secret_safety",
+        "screen_raw_secret_safety",
         AsyncMock(
             return_value=SimpleNamespace(
                 status="detected",
@@ -831,7 +831,7 @@ async def test_near_expiry_reply_renews_client_presence_and_rechecks_cancel(
         assert recorded.status == ("cancelled" if cancel_during_screen else "pending")
         return SimpleNamespace(status="clean", canonical_user_message=text)
 
-    monkeypatch.setattr(routes, "_screen_raw_secret_safety", screen)
+    monkeypatch.setattr(routes, "screen_raw_secret_safety", screen)
     async with client:
         result = await client.post(
             "/reply",

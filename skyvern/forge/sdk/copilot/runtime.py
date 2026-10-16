@@ -345,6 +345,7 @@ class ScoutedSelectorCandidate(TypedDict):
     source: str
     match_count: int | None
     visible_match_count: NotRequired[int]
+    first_match_visible: NotRequired[bool]
 
 
 class ScoutedInteraction(TypedDict):
@@ -352,6 +353,7 @@ class ScoutedInteraction(TypedDict):
     # those named in context._TURN_EPHEMERAL_INTERACTION_FIELDS. A field added here that holds a
     # raw value — a literal, page text — has to be listed there too; nothing enforces the pair.
     tool_name: str
+    actor: NotRequired[Literal["user"]]
     # Set only when the action was demonstrated somewhere other than the chat's own browser, so
     # absence means the chat's browser. Without it a demonstration in the last run's browser is
     # indistinguishable from one the chat drove.
@@ -944,6 +946,31 @@ async def _resolve_self_heal_browser_state_inner(ctx: AgentContext) -> tuple[str
 _CALL_BROWSER_SESSION_ID: ContextVar[str | None] = ContextVar("copilot_call_browser_session_id", default=None)
 
 
+@dataclass(frozen=True)
+class DemonstratedAction:
+    selector: str
+    source_url: str
+    packet: dict[str, Any] | None
+    synthesized_result: dict[str, Any]
+    readback: str | None = None
+
+
+_DEMONSTRATED_ACTION: ContextVar[DemonstratedAction | None] = ContextVar("copilot_demonstrated_action", default=None)
+
+
+@contextmanager
+def staged_demonstrated_action(action: DemonstratedAction) -> Iterator[None]:
+    token = _DEMONSTRATED_ACTION.set(action)
+    try:
+        yield
+    finally:
+        _DEMONSTRATED_ACTION.reset(token)
+
+
+def current_demonstrated_action() -> DemonstratedAction | None:
+    return _DEMONSTRATED_ACTION.get()
+
+
 @contextmanager
 def bound_call_browser_session(session_id: str | None) -> Iterator[None]:
     """Bind one tool call's browser for everything it reaches: hooks, preparation, dispatch.
@@ -1098,6 +1125,8 @@ async def resolve_browser_state_for_context(
     *,
     session_id: str | None = None,
 ) -> BrowserState | None:
+    if current_demonstrated_action() is not None:
+        return None
     resolved_session_id = session_id if session_id is not None else _CALL_BROWSER_SESSION_ID.get()
     if resolved_session_id is None:
         resolved_session_id = ctx.browser_session_id

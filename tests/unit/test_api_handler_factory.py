@@ -15,6 +15,7 @@ import litellm  # type: ignore[import-not-found]
 import openai
 import pytest  # type: ignore[import-not-found]
 import structlog
+from litellm.llms.anthropic.chat.transformation import AnthropicConfig  # type: ignore[import-not-found]
 from PIL import Image
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -666,6 +667,7 @@ async def test_llm_caller_preserves_generated_cost_and_tokens_during_real_redact
     accounting = next(record for record in records if "llm_cost" in record and "model" in record)
     assert accounting["llm_cost"] == 0.25 and type(accounting["llm_cost"]) is float
     assert accounting["input_tokens"] == 7 and type(accounting["input_tokens"]) is int
+    assert accounting["cache_creation_tokens"] == 2
     assert credential not in json.dumps(records)
     assert REDACTED_SECRET_PLACEHOLDER in accounting["prompt_name"]
     usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
@@ -784,6 +786,7 @@ async def test_anthropic_call_stats_treats_missing_cache_read_tokens_as_zero(
                 "input_tokens": 100,
                 "output_tokens": 10,
                 "cache_read_input_tokens": None,
+                "output_tokens_details": {"thinking_tokens": 4},
             },
         }
     )
@@ -791,7 +794,24 @@ async def test_anthropic_call_stats_treats_missing_cache_read_tokens_as_zero(
     stats = await caller.get_call_stats(response)
 
     assert stats.cached_tokens == 0
+    assert stats.reasoning_tokens == 4
     assert stats.llm_cost == pytest.approx((3.0 * 100 + 15.0 * 10) / 1_000_000)
+
+
+def test_anthropic_usage_takes_the_api_thinking_count_until_litellm_does() -> None:
+    """litellm < 1.99 counts Claude's thinking text, empty on Claude 5.x, instead of the API's thinking_tokens. When the
+    upstream assertion fails, litellm reads the count itself and use_anthropic_reported_thinking_tokens can go."""
+    usage_object = {"input_tokens": 93, "output_tokens": 215, "output_tokens_details": {"thinking_tokens": 189}}
+    config = AnthropicConfig()
+    upstream = AnthropicConfig.calculate_usage.__wrapped__(config, usage_object, "")  # type: ignore[attr-defined]
+    patched = config.calculate_usage(usage_object, "")
+
+    assert not upstream.completion_tokens_details.reasoning_tokens
+    assert patched.completion_tokens == 215
+    assert (patched.completion_tokens_details.reasoning_tokens, patched.completion_tokens_details.text_tokens) == (
+        189,
+        26,
+    )
 
 
 @pytest.mark.parametrize("pricing_case", ["bundled", "unknown", "lookup_error"])

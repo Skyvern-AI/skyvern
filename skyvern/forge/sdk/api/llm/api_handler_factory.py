@@ -19,6 +19,7 @@ from anthropic import NOT_GIVEN
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
+from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
 
@@ -56,6 +57,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -93,6 +95,7 @@ from skyvern.utils.url_validators import validate_fetch_url
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
+use_anthropic_reported_thinking_tokens()
 
 LOG = structlog.get_logger()
 _HASHED_HREF_PLACEHOLDER = re.compile(r"\{\{\s*(_[0-9a-f]{64})\s*\}\}")
@@ -820,12 +823,37 @@ def _response_provider(response: object) -> str | None:
     return provider if isinstance(provider, str) else None
 
 
+def _response_finish_reason(response: object) -> str | None:
+    # The raw Anthropic SDK reports a stop_reason; map it to litellm's vocabulary so every path logs the same values.
+    if isinstance(response, AnthropicMessage):
+        return map_finish_reason(response.stop_reason) if response.stop_reason else None
+    if isinstance(response, ModelResponse) and response.choices:
+        return response.choices[0].finish_reason
+    return None
+
+
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
     for field_name in field_names:
         field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
         if isinstance(field, int) and not isinstance(field, bool):
             return field
     return None
+
+
+def _cache_creation_tokens(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
+    tokens = (
+        _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens") if details is not None else None
+    )
+    if tokens is None and details is not None:
+        model_extra = getattr(details, "model_extra", None)
+        if isinstance(model_extra, dict):
+            tokens = _usage_int_field(model_extra, "cache_write_tokens")
+    if tokens is None:
+        tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+    return tokens
 
 
 def _copilot_model_usage_event(
@@ -850,17 +878,7 @@ def _copilot_model_usage_event(
         cache_read_tokens = _usage_int_field(details, "cached_tokens") if details is not None else None
         if cache_read_tokens is None and usage is not None:
             cache_read_tokens = _usage_int_field(usage, "cache_read_input_tokens")
-        cache_creation_tokens = (
-            _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens")
-            if details is not None
-            else None
-        )
-        if cache_creation_tokens is None and details is not None:
-            model_extra = getattr(details, "model_extra", None)
-            if isinstance(model_extra, dict):
-                cache_creation_tokens = _usage_int_field(model_extra, "cache_write_tokens")
-        if cache_creation_tokens is None and usage is not None:
-            cache_creation_tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+        cache_creation_tokens = _cache_creation_tokens(usage)
     except Exception:
         input_tokens = None
         output_tokens = None
@@ -4176,6 +4194,9 @@ class LLMCaller:
                     "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
                 ),
                 cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                cache_creation_tokens=_generated_log_value(
+                    "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                ),
                 llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
                 image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                 image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -4183,6 +4204,7 @@ class LLMCaller:
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
+                finish_reason=_response_finish_reason(response),
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
                 served_model_group=_model_log_value("served_model_group", served_model_group),
@@ -4675,7 +4697,7 @@ class LLMCaller:
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=cached_tokens,
-                reasoning_tokens=0,
+                reasoning_tokens=usage.output_tokens_details.thinking_tokens if usage.output_tokens_details else 0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(

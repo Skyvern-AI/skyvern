@@ -58,6 +58,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/workflow/copilot/question-response",
     "POST /v1/workflow/copilot/steer",
     "POST /v1/workflow/copilot/credential-response",
+    "POST /v1/workflow/copilot/demonstration/control",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
     "POST /api/v1/stripe_webhook",

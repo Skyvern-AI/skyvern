@@ -90,6 +90,7 @@ from skyvern.forge.taskv3.run_arms import (
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
+from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -360,6 +361,33 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "kill_switch", "marks"),
+    [
+        ("anthropic/claude-haiku-5-5", False, True),
+        ("anthropic/claude-haiku-5-5", True, False),
+        ("gpt-5.4", False, False),
+    ],
+)
+async def test_execute_task_v3_sends_claude_cache_marks_unless_the_kill_switch_is_on(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, kill_switch: bool, marks: bool
+) -> None:
+    flags = AsyncMock(side_effect=lambda flag, *_a, **_k: kill_switch and flag == "DISABLE_ANTHROPIC_PROMPT_CACHING")
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flags)
+    caller = MagicMock(llm_config=LLMConfig(model_name, [], True, False))
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        llm_caller_factory=MagicMock(return_value=caller),
+    )
+
+    assert loop_mock.call_args.kwargs["anthropic_cache_markers"] is marks
 
 
 @pytest.mark.asyncio
@@ -1214,11 +1242,24 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_resolve_v3_llm_key_ignores_unregistered_flag_value(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("variant", "registered"),
+    [
+        ("TYPO_KEY", {}),
+        # LLMCaller sends a non-router ANTHROPIC key down its native Anthropic path, which cannot run a v3 transcript.
+        (
+            "ANTHROPIC_CLAUDE5_5_HAIKU",
+            {"ANTHROPIC_CLAUDE5_5_HAIKU": LLMConfig("anthropic/claude-haiku-5-5", [], True, False)},
+        ),
+    ],
+)
+async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
+    monkeypatch: pytest.MonkeyPatch, variant: str, registered: dict[str, LLMConfig]
+) -> None:
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value="TYPO_KEY")
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=variant)
     )
-    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: False)
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "_configs", registered)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")

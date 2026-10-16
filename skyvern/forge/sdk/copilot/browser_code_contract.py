@@ -177,6 +177,11 @@ class BrowserCodeSession(Protocol):
     @property
     def page(self) -> Page: ...
 
+    @property
+    def confirmed_page(self) -> Page | None:
+        """The tab the last cell is known to have finished on, or None when that is unconfirmed."""
+        ...
+
     async def rebind(self, page: Page) -> None: ...
 
     async def reset_namespace(self) -> None: ...
@@ -203,6 +208,8 @@ class BrowserCodeHost:
     sessions_opened: int = 0
     interrupted: bool = False
     interrupted_operation: BrowserCodeOperation | None = None
+    # A cell that finished but whose call was cancelled before its result was returned.
+    unreturned_cell: BrowserCodeCellResult | None = None
     source_turn_token: str = field(default_factory=lambda: uuid.uuid4().hex)
     executed_sources: dict[str, ExecutedBrowserCodeSource] = field(default_factory=dict)
     expired_source_references: set[str] = field(default_factory=set)
