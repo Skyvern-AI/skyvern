@@ -17,8 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.config import settings
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import Base
-
-_LOCAL_POSTGRES_HOSTS = {"localhost", "127.0.0.1", "::1", "postgres"}
+from tests.unit.conftest import skip_unless_local_postgres
 
 
 @pytest_asyncio.fixture
@@ -39,8 +38,7 @@ async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB]:
 def postgres_scratch_schema_url() -> Iterator[URL]:
     """DATABASE_STRING aimed at a throwaway schema built from the models, so no test row lands in public."""
     url = make_url(settings.DATABASE_STRING)
-    if url.get_backend_name() != "postgresql" or url.host not in _LOCAL_POSTGRES_HOSTS:
-        pytest.skip("needs a local or CI PostgreSQL")
+    skip_unless_local_postgres(url)
     schema = f"test_scratch_{uuid.uuid4().hex}"
     admin = create_engine(url.set(drivername="postgresql+psycopg"))
     try:
