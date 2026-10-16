@@ -99,6 +99,7 @@ class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
     org_age: int | None = None
+    integration_platform: str | None = None
     principal: RequestPrincipal | None = None
     principal_resolution_key: tuple[str, bytes | None] | None = None
     principal_resolution_conflict: bool = False
@@ -173,6 +174,8 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
         fields["organization_name"] = identity.organization_name
     if identity.org_age is not None:
         fields["org_age"] = identity.org_age
+    if identity.integration_platform is not None:
+        fields["integration_platform"] = identity.integration_platform
     if identity.principal is not None:
         # Explicit nulls: "resolved, no user" must stay distinguishable from an unauthenticated request.
         fields["auth_kind"] = identity.principal.auth_kind.value
@@ -183,6 +186,22 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
         fields["bearer_identity_status"] = identity.bearer_identity_status
         fields["principal_resolution_conflict"] = identity.principal_resolution_conflict
     return fields
+
+
+def integration_platform_from_user_agent(user_agent: str | None) -> str | None:
+    if not isinstance(user_agent, str) or not user_agent.strip():
+        return None
+
+    value = user_agent.casefold()
+    if "zapier" in value:
+        return "zapier"
+    if "n8n" in value:
+        return "n8n"
+    if value.startswith("make/") or re.search(r"\bmake\.com\b", value) or "integromat" in value:
+        return "make"
+    if "workato" in value:
+        return "workato"
+    return "other"
 
 
 def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
@@ -367,7 +386,8 @@ def log_raw_request_exception(status_code: int) -> None:
 
 
 async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    _request_identity.set(_RequestIdentity())
+    integration_platform = integration_platform_from_user_agent(request.headers.get("user-agent"))
+    _request_identity.set(_RequestIdentity(integration_platform=integration_platform))
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 

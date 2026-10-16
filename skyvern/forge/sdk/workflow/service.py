@@ -234,7 +234,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.run_limits import get_effective_workflow_run_max_elapsed_time_minutes
-from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.tags import (
+    INTEGRATION_PLATFORM_RUN_TAG_KEY,
+    CallerType,
+    TagSource,
+    TagWriteContext,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
@@ -2119,7 +2124,7 @@ class WorkflowService:
                     deletes=set(),
                     context=write_context,
                 )
-                return
+                break
             except IntegrityError:
                 if attempt == 0:
                     await asyncio.sleep(random.uniform(0.01, 0.05))
@@ -2134,9 +2139,12 @@ class WorkflowService:
         organization_id: str,
         parameters: dict[str, Any],
         trigger_type: WorkflowRunTriggerType,
+        integration_platform: str | None = None,
     ) -> None:
         try:
             tags = {TRIGGER_RUN_TAG_KEY: trigger_type.value}
+            if integration_platform is not None:
+                tags[INTEGRATION_PLATFORM_RUN_TAG_KEY] = integration_platform
             domain = workflow_script_service.resolve_target_domain_for_run_provenance(workflow, parameters)
             if domain:
                 tags[TARGET_DOMAIN_RUN_TAG_KEY] = domain
@@ -3313,6 +3321,7 @@ class WorkflowService:
         refuse_unusable_parameters_before_create: bool = False,
         workflow: Workflow | None = None,
         post_dispatch_effects: list[Callable[[], Awaitable[None]]] | None = None,
+        integration_platform: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3490,7 +3499,7 @@ class WorkflowService:
                 )
             except Exception:
                 LOG.warning(
-                    "Failed to apply initial workflow run metadata tags",
+                    "Failed to apply initial workflow run tags",
                     workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization.organization_id,
                     exc_info=True,
@@ -3694,6 +3703,7 @@ class WorkflowService:
                     organization_id=organization.organization_id,
                     parameters=parameter_values,
                     trigger_type=resolved_trigger_type,
+                    integration_platform=integration_platform,
                 )
                 if post_dispatch_effects is None:
                     await apply_creation_tags()
