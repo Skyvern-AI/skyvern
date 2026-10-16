@@ -13,7 +13,7 @@ import textwrap
 import time
 import unicodedata
 import uuid
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -24,6 +24,7 @@ from http import HTTPStatus
 from typing import Any, Literal, NamedTuple, TypeVar, cast, overload
 
 import structlog
+from jinja2 import TemplateSyntaxError
 from jinja2 import meta as jinja2_meta
 from pydantic import BaseModel
 from sqlalchemy import select, update
@@ -168,6 +169,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_workflow_browser_session_storage_key,
     render_browser_profile_key,
 )
+from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code
 from skyvern.forge.sdk.workflow.context_manager import (
     WorkflowRunContext,
     jinja_sandbox_env,
@@ -184,9 +186,11 @@ from skyvern.forge.sdk.workflow.credential_selection import (
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     BlockEngineNotEnabledError,
+    CodeBlockInsecureCodeError,
     InvalidWorkflowDefinition,
     WorkflowVersionConflict,
 )
+from skyvern.forge.sdk.workflow.models._jinja import mask_jinja_in_python_comments
 from skyvern.forge.sdk.workflow.models.block import (
     _ENGINE_INERT_BLOCK_TYPES,
     BaseTaskBlock,
@@ -10660,6 +10664,49 @@ class WorkflowService:
             if isinstance(block, CodeBlock):
                 block.validate_code_template()
 
+    @staticmethod
+    def _validate_new_code_block_safety(
+        workflow_definition: WorkflowDefinition, prior_definition: WorkflowDefinition | None
+    ) -> None:
+        """Reject new code the runner's static check always refuses; each copy of code already in the prior version
+        stays saveable, so a flagged block in a branch that never runs cannot wedge later saves. Code with Jinja
+        statements, or that does not parse once its Jinja values are stood in for, is left to the runner's check."""
+        prior_code: Counter[str] = Counter(
+            block.code
+            for block in (get_all_blocks(prior_definition.blocks) if prior_definition is not None else [])
+            if isinstance(block, CodeBlock)
+        )
+        for block in get_all_blocks(workflow_definition.blocks):
+            if not isinstance(block, CodeBlock):
+                continue
+            if prior_code[block.code] > 0:
+                prior_code[block.code] -= 1
+                continue
+            try:
+                checked_code = WorkflowService._code_with_jinja_values_as_names(block.code)
+                if checked_code is not None:
+                    is_safe_code(checked_code, error_factory=partial(CodeBlockInsecureCodeError, block.label))
+            except (SyntaxError, ValueError, RecursionError, MemoryError, TemplateSyntaxError):
+                continue
+
+    @staticmethod
+    def _code_with_jinja_values_as_names(code: str) -> str | None:
+        """The code with each `{{ }}` value replaced by a plain name, which is what the expression's rendered value
+        is to the static check; None when the code has Jinja statements or comments."""
+        parts: list[str] = []
+        in_value = False
+        for _, token_type, value in jinja_sandbox_env.lex(mask_jinja_in_python_comments(code)[0]):
+            if token_type == "data":
+                parts.append(value)
+            elif token_type == "variable_begin":
+                in_value = True
+                parts.append("jinja_value")
+            elif token_type == "variable_end":
+                in_value = False
+            elif not in_value:
+                return None
+        return "".join(parts)
+
     async def create_workflow(
         self,
         organization_id: str,
@@ -16631,6 +16678,7 @@ class WorkflowService:
         workflow_definition.validate()
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
+        self._validate_new_code_block_safety(workflow_definition, None)
         await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
         cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
 
@@ -16865,6 +16913,11 @@ class WorkflowService:
 
                 # Reject workflow_trigger.payload entries with malformed Jinja2 (matches runtime PayloadTemplateRenderError)
                 self._validate_payload_templates(built_definition)
+                if validate_code_block_templates:
+                    self._validate_new_code_block_safety(
+                        built_definition,
+                        existing_latest_workflow.workflow_definition if existing_latest_workflow else None,
+                    )
 
                 saved_workflow = await self.update_workflow_definition(
                     workflow_id=allocated_workflow.workflow_id,

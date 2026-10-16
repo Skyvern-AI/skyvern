@@ -73,6 +73,8 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /oauth/(?:token|consent|callback)$"),
     # Marketplace service routes return freshly minted client secrets.
     re.compile(r"^POST /(?:api/)?v1/marketplace(?:/.*)?$"),
+    # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
+    re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

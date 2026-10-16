@@ -3021,7 +3021,7 @@ class WorkflowRunsRepository(BaseRepository):
             )
         return query.where(or_(error_code_in_tasks, error_code_in_blocks))
 
-    @db_operation("get_workflow_runs")
+    @db_operation("get_workflow_runs", expected_errors=(RunsListSearchCanceled,))
     async def get_workflow_runs(
         self,
         organization_id: str,
@@ -3033,6 +3033,12 @@ class WorkflowRunsRepository(BaseRepository):
         error_code: str | None = None,
     ) -> list[WorkflowRun]:
         async with self.Session() as session:
+            statement_timeout_seconds: float | None = None
+            if _is_bounded_runs_list_read(session, search_key):
+                # Start after checkout so pool wait does not consume the connection-hold budget.
+                await session.connection()
+                statement_timeout_seconds = RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+                await apply_statement_timeout(session, statement_timeout_seconds)
             db_page = page - 1  # offset logic is 0 based
 
             query = (
@@ -3070,7 +3076,16 @@ class WorkflowRunsRepository(BaseRepository):
 
             query = query.limit(page_size).offset(db_page * page_size)
 
-            workflow_runs = (await session.execute(query)).all()
+            try:
+                workflow_runs = (await session.execute(query)).all()
+            except StatementError as exc:
+                if not search_key or not is_statement_timeout(exc):
+                    raise
+                exc.hide_parameters = True
+                raise RunsListSearchCanceled(
+                    indexed_search=is_indexed_runs_list_search_key(search_key),
+                    statement_timeout_seconds=statement_timeout_seconds,
+                ) from exc
 
             return [
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
