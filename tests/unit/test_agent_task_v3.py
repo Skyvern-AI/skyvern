@@ -31,7 +31,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
@@ -1267,6 +1267,55 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
     assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger_type, expected_key",
+    [
+        (WorkflowRunTriggerType.manual, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.mcp, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.api, "FLEX_ROUTER"),
+        (WorkflowRunTriggerType.scheduled, "FLEX_ROUTER"),
+    ],
+)
+async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
+    monkeypatch: pytest.MonkeyPatch,
+    trigger_type: WorkflowRunTriggerType,
+    expected_key: str,
+) -> None:
+    """Task V3 builds its caller from the resolved key rather than the handler factory."""
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "FLEX_ROUTER")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=lambda key: "STANDARD_ROUTER" if key == "FLEX_ROUTER" else None),
+    )
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit task.llm_key is a deliberate caller choice, matching get_override_llm_api_handler."""
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=AssertionError("explicit keys must not be downgraded")),
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+    finally:
+        skyvern_context.reset()
 
 
 @pytest.mark.asyncio
