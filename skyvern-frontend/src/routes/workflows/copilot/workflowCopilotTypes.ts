@@ -30,6 +30,11 @@ export type CopilotProductAction =
       kind: "refine_recording";
       nonce: string;
     };
+
+export interface WorkflowCopilotDemonstrationInsertion {
+  after_label: string | null;
+  before_label: string | null;
+}
 export type ProposalDisposition =
   | "no_proposal"
   | "auto_applicable"
@@ -227,7 +232,9 @@ export interface WorkflowCopilotChatRequest {
     | "test_end_to_end"
     | "diagnose_run"
     | "refine_recording"
+    | "demonstrate"
     | null;
+  demonstration_id?: string | null;
   // Required by the refine_recording action; reaches the model as untrusted
   // evidence, never as the turn's message.
   recording_evidence?: RecordingEvidencePacket | null;
@@ -552,6 +559,87 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
     outcome?: "rejected" | "unknown" | "created_not_connected" | null;
   } | null;
   timestamp: string;
+}
+
+export interface WorkflowCopilotDemonstrationStartedUpdate {
+  type: "demonstration_started";
+  demonstration_id: string;
+  browser_session_id: string;
+  action_count: number;
+  resumed: boolean;
+  can_fill_credentials: boolean;
+}
+
+export interface WorkflowCopilotDemonstrationActionUpdate {
+  type: "demonstration_action";
+  seq: number;
+  label: string;
+  tool_name:
+    | "click"
+    | "type_text"
+    | "select_option"
+    | "press_key"
+    | "navigate_browser"
+    | "upload_attached_file"
+    | "fill_credential_field";
+}
+
+export interface WorkflowCopilotDemonstrationSensitiveFieldUpdate {
+  type: "demonstration_sensitive_field";
+  field: "password" | "totp" | "other";
+  selector: string;
+  url: string;
+}
+
+export interface WorkflowCopilotDemonstrationNoticeUpdate {
+  type: "demonstration_notice";
+  message: string;
+  level: "info" | "error";
+}
+
+export interface WorkflowCopilotDemonstrationStoppedUpdate {
+  type: "demonstration_stopped";
+  demonstration_id?: string;
+  reason:
+    | "stopped"
+    | "cancelled"
+    | "disconnected"
+    | "browser_gone"
+    | "time_limit"
+    | "event_limit"
+    | "consumed";
+  action_count: number;
+}
+
+export interface WorkflowCopilotDemonstrationControlRequest {
+  demonstration_id: string;
+  action: "navigate" | "fill_credential" | "stop" | "cancel";
+  url?: string | null;
+  selector?: string | null;
+  credential_id?: string | null;
+  field?: "password" | "totp" | null;
+}
+
+export interface WorkflowCopilotDemonstrationControlResult {
+  seq: number;
+  action_count?: number | null;
+}
+
+export type WorkflowCopilotDemonstrationUpdate =
+  | WorkflowCopilotDemonstrationStartedUpdate
+  | WorkflowCopilotDemonstrationActionUpdate
+  | WorkflowCopilotDemonstrationSensitiveFieldUpdate
+  | WorkflowCopilotDemonstrationNoticeUpdate
+  | WorkflowCopilotDemonstrationStoppedUpdate;
+
+export interface WorkflowCopilotActiveDemonstration {
+  demonstration_id: string;
+  status: "recording" | "stopping" | "stopped";
+  action_count: number;
+  action_labels: string[];
+  can_fill_credentials: boolean;
+  can_resume: boolean;
+  insertion?: WorkflowCopilotDemonstrationInsertion | null;
 }
 
 export interface WorkflowCopilotCredentialResponseResult {

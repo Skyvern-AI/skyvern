@@ -51,5 +51,8 @@ describe("composerPlaceholder", () => {
     expect(
       composerPlaceholder({ ...base, latestTurnIsAsk: true, isLoading: true }),
     ).toBe("Type to queue a message…");
+    expect(composerPlaceholder({ ...base, isDemonstrating: true })).toBe(
+      "Show Copilot the task",
+    );
   });
 });

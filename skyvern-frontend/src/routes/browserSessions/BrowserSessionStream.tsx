@@ -9,7 +9,10 @@ import {
 } from "@/routes/streaming/useRecordingMessageChannel";
 import { toast } from "@/components/ui/use-toast";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
-import { useManualSignInControl } from "@/store/useManualSignInStore";
+import {
+  useDemonstrationControl,
+  useManualSignInControl,
+} from "@/store/useManualSignInStore";
 import {
   toastClipboardReadFailed,
   toastNothingToPaste,
@@ -47,6 +50,7 @@ import type {
   StreamStateChangeHandler,
 } from "@/routes/streaming/streamState";
 import { useSettingsStore } from "@/store/SettingsStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
   captureRecordBrowser,
   getRecordBrowserContext,
@@ -145,6 +149,16 @@ function BrowserSessionStream({
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
   const settingsStore = useSettingsStore();
+  const demonstrating = useRecordingLauncherStore(
+    (state) => state.demonstrationBrowserSessionId === browserSessionId,
+  );
+  const recordingDemonstration = useRecordingLauncherStore(
+    (state) =>
+      state.demonstrationRecordingBrowserSessionId === browserSessionId,
+  );
+  const navigateDemonstration = useRecordingLauncherStore(
+    (state) => state.navigateDemonstration,
+  );
 
   const socketRef = useRef<WebSocket | null>(null);
   const streamImgSrcRef = useRef("");
@@ -305,6 +319,12 @@ function BrowserSessionStream({
   useManualSignInControl(
     controllable ? browserSessionId : undefined,
     setUserIsControlling,
+  );
+  useDemonstrationControl(
+    recordingDemonstration,
+    controllable,
+    setUserIsControlling,
+    inputReady,
   );
   const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
   keepMessageChannelAliveRef.current = keepMessageChannelAlive;
@@ -761,6 +781,7 @@ function BrowserSessionStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
 
+  const streamNavigate = demonstrating ? navigateDemonstration : navigate;
   if (isReady) {
     return (
       <InteractiveStreamView
@@ -771,13 +792,17 @@ function BrowserSessionStream({
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
         containerRef={containerRef}
-        showControlButtons={showControlButtons && !exfiltrate}
+        showControlButtons={showControlButtons && !exfiltrate && !demonstrating}
         handlers={handlers}
         currentUrl={currentUrl}
         centered={centered}
-        onNavigate={enableUrlInput ? navigate : undefined}
-        navigateError={enableUrlInput ? navigateError : undefined}
-        onHistoryNavigate={enableUrlInput ? historyNavigate : undefined}
+        onNavigate={enableUrlInput ? (streamNavigate ?? undefined) : undefined}
+        navigateError={
+          enableUrlInput && !demonstrating ? navigateError : undefined
+        }
+        onHistoryNavigate={
+          enableUrlInput && !demonstrating ? historyNavigate : undefined
+        }
         onFrameWidthChange={onFrameWidthChange}
         frameToken={streamImgToken}
         onFrameLoad={markLoad}

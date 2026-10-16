@@ -5,6 +5,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { Status } from "@/api/types";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { StudioPaneDefaultsProvider } from "../workflows/studio/StudioPaneDefaults";
@@ -13,7 +14,11 @@ import { RunRouter } from "./RunRouter";
 
 type RunQueryResult = {
   data:
-    | { workflow_run_id: string; workflow: { workflow_permanent_id: string } }
+    | {
+        workflow_run_id: string;
+        status: Status;
+        workflow: { workflow_permanent_id: string };
+      }
     | undefined;
   isLoading: boolean;
   isError?: boolean;
@@ -21,6 +26,7 @@ type RunQueryResult = {
 
 const resolvedRun = {
   workflow_run_id: "wr_1",
+  status: Status.Completed,
   workflow: { workflow_permanent_id: "wpid_123" },
 };
 
@@ -31,6 +37,14 @@ const { getClientMock, realRunQuery } = vi.hoisted(() => ({
   realRunQuery: { enabled: false },
 }));
 
+const { postHogCaptureMock } = vi.hoisted(() => ({
+  postHogCaptureMock: vi.fn(),
+}));
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: postHogCaptureMock }),
+}));
+
 const mocks = vi.hoisted(() => ({
   taskV2: vi.fn(() => ({ data: undefined, isLoading: false })),
   runQuery: vi.fn<
@@ -38,6 +52,7 @@ const mocks = vi.hoisted(() => ({
   >(() => ({
     data: {
       workflow_run_id: "wr_1",
+      status: "completed",
       workflow: { workflow_permanent_id: "wpid_123" },
     },
     isLoading: false,
@@ -98,18 +113,19 @@ function renderAt(entry: string, client?: QueryClient) {
     new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-  const tree = (
-    <MemoryRouter initialEntries={[entry]}>
-      <Routes>
-        <Route path="/runs/:runId/*" element={<RunRouter />} />
-        <Route path="/agents/*" element={<div data-testid="redirected" />} />
-      </Routes>
-      <LocationProbe />
-    </MemoryRouter>
+  const renderPage = () => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route path="/runs/:runId/*" element={<RunRouter />} />
+          <Route path="/agents/*" element={<div data-testid="redirected" />} />
+        </Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
-  return render(
-    <QueryClientProvider client={queryClient}>{tree}</QueryClientProvider>,
-  );
+  const result = render(renderPage());
+  return { ...result, rerenderPage: () => result.rerender(renderPage()) };
 }
 
 function expectCenteredLoadingIndicator() {
@@ -128,6 +144,7 @@ function expectCenteredLoadingIndicator() {
 
 describe("RunRouter", () => {
   beforeEach(() => {
+    postHogCaptureMock.mockReset();
     mocks.taskV2.mockReturnValue({ data: undefined, isLoading: false });
     mocks.runQuery.mockReturnValue({ data: resolvedRun, isLoading: false });
   });
@@ -141,6 +158,53 @@ describe("RunRouter", () => {
     renderAt("/runs/wr_1");
     expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
     expect(screen.queryByTestId("redirected")).toBeNull();
+  });
+
+  test("captures one safe page-view event for a run id despite status rerenders", () => {
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status: Status.Failed },
+      isLoading: false,
+    });
+    const page = renderAt("/runs/wr_1");
+
+    expect(postHogCaptureMock.mock.calls).toEqual([
+      [
+        "run.page_viewed",
+        { run_id: "wr_1", run_status: Status.Failed, failed: true },
+      ],
+    ]);
+
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status: Status.Completed },
+      isLoading: false,
+    });
+    page.rerenderPage();
+
+    expect(postHogCaptureMock.mock.calls).toEqual([
+      [
+        "run.page_viewed",
+        { run_id: "wr_1", run_status: Status.Failed, failed: true },
+      ],
+    ]);
+  });
+
+  test.each([
+    [Status.Terminated, true],
+    [Status.TimedOut, true],
+    [Status.Canceled, false],
+    [Status.Completed, false],
+  ])("marks a %s run page view failed=%s", (status, failed) => {
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status },
+      isLoading: false,
+    });
+    renderAt("/runs/wr_1");
+
+    expect(postHogCaptureMock).toHaveBeenCalledWith("run.page_viewed", {
+      run_id: "wr_1",
+      run_status: status,
+      failed,
+    });
   });
 
   test.each([

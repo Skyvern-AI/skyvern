@@ -14,6 +14,7 @@ type WorkflowAddMenuProps = {
   rotateText?: boolean;
   startAt?: number;
   isUploadingSOP?: boolean;
+  canRecordTask?: boolean;
   //   --
   onAdd: () => void;
   onRecord: () => void;
@@ -29,6 +30,7 @@ function WorkflowAddMenu({
   rotateText = true,
   startAt = 90,
   isUploadingSOP = false,
+  canRecordTask = true,
   //   --
   onAdd,
   onRecord,
@@ -58,7 +60,10 @@ function WorkflowAddMenu({
       menuItems.push({
         id: "2",
         icon: <SquareIcon className={buttonSize ? "h-3 w-3" : undefined} />,
-        enabled: settingsStore.isUsingABrowser && !recordingStore.isRecording,
+        enabled:
+          canRecordTask &&
+          settingsStore.isUsingABrowser &&
+          !recordingStore.isRecording,
         text: "Record Task",
         onClick: () => {
           onRecord();
@@ -80,6 +85,7 @@ function WorkflowAddMenu({
     return menuItems;
   }, [
     buttonSize,
+    canRecordTask,
     onAdd,
     onRecord,
     onUploadSOP,

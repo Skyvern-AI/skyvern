@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BrowserStream } from "./BrowserStream";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 
 const mocks = vi.hoisted(() => {
   type RfbListener = (event: { detail?: unknown }) => void;
@@ -332,6 +333,9 @@ function renderBrowserSession() {
 
 describe("BrowserStream", () => {
   beforeEach(() => {
+    useRecordingLauncherStore.setState(
+      useRecordingLauncherStore.getInitialState(),
+    );
     mocks.autoConnect.value = true;
     Object.defineProperty(globalThis, "WebSocket", {
       configurable: true,
@@ -694,6 +698,36 @@ describe("BrowserStream", () => {
         .querySelector(".browser-stream")
         ?.classList.contains("user-is-controlling"),
     ).toBe(false);
+  });
+
+  it("takes VNC control while a demonstration records and releases it when recording ends", async () => {
+    const { container } = renderBrowserStream();
+    await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream");
+    expect(stream?.classList.contains("user-is-controlling")).toBe(false);
+
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstrationBrowserSessionId: "pbs_test",
+        demonstrationRecordingBrowserSessionId: "pbs_test",
+      }),
+    );
+    await waitFor(() =>
+      expect(stream?.classList.contains("user-is-controlling")).toBe(true),
+    );
+
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstrationRecordingBrowserSessionId: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(stream?.classList.contains("user-is-controlling")).toBe(false),
+    );
   });
 
   it("pastes an Edit-menu paste over VNC only while in control", async () => {

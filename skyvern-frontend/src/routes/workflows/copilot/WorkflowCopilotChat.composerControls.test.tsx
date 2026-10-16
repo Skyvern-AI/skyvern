@@ -611,7 +611,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     );
     // Border + focus ring moved off the textarea onto the wrapping container.
     expect(ta.className).not.toContain("border-input");
-    expect(ta.parentElement?.className).toContain("focus-within");
+    expect(ta.closest("[class*='focus-within']")).not.toBeNull();
   });
 
   it("starts SOP upload and task recording from the empty state", async () => {

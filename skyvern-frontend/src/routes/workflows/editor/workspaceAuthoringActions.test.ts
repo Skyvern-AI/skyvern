@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   applySopResultAtCurrentAppend,
+  demonstrationInsertionFromNodes,
   resolveWorkspaceAuthoringActionAvailability,
 } from "./workspaceAuthoringActions";
 
@@ -170,5 +171,40 @@ describe("workspace authoring actions", () => {
       canRecordTask: false,
       unavailableReason: "Switch to Visual mode before adding workflow steps",
     });
+  });
+});
+
+describe("demonstrationInsertionFromNodes", () => {
+  it("uses adjacent workflow labels for the insertion", () => {
+    const nodes = [
+      { id: "first", type: "task", data: { label: "first_step" } },
+      { id: "second", type: "task", data: { label: "second_step" } },
+    ];
+
+    expect(
+      demonstrationInsertionFromNodes(nodes, {
+        previous: "first",
+        next: "second",
+        parent: undefined,
+      }),
+    ).toEqual({
+      after_label: "first_step",
+      before_label: "second_step",
+    });
+  });
+
+  it("refuses a parent-only insertion inside an empty container", () => {
+    const nodes = [
+      { id: "start", type: "start", parentId: "loop" },
+      { id: "adder", type: "nodeAdder", parentId: "loop" },
+    ];
+
+    expect(
+      demonstrationInsertionFromNodes(nodes, {
+        previous: "start",
+        next: "adder",
+        parent: "loop",
+      }),
+    ).toBeNull();
   });
 });

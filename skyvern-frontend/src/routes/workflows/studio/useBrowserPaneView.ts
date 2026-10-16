@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import {
   useStudioBrowserStore,
@@ -62,34 +63,45 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   const setViewIntent = useStudioBrowserStore((s) => s.setView);
   const pinNonce = useRunViewStore((s) => s.pinNonce);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const demonstrationBrowserSessionId = useRecordingLauncherStore(
+    (s) => s.demonstrationBrowserSessionId,
+  );
+  const userDrivingDebugBrowser =
+    isRecording ||
+    (demonstrationBrowserSessionId !== null &&
+      demonstrationBrowserSessionId === debugBrowserSessionId);
   const recordingDeepLink = searchParams.get("view") === "recording";
 
   // Timeline selection outranks a pinned pill: a step click (?active= change or
   // a re-pin of the same step) or a run swap hands the pane back to the machine,
   // which lands on Screenshots for a pinned step and Live for a fresh run.
   const activeParam = searchParams.get("active");
-  const syncRef = useRef({ activeParam, pinNonce, runId, isRecording });
+  const syncRef = useRef({
+    activeParam,
+    pinNonce,
+    runId,
+    userDrivingDebugBrowser,
+  });
   useEffect(() => {
     const prev = syncRef.current;
-    const recordingStarted = isRecording && !prev.isRecording;
+    const manualControlStarted =
+      userDrivingDebugBrowser && !prev.userDrivingDebugBrowser;
     if (
       prev.activeParam !== activeParam ||
       prev.pinNonce !== pinNonce ||
       prev.runId !== runId ||
-      recordingStarted
+      manualControlStarted
     ) {
-      syncRef.current = { activeParam, pinNonce, runId, isRecording };
       if (!recordingDeepLink) {
         setViewIntent("auto");
       }
-    } else if (prev.isRecording !== isRecording) {
-      syncRef.current = { activeParam, pinNonce, runId, isRecording };
     }
+    syncRef.current = { activeParam, pinNonce, runId, userDrivingDebugBrowser };
   }, [
     activeParam,
     pinNonce,
     runId,
-    isRecording,
+    userDrivingDebugBrowser,
     recordingDeepLink,
     setViewIntent,
   ]);
@@ -132,7 +144,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
 
   const view = resolveBrowserPaneView({
     intent,
-    recording: isRecording,
+    recording: userDrivingDebugBrowser,
     scrubbing: visuals.scrubbing,
     inspectingRun: explicit,
     blockRunInDebugSession,
@@ -149,7 +161,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   });
 
   const liveSurface = resolveLiveSurface({
-    recording: isRecording,
+    recording: userDrivingDebugBrowser,
     running: visuals.running,
     runInDebugSession,
     hasRunId: runId != null,
