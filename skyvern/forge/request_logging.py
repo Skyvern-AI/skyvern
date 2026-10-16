@@ -63,6 +63,7 @@ _SENSITIVE_ENDPOINTS = {
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
     "POST /api/v1/stripe_webhook",
 }
+_SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
@@ -73,6 +74,8 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /oauth/(?:token|consent|callback)$"),
     # Marketplace service routes return freshly minted client secrets.
     re.compile(r"^POST /(?:api/)?v1/marketplace(?:/.*)?$"),
+    # Signed trigger events contain arbitrary caller-provided payloads.
+    _SIGNED_TRIGGER_RECEIVER_ENDPOINT,
     # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
     re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
@@ -392,6 +395,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         return await call_next(request)
 
     start_time = time.monotonic()
+    body_buffered = True
     try:
         if _is_fixture_endpoint(request):
             bounded = bytearray()
@@ -401,6 +405,10 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
                         return Response(status_code=413)
                     bounded.extend(chunk)
             body_bytes = bytes(bounded)
+        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(f"{request.method.upper()} {request.url.path.rstrip('/')}"):
+            # The receiver's route-level size limit must see the unconsumed request stream.
+            body_bytes = b""
+            body_buffered = False
         else:
             body_bytes = await request.body()
     except TimeoutError:
@@ -413,10 +421,11 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         LOG.info("api.client_disconnect", method=request.method, path=request.url.path)
         return Response(status_code=499)
     # ensure downstream handlers can access body again
-    try:
-        request._body = body_bytes  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    if body_buffered:
+        try:
+            request._body = body_bytes  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     url_path = request.url.path
     http_method = request.method

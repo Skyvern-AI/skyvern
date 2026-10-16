@@ -4993,6 +4993,21 @@ _OWN_LABEL_HIT_JS = (
 """
 )
 
+# The probe's target lookup and readonly rule, shared with the type tool's readonly re-read so the two cannot
+# disagree. Needs `_q`, `arg` and `_NATIVE_LABEL_JS` in scope; defines `el`, `ctl` and `readOnly`.
+_TARGET_READONLY_JS = r"""
+  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
+  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
+  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return { exists: false };
+  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
+  let ctl = el;
+  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+  let readOnly = false;
+  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
+"""
+
 _TYPE_TARGET_PROBE_JS = (
     r"""(arg) => {
   const _q = """
@@ -5006,20 +5021,11 @@ _TYPE_TARGET_PROBE_JS = (
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
-
-  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
-  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
-  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
-  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return { exists: false };
-  const RETEST_SCROLLABLE_CLIP = false;
-  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
-  let ctl = el;
-  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+"""
+    + _TARGET_READONLY_JS
+    + r"""  const RETEST_SCROLLABLE_CLIP = false;
   let disabled = false;
   try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
-  let readOnly = false;
-  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
   const out = { exists: true, disabled, readOnly };
   try {
     if (_isToggle(ctl)) {
@@ -5895,6 +5901,20 @@ _TYPE_TARGET_PROBE_JS = (
 # The typing path's probe: the same reading, except that a field which only needs its scroller scrolled is re-tested.
 _TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
     "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
+)
+
+# The probe's readonly reading alone. Unlike the probe it scrolls nothing and re-mints no cover markers, so it can
+# be repeated without invalidating the markers the probe's verdict names.
+_TYPING_READONLY_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+"""
+    + _NATIVE_LABEL_JS
+    + _TARGET_READONLY_JS
+    + r"""  return { exists: true, readOnly };
+}"""
 )
 
 _ACTIVE_IS_JS = (
@@ -15545,6 +15565,17 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 could not enumerate frames under the covering layer", exc_info=True)
 
+    async def _readonly_now(page: Any, selector: str) -> bool:
+        # Resolved afresh on every read: a control the page replaces leaves a cached handle disconnected.
+        arg = await _probe_arg(page, selector)
+        try:
+            read = await _probe_evaluate(page, _TYPING_READONLY_JS, selector, arg)
+        finally:
+            if arg["el"] is not None:
+                with contextlib.suppress(Exception):
+                    await arg["el"].dispose()
+        return isinstance(read, dict) and bool(read.get("exists")) and bool(read.get("readOnly"))
+
     async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool, dict[str, Any] | None]:
         """(reachable, occluded, occluder). Raises when the field cannot accept typed text at all. Shared
         by both typing paths: fill() does no hit-testing, so without this a covered password or email
@@ -15569,21 +15600,26 @@ def build_browser_tools(
             # the driver is asked for the rest of its rule -- see the click gate. Held for that gate's
             # grace rather than refused outright, because fill()'s own wait used to cover a field the
             # page releases a moment later.
-            enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
-            while not await _engine_enabled(page, selector):
-                if time.monotonic() >= enable_deadline:
-                    raise _FieldNotEditable(selector, False)
+            deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
+            released = False
+            enabled = await _engine_enabled(page, selector)
+            read_only = False  # not read for a field answered enabled here: fill() waits out its lock itself
+            while not enabled or read_only:
+                if time.monotonic() >= deadline:
+                    raise _FieldNotEditable(selector, read_only)
                 await asyncio.sleep(0.1)
+                enabled = await _engine_enabled(page, selector)
                 # Re-read rather than only polling the driver: a page that answers the grace by making
                 # the field readonly has made it un-typable for a different reason, and the accurate
                 # message is the one the caller renders.
-                held: Any = None
+                read_only = False
                 with contextlib.suppress(Exception):
-                    held = await _probe_evaluate(
-                        page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector)
-                    )
-                if isinstance(held, dict) and held.get("exists") and held.get("readOnly"):
-                    raise _FieldNotEditable(selector, True)
+                    read_only = await _readonly_now(page, selector)
+                if enabled and not released:
+                    # From here fill() would have waited, so a lock gets fill()'s budget rather than the
+                    # disabled grace; a lock still held at its end is refused instead of timing fill() out.
+                    released = True
+                    deadline = time.monotonic() + _ACTION_TIMEOUT_MS / 1000
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):
