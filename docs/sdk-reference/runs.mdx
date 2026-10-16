@@ -55,31 +55,141 @@ skyvern.runTask(request: RunTaskOptions): Promise<TaskRunResponse>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | The goal or task description for Skyvern to accomplish |
-| `engine` | `engine` | `RunEngine` | No | `RunEngine.skyvern_v1` | The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted. |
-| `model` | `model` | `dict[str, Any] \| None` | No | `None` | Optional model configuration. |
-| `url` | `url` | `str \| None` | No | `None` | The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL |
-| `webhook_url` | `webhook_url` | `str \| None` | No | `None` | After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details. |
-| `totp_identifier` | `totp_identifier` | `str \| None` | No | `None` | Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details. |
-| `totp_url` | `totp_url` | `str \| None` | No | `None` | URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details. |
-| `title` | `title` | `str \| None` | No | `None` | The title for the task |
-| `error_code_mapping` | `error_code_mapping` | `dict[str, str] \| None` | No | `None` | Custom mapping of error codes to error messages if Skyvern encounters an error. |
-| `data_extraction_schema` | `data_extraction_schema` | `dict[str, Any] \| str \| None` | No | `None` | The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/. |
-| `proxy_location` | `proxy_location` | `ProxyLocationInput` | No | `None` | Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
-| `max_steps` | `max_steps` | `int \| None` | No | `None` | Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing. |
-| `wait_for_completion` | `waitForCompletion` | `bool` | No | `False` | Wait for the run to reach a final status before returning. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time to wait for completion, in seconds. |
-| `browser_session_id` | `browser_session_id` | `str \| None` | No | `None` | Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off. |
-| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
-| `extra_http_headers` | `extra_http_headers` | `dict[str, str] \| None` | No | `None` | The extra HTTP headers for the requests in browser. |
-| `publish_workflow` | `publish_workflow` | `bool` | No | `False` | Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs. |
-| `include_action_history_in_verification` | `include_action_history_in_verification` | `bool \| None` | No | `None` | Whether to include action history when verifying that the task is complete |
-| `max_screenshot_scrolls` | `max_screenshot_scrolls` | `int \| None` | No | `None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. |
-| `browser_address` | `browser_address` | `str \| None` | No | `None` | The CDP address for the task. |
-| — | `cdp_connect_headers` | `Record<string, string \| undefined>` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites. |
-| — | `run_with` | `string` | No | — | Whether to run the task with agent or code. Null means use the default. |
+<ParamField path={"prompt"} type={"str"} required>
+The goal or task description for Skyvern to accomplish
+</ParamField>
+
+<ParamField path={"engine"} type={"RunEngine"}>
+The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted.
+
+Default: `RunEngine.skyvern_v1`
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | None"}>
+Optional model configuration.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+The title for the task
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code_mapping"} type={"dict[str, str] | None"}>
+Custom mapping of error codes to error messages if Skyvern encounters an error.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"data_extraction_schema"} type={"dict[str, Any] | str | None"}>
+The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_steps"} type={"int | None"}>
+Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"wait_for_completion"} type={"bool"}>
+Wait for the run to reach a final status before returning.
+
+Default: `False` · TypeScript: `waitForCompletion`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for completion, in seconds.
+
+Default: `1800`
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+User-Agent string the browser sends.
+
+Default: `None` · TypeScript: `x-user-agent`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+The extra HTTP headers for the requests in browser.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"publish_workflow"} type={"bool"}>
+Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
+
+Default: `False`
+</ParamField>
+
+<ParamField path={"include_action_history_in_verification"} type={"bool | None"}>
+Whether to include action history when verifying that the task is complete
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolls"} type={"int | None"}>
+The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the task.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"Record<string, string | undefined>"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
+
+TypeScript only
+</ParamField>
+
+<ParamField path={"run_with"} type={"string"}>
+Whether to run the task with agent or code. Null means use the default.
+
+TypeScript only
+</ParamField>
 
 **Returns** `TaskRunResponse` · TypeScript `Promise<TaskRunResponse>`
 
@@ -158,9 +268,11 @@ skyvern.getRun(runId: string): Promise<GetRunResponse>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
+<ParamField path={"run_id"} type={"str"} required>
+The id of the task run or the workflow run.
+
+TypeScript: `runId`
+</ParamField>
 
 **Returns** `GetRunResponse` · TypeScript `Promise<GetRunResponse>`
 
@@ -216,13 +328,27 @@ skyvern.getRunsV2(request?: GetRunsV2Request): Promise<TaskRunListItem[]>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | `page` | `int \| None` | No | `None` |  |
-| `page_size` | `page_size` | `int \| None` | No | `None` |  |
-| `status` | `status` | `RunStatus \| Sequence[RunStatus] \| None` | No | `None` |  |
-| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search (min 3 chars for trigram index). |
-| `run_type` | `run_type` | `RunType \| Sequence[RunType] \| None` | No | `None` |  |
+<ParamField path={"page"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"status"} type={"RunStatus | Sequence[RunStatus] | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"search_key"} type={"str | None"}>
+Case-insensitive substring search (min 3 chars for trigram index).
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"run_type"} type={"RunType | Sequence[RunType] | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `list[TaskRunListItem]` · TypeScript `Promise<TaskRunListItem[]>`
 
@@ -290,9 +416,11 @@ skyvern.getRunTimeline(runId: string): Promise<WorkflowRunTimeline[]>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_id` | `runId` | `str` | Yes | — | The id of the workflow run or task_v2 run. |
+<ParamField path={"run_id"} type={"str"} required>
+The id of the workflow run or task_v2 run.
+
+TypeScript: `runId`
+</ParamField>
 
 **Returns** `list[WorkflowRunTimeline]` · TypeScript `Promise<WorkflowRunTimeline[]>`
 
@@ -354,11 +482,13 @@ skyvern.cancelRun(runId: string): Promise<unknown>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run to cancel. |
+<ParamField path={"run_id"} type={"str"} required>
+The id of the task run or the workflow run to cancel.
 
-**Returns** `Any \| None` · TypeScript `Promise<unknown>`
+TypeScript: `runId`
+</ParamField>
+
+**Returns** `Any | None` · TypeScript `Promise<unknown>`
 
 **Example**
 
@@ -405,9 +535,9 @@ skyvern.bulkCancelRuns(request: BulkCancelRunsRequest): Promise<BulkCancelRunsRe
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_ids` | `run_ids` | `Sequence[str]` | Yes | — | List of run IDs to cancel |
+<ParamField path={"run_ids"} type={"Sequence[str]"} required>
+List of run IDs to cancel
+</ParamField>
 
 **Returns** `BulkCancelRunsResponse` · TypeScript `Promise<BulkCancelRunsResponse>`
 
@@ -469,11 +599,15 @@ skyvern.retryRunWebhook(runId: string, request?: RetryRunWebhookRequest): Promis
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
-| `request` | — | `RetryRunWebhookRequest \| None` | No | `None` |  |
-| — | `webhook_url` | `string` | No | — | Optional webhook URL to send the payload to instead of the stored configuration |
+<ParamField path={"run_id"} type={"str"} required>
+The id of the task run or the workflow run.
+
+TypeScript: `runId`
+</ParamField>
+
+<ParamField path={"request"} type={"RetryRunWebhookRequest | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `RunWebhookReplayResponse` · TypeScript `Promise<RunWebhookReplayResponse>`
 
