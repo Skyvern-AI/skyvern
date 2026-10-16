@@ -33,7 +33,7 @@ from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
-from skyvern.errors.errors import CredentialCheckEvidence, LoginUnconfirmedError, UserDefinedError
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     IllegitCompleteScriptTermination,
     NoTOTPSecretFound,
@@ -631,7 +631,7 @@ async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scr
 
 
 @pytest.mark.asyncio
-async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
+async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
     """
     When context, task, and step are available, terminate() should call
     handle_terminate_action and then raise ScriptTerminationException.
@@ -660,14 +660,9 @@ async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
         mapped_error = UserDefinedError(
             error_code="unavailable", reasoning="The requested item is unavailable", confidence_float=1.0
         )
-        gate_error = (
-            LoginUnconfirmedError()
-            .to_user_defined_error()
-            .with_credential_check(CredentialCheckEvidence(confirmed=False))
-        )
 
         async def classify(action, *_args):
-            action.errors = [mapped_error, gate_error]
+            action.errors = [mapped_error]
             return [MagicMock(success=True)]
 
         mock_step = MagicMock()
@@ -697,7 +692,7 @@ async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
             with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2") as raised:
                 await script_page.terminate(errors=["error1", "error2"])
 
-            assert raised.value.user_defined_errors == [mapped_error, gate_error]
+            assert raised.value.user_defined_errors == [mapped_error]
 
             # Verify handler was called with correct arguments
             mock_handler.assert_called_once()

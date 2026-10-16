@@ -799,6 +799,7 @@ def _make_context(
         context.include_secrets_in_templates = True
     if with_workflow:
         context.workflow = SimpleNamespace(
+            ai_fallback=True,
             enable_self_healing=False,
             workflow_definition=None,
             created_by=created_by,
@@ -1276,7 +1277,6 @@ async def test_inline_declared_error_failure_preserves_download_metadata(monkeyp
         "reasoning": "report generation failed",
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
-        "credential_check": None,
     }
     download_output = {
         "errors": [typed_error],
@@ -1293,11 +1293,10 @@ async def test_inline_declared_error_failure_preserves_download_metadata(monkeyp
         error_code_mapping={"report_unavailable": "The report could not be generated"},
     )
 
-    serialized_error = {key: value for key, value in typed_error.items() if key != "credential_check"}
     assert result.output_parameter_value == download_output
     assert result.output_parameter_value["errors"] == [typed_error]
     assert result.error_codes == ["report_unavailable"]
-    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == [serialized_error]
+    assert failure_output_with_downloads.await_args.kwargs["result"]["errors"] == [typed_error]
     record_output.assert_not_awaited()
 
 
@@ -1410,6 +1409,73 @@ async def test_hand_authored_workflow_runs_the_ai_fallback_on_task_v3(
     # Without this the engine sizes the run like a bare task: the org's caps stop binding it and
     # it stops following popups and reaching into child frames.
     assert state["execute_step_kwargs"]["workflow_owned_recovery"] is True
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_ai_fallback_false_skips_self_heal_when_org_flag_is_on(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                ai_fallback=False,
+                copilot_session_id=None,
+                is_debug_session=False,
+                parent_workflow_run_id=None,
+            )
+        ),
+    )
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = True
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exception = RuntimeError("rotted selector")
+
+    result = await _heal(block, context, exception, _recording_page(exception))
+
+    assert result is None
+    assert state["create_task_kwargs"] is None
+    assert state["recovery_block_kwargs"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_ai_fallback", "workflow_ai_fallback", "expected"), [(True, False, True), (None, False, False)]
+)
+async def test_ai_fallback_enabled_prefers_run_setting_then_workflow_default(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    run_ai_fallback: bool | None,
+    workflow_ai_fallback: bool,
+    expected: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(ai_fallback=run_ai_fallback)),
+    )
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = workflow_ai_fallback
+
+    assert await _make_code_block()._ai_fallback_enabled(context) is expected
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_enabled_fails_closed_when_run_lookup_raises(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    get_workflow_run = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_workflow_run)
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = True
+
+    assert await _make_code_block()._ai_fallback_enabled(context) is False
+    get_workflow_run.assert_awaited_once_with(workflow_run_id="wr_test", organization_id="o_test")
 
 
 @pytest.mark.asyncio
