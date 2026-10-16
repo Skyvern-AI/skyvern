@@ -23,7 +23,7 @@ from agents.models.interface import ModelTracing
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 from litellm.litellm_core_utils.fallback_utils import async_completion_with_fallbacks
 from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
-from litellm.types.llms.openai import ResponsesAPIResponse
+from litellm.types.llms.openai import GenericEvent, ResponsesAPIResponse
 from litellm.types.utils import Delta
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
@@ -2148,6 +2148,73 @@ async def test_a_stream_that_drops_midway_raises_the_typed_error_copilot_retries
             pass
 
     assert is_retriable_llm_error(raised.value) is True
+
+
+async def _silent_after_one_chunk() -> AsyncIterator[ChatCompletionChunk]:
+    yield _stream_chunks()[0]
+    await asyncio.Event().wait()
+
+
+async def _keepalives_forever() -> AsyncIterator[GenericEvent]:
+    while True:
+        await asyncio.sleep(0.05)
+        yield GenericEvent(type="keepalive")
+
+
+async def _slow_steady_chunks() -> AsyncIterator[ChatCompletionChunk]:
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        yield _stream_chunks()[0]
+    yield _stream_chunks()[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "upstream", "stalls"),
+    [
+        ("anthropic/claude-sonnet-5-5", _silent_after_one_chunk, True),
+        ("azure/gpt-5.6-terra", _keepalives_forever, True),
+        ("anthropic/claude-sonnet-5-5", _slow_steady_chunks, False),
+    ],
+)
+async def test_a_stream_without_progress_is_cut_as_a_retriable_timeout_but_slow_steady_output_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    upstream: Callable[[], AsyncIterator[Any]],
+    stalls: bool,
+) -> None:
+    async def fake_call(**_kwargs: object) -> AsyncIterator[Any]:
+        return upstream()
+
+    monkeypatch.setattr(model_telemetry_module, "_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("litellm.acompletion", fake_call)
+    monkeypatch.setattr("litellm.aresponses", fake_call)
+    model_settings = (
+        _gpt_route_settings(model_name, []) if model_name.startswith("azure/") else ModelSettings(include_usage=True)
+    )
+    events: list[Any] = []
+    with pytest.raises(litellm.Timeout) if stalls else contextlib.nullcontext() as raised:
+        async with asyncio.timeout(5):
+            async for event in CopilotLitellmModel(
+                model=model_name,
+                base_url=_AZURE_BASE if model_name.startswith("azure/") else None,
+                api_key="test-key",
+                next_model_call_index=lambda: 1,
+            ).stream_response(
+                system_instructions=_CACHED_PROMPT,
+                input=_GPT_TOOL_HISTORY,
+                model_settings=model_settings,
+                tools=[_lookup_number],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+            ):
+                events.append(event)
+
+    if stalls:
+        assert is_retriable_llm_error(raised.value) is True
+    else:
+        assert events[-1].type == "response.completed"
 
 
 @pytest.mark.asyncio

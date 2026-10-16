@@ -14,6 +14,7 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.run_config import RunConfig
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot import agent as agent_module
@@ -995,3 +996,61 @@ async def test_stop_still_cancels_the_active_build_test(
     assert owned.row.status == "canceled"
     assert harness["executor_cancelled"] is not dispatch_to_worker
     harness["clear"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_at_cut", [300.0, TOTAL_TIMEOUT_SECONDS + 50.0])
+async def test_a_model_call_cut_mid_turn_leaves_the_fallback_on_the_turns_clock(
+    monkeypatch: pytest.MonkeyPatch, seconds_at_cut: float
+) -> None:
+    offset = 0.0
+    attempts: list[dict[str, Any]] = []
+
+    def run_streamed(agent: Agent, **_kwargs: Any) -> MagicMock:
+        attempts.append({"model": str(agent.model), "tools": {tool.name for tool in agent.tools}})
+        return _result(json.dumps({"type": "REPLY", "user_response": "Here is where things stand."}))
+
+    async def stream_to_sse(_result: Any, _stream: Any, ctx: Any) -> None:
+        nonlocal offset
+        attempts[-1]["drained"] = ctx.budget_expiry_state.drain_active
+        attempts[-1]["allowance"] = ctx.model_stream_deadline.when() - asyncio.get_running_loop().time()
+        if len(attempts) == 1:
+            offset = seconds_at_cut
+            raise LiteLLMTimeout("Copilot model stream made no progress", model="m", llm_provider="anthropic")
+
+    stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset)
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", run_streamed)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", stream_to_sse)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="build it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key="SECONDARY"),
+    )
+
+    budget_spent = seconds_at_cut >= TOTAL_TIMEOUT_SECONDS
+    (_, fallback) = attempts
+    assert fallback["model"] == "model-SECONDARY"
+    assert fallback["drained"] is budget_spent
+    assert ("update_workflow" in fallback["tools"]) is not budget_spent
+    assert fallback["allowance"] < TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - seconds_at_cut + 5
+    assert result.user_response == "Here is where things stand."
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.budget_expired is budget_spent
