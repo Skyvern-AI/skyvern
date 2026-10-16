@@ -3454,6 +3454,7 @@ class WorkflowService:
                 resolved_trigger_type = ambient_context.trigger_type
             if resolved_trigger_type is None:
                 resolved_trigger_type = WorkflowRunTriggerType.api
+            otel_trace.get_current_span().set_attribute("trigger_type", resolved_trigger_type.value)
 
             prevalidated_workflow_parameters: list[WorkflowParameter] | None = None
             if refuse_unusable_parameters_before_create:
@@ -3523,6 +3524,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_id=workflow.workflow_id,
                 organization_id=workflow.organization_id,
+                run_source=resolved_trigger_type.value,
                 proxy_location=workflow_request.proxy_location,
                 webhook_callback_url=workflow_request.webhook_callback_url,
                 max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
@@ -3530,6 +3532,21 @@ class WorkflowService:
                 run_with=workflow_request.run_with,
                 code_gen=code_gen,
             )
+            if parent_workflow_run_id is None and retried_from_workflow_run_id is None:
+                try:
+                    await app.AGENT_FUNCTION.capture_workflow_run_created(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        trigger_type=resolved_trigger_type,
+                    )
+                except Exception:  # Telemetry must never fail run creation.
+                    LOG.warning(
+                        "Failed to capture workflow run creation event",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        exc_info=True,
+                    )
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
             current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
             root_workflow_run_id = (
