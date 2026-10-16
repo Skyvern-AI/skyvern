@@ -379,7 +379,13 @@ LLM_REQUEST_SPAN_NAME = "skyvern.llm.request"
 LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
-CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination", "check-user-goal-after-click"}
+# In the check-user-goal templates, everything from the first of these sections on changes between calls.
+_CHECK_USER_GOAL_PER_CALL_SECTIONS = (
+    "\nAction History:\n",
+    "\nIDs for emerging HTML elements\n",
+    "\nElements on the page:\n",
+)
 VISION_REQUIRED_PROMPT_NAMES = {
     "workflow-copilot-video-perception",
     "workflow-copilot-video-secret-safety",
@@ -1226,7 +1232,9 @@ class LLMAPIHandlerFactory:
         return prompt_stripped
 
     @staticmethod
-    def _cache_static_prompt_for_anthropic(messages: list[dict[str, Any]], static_prompt: str) -> bool:
+    def _cache_static_prompt_for_anthropic(
+        messages: list[dict[str, Any]], static_prompt: str, task_prompt: str | None = None
+    ) -> bool:
         marked_static_block = {
             "type": "text",
             "text": static_prompt.rstrip(),
@@ -1238,13 +1246,36 @@ class LLMAPIHandlerFactory:
             content = message.get("content")
             if not isinstance(content, list):
                 return False
-            if content and content[0] == marked_static_block:
-                return True
-            if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
-                return False
-            content.insert(0, marked_static_block)
+            if not (content and content[0] == marked_static_block):
+                if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
+                    return False
+                content.insert(0, marked_static_block)
+            if task_prompt and len(content) > 1:
+                LLMAPIHandlerFactory._mark_cached_prefix(content, 1, task_prompt)
             return True
         return False
+
+    @staticmethod
+    def _cache_check_user_goal_prefix_for_anthropic(messages: list[dict[str, Any]]) -> bool:
+        user_message = next((message for message in messages if message.get("role") == "user"), None)
+        content = user_message.get("content") if user_message else None
+        if not isinstance(content, list) or not content or content[0].get("type") != "text":
+            return False
+        text = content[0].get("text", "")
+        cut = min((at for at in map(text.find, _CHECK_USER_GOAL_PER_CALL_SECTIONS) if at > 0), default=0)
+        return cut > 0 and LLMAPIHandlerFactory._mark_cached_prefix(content, 0, text[:cut])
+
+    @staticmethod
+    def _mark_cached_prefix(content: list[dict[str, Any]], index: int, prefix: str) -> bool:
+        block = content[index]
+        text = block.get("text", "")
+        if block.get("type") != "text" or not text.startswith(prefix) or len(text) <= len(prefix):
+            return False
+        content[index : index + 1] = [
+            {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+            {**block, "text": text[len(prefix) :]},
+        ]
+        return True
 
     @staticmethod
     def _models_equivalent(left: str | None, right: str | None) -> bool:
@@ -1629,12 +1660,17 @@ class LLMAPIHandlerFactory:
         check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
         if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
+            effort = (
+                llm_config.reasoning_effort
+                if llm_config.pin_reasoning_effort and llm_config.reasoning_effort
+                else LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            )
             parameters["thinking"] = {"type": "adaptive"}
-            parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            parameters.setdefault("output_config", {})["effort"] = effort
             LOG.debug(
                 "Applied thinking budget optimization (adaptive)",
                 prompt_name=prompt_name,
-                effort=LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT,
+                effort=effort,
                 model=model_label,
             )
             return
@@ -2150,8 +2186,16 @@ class LLMAPIHandlerFactory:
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                         and uses_only_anthropic_models(llm_config)
                         and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
-                            messages, redacted_cached_static_prompt
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
                         )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
                     ):
                         LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
@@ -2678,6 +2722,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -3002,8 +3049,16 @@ class LLMAPIHandlerFactory:
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                         and uses_only_anthropic_models(llm_config)
                         and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
-                            messages, redacted_cached_static_prompt
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
                         )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
                     ):
                         LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
@@ -3335,6 +3390,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),

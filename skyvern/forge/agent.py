@@ -271,6 +271,7 @@ from skyvern.utils.stall_watch import (
     log_if_stalled,
     wait_for_task,
 )
+from skyvern.utils.strings import UNTRUSTED_WEB_PAGE_DATA_BEGIN
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.action_deadline import cancellation_pending
@@ -3333,8 +3334,7 @@ class ForgeAgent:
                 target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
-                anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config)
-                and not (context is not None and await self._is_anthropic_prompt_caching_disabled(context)),
+                anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config),
             )
         finally:
             input_dispatch.end_login_pace()
@@ -8254,6 +8254,7 @@ class ForgeAgent:
         # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
         # This prevents extract-action cache from being attached to other prompts (e.g. validation).
         context.cached_static_prompt = None
+        context.cached_task_prompt = None
         context.vertex_cache_name = None
 
         # Check if prompt caching is enabled for extract-action
@@ -8275,8 +8276,6 @@ class ForgeAgent:
             or prompt_caching_settings.get(EXTRACT_ACTION_TEMPLATE)
             or (template == EXTRACT_ACTION_TEMPLATE and uses_anthropic_handler)
         )
-        if cache_enabled and uses_anthropic_handler and await self._is_anthropic_prompt_caching_disabled(context):
-            cache_enabled = False
         LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
@@ -8426,6 +8425,10 @@ class ForgeAgent:
                 # first call succeeds even if the cache is cold. The cached reference simply lets the service
                 # reuse the static portion internally.
                 context.cached_static_prompt = static_prompt
+                task_prompt, page_data_marker, _ = dynamic_prompt.lstrip().partition(UNTRUSTED_WEB_PAGE_DATA_BEGIN)
+                # Not redacted here: the LLM handler redacts it with the prompt's secret set, so it stays a prefix
+                # of the text sent (the run's full set here also covers runtime OTPs the prompt keeps).
+                context.cached_task_prompt = task_prompt if page_data_marker and task_prompt else None
                 context.use_prompt_caching = True
                 use_caching = True
 
@@ -8583,26 +8586,6 @@ class ForgeAgent:
             )
 
         return context.prompt_caching_settings
-
-    async def _is_anthropic_prompt_caching_disabled(self, context: SkyvernContext) -> bool:
-        distinct_id = context.run_id or context.workflow_run_id or context.task_id
-        organization_id = context.organization_id
-        if not distinct_id or not organization_id:
-            return False
-        try:
-            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "DISABLE_ANTHROPIC_PROMPT_CACHING",
-                distinct_id,
-                properties={"organization_id": organization_id},
-            )
-        except Exception as exc:
-            LOG.warning(
-                "Failed to evaluate Anthropic prompt caching kill switch; leaving caching on",
-                distinct_id=distinct_id,
-                organization_id=organization_id,
-                error=str(exc),
-            )
-            return False
 
     async def _is_multi_tab_control_enabled(self, context: SkyvernContext) -> bool:
         distinct_id = context.run_id or context.workflow_run_id or context.task_id
