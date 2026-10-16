@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.forge_log_capture import capture_runtime_logs
@@ -1115,11 +1116,13 @@ async def test_anthropic_prompt_caching_marks_static_user_content(
     monkeypatch: pytest.MonkeyPatch, model_name: str, uses_anthropic_cache: bool
 ) -> None:
     static_prompt = "static instructions"
-    dynamic_prompt = "dynamic context"
+    task_prompt = "User goal:\nsubmit the form\n\n"
+    dynamic_prompt = f"{task_prompt}BEGIN_UNTRUSTED_WEB_PAGE_DATA\npage"
     context = MagicMock()
     context.vertex_cache_name = None
     context.use_prompt_caching = True
     context.cached_static_prompt = static_prompt
+    context.cached_task_prompt = task_prompt
     context.hashed_href_map = {}
     llm_config = LLMConfig(
         model_name=model_name,
@@ -1148,15 +1151,18 @@ async def test_anthropic_prompt_caching_marks_static_user_content(
 
     user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
     if uses_anthropic_cache:
-        assert LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(captured_messages, static_prompt)
-        assert user_content[:2] == [
+        expected_content = [
             {
                 "type": "text",
                 "text": static_prompt,
                 "cache_control": {"type": "ephemeral"},
             },
-            {"type": "text", "text": dynamic_prompt},
+            {"type": "text", "text": task_prompt, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dynamic_prompt.removeprefix(task_prompt)},
         ]
+        assert user_content == expected_content
+        assert LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(captured_messages, static_prompt, task_prompt)
+        assert user_content == expected_content
         text_blocks = [
             block["text"]
             for message in captured_messages
@@ -1167,6 +1173,95 @@ async def test_anthropic_prompt_caching_marks_static_user_content(
         assert text_blocks.count(static_prompt) == 1
     else:
         assert all("cache_control" not in block for block in user_content)
+
+
+@pytest.mark.parametrize("template", ["check-user-goal", "check-user-goal-with-termination"])
+@pytest.mark.parametrize(
+    ("provider_models", "uses_anthropic_cache"),
+    [
+        (["anthropic/claude-haiku-test"], True),
+        (["gpt-test"], False),
+        (["anthropic/claude-haiku-test", "bedrock/us.anthropic.claude-test"], True),
+        (["anthropic/claude-haiku-test", "openai/gpt-5.5"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_check_user_goal_caches_the_prefix_every_call_shares(
+    monkeypatch: pytest.MonkeyPatch, template: str, provider_models: list[str], uses_anthropic_cache: bool
+) -> None:
+    captured_contents: list[list[dict[str, Any]]] = []
+
+    def capture(messages: list[dict[str, Any]], model: str) -> FakeLLMResponse:
+        captured_contents.append(next(message["content"] for message in messages if message["role"] == "user"))
+        return FakeLLMResponse(model)
+
+    class _CapturingRouter:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: list[dict[str, Any]], **_: Any) -> FakeLLMResponse:
+            return capture(messages, model)
+
+    async def acompletion(*_: Any, model: str, messages: list[dict[str, Any]], **__: Any) -> FakeLLMResponse:
+        return capture(messages, model)
+
+    llm_key = f"TEST_CHECK_USER_GOAL_CACHE_{len(provider_models)}_{uses_anthropic_cache}"
+    if len(provider_models) > 1:
+        config = LLMRouterConfig(
+            model_name="test-router",
+            required_env_vars=[],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            model_list=[
+                LLMRouterModelConfig(model_name=f"group-{index}", litellm_params={"model": provider_model})
+                for index, provider_model in enumerate(provider_models)
+            ],
+            main_model_group="group-0",
+            fallback_model_group="group-1",
+        )
+        real_messages_builder = api_handler_factory.llm_messages_builder
+        _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+        monkeypatch.setattr(api_handler_factory, "llm_messages_builder", real_messages_builder)
+        monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+        handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+    else:
+        llm_config = LLMConfig(provider_models[0], [], supports_vision=False, add_assistant_prefix=False)
+        monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+        monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+        monkeypatch.setattr(api_handler_factory.litellm, "acompletion", acompletion)
+        monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+        handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: SkyvernContext())
+
+    prompts = [
+        PromptEngine(model="skyvern").load_prompt(
+            template,
+            navigation_goal="Submit the membership application",
+            navigation_payload='{"first_name": "Corin"}',
+            complete_criterion="The page shows Application received",
+            action_history=action_history,
+            elements=elements,
+            local_datetime=local_datetime,
+        )
+        for action_history, elements, local_datetime in (
+            ("", "<button>Next</button>", "2026-01-01T00:00:00"),
+            ('["CLICK"]', "<h1>Received</h1>", "2026-01-01T00:00:09"),
+        )
+    ]
+    for prompt in prompts:
+        await handler(prompt=prompt, prompt_name=template)
+
+    if uses_anthropic_cache:
+        assert [[block.get("cache_control") is not None for block in content] for content in captured_contents] == [
+            [True, False],
+            [True, False],
+        ]
+        assert captured_contents[0][0] == captured_contents[1][0]
+        assert '"first_name": "Corin"' in captured_contents[0][0]["text"]
+        for prompt, content in zip(prompts, captured_contents):
+            assert "".join(block["text"] for block in content) == prompt
+    else:
+        assert all("cache_control" not in block for content in captured_contents for block in content)
 
 
 @pytest.mark.parametrize(
@@ -1181,7 +1276,8 @@ async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
     monkeypatch: pytest.MonkeyPatch, provider_models: list[str], uses_anthropic_cache: bool
 ) -> None:
     static_prompt = "static instructions"
-    dynamic_prompt = "dynamic context"
+    task_prompt = "User goal:\nsubmit the form\n\n"
+    dynamic_prompt = f"{task_prompt}BEGIN_UNTRUSTED_WEB_PAGE_DATA\npage"
     captured_messages: list[dict[str, Any]] = []
 
     class _CapturingRouter:
@@ -1219,6 +1315,7 @@ async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
     context.vertex_cache_name = None
     context.use_prompt_caching = True
     context.cached_static_prompt = static_prompt
+    context.cached_task_prompt = task_prompt
     context.hashed_href_map = {}
     monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
 
@@ -1231,9 +1328,9 @@ async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
     user_content = next(message["content"] for message in captured_messages if message["role"] == "user")
     marked_blocks = [block for block in user_content if "cache_control" in block]
     if uses_anthropic_cache:
-        assert marked_blocks == [user_content[0]]
-        assert user_content[0]["text"] == static_prompt
-        assert sum(block.get("text") == static_prompt for block in user_content) == 1
+        assert marked_blocks == user_content[:2]
+        assert [block["text"] for block in marked_blocks] == [static_prompt, task_prompt]
+        assert "".join(block["text"] for block in user_content[1:]) == dynamic_prompt
     else:
         assert not marked_blocks
 
@@ -1294,6 +1391,7 @@ def test_apply_anthropic_thinking_optimization_uses_adaptive_shape(model_name: s
         required_env_vars=[],
         supports_vision=True,
         add_assistant_prefix=False,
+        reasoning_effort="max",
     )
     params: dict[str, Any] = {}
 

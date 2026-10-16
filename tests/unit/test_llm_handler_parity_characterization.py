@@ -427,11 +427,13 @@ async def _run_router(
 
 @pytest.mark.asyncio
 async def test_happy_path_parses_and_records_identically(span_exporter: InMemorySpanExporter) -> None:
-    direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
-    router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
+    response = ParityResponse("gpt-4", cache_creation_tokens=404)
+    direct = await _run_direct(span_exporter, responses=[response], step=_make_step(), parameters={})
+    router = await _run_router(span_exporter, responses=[response], step=_make_step(), parameters={})
 
     assert direct.error is None and router.error is None
     assert direct.parsed == router.parsed == {"actions": []}
+    assert [outcome.metrics_events[0]["cache_creation_tokens"] for outcome in (direct, router)] == [404, 404]
 
     assert len(direct.completion_calls) == 1 and not direct.router_calls
     assert len(router.router_calls) == 1 and not router.completion_calls
