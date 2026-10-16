@@ -348,6 +348,7 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     # Internal routing: the worker queue the run was dispatched to. Never an API field.
     task_queue: str | None = Field(default=None, exclude=True)
+    setup_completed: bool = Field(default=True, exclude=True)
     # Digest of the definition the run was created against; the saved row can be overwritten in place later.
     workflow_definition_sha256: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None

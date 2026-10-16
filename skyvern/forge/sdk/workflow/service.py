@@ -3771,6 +3771,20 @@ class WorkflowService:
                 )
                 raise
 
+            if resolved_trigger_type == WorkflowRunTriggerType.event:
+                try:
+                    workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                        workflow_run.workflow_run_id,
+                        setup_completed=True,
+                    )
+                except SQLAlchemyError as error:
+                    await outer_session.rollback()
+                    LOG.warning(
+                        "Failed to persist event workflow run setup completion",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        error_type=type(error).__name__,
+                    )
+
             return workflow_run
 
     @staticmethod

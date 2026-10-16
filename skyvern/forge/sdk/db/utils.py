@@ -817,6 +817,7 @@ def convert_to_workflow_run(
         cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        setup_completed=workflow_run_model.setup_completed,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
         sequential_credential_id=workflow_run_model.sequential_credential_id,
