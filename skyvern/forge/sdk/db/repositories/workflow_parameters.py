@@ -2128,7 +2128,11 @@ class WorkflowParametersRepository(BaseRepository):
             query = (
                 select(WorkflowCopilotChatMessageModel)
                 .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc())
+                # Within one second, ids follow the worker hash and a wrapping 10-bit sequence, not write order.
+                .order_by(
+                    WorkflowCopilotChatMessageModel.created_at.asc(),
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                )
             )
             messages = (await session.scalars(query)).all()
             return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
