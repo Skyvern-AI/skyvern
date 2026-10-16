@@ -225,11 +225,6 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
-from skyvern.services.credential_verdict_service import (
-    CredentialVerdictContext,
-    confirm_credential_verdicts,
-    is_credential_rejection_code,
-)
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
     OTPValue,
@@ -730,26 +725,6 @@ _EXPECTED_STEP_FAILURES = (FailedToReloadPage, LLMResponseMissingActionsError)
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": FailureCategory.LLM_ERROR.value, "confidence_float": 0.9, "reasoning": reasoning}]
-
-
-def _append_mapped_category_errors(
-    errors: list[UserDefinedError], categories: list[dict[str, Any]], error_code_mapping: dict[str, str] | None
-) -> None:
-    error_codes = {error.error_code for error in errors}
-    for category in categories:
-        category_name = category.get("category")
-        if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
-            continue
-        error_code = resolve_error_code_mapping_key(category_name, error_code_mapping)
-        if error_code and error_code not in error_codes:
-            errors.append(
-                UserDefinedError(
-                    error_code=error_code,
-                    reasoning=f"{error_code}: {(error_code_mapping or {})[error_code]}",
-                    confidence_float=1.0,
-                )
-            )
-            error_codes.add(error_code)
 
 
 def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
@@ -10617,18 +10592,14 @@ class ForgeAgent:
             )
 
             user_errors = list(failure_response.errors)
-            # Keep legacy mapping support for non-credential categories; credential verdicts must have passed
-            # through summary_failure_reason_for_max_retries' confirmation gate.
+            # The summary model sometimes files a mapped code as a failure category instead of an error.
+            # A taxonomy name is its own classification, even when a mapping key reuses that name.
             for category in failure_response.failure_categories:
                 category_name = category.get("category")
                 if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
                     continue
                 error_code = resolve_error_code_mapping_key(category_name, task.error_code_mapping)
-                if (
-                    error_code
-                    and not is_credential_rejection_code(error_code)
-                    and error_code not in {error.error_code for error in user_errors}
-                ):
+                if error_code and error_code not in {error.error_code for error in user_errors}:
                     user_errors.append(
                         UserDefinedError(
                             error_code=error_code,
@@ -10700,14 +10671,7 @@ class ForgeAgent:
             )
             return next_step
 
-    async def _filter_response_errors(
-        self,
-        task: Task,
-        step: Step,
-        errors: list[UserDefinedError],
-        *,
-        credential_context: CredentialVerdictContext | None = None,
-    ) -> list[UserDefinedError]:
+    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
         canonical = [
             error.model_copy(update={"error_code": key})
             if (key := resolve_error_code_mapping_key(error.error_code, task.error_code_mapping))
@@ -10723,7 +10687,7 @@ class ForgeAgent:
                 dropped_codes=dropped,
                 allowed_codes=sorted((task.error_code_mapping or {}).keys()),
             )
-        return await confirm_credential_verdicts(task=task, step=step, errors=kept, context=credential_context)
+        return kept
 
     async def summary_failure_reason_for_max_steps(
         self,
@@ -10823,17 +10787,7 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
-            response.errors = await self._filter_response_errors(
-                task=task,
-                step=step,
-                errors=response.errors,
-                credential_context=CredentialVerdictContext(
-                    current_url=page.url if page is not None else None,
-                    screenshots=screenshots,
-                    agent_reasoning=response.reasoning,
-                ),
-            )
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
@@ -10987,19 +10941,7 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            # A category-only credential verdict must reach this same gate before it is returned.
-            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
-            response.errors = await self._filter_response_errors(
-                task=task,
-                step=step,
-                errors=response.errors,
-                credential_context=CredentialVerdictContext(
-                    current_url=page.url if page is not None else None,
-                    elements=html or None,
-                    screenshots=screenshots,
-                    agent_reasoning=response.reasoning,
-                ),
-            )
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")

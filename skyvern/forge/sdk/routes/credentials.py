@@ -100,6 +100,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
+    AzureOrganizationAuthToken,
     BitwardenCredentialResponse,
     BitwardenCredentialSafe,
     BitwardenOrganizationAuthToken,
@@ -110,9 +111,11 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateCustomCredentialServiceConfigRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
+    CustomCredentialServiceConfig,
     CustomCredentialServiceConfigResponse,
     OnePasswordTokenStatusResponse,
     Organization,
+    OrganizationAuthToken,
     OrganizationAuthTokenMetadata,
     TestConnectionResponse,
 )
@@ -133,6 +136,7 @@ from skyvern.forge.sdk.services.credentials import (
     parse_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -199,6 +203,9 @@ _SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
     "or full otpauth:// URI from the website's 2FA setup screen."
 )
 CREDENTIAL_WRITE_CONFLICT_DETAIL = "Credential was modified by another request. Please retry."
+# Reserved: the settings forms echo this mask back, so a submitted secret equal to it means "keep the stored one".
+# ponytail: value-based marker; switch to an explicit keep-secret field if a provider ever issues this as a secret.
+_REDACTED_ORG_CREDENTIAL_SECRET = "********"
 _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 
 
@@ -206,6 +213,49 @@ _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 class _TotpCodePreviewCacheEntry:
     code: str
     expires_at: int
+
+
+async def _should_redact_org_credential_secrets(organization_id: str) -> bool:
+    return await app.AGENT_FUNCTION.should_redact_organization_credential_secrets(
+        get_request_principal(), organization_id
+    )
+
+
+async def _restore_redacted_custom_credential_secret(
+    organization_id: str,
+    config: CustomCredentialServiceConfig,
+) -> CustomCredentialServiceConfig:
+    if config.api_token != _REDACTED_ORG_CREDENTIAL_SECRET:
+        return config
+    existing = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.custom_credential_service.value,
+    )
+    if existing is None:
+        raise HTTPException(status_code=409, detail="Credential changed; refresh and enter the secret again")
+    stored_config = json.loads(existing.token)
+    if not isinstance(stored_config, dict) or not isinstance(stored_config.get("api_token"), str):
+        raise ValueError("Stored custom credential configuration has no API token")
+    if stored_config.get("api_base_url") != config.api_base_url:
+        raise HTTPException(status_code=409, detail="Credential service URL changed; enter the secret again")
+    return config.model_copy(update={"api_token": stored_config["api_token"]})
+
+
+def _redact_azure_client_secret(token: AzureOrganizationAuthToken) -> AzureOrganizationAuthToken:
+    return token.model_copy(
+        update={"credential": token.credential.model_copy(update={"client_secret": _REDACTED_ORG_CREDENTIAL_SECRET})}
+    )
+
+
+def _redact_custom_credential_secret(token: OrganizationAuthToken) -> OrganizationAuthToken:
+    try:
+        config = json.loads(token.token)
+    except (TypeError, json.JSONDecodeError):
+        config = None
+    if not isinstance(config, dict) or not isinstance(config.get("api_token"), str):
+        return token.model_copy(update={"token": _REDACTED_ORG_CREDENTIAL_SECRET})
+    config["api_token"] = _REDACTED_ORG_CREDENTIAL_SECRET
+    return token.model_copy(update={"token": json.dumps(config)})
 
 
 _TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
@@ -3232,6 +3282,8 @@ async def get_azure_client_secret_credential(
                 detail="No Azure Client Secret Credential found for this organization",
             )
 
+        if await _should_redact_org_credential_secrets(current_org.organization_id):
+            auth_token = _redact_azure_client_secret(auth_token)
         return AzureClientSecretCredentialResponse(token=auth_token)
 
     except HTTPException:
@@ -3272,6 +3324,23 @@ async def update_azure_client_secret_credential(
     If a valid token already exists, it will be invalidated before creating the new one.
     """
     try:
+        credential = request.credential
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        # A redacted form echoes the sentinel even if the caller's role changed since the read.
+        if credential.client_secret == _REDACTED_ORG_CREDENTIAL_SECRET:
+            existing = await app.DATABASE.organizations.get_valid_org_auth_token(
+                organization_id=current_org.organization_id,
+                token_type=OrganizationAuthTokenType.azure_client_secret_credential.value,
+            )
+            if existing is None:
+                raise HTTPException(status_code=409, detail="Credential changed; refresh and enter the secret again")
+            if (existing.credential.tenant_id, existing.credential.client_id) != (
+                credential.tenant_id,
+                credential.client_id,
+            ):
+                raise HTTPException(status_code=409, detail="Azure tenant or client changed; enter the secret again")
+            credential = credential.model_copy(update={"client_secret": existing.credential.client_secret})
+
         # Invalidate any existing valid Azure Client Secret Credential for this organization
         await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
@@ -3282,7 +3351,7 @@ async def update_azure_client_secret_credential(
         auth_token = await app.DATABASE.organizations.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
-            token=request.credential,
+            token=credential,
         )
 
         LOG.info(
@@ -3297,8 +3366,12 @@ async def update_azure_client_secret_credential(
             OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
 
+        if redact_secrets:
+            auth_token = _redact_azure_client_secret(auth_token)
         return AzureClientSecretCredentialResponse(token=auth_token)
 
+    except HTTPException:
+        raise
     except Exception as e:
         LOG.error(
             "Failed to create or update Azure Client Secret Credential",
@@ -3341,6 +3414,9 @@ async def get_custom_credential_service_config(
                 detail="No custom credential service configuration found for this organization",
             )
 
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        if redact_secrets:
+            auth_token = _redact_custom_credential_secret(auth_token)
         return CustomCredentialServiceConfigResponse(token=auth_token)
 
     except HTTPException:
@@ -3381,6 +3457,9 @@ async def update_custom_credential_service_config(
     If a valid configuration already exists, it will be invalidated before creating the new one.
     """
     try:
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
+
         # Invalidate any existing valid custom credential service configuration for this organization
         await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
@@ -3388,7 +3467,7 @@ async def update_custom_credential_service_config(
         )
 
         # Store the configuration as JSON in the token field
-        config_json = json.dumps(request.config.model_dump())
+        config_json = json.dumps(config.model_dump())
 
         # Create the new configuration
         auth_token = await app.DATABASE.organizations.create_org_auth_token(
@@ -3409,8 +3488,12 @@ async def update_custom_credential_service_config(
             OrganizationAuthTokenType.custom_credential_service.value,
         )
 
+        if redact_secrets:
+            auth_token = _redact_custom_credential_secret(auth_token)
         return CustomCredentialServiceConfigResponse(token=auth_token)
 
+    except HTTPException:
+        raise
     except Exception as e:
         LOG.error(
             "Failed to create or update custom credential service configuration",
@@ -3445,8 +3528,9 @@ async def test_custom_credential_service_connection(
     to verify the service is reachable and the token is valid.
     Uses the shared URL validator for scheme/host validation (respects ALLOWED_HOSTS / BLOCKED_HOSTS).
     """
-    api_base_url = request.config.api_base_url
-    api_token = request.config.api_token
+    config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
+    api_base_url = config.api_base_url
+    api_token = config.api_token
 
     try:
         validated_url = validate_url(api_base_url)

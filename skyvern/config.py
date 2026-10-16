@@ -437,11 +437,6 @@ class Settings(BaseSettings):
     # model keeps the click->labeled-draft latency low. Falls back to the default
     # LLM_API_HANDLER when the key is unset or not registered in this environment.
     RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
-    # A login that the same credential completed on the same workflow inside this window contradicts
-    # a credential-rejection verdict on a later run.
-    CREDENTIAL_VERDICT_LOGIN_HISTORY_HOURS: int = 24
-    # Additional login-block parameter keys that carry credential references as plain strings.
-    CREDENTIAL_VERDICT_HISTORY_PARAMETER_KEYS: list[str] = []
     # Server-side kill switch for delta interpretation updates. Deltas are also
     # gated per-connection on the client declaring support (begin-exfiltration
     # supports_interpretation_deltas); this only force-disables them everywhere.

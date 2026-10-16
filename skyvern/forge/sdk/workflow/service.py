@@ -513,15 +513,7 @@ def partition_reuse_bound_key_by_timezone(reuse_bound_key: str, timezone_id: str
 
 
 def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
-    if type(value) is not dict:
-        return None
-    # `credential_check` is written only by the credential confirmation gate, which never runs on a
-    # code block's declared error. Tolerate the serialized null so the field's mere existence on
-    # UserDefinedError does not reject every typed block error, and drop the key so the merged rows
-    # stay exactly as they were; a non-null value is a claim this payload is not allowed to make.
-    if value.get("credential_check") is not None:
-        return None
-    if set(value) - {"credential_check"} != _USER_DEFINED_ERROR_KEYS:
+    if type(value) is not dict or set(value) != _USER_DEFINED_ERROR_KEYS:
         return None
     if (
         type(value["error_code"]) is not str
@@ -538,7 +530,7 @@ def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
         or value["error_type"] != "USER_DEFINED_ERROR"
     ):
         return None
-    return {key: entry for key, entry in value.items() if key != "credential_check"}
+    return dict(value)
 
 
 def _merge_workflow_run_errors(

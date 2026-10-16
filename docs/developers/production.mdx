@@ -296,9 +296,7 @@ if (run.status === "completed") {
 
 Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...", "confidence_float": 0.95}`. In an agent, set `error_code_mapping` on a block instead. A Validation block with `complete_criterion`, `terminate_criterion`, and `error_code_mapping` works like an assertion: it stops the agent with your code as soon as the page shows the wrong state. See [blocks](/reference/blocks).
 
-Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, `MISSING_TOTP_SOURCE`, `CREDENTIAL_LOGIN_UNCONFIRMED`, and `CREDENTIAL_ACCOUNT_LOCKED`.
-
-A rejected login with a stored credential can be reported as `CREDENTIAL_LOGIN_UNCONFIRMED` or `CREDENTIAL_ACCOUNT_LOCKED` instead of your own code. Handle both anywhere you branch, retry or filter on login failures.
+Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, and `MISSING_TOTP_SOURCE`.
 
 ### Failure categories
 

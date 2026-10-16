@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from _pytest.monkeypatch import NOTSET, derive_importpath
+from structlog._config import BoundLoggerLazyProxy
 
 from skyvern.config import settings
 from skyvern.forge import app, forge_app_initializer, request_logging
@@ -22,6 +24,38 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.services import organization_log_scope
+
+_monkeypatch_setattr = pytest.MonkeyPatch.setattr
+_monkeypatch_undo = pytest.MonkeyPatch.undo
+
+
+def _setattr_tracking_resolved_logger_methods(
+    self: pytest.MonkeyPatch,
+    target: str | object,
+    name: object | str,
+    value: object = NOTSET,
+    raising: bool = True,
+) -> None:
+    if isinstance(target, str) and value is NOTSET:
+        attr, obj = derive_importpath(target, raising)
+    else:
+        attr, obj = name, target
+    # A lazy proxy resolves log methods on every access, so a name missing from its instance dict means undo would
+    # pin the method it resolved now to the processors of this moment.
+    if isinstance(obj, BoundLoggerLazyProxy) and isinstance(attr, str) and attr not in vars(obj):
+        self.__dict__.setdefault("_resolved_logger_methods", []).append((obj, attr))
+    _monkeypatch_setattr(self, target, name, value, raising)
+
+
+def _undo_without_stranding_logger_methods(self: pytest.MonkeyPatch) -> None:
+    resolved: list[tuple[BoundLoggerLazyProxy, str]] = self.__dict__.pop("_resolved_logger_methods", [])
+    _monkeypatch_undo(self)
+    for proxy, attr in resolved:
+        vars(proxy).pop(attr, None)
+
+
+pytest.MonkeyPatch.setattr = _setattr_tracking_resolved_logger_methods  # type: ignore[method-assign,assignment]
+pytest.MonkeyPatch.undo = _undo_without_stranding_logger_methods  # type: ignore[method-assign]
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -165,7 +199,12 @@ def ai_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None], 
         app.DATABASE.workflow_runs,
         "get_workflow_run",
         AsyncMock(
-            return_value=SimpleNamespace(copilot_session_id=None, is_debug_session=False, parent_workflow_run_id=None)
+            return_value=SimpleNamespace(
+                ai_fallback=None,
+                copilot_session_id=None,
+                is_debug_session=False,
+                parent_workflow_run_id=None,
+            )
         ),
     )
 
@@ -186,6 +225,7 @@ def ai_fallback_on_in_an_ordinary_run(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def copilot_workflow_toggle_off() -> SimpleNamespace:
     return SimpleNamespace(
+        ai_fallback=True,
         enable_self_healing=False,
         created_by="copilot",
         edited_by=None,
