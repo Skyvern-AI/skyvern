@@ -10,6 +10,7 @@ from skyvern.services.script_service import (
     _append_to_loop_output,
     _filter_downloaded_files_for_current_iteration,
     _to_downloaded_file_signature,
+    execute_script,
     load_scripts,
 )
 
@@ -250,9 +251,9 @@ def test_to_downloaded_file_signature_strips_fragment_without_query() -> None:
 async def test_load_scripts_omits_a_path_it_could_not_write(tmp_path: Path) -> None:
     """The caller gates on this set, so empty content must not be reported as written -- otherwise a
     stale copy from an earlier run gets loaded as if it were this revision's code."""
-    script = MagicMock(script_id="s_1", organization_id="o_1")
+    script = MagicMock(script_id="s_1", script_revision_id="sr_1", organization_id="o_1")
     script_file = MagicMock(artifact_id="a_1", file_path="main.py", mime_type="text/x-python")
-    stale = tmp_path / "s_1" / "main.py"
+    stale = tmp_path / "s_1" / "sr_1" / "main.py"
     stale.parent.mkdir(parents=True)
     stale.write_text("print('code the retention sweep already deleted')")
 
@@ -268,6 +269,29 @@ async def test_load_scripts_omits_a_path_it_could_not_write(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_execute_script_does_not_schedule_an_old_revision_main(
+    tmp_path: Path,
+) -> None:
+    script = MagicMock(script_id="s_1", script_revision_id="sr_current", organization_id="o_1")
+    stale_main = tmp_path / "s_1" / "sr_old" / "main.py"
+    stale_main.parent.mkdir(parents=True)
+    stale_main.write_text("raise AssertionError('old revision')")
+    background_tasks = MagicMock()
+
+    with (
+        patch("skyvern.services.script_service.settings.TEMP_PATH", str(tmp_path)),
+        patch("skyvern.services.script_service.app") as mock_app,
+        patch("skyvern.services.script_service.load_scripts", new_callable=AsyncMock, return_value=set()),
+    ):
+        mock_app.DATABASE.scripts.get_script = AsyncMock(return_value=script)
+        mock_app.DATABASE.scripts.get_script_files = AsyncMock(return_value=[])
+        with pytest.raises(Exception, match="Script main.py not found"):
+            await execute_script("s_1", "o_1", background_tasks=background_tasks)
+
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_load_scripts_leaves_an_existing_local_copy_alone_when_the_fetch_returns_nothing(
     tmp_path: Path,
 ) -> None:
@@ -275,9 +299,9 @@ async def test_load_scripts_leaves_an_existing_local_copy_alone_when_the_fetch_r
     deletion -- download_file returns None on both paths -- so this layer cannot tell them apart.
     Gating on the written set rather than deleting means a transient failure costs this run its
     cached code without destroying the copy for the next one."""
-    script = MagicMock(script_id="s_1", organization_id="o_1")
+    script = MagicMock(script_id="s_1", script_revision_id="sr_1", organization_id="o_1")
     script_file = MagicMock(artifact_id="a_1", file_path="main.py", mime_type="text/x-python")
-    cached = tmp_path / "s_1" / "main.py"
+    cached = tmp_path / "s_1" / "sr_1" / "main.py"
     cached.parent.mkdir(parents=True)
     cached.write_text("print('a perfectly good cached script')")
 
@@ -295,7 +319,7 @@ async def test_load_scripts_leaves_an_existing_local_copy_alone_when_the_fetch_r
 
 @pytest.mark.asyncio
 async def test_load_scripts_reports_a_path_it_did_write(tmp_path: Path) -> None:
-    script = MagicMock(script_id="s_2", organization_id="o_1")
+    script = MagicMock(script_id="s_2", script_revision_id="sr_2", organization_id="o_1")
     script_file = MagicMock(artifact_id="a_1", file_path="main.py", mime_type="text/x-python")
 
     with (
@@ -306,5 +330,5 @@ async def test_load_scripts_reports_a_path_it_did_write(tmp_path: Path) -> None:
         mock_app.ARTIFACT_MANAGER.retrieve_artifact = AsyncMock(return_value=b"print('fresh')")
         written = await load_scripts(script, [script_file])
 
-    target = tmp_path / "s_2" / "main.py"
+    target = tmp_path / "s_2" / "sr_2" / "main.py"
     assert str(target) in written and target.read_text() == "print('fresh')"

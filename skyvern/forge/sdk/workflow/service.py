@@ -1519,6 +1519,17 @@ async def _load_user_script_module(
         return None
     loaded_script_module = importlib.util.module_from_spec(spec)
     try:
+        script_service._validate_stored_script_sources(script_path)
+    except Exception as exc:
+        LOG.warning(
+            "Refusing to load unsafe stored script body",
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+            reason="safety_validation_failed",
+            error_type=type(exc).__name__,
+        )
+        return None
+    try:
         spec.loader.exec_module(loaded_script_module)
     except Exception:
         LOG.warning("exec_module failed for stored script body", script_path=script_path, exc_info=True)
@@ -8139,10 +8150,10 @@ class WorkflowService:
                     )
                     written_paths = await script_service.load_scripts(script, script_files)
 
-                    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
-                    # Gate on what this run wrote, not on what is on disk. TEMP_PATH is reused
-                    # across runs and keyed by script_id rather than revision, so an earlier run's
-                    # copy can outlive the code it came from and make os.path.exists lie.
+                    script_path = os.path.join(
+                        settings.TEMP_PATH, script.script_id, script.script_revision_id, "main.py"
+                    )
+                    # A revision-scoped path still needs a load-time gate when artifact retrieval fails.
                     if script_path in written_paths:
                         # setup script run
                         parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
@@ -8213,6 +8224,7 @@ class WorkflowService:
                                     "Script module failed to load, blocks will fall back to agent",
                                     script_id=script.script_id,
                                 )
+                                script_blocks_by_label = {}
                     else:
                         # This run has no code for the script: either the revision's stored code
                         # is gone, or the fetch failed. Either way every run_signature would resolve

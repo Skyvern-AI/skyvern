@@ -66,6 +66,9 @@ BLOCKED_ATTRS: frozenset[str] = frozenset(
         "co_consts",
         "co_names",
         "co_varnames",
+        "CodeType",
+        "FunctionType",
+        "LambdaType",
         "gi_frame",
         "gi_code",
         "cr_frame",
@@ -104,7 +107,7 @@ SANDBOX_MODULES_GLOBAL = "__codeblock_modules__"
 ALLOWED_SCRIPT_ATTRS: frozenset[str] = frozenset(
     {"format", "listdir", "makedirs", "rmdir", "stderr", "stdin", "stdout"}
 )
-BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle"}
+BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle", "sys"}
 BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
     {
         "antigravity",
@@ -135,9 +138,11 @@ BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
         "site",
         "socket",
         "subprocess",
+        "sys",
         "thread",
         "timeit",
         "trace",
+        "types",
         "webbrowser",
         "zipfile",
         "zipimport",
