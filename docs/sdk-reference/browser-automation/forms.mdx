@@ -34,10 +34,15 @@ await page.fill_form(data: dict[str, Any], *, prompt: str = 'Fill out the form')
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `data` | — | `dict[str, Any]` | Yes | — | Dict of data keys/values to fill into the form. |
-| `prompt` | — | `str` | No | `'Fill out the form'` | User instructions for how to fill the form. |
+<ParamField path={"data"} type={"dict[str, Any]"} required>
+Dict of data keys/values to fill into the form.
+</ParamField>
+
+<ParamField path={"prompt"} type={"str"}>
+User instructions for how to fill the form.
+
+Default: `'Fill out the form'`
+</ParamField>
 
 **Returns** `None`
 
@@ -93,14 +98,37 @@ await page.fill_multipage_form(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `data` | — | `dict[str, Any]` | Yes | — | Dict of data keys/values to fill into the form. |
-| `prompt` | — | `str` | No | `'Fill out the form'` | User instructions for how to fill the form. |
-| `next_button` | — | `str` | No | `'button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")'` | CSS selector(s) for the next/continue button. |
-| `max_pages` | — | `int` | No | `10` | Safety limit on number of pages to fill. |
-| `timeout_seconds` | — | `float` | No | `300` | Wall-clock timeout for the entire multi-page fill (default 5 min). |
-| `debug_dir` | — | `str \| None` | No | `None` |  |
+<ParamField path={"data"} type={"dict[str, Any]"} required>
+Dict of data keys/values to fill into the form.
+</ParamField>
+
+<ParamField path={"prompt"} type={"str"}>
+User instructions for how to fill the form.
+
+Default: `'Fill out the form'`
+</ParamField>
+
+<ParamField path={"next_button"} type={"str"}>
+CSS selector(s) for the next/continue button.
+
+Default: `'button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")'`
+</ParamField>
+
+<ParamField path={"max_pages"} type={"int"}>
+Safety limit on number of pages to fill.
+
+Default: `10`
+</ParamField>
+
+<ParamField path={"timeout_seconds"} type={"float"}>
+Wall-clock timeout for the entire multi-page fill (default 5 min).
+
+Default: `300`
+</ParamField>
+
+<ParamField path={"debug_dir"} type={"str | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `int`
 
@@ -199,13 +227,19 @@ await page.dynamic_field_map(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
-| `data` | — | `dict[str, Any]` | Yes | — | Flat dict of data keys/values to map to form fields. |
-| `prompt` | — | `str \| None` | No | `None` |  |
+<ParamField path={"form_fields"} type={"list[dict[str, Any]]"} required>
+Output of `extract_form_fields`.
+</ParamField>
 
-**Returns** `dict[int, str \| list \| bool \| None]` — Mapping of 0-based field index -&gt; value to fill (or None to skip).
+<ParamField path={"data"} type={"dict[str, Any]"} required>
+Flat dict of data keys/values to map to form fields.
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Default: `None`
+</ParamField>
+
+**Returns** `dict[int, str | list | bool | None]` — Mapping of 0-based field index -&gt; value to fill (or None to skip).
 
 **Example**
 
@@ -257,11 +291,19 @@ await page.fill_from_mapping(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
-| `mapping` | — | `dict[int, str \| list \| bool \| None]` | Yes | — | Output of `dynamic_field_map` (index -&gt; value). |
-| `data` | — | `dict[str, Any] \| None` | No | `None` | Original data dict for post-fill file upload matching. |
+<ParamField path={"form_fields"} type={"list[dict[str, Any]]"} required>
+Output of `extract_form_fields`.
+</ParamField>
+
+<ParamField path={"mapping"} type={"dict[int, str | list | bool | None]"} required>
+Output of `dynamic_field_map` (index -&gt; value).
+</ParamField>
+
+<ParamField path={"data"} type={"dict[str, Any] | None"}>
+Original data dict for post-fill file upload matching.
+
+Default: `None`
+</ParamField>
 
 **Returns** `None`
 
@@ -317,11 +359,17 @@ await page.validate_mapping(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `form_fields` | — | `list[dict[str, Any]]` | Yes | — | Output of `extract_form_fields`. |
-| `mapping` | — | `dict[int, str \| list \| bool \| None]` | Yes | — | Output of `dynamic_field_map`. |
-| `prompt` | — | `str \| None` | Yes | — | The user's instructions/prompt for this automation. |
+<ParamField path={"form_fields"} type={"list[dict[str, Any]]"} required>
+Output of `extract_form_fields`.
+</ParamField>
+
+<ParamField path={"mapping"} type={"dict[int, str | list | bool | None]"} required>
+Output of `dynamic_field_map`.
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"} required>
+The user's instructions/prompt for this automation.
+</ParamField>
 
 **Returns** `bool` — True to complete, False to terminate.
 
@@ -390,14 +438,41 @@ await page.fill_autocomplete(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str \| None` | No | `None` | CSS selector for the input field. |
-| `value` | — | `str \| None` | No | `None` | The text to type (e.g. "San Francisco, CA"). |
-| `prompt` | — | `str \| None` | No | `None` | Natural language description for AI fallback. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode (same as fill). Defaults to "fallback". |
-| `option_selector` | — | `str \| None` | No | `None` | CSS selector for the dropdown options. If not provided, tries common patterns: `[role="option"]`, `.pac-item`, `li[role="option"]`, `[data-option-id]`. |
-| `wait_seconds` | — | `float` | No | `1.5` | How long to wait for dropdown options to appear after typing. Defaults to 1.5 seconds. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the input field.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The text to type (e.g. "San Francisco, CA").
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description for AI fallback.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode (same as fill). Defaults to "fallback".
+
+Default: `'fallback'`
+</ParamField>
+
+<ParamField path={"option_selector"} type={"str | None"}>
+CSS selector for the dropdown options. If not provided, tries common patterns: `[role="option"]`, `.pac-item`, `li[role="option"]`, `[data-option-id]`.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"wait_seconds"} type={"float"}>
+How long to wait for dropdown options to appear after typing. Defaults to 1.5 seconds.
+
+Default: `1.5`
+</ParamField>
 
 **Returns** `str` — The value that was selected from the dropdown, or the typed value if no dropdown appeared.
 

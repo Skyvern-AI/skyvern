@@ -83,7 +83,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    content: dict[str, str | None] = {"detail": exc.message}
+    if exc.error_code is not None:
+        content["error_code"] = exc.error_code
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 async def db_unavailable_handler(

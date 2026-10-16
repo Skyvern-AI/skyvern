@@ -36,10 +36,15 @@ skyvern.getRunArtifacts(runId: string, request?: GetRunArtifactsRequest): Promis
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `run_id` | `runId` | `str` | Yes | — | The id of the task run or the workflow run. |
-| `artifact_type` | `artifact_type` | `ArtifactType \| Sequence[ArtifactType] \| None` | No | `None` |  |
+<ParamField path={"run_id"} type={"str"} required>
+The id of the task run or the workflow run.
+
+TypeScript: `runId`
+</ParamField>
+
+<ParamField path={"artifact_type"} type={"ArtifactType | Sequence[ArtifactType] | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `list[Artifact]` · TypeScript `Promise<Artifact[]>`
 
@@ -115,11 +120,11 @@ skyvern.artifacts.getArtifactContent(artifactId: string): Promise<unknown>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `artifact_id` | `artifactId` | `str` | Yes | — |  |
+<ParamField path={"artifact_id"} type={"str"} required>
+TypeScript: `artifactId`
+</ParamField>
 
-**Returns** `Any \| None` · TypeScript `Promise<unknown>` — Raw artifact content
+**Returns** `Any | None` · TypeScript `Promise<unknown>` — Raw artifact content
 
 **Example**
 

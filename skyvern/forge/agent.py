@@ -2255,7 +2255,9 @@ class ForgeAgent:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
-            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            unusable = unusable_browser_session_error(
+                browser_session, refused_at_submission=True, submission_path="task_v1"
+            )
             if unusable is not None:
                 raise unusable
 
