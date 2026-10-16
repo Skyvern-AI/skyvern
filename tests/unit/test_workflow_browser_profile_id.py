@@ -723,6 +723,7 @@ def _make_workflow_update_service(
         pin_saved_session_ip=existing_pin_saved_session_ip,
         webhook_callback_url=existing_webhook_callback_url,
         created_by=existing_created_by,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
     updated_workflow = SimpleNamespace(

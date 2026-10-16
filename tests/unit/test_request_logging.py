@@ -622,6 +622,14 @@ class TestSanitizeBody:
         result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
         assert result == REDACTED
 
+    @pytest.mark.parametrize("path", ["/api/v1/skyplane/authority/session", "/api/v1/skyplane/authority/feedback"])
+    def test_skyplane_authority_request_and_response_are_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = '{"job_capability":"cap-secret","summary":"customer text","details":"more customer text"}'
+
+        assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+        assert _sanitize_response_body(request, body, "application/json") == REDACTED
+
     def test_non_sensitive_endpoint_request_preserved(self) -> None:
         request = _make_request("GET", "/v1/tasks")
         result = _sanitize_body(request, b'{"user": "alice"}', "application/json")

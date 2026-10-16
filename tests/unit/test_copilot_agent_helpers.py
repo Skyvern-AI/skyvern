@@ -7727,7 +7727,6 @@ class TestCopilotConfig:
             pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
             pytest.param(RuntimeError("provider unavailable"), id="failed"),
             pytest.param(CopilotTotalTimeoutError(), id="reply_timed_out"),
-            pytest.param(asyncio.CancelledError(), id="user_stopped_during_reply"),
         ],
     )
     async def test_budget_expiry_reply_that_fails_keeps_the_typed_no_report_fact(
@@ -7748,6 +7747,26 @@ class TestCopilotConfig:
         assert outcome.terminal_reason == "timeout"
         assert outcome.budget_expiry_report_produced is False
         assert outcome.tool_calls == ["update_and_run_blocks"]
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_budget_expiry_reply_is_saved_as_a_stop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._record_run_still_going(monkeypatch)
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            asyncio.CancelledError(),
+            attempts=(_EnforcementAttempt(error=CopilotTotalTimeoutError()),),
+            during_attempt=self._hit_hard_backstop,
+        )
+
+        assert run.result.cancelled is True
+        assert run.result.user_response == ""
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expired is True
+        assert outcome.budget_expiry_report_produced is None
 
     @staticmethod
     def _withheld_reply(*reason_codes: OutputPolicyReason, user_response: str = "") -> OutputGuardrailTripwireTriggered:
