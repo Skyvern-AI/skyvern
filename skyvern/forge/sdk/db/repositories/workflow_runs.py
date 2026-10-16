@@ -924,6 +924,7 @@ class WorkflowRunsRepository(BaseRepository):
                 workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
+                setup_completed=trigger_type != WorkflowRunTriggerType.event,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
@@ -1077,6 +1078,7 @@ class WorkflowRunsRepository(BaseRepository):
         started_at: datetime | None | object = _UNSET,
         queued_at: datetime | None | object = _UNSET,
         finished_at: datetime | None | object = _UNSET,
+        setup_completed: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
@@ -1085,6 +1087,8 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.with_for_update().execution_options(populate_existing=True)
             workflow_run = (await session.scalars(query)).first()
             if workflow_run:
+                if setup_completed is not None:
+                    workflow_run.setup_completed = setup_completed
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:

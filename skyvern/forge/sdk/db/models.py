@@ -989,6 +989,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
+    setup_completed = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     task_queue = Column(String, nullable=True)
     target_cluster = Column(String, nullable=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
