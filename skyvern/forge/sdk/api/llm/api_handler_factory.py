@@ -1891,19 +1891,27 @@ class LLMAPIHandlerFactory:
             return None
 
     @staticmethod
-    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
-        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
-        default for its non-flex twin when `trigger_type` is manual-like."""
+    def resolve_non_flex_llm_key_for_manual_run(llm_key: str | None) -> str | None:
+        """Return a registered non-flex twin for a manual-like run, or None."""
         ctx = skyvern_context.current()
         if ctx is None or not is_manual_like_workflow_run_trigger_type(ctx.trigger_type):
             return None
+        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(llm_key)
+        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+            return None
+        return non_flex_key
+
+    @staticmethod
+    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
+        default for its non-flex twin when `trigger_type` is manual-like."""
         effective_key = (
             getattr(default, "llm_key", None)
             or getattr(getattr(default, "__self__", None), "llm_key", None)
             or settings.LLM_KEY
         )
-        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(effective_key)
-        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+        non_flex_key = LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(effective_key)
+        if not non_flex_key:
             return None
         try:
             non_flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(non_flex_key)
