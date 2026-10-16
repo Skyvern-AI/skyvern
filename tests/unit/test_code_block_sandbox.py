@@ -3061,6 +3061,11 @@ class TestIsSafeCodeClassStatements:
     def test_script_path_keeps_metaclass_support(self) -> None:
         is_safe_script_code("class Weird(metaclass=type):\n    pass")
 
+    @pytest.mark.parametrize("code", ["import sys", "import asyncio\nvalue = asyncio.sys"])
+    def test_script_cannot_access_sys_module(self, code: str) -> None:
+        with pytest.raises(InsecureCodeDetected, match="sys"):
+            is_safe_script_code(code)
+
 
 class TestCodeBlockMagicLink:
     """SKY-14056: a credential can request an emailed sign-in link and open it."""
