@@ -46,6 +46,11 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.utils.document import get_main_document_loader_id
+from skyvern.webeye.utils.flutter_semantics import (
+    FlutterSemanticsState,
+    SemanticsActivation,
+    activate_flutter_semantics,
+)
 from skyvern.webeye.utils.page import SkyvernFrame, load_js_script, with_dom_utils
 
 if TYPE_CHECKING:
@@ -55,7 +60,7 @@ LOG = structlog.get_logger()
 
 
 async def build_scraping_failed_reason(
-    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False
+    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False, canvas_app: bool = False
 ) -> str:
     """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
 
@@ -78,6 +83,12 @@ async def build_scraping_failed_reason(
         base = (
             "Skyvern hit a page-analysis timeout while loading the website. "
             "The page took too long to load or become responsive during analysis."
+        )
+    elif canvas_app:
+        # Keeps "failed to load the website" as a substring: the page-load log filter and reports still match on it.
+        base = (
+            "Skyvern failed to load the website's controls. The page loaded, but it draws its interface on a "
+            "canvas and its accessibility tree did not come up, so there was nothing on it Skyvern could read."
         )
     else:
         base = (
@@ -389,7 +400,10 @@ async def scrape_website(
             else:
                 raise ScrapingFailed(
                     reason=await build_scraping_failed_reason(
-                        browser_state, url, timed_out=_scrape_timed_out(browser_state, e)
+                        browser_state,
+                        url,
+                        timed_out=_scrape_timed_out(browser_state, e),
+                        canvas_app=isinstance(e, NoElementFound) and e.canvas_app,
                     )
                 ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
@@ -590,23 +604,43 @@ async def scrape_web_unsafe(
 
     document_loader_id_before = await get_main_document_loader_id(page)
 
-    elements, element_tree, destinations = await get_interactable_element_tree(
-        page,
-        scrape_exclude,
-        must_included_tags,
-        engine_selection=browser_state.engine_selection,
-    )
-    empty_page_retry = False
-    if not elements and not support_empty_page:
-        LOG.warning("No elements found on the page, wait and retry")
-        await empty_page_retry_wait()
-        empty_page_retry = True
+    async def read_tree() -> tuple[list[dict], list[dict], dict[str, dict], FlutterSemanticsState]:
+        flutter_state = FlutterSemanticsState()
         elements, element_tree, destinations = await get_interactable_element_tree(
             page,
             scrape_exclude,
             must_included_tags,
             engine_selection=browser_state.engine_selection,
+            flutter_state=flutter_state,
         )
+        return elements, element_tree, destinations, flutter_state
+
+    async def enable_semantics(flutter_state: FlutterSemanticsState) -> SemanticsActivation | None:
+        # Keyed on the placeholder rather than on what was listed: banners, host controls and child frames can all be
+        # readable while the app itself is not.
+        if not flutter_state.needs_activation:
+            return None
+        return await activate_flutter_semantics(skyvern_frame)
+
+    elements, element_tree, destinations, flutter_state = await read_tree()
+    activation = await enable_semantics(flutter_state)
+    if activation is not None and activation.reading_stale:
+        # Switching on can rewrite the URL (an app's hash routing), and the reading must carry the URL it was taken at.
+        url = page.url
+        elements, element_tree, destinations, flutter_state = await read_tree()
+    empty_page_retry = False
+    # An activation never stands in for this wait: an app that draws its tree after the activation's budget is read
+    # here, where skipping ahead would reach the reload that switches its semantics off again.
+    if not elements and not support_empty_page:
+        LOG.warning("No elements found on the page, wait and retry")
+        await empty_page_retry_wait()
+        empty_page_retry = True
+        elements, element_tree, destinations, flutter_state = await read_tree()
+        # An app that mounted during the wait shows its placeholder only now.
+        activation = await enable_semantics(flutter_state)
+        if activation is not None and activation.reading_stale:
+            url = page.url
+            elements, element_tree, destinations, flutter_state = await read_tree()
 
     element_tree = await cleanup_element_tree(page, url, _deepcopy_element_tree(element_tree))
     element_tree_trimmed = trim_element_tree(_deepcopy_element_tree(element_tree))
@@ -694,7 +728,7 @@ async def scrape_web_unsafe(
 
     # if there are no elements, fail the scraping unless support_empty_page is True
     if not elements and not support_empty_page:
-        raise NoElementFound()
+        raise NoElementFound(canvas_app=flutter_state.tree_missing)
 
     text_content = await get_frame_text(page.main_frame, scrape_exclude)
 
@@ -906,17 +940,20 @@ async def get_interactable_element_tree(
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
     engine_selection: "BrowserEngineSelection | None" = None,
+    *,
+    flutter_state: FlutterSemanticsState | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
+    :param flutter_state: filled in with what the main frame showed of a Flutter app, when given.
     :return: Tuple of the interactable elements, the element tree, and the per-element
         destination-facts sidecar stripped out of them at the SkyvernFrame boundary.
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
     elements, element_tree, destinations = await skyvern_page.build_tree_from_body(
-        frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
+        frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags, flutter_state=flutter_state
     )
 
     context = skyvern_context.ensure_context()

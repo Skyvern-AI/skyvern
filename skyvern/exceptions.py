@@ -1984,7 +1984,9 @@ class NoTOTPSecretFound(SkyvernException):
 
 
 class NoElementFound(SkyvernException):
-    def __init__(self) -> None:
+    def __init__(self, *, canvas_app: bool = False) -> None:
+        # Set when the page is an app that draws its interface on a canvas: it loaded, it just exposed nothing to read.
+        self.canvas_app = canvas_app
         super().__init__("No element found.")
 
 
