@@ -49,6 +49,7 @@ from skyvern.webeye.browser_runtime_events import (
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
+from skyvern.webeye.utils.flutter_semantics import FLUTTER_STATE_JS, FlutterSemanticsState
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
@@ -2939,6 +2940,8 @@ class SkyvernFrame:
         frame_index: int,
         must_included_tags: list[str] | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+        *,
+        flutter_state: FlutterSemanticsState | None = None,
     ) -> tuple[list[dict], list[dict], dict[str, dict]]:
         must_included_tags = must_included_tags or []
         # Capture is flag-gated so a disabled-mode build does no destination-fact work on any page
@@ -2947,10 +2950,22 @@ class SkyvernFrame:
         # unconditional: it is protection against a hostile wrapper injecting the key, not capture
         # cost.
         capture_destination_facts = policy_observation_enabled()
+        build_call = "await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
+        if flutter_state is not None:
+            # Read in the same evaluate as the tree, so knowing whether the page is a Flutter app costs no round trip.
+            build_call = (
+                f"((tree) => Array.isArray(tree) ? [tree[0], tree[1], {FLUTTER_STATE_JS}] : tree)({build_call})"
+            )
         js_script = with_dom_utils(
-            "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)",
+            f"async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => {build_call}",
             ("buildTreeFromBody",),
         )
+
+        def split_flutter_state(result: Any) -> Any:
+            if flutter_state is not None and isinstance(result, (list, tuple)) and len(result) == 3:
+                flutter_state.record(result[2])
+                return result[:2]
+            return result
 
         # One monotonic budget across the flag write, both build attempts and the re-injection
         # between them -- as _evaluate_with_navigation_recovery does -- so the retry cannot double
@@ -2973,7 +2988,7 @@ class SkyvernFrame:
                 deadline=deadline,
             )
 
-        tree = _as_element_tree_pair(await build())
+        tree = _as_element_tree_pair(split_flutter_state(await build()))
         if tree is None:
             # Re-bootstrap once for a malformed tree result; missing helpers are prepared before build().
             LOG.warning(
@@ -2987,7 +3002,7 @@ class SkyvernFrame:
                 timeout_ms=remaining_ms(),
                 deadline=deadline,
             )
-            retried = await build()
+            retried = split_flutter_state(await build())
             tree = _as_element_tree_pair(retried)
             if tree is None:
                 raise ElementTreeBuildFailed(returned=_describe_non_pair(retried))

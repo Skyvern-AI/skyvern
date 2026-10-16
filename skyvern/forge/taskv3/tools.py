@@ -123,7 +123,18 @@ from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_time
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
-from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
+from skyvern.webeye.utils.flutter_semantics import (
+    FLUTTER_STATE_JS,
+    FlutterSemanticsState,
+    SemanticsActivation,
+    activate_flutter_semantics,
+)
+from skyvern.webeye.utils.page import (
+    OTP_INPUT_PRIVACY_JS,
+    OTP_SAFE_FRAGMENT_HTML_JS,
+    SkyvernFrame,
+    mask_otp_values_in_html,
+)
 
 if TYPE_CHECKING:
     # opaque_refs imports auth_tools which imports this module, so it can only be referenced for
@@ -10937,7 +10948,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -10954,6 +10965,7 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
         .replace("__OBSERVE_TEXT_DELTA__", _OBSERVE_TEXT_DELTA_JS, 1)
+        .replace("__OBSERVE_FLUTTER__", FLUTTER_STATE_JS, 1)
     )
 
 
@@ -12269,6 +12281,8 @@ class _Observation(NamedTuple):
     # Frames left out by the walk's own caps (count or depth), which is a different fact from a frame
     # that refused to be read and is disclosed separately.
     capped_frames: int = 0
+    # Whether this reading switched a canvas-drawn app's accessibility tree on, or found it still off after trying.
+    semantics: SemanticsActivation | None = None
 
 
 # Summed across realms: each is a count of something the reading gave up, and the model needs the
@@ -12850,6 +12864,46 @@ def build_browser_tools(
         return data, handles, after
 
     async def _read_observation(page: Any) -> _Observation:
+        """The page's reading, taken again whenever switching on a canvas-drawn app's accessibility tree may have
+        changed the page under the first one."""
+        observation = await _read_settled_observation(page)
+        first = FlutterSemanticsState.from_raw(observation.data.get("flutter"))
+        if not first.needs_activation:
+            return observation
+        keep_first = False
+        try:
+            activation = await activate_flutter_semantics(SkyvernFrame(frame=page))
+            if not activation.reading_stale:
+                keep_first = True
+                # Clicked earlier in this document, so the note says only what this reading shows.
+                return observation if first.tree else observation._replace(semantics=SemanticsActivation.NOT_ACTIVATED)
+            reading = await _read_settled_observation(page)
+        finally:
+            # Released here, even when the second read raises or is cancelled: the pairing step only ever
+            # sees the reading that is returned.
+            if not keep_first:
+                for discarded in observation.handles:
+                    if discarded is None:
+                        continue
+                    try:
+                        await discarded.dispose()
+                    except Exception:
+                        pass
+        # A realm whose numbering restarted on the first reading looks unchanged on the second, which would keep refs a
+        # reload made stale. Carried whatever document the second reading found: a restart reported that did not happen
+        # only renumbers that realm's refs.
+        refs_fresh = {
+            realm: fresh or observation.refs_fresh.get(realm, False) for realm, fresh in reading.refs_fresh.items()
+        }
+        if activation is SemanticsActivation.PLACEHOLDER_GONE:
+            return reading._replace(refs_fresh=refs_fresh)
+        state = FlutterSemanticsState.from_raw(reading.data.get("flutter"))
+        semantics = (
+            SemanticsActivation.ACTIVATED if state.tree and not state.placeholder else SemanticsActivation.NOT_ACTIVATED
+        )
+        return reading._replace(refs_fresh=refs_fresh, semantics=semantics)
+
+    async def _read_settled_observation(page: Any) -> _Observation:
         """One reading, retried once if a document was replaced while it was being assembled.
 
         A page or frame navigating across a read is ordinary; navigating across two consecutive reads is
@@ -13086,6 +13140,18 @@ def build_browser_tools(
             f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > OBSERVE_URL_MAX_CHARS else ""
         )
         lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        # Said either way: observe clicked the page to get this reading, and when that did not work the model would
+        # otherwise read the framework's placeholder as the page.
+        if observation.semantics is SemanticsActivation.ACTIVATED:
+            lines.append(
+                "note: this page draws its interface on a canvas; observe switched on its accessibility tree so its "
+                "controls could be listed"
+            )
+        elif observation.semantics is SemanticsActivation.NOT_ACTIVATED:
+            lines.append(
+                "note: this page draws its interface on a canvas and its accessibility tree did not come up, so its "
+                "controls are not listed; use look to see the page"
+            )
         hidden_kept = data.get("hiddenListed") or 0
         if hidden_kept:
             lines.append(
