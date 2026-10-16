@@ -138,8 +138,16 @@ class SkyvernClientException(SkyvernException):
 
 
 class SkyvernHTTPException(SkyvernException):
-    def __init__(self, message: str | None = None, status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST):
+    def __init__(
+        self,
+        message: str | None = None,
+        status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST,
+        error_code: str | None = None,
+    ):
         self.status_code = int(status_code)
+        # Serialized alongside `detail` only when set, so a caller can branch on the cause without
+        # matching on prose. Treat a code as a published contract once a response carries it.
+        self.error_code = error_code
         super().__init__(message)
 
 
@@ -1826,13 +1834,26 @@ REREGISTER_EXTERNAL_BROWSER = (
     "(POST /v1/browser_sessions/external) and pass the new id."
 )
 
+# HTTP error codes are separate from persisted failure_category reason codes, even where their values match.
+BROWSER_SESSION_EXPIRED_ERROR_CODE = "browser_session_expired"
+BROWSER_SESSION_CLOSED_ERROR_CODE = "browser_session_closed"
+BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE = "browser_session_startup_timeout"
+
 
 class BrowserSessionClosed(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str, *, reason: str | None = None, registered: bool = False) -> None:
+    def __init__(
+        self,
+        browser_session_id: str,
+        *,
+        reason: str | None = None,
+        registered: bool = False,
+        error_code: str = BROWSER_SESSION_CLOSED_ERROR_CODE,
+    ) -> None:
         remedy = REREGISTER_EXTERNAL_BROWSER if registered else "Create a new browser session and retry."
         super().__init__(
             f"Browser session {browser_session_id} {reason or 'is closed'}. {remedy}",
             status_code=HTTPStatus.GONE,
+            error_code=error_code,
         )
 
 
@@ -1865,11 +1886,17 @@ class BrowserSessionExpired(BrowserSessionClosed):
         self.bound = bound
         if refused_at_submission and not registered:
             SkyvernHTTPException.__init__(
-                self, self.expired_before_run_message(run_created=False), status_code=HTTPStatus.GONE
+                self,
+                self.expired_before_run_message(run_created=False),
+                status_code=HTTPStatus.GONE,
+                error_code=BROWSER_SESSION_EXPIRED_ERROR_CODE,
             )
         else:
             super().__init__(
-                browser_session_id, reason="expired after reaching its configured lifetime", registered=registered
+                browser_session_id,
+                reason="expired after reaching its configured lifetime",
+                registered=registered,
+                error_code=BROWSER_SESSION_EXPIRED_ERROR_CODE,
             )
 
     def expired_before_run_message(self, *, run_created: bool) -> str:
@@ -1940,8 +1967,10 @@ class BrowserSessionSwitchNotAllowed(SkyvernException):
 class BrowserSessionStartupTimeout(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
-            f"Browser session {browser_session_id} failed to start within the timeout period.",
+            f"Browser session {browser_session_id} failed to start within the timeout period. "
+            "Create a new browser session and retry with its id.",
             status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            error_code=BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE,
         )
 
 

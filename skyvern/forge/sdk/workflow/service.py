@@ -11822,7 +11822,9 @@ class WorkflowService:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
             # Nothing between here and the lease swaps or revives a caller's session, so a run sent to
             # one that has already ended can only fail; refuse it before a run row exists.
-            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            unusable = unusable_browser_session_error(
+                browser_session, refused_at_submission=True, submission_path="workflow_run"
+            )
             if unusable is not None:
                 raise unusable
             # Auto-propagate profile from session when not explicitly provided

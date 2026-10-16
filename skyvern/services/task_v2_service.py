@@ -371,7 +371,9 @@ async def initialize_task_v2(
         )
         if not browser_session:
             raise BrowserSessionNotFound(browser_session_id=browser_session_id)
-        unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+        unusable = unusable_browser_session_error(
+            browser_session, refused_at_submission=True, submission_path="task_v2"
+        )
         if unusable is not None:
             raise unusable
 
