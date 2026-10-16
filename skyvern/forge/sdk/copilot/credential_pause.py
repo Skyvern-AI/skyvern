@@ -811,7 +811,7 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
     return admitted_url
 
 
-def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
+def apply_connected_credential_to_policy(ctx: CopilotContext, policy: RequestPolicy, credential: Credential) -> None:
     """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
     (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
     raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn."""
@@ -1274,7 +1274,7 @@ async def _run_credential_pause(
         await answered("not_admitted")
         return resolution
     if isinstance(policy, RequestPolicy):
-        _apply_connected_credential_to_policy(ctx, policy, credential)
+        apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
     await answered("connected", credential)
     return replace(resolution, generated=True) if is_generated else resolution

@@ -46,7 +46,6 @@ from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiryState,
     RecordedBlockState,
     RecordedRunState,
-    budget_run_denial,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -3744,8 +3743,6 @@ async def _run_blocks_and_collect_debug(
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
-    if ctx.budget_expiry_state.drain_active:
-        return dict(budget_run_denial(ctx.budget_expiry_state))
     new_exit_prior_session_id = ctx.last_run_blocks_browser_session_id
     if new_exit and new_exit_prior_session_id is None:
         return {
@@ -7007,9 +7004,7 @@ def _is_undispatched_run(result: Mapping[str, object]) -> bool:
 def _skips_build_test_finalize(result: Mapping[str, object]) -> bool:
     data = result.get("data")
     return (
-        isinstance(data, dict)
-        and data.get("run_dispatched") is False
-        and (data.get("budget_expired") is True or data.get(_PROPOSAL_BIND_REFUSED_KEY) is True)
+        isinstance(data, dict) and data.get("run_dispatched") is False and data.get(_PROPOSAL_BIND_REFUSED_KEY) is True
     )
 
 

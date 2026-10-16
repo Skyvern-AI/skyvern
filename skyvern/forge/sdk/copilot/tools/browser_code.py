@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -15,7 +16,7 @@ from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from playwright.async_api import Page
 
-from skyvern.cli.core.session_manager import get_page
+from skyvern.cli.core.session_manager import get_page, resolve_browser
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.browser_code_contract import (
     DEMONSTRATED_OPERATIONS,
@@ -34,7 +35,11 @@ from skyvern.forge.sdk.copilot.browser_target import (
     last_run_facts,
     resolve_browser_session_binding,
 )
-from skyvern.forge.sdk.copilot.enforcement import HARD_BACKSTOP_ALLOWANCE_SECONDS, TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.enforcement import (
+    HARD_BACKSTOP_ALLOWANCE_SECONDS,
+    TOTAL_TIMEOUT_SECONDS,
+    pending_screenshot_entry,
+)
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     _browser_call_outcome_from_mapping,
@@ -57,11 +62,19 @@ from skyvern.forge.sdk.copilot.runtime import (
     effective_browser_session_id,
     mcp_browser_context,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import capturing_tool_call_id, withdraw_frame_captured_before
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_errors import BrowserAutomationError
 
+from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from .errors import reporting_withheld_browser
 from .guardrails import _authority_tool_error
-from .scouting import _mark_pending_browser_interaction_observation, _record_scouted_interaction
+from .scouting import (
+    _capture_post_interaction_screenshot,
+    _mark_pending_browser_interaction_observation,
+    _record_scouted_interaction,
+    _take_viewport_frame,
+)
 
 LOG = structlog.get_logger()
 
@@ -90,13 +103,19 @@ expression is returned as `value`; `print` output is returned as `stdout`.
 
 Browser API (async, Playwright-shaped):
 - `page` is the current tab. Locators: `page.locator(css)`, `page.get_by_role(role, name=...)`,
-  `get_by_text`, `get_by_label`, `get_by_placeholder`, `.first`, `.last`, `.nth(i)`, `.filter(...)`.
+  `get_by_text`, `get_by_label`, `get_by_placeholder`, `.first`, `.last`, `.nth(i)`, `.filter(...)`,
+  `.or_(other_locator)`.
 - Actions: `.click()`, `.fill(text)`, `.press(key)`, `.check()`, `.select_option(...)`, `.hover()`,
-  `page.keyboard.press(key)`.
+  `page.keyboard.press(key)`. `.click()` and `.press(key)` wait for a navigation they start until the new
+  page starts loading, not until it has loaded; the other actions, `page.keyboard.press`, and a navigation
+  the page's script starts later, such as after a timer or a network request, are not waited for.
 - Waits: `page.wait_for_selector(...)`, `page.wait_for_url(...)`, `page.wait_for_load_state(...)`,
-  `locator.wait_for(...)`.
+  `locator.wait_for(...)`. `wait_for_selector` and `locator.wait_for` keep polling while a navigation
+  replaces the page, until the element matches or the timeout ends.
 - DOM reads: `.text_content()`, `.inner_text()`, `.get_attribute(name)`, `.input_value()`, `.count()`,
-  `.is_visible()`, `page.content()`, `page.evaluate(js)`, `page.title()`, and `page.url`.
+  `.is_visible()`, `page.content()`, `page.evaluate(js)`, `page.title()`, and `page.url`. `.count()`
+  and `.is_visible()` answer once, for the page present at the call: while a navigation replaces it,
+  `.count()` raises `Execution context was destroyed` and `.is_visible()` returns False.
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
@@ -310,8 +329,17 @@ def _cell_payload(cell: BrowserCodeCellResult) -> dict[str, Any]:
 
 
 def _take_interruption_note(host: BrowserCodeHost) -> dict[str, Any]:
+    notes: dict[str, Any] = {}
+    unreturned = host.unreturned_cell
+    if unreturned is not None:
+        host.unreturned_cell = None
+        payload = _cell_payload(unreturned)
+        notes["previous_call_completed"] = {
+            "state": "the previous run_browser_code call finished; its result was not returned",
+            **{key: payload[key] for key in ("ok", "error_code", "current_url", "operations") if key in payload},
+        }
     if not host.interrupted:
-        return {}
+        return notes
     operation = host.interrupted_operation
     host.interrupted = False
     host.interrupted_operation = None
@@ -320,7 +348,8 @@ def _take_interruption_note(host: BrowserCodeHost) -> dict[str, Any]:
         note["last_operation"] = _operation_fact(operation)
         if operation.succeeded is None:
             note["page_after_call"] = "unknown: that operation reached the browser without a reply"
-    return {"previous_call_interrupted": note}
+    notes["previous_call_interrupted"] = note
+    return notes
 
 
 async def _discard_session(host: BrowserCodeHost) -> None:
@@ -539,6 +568,7 @@ async def _run_bound_cell(
         browser_evidence_commit_lock(copilot_ctx),
         browser_session_recovery(copilot_ctx),
     ):
+        cell_started = time.monotonic()
         notes = _take_interruption_note(host)
         session_to_reset = host.session if fresh_namespace else None
         browser_session_id = effective_browser_session_id(copilot_ctx)
@@ -583,6 +613,8 @@ async def _run_bound_cell(
                 cell = await _run_cell(host, session, code, timeout, deny_pixels=pixels_denied)
         except BrowserCodeSessionUnavailableError as exc:
             if exc.session_ended:
+                if entered_browser:
+                    withdraw_frame_captured_before(copilot_ctx, cell_started)
                 # Dropped now, or the retry this refusal asks for is spent rediscovering that the
                 # session is over, and only the call after that reopens one.
                 await _discard_session(host)
@@ -591,6 +623,8 @@ async def _run_bound_cell(
                 refusal["retry_after_seconds"] = exc.retry_after_seconds
             return finish(refusal)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
+            if entered_browser:
+                withdraw_frame_captured_before(copilot_ctx, cell_started)
             disposition = await _browser_session_error_disposition(
                 copilot_ctx, exc, tool_name=TOOL_NAME, call_path="model"
             )
@@ -661,12 +695,92 @@ async def _run_bound_cell(
                 if last.succeeded is None:
                     ended["page_after_call"] = "unknown: that operation reached the browser without a reply"
                 notes["session_ended_during_call"] = ended
-            await _discard_session(host)
-        result = finish(
-            {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
-        )
-        _record_outcome(copilot_ctx, cell, result, browser_session_id=browser_session_id, generation=generation)
+        try:
+            result = finish(
+                {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
+            )
+            _record_outcome(copilot_ctx, cell, result, browser_session_id=browser_session_id, generation=generation)
+            try:
+                await _stage_cell_frame(
+                    copilot_ctx,
+                    cell,
+                    session,
+                    browser_session_id=browser_session_id,
+                    session_id_override=binding.session_id_override,
+                    cell_started=cell_started,
+                )
+            finally:
+                if not cell.session_alive:
+                    await asyncio.shield(_discard_session(host))
+        except asyncio.CancelledError:
+            host.unreturned_cell = cell
+            raise
         return result
+
+
+async def _stage_cell_frame(
+    copilot_ctx: AgentContext,
+    cell: BrowserCodeCellResult,
+    session: BrowserCodeSession,
+    *,
+    browser_session_id: str | None,
+    session_id_override: str | None,
+    cell_started: float,
+) -> None:
+    started = time.monotonic()
+    staged = False
+    reason = "cancelled"
+    try:
+        # A session that ended under the cell, as a timeout ends it, can still have confirmed the tab it left.
+        page = session.confirmed_page
+        if page is None:
+            reason = "tab_unconfirmed" if cell.session_alive else "session_ended"
+        elif copilot_ctx.codeblock_redaction_parameters:
+            reason = "self_heal"
+        elif not copilot_ctx.supports_vision:
+            reason = "no_vision"
+        else:
+            try:
+                # A fresh lease, so a browser retired after the cell stops the capture instead of shooting a
+                # closing tab.
+                async with mcp_browser_context(copilot_ctx, session_id_override=session_id_override):
+                    # Checked here, not before the cell: a secret can reach this browser while the cell runs.
+                    if browser_session_id in copilot_ctx.secret_run_browser_session_ids:
+                        reason = "secret_run"
+                    elif page not in (await resolve_browser(session_id=browser_session_id))[0].pages:
+                        # The browser was replaced before this lease; its old tab can still answer a screenshot.
+                        reason = "browser_retired"
+                    else:
+                        frame = await _take_viewport_frame(
+                            copilot_ctx, timeout_seconds=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS, page=page
+                        )
+                        if frame is None:
+                            reason = "screenshot_failed"
+                        else:
+                            staged = await _capture_post_interaction_screenshot(
+                                copilot_ctx, source_tool=TOOL_NAME, captured_url=cell.current_url, frame=frame
+                            )
+                            reason = "staged" if staged else "not_staged"
+            except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable):
+                reason = "browser_retired"
+            except Exception as exc:
+                # The cell has already acted on the page; a failed picture must not turn its result into an error.
+                reason = f"capture_error:{type(exc).__name__}"
+    finally:
+        # Otherwise a frame from before this cell would reach the model as if this cell had produced it.
+        withdrawn = None if staged else withdraw_frame_captured_before(copilot_ctx, cell_started)
+        with contained_effect("record browser-code cell frame", tool_name=TOOL_NAME):
+            entry = pending_screenshot_entry(copilot_ctx) if staged else None
+            LOG.info(
+                "copilot_browser_code_cell_frame",
+                staged=staged,
+                reason=reason,
+                tool_call_id=capturing_tool_call_id(),
+                capture_id=entry.capture_id if entry else None,
+                capture_event_id=entry.capture_event_id if entry else None,
+                withdrawn_capture_id=withdrawn.capture_id if withdrawn else None,
+                capture_ms=round((time.monotonic() - started) * 1000),
+            )
 
 
 async def close_browser_code_session(copilot_ctx: AgentContext) -> None:

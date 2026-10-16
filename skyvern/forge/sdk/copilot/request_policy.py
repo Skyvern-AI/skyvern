@@ -392,7 +392,7 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
-async def _screen_raw_secret_safety(
+async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
     *,
@@ -897,7 +897,17 @@ class SteerMessageSiteURLSource:
     kind: Literal["steer_message"] = field(default="steer_message", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
+@dataclass(frozen=True)
+class DemonstrationNavigationSiteURLSource:
+    kind: Literal["demonstration_navigation"] = field(default="demonstration_navigation", init=False)
+
+
+SiteURLSource = (
+    UserMessageSiteURLSource
+    | QuestionResponseSiteURLSource
+    | SteerMessageSiteURLSource
+    | DemonstrationNavigationSiteURLSource
+)
 
 
 @dataclass(frozen=True)
@@ -1024,6 +1034,13 @@ class RequestPolicy:
             self.apply_raw_secret_redacted_draft()
             return
         _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
+
+    def project_demonstration_navigation(self, url: str) -> None:
+        _project_user_provided_sites(
+            self,
+            [_SiteURLText(text=url, source=DemonstrationNavigationSiteURLSource())],
+            reset=False,
+        )
 
     @property
     def raw_secret_redacted_draft(self) -> bool:
@@ -4901,7 +4918,7 @@ async def build_request_policy_trust_floor(
     selected_connected_account_id: str | None = None,
 ) -> RequestPolicy:
     del config
-    safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
+    safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
     # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it

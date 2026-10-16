@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    DemonstrationNavigationSiteURLSource,
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
@@ -454,6 +455,8 @@ def _log_fill_grant(
         source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
     elif isinstance(source, SteerMessageSiteURLSource):
         source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
+    elif isinstance(source, DemonstrationNavigationSiteURLSource):
+        source_fields = {"source_kind": source.kind}
     LOG.info(
         "copilot credential fill grant",
         route=route,
@@ -1328,7 +1331,7 @@ async def _submit_after_credential_fill(
     )
 
 
-async def _fill_credential_field_impl(
+async def fill_credential_field(
     copilot_ctx: AgentContext,
     selector: str,
     credential_id: str,

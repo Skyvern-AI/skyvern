@@ -44,7 +44,12 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url as workflow_target_url
 from skyvern.forge.sdk.copilot.config import AuthoringCapability, BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
+    BLOCK_RUNNING_TOOLS,
+    EDIT_BLOCK_AND_RUN_TOOL_NAME,
+    EDIT_BLOCK_TOOL_NAME,
     REPLY_TOOL_NAME,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+    UPDATE_WORKFLOW_TOOL_NAME,
     USER_FACING_REASON_PARAM,
     USER_FACING_REASON_SCHEMA,
     CopilotContext,
@@ -128,10 +133,7 @@ from skyvern.utils.yaml_loader import dump_workflow_yaml
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS as _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
-from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
-from ._shared import EDIT_BLOCK_AND_RUN_TOOL_NAME, EDIT_BLOCK_TOOL_NAME
 from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEILING_SECONDS
-from ._shared import UPDATE_AND_RUN_BLOCKS_TOOL_NAME, UPDATE_WORKFLOW_TOOL_NAME
 from ._shared import AdmittedOutputRead as AdmittedOutputRead
 from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
@@ -184,10 +186,12 @@ from .composition_capture import _same_inspect_target as _same_inspect_target
 from .credential_fill import _credential_fill_authority_error as _credential_fill_authority_error
 from .credential_fill import _credential_fill_prerequisite_error as _credential_fill_prerequisite_error
 from .credential_fill import (
-    _fill_credential_field_impl,
     _request_credential,
 )
 from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
+from .credential_fill import (
+    fill_credential_field,
+)
 from .credentials import (
     LIST_CREDENTIALS_MAX_PAGE_SIZE,
 )
@@ -2239,7 +2243,7 @@ async def fill_credential_field_tool(
         # Never fall back to the chat's browser: a credential filled there lands on a page the model did not name.
         return json.dumps({"ok": False, "error": binding.unavailable_reason, **binding.provenance()})
     with bound_call_browser_session(binding.session_id_override):
-        result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field, submit_selector)
+        result = await fill_credential_field(ctx.context, selector, credential_id, field, submit_selector)
     return json.dumps(scrub_secrets_from_structure(ctx.context, {**result, **binding.provenance()}))
 
 

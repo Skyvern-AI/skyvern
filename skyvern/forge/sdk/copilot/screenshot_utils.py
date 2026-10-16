@@ -124,10 +124,23 @@ def capturing_tool_call(tool_call_id: str | None) -> Iterator[None]:
         _capturing_tool_call_id.reset(token)
 
 
+def capturing_tool_call_id() -> str | None:
+    return _capturing_tool_call_id.get()
+
+
 @runtime_checkable
 class CarriesChatScreenshots(Protocol):
     pending_chat_screenshots: list[ChatScreenshotFrame]
     chat_screenshot_capture_ids: set[str]
+
+
+@runtime_checkable
+class CarriesPendingScreenshots(Protocol):
+    pending_screenshots: list[ScreenshotEntry]
+
+
+class CarriesPendingFrames(CarriesPendingScreenshots, Protocol):
+    pending_frame_lease: PendingFrameLease | None
 
 
 def screenshot_result_facts(
@@ -306,6 +319,17 @@ def enqueue_screenshot(
                 frames.pop(_BROWSER_ABLATION_MAX_SCREENSHOT_FRAMES // 2)
                 frames.append(frame)
     return True
+
+
+def withdraw_frame_captured_before(ctx: CarriesPendingFrames, cutoff: float) -> ScreenshotEntry | None:
+    """Drop the pending frame if it was captured before `cutoff`, releasing a lease on it, and return it."""
+    pending = ctx.pending_screenshots
+    if not pending or pending[0].captured_at >= cutoff:
+        return None
+    entry = pending.pop(0)
+    if ctx.pending_frame_lease is not None and ctx.pending_frame_lease.capture_event_id == entry.capture_event_id:
+        ctx.pending_frame_lease = None
+    return entry
 
 
 def consume_screenshot_artifact(result: dict[str, Any]) -> bytes | None:

@@ -1220,22 +1220,7 @@ class Block(BaseModel, abc.ABC):
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
         # to workflow_run_blocks.failure_reason and lifted onto the run, neither redacted downstream.
-        if failure_reason:
-            # Best-effort: this builder runs for every block result, including on paths that never
-            # start a ForgeApp, and a secret lookup must never be what turns a block result into a
-            # failure. Degrades to the unredacted reason, which is the pre-existing behaviour.
-            try:
-                context = skyvern_context.current()
-                block_run_id = context.workflow_run_id if context is not None else None
-                block_run_secrets = (
-                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(block_run_id)
-                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(block_run_id)
-                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-                )
-                if block_run_secrets:
-                    failure_reason = redact_secrets_from_text(failure_reason, block_run_secrets)
-            except Exception:
-                LOG.warning("failed to redact a block failure reason", exc_info=True)
+        failure_reason = _redact_run_secrets(failure_reason)
 
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -5076,11 +5061,12 @@ class _StagedFrame(NamedTuple):
 
 @dataclass
 class _HealAttemptTrace:
-    """Carries the recovery task id and pinned credential key back to the episode writer, which runs
-    after the attempt returns."""
+    """Carries the recovery task id, pinned credential key and the recovery's own failure sentence back to
+    the episode writer, which runs after the attempt returns."""
 
     escalation_task_id: str | None = None
     credential_parameter_key: str | None = None
+    recovery_failure_reason: str | None = None
 
 
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
@@ -5401,6 +5387,26 @@ def _context_navigation_output(
         return {}
     context = replace(receipt, relation="context")
     return {"associated_navigation": associated_navigation_output(context, workflow_run_context, parameters)}
+
+
+def _redact_run_secrets(text: str | None) -> str | None:
+    if not text:
+        return text
+    # Best-effort: every block result passes through here, including on paths that never start a ForgeApp,
+    # and a secret lookup must never be what turns a block result into a failure. Degrades to the
+    # unredacted text, which is the pre-existing behaviour.
+    try:
+        context = skyvern_context.current()
+        run_id = context.workflow_run_id if context is not None else None
+        run_secrets = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(run_id)
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(run_id)
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+        )
+        return redact_secrets_from_text(text, run_secrets) if run_secrets else text
+    except Exception:
+        LOG.warning("failed to redact a block failure reason", exc_info=True)
+        return text
 
 
 def _redact_codeblock_failure_text(
@@ -7998,11 +8004,21 @@ async def wrapper({default_args}):
         trace: _HealAttemptTrace | None = None,
         failed_nav_error_code: str | None = None,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         resolved_redaction_parameters = redaction_parameters or {}
+
+        def block_failure_reason(recovery_reason: str | None) -> str | None:
+            if trace is not None:
+                trace.recovery_failure_reason = recovery_reason
+            if not code_failure_reason:
+                return recovery_reason
+            code_reason = workflow_run_context.mask_secrets_in_data(code_failure_reason)
+            return f"{code_reason}\nAI fallback: {recovery_reason}" if recovery_reason else code_reason
+
         if not await self._ai_fallback_enabled(workflow_run_context):
             return None
         effective_classification = classification
@@ -8252,9 +8268,11 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=_redact_codeblock_failure_text(
-                        f"Self-heal escalation did not reach a final status for block {self.label}",
-                        resolved_redaction_parameters,
+                    failure_reason=block_failure_reason(
+                        _redact_codeblock_failure_text(
+                            f"Self-heal escalation did not reach a final status for block {self.label}",
+                            resolved_redaction_parameters,
+                        )
                     ),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
@@ -8286,7 +8304,7 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=unsatisfied_reason,
+                    failure_reason=block_failure_reason(unsatisfied_reason),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
@@ -8314,9 +8332,13 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
             recovery_status = TASK_TO_BLOCK_STATUS.get(updated_task.status, BlockStatus.failed)
-            recovery_failure_reason = _redact_codeblock_failure_text(
-                updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
-                resolved_redaction_parameters,
+            # Redacted here, not only by build_block_result, because the child row and the heal episode
+            # also persist this sentence.
+            recovery_failure_reason = _redact_run_secrets(
+                _redact_codeblock_failure_text(
+                    updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
+                    resolved_redaction_parameters,
+                )
             )
             # Driver codes ride behind the recovery's own codes because its sentence cannot name them. The
             # recovery block repeats this failure_reason and is newer, so readers attribute codes from it.
@@ -8329,7 +8351,7 @@ async def wrapper({default_args}):
             )
             return await self.build_block_result(
                 success=False,
-                failure_reason=recovery_failure_reason,
+                failure_reason=block_failure_reason(recovery_failure_reason),
                 output_parameter_value=None,
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8933,6 +8955,7 @@ async def wrapper({default_args}):
         # Read by the caller before this runs, since AI fallback can navigate away from the failing tab.
         sign_in_form_visible: bool = False,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9186,6 +9209,7 @@ async def wrapper({default_args}):
                 trace=trace,
                 failed_nav_error_code=failed_nav_error_code,
                 authored_code=authored_code,
+                code_failure_reason=code_failure_reason,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -9203,7 +9227,9 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
                 failure_message=scrub_failure_value(
-                    recovery_result.failure_reason if recovery_result is not None else "floor_no_result"
+                    "floor_no_result"
+                    if recovery_result is None
+                    else trace.recovery_failure_reason or recovery_result.failure_reason
                 ),
                 wall_clock_ms=recovery_wall_clock_ms,
                 action_count=await _recovery_action_count(trace.escalation_task_id),
@@ -9722,6 +9748,12 @@ async def wrapper({default_args}):
                         if recovery_nav_code and is_registered_secret(recovery_nav_code, workflow_run_context):
                             recovery_nav_code = None
 
+                        # The runner already scrubbed this text against the same serialized
+                        # parameters and guarded the fail-closed case, so re-scrubbing can only
+                        # no-op or empty it; fall back to what the runner reported.
+                        runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
+                        secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
@@ -9746,11 +9778,6 @@ async def wrapper({default_args}):
                                     organization_id=organization_id,
                                 )
                                 return engine_block_result
-                            # The runner already scrubbed this text against the same serialized
-                            # parameters and guarded the fail-closed case, so re-scrubbing can only
-                            # no-op or empty it; fall back to what the runner reported.
-                            runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
-                            secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             if secure_failure.nav_error_code and not is_registered_secret(
@@ -9798,6 +9825,7 @@ async def wrapper({default_args}):
                             secure_sign_in_form_visible = await page_shows_sign_in_form(page)
                         return await self._resolve_failure_with_heal(
                             authored_code=authored_code,
+                            code_failure_reason=secure_failure_reason,
                             exception=None,
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
@@ -10186,6 +10214,7 @@ async def wrapper({default_args}):
 
                 return await self._resolve_failure_with_heal(
                     authored_code=authored_code,
+                    code_failure_reason=None,
                     exception=e,
                     failing_line=failing_line,
                     build_failure_result=build_declared_failure_result,
@@ -10381,6 +10410,7 @@ async def wrapper({default_args}):
 
             return await self._resolve_failure_with_heal(
                 authored_code=authored_code,
+                code_failure_reason=failure_reason,
                 exception=e,
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,

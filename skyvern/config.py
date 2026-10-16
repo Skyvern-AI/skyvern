@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Minimum seconds between the full gc.collect() runs after multi-viewport screenshot stitches, per
+    # process. Each run pauses every browser session on the event loop; 0 collects after every stitch.
+    SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS: float = 60.0
     # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
     # a run stops starting new steps against that browser. Sized so a healthy run — which lands
     # hundreds of successful operations per step, any one of which resets the count — cannot reach
@@ -285,6 +288,7 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    WORKFLOW_COPILOT_DEMONSTRATION_ENABLED: bool = False
     # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
     WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring

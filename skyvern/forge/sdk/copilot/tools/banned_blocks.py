@@ -401,7 +401,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
         "A saved run executes this block against a page it loads itself, without the interactions performed while scouting. Whatever the page requires before the target is reachable is part of what the block does, not a condition it inherits.",
         _code_only_browser_validation_guidance(agent_blocks=agent_blocks),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-        "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
+        "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived. In a saved run each statement starts as soon as the previous one returns.",
         _saved_credential_guidance(),
         _secret_credential_guidance(),
         "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting.",
