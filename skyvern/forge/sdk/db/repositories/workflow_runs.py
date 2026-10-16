@@ -1303,6 +1303,7 @@ class WorkflowRunsRepository(BaseRepository):
         job_id: str | None = None,
         depends_on_workflow_run_id: str | None = None,
         workflow_definition_sha256: str | None = None,
+        require_latest_attempt_number: int | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
@@ -1361,9 +1362,16 @@ class WorkflowRunsRepository(BaseRepository):
                     values["queued_at"] = func.coalesce(
                         WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
                     )
+            statement = update(WorkflowRunModel)
+            if require_latest_attempt_number is not None:
+                statement = statement.where(
+                    ~exists().where(
+                        WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                        WorkflowRunAttemptModel.attempt_number > require_latest_attempt_number,
+                    )
+                )
             result = await session.execute(
-                update(WorkflowRunModel)
-                .where(
+                statement.where(
                     WorkflowRunModel.workflow_run_id == workflow_run_id,
                     WorkflowRunModel.status.in_(non_terminal),
                 )

@@ -603,6 +603,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> Task:
         updated_task, _ = await self._update_task_with_finish_claim(
             task_id,
@@ -614,6 +616,7 @@ class TasksRepository(BaseRepository):
             max_steps_per_run=max_steps_per_run,
             organization_id=organization_id,
             failure_category=failure_category,
+            keep_final_status=keep_final_status,
         )
         return updated_task
 
@@ -630,6 +633,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> tuple[Task, bool]:
         """``update_task``, plus whether THIS write flipped ``finished_at`` from NULL.
 
@@ -648,6 +653,7 @@ class TasksRepository(BaseRepository):
             max_steps_per_run=max_steps_per_run,
             organization_id=organization_id,
             failure_category=failure_category,
+            keep_final_status=keep_final_status,
         )
 
     async def _update_task_with_finish_claim(
@@ -661,6 +667,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> tuple[Task, bool]:
         if (
             status is None
@@ -687,6 +695,8 @@ class TasksRepository(BaseRepository):
                     .with_for_update()
                 )
             ).first():
+                if keep_final_status and TaskStatus(task.status).is_final():
+                    return convert_to_task(task, debug_enabled=self.debug_enabled), False
                 if status is not None:
                     task.status = status
                     if status == TaskStatus.queued and task.queued_at is None:
@@ -902,6 +912,30 @@ class TasksRepository(BaseRepository):
             stmt = (
                 update(StepModel)
                 .where(StepModel.task_id.in_(task_id_subquery))
+                .where(StepModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
+
+    @db_operation("bulk_update_steps_by_task_ids")
+    async def bulk_update_steps_by_task_ids(
+        self,
+        task_ids: list[str],
+        new_status: StepStatus,
+        only_if_status_in: list[StepStatus],
+    ) -> int:
+        if not task_ids or not only_if_status_in:
+            return 0
+
+        update_values: dict[str, Any] = {"status": new_status.value}
+        if new_status.is_terminal():
+            update_values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+        async with self.Session() as session:
+            stmt = (
+                update(StepModel)
+                .where(StepModel.task_id.in_(task_ids))
                 .where(StepModel.status.in_([s.value for s in only_if_status_in]))
                 .values(**update_values)
             )

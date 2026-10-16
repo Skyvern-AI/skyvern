@@ -95,6 +95,16 @@ class Base(AsyncAttrs, DeclarativeBase):
     pass
 
 
+class RunExecutionLeaseModel(Base):
+    __tablename__ = "run_execution_leases"
+
+    run_id = Column(String, primary_key=True)
+    run_type = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    attempt_number = Column(Integer, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=False)
+
+
 class TaskModel(Base):
     __tablename__ = "tasks"
     __table_args__ = (

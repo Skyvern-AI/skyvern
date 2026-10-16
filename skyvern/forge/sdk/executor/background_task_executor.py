@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_MAX_PAGES,
 )
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
+from skyvern.forge.sdk.executor.run_liveness import acquire_run_lease, hold_run, track_run
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -442,6 +443,14 @@ class BackgroundTaskExecutor(AsyncExecutor):
             await asyncio.sleep(min(backoff_seconds, remaining_seconds))
             backoff_seconds = min(backoff_seconds * 2, 30.0)
 
+    async def schedule_recorded_retry(self, workflow_run_id: str, attempt_number: int) -> bool:
+        attempts = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+        attempt = next((row for row in attempts if row.attempt_number == attempt_number), None)
+        if attempt is None or attempt.retry_decision != "retry":
+            return False
+        self._schedule_retry_resume(attempt)
+        return True
+
     def _schedule_retry_resume(self, attempt: Any) -> None:
         key = (attempt.workflow_run_id, attempt.attempt_number)
         if key in self._scheduled_retry_resumes:
@@ -717,47 +726,59 @@ class BackgroundTaskExecutor(AsyncExecutor):
             organization_id=organization_id,
         )
 
-        task = await app.DATABASE.tasks.update_task(
-            task_id,
-            status=TaskStatus.running,
-            organization_id=organization_id,
-        )
+        release_hold = hold_run(task_id, "task")
+        try:
+            await acquire_run_lease(task_id)
+            task = await app.DATABASE.tasks.update_task(
+                task_id,
+                status=TaskStatus.running,
+                organization_id=organization_id,
+            )
 
-        close_browser_on_completion = browser_session_id is None and not task.browser_address
+            close_browser_on_completion = browser_session_id is None and not task.browser_address
 
-        run_obj = await app.DATABASE.tasks.get_run(run_id=task_id, organization_id=organization_id)
-        engine = RunEngine.skyvern_v1
-        if run_obj and run_obj.task_run_type == RunType.openai_cua:
-            engine = RunEngine.openai_cua
-        elif run_obj and run_obj.task_run_type == RunType.anthropic_cua:
-            engine = RunEngine.anthropic_cua
-        elif run_obj and run_obj.task_run_type == RunType.ui_tars:
-            engine = RunEngine.ui_tars
-        elif run_obj and run_obj.task_run_type == RunType.yutori_navigator:
-            engine = RunEngine.yutori_navigator
-        elif run_obj and run_obj.task_run_type == RunType.task_v3:
-            engine = RunEngine.skyvern_v3
+            run_obj = await app.DATABASE.tasks.get_run(run_id=task_id, organization_id=organization_id)
+            engine = RunEngine.skyvern_v1
+            if run_obj and run_obj.task_run_type == RunType.openai_cua:
+                engine = RunEngine.openai_cua
+            elif run_obj and run_obj.task_run_type == RunType.anthropic_cua:
+                engine = RunEngine.anthropic_cua
+            elif run_obj and run_obj.task_run_type == RunType.ui_tars:
+                engine = RunEngine.ui_tars
+            elif run_obj and run_obj.task_run_type == RunType.yutori_navigator:
+                engine = RunEngine.yutori_navigator
+            elif run_obj and run_obj.task_run_type == RunType.task_v3:
+                engine = RunEngine.skyvern_v3
 
-        context: SkyvernContext = skyvern_context.ensure_context()
-        context.task_id = task.task_id
-        context.run_id = context.run_id or task.task_id
-        context.organization_id = organization_id
-        context.max_steps_override = max_steps_override
-        context.max_screenshot_scrolls = task.max_screenshot_scrolls
+            context: SkyvernContext = skyvern_context.ensure_context()
+            context.task_id = task.task_id
+            context.run_id = context.run_id or task.task_id
+            context.organization_id = organization_id
+            context.max_steps_override = max_steps_override
+            context.max_screenshot_scrolls = task.max_screenshot_scrolls
 
-        await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
-        await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
-        self._schedule(
-            background_tasks,
-            app.agent.execute_step,
-            organization,
-            task,
-            step,
-            api_key,
-            close_browser_on_completion=close_browser_on_completion,
-            browser_session_id=browser_session_id,
-            engine=engine,
-        )
+            await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
+            await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
+
+            async def execute_registered_step(*args: Any, **kwargs: Any) -> None:
+                with track_run(task_id, "task"):
+                    release_hold()
+                    await app.agent.execute_step(*args, **kwargs)
+
+            self._schedule(
+                background_tasks,
+                execute_registered_step,
+                organization,
+                task,
+                step,
+                api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+                engine=engine,
+            )
+        except BaseException:
+            release_hold()
+            raise
 
     async def execute_workflow(
         self,
