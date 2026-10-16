@@ -49,6 +49,7 @@ class WorkflowRunTriggerType(StrEnum):
     - api: Direct API call to the run endpoint
     - scheduled: Triggered by a cron schedule
     - webhook: Triggered by an external system via the webhook endpoint
+    - event: Triggered by an external event source
     - job_recipe_extract: Launched by a job recipe extract request
     - job_recipe_apply: Launched by a job recipe apply request
     """
@@ -58,6 +59,7 @@ class WorkflowRunTriggerType(StrEnum):
     api = "api"
     scheduled = "scheduled"
     webhook = "webhook"
+    event = "event"
     job_recipe_extract = "job_recipe_extract"
     job_recipe_apply = "job_recipe_apply"
 

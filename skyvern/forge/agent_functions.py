@@ -1057,6 +1057,17 @@ class AgentFunction:
         """
         return None
 
+    async def capture_workflow_run_created(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+        trigger_type: WorkflowRunTriggerType,
+    ) -> None:
+        """Capture Cloud run-creation telemetry; OSS builds have no product analytics sink."""
+        return None
+
     def is_backup_queue_organization(self, organization_id: str) -> bool:
         return False
 
