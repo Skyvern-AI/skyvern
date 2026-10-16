@@ -1397,19 +1397,15 @@ async def _read_task_v3_llm_name_override(
 
 
 async def _resolve_task_v3_llm_key(task: Task) -> str:
-    """Choose the LLM the native Task V3 engine runs on.
-
-    Order: explicit task.llm_key -> TASK_V3_LLM_NAME PostHog flag (per-task runtime override, so the
-    model can change without a redeploy, like LLM_NAME) -> TASK_V3_LLM_KEY setting -> LLM_KEY setting.
-    LLMCaller now dispatches router/flex keys too, so any of these may be a router group.
-    """
+    """Resolve Task V3's LLM key, preserving explicit task keys and downgrading UI defaults."""
     if task.llm_key:
         return task.llm_key
     # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
     context = skyvern_context.current()
     workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
-    return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
+    resolved = override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
+    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved
 
 
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
