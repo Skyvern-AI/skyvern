@@ -48,6 +48,12 @@ class ApiKeyValidationResult:
     token: OrganizationAuthToken
 
 
+@dataclass(frozen=True)
+class _CachedOrganizationAuth:
+    organization: Organization
+    token_id: str
+
+
 def _normalize_api_key_with_flags(raw_api_key: str) -> tuple[str, dict[str, bool]]:
     normalized = raw_api_key
     flags = {
@@ -284,6 +290,9 @@ async def _get_current_org_for_token_types(
     await resolve_request_principal(
         validation.organization.organization_id,
         api_key_type=_api_key_type(_decode_token_before_cache(x_api_key)),
+        api_key_token_id=(
+            validation.token.id if validation.token.token_type == OrganizationAuthTokenType.api else None
+        ),
         bearer_token=_extract_bearer_token(authorization),
     )
     return validation.organization
@@ -716,7 +725,7 @@ async def _get_current_org_cached(
     *,
     user_agent: str | None = None,
     fern_language: str | None = None,
-) -> Organization:
+) -> _CachedOrganizationAuth:
     """Validate API-key authentication and cache successful results for one minute."""
     cache_key = (x_api_key, db)
     try:
@@ -737,10 +746,11 @@ async def _get_current_org_cached(
             user_agent=user_agent,
             fern_language=fern_language,
         )
+        cached_auth = _CachedOrganizationAuth(validation.organization, validation.token.id)
 
         if invalidation_generation == _current_org_cache_invalidation_generation:
-            _current_org_cache[cache_key] = validation.organization
-        return validation.organization
+            _current_org_cache[cache_key] = cached_auth
+        return cached_auth
 
 
 def _claims_ui_session(payload: dict[str, object] | None) -> bool:
@@ -771,17 +781,21 @@ async def get_current_org_cached(
             fern_language=fern_language,
         )
         organization = validation.organization
+        token_id = validation.token.id if validation.token.token_type == OrganizationAuthTokenType.api else None
     else:
-        organization = await _get_current_org_cached(
+        cached_auth = await _get_current_org_cached(
             x_api_key,
             db,
             user_agent=user_agent,
             fern_language=fern_language,
         )
+        organization = cached_auth.organization
+        token_id = cached_auth.token_id
     apply_request_org_context(organization)
     await resolve_request_principal(
         organization.organization_id,
         api_key_type=_api_key_type(payload),
+        api_key_token_id=token_id,
         bearer_token=_extract_bearer_token(authorization),
     )
     return organization
@@ -795,7 +809,7 @@ def invalidate_cached_org(organization_id: str) -> None:
     keys_to_remove = [
         key
         for key, value in list(_current_org_cache.items())
-        if isinstance(value, Organization) and value.organization_id == organization_id
+        if isinstance(value, _CachedOrganizationAuth) and value.organization.organization_id == organization_id
     ]
     for key in keys_to_remove:
         _current_org_cache.pop(key, None)

@@ -55,6 +55,7 @@ class BearerIdentityResolution:
 class RequestPrincipal:
     organization_id: str
     auth_kind: AuthKind
+    api_key_token_id: str | None = None
     user_id: str | None = None
     org_role: str | None = None
     org_role_claim: str | None = None
@@ -65,7 +66,7 @@ def synthetic_user_id(organization_id: str) -> str:
     return f"{organization_id}_user"
 
 
-_ResolutionKey = tuple[str, str | None, bytes | None]
+_ResolutionKey = tuple[str, str | None, str | None, bytes | None]
 _request_principal: ContextVar[tuple[_ResolutionKey, RequestPrincipal, BearerIdentityStatus] | None] = ContextVar(
     "request_principal", default=None
 )
@@ -111,11 +112,17 @@ async def resolve_request_principal(
     organization_id: str,
     *,
     api_key_type: OrganizationAuthTokenType | None = None,
+    api_key_token_id: str | None = None,
     bearer_token: str | None = None,
 ) -> RequestPrincipal:
     """Record the caller's identity after auth without changing the request outcome."""
     bearer_hash = hashlib.sha256(bearer_token.encode()).digest() if bearer_token else None
-    resolution_key = (organization_id, api_key_type.value if api_key_type is not None else None, bearer_hash)
+    resolution_key = (
+        organization_id,
+        api_key_type.value if api_key_type is not None else None,
+        api_key_token_id,
+        bearer_hash,
+    )
     identity_key = (organization_id, bearer_hash)
     request_state = get_request_principal_state()
     if request_state is not None:
@@ -137,6 +144,7 @@ async def resolve_request_principal(
             principal = RequestPrincipal(
                 organization_id=organization_id,
                 auth_kind=_auth_kind(api_key_type, identity is not None),
+                api_key_token_id=api_key_token_id,
                 user_id=identity.user_id if identity else None,
                 org_role=identity.org_role if identity else None,
                 org_role_claim=identity.org_role_claim if identity else None,
@@ -158,6 +166,7 @@ async def resolve_request_principal(
     principal = RequestPrincipal(
         organization_id=organization_id,
         auth_kind=_auth_kind(api_key_type, identity is not None),
+        api_key_token_id=api_key_token_id,
         user_id=identity.user_id if identity else None,
         org_role=identity.org_role if identity else None,
         org_role_claim=identity.org_role_claim if identity else None,
