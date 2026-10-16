@@ -364,19 +364,10 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("model_name", "kill_switch", "marks"),
-    [
-        ("anthropic/claude-haiku-5-5", False, True),
-        ("anthropic/claude-haiku-5-5", True, False),
-        ("gpt-5.4", False, False),
-    ],
-)
-async def test_execute_task_v3_sends_claude_cache_marks_unless_the_kill_switch_is_on(
-    monkeypatch: pytest.MonkeyPatch, model_name: str, kill_switch: bool, marks: bool
+@pytest.mark.parametrize(("model_name", "marks"), [("anthropic/claude-haiku-5-5", True), ("gpt-5.4", False)])
+async def test_execute_task_v3_sends_cache_marks_only_to_claude(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, marks: bool
 ) -> None:
-    flags = AsyncMock(side_effect=lambda flag, *_a, **_k: kill_switch and flag == "DISABLE_ANTHROPIC_PROMPT_CACHING")
-    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", flags)
     caller = MagicMock(llm_config=LLMConfig(model_name, [], True, False))
 
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
