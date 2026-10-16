@@ -1357,8 +1357,12 @@ def _static_goto_code() -> str:
 
 @pytest.mark.parametrize(
     "code",
-    [None, 'await page.goto(url="https://example.com/orders")\n'],
-    ids=["synthesized_indented", "url_keyword"],
+    [
+        None,
+        'await page.goto(url="https://example.com/orders")\n',
+        'import re\nawait page.goto("https://example.com/orders")\n',
+    ],
+    ids=["synthesized_indented", "url_keyword", "after_import"],
 )
 def test_plan_frontier_head_code_block_with_static_goto_starts_initial(code: str | None) -> None:
     code = code or _static_goto_code()

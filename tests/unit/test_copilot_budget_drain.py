@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     hydrate_prior_run_packet,
     recorded_open_step_runs,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import CANCEL_TERMINAL_REASON
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -988,10 +989,14 @@ async def test_stop_still_cancels_the_active_build_test(
     with pytest.raises(asyncio.CancelledError):
         await turn
     left_run_ids = _saved_left_run_ids(ctx)
+    saved = agent_module._build_cancelled_exit_result(ctx, None)
     await settle_cancelled_tools()
 
     assert left_run_ids == []
-    assert ctx.copilot_total_timeout_exceeded is (elapsed_at_stop >= 900)
+    assert saved.cancelled is True
+    assert saved.turn_outcome is not None
+    assert saved.turn_outcome.terminal_reason == CANCEL_TERMINAL_REASON
+    assert not saved.turn_outcome.budget_expired
     assert owned.cancel_writes == [OWNED_RUN_ID]
     assert owned.row.status == "canceled"
     assert harness["executor_cancelled"] is not dispatch_to_worker

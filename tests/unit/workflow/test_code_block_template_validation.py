@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.workflow.exceptions import BlockEngineNotEnabledError, CodeBlockTemplateSyntaxError
+from skyvern.forge.sdk.workflow.exceptions import (
+    BlockEngineNotEnabledError,
+    CodeBlockInsecureCodeError,
+    CodeBlockTemplateSyntaxError,
+)
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
@@ -46,6 +50,40 @@ def test_save_validator_rejects_nested_code_block_with_line_number() -> None:
 
 def test_save_validator_allows_syntactically_valid_undefined_reference() -> None:
     WorkflowService._validate_code_block_templates(_definition([_code_block("code", "value = {{ future_value }}")]))
+
+
+def test_save_rejects_new_code_the_runner_always_refuses() -> None:
+    prior = _definition([_code_block("legacy", "import os\nvalue = 1")])
+    renamed_legacy = _code_block("renamed", "import os\nvalue = 1")
+    sandbox_import = _code_block("shim", "import re\nvalue = re.escape('a')")
+    jinja_statement = _code_block("jinja", "{% if flag %}value = 1{% endif %}")
+    # Each value renders to a literal before the runner checks it, so the expression itself is not code.
+    jinja_values = _code_block(
+        "jinja_values",
+        "price = {{ '{:.2f}'.format(total) }}\ndoc_id = {{ api_output._id | tojson }}\nurl = \"{{ base }}/x\"",
+    )
+    too_deep = _code_block("too_deep", "x = " + "-" * 20000 + "1")
+    WorkflowService._validate_new_code_block_safety(
+        _definition([renamed_legacy, sandbox_import, jinja_statement, jinja_values, too_deep]), prior
+    )
+    # The exemption covers each prior copy once, so duplicating a grandfathered block does not grandfather the copy.
+    copied_legacy = _code_block("legacy_copy", "import os\nvalue = 1")
+    with pytest.raises(CodeBlockInsecureCodeError, match="'legacy_copy'"):
+        WorkflowService._validate_new_code_block_safety(_definition([renamed_legacy, copied_legacy]), prior)
+    # The runtime render masks Jinja inside Python comments, so a commented tag must not hide the import.
+    commented_tag = _code_block("commented_tag", "# wrap in {% if flag %} later\nimport os")
+    with pytest.raises(CodeBlockInsecureCodeError, match="commented_tag"):
+        WorkflowService._validate_new_code_block_safety(_definition([commented_tag]), None)
+
+    nested = _code_block("nested_code", 'import subprocess\nurl = "{{ base }}/x"')
+    loop = ForLoopBlock(label="loop", loop_blocks=[nested], output_parameter=_output_parameter("loop"))
+    with pytest.raises(CodeBlockInsecureCodeError) as excinfo:
+        WorkflowService._validate_new_code_block_safety(_definition([renamed_legacy, loop]), prior)
+
+    assert excinfo.value.status_code == 422
+    assert str(excinfo.value).startswith(
+        "Code block 'nested_code' can't run: Not allowed to import module 'subprocess'"
+    )
 
 
 def test_save_validator_rejects_unknown_jinja_filter() -> None:

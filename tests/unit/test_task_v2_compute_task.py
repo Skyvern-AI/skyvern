@@ -253,6 +253,16 @@ class TestComputeCodeSafety:
         with pytest.raises(InsecureCodeDetected):
             task_v2_service._assert_compute_code_safe(code)
 
+    @pytest.mark.parametrize(
+        "snippet",
+        ['import re as rx\nreturn {"output": rx.findall("a", "a")}', 'from re import findall\nreturn {"output": 1}'],
+    )
+    def test_sandbox_module_import_rejected(self, snippet: str) -> None:
+        code = task_v2_service._build_compute_code(GATHERED, snippet)
+        CodeBlock.is_safe_code(code)  # is_safe_code admits sandbox-module imports
+        with pytest.raises(InsecureCodeDetected, match="import"):
+            task_v2_service._assert_compute_code_safe(code)
+
     def test_await_rejected(self) -> None:
         code = task_v2_service._build_compute_code(GATHERED, PAGE_SNIPPET)
         with pytest.raises(InsecureCodeDetected):

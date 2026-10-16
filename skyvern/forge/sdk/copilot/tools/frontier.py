@@ -684,9 +684,7 @@ def _code_block_opens_on_static_url(block: _HasCode) -> bool:
         body = ast.parse(textwrap.dedent(code)).body
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
-    if not body:
-        return False
-    first = body[0]
+    first = next((statement for statement in body if not isinstance(statement, ast.Import | ast.ImportFrom)), None)
     if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Await)):
         return False
     call = first.value.value

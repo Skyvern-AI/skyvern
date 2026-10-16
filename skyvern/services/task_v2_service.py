@@ -1994,8 +1994,9 @@ def _build_compute_code(gathered: list[dict], snippet: str) -> str:
 
 def _assert_compute_code_safe(code: str) -> None:
     """Validate that compute code is data-only, bounded, and ends with the output contract."""
-    # is_safe_code blocks imports/dunders/blocked-attrs but not the browser/async/regex/exec names
-    # the sandbox exposes, not unbounded loops, not the .format dunder escape, and not a guarded or
+    # is_safe_code blocks dunders/blocked-attrs but admits imports of the sandbox modules (an alias would
+    # carry a forbidden name past the bare-name check), and does not block the browser/async/regex/exec
+    # names the sandbox exposes, unbounded loops, the .format dunder escape, or a guarded or
     # nested return that falls through to captured locals. Raise InsecureCodeDetected (caught by the
     # regenerate loop) on violation.
     # CodeBlock.execute Jinja-renders the whole code string before exec, and CODE blocks resolve
@@ -2010,6 +2011,8 @@ def _assert_compute_code_safe(code: str) -> None:
             raise InsecureCodeDetected("compute code must be synchronous (no await/async)")
         if isinstance(node, (ast.While,)):
             raise InsecureCodeDetected("compute code may not use while loops")
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise InsecureCodeDetected("compute code may not import modules")
         if isinstance(node, ast.Name) and node.id in _COMPUTE_FORBIDDEN_NAMES:
             raise InsecureCodeDetected(f"compute code may not reference '{node.id}'")
         if isinstance(node, ast.Attribute) and node.attr in _COMPUTE_FORBIDDEN_ATTRS:

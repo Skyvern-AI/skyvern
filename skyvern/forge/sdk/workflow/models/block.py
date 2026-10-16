@@ -225,6 +225,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
+from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
 from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -6793,6 +6794,7 @@ class CodeBlock(Block):
     def build_safe_vars() -> dict[str, Any]:
         # Builtins live under __builtins__ rather than as globals so a workflow parameter can shadow
         # a builtin name by normal scoping, matching codeblock_runtime.build_safe_vars.
+        shims = module_shims()
         return {
             "__builtins__": {
                 **safe_builtins(),
@@ -6802,7 +6804,8 @@ class CodeBlock(Block):
             },
             "print": print,
             "sleep": asyncio.sleep,
-            **module_shims(),
+            **shims,
+            SANDBOX_MODULES_GLOBAL: shims,
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
             "solve_captcha": _bind_code_block_solve_captcha(None, None),
@@ -6947,12 +6950,25 @@ class CodeBlock(Block):
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return {{key: value for key, value in __capture_locals().items() if key not in __param_defaults}}
+    return {{
+        key: value
+        for key, value in __capture_locals().items()
+        if key not in __param_defaults and not __codeblock_sandbox_binding(key, value)
+    }}
 """
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
+        # A name an import bound would otherwise reach the output as an unserializable placeholder.
+        sandbox_binding_ids = {
+            id(member) for shim in safe_vars[SANDBOX_MODULES_GLOBAL].values() for member in (shim, *vars(shim).values())
+        }
+        import_binder = BindSandboxModuleImports()
+        safe_vars["__codeblock_sandbox_binding"] = lambda key, value: (
+            key in import_binder.bound_names and id(value) in sandbox_binding_ids
+        )
         # Compile under a recognizable filename so tracebacks map back to user code lines.
-        compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        tree = import_binder.visit(ast.parse(full_code, filename=CODE_BLOCK_FILENAME))
+        compiled_code = compile(ast.fix_missing_locations(tree), CODE_BLOCK_FILENAME, "exec")
         inline_exec_context = skyvern_context.current()
         LOG.info(
             "codeblock.inline_exec_entered",

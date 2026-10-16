@@ -36,11 +36,17 @@ from structlog.testing import capture_logs
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import cache_envelope as cache_envelope_module
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, SCREENSHOT_SENTINEL, _prune_input_list
+from skyvern.forge.sdk.copilot.enforcement import (
+    NUDGE_SENTINEL,
+    SCREENSHOT_SENTINEL,
+    CopilotTotalTimeoutError,
+    _prune_input_list,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.model_telemetry import (
@@ -1312,9 +1318,10 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
         if fallback_enabled and attempt_count == 1:
             raise FakeRateLimitError("rate limit")
         ctx = cast(copilot_agent_module.CopilotContext, kwargs["ctx"])
-        ctx.copilot_total_timeout_exceeded = True
+        ctx.budget_expiry_state.hard_backstop_reached = True
+        enforcement_module._mark_copilot_total_timeout(ctx, elapsed_seconds=990.0, iteration=0)
         ctx.eval_tool_activity = [{"tool_name": "navigate_browser", "success": True}]
-        raise asyncio.CancelledError
+        raise CopilotTotalTimeoutError
 
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)

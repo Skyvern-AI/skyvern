@@ -3318,11 +3318,7 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
 
 
 def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    if ctx.copilot_total_timeout_exceeded:
-        LOG.info("Copilot cancellation resolved as total timeout")
-        result = _build_timeout_exit_result(ctx, global_llm_context)
-    else:
-        result = _build_cancel_exit_result(ctx, global_llm_context)
+    result = _build_cancel_exit_result(ctx, global_llm_context)
     result.cancellation_iteration = ctx.copilot_turn_cancelled_iteration
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
     recorded = outcome if isinstance(outcome, RecordedBuildTestOutcome) else None

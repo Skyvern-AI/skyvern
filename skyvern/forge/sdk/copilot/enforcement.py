@@ -364,21 +364,14 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
-    elapsed = _elapsed_run_seconds(ctx, start_time)
-    if elapsed >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-
-
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
-    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+    """Record a cancellation raised at a model-call boundary; the turn deadline never arrives as a cancellation.
 
     Synchronous and never raising, so the caller's ``raise`` re-raises the original
     cancellation neither masked nor delayed.
     """
     try:
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
         ctx.copilot_turn_cancelled_iteration = iteration
         LOG.warning(
             "copilot_turn_cancelled",

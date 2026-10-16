@@ -5338,14 +5338,33 @@ async def get_workflow_runs(
     - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
-    return await app.WORKFLOW_SERVICE.get_workflow_runs(
-        organization_id=current_org.organization_id,
-        page=page,
-        page_size=page_size,
-        status=status,
-        search_key=search_key,
-        error_code=error_code,
-    )
+    try:
+        return await app.WORKFLOW_SERVICE.get_workflow_runs(
+            organization_id=current_org.organization_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+        )
+    except RunsListSearchCanceled as exc:
+        LOG.warning(
+            "runs_list_statement_timeout",
+            organization_id=current_org.organization_id,
+            # Names, never values: a search term can carry customer data.
+            filters=_runs_list_filter_names(
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+            ),
+            page=page,
+            page_size=page_size,
+            statement_timeout_seconds=exc.statement_timeout_seconds,
+        )
+        raise _runs_list_timeout_error(
+            indexed_search=exc.indexed_search,
+            search_detail=_RUNS_LIST_SEARCH_TIMEOUT_DETAIL,
+        ) from exc
 
 
 _WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
