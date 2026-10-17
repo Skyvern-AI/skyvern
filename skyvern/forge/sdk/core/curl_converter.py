@@ -90,6 +90,14 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
 
         return result
 
+    except SystemExit as e:
+        # curlparser reports unsupported options (for example --compressed) by exiting the interpreter
+        # through argparse. Convert it to an error so a pasted command cannot stop the server.
+        LOG.warning(
+            "Unsupported option in curl command",
+            curl_command=curl_command,
+        )
+        raise ValueError("Failed to parse curl command: the command contains an unsupported option") from e
     except Exception as e:
         LOG.exception(
             "Failed to parse curl command",
