@@ -231,8 +231,8 @@ from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import (
-    WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowUpdateYAMLRequest,
 )
 from skyvern.services.browser_recording.evidence import build_recording_evidence
 from skyvern.services.browser_recording.session_registry import interpretation_registry
@@ -2041,10 +2041,10 @@ async def _finalise_normal_turn(
 
 async def _resolve_proposal_for_accept(
     proposal: dict[str, Any], *, organization_id: str, workflow_permanent_id: str
-) -> WorkflowCreateYAMLRequest:
+) -> WorkflowUpdateYAMLRequest:
     data = safe_load_no_dates(proposal["_copilot_yaml"])
     if not isinstance(data, dict):
-        return _normalize_copilot_yaml(proposal["_copilot_yaml"])
+        return _normalize_copilot_yaml(proposal["_copilot_yaml"], request_type=WorkflowUpdateYAMLRequest)
     submitted = private_workflow_settings_from_proposal(proposal)
     stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
@@ -2057,10 +2057,13 @@ async def _resolve_proposal_for_accept(
     data.pop("extra_http_headers", None)
     data.pop("cdp_connect_headers", None)
     data.update({key: value for key, value in private_settings.items() if key not in data})
-    yaml_request = _normalize_copilot_yaml(dump_workflow_yaml(data))
+    yaml_request = _normalize_copilot_yaml(dump_workflow_yaml(data), request_type=WorkflowUpdateYAMLRequest)
     if "workflow_definition" in proposal:
         # Header snapshots can be masked or stale; only authored YAML overrides saved headers.
         resolved = Workflow.model_validate(proposal).model_dump(mode="json")
+        if resolved["run_sequentially"] is None:
+            # Stored workflows allow legacy nulls; update requests use a boolean default.
+            resolved.pop("run_sequentially")
         if (
             "max_elapsed_time_minutes" not in yaml_request.model_fields_set
             and resolved["max_elapsed_time_minutes"] is None
@@ -2082,7 +2085,7 @@ async def _resolve_proposal_for_accept(
         resolved.update(yaml_request.model_dump(exclude_unset=True))
         if "cdp_connect_headers" in yaml_request.model_fields_set:
             resolved["cdp_connect_headers"] = yaml_request.cdp_connect_headers
-        yaml_request = WorkflowCreateYAMLRequest.model_validate(resolved)
+        yaml_request = WorkflowUpdateYAMLRequest.model_validate(resolved)
 
     return yaml_request
 

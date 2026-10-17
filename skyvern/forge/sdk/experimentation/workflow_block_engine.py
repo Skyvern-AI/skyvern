@@ -136,10 +136,14 @@ ARM_ATTRIBUTION_LOST = WorkflowBlockEngineArmAttribution(
 async def task_v3_disabled(distinct_id: str, organization_id: str | None) -> bool:
     """The Task V3 kill switch, evaluated identically for the dispatch gate and the A/B resolver.
 
+    Also true while this process runs the prompt-injection guard, which V3 tools bypass.
+
     The provider caches on (flag, distinct_id, properties), so both callers must build the same
     key or the kill switch can answer differently for the same run. Strict, so an evaluation error
     raises instead of being swallowed into "not disabled"; every caller must fail closed to v1.
     """
+    if app.AGENT_FUNCTION.needs_browser_observation():
+        return True
     return bool(
         await app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict(
             DISABLE_TASK_V3_FLAG, distinct_id, properties={"organization_id": organization_id}

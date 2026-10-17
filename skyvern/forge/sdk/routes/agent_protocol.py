@@ -161,6 +161,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
     InvalidTemplateWorkflowPermanentId,
+    InvalidWaitBlockTime,
     WorkflowDefinitionValidationException,
 )
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
@@ -240,6 +241,8 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowUpdateRequest,
+    WorkflowUpdateYAMLRequest,
     sanitize_workflow_yaml_with_references,
 )
 from skyvern.services import (
@@ -987,9 +990,11 @@ async def create_workflow_legacy(
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
         raise e
+    except InvalidWaitBlockTime as e:
+        raise FailedToCreateWorkflow(str(e)) from e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
-        raise FailedToCreateWorkflow(str(e))
+        raise FailedToCreateWorkflow("An unexpected error occurred") from e
 
 
 IDEMPOTENCY_KEY_MAX_BYTES = 255
@@ -1129,9 +1134,11 @@ async def create_workflow(
         raise e
     except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         raise e
+    except InvalidWaitBlockTime as e:
+        raise FailedToCreateWorkflow(str(e)) from e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
-        raise FailedToCreateWorkflow(str(e))
+        raise FailedToCreateWorkflow("An unexpected error occurred") from e
 
 
 @base_router.post(
@@ -1207,7 +1214,7 @@ async def create_workflow_from_prompt(
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
-        raise FailedToCreateWorkflow(str(e))
+        raise FailedToCreateWorkflow("An unexpected error occurred") from e
 
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
@@ -1452,7 +1459,7 @@ async def import_workflow_from_pdf(
     "/workflows/{workflow_id}",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
             "required": True,
         },
         "x-fern-sdk-method-name": "update_workflow",
@@ -1464,7 +1471,7 @@ async def import_workflow_from_pdf(
     "/workflows/{workflow_id}/",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
             "required": True,
         },
     },
@@ -1500,10 +1507,10 @@ async def update_workflow_legacy(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
-        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        workflow_update_request = WorkflowUpdateYAMLRequest.model_validate(workflow_yaml)
         workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
-            request=workflow_create_request,
+            request=workflow_update_request,
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
@@ -1571,7 +1578,7 @@ async def update_workflow_legacy(
     "/agents/{workflow_id}/",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
             "required": True,
         },
     },
@@ -1582,7 +1589,7 @@ async def update_workflow_legacy(
 @base_router.post("/workflows/{workflow_id}", response_model=Workflow, include_in_schema=False)
 @base_router.post("/workflows/{workflow_id}/", response_model=Workflow, include_in_schema=False)
 async def update_workflow(
-    data: WorkflowRequest,
+    data: WorkflowUpdateRequest,
     workflow_id: str = Path(
         ..., description="The ID of the agent to update. Starts with `wpid_`.", examples=["wpid_123"]
     ),
@@ -1596,7 +1603,7 @@ async def update_workflow(
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
             workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
-            workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
+            workflow_definition = WorkflowUpdateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
         else:
@@ -1667,7 +1674,10 @@ async def update_workflow(
     },
     description="Delete an agent",
     summary="Delete an agent",
-    responses={200: {"description": "Successfully deleted agent"}},
+    responses={
+        200: {"description": "Successfully deleted agent"},
+        404: {"description": "Agent not found"},
+    },
 )
 @base_router.post("/agents/{workflow_id}/delete/", include_in_schema=False)
 # Backwards-compatible aliases: an agent is a workflow. Hidden from schema in favor of /agents/{...}/delete.
@@ -1684,7 +1694,7 @@ async def delete_workflow(
         workflow_id, current_org.organization_id
     )
     if deleted_workflow_id is None:
-        return
+        raise WorkflowNotFound(workflow_permanent_id=workflow_id)
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
         AuditEvent(

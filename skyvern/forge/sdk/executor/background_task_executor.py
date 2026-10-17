@@ -15,6 +15,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtime
+from skyvern.forge.sdk.browser_action_policy import UNWIRED_AUTHORITY
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -61,8 +62,8 @@ async def _run_with_own_context(
     asyncio.create_task copies the ContextVar binding but not the object it points at, and the
     caller keeps running (WorkflowTriggerBlock dispatches a child and resumes). Both would then
     write the same context — execute_workflow assigns generate_script on it, block execution
-    assigns task_id/step_id — and clobber each other. Shallow-copy so scalar writes stay local
-    while inherited values survive.
+    assigns task_id/step_id — and clobber each other. Runtime origin authority is reset because
+    each child run must establish its own authority.
     """
     parent = skyvern_context.current()
     if parent is not None:
@@ -74,6 +75,7 @@ async def _run_with_own_context(
         skyvern_context.set(
             replace(
                 parent,
+                browser_action_authority=UNWIRED_AUTHORITY,
                 download_popup_claims={},
                 download_popup_context_listeners={},
                 download_popup_late_candidates={},

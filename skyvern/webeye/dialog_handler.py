@@ -194,8 +194,10 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     For alert and beforeunload dialogs, always accepts without calling the LLM.
     For confirm/prompt dialogs with no task context, auto-accepts (no LLM round-trip needed).
     For confirm/prompt dialogs with task context, calls the secondary LLM handler to decide.
-    Falls back to accept on any decision error (safer than dismiss for form submissions), except
-    when the dialog itself is already gone — nothing is answerable then.
+    On extension-policy failure, confirm/prompt dialogs are dismissed as the conservative choice
+    against authorizing a page action, but neither answer contains a hostile page: the page can
+    branch on either response. Alerts and beforeunload are accepted because they have no meaningful
+    alternative here; a gone dialog is ignored because nothing is answerable then.
 
     ``page`` is the page this handler was registered on — the dialog's originating page. Every
     response this handler gives except an alert's (which has no alternative) routes through
@@ -210,21 +212,7 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     dialog_message = dialog.message
     default_value = dialog.default_value
 
-    policy: DialogPolicy | None = None
-    policy_scope = "block"
     policy_context = _policy_key(page.context) if page is not None else None
-    if policy_context is not None:
-        policy = _dialog_policies.get(policy_context)
-        if policy is not None:
-            recorded_message = dialog_message
-            if len(recorded_message) > skyvern_context.MAX_DIALOG_MESSAGE_CHARS:
-                recorded_message = recorded_message[: skyvern_context.MAX_DIALOG_MESSAGE_CHARS] + "…"
-            records = _dialog_records.setdefault(policy_context, [])
-            records.append({"type": dialog_type, "message": recorded_message})
-            del records[:-MAX_DIALOG_POLICY_RECORDS]
-        elif run_policies := _run_dialog_policies.get(policy_context):
-            policy = next(reversed(run_policies.values()))
-            policy_scope = "run"
 
     ctx = skyvern_context.current()
     organization_id = ctx.organization_id if ctx else None
@@ -241,10 +229,58 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
         organization_id=organization_id,
     )
 
-    # Record alert only — beforeunload is informational ("Changes you made may not
-    # be saved") and would misfit the "field rejection" prompt copy; confirm/prompt
-    # are handled deliberately by the LLM and would be mislabeled as rejections.
-    if ctx is not None and dialog_type == "alert":
+    # The extension policy may await an inspection round-trip, so it is consulted before the declared
+    # policy is read: nothing may suspend between reading that policy and applying it (a synchronous
+    # revocation would otherwise still be applied), and the verdict is applied inside the try below.
+    async def _extension_policy_verdict() -> str | None:
+        try:
+            should_dismiss = app.AGENT_FUNCTION.should_dismiss_browser_dialog(
+                dialog_type,
+                dialog_message,
+                default_value,
+                page,
+            )
+            if not should_dismiss:
+                should_dismiss = await app.AGENT_FUNCTION.inspect_browser_dialog(
+                    dialog_type,
+                    dialog_message,
+                    default_value,
+                    page,
+                )
+        except Exception as exc:
+            if _is_dialog_gone_error(exc):
+                log.warning("Dialog was gone before it could be answered", error=str(exc))
+                return "gone"
+            log.exception("Browser dialog extension policy error")
+            # A confirm/prompt accept can authorize a page-controlled action; fail closed on detector errors.
+            return "dismiss" if dialog_type in {"confirm", "prompt"} else "accept"
+        return "dismiss" if should_dismiss else None
+
+    extension_verdict = await _extension_policy_verdict()
+    if extension_verdict == "gone":
+        return
+
+    policy: DialogPolicy | None = None
+    policy_scope = "block"
+    if policy_context is not None:
+        policy = _dialog_policies.get(policy_context)
+        if policy is None and (run_policies := _run_dialog_policies.get(policy_context)):
+            policy = next(reversed(run_policies.values()))
+            policy_scope = "run"
+        if policy is not None and policy_scope == "block" and extension_verdict is None:
+            recorded_message = dialog_message
+            if len(recorded_message) > skyvern_context.MAX_DIALOG_MESSAGE_CHARS:
+                recorded_message = recorded_message[: skyvern_context.MAX_DIALOG_MESSAGE_CHARS] + "…"
+            records = _dialog_records.setdefault(policy_context, [])
+            records.append({"type": dialog_type, "message": recorded_message})
+            del records[:-MAX_DIALOG_POLICY_RECORDS]
+
+    # Recorded only past the extension verdict: the message is attacker-controlled page content,
+    # and a dismissed dialog's text must not reach the agent's context.
+    # Alert only — beforeunload is informational ("Changes you made may not be saved") and
+    # would misfit the "field rejection" prompt copy; confirm/prompt are handled deliberately
+    # by the LLM and would be mislabeled as rejections.
+    if extension_verdict is None and ctx is not None and dialog_type == "alert":
         try:
             ctx.record_dialog_message(dialog_type, dialog_message)
         except Exception:
@@ -253,8 +289,10 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     # THE ONE CHOKE POINT for answering a dialog: the observe-only preflight sees every response
     # this handler ever gives, and its result is discarded — the answer must be identical whether
     # the policy observes or not. Only alert stays outside: with a single possible response there
-    # is no choice, and THE CHOICE IS THE CAPABILITY (a page can branch on accept vs dismiss —
-    # a real-Chromium probe fired an exfil POST specifically on dismiss).
+    # is no choice, and THE CHOICE IS THE CAPABILITY: neither answer contains a hostile page that
+    # can branch on accept vs dismiss (a real-Chromium probe fired an exfil POST specifically on
+    # dismiss). Extension-hook failure chooses dismiss conservatively for confirm/prompt; this is
+    # a response policy, not a containment boundary.
     async def _respond(response: str, prompt_text: str | None = None) -> None:
         preflight_dialog_response(page, dialog_type=dialog_type, response=response, site="dialog_handler")
         if response == "dismiss":
@@ -268,6 +306,14 @@ async def _handle_dialog(dialog: Dialog, page: Page | None = None) -> None:
     # listener, so an escaping error lands in asyncio's default exception handler at error level
     # with none of the context bound above; the race is an expected outcome, everything else is not.
     try:
+        if extension_verdict == "dismiss":
+            log.warning("Browser dialog dismissed by extension policy")
+            await _respond("dismiss")
+            return
+        if extension_verdict == "accept":
+            await _respond("accept", default_value or "")
+            return
+
         # Alert (no choice to preflight) auto-accepts directly; beforeunload accept commits a
         # pending navigation, so its acceptance goes through the choke point.
         if dialog_type == "alert":

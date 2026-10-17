@@ -52,6 +52,7 @@ from skyvern.errors.errors import (
     resolve_error_code_mapping_key,
 )
 from skyvern.exceptions import (
+    ActionPolicyBlocked,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionDegraded,
@@ -2140,6 +2141,8 @@ class ForgeAgent:
         for parameter in task_block_parameters:
             navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
+        # A URL rendered from workflow input is untrusted, so it must not become trusted authority.
+        declares_static_origin = task_block.declares_static_browser_origin(workflow_run_context)
         task_url = task_block.url
         if task_url is None:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
@@ -2187,6 +2190,12 @@ class ForgeAgent:
             download_timeout=task_block.download_timeout,
             include_extracted_text=task_block.include_extracted_text,
         )
+        if declares_static_origin:
+            app.AGENT_FUNCTION.register_browser_origin_authority(
+                task_id=task.task_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                url=task.url,
+            )
         LOG.info(
             "Created a new task for workflow run",
             sampling=True,
@@ -3964,6 +3973,17 @@ class ForgeAgent:
             # complete here. Returns next_step=None, so neither retry nor execute-all-steps
             # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
             task_v3_available = engine == RunEngine.skyvern_v3 and task_block_supports_v3
+            if task_v3_available and app.AGENT_FUNCTION.needs_browser_observation():
+                # Task V3 tools neither scan pages nor enforce the browser action policy, so a guarded
+                # run stays on the step engine the guard covers.
+                LOG.info(
+                    "Prompt-injection guard is on; running the task on the step engine",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    route_reason="prompt_injection_guard",
+                )
+                task_v3_available = False
+                engine = RunEngine.skyvern_v1
             if task_v3_available:
                 try:
                     task_v3_available = not await task_v3_disabled(
@@ -4403,7 +4423,8 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return last_step, detailed_output, None
-        except StepTerminationError as e:
+        except (StepTerminationError, ActionPolicyBlocked) as e:
+            # Action policy blocks use a BaseException signal so they reach this explicit run boundary.
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
@@ -4831,7 +4852,7 @@ class ForgeAgent:
         step: Step | None,
         reason: str | None,
         browser_state: BrowserState | None = None,
-        exception: Exception | None = None,
+        exception: BaseException | None = None,
     ) -> bool:
         try:
             if step is not None and step.status != StepStatus.completed:
@@ -4856,13 +4877,18 @@ class ForgeAgent:
             if reason and run_secrets:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            # A policy block is a BaseException, not a generic runtime failure, so keep it out of the
+            # Exception-typed classifier.
+            classifier_exception = exception if isinstance(exception, Exception) else None
+            failure_category = classify_from_failure_reason(
+                reason, exception=classifier_exception, fallback_to_unknown=True
+            )
             if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
                 unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
                 if unsolved_captcha_exception:
                     failure_category = classify_from_failure_reason(
                         reason,
-                        exception=exception,
+                        exception=classifier_exception,
                         fallback_to_unknown=True,
                         unsolved_captcha_exception=unsolved_captcha_exception,
                     )
@@ -5181,6 +5207,7 @@ class ForgeAgent:
             ScrapingFailed,
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
+            StepTerminationError,
             BrowserSessionDegraded,
         ) as e:
             # Stamp the accumulated step output (e.g. a download action's observed HTTP failure status)
@@ -8312,6 +8339,7 @@ class ForgeAgent:
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        elements_for_prompt = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(elements_for_prompt)
 
         open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None

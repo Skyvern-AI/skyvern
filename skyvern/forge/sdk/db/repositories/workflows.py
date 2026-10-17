@@ -1519,6 +1519,22 @@ class WorkflowsRepository(BaseRepository):
     ) -> tuple[list[str], str | None]:
         """Soft-delete a workflow and its active schedules in a single DB transaction."""
         async with self.Session() as session:
+            deleted_at = datetime.now(timezone.utc)
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+            )
+            if organization_id is not None:
+                update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
+            result = await session.execute(
+                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
+            )
+            deleted_workflow_id = result.scalars().first()
+            if deleted_workflow_id is None:
+                await session.rollback()
+                return [], None
+
             select_query = (
                 select(WorkflowScheduleModel.workflow_schedule_id)
                 .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
@@ -1529,7 +1545,6 @@ class WorkflowsRepository(BaseRepository):
             result = await session.execute(select_query)
             schedule_ids = list(result.scalars().all())
 
-            deleted_at = datetime.now(timezone.utc)
             if schedule_ids:
                 update_schedules_query = (
                     update(WorkflowScheduleModel)
@@ -1538,17 +1553,6 @@ class WorkflowsRepository(BaseRepository):
                 )
                 await session.execute(update_schedules_query)
 
-            update_workflow_query = (
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowModel.deleted_at.is_(None))
-            )
-            if organization_id is not None:
-                update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            workflow_result = await session.execute(
-                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
-            )
-            deleted_workflow_id = workflow_result.scalars().first()
             recording_delete_query = update(BrowserRecordingModel).where(
                 BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
                 BrowserRecordingModel.deleted_at.is_(None),

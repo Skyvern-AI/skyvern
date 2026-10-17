@@ -51,6 +51,7 @@ from skyvern.schemas.workflows import (
     LoginBlockYAML,
     WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
+    WorkflowUpdateYAMLRequest,
 )
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
 from skyvern.utils.yaml_loader import _YAML_NO_FOLD_WIDTH, NoDatesSafeLoader, dump_workflow_yaml, safe_load_no_dates
@@ -195,7 +196,7 @@ def with_private_workflow_settings(
     data = {**root_settings, "title": request.title, "workflow_definition": {"parameters": [], "blocks": []}}
     _canonicalize_copilot_proxy_location(data)
     try:
-        validated = WorkflowCreateYAMLRequest.model_validate(data)
+        validated = WorkflowUpdateYAMLRequest.model_validate(data)
     except ValidationError as exc:
         fields = sorted(
             {
@@ -652,7 +653,10 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
             _repair_next_block_label_chain(block.loop_blocks)
 
 
-def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
+def _normalize_copilot_yaml(
+    workflow_yaml: str,
+    request_type: type[WorkflowCreateYAMLRequest] = WorkflowUpdateYAMLRequest,
+) -> WorkflowCreateYAMLRequest:
     parsed_yaml = safe_load_no_dates(workflow_yaml)
 
     # Fixing trivial common LLM mistakes; non-dict YAML falls through to model_validate.
@@ -667,7 +671,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
             for block in blocks:
                 block["title"] = block.get("title", "")
 
-    workflow_yaml_request = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
+    workflow_yaml_request = request_type.model_validate(parsed_yaml)
 
     # Post-processing
     for block in workflow_yaml_request.workflow_definition.blocks:

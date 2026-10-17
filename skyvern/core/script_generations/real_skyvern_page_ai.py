@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
+import weakref
 from datetime import datetime, timezone
 from typing import Any, cast, get_args
 
@@ -12,8 +14,15 @@ from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
+from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, _get_raw_page, _SkyvernPageBase
 from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
-from skyvern.exceptions import NoTOTPSecretFound, SkyvernActionFailed, WorkflowRunContextNotInitialized
+from skyvern.exceptions import (
+    ActionPolicyBlocked,
+    NoTOTPSecretFound,
+    SkyvernActionFailed,
+    StepTerminationError,
+    WorkflowRunContextNotInitialized,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -23,6 +32,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.browser_action_preflight import preflight_action
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
@@ -30,7 +40,6 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.forge.sdk.workflow.context_manager import register_secret_derived_output
 from skyvern.schemas.workflows import BlockStatus
-from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.midrun import v3_review_in_flight
@@ -40,11 +49,13 @@ from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements, load_prompt_with_elements_tracked
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ClickAction,
     HoverAction,
     InputTextAction,
+    SelectOption,
     SelectOptionAction,
     UploadFileAction,
 )
@@ -185,18 +196,68 @@ class RealSkyvernPageAi(SkyvernPageAi):
     def __init__(
         self,
         scraped_page: ScrapedPage,
-        page: Page,
+        page: Page | _SkyvernPageBase,
     ):
         self.scraped_page = scraped_page
-        self.page = page
+        self._skyvern_page: _SkyvernPageBase | weakref.ReferenceType[_SkyvernPageBase] = (
+            page
+            if isinstance(page, _SkyvernPageBase)
+            else _SkyvernPageBase(page, cast(SkyvernPageAi, weakref.proxy(self)))
+        )
         self.current_label: str | None = None
+
+    def _bind_page(self, page: _SkyvernPageBase) -> None:
+        self._skyvern_page = weakref.ref(page)
 
     async def _refresh_scraped_page(
         self, take_screenshots: bool = True, max_retries: int = SKYVERN_PAGE_MAX_SCRAPING_RETRIES
     ) -> None:
-        self.scraped_page = await self.scraped_page.generate_scraped_page(
-            take_screenshots=take_screenshots, max_retries=max_retries
+        try:
+            self.scraped_page = await self.scraped_page.generate_scraped_page(
+                take_screenshots=take_screenshots, max_retries=max_retries
+            )
+        except Exception:
+            app.AGENT_FUNCTION.record_browser_observation_failure("script_page_refresh_error")
+            raise
+
+    async def _enforce_browser_action_egress_and_policy(self, action: Any, task: Any) -> None:
+        preflight_action(action, _get_raw_page(self._skyvern_page), site="cached_script_ai_action")
+        egress_policy_result = app.AGENT_FUNCTION.enforce_browser_action_egress_policy(
+            action=action,
+            task=task,
+            page=_get_raw_page(self._skyvern_page),
+            scraped_page=self.scraped_page,
         )
+        if inspect.isawaitable(egress_policy_result):
+            await egress_policy_result
+        app.AGENT_FUNCTION.enforce_browser_action_policy(action.action_type, _get_raw_page(self._skyvern_page))
+
+    async def _resolve_deferred_otp(
+        self,
+        *,
+        organization_id: str | None,
+        task_id: str | None,
+        workflow_run_id: str | None,
+        totp_identifier: str | None,
+        totp_url: str | None,
+    ) -> str:
+        if not organization_id or not task_id:
+            raise NoTOTPSecretFound()
+        if totp_identifier:
+            totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
+        if totp_url:
+            totp_url = _render_template_with_label(totp_url, label=self.current_label)
+        otp_value = await poll_otp_value(
+            organization_id=organization_id,
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_url,
+            expected_otp_type=OTPType.TOTP,
+        )
+        if otp_value is None or otp_value.get_otp_type() != OTPType.TOTP:
+            raise NoTOTPSecretFound()
+        return otp_value.value
 
     async def ai_click(
         self,
@@ -242,6 +303,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if ep_id is not None:
                 v3_parent_episode_id = ep_id
 
+        organization_id = None
+        task_id: str | None = None
+        task = None
+        step = None
+        workflow_run_id = None
         # Set when a setup already performed the interaction before raising SkyvernActionFailed,
         # so the except block below can tell a genuine AI miss (safe to retry on selector) apart
         # from a setup failure that already mutated the page (retrying would repeat side effects).
@@ -252,6 +318,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             payload_str = _get_context_data(data)
             await self._refresh_scraped_page(take_screenshots=False)
             element_tree = self.scraped_page.build_element_tree()
+            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, _get_raw_page(self._skyvern_page))
 
             organization_id = context.organization_id if context else None
             step_id = context.step_id if context else None
@@ -260,7 +327,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 template="single-click-action",
                 navigation_goal=intention,
                 navigation_payload_str=payload_str,
-                current_url=self.page.url,
+                current_url=_get_raw_page(self._skyvern_page).url,
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                 user_context=context.prompt,
@@ -281,6 +348,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     "The element may not exist on the current page."
                 )
             task_id = context.task_id if context else None
+            workflow_run_id = context.workflow_run_id if context else None
             task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
             if organization_id and task and step:
                 actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
@@ -290,7 +358,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         "The proposed action could not be parsed."
                     )
                 action = cast(ClickAction, actions[0])
-
+                await self._enforce_browser_action_egress_and_policy(action, task)
                 # Run the registered click setup (e.g. the selected-state guard) the
                 # same way ActionHandler._handle_action does, so this cached AI-click
                 # path can't re-toggle an already-selected control. There, any nonempty
@@ -299,7 +367,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 setup_result: ActionResult | None = None
                 setup = ActionHandler.get_setup_for_action_type(action.action_type)
                 if setup is not None:
-                    setup_results = await setup(action, self.page, self.scraped_page, task, step)
+                    setup_results = await setup(
+                        action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                    )
                     if setup_results:
                         if setup_results[-1].success is False:
                             setup_performed_before_failure = setup_results[-1].setup_performed
@@ -309,7 +379,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         setup_result = setup_results[-1]
 
                 if setup_result is None:
-                    result = await handle_click_action(action, self.page, self.scraped_page, task, step)
+                    result = await handle_click_action(
+                        action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                    )
                     if result and result[-1].success is False:
                         setup_performed_before_failure = result[-1].setup_performed
                         raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
@@ -374,7 +446,31 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         if selector:
-            locator = self.page.locator(selector)
+            locator = _get_raw_page(self._skyvern_page).locator(selector)
+            fallback_action: ClickAction | None = None
+            if task and organization_id and step:
+                element_id = await _get_element_id_by_selector(selector, _get_raw_page(self._skyvern_page))
+                if element_id:
+                    fallback_action = ClickAction(
+                        element_id=element_id,
+                        status=ActionStatus.pending,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        step_id=context.step_id if context else None,
+                        reasoning=intention,
+                        intention=intention,
+                        response=intention,
+                    )
+                    await self._enforce_browser_action_egress_and_policy(fallback_action, task)
+
+            if fallback_action is None:
+                preflight_action(
+                    ClickAction(element_id=selector),
+                    _get_raw_page(self._skyvern_page),
+                    site="cached_script_ai_action",
+                )
+                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, _get_raw_page(self._skyvern_page))
             await locator.click(timeout=timeout)
             return selector
 
@@ -396,11 +492,25 @@ class RealSkyvernPageAi(SkyvernPageAi):
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        context = skyvern_context.ensure_context()
+        if not value_is_sensitive:
+            value_is_sensitive = (
+                isinstance(value, ResolvedSensitiveValue)
+                or is_unresolved_totp_value(value)
+                or bool(totp_identifier or totp_url)
+            )
+            if not value_is_sensitive and context.workflow_run_id:
+                workflow_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+                value_is_sensitive = bool(
+                    workflow_context and workflow_context.get_original_secret_value_or_none(value or "") is not None
+                )
         sensitive_value = value if value_is_sensitive else None
+
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, _get_raw_page(self._skyvern_page))
 
         # v3 mid-run hook — see ai_click for the contract.
         # Never expose an unresolved TOTP value to a reviewer that can write its prompt value directly to the page.
-        if v3_parent_episode_id is None and not is_unresolved_totp_value(value):
+        if v3_parent_episode_id is None and not value_is_sensitive and not is_unresolved_totp_value(value):
             ep_id, class_a = await self._maybe_run_v3_midrun(
                 action_type="fill",
                 failed_selector=failed_selector,
@@ -419,8 +529,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if ep_id is not None:
                 v3_parent_episode_id = ep_id
 
-        context = skyvern_context.ensure_context()
         value = value or ""
+        trusted_value = value
         transformed_value = value
         action: InputTextAction | None = None
         organization_id = context.organization_id
@@ -435,13 +545,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 prompt = context.prompt
                 # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
                 # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
-                data = _get_context_data(data)
-                data = data or {}
-                if value and isinstance(data, dict) and "value" not in data:
+                data = {} if value_is_sensitive else _get_context_data(data) or {}
+                if value and not value_is_sensitive and isinstance(data, dict) and "value" not in data:
                     data["value"] = value
 
                 otp_value = None
-                if (totp_identifier or totp_url) and context and organization_id and task_id:
+                if not value_is_sensitive and (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
                     if totp_url:
@@ -468,7 +577,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 await self._refresh_scraped_page(take_screenshots=False)
 
                 # Try to get element_id from selector if selector is provided
-                element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
+                element_id = (
+                    await _get_element_id_by_selector(selector, _get_raw_page(self._skyvern_page)) if selector else None
+                )
 
                 if element_id:
                     # The selector/element is valid, using a simpler/smaller prompt
@@ -487,7 +598,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         step=step,
                         organization_id=organization_id,
                     )
-                    value = json_response.get("answer", value)
+                    value = trusted_value if value_is_sensitive else json_response.get("answer", value)
 
                     if context and context.workflow_run_id:
                         transformed_value = get_actual_value_of_parameter_if_secret(context.workflow_run_id, str(value))
@@ -513,7 +624,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         template="single-input-action",
                         navigation_goal=merged_goal,
                         navigation_payload_str=payload_str,
-                        current_url=self.page.url,
+                        current_url=_get_raw_page(self._skyvern_page).url,
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
@@ -532,11 +643,30 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
                         if actions and isinstance(actions[0], InputTextAction):
                             action = cast(InputTextAction, actions[0])
+                            if value_is_sensitive:
+                                action.text = value
             except Exception:
                 LOG.exception("Failed to adapt value for input text action", selector=selector)
 
         if action and organization_id and task and step:
-            result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
+            # Deliberately authorize the opaque action before resolving sensitive input for execution.
+            await self._enforce_browser_action_egress_and_policy(action, task)
+            execution_action = action
+            if value_is_sensitive and (totp_identifier or totp_url):
+                execution_action = action.model_copy(
+                    update={
+                        "text": await self._resolve_deferred_otp(
+                            organization_id=organization_id,
+                            task_id=task_id,
+                            workflow_run_id=workflow_run_id,
+                            totp_identifier=totp_identifier,
+                            totp_url=totp_url,
+                        )
+                    }
+                )
+            result = await handle_input_text_action_direct(
+                execution_action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+            )
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
             await self._record_element_fallback_episode(
@@ -557,7 +687,60 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 raise SkyvernActionFailed(
                     "Input text failed: no selector was provided and no intention was given to locate the element"
                 )
-            locator = self.page.locator(selector)
+            locator = _get_raw_page(self._skyvern_page).locator(selector)
+            fallback_action: InputTextAction | None = None
+            if task and organization_id and step and selector:
+                element_id = await _get_element_id_by_selector(selector, _get_raw_page(self._skyvern_page))
+                if element_id:
+                    fallback_action = InputTextAction(
+                        element_id=element_id,
+                        text=transformed_value,
+                        status=ActionStatus.pending,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        step_id=context.step_id if context else None,
+                        reasoning=intention,
+                        intention=intention,
+                        response=transformed_value,
+                    )
+                    await self._enforce_browser_action_egress_and_policy(fallback_action, task)
+
+            if fallback_action is None:
+                preflight_action(
+                    InputTextAction(
+                        element_id=selector or "",
+                        text="",
+                        totp_identifier=totp_identifier,
+                        totp_url=totp_url,
+                    ),
+                    _get_raw_page(self._skyvern_page),
+                    site="cached_script_ai_action",
+                )
+                app.AGENT_FUNCTION.enforce_browser_action_policy(
+                    ActionType.INPUT_TEXT, _get_raw_page(self._skyvern_page)
+                )
+            elif value_is_sensitive:
+                if totp_identifier or totp_url:
+                    transformed_value = await self._resolve_deferred_otp(
+                        organization_id=organization_id,
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                        totp_identifier=totp_identifier,
+                        totp_url=totp_url,
+                    )
+                else:
+                    page_or_ref = self._skyvern_page
+                    skyvern_page = page_or_ref() if isinstance(page_or_ref, weakref.ReferenceType) else page_or_ref
+                    if skyvern_page is None:
+                        raise SkyvernActionFailed("Input text failed: the page was released mid-action")
+                    transformed_value = await skyvern_page.get_actual_value(
+                        transformed_value,
+                        totp_identifier=totp_identifier,
+                        totp_url=totp_url,
+                    )
+                    if is_unresolved_totp_value(transformed_value):
+                        raise NoTOTPSecretFound()
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
         return value
 
@@ -593,7 +776,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 await self._refresh_scraped_page(take_screenshots=False)
 
                 # Try to get element_id from selector if selector is provided
-                element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
+                element_id = (
+                    await _get_element_id_by_selector(selector, _get_raw_page(self._skyvern_page)) if selector else None
+                )
 
                 if element_id:
                     # The selector/element is valid, using a simpler/smaller prompt
@@ -636,7 +821,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         template="single-upload-action",
                         navigation_goal=merged_goal,
                         navigation_payload_str=payload_str,
-                        current_url=self.page.url,
+                        current_url=_get_raw_page(self._skyvern_page).url,
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
@@ -672,7 +857,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             raise Exception("Only public URLs are allowed")
 
         if action and organization_id and task and step:
-            result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
+            await self._enforce_browser_action_egress_and_policy(action, task)
+            result = await handle_upload_file_action(
+                action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+            )
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
 
@@ -710,7 +898,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         template="single-select-action",
                         navigation_payload_str=data,
                         navigation_goal=merged_goal,
-                        current_url=self.page.url,
+                        current_url=_get_raw_page(self._skyvern_page).url,
                         elements=element_tree,
                         local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                     )
@@ -734,9 +922,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     if not action.option:
                         raise ValueError("SelectOptionAction requires an 'option' field")
                     option_value = action.option.value or action.option.label or ""
+                    await self._enforce_browser_action_egress_and_policy(action, task)
                     result = await handle_select_option_action(
                         action=action,
-                        page=self.page,
+                        page=_get_raw_page(self._skyvern_page),
                         scraped_page=self.scraped_page,
                         task=task,
                         step=step,
@@ -746,6 +935,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                             result[-1].exception_message or "Select option action returned success=False"
                         )
                     return option_value
+                except StepTerminationError:
+                    raise
                 except Exception:
                     # Nothing has been selected at this point, so returning option_value here would
                     # report a select that never happened. Only use the raw selector with a known value.
@@ -762,8 +953,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             raise SkyvernActionFailed(
                 f"Select option failed and no fallback selector available for intention: {intention}"
             )
-        locator = self.page.locator(selector)
-        await locator.select_option(option_value, timeout=timeout)
+        raw_page = _get_raw_page(self._skyvern_page)
+        preflight_action(
+            SelectOptionAction(element_id=selector, option=SelectOption(value=option_value)),
+            raw_page,
+            site="cached_script_ai_action",
+        )
+        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.SELECT_OPTION, raw_page)
+        await raw_page.locator(selector).select_option(option_value, timeout=timeout)
         return option_value
 
     async def ai_classify(
@@ -781,7 +978,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         Returns the matching option key or "UNKNOWN".
         Also records a branch hit for TTL-based branch pruning.
         """
-        current_url = self.page.url
+        current_url = _get_raw_page(self._skyvern_page).url
         result = "UNKNOWN"
         # Defaults so the meta write below is always safe — the LLM-exception
         # path skips the assignments inside the try block, but UNKNOWN can
@@ -923,8 +1120,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
           via a successful live_try_*. The caller short-circuits the AI
           fallback in that case — the workflow already advanced.
 
-        Never raises — any internal failure logs and returns ``(None, False)``
-        so the caller falls through to the existing AI fallback path.
+        Never raises on internal failure — logs and returns ``(None, False)`` so
+        the caller falls through to the existing AI fallback path.
+        ``ActionPolicyBlocked`` is a BaseException policy signal and must propagate;
+        ``StepTerminationError`` is also re-raised below.
         """
         if failed_selector is None or not failed_selector.strip():
             return None, False
@@ -955,6 +1154,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if not use_v3:
                 return None, False
 
+            # v3 mutates the page directly, so refresh before the extension-policy check. Skipped
+            # when no extension consumes observations: the policy check below is a no-op then, and
+            # a full DOM scrape would only add cost and a NoElementFound path on element-less pages.
+            if app.AGENT_FUNCTION.needs_browser_observation():
+                await self._refresh_scraped_page(take_screenshots=False)
+            app.AGENT_FUNCTION.enforce_browser_action_policy(
+                ActionType.CLICK if action_type == "click" else ActionType.INPUT_TEXT,
+                _get_raw_page(self._skyvern_page),
+            )
+
             # Create the episode now so v3's agent can attach decisions to it.
             episode = await app.DATABASE.scripts.create_fallback_episode(
                 organization_id=context.organization_id,
@@ -963,7 +1172,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 block_label=block_label or self.current_label or "unknown",
                 fallback_type="element",
                 script_revision_id=context.script_revision_id,
-                page_url=redact_sensitive_content(self.page.url, value if value_is_sensitive else None),
+                page_url=redact_sensitive_content(
+                    _get_raw_page(self._skyvern_page).url, value if value_is_sensitive else None
+                ),
                 reviewer_version="v3",
             )
             episode_id_for_cleanup = episode.episode_id
@@ -976,14 +1187,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 value=value,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
-                page=self.page,
+                page=_get_raw_page(self._skyvern_page),
                 context=context,
                 episode_id=episode.episode_id,
                 value_is_sensitive=value_is_sensitive,
             )
             result = await v3_review_in_flight(fc)
             return episode.episode_id, result.decision.is_midrun_class_a()
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ActionPolicyBlocked, StepTerminationError):
             raise
         except Exception:
             LOG.warning(
@@ -1177,7 +1388,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     fallback_type="element",
                     script_revision_id=context.script_revision_id,
                     error_message=error_msg,
-                    page_url=redact_sensitive_content(self.page.url, sensitive_value),
+                    page_url=redact_sensitive_content(_get_raw_page(self._skyvern_page).url, sensitive_value),
                     agent_actions=action_data,
                 )
                 LOG.info(
@@ -1267,14 +1478,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             "page.element_fallback: starting from current page",
             navigation_goal=navigation_goal,
             max_steps=max_steps,
-            current_url=self.page.url,
+            current_url=_get_raw_page(self._skyvern_page).url,
             workflow_run_id=context.workflow_run_id,
         )
 
-        page_url_at_entry = self.page.url
+        page_url_at_entry = _get_raw_page(self._skyvern_page).url
         page_text_at_entry: str | None = None
         try:
-            page_text_at_entry = (await self.page.inner_text("body"))[:1500]
+            page_text_at_entry = (await _get_raw_page(self._skyvern_page).inner_text("body"))[:1500]
         except Exception:
             pass
 
@@ -1302,11 +1513,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.info(
                     "page.element_fallback: executing step",
                     step_num=step_num,
-                    current_url=self.page.url,
+                    current_url=_get_raw_page(self._skyvern_page).url,
                 )
 
                 context.current_step_actions = []
-                url_before = self.page.url
+                url_before = _get_raw_page(self._skyvern_page).url
                 try:
                     await self.ai_act(
                         prompt=f"Take the next action to achieve this goal: {navigation_goal}",
@@ -1318,7 +1529,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     {
                         "step": step_num,
                         "url_before": url_before,
-                        "url_after": self.page.url,
+                        "url_after": _get_raw_page(self._skyvern_page).url,
                         "actions": actions_this_step[:10],
                     }
                 )
@@ -1656,6 +1867,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         prompt: str,
         model: dict[str, Any] | None = None,
     ) -> bool:
+        from skyvern.services import script_service
+
         result = await script_service.execute_validation(
             complete_criterion=prompt,
             terminate_criterion=None,
@@ -1752,6 +1965,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
         model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Send a prompt to the LLM and get a response based on the provided schema."""
+        from skyvern.services import script_service
+
         result = await script_service.prompt(
             prompt=prompt,
             schema=schema,
@@ -1850,7 +2065,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             template=template,
             navigation_goal=prompt,
             navigation_payload_str=None,
-            current_url=self.page.url,
+            current_url=_get_raw_page(self._skyvern_page).url,
             elements=element_tree,
             local_datetime=local_datetime,
         )
@@ -1876,7 +2091,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     template=template,
                     navigation_goal=prompt,
                     navigation_payload_str=None,
-                    current_url=self.page.url,
+                    current_url=_get_raw_page(self._skyvern_page).url,
                     elements=element_tree,
                     local_datetime=local_datetime,
                 )
@@ -1897,17 +2112,28 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 return
 
             action = actions[0]
+            await self._enforce_browser_action_egress_and_policy(action, task)
 
             if action_type == "CLICK" and isinstance(action, ClickAction):
-                result = await handle_click_action(action, self.page, self.scraped_page, task, step)
+                result = await handle_click_action(
+                    action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                )
             elif action_type == "INPUT_TEXT" and isinstance(action, InputTextAction):
-                result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
+                result = await handle_input_text_action_direct(
+                    action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                )
             elif action_type == "UPLOAD_FILE" and isinstance(action, UploadFileAction):
-                result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
+                result = await handle_upload_file_action(
+                    action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                )
             elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):
-                result = await handle_select_option_action(action, self.page, self.scraped_page, task, step)
+                result = await handle_select_option_action(
+                    action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                )
             elif action_type == "HOVER" and isinstance(action, HoverAction):
-                result = await handle_hover_action(action, self.page, self.scraped_page, task, step)
+                result = await handle_hover_action(
+                    action, _get_raw_page(self._skyvern_page), self.scraped_page, task, step
+                )
             else:
                 LOG.warning(
                     "ai_act: action type mismatch",
@@ -1929,7 +2155,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     "action_type": action_type,
                     "intention": getattr(action, "intention", None),
                     "reasoning": getattr(action, "reasoning", None),
-                    "page_url": self.page.url,
+                    "page_url": _get_raw_page(self._skyvern_page).url,
                     "status": "failed" if action_failed else "success",
                 }
                 el_data = getattr(action, "skyvern_element_data", None)
@@ -1972,5 +2198,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
 
+        except StepTerminationError:
+            raise
         except Exception:
             LOG.exception("ai_act: failed to execute action", action_type=action_type, prompt=prompt)
