@@ -103,7 +103,7 @@ def _selected_engine():
 
 class _ScrapedPageStub:
     def __init__(self) -> None:
-        self._browser_state = SimpleNamespace()
+        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +156,24 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
     await page.goto("https://93.184.216.34/path")
 
     raw_page.goto.assert_awaited_once()
+    if page_type is ScriptSkyvernPage:
+        mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(
+            None,
+            url="https://93.184.216.34/path",
+        )
+
+
+@pytest.mark.asyncio
+async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
+    raw_page.goto = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match="ERR_INVALID_AUTH_CREDENTIALS"):
+        await page.goto("https://93.184.216.34/path", max_retries=1)
+
+    mock_scraped_page._browser_state.begin_navigation.assert_called_once_with()
+    mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(error)
 
 
 @pytest.mark.asyncio

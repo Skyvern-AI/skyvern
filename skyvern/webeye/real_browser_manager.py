@@ -1213,6 +1213,8 @@ class RealBrowserManager(BrowserManager):
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
+            # Keep quarantine deduplication on the workflow run without changing browser-context scoping.
+            navigation_run_id=task.workflow_run_id or task.task_id,
             browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(

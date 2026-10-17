@@ -1080,6 +1080,26 @@ class AgentFunction:
         """
         return None
 
+    async def record_server_assigned_address_navigation_failure(
+        self,
+        *,
+        browser_address: str,
+        nav_error_code: str | None,
+        run_id: str | None,
+        workflow_permanent_id: str | None = None,
+    ) -> None:
+        """Report a failed navigation on a browser address this deployment assigned to the run."""
+        return None
+
+    async def record_server_assigned_address_navigation_success(
+        self,
+        *,
+        browser_address: str,
+        run_id: str | None,
+    ) -> None:
+        """Clear navigation-failure strikes after a server-assigned browser address navigates."""
+        return None
+
     async def capture_workflow_run_created(
         self,
         *,

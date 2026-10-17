@@ -1218,6 +1218,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         # Retry logic matching agent mode (real_browser_state.navigate_to_url)
         last_error: Exception | None = None
+        _get_scraped_page(self)._browser_state.begin_navigation()
         for attempt in range(max_retries):
             # Origin-authority policy runs before the network-touching SSRF/DNS check below, so a
             # blocked origin fails closed with ActionPolicyBlocked instead of an unrelated DNS error.
@@ -1225,6 +1226,7 @@ class ScriptSkyvernPage(SkyvernPage):
             url = await asyncio.to_thread(validate_fetch_url, url)
             try:
                 await _get_raw_page(self).goto(url, timeout=timeout, **kwargs)
+                await _get_scraped_page(self)._browser_state.record_navigation_result(None, url=url)
             except Exception as e:
                 last_error = e
                 # A timed-out navigation may still commit; refresh before the next policy check.
@@ -1253,6 +1255,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         if last_error is None:
             raise RuntimeError("Navigation failed but no error was captured")
+        await _get_scraped_page(self)._browser_state.record_navigation_result(last_error)
         raise last_error
 
     async def magic_link(
