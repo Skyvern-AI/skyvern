@@ -1124,7 +1124,7 @@ async def test_task_does_not_cache_a_browser_rejected_by_terminal_session() -> N
 @pytest.mark.asyncio
 async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -> None:
     manager = RealBrowserManager()
-    task = make_task("tsk_1", proxy_location="RESIDENTIAL")
+    task = make_task("tsk_1", proxy_location="RESIDENTIAL", workflow_run_id="wr_1")
     task.extra_http_headers = {"X-Test": "1"}
     new_browser_state = MagicMock()
     new_browser_state.get_or_create_page = AsyncMock()
@@ -1148,6 +1148,8 @@ async def test_task_browser_inherits_session_proxy_pin_when_no_browser_state() -
     assert mock_create.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_123"
+    assert new_browser_state.get_or_create_page.await_args.kwargs["navigation_run_id"] == "wr_1"
+    assert "workflow_run_id" not in new_browser_state.get_or_create_page.await_args.kwargs
     assert task.extra_http_headers == {"X-Test": "1"}
 
 
