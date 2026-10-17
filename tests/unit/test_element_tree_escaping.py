@@ -112,14 +112,18 @@ def test_markup_in_an_option_label_stays_text() -> None:
 
 
 def test_ordinary_elements_are_unchanged() -> None:
-    """Nothing that needs no escaping may grow an entity."""
+    """Nothing that needs no escaping may grow an entity: the model reads the tree
+    and reuses what it finds there, so ``&amp;`` in a link would come back in the URL
+    it navigates to."""
     element = {
         "id": "AACS",
         "tagName": "a",
         "interactable": True,
-        "attributes": {"href": "https://example.com/search?q=shoes", "class": "link"},
-        "text": "Shoes",
+        "attributes": {"href": "https://example.com/search?q=shoes&page=2", "class": "link"},
+        "text": "Shoes & socks",
         "children": [],
     }
 
-    assert json_to_html(element) == '<a href="https://example.com/search?q=shoes" class="link" id="AACS">Shoes</a>'
+    assert json_to_html(element) == (
+        '<a href="https://example.com/search?q=shoes&page=2" class="link" id="AACS">Shoes & socks</a>'
+    )
