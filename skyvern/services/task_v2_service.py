@@ -39,7 +39,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.run_liveness import (
     acquire_run_lease,
     note_run_finalized,
@@ -1281,6 +1281,7 @@ async def run_task_v2_helper(
             request=workflow_create_request,
             workflow_permanent_id=workflow.workflow_permanent_id,
             delete_script=False,
+            build_source=WorkflowBuildSource.internal,
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 

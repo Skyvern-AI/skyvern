@@ -768,6 +768,7 @@ def convert_to_workflow(
         import_error=workflow_model.import_error,
         created_by=workflow_model.created_by,
         edited_by=workflow_model.edited_by,
+        build_source=workflow_model.build_source,
     )
 
 

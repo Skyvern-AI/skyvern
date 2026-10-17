@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from skyvern._cli_bootstrap import mark_cli_command
 from skyvern.cli.core.guards import STALE_FRAME_HINT, stale_frame_selection_in
 from skyvern.cli.core.telemetry import capture_cli_tool_call
 
@@ -131,6 +132,7 @@ def run_tool(
     telemetry_tool_name: str | None = None,
 ) -> None:
     """Run an async MCP tool and emit the result."""
+    mark_cli_command()
     try:
         result: dict[str, Any] = asyncio.run(runner())
         emit_tool_result(result, json_output=json_output, telemetry_tool_name=telemetry_tool_name)

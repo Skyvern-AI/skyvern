@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db._soft_delete import exclude_deleted
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     AWSSecretParameterModel,
@@ -305,6 +306,7 @@ class WorkflowsRepository(BaseRepository):
         folder_id: str | None = None,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         workflow_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
@@ -353,6 +355,7 @@ class WorkflowsRepository(BaseRepository):
                 folder_id=folder_id,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1020,6 +1023,7 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        build_source: WorkflowBuildSource | None | object = _UNSET,
         refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
         async with self.Session() as session:
@@ -1098,6 +1102,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.created_by = cast(str | None, created_by)
                 if edited_by is not _UNSET:
                     workflow.edited_by = cast(str | None, edited_by)
+                if build_source is not _UNSET:
+                    workflow.build_source = cast(WorkflowBuildSource | None, build_source)
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -1359,6 +1365,7 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        build_source: WorkflowBuildSource | None | object = _UNSET,
         preserve_completion_contract: bool = True,
         refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
@@ -1485,6 +1492,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.created_by = cast(str | None, created_by)
             if edited_by is not _UNSET:
                 workflow.edited_by = cast(str | None, edited_by)
+            if build_source is not _UNSET:
+                workflow.build_source = cast(WorkflowBuildSource | None, build_source)
 
             await session.commit()
             await session.refresh(workflow)

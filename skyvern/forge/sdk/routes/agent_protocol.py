@@ -128,6 +128,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.trigger_type import (
     caps_run_response_values,
+    workflow_build_source_from_user_agent,
     workflow_run_trigger_type_from_user_agent,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
@@ -942,6 +943,7 @@ async def create_workflow_legacy(
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
     raw_yaml = await request.body()
@@ -963,6 +965,7 @@ async def create_workflow_legacy(
             request=workflow_create_request,
             created_by=user_id,
             edited_by=user_id,
+            build_source=workflow_build_source_from_user_agent(x_user_agent),
             return_write_result=True,
         )
         if changed_fields:
@@ -1047,8 +1050,10 @@ async def create_workflow(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     idempotency_key: IdempotencyKey = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
+    build_source = workflow_build_source_from_user_agent(x_user_agent)
     try:
         if data.yaml_definition:
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
@@ -1087,6 +1092,7 @@ async def create_workflow(
                 new_workflow_permanent_id=workflow_permanent_id,
                 created_by=user_id,
                 edited_by=user_id,
+                build_source=build_source,
                 resolved_title=resolved_title,
                 return_write_result=True,
             )
@@ -1096,6 +1102,7 @@ async def create_workflow(
                 request=workflow_definition,
                 created_by=user_id,
                 edited_by=user_id,
+                build_source=build_source,
                 return_write_result=True,
             )
         if changed_fields:
@@ -1137,6 +1144,7 @@ async def create_workflow_from_prompt(
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     try:
         body = await raw_request.json()
@@ -1195,6 +1203,7 @@ async def create_workflow_from_prompt(
             generate_script=bool(request.generate_script),
             actor_user_id=user_id,
             created_via="prompt",
+            build_source=workflow_build_source_from_user_agent(x_user_agent),
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
@@ -1328,9 +1337,11 @@ async def import_workflow_from_pdf(
     folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
+    build_source = workflow_build_source_from_user_agent(x_user_agent)
 
     # Read file and validate early (before creating import record)
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -1363,6 +1374,7 @@ async def import_workflow_from_pdf(
         folder_id=folder_id,
         created_by=user_id,
         edited_by=user_id,
+        build_source=build_source,
     )
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
@@ -1389,6 +1401,7 @@ async def import_workflow_from_pdf(
                 workflow_permanent_id=empty_workflow.workflow_permanent_id,
                 created_by=user_id,
                 edited_by=user_id,
+                build_source=build_source,
                 created_via="pdf",
             )
 
@@ -1466,6 +1479,7 @@ async def update_workflow_legacy(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     expected_version: Annotated[int | None, Query(ge=1)] = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
 
@@ -1493,6 +1507,7 @@ async def update_workflow_legacy(
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
+            build_source=workflow_build_source_from_user_agent(x_user_agent),
             expected_version=expected_version,
             return_write_result=True,
         )
@@ -1573,6 +1588,7 @@ async def update_workflow(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     try:
@@ -1594,6 +1610,7 @@ async def update_workflow(
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
+            build_source=workflow_build_source_from_user_agent(x_user_agent),
             return_write_result=True,
         )
     except yaml.YAMLError as exc:

@@ -17,7 +17,12 @@ from pydantic import (
 )
 from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunStatus, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import (
+    BrowserSeedSource,
+    WorkflowBuildSource,
+    WorkflowRunStatus,
+    WorkflowRunTriggerType,
+)
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -276,6 +281,10 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    build_source: WorkflowBuildSource | None = Field(
+        default=None,
+        description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",
+    )
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False

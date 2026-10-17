@@ -45,7 +45,7 @@ class WorkflowRunTriggerType(StrEnum):
     """How a workflow run was initiated.
 
     - manual: User clicked "Run" in the UI
-    - mcp: First-party MCP client request
+    - mcp: First-party MCP client or Skyvern CLI request
     - api: Direct API call to the run endpoint
     - scheduled: Triggered by a cron schedule
     - webhook: Triggered by an external system via the webhook endpoint
@@ -62,6 +62,25 @@ class WorkflowRunTriggerType(StrEnum):
     event = "event"
     job_recipe_extract = "job_recipe_extract"
     job_recipe_apply = "job_recipe_apply"
+
+
+class WorkflowBuildSource(StrEnum):
+    """Which surface wrote a workflow version.
+
+    - ui: the Skyvern app
+    - copilot: the workflow copilot
+    - mcp: a first-party MCP client
+    - cli: the Skyvern CLI
+    - api: any other API or SDK caller
+    - internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)
+    """
+
+    ui = "ui"
+    copilot = "copilot"
+    mcp = "mcp"
+    cli = "cli"
+    api = "api"
+    internal = "internal"
 
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(

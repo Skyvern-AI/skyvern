@@ -112,6 +112,7 @@ from skyvern.forge.sdk.db.enums import (
     BrowserSeedSource,
     DispatchFinalizationStatus,
     OrganizationAuthTokenType,
+    WorkflowBuildSource,
     WorkflowRunTriggerType,
 )
 from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_id, generate_workflow_parameter_id
@@ -1312,6 +1313,7 @@ _WORKFLOW_AUDIT_METADATA_FIELDS = {
     "modified_at",
     "deleted_at",
     "copilot_authored",
+    "build_source",
     "effective_default_engine",
     "original_created_by",
     "original_created_at",
@@ -10887,6 +10889,7 @@ class WorkflowService:
         generate_script_on_terminal: bool = False,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
     ) -> Workflow:
@@ -10932,6 +10935,7 @@ class WorkflowService:
                 generate_script_on_terminal=generate_script_on_terminal,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
                 workflow_id=workflow_id,
             )
         except IntegrityError as e:
@@ -10983,6 +10987,7 @@ class WorkflowService:
         generate_script: bool = False,
         actor_user_id: str | None = None,
         created_via: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -11125,6 +11130,7 @@ class WorkflowService:
             generate_script_on_terminal=generate_script,
             created_by=actor_user_id,
             edited_by=actor_user_id,
+            build_source=build_source,
         )
 
         if status == WorkflowStatus.published:
@@ -11436,6 +11442,7 @@ class WorkflowService:
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        build_source: WorkflowBuildSource | None | object = _UNSET,
         notify_workflow_saved: bool = True,
         preserve_completion_contract: bool = True,
         created_via: str | None = None,
@@ -11484,6 +11491,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
                 preserve_completion_contract=preserve_completion_contract,
                 refuse_if_pinned_by_run_group=True,
             )
@@ -11519,6 +11527,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
                 refuse_if_pinned_by_run_group=True,
             )
 
@@ -16713,6 +16722,7 @@ class WorkflowService:
                 status=WorkflowStatus.auto_generated,
                 created_by=COPILOT_TEST_WORKFLOW_CREATOR,
                 edited_by="copilot",
+                build_source=WorkflowBuildSource.copilot,
                 description=runtime_workflow.description,
                 proxy_location=runtime_workflow.proxy_location,
                 webhook_callback_url=runtime_workflow.webhook_callback_url,
@@ -16818,6 +16828,7 @@ class WorkflowService:
         cdp_connect_headers: dict[str, str] | None,
         created_by: str | None,
         edited_by: str | None,
+        build_source: WorkflowBuildSource | None,
         workflow_permanent_id: str | None = None,
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
@@ -16859,6 +16870,7 @@ class WorkflowService:
             generate_script_on_terminal=request.generate_script_on_terminal,
             created_by=created_by,
             edited_by=edited_by,
+            build_source=build_source,
             workflow_id=workflow_id,
             encrypt_secrets=encrypt_secrets,
         )
@@ -16873,6 +16885,7 @@ class WorkflowService:
         delete_script: bool,
         created_by: str | None,
         edited_by: str | None,
+        build_source: WorkflowBuildSource | None,
         created_via: str | None = None,
     ) -> tuple[Workflow, bool]:
         organization_id = organization.organization_id
@@ -16915,6 +16928,7 @@ class WorkflowService:
                 workflow_permanent_id=workflow_permanent_id,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
                 workflow_id=workflow_id,
                 encrypt_secrets=False,
             )
@@ -16964,6 +16978,7 @@ class WorkflowService:
         delete_script: bool = True,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         new_workflow_permanent_id: str | None = None,
         resolved_title: str | None = None,
         created_via: str | None = None,
@@ -16982,6 +16997,7 @@ class WorkflowService:
         delete_script: bool = True,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         new_workflow_permanent_id: str | None = None,
         resolved_title: str | None = None,
         created_via: str | None = None,
@@ -16999,6 +17015,7 @@ class WorkflowService:
         delete_script: bool = True,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         new_workflow_permanent_id: str | None = None,
         resolved_title: str | None = None,
         created_via: str | None = None,
@@ -17035,6 +17052,7 @@ class WorkflowService:
                 delete_script=delete_script,
                 created_by=created_by,
                 edited_by=edited_by,
+                build_source=build_source,
                 created_via=created_via,
             )
             return (workflow, ("workflow_definition",) if created else ()) if return_write_result else workflow
@@ -17228,6 +17246,7 @@ class WorkflowService:
                         generate_script_on_terminal=request.generate_script_on_terminal,
                         created_by=created_by if created_by is not None else existing_latest_workflow.created_by,
                         edited_by=edited_by,
+                        build_source=build_source,
                     )
 
                 async def next_version_from_same_settings() -> int:
@@ -17262,6 +17281,7 @@ class WorkflowService:
                         cdp_connect_headers=new_cdp_connect_headers,
                         created_by=created_by,
                         edited_by=edited_by,
+                        build_source=build_source,
                     )
                 )
             # Only the steps below still need the version cleaned up by hand; a failure inside the
@@ -17437,6 +17457,7 @@ class WorkflowService:
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
             request=workflow_create_request,
+            build_source=WorkflowBuildSource.internal,
         )
 
     async def get_workflow_run_timeline(
