@@ -1760,6 +1760,17 @@ class AgentFunction:
         """
         return None
 
+    async def resolve_mcp_oauth_member_api_key(
+        self, organization_id: str, payload: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        return None
+
+    async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
+        return None
+
+    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> tuple[str, str | None, bool] | None:
+        return "full_org", None, True
+
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None

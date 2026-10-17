@@ -158,7 +158,12 @@ def set_request_principal(
     identity = _request_identity.get()
     if identity is None:
         return
-    if identity.principal is None:
+    # The bound member key takes precedence over any bearer principal observed earlier in this request.
+    if principal.auth_kind == "member_api_key":
+        identity.principal = principal
+        identity.principal_resolution_key = resolution_key
+        identity.bearer_identity_status = bearer_identity_status
+    elif identity.principal is None:
         identity.principal = principal
         identity.principal_resolution_key = resolution_key
         identity.bearer_identity_status = bearer_identity_status

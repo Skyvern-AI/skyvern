@@ -154,7 +154,11 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import (
+    RequestPrincipal,
+    get_request_principal,
+    reject_non_admin_api_key_secret_access,
+)
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -6465,7 +6469,9 @@ async def get_current_organization(
 async def get_api_keys(
     organization_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org_with_api_token),
+    principal: RequestPrincipal | None = Depends(get_request_principal),
 ) -> GetOrganizationAPIKeysResponse:
+    reject_non_admin_api_key_secret_access(principal)
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
     api_keys = []

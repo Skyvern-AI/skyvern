@@ -463,6 +463,7 @@ async def test_runtime_end_run_phase_follows_the_runs_hold_on_the_browser(
 
             context.close = hang_after_close_call
             monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+            monkeypatch.setattr(real_browser_state_module, "BROWSER_CONTEXT_CLOSE_TIMEOUT", 0)
             await manager.cleanup_for_workflow_run(owner, [], close_browser_on_completion=True)
             await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
         else:
