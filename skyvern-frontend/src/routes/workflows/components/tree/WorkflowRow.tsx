@@ -7,7 +7,6 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { FolderIcon } from "@/components/icons/FolderIcon";
 import { Button } from "@/components/ui/button";
 import { SelectionCheckboxCell } from "@/components/SelectionCheckbox";
 import { TableCell, TableRow } from "@/components/ui/table";
@@ -31,6 +30,7 @@ import { TagChipList } from "../tagging/TagChipList";
 import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowActions } from "../WorkflowRowActions";
 import { WorkflowCreatorLabel } from "../WorkflowCreatorLabel";
+import { WorkflowFolderCell } from "../WorkflowFolderCell";
 import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
@@ -232,33 +232,17 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 ) : null}
               </div>
             </TableCell>
-            <TableCell
-              onClick={(event) => {
-                handleRowClick(event, workflow.workflow_permanent_id);
-              }}
-            >
-              {workflow.folder_id ? (
-                <div className="flex min-w-0 items-center gap-1.5">
-                  <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
-                  <span
-                    className="truncate text-sm"
-                    title={
-                      foldersMap.get(workflow.folder_id)?.title ||
-                      workflow.folder_id
-                    }
-                  >
-                    <HighlightText
-                      text={
-                        foldersMap.get(workflow.folder_id)?.title ||
-                        workflow.folder_id
-                      }
-                      query={debouncedSearch}
-                    />
-                  </span>
-                </div>
-              ) : (
-                <span className="text-muted-foreground">-</span>
-              )}
+            <TableCell>
+              <WorkflowFolderCell
+                workflowPermanentId={workflow.workflow_permanent_id}
+                folderId={workflow.folder_id ?? null}
+                folderTitle={
+                  (workflow.folder_id &&
+                    foldersMap.get(workflow.folder_id)?.title) ||
+                  null
+                }
+                highlightQuery={debouncedSearch}
+              />
             </TableCell>
             {showCreator && (
               <TableCell
