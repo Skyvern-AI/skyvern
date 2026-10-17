@@ -118,6 +118,10 @@ class BrowserState(Protocol):
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None: ...
 
+    def begin_navigation(self) -> None: ...
+
+    async def record_navigation_result(self, error: BaseException | None, url: str | None = None) -> None: ...
+
     async def get_or_create_page(
         self,
         url: str | None = None,
@@ -132,6 +136,7 @@ class BrowserState(Protocol):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        navigation_run_id: str | None = None,
     ) -> Page: ...
 
     async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]: ...

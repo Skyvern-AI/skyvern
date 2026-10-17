@@ -988,9 +988,12 @@ async def run_task_v2_helper(
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
+                        browser_state.begin_navigation()
                         await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                        await browser_state.record_navigation_result(None, url=fallback_url)
                         should_fallback = True
-                    except Exception:
+                    except Exception as navigation_error:
+                        await browser_state.record_navigation_result(navigation_error)
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
         skip_completion_check_after_navigate_enabled = await planner_levers.skip_completion_check_after_navigate(
