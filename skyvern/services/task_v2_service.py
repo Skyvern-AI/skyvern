@@ -23,7 +23,7 @@ from skyvern.exceptions import (
     UrlGenerationFailure,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import bounded_failure_categories, classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
@@ -240,7 +240,7 @@ async def _summarize_max_steps_failure_reason(
             thought=thought,
             system_prompt=task_v2.workflow_system_prompt,
         )
-        return json_response.get("reasoning", ""), json_response.get("failure_categories")
+        return json_response.get("reasoning", ""), bounded_failure_categories(json_response.get("failure_categories"))
     except Exception:
         LOG.warning("Failed to summarize the failure reason for task v2", exc_info=True)
         return "", None
@@ -1088,7 +1088,7 @@ async def run_task_v2_helper(
             user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
             should_terminate = task_v2_response.get("should_terminate", False)
             termination_reason = task_v2_response.get("termination_reason")
-            failure_categories = task_v2_response.get("failure_categories")
+            failure_categories = bounded_failure_categories(task_v2_response.get("failure_categories"))
             observation = task_v2_response.get("page_info", "")
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
@@ -1415,7 +1415,7 @@ async def run_task_v2_helper(
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
             should_terminate = completion_resp.get("should_terminate", False)
             termination_reason = completion_resp.get("termination_reason")
-            completion_failure_categories = completion_resp.get("failure_categories")
+            completion_failure_categories = bounded_failure_categories(completion_resp.get("failure_categories"))
             thought_content = completion_resp.get("thoughts", "")
             await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,

@@ -17,7 +17,8 @@ type WorkflowPanelState = {
     | "nodeLibrary"
     | "history"
     | "comparison"
-    | "schedules";
+    | "schedules"
+    | "triggers";
   data?: {
     previous?: string | null;
     next?: string | null;

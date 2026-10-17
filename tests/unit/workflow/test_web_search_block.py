@@ -117,7 +117,11 @@ async def test_exa_search_keeps_pages_without_cached_content(
     payloads: dict[str, dict[str, Any]] = {}
 
     async def request(
-        _response: SearchResponse, provider: str, url: str, payload: dict[str, Any] | None = None
+        _response: SearchResponse,
+        provider: str,
+        url: str,
+        payload: dict[str, Any] | None = None,
+        attempts: int = web_search_client.REQUEST_ATTEMPTS,
     ) -> dict[str, Any]:
         assert payload is not None
         payloads[url] = payload
@@ -249,7 +253,7 @@ async def test_search_rejects_invalid_schema_before_llm_call(
 @pytest.mark.parametrize(
     "second_page,num_results,expected_count",
     [
-        (TimeoutError("Google search timed out after 30 seconds."), 11, 9),
+        (TimeoutError(web_search_client.timeout_message("google")), 11, 9),
         (WebSearchError("Google search failed (HTTP 429)."), 11, 9),
         *[
             (
@@ -340,7 +344,7 @@ async def test_search_first_page_timeout_preserves_fallback(
     original, _, handler = search_setup
     block = original.model_copy(update={"provider": provider})
     request = AsyncMock(
-        side_effect=[TimeoutError("Google search timed out after 30 seconds."), PROVIDER_PAGE, PROVIDER_PAGE]
+        side_effect=[TimeoutError(web_search_client.timeout_message("google")), PROVIDER_PAGE, PROVIDER_PAGE]
     )
     monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", "test-google-key")
     monkeypatch.setattr(web_search_client, "request", request)
@@ -426,6 +430,38 @@ async def test_search_no_results_detects_legacy_code_after_prompt(
     ]
     assert output["results"] == []
     assert context.values["search_output"] == output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("served", [False, True], ids=["unserved", "served-but-empty"])
+async def test_only_a_served_search_offers_its_result_list_to_error_detection(
+    search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    served: bool,
+) -> None:
+    block, _, handler = search_setup
+    block.prompt = None
+    block.error_code_mapping = {"SEARCH_UNAVAILABLE": "The search could not be run."}
+    reply = {"reasoning": "Checked.", "errors": []}
+    handler.side_effect = [reply]
+    served_reply: dict[str, Any] = {"results": []}
+    request = (
+        AsyncMock(return_value=served_reply)
+        if served
+        else AsyncMock(side_effect=TimeoutError(web_search_client.timeout_message("exa")))
+    )
+    monkeypatch.setattr(web_search_client, "request", request)
+
+    result = await block.execute("workflow-run-test", "block-run-test", "org-test")
+
+    # Detection still runs on an unserved search so a failure-describing code can match, but it is
+    # not handed a result list that only our own failure emptied.
+    handler.assert_awaited_once()
+    detection_prompt = handler.await_args_list[0].kwargs["prompt"]
+    assert ('"results"' in detection_prompt) is served
+    assert result.status == (BlockStatus.completed if served else BlockStatus.timed_out)
+    if not served:
+        assert result.output_parameter_value["failure_category"][0]["category"] == "INFRASTRUCTURE_ERROR"
 
 
 @pytest.mark.asyncio

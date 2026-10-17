@@ -10,7 +10,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     get_user_facing_exception_message,
 )
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import bounded_failure_categories, classify_from_failure_reason
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.block import _should_skip_retry_on_anti_bot_detection
 
@@ -57,6 +57,17 @@ class TestPersistedCategory:
                 {"category": "AUTH_FAILURE", "confidence_float": 0.9, "reasoning": "bad password"},
             ],
         )
+        assert _should_skip_retry_on_anti_bot_detection(task) is False
+
+    @pytest.mark.parametrize("model_category", ["SITE_BLOCKED_ME", " anti_bot_detection "])
+    def test_unrecognized_model_category_does_not_suppress_captcha_retries(self, model_category: str) -> None:
+        categories = bounded_failure_categories([{"category": model_category}])
+        task = _make_failed_task(
+            failure_category=categories,
+            failure_reason="The page showed a captcha challenge",
+        )
+
+        assert categories[0]["category"] == "UNKNOWN"
         assert _should_skip_retry_on_anti_bot_detection(task) is False
 
     def test_persisted_primary_wins_over_reason_keywords(self) -> None:

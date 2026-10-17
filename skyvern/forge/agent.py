@@ -93,7 +93,12 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
-from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason, is_captcha_solve_failure
+from skyvern.forge.failure_classifier import (
+    FailureCategory,
+    bounded_failure_categories,
+    classify_from_failure_reason,
+    is_captcha_solve_failure,
+)
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -725,6 +730,30 @@ _EXPECTED_STEP_FAILURES = (FailedToReloadPage, LLMResponseMissingActionsError)
 
 def _llm_error_category(reasoning: str) -> list[dict]:
     return [{"category": FailureCategory.LLM_ERROR.value, "confidence_float": 0.9, "reasoning": reasoning}]
+
+
+def _append_mapped_category_errors(
+    errors: list[UserDefinedError],
+    categories: list[dict[str, Any]],
+    error_code_mapping: dict[str, str] | None,
+    rejected_category_names: list[str],
+) -> None:
+    error_codes = {error.error_code for error in errors}
+    category_names = [category.get("category") for category in categories]
+    category_names.extend(rejected_category_names)
+    for category_name in category_names:
+        if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
+            continue
+        error_code = resolve_error_code_mapping_key(category_name, error_code_mapping)
+        if error_code and error_code not in error_codes:
+            errors.append(
+                UserDefinedError(
+                    error_code=error_code,
+                    reasoning=f"{error_code}: {(error_code_mapping or {})[error_code]}",
+                    confidence_float=1.0,
+                )
+            )
+            error_codes.add(error_code)
 
 
 def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
@@ -10325,7 +10354,9 @@ class ForgeAgent:
                 )
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
-                failure_category = persisted_action.failure_categories or classify_from_failure_reason(failure_reason)
+                failure_category = bounded_failure_categories(persisted_action.failure_categories) or (
+                    classify_from_failure_reason(failure_reason)
+                )
                 LOG.info(
                     "Task failure classified",
                     task_id=task.task_id,
@@ -10590,11 +10621,9 @@ class ForgeAgent:
             )
 
             user_errors = list(failure_response.errors)
-            # The summary model sometimes files a mapped code as a failure category instead of an error.
-            # A taxonomy name is its own classification, even when a mapping key reuses that name.
-            for category in failure_response.failure_categories:
-                category_name = category.get("category")
-                if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
+            # Preserve mapped error recovery without treating taxonomy case variants as customer codes.
+            for category_name in failure_response._rejected_failure_categories:
+                if category_name.upper() in FailureCategory.__members__:
                     continue
                 error_code = resolve_error_code_mapping_key(category_name, task.error_code_mapping)
                 if error_code and error_code not in {error.error_code for error in user_errors}:
@@ -10785,6 +10814,12 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
+            _append_mapped_category_errors(
+                response.errors,
+                response.failure_categories,
+                task.error_code_mapping,
+                response._rejected_failure_categories,
+            )
             response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:
@@ -10939,6 +10974,12 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
+            _append_mapped_category_errors(
+                response.errors,
+                response.failure_categories,
+                task.error_code_mapping,
+                response._rejected_failure_categories,
+            )
             response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:

@@ -11,6 +11,7 @@ import pytest
 
 from skyvern.errors.errors import ReachMaxRetriesError, UserDefinedError
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.failure_classifier import FailureCategory
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
@@ -397,6 +398,46 @@ async def test_max_retries_without_mapped_code_still_fails_with_reach_max_retrie
 
     assert captured["status"] == TaskStatus.failed
     assert [error["error_code"] for error in captured["errors"]] == [ReachMaxRetriesError().error_code]
+    # Whatever is persisted is a category every reader can match, even when the model named none.
+    assert all(entry["category"] in FailureCategory.__members__ for entry in captured["failure_category"])
+
+
+@pytest.mark.asyncio
+async def test_max_retries_does_not_map_case_variant_of_builtin_category(agent, mock_browser_state):
+    summary = MaxStepsReasonResponse(
+        page_info="",
+        reasoning="The agent could not find the login form",
+        errors=[],
+        failure_categories=[{"category": "element_not_found", "confidence_float": 0.9, "reasoning": "No form"}],
+    )
+
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["status"] == TaskStatus.failed
+    assert [error["error_code"] for error in captured["errors"]] == [ReachMaxRetriesError().error_code]
+    assert captured["failure_category"][0]["category"] == FailureCategory.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_max_retries_does_not_persist_a_failure_category_the_model_invented(agent, mock_browser_state):
+    """SKY-17368: every reader of failure_category matches the literal exactly, so an invented
+    name is a classification nothing can read. Known categories are persisted untouched."""
+    known = {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8, "reasoning": "No login form"}
+    summary = MaxStepsReasonResponse.model_validate(
+        {
+            "page_info": "",
+            "reasoning": "The agent could not find the login form",
+            "errors": [],
+            "failure_categories": [
+                {"category": "LOGIN_FORM_MISSING", "confidence_float": 0.9, "reasoning": "Invented by the model"},
+                known,
+            ],
+        }
+    )
+
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["failure_category"] == [known]
 
 
 @pytest.mark.asyncio

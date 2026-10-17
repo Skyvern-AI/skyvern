@@ -20,6 +20,11 @@ LOG = structlog.get_logger()
 SearchProvider = Literal["google", "exa"]
 ProviderChoice = Literal["auto", "google", "exa"]
 SEARCH_TIMEOUT_SECONDS = 180
+REQUEST_TIMEOUT_SECONDS = 30
+# The upstream slow tail is per-request, so each attempt is an independent draw. Three of them fit
+# inside SEARCH_TIMEOUT_SECONDS per provider; pagination and a provider fallback can still reach
+# that ceiling, which stays the hard bound on the whole search.
+REQUEST_ATTEMPTS = 3
 
 
 def _site_restriction(query: str) -> tuple[str, str] | None:
@@ -110,24 +115,56 @@ def redact_keys(value: Any, secret_values: Collection[str] = ()) -> Any:
     return value
 
 
+def timeout_message(provider: SearchProvider, attempts: int = REQUEST_ATTEMPTS) -> str:
+    attempt_count = f"{attempts} attempts" if attempts > 1 else "1 attempt"
+    return f"{provider.title()} search timed out after {attempt_count} of {REQUEST_TIMEOUT_SECONDS} seconds."
+
+
+async def _request_with_retries(
+    provider: SearchProvider, url: str, payload: dict[str, Any] | None, attempts: int
+) -> tuple[int, dict[str, Any]]:
+    """Only a timed-out attempt is retried; a served response is returned on any status, for the
+    caller to judge."""
+    attempt = 1
+    while True:
+        try:
+            status, _, body = await aiohttp_request(
+                method="GET" if provider == "google" else "POST",
+                url=url,
+                headers={"x-api-key": settings.EXA_API_KEY or ""} if provider == "exa" else None,
+                json_data=payload,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            )
+        except TimeoutError:
+            if attempt == attempts:
+                raise TimeoutError(timeout_message(provider, attempts)) from None
+            with contained_effect("log search request retry"):
+                LOG.info(
+                    "Search request timed out; retrying",
+                    provider=provider,
+                    attempt=attempt,
+                    attempts=attempts,
+                    timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+                )
+            attempt += 1
+        except Exception:
+            raise WebSearchError(f"{provider.title()} search request failed.") from None
+        else:
+            return status, body
+
+
 async def request(
-    response: SearchResponse, provider: SearchProvider, url: str, payload: dict[str, Any] | None = None
+    response: SearchResponse,
+    provider: SearchProvider,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    attempts: int = REQUEST_ATTEMPTS,
 ) -> dict[str, Any]:
     # SerpAPI authenticates in the URL; the HTTP instrumentor does not redact api_key.
     token = attach(set_value(_SUPPRESS_HTTP_INSTRUMENTATION_KEY, True))
     try:
-        status, _, body = await aiohttp_request(
-            method="GET" if provider == "google" else "POST",
-            url=url,
-            headers={"x-api-key": settings.EXA_API_KEY or ""} if provider == "exa" else None,
-            json_data=payload,
-            timeout=30,
-            follow_redirects=False,
-        )
-    except TimeoutError:
-        raise TimeoutError(f"{provider.title()} search timed out after 30 seconds.") from None
-    except Exception:
-        raise WebSearchError(f"{provider.title()} search request failed.") from None
+        status, body = await _request_with_retries(provider, url, payload, attempts)
     finally:
         detach(token)
 
@@ -211,7 +248,12 @@ async def google_search(response: SearchResponse, num_results: int, max_pages: i
                 query = urlencode({**params, "no_cache": "true"})
                 page_status = (response.http_status, response.http_status_provider)
                 try:
-                    fresh_body = await request(response, "google", f"https://serpapi.com/search.json?{query}")
+                    # One attempt: this page is uncached and the slowest request of the search, and the
+                    # page in hand reaches response.results only after this loop, so a retry here risks
+                    # the global deadline discarding it.
+                    fresh_body = await request(
+                        response, "google", f"https://serpapi.com/search.json?{query}", attempts=1
+                    )
                 except Exception:  # noqa: BLE001
                     # The page already in hand is what gets reported, so its status stays the reported one.
                     response.http_status, response.http_status_provider = page_status
@@ -283,7 +325,8 @@ async def exa_search(response: SearchResponse, num_results: int) -> None:
     append_results(response, body.get("results"), num_results)
     if not response.results:
         return
-    # The snippet lookup is best-effort; the reported status stays the search's.
+    # The snippet lookup is best-effort; the reported status stays the search's. It gets one attempt
+    # so retrying it cannot spend the budget the caller still needs to keep the results it holds.
     search_status = (response.http_status, response.http_status_provider)
     try:
         contents = await request(
@@ -295,6 +338,7 @@ async def exa_search(response: SearchResponse, num_results: int) -> None:
                 "highlights": {"maxCharacters": 1000, "query": payload["query"]},
                 "maxAgeHours": -1,
             },
+            attempts=1,
         )
         if contents.get("error"):
             raise WebSearchError("Exa highlights request did not complete successfully.")
@@ -347,7 +391,7 @@ async def search(response: SearchResponse, provider: ProviderChoice, num_results
     except (TimeoutError, WebSearchError) as exc:
         if provider != "auto" or response.results or not settings.EXA_API_KEY:
             raise
-        response.fallback_reason = str(exc) or "Google search timed out after 30 seconds."
+        response.fallback_reason = str(exc) or timeout_message("google")
         response.provider = "exa"
         response.pages.clear()
         await exa_search(response, num_results)
