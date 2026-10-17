@@ -72,6 +72,10 @@ _request_principal: ContextVar[tuple[_ResolutionKey, RequestPrincipal, BearerIde
 )
 
 
+# Set by the route authorization dependency, which FastAPI resolves before the route's auth dependency.
+pending_route_action: ContextVar[str | None] = ContextVar("pending_route_action", default=None)
+
+
 def get_request_principal() -> RequestPrincipal | None:
     request_state = get_request_principal_state()
     if request_state is not None:
@@ -109,6 +113,28 @@ def _auth_kind(api_key_type: OrganizationAuthTokenType | None, has_user: bool) -
 
 
 async def resolve_request_principal(
+    organization_id: str,
+    *,
+    api_key_type: OrganizationAuthTokenType | None = None,
+    api_key_token_id: str | None = None,
+    bearer_token: str | None = None,
+) -> RequestPrincipal:
+    principal = await _resolve_request_principal(
+        organization_id, api_key_type=api_key_type, api_key_token_id=api_key_token_id, bearer_token=bearer_token
+    )
+    await app.AGENT_FUNCTION.enforce_request_role(principal, pending_route_action.get(), _bearer_identity_status())
+    return principal
+
+
+def _bearer_identity_status() -> BearerIdentityStatus | None:
+    request_state = get_request_principal_state()
+    if request_state is not None and request_state.bearer_identity_status is not None:
+        return BearerIdentityStatus(request_state.bearer_identity_status)
+    resolved = _request_principal.get()
+    return resolved[2] if resolved else None
+
+
+async def _resolve_request_principal(
     organization_id: str,
     *,
     api_key_type: OrganizationAuthTokenType | None = None,
