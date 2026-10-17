@@ -30528,6 +30528,17 @@
             ],
             "title": "Edited By"
           },
+          "build_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowBuildSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+          },
           "copilot_authored": {
             "type": "boolean",
             "title": "Copilot Authored",
@@ -30612,6 +30623,19 @@
           "agent_id"
         ],
         "title": "Workflow"
+      },
+      "WorkflowBuildSource": {
+        "type": "string",
+        "enum": [
+          "ui",
+          "copilot",
+          "mcp",
+          "cli",
+          "api",
+          "internal"
+        ],
+        "title": "WorkflowBuildSource",
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -34048,7 +34072,7 @@
           "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {

@@ -141,6 +141,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
+from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
     DatabaseConnectionUnavailableError,
@@ -2160,6 +2161,7 @@ async def _commit_staged_workflow(
         run_sequentially=staged_workflow.run_sequentially,
         sequential_key=staged_workflow.sequential_key,
         edited_by="copilot",
+        build_source=WorkflowBuildSource.copilot,
         preserve_completion_contract=not clear_persisted_completion_contract,
         validate_code_block_templates=False,
     )
@@ -2241,6 +2243,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         sequential_key=original_workflow.sequential_key,
         created_by=original_workflow.created_by,
         edited_by=original_workflow.edited_by,
+        build_source=original_workflow.build_source,
         preserve_completion_contract=False,
         validate_code_block_templates=False,
     )
@@ -5235,6 +5238,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 request=yaml_request,
                 workflow_permanent_id=chat.workflow_permanent_id,
                 edited_by="copilot",
+                build_source=WorkflowBuildSource.copilot,
                 validate_code_block_templates=False,
                 expected_version=canonical.version if metadata is not None else base_version,
                 return_write_result=True,

@@ -741,6 +741,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     import_error = Column(String, nullable=True)  # Error message if import failed
     created_by = Column(String, nullable=True)
     edited_by = Column(String, nullable=True)
+    build_source = Column(String, nullable=True)  # WorkflowBuildSource
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

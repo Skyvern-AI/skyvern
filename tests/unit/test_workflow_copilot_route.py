@@ -9000,6 +9000,7 @@ async def test_restore_records_only_a_rollback_that_landed(
         sequential_key=None,
         created_by=None,
         edited_by=None,
+        build_source=None,
     )
     update = AsyncMock(side_effect=RuntimeError("canonical write failed") if update_fails else None)
     monkeypatch.setattr(

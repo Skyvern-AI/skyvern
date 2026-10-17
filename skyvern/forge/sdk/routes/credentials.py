@@ -53,7 +53,7 @@ from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -1148,6 +1148,7 @@ async def test_login(
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
+            build_source=WorkflowBuildSource.internal,
         )
 
         credential_proxy_session_id = getattr(credential, "proxy_session_id", None)
@@ -1343,6 +1344,7 @@ async def test_credential(
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
+            build_source=WorkflowBuildSource.internal,
         )
 
         # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
