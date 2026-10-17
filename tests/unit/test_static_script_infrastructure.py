@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -166,35 +166,30 @@ class TestBlockMapResolution:
 class TestModeDirectClick:
     """Test that mode='direct' short-circuits before backward compat / validation."""
 
-    @pytest.mark.asyncio
-    async def test_direct_click_requires_selector(self) -> None:
+    @staticmethod
+    def _page() -> object:
         from skyvern.core.script_generations.skyvern_page import SkyvernPage
 
-        page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+            return SkyvernPage(MagicMock(), MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_direct_click_requires_selector(self) -> None:
+        skyvern_page = self._page()
 
         with pytest.raises(ValueError, match="mode='direct' requires a selector"):
             await skyvern_page.click(mode="direct")
 
     @pytest.mark.asyncio
     async def test_direct_fill_requires_selector(self) -> None:
-        from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-        page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        skyvern_page = self._page()
 
         with pytest.raises(ValueError, match="mode='direct' requires a selector"):
             await skyvern_page.fill(value="test", mode="direct")
 
     @pytest.mark.asyncio
     async def test_direct_fill_requires_value(self) -> None:
-        from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-        page = MagicMock()
-        skyvern_page = SkyvernPage.__new__(SkyvernPage)
-        skyvern_page.page = page
+        skyvern_page = self._page()
 
         with pytest.raises(ValueError, match="mode='direct' requires a value"):
             await skyvern_page.fill(selector="input", mode="direct")

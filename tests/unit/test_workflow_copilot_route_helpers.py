@@ -65,6 +65,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowUpdateYAMLRequest
 from tests.unit.copilot_test_helpers import (
     RECEIPT_WORKFLOW_YAML,
     make_copilot_ctx,
@@ -451,6 +452,20 @@ class TestNormalizeCopilotYamlProxyLocation:
 
         with pytest.raises(ValidationError):
             _normalize_copilot_yaml(yaml_str)
+
+
+def test_normalize_copilot_yaml_defaults_to_update_schema_for_legacy_titles() -> None:
+    title = "Legacy title " * 24
+    yaml_str = f"title: {title!r}\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
+
+    request = _normalize_copilot_yaml(yaml_str)
+
+    assert isinstance(request, WorkflowUpdateYAMLRequest)
+    assert request.title == title
+    with pytest.raises(ValidationError):
+        WorkflowCreateYAMLRequest.model_validate(
+            {"title": title, "workflow_definition": {"blocks": [], "parameters": []}}
+        )
 
 
 _PROPOSED_YAML = textwrap.dedent(

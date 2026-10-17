@@ -127,7 +127,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowUpdateYAMLRequest
 from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
 from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 from skyvern.utils.url_validators import validate_webhook_url
@@ -5427,6 +5427,31 @@ async def _accept(chat_id: str, tokened: bool = True) -> Workflow:
 
 
 @pytest.mark.asyncio
+async def test_accept_proposal_uses_update_schema_for_legacy_long_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    title = "Legacy title " * 24
+    canonical = _make_copilot_workflow(title, _NOW)
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflows",
+        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
+    )
+    proposal = canonical.model_dump(mode="json")
+    proposal["_copilot_yaml"] = yaml.safe_dump(
+        {"title": title, "workflow_definition": {"parameters": [], "blocks": []}}
+    )
+
+    request = await workflow_copilot_route._resolve_proposal_for_accept(
+        proposal,
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+    )
+
+    assert len(title) > 255
+    assert isinstance(request, WorkflowUpdateYAMLRequest)
+    assert request.title == title
+
+
+@pytest.mark.asyncio
 async def test_untyped_proposal_publication_records_base_and_rejects_a_save_before_accept(
     sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5708,7 +5733,7 @@ async def test_every_accept_refusal_after_the_claim_releases_it(
         assert isinstance(exc_info.value, HTTPException)
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail.startswith("Proposed copilot YAML is invalid:")
-        assert "WorkflowCreateYAMLRequest" in exc_info.value.detail
+        assert "WorkflowUpdateYAMLRequest" in exc_info.value.detail
     if refusal != "create_failed":
         create.assert_not_awaited()
     row = await repo.get_workflow_copilot_chat_by_id("org-1", chat_id)

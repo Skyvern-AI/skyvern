@@ -819,7 +819,7 @@ async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> 
         await aiohttp_request(
             method="GET",
             url="https://example.com/start",
-            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "Accept": "*/*", "X-Keep": "1"},
             cookies={"session": "abc"},
             follow_redirects=True,
         )
@@ -827,7 +827,9 @@ async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> 
     assert requested_headers[0]["Authorization"] == "Bearer secret"
     assert requested_headers[0]["Cookie"] == "sid=abc"
     assert requested_cookies[0] == {"session": "abc"}
-    assert requested_headers[1] == {"X-Keep": "1"}
+    # Allowlist, not a credential denylist: a custom header can itself be a credential
+    # (X-Api-Key), so only the safe navigational headers survive a cross-origin hop.
+    assert requested_headers[1] == {"Accept": "*/*"}
     assert requested_cookies[1] is None
 
 

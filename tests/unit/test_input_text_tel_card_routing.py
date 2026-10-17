@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -756,6 +756,7 @@ async def test_secret_in_exact_value_input_uses_readback(input_type: str | None)
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     secret_readback.assert_awaited_once_with(
         skyvern_element=el,
+        page=ANY,
         tag_name="input",
         text="mysecretvalue",
         input_type=input_type or "",
@@ -819,6 +820,7 @@ async def test_secret_readback_runs_on_retargeted_element_type() -> None:
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     secret_readback.assert_awaited_once_with(
         skyvern_element=blocker,
+        page=ANY,
         tag_name="input",
         text="mysecretvalue",
         input_type="password",
@@ -1089,6 +1091,7 @@ async def test_secret_valued_typed_widget_keeps_keyboard_path_with_readback(
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     secret_readback.assert_awaited_once_with(
         skyvern_element=el,
+        page=ANY,
         tag_name="input",
         text="mysecretvalue",
         input_type="text",
@@ -1110,6 +1113,7 @@ async def test_secret_valued_search_bar_keeps_keyboard_path() -> None:
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     secret_readback.assert_awaited_once_with(
         skyvern_element=el,
+        page=ANY,
         tag_name="input",
         text="mysecretvalue",
         input_type="text",
@@ -1132,6 +1136,7 @@ async def test_secret_valued_plain_native_input_still_uses_atomic_readback() -> 
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     secret_readback.assert_awaited_once_with(
         skyvern_element=el,
+        page=ANY,
         tag_name="input",
         text="mysecretvalue",
         input_type="text",

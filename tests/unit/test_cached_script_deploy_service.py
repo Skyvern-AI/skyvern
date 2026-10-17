@@ -1,11 +1,16 @@
+import ast
 import base64
+import inspect
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
+from skyvern.core.script_generations import generate_script
 from skyvern.core.script_generations.generate_script import CodeGenResult
+from skyvern.core.script_generations.skyvern_page import CACHED_SCRIPT_PAGE_API
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.repositories.scripts import WorkflowScriptUpsertStatus
 from skyvern.forge.sdk.routes import scripts as scripts_routes
@@ -1718,3 +1723,61 @@ def test_uploaded_python_rejects_logging_config_callable_resolution(source: str)
 )
 def test_uploaded_python_allows_ordinary_logging(source: str) -> None:
     _validate_uploaded_source(source)
+
+
+def _page_verbs_the_generator_emits() -> set[str]:
+    """Every ``page.<verb>`` the code generator can emit, read off its own AST.
+
+    Derived rather than listed: a hand-written copy drifts the same way the allowlist did,
+    and the drift is silent — an unlisted verb downgrades the block to a full agent run.
+    """
+    source = Path(inspect.getfile(generate_script)).read_text()
+    tree = ast.parse(source)
+
+    def cst_name(node: ast.expr | None) -> str | None:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "Name":
+            argument = node.args[0] if node.args else None
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                return argument.value
+        return None
+
+    verbs = set(generate_script.ACTION_MAP.values())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "Attribute":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if cst_name(keywords.get("value")) != "page":
+            continue
+        if (attribute := cst_name(keywords.get("attr"))) is not None:
+            verbs.add(attribute)
+    # `method` is the ACTION_MAP lookup, plus the one branch that rewrites it.
+    verbs.add("magic_link")
+    return verbs
+
+
+def test_cached_script_allowlist_covers_every_verb_the_generator_emits() -> None:
+    unlisted = _page_verbs_the_generator_emits() - CACHED_SCRIPT_PAGE_API
+    assert not unlisted, (
+        "the generator emits page verbs the deploy gate does not allow, so every cached block "
+        f"using one silently downgrades to a full agent run: {sorted(unlisted)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "await page.evaluate('() => 1')",
+        "await page.page.keyboard.press('Enter')",
+        "await page.context.new_page()",
+        "await getattr(page, 'evaluate')('() => 1')",
+        "p = page\n    await p.evaluate('() => 1')",
+        "await eval('page.evaluate')('() => 1')",
+        "exec('import asyncio')",
+        "compile('page.evaluate(1)', '<s>', 'eval')",
+    ],
+)
+def test_cached_script_gate_still_flags_raw_browser_capability(escape: str) -> None:
+    source = f"@skyvern.cached('block_a')\nasync def block_a(page, context):\n    {escape}\n"
+    assert cached_script_deploy_service._unsafe_cached_block_labels(source) == {"block_a"}

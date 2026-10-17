@@ -399,9 +399,7 @@ def _capture_ai_extract_kwargs(monkeypatch, include_extracted_text: bool):
     scraped_page.build_element_tree = MagicMock(return_value="<a>link</a>")
     scraped_page.support_economy_elements_tree = MagicMock(return_value=False)
 
-    page = module.RealSkyvernPageAi.__new__(module.RealSkyvernPageAi)
-    page.scraped_page = scraped_page
-    page.current_label = None
+    page = module.RealSkyvernPageAi(scraped_page, MagicMock())
 
     async def fake_refresh(*_args, **_kwargs):
         return None
@@ -461,9 +459,7 @@ def _capture_ai_extract_kwargs_with_schema(monkeypatch, schema):
     scraped_page.build_element_tree = MagicMock(return_value="<a>link</a>")
     scraped_page.support_economy_elements_tree = MagicMock(return_value=False)
 
-    page = module.RealSkyvernPageAi.__new__(module.RealSkyvernPageAi)
-    page.scraped_page = scraped_page
-    page.current_label = None
+    page = module.RealSkyvernPageAi(scraped_page, MagicMock())
 
     async def fake_refresh(*_args, **_kwargs):
         return None
