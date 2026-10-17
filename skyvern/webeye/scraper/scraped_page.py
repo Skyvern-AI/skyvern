@@ -53,11 +53,36 @@ def _replace_pua_with_marker(text: str | None) -> str:
     return _PUA_PATTERN.sub("[icon]", text)
 
 
+def _escape_text(value: Any) -> str:
+    """Escape page text for the element tree.
+
+    Everything the tree carries as text came from ``textContent``, so a ``<`` in
+    it is a literal character the page displays, not the start of a tag. Left
+    raw, a page that merely shows markup -- a docs page with a code sample, a
+    form that echoes what was typed -- writes elements into the tree that do not
+    exist on the page, including their ``id``, which is what an action is
+    addressed by. A ``<`` is the only character that can do that, so it is the
+    only one escaped: an ``&`` stays as the page shows it ("Terms & Conditions").
+    """
+    return str(value).replace("<", "&lt;") if value else ""
+
+
+def _escape_attribute(value: Any) -> str:
+    """Escape an attribute value for the element tree.
+
+    The value is delimited by double quotes, so one inside it ends the attribute
+    early and turns the rest into attributes of its own. That quote is the only
+    character escaped: an ``&`` in a URL stays as written, so the model reads and
+    can reuse ``?a=1&b=2`` rather than ``?a=1&amp;b=2``.
+    """
+    return str(value).replace('"', "&quot;")
+
+
 def build_attribute(key: str, value: Any) -> str:
     if isinstance(value, bool) or isinstance(value, int):
         return f'{key}="{str(value).lower()}"'
 
-    return f'{key}="{str(value)}"' if value else key
+    return f'{key}="{_escape_attribute(value)}"' if value else key
 
 
 def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
@@ -100,24 +125,26 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("isSelectable", False):
         tag = "select"
 
-    text = element.get("text", "")
+    text = _escape_text(element.get("text", ""))
     # build children HTML
     children_html = "".join(
         json_to_html(child, need_skyvern_attrs=need_skyvern_attrs) for child in element.get("children", [])
     )
     # build option HTML
     option_html = "".join(
-        f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
+        f'<option index="{option.get("optionIndex")}">{_escape_text(option.get("text"))}</option>'
         if option.get("text")
-        else f'<option index="{option.get("optionIndex")}" value="{option.get("value")}">{option.get("text")}</option>'
+        else f'<option index="{option.get("optionIndex")}" '
+        f'value="{_escape_attribute(option.get("value") or "")}">'
+        f"{_escape_text(option.get('text'))}</option>"
         for option in element.get("options", [])
     )
 
     if element.get("purgeable", False):
         return children_html + option_html
 
-    before_pseudo_text = _replace_pua_with_marker(element.get("beforePseudoText"))
-    after_pseudo_text = _replace_pua_with_marker(element.get("afterPseudoText"))
+    before_pseudo_text = _escape_text(_replace_pua_with_marker(element.get("beforePseudoText")))
+    after_pseudo_text = _escape_text(_replace_pua_with_marker(element.get("afterPseudoText")))
 
     # Check if the element is self-closing
     if (
