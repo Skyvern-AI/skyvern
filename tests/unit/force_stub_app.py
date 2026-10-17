@@ -110,6 +110,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy

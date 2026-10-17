@@ -1819,6 +1819,7 @@ async def test_browser_runtime_event_failed_close_keeps_later_loss_unexpected(
     state = RealBrowserState(pw=MagicMock(), browser_context=context, browser_cleanup=cleanup)
     if failure == "timeout":
         monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CONTEXT_CLOSE_TIMEOUT", 0)
     with capture_logs() as logs:
         if operation == "recreate":
             assert await state.close_current_open_page() is False
@@ -2048,6 +2049,7 @@ async def test_browser_runtime_event_failed_close_intent_is_not_proof_of_context
     state = RealBrowserState(pw=MagicMock(), browser_context=context)
     if failure == "timeout":
         monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CONTEXT_CLOSE_TIMEOUT", 0)
     with capture_logs() as logs:
         if operation == "recreate":
             assert await state.close_current_open_page() is False
@@ -2868,7 +2870,7 @@ async def test_lifecycle_v4_close_intent_follows_owned_teardown(
 
     context.close = close_context
     if detach == "timeout":
-        monkeypatch.setattr(real_browser_state_module, "BROWSER_CLOSE_TIMEOUT", 0)
+        monkeypatch.setattr(real_browser_state_module, "BROWSER_CONTEXT_CLOSE_TIMEOUT", 0)
     with capture_logs() as logs:
         if detach == "caller_cancel":
             closing = asyncio.create_task(state.close(release_driver=False))
