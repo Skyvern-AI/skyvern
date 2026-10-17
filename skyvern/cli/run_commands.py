@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from skyvern.forge.forge_app import ForgeApp
     from skyvern.library.local_browser_profile import LocalBrowserProfile
 
 import psutil
@@ -37,6 +38,7 @@ from skyvern.cli.commands._tty import is_interactive
 from skyvern.cli.console import console
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.utils import detect_os
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.env_paths import (
     EnvIntent,
     resolve_backend_env_path,
@@ -278,7 +280,13 @@ async def _settle_browser_extension_startup(startup: asyncio.Task[None]) -> None
         LOG.warning("Browser extension bridge startup cleanup failed", exc_info=True)
 
 
-async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = False, **kwargs: Any) -> None:
+async def _run_mcp_with_cleanup(
+    run_async: Any,
+    *,
+    browser_extension: bool = False,
+    forge_app: ForgeApp | None = None,
+    **kwargs: Any,
+) -> None:
     global _mcp_cleanup_done, _mcp_cleanup_in_progress, _mcp_main_task
     current_task = asyncio.current_task()
     _mcp_main_task = current_task
@@ -295,7 +303,15 @@ async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = Fal
             try:
                 if extension_startup is not None:
                     await _settle_browser_extension_startup(extension_startup)
-                await _cleanup_mcp_resources()
+                try:
+                    await _cleanup_mcp_resources()
+                finally:
+                    if forge_app is not None and forge_app.api_app_shutdown_event is not None:
+                        try:
+                            await forge_app.api_app_shutdown_event()
+                        except Exception:
+                            with contained_effect("ForgeApp shutdown failure"):
+                                LOG.exception("ForgeApp shutdown failed")
             finally:
                 from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
 
@@ -788,6 +804,9 @@ def run_mcp(
                 raise SystemExit(_mcp_shutdown_exit_code) from None
             return
 
+        from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
+
+        forge_app = start_forge_app()
         # Origin validation must precede MCPAPIKeyMiddleware: a hostile page riding a
         # valid API key is already past the gate if auth resolves first. The server card
         # stays outermost so discovery remains public.
@@ -800,6 +819,7 @@ def run_mcp(
             _run_mcp_with_cleanup(
                 mcp.run_async,
                 browser_extension=browser_extension,
+                forge_app=forge_app,
                 transport=transport,
                 host=host,
                 port=port,

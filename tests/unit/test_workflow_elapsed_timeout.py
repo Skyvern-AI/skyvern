@@ -24,7 +24,13 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import WorkflowRunRequest
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
+from skyvern.schemas.workflows import (
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+    WorkflowRequest,
+    WorkflowUpdateRequest,
+    WorkflowUpdateYAMLRequest,
+)
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
@@ -143,6 +149,29 @@ def test_workflow_create_yaml_request_rejects_bool_max_elapsed_time() -> None:
             workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
             max_elapsed_time_minutes=True,
         )
+
+
+def test_workflow_create_rejects_long_titles_while_update_preserves_existing_title() -> None:
+    title = "x" * 256
+    workflow_definition = WorkflowDefinitionYAML(parameters=[], blocks=[])
+
+    with pytest.raises(ValidationError):
+        WorkflowRequest(
+            json_definition={
+                "title": title,
+                "workflow_definition": workflow_definition,
+            }
+        )
+
+    request = WorkflowUpdateRequest(
+        json_definition={
+            "title": title,
+            "workflow_definition": workflow_definition,
+        }
+    )
+
+    assert isinstance(request.json_definition, WorkflowUpdateYAMLRequest)
+    assert request.json_definition.title == title
 
 
 def test_workflow_create_yaml_request_rejects_max_elapsed_time_above_platform_cap() -> None:

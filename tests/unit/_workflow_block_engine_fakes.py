@@ -126,6 +126,7 @@ async def resolve_arm(
     trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
     takes_default_engine: bool | None = True,
     would_be_code: bool = False,
+    prompt_injection_guard: bool = False,
 ) -> Resolution:
     async def read_birth_timestamp(workflow_permanent_id: str, organization_id: str) -> datetime | None:
         if first_version_error is not None:
@@ -148,6 +149,7 @@ async def resolve_arm(
     ):
         mock_app.EXPERIMENTATION_PROVIDER = provider
         stub_workflow_block_engine_app(mock_app, billing_tier=billing_tier)
+        mock_app.AGENT_FUNCTION.needs_browser_observation.return_value = prompt_injection_guard
         # spec'd to the one repository the rule may reach, and to the two reads it could plausibly
         # use: on a bare MagicMock any attribute path answers, so a resolver reading a method the
         # real AgentDB does not have would pass here and raise in production, where the helper's

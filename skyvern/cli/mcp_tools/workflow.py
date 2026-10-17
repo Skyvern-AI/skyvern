@@ -19,6 +19,7 @@ import structlog
 import yaml
 from pydantic import Field
 
+from skyvern.client.core.api_error import ApiError
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -2048,7 +2049,10 @@ async def skyvern_workflow_update(
 
 async def skyvern_workflow_delete(
     workflow_id: Annotated[str, "Workflow permanent ID (wpid_...) to delete"],
-    force: Annotated[bool, "Must be true to confirm deletion — prevents accidental deletes"] = False,
+    force: Annotated[
+        bool,
+        Field(strict=True, description="Must be true to confirm deletion — prevents accidental deletes"),
+    ] = False,
 ) -> dict[str, Any]:
     """Delete a workflow permanently. Use when you need to remove a workflow that is no longer needed.
     Requires force=true to prevent accidental deletion."""
@@ -2072,16 +2076,24 @@ async def skyvern_workflow_delete(
         try:
             await skyvern.delete_workflow(workflow_id)
             timer.mark("sdk")
-        except NotFoundError:
+        except ApiError as e:
+            if e.status_code == 404:
+                return make_result(
+                    "skyvern_workflow_delete",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.WORKFLOW_NOT_FOUND,
+                        f"Workflow {workflow_id!r} not found",
+                        "Verify the workflow ID with skyvern_workflow_list",
+                    ),
+                )
+            LOG.error("workflow_delete_failed", workflow_id=workflow_id, error=str(e))
             return make_result(
                 "skyvern_workflow_delete",
                 ok=False,
                 timing_ms=timer.timing_ms,
-                error=make_error(
-                    ErrorCode.WORKFLOW_NOT_FOUND,
-                    f"Workflow {workflow_id!r} not found",
-                    "Verify the workflow ID with skyvern_workflow_list",
-                ),
+                error=make_error(ErrorCode.API_ERROR, str(e), "Check the workflow ID and your permissions"),
             )
         except Exception as e:
             LOG.error("workflow_delete_failed", workflow_id=workflow_id, error=str(e))

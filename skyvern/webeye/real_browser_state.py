@@ -716,13 +716,13 @@ class RealBrowserState(BrowserState):
         active_page = self.__active_page
         if active_page is not None and not active_page.is_closed() and active_page in pages:
             if all(page in self.__active_page_known_pages for page in pages):
-                self.__page = active_page
+                await self.set_working_page(active_page)
                 return active_page
 
             new_pages = [page for page in pages if page not in self.__active_page_known_pages]
             if new_pages and all(page.url in RECOVERABLE_BLANK_PAGE_URLS for page in new_pages):
                 # Do not add marker pages to known_pages; they should remain ignored until closed.
-                self.__page = active_page
+                await self.set_working_page(active_page)
                 return active_page
 
         # No (or stale) pin: fall back to the newest valid page.
@@ -804,12 +804,16 @@ class RealBrowserState(BrowserState):
         return await self.__assert_page()
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
+        if page is not self.__page:
+            app.AGENT_FUNCTION.record_browser_observation_failure("active_page_changed")
         self.__page = page
         if page is None:
             self.__active_page = None
             self.__active_page_known_pages = set()
 
     async def set_active_page(self, page: Page, *, prune_excess_pages: bool = True) -> None:
+        if page is not self.__page:
+            app.AGENT_FUNCTION.record_browser_observation_failure("active_page_changed")
         self.__active_page = page
         self.__page = page
         # list_valid_pages closes the oldest tabs past the cap, and the snapshot below only needs to

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -70,6 +71,34 @@ class _Browser:
 
 
 class _AgentFunction:
+    def __init__(self) -> None:
+        self.active = False
+        self.idle_waits = 0
+
+    @asynccontextmanager
+    async def copilot_candidate_network_guard(self, _browser_context, *, expected_origin: str):
+        assert expected_origin == "https://public.test"
+        self.active = True
+        hops = [
+            {
+                "url": "https://public.test/start",
+                "resource_type": "document",
+                "resolved_public_ips": ["93.184.216.34"],
+                "connected_peer_ip": "93.184.216.34",
+                "enforcement_version": "copilot_candidate_preconnect_v1",
+            }
+        ]
+        try:
+            yield hops
+        finally:
+            self.active = False
+
+    async def wait_for_copilot_candidate_network_idle(self, _browser_context) -> None:
+        self.idle_waits += 1
+
+    def record_browser_observation_failure(self, _reason: str) -> None:
+        return None
+
     async def setup_browser_context_extensions(self, _browser_context, **_kwargs) -> None:
         return None
 

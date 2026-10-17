@@ -582,6 +582,16 @@ def test_private_settings_restore_preserves_untouched_request_fields() -> None:
         assert getattr(restored, field_name) is getattr(request, field_name)
 
 
+def test_private_settings_restore_keeps_a_legacy_long_title_editable() -> None:
+    request = workflow_yaml_module._normalize_copilot_yaml(_STAGED_WORKFLOW_YAML)
+    request = request.model_copy(update={"title": "t" * 256})
+
+    restored = workflow_yaml_module.with_private_workflow_settings(request, {"proxy_location": "residential"})
+
+    assert restored.title == "t" * 256
+    assert restored.proxy_location == ProxyLocation.RESIDENTIAL
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field_name", ["totp_identifier", "totp_verification_url", "webhook_callback_url", "proxy_location"]

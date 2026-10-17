@@ -1160,7 +1160,7 @@ async def test_execute_task_v3_extraction_redaction_respects_word_boundaries(
 
 
 def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: BillingTier = BillingTier.UNKNOWN) -> None:
-    """Give a patched workflow_block_engine ``app`` an awaitable billing-tier seam.
+    """Give a patched workflow_block_engine ``app`` an awaitable billing-tier seam and a guard that is off.
 
     Without it, awaiting the bare MagicMock's ``resolve_billing_tier`` raises TypeError, which
     ``_billing_tier_for_arm`` swallows into UNKNOWN (with a logged traceback); the arm is still
@@ -1168,6 +1168,7 @@ def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: Bil
     assert on that property need this; ``ForgeAgent.execute_step`` never reaches the arm resolver.
     """
     mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
+    mock_wbe_app.AGENT_FUNCTION.needs_browser_observation.return_value = False
 
 
 def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
@@ -1948,10 +1949,12 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+            mock_app.AGENT_FUNCTION.needs_browser_observation.return_value = False
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
             mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_wbe_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
+            stub_workflow_block_engine_app(mock_wbe_app)
             mock_app.ARTIFACT_MANAGER = manager
             mock_app.STORAGE = storage
             mock_app.DATABASE.artifacts = database.artifacts
@@ -2123,6 +2126,7 @@ async def _run_execute_step_gate(
     workflow_owned_recovery: bool = False,
     recovery_code_progress: CodeProgressRecord | None = None,
     observer: Any = None,
+    prompt_injection_guard: bool = False,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2165,6 +2169,8 @@ async def _run_execute_step_gate(
             else:
                 mock_app.DATABASE.observer.set_workflow_run_block_engine_by_task_id = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+            mock_app.AGENT_FUNCTION.needs_browser_observation.return_value = prompt_injection_guard
+            stub_workflow_block_engine_app(mock_wbe_app)
             if experimentation_provider is not None:
                 mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
                 mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
@@ -2325,6 +2331,20 @@ async def test_an_unevaluable_kill_switch_runs_an_explicit_v3_block_on_the_step_
     assert any(
         log.get("route_reason") == "flag_error" and log.get("workflow_run_id") == "wr_task_v3_kill_down" for log in logs
     )
+
+
+@pytest.mark.asyncio
+async def test_a_guarded_v3_run_executes_on_the_step_engine() -> None:
+    # Task V3 tools bypass the browser action policy, so the guard must keep runs off V3.
+    with capture_logs() as logs:
+        v3_mock, step_engine_mock = await _run_execute_step_gate(
+            engine=agent_module.RunEngine.skyvern_v3, task_block=None, prompt_injection_guard=True
+        )
+
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
+    assert step_engine_mock.await_args.kwargs["engine"] == agent_module.RunEngine.skyvern_v1
+    assert any(log.get("route_reason") == "prompt_injection_guard" for log in logs)
 
 
 @pytest.mark.asyncio

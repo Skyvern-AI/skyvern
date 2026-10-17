@@ -127,6 +127,33 @@ def create_forge_stub_app() -> ForgeApp:
     # awaited value is a non-None MagicMock, poisoning the extract-information prompt/cache key.
     # Match the real OSS base no-op (None → no grid rows injected).
     fake_app_module.AGENT_FUNCTION.collect_virtualized_grid_rows = AsyncMock(return_value=None)
+    # Browser-defense seams — _LazyNamespace would auto-mock each as an AsyncMock, so the sync
+    # ones hand callers an unawaited coroutine (len(screenshots) blows up) and the predicates read
+    # as truthy, silently arming dismiss/block policies OSS ships inert. Bind the real base methods.
+    for browser_defense_seam in (
+        "begin_browser_observation",
+        "enforce_browser_action_egress_policy",
+        "enforce_browser_action_policy",
+        "enforce_cached_browser_script_policy",
+        "enforce_external_request_policy",
+        "filter_browser_screenshots",
+        "inspect_browser_dialog",
+        "inspect_browser_observation",
+        "needs_browser_observation",
+        "needs_browser_observation_text",
+        "prepare_browser_observation",
+        "record_browser_observation_failure",
+        "register_browser_origin_authority",
+        "should_block_browser_action",
+        "should_dismiss_browser_dialog",
+        "should_use_cached_browser_scripts",
+        "transform_browser_elements_for_prompt",
+    ):
+        setattr(
+            fake_app_module.AGENT_FUNCTION,
+            browser_defense_seam,
+            getattr(base_agent_function, browser_defense_seam),
+        )
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

@@ -22,7 +22,6 @@ def workflow(
 def cached(cache_key: str) -> Callable:
     def decorator(func: Callable) -> Callable:
         async def wrapper(page: SkyvernPage, context: RunContext, *args: Any, **kwargs: Any) -> Any:
-            # Store the function in context.cached_fns
             page.current_label = cache_key
             try:
                 return await func(page, context, *args, **kwargs)

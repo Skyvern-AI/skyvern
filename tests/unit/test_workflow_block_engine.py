@@ -309,6 +309,18 @@ async def test_disable_flag_wins_over_ab_flag(scoped_context: SkyvernContext) ->
 
 
 @pytest.mark.asyncio
+async def test_prompt_injection_guard_keeps_the_run_out_of_the_v3_arm(scoped_context: SkyvernContext) -> None:
+    # Dispatch runs a guarded task on the step engine, so routing must not label it treatment.
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
+    resolution = await resolve_arm(
+        scoped_context, provider, workflow_run_id="wr_guarded", ineligibility_reason=None, prompt_injection_guard=True
+    )
+
+    assert scoped_context.workflow_block_engine_override is None
+    assert resolution.log["route_reason"] == WorkflowBlockEngineRouteReason.disabled
+
+
+@pytest.mark.asyncio
 async def test_provider_exception_fails_closed_to_control(scoped_context: SkyvernContext) -> None:
     provider = FakeExperimentationProvider(raise_error=True)
     resolution = await resolve_arm(scoped_context, provider, workflow_run_id="wr_err", ineligibility_reason=None)
@@ -1101,6 +1113,7 @@ async def test_a_run_that_never_reaches_the_ab_pays_for_no_tier_lookup(scoped_co
             patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app,
             patch("skyvern.forge.sdk.experimentation.workflow_block_engine.LOG") as mock_log,
         ):
+            stub_workflow_block_engine_app(mock_app)
             mock_app.EXPERIMENTATION_PROVIDER = provider
             mock_app.AGENT_FUNCTION.resolve_billing_tier = tier
             await resolve_workflow_block_engine_arm(
@@ -1125,6 +1138,7 @@ async def test_a_failing_billing_tier_lookup_cannot_decide_the_arm(scoped_contex
     # dependency the arm never had. The treated run must still be treated.
     provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: True})
     with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+        stub_workflow_block_engine_app(mock_app)
         mock_app.EXPERIMENTATION_PROVIDER = provider
         mock_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(side_effect=RuntimeError("billing down"))
         await resolve_workflow_block_engine_arm(
@@ -1780,6 +1794,7 @@ async def test_effective_default_engine_follows_the_chosen_engine_cutoff(
 ) -> None:
     monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
     with patch(WORKFLOW_BLOCK_ENGINE_APP_TARGET) as mock_app:
+        stub_workflow_block_engine_app(mock_app)
         mock_app.EXPERIMENTATION_PROVIDER = FakeExperimentationProvider()
         mock_app.DATABASE.workflows.get_workflow_permanent_id_created_at = AsyncMock(return_value=born_at)
         assert await effective_default_engine("wpid_1", "org_1") == expected

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -9,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
@@ -707,6 +708,44 @@ def test_visual_summary_marks_observed_empty_page_without_text_hints() -> None:
     assert marked["observed_empty_page"] is True
     assert marked["empty_page_observation_source"] == "vision_summary"
     assert marked["empty_page_visual_state"] == "settled_empty"
+
+
+@pytest.mark.asyncio
+async def test_filtered_screenshot_cannot_become_copilot_visual_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge import app
+    from skyvern.forge.sdk.copilot.tools import composition_capture
+
+    evidence = parse_composition_html(
+        "<html><body></body></html>",
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+    )
+    screenshot = base64.b64encode(b"captured image").decode()
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(filter_browser_screenshots=lambda _screenshots: []),
+    )
+    monkeypatch.setattr(
+        composition_capture,
+        "_composition_get_screenshot",
+        AsyncMock(return_value={"ok": True, "data": {"screenshot_base64": screenshot}}),
+    )
+    monkeypatch.setattr(composition_capture, "effective_browser_session_id", lambda _ctx: None)
+    monkeypatch.setattr(composition_capture, "screenshot_result_facts", lambda *_args, **_kwargs: (None, None, None))
+    visual_handler = AsyncMock()
+    monkeypatch.setattr(composition_capture, "_composition_visual_handler", AsyncMock(return_value=visual_handler))
+
+    captured = await composition_capture._composition_capture_visual_summary(SimpleNamespace(), evidence)
+    merged = composition_capture._merge_visual_summary_capture(evidence, captured)
+
+    assert captured.error == composition_capture._COMPOSITION_SCREENSHOT_FILTERED
+    assert captured.summary is None
+    assert captured.frame is None
+    visual_handler.assert_not_awaited()
+    assert merged["screenshot_used"] is False
+    assert merged["evidence_sources"] == ["dom_html"]
+    assert "screenshot_filtered_by_browser_policy" in merged["visual_evidence_omissions"]
 
 
 def test_visual_summary_keeps_loading_shell_unobserved() -> None:

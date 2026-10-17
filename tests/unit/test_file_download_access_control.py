@@ -459,14 +459,14 @@ async def test_download_file_strips_credentials_on_cross_origin_redirect(
 
     result = await files.download_file(
         "https://example.com/start.pdf",
-        headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+        headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "Accept": "*/*", "X-Keep": "1"},
         output_dir=str(tmp_path),
     )
 
     assert Path(result).read_bytes() == b"file-bytes"
     assert requested_headers[0]["Authorization"] == "Bearer secret"
     assert requested_headers[0]["Cookie"] == "sid=abc"
-    assert requested_headers[1] == {"X-Keep": "1"}
+    assert requested_headers[1] == {"Accept": "*/*"}
 
 
 @pytest.mark.asyncio

@@ -152,6 +152,7 @@ from skyvern.schemas.proxy_pinning import redact_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
+    WORKFLOW_TITLE_MAX_LENGTH,
     LoginBlockYAML,
     UrlBlockYAML,
     ValidationBlockYAML,
@@ -1137,7 +1138,7 @@ async def test_login(
     )
 
     workflow_create_request = WorkflowCreateYAMLRequest(
-        title=f"Login Test - {data.username}",
+        title=f"Login Test - {data.username}"[:WORKFLOW_TITLE_MAX_LENGTH],
         description="Auto-generated workflow to test login credentials",
         persist_browser_session=True,
         workflow_definition=workflow_definition_yaml,
@@ -1333,7 +1334,7 @@ async def test_credential(
     )
 
     workflow_create_request = WorkflowCreateYAMLRequest(
-        title=f"Credential Test - {credential.name}",
+        title=f"Credential Test - {credential.name}"[:WORKFLOW_TITLE_MAX_LENGTH],
         description=f"Auto-generated workflow to test credential {credential_id}",
         persist_browser_session=data.save_browser_profile,
         workflow_definition=workflow_definition_yaml,

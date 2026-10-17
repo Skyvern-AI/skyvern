@@ -16,7 +16,12 @@ from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService, _workflow_save_fingerprint
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowStatus
+from skyvern.schemas.workflows import (
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+    WorkflowStatus,
+    WorkflowUpdateYAMLRequest,
+)
 
 
 def _make_workflow(browser_profile_id: str | None = None) -> Workflow:
@@ -105,6 +110,51 @@ async def test_create_workflow_from_request_allows_unchanged_legacy_webhook_url(
     )
 
     assert result is updated_workflow
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_allows_unchanged_legacy_long_title() -> None:
+    legacy_title = "x" * 256
+    service, updated_workflow = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_title=legacy_title,
+    )
+    request = WorkflowUpdateYAMLRequest(
+        title=legacy_title,
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    result = await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+    )
+
+    assert result is updated_workflow
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_rejects_replacing_legacy_long_title() -> None:
+    service, _ = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_title="x" * 256,
+    )
+    request = WorkflowUpdateYAMLRequest(
+        title="y" * 256,
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    with pytest.raises(SkyvernHTTPException, match="must be at most 255 characters") as exc_info:
+        await service.create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+            workflow_permanent_id="wpid_test",
+        )
+
+    assert exc_info.value.status_code == 422
+    create_workflow_mock = service.create_workflow
+    assert isinstance(create_workflow_mock, AsyncMock)
+    create_workflow_mock.assert_not_awaited()
 
 
 def test_workflow_create_yaml_request_masks_cdp_connect_headers_on_dump() -> None:
@@ -706,10 +756,12 @@ def _make_workflow_update_service(
     existing_pin_saved_session_ip: bool = False,
     existing_webhook_callback_url: str | None = None,
     existing_created_by: str | None = None,
+    existing_title: str = "test",
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
         version=2,
+        title=existing_title,
         proxy_location=None,
         totp_identifier=None,
         totp_verification_url=None,

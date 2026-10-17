@@ -447,7 +447,7 @@ async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
 
     try:
-        with pytest.raises(FailedToCreateWorkflow, match="database timed out"):
+        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
             await agent_protocol.create_workflow(
                 data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
                 folder_id=None,
@@ -455,6 +455,9 @@ async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
                 user_id="u_test",
                 idempotency_key="database-timeout-key",
             )
+        # The internal cause reaches the logs and __cause__, never the client-visible message.
+        assert "database timed out" not in str(raised.value)
+        assert "database timed out" in str(raised.value.__cause__)
     finally:
         await database.engine.dispose()
 
@@ -503,7 +506,7 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
     monkeypatch.setattr(workflow_service, "maybe_delete_cached_code", fail_cache_invalidation)
 
     try:
-        with pytest.raises(FailedToCreateWorkflow, match="cache invalidation failed"):
+        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
             await agent_protocol.create_workflow(
                 data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
                 folder_id=None,
@@ -511,6 +514,9 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
                 user_id="u_test",
                 idempotency_key="rollback-key",
             )
+        # The internal cause reaches the logs and __cause__, never the client-visible message.
+        assert "cache invalidation failed" not in str(raised.value)
+        assert "cache invalidation failed" in str(raised.value.__cause__)
 
         assert first_save_at is not None
         async with database.Session() as session:
@@ -698,7 +704,7 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
     try:
-        with pytest.raises(FailedToCreateWorkflow, match="definition write failed"):
+        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
             await agent_protocol.create_workflow(
                 data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
                 folder_id=None,
@@ -706,6 +712,9 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
                 user_id="u_test",
                 idempotency_key="write-rollback-key",
             )
+        # The internal cause reaches the logs and __cause__, never the client-visible message.
+        assert "definition write failed" not in str(raised.value)
+        assert "definition write failed" in str(raised.value.__cause__)
 
         async with database.Session() as session:
             workflow_count = await session.scalar(select(func.count()).select_from(WorkflowModel))

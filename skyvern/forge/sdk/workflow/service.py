@@ -353,6 +353,7 @@ from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
+    WORKFLOW_TITLE_MAX_LENGTH,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -1495,7 +1496,7 @@ async def _load_user_script_module(
     fails loads as None — blocks drop to the agent — because exec-ing its
     stored body would resurrect the same staleness, and the marker-only pin
     check would never supersede it. Only a markerless pin (a generated script)
-    executes its stored body.
+    may proceed through the execution policy to its stored body.
     """
     loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
     if loaded_script_module is not None:
@@ -8335,7 +8336,7 @@ class WorkflowService:
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
         # Only enable when we actually have a script to run
-        script_mode_active = bool(script and is_script_run and script_blocks_by_label)
+        script_mode_active = bool(script and is_script_run and loaded_script_module and script_blocks_by_label)
         if script_mode_active:
             ctx = skyvern_context.current()
             if ctx:
@@ -8371,6 +8372,7 @@ class WorkflowService:
             execution_mode = "code_generation"
         else:
             execution_mode = "agent"
+
         LOG.info(
             "Workflow run execution mode resolved",
             execution_mode=execution_mode,
@@ -11707,6 +11709,8 @@ class WorkflowService:
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
+        if deleted_workflow_id is None:
+            return None
         if deleted_schedule_ids:
             LOG.info(
                 "Cascade-deleted schedules during workflow deletion",
@@ -17109,6 +17113,16 @@ class WorkflowService:
         else:
             existing_latest_workflow = None
 
+        if (
+            existing_latest_workflow
+            and len(request.title) > WORKFLOW_TITLE_MAX_LENGTH
+            and request.title != existing_latest_workflow.title
+        ):
+            raise SkyvernHTTPException(
+                message=f"Workflow title must be at most {WORKFLOW_TITLE_MAX_LENGTH} characters.",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
         if request.webhook_callback_url and (
             existing_latest_workflow is None
             or request.webhook_callback_url != existing_latest_workflow.webhook_callback_url
@@ -18581,10 +18595,8 @@ class WorkflowService:
         we then ran agent." That's the precise definition of a mid-execution
         script→AI fallback.
 
-        Caller must only invoke this AFTER `block.execute_safe` actually ran
-        (i.e., the fallback agent execution happened). Calling before would
-        risk false positives in the `ai_fallback=False` kept-the-failure
-        case where `execute_safe` is never reached.
+        Callers invoke this only after `block.execute_safe` ran, so the flag
+        excludes denied, skipped, and agent-only blocks.
 
         Wrapped in try/except so a transient DB error on the flag flip can't
         abort downstream block post-processing. Regression-locked by
