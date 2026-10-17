@@ -195,6 +195,7 @@ class WebSearchBlock(Block):
         merged_mapping: dict[str, str],
         mapping_is_page_derived: bool,
         failure_reason: str | None,
+        search_served: bool,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None,
@@ -223,10 +224,13 @@ class WebSearchBlock(Block):
         tz_info = run_context.tz_info if run_context and run_context.tz_info else datetime.now().astimezone().tzinfo
         search_data: dict[str, Any] = {
             "query": response.query,
-            "results": response.results,
             "prompt": rendered_prompt or None,
             "prompt_output": response.prompt_output,
         }
+        # A search that was never served has no result list to judge, and offering an empty one
+        # invites a code describing empty results. The failure itself still gets a code.
+        if search_served:
+            search_data["results"] = response.results
         if mapping_is_page_derived:
             search_data["error_codes"] = merged_mapping
         detection_prompt = prompt_engine.load_prompt(
@@ -343,10 +347,12 @@ class WebSearchBlock(Block):
 
             execution_denied = False
             prompt_ran = False
+            search_served = False
             if failure_reason is None:
                 try:
                     async with asyncio.timeout(web_search_client.SEARCH_TIMEOUT_SECONDS):
                         await web_search_client.search(response, self.provider, self.num_results)
+                    search_served = True
                 except (TimeoutError, WebSearchError) as exc:
                     reason = str(exc) or (
                         f"{response.provider.title()} search timed out after "
@@ -355,6 +361,7 @@ class WebSearchBlock(Block):
                     if response.fallback_reason:
                         reason += f" Exa ran because {response.fallback_reason.rstrip('.')}."
                     if response.results:
+                        search_served = True
                         LOG.warning(
                             "Web search stopped before reaching the requested result count",
                             provider=response.provider,
@@ -483,6 +490,7 @@ class WebSearchBlock(Block):
                             merged_mapping,
                             mapping_is_page_derived,
                             failure_reason,
+                            search_served,
                             workflow_run_id,
                             workflow_run_block_id,
                             organization_id,
