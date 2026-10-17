@@ -885,7 +885,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/WorkflowRequest"
+                "$ref": "#/components/schemas/WorkflowUpdateRequest"
               }
             }
           }
@@ -976,6 +976,9 @@
                 "schema": {}
               }
             }
+          },
+          "404": {
+            "description": "Agent not found"
           },
           "422": {
             "description": "Validation Error",
@@ -30641,6 +30644,7 @@
         "properties": {
           "title": {
             "type": "string",
+            "maxLength": 255,
             "title": "Title"
           },
           "recording_id": {
@@ -34709,6 +34713,350 @@
           "workflow_permanent_id"
         ],
         "title": "WorkflowTriggerBlockYAML"
+      },
+      "WorkflowUpdateRequest": {
+        "properties": {
+          "json_definition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowUpdateYAMLRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Workflow definition in JSON format"
+          },
+          "yaml_definition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yaml Definition",
+            "description": "Workflow definition in YAML format"
+          }
+        },
+        "type": "object",
+        "title": "WorkflowUpdateRequest"
+      },
+      "WorkflowUpdateYAMLRequest": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "recording_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recording Id",
+            "description": "Durable browser recording to attach to the workflow version created by this save."
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "$ref": "#/components/schemas/GeoTarget"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proxy Location",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+          },
+          "webhook_callback_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Callback Url",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. URL validation errors identify the field and failure class without returning the URL or host."
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. URL validation errors identify the field and failure class without returning the URL or host."
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+          },
+          "persist_browser_session": {
+            "type": "boolean",
+            "title": "Persist Browser Session",
+            "default": false
+          },
+          "reuse_browser_session": {
+            "type": "boolean",
+            "title": "Reuse Browser Session",
+            "default": false
+          },
+          "mask_secrets": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mask Secrets",
+            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text."
+          },
+          "pin_saved_session_ip": {
+            "type": "boolean",
+            "title": "Pin Saved Session Ip",
+            "default": false
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id"
+          },
+          "browser_profile_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Key"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "workflow_definition": {
+            "$ref": "#/components/schemas/WorkflowDefinitionYAML"
+          },
+          "is_saved_task": {
+            "type": "boolean",
+            "title": "Is Saved Task",
+            "default": false
+          },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls"
+          },
+          "max_elapsed_time_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 480.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Elapsed Time Minutes"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. An empty object ({}) clears the header map. Values, including ***, are literal."
+          },
+          "cdp_connect_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cdp Connect Headers",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. An empty object ({}) clears the header map; each masked *** entry keeps the stored value for that key."
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkflowStatus",
+            "default": "published"
+          },
+          "run_with": {
+            "type": "string",
+            "title": "Run With",
+            "default": "agent"
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for runs of this workflow, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. Null means the system default."
+          },
+          "ai_fallback": {
+            "type": "boolean",
+            "title": "Ai Fallback",
+            "default": true
+          },
+          "cache_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Key",
+            "default": "default"
+          },
+          "adaptive_caching": {
+            "type": "boolean",
+            "title": "Adaptive Caching",
+            "default": false
+          },
+          "enable_self_healing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Self Healing"
+          },
+          "code_version": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Version"
+          },
+          "generate_script_on_terminal": {
+            "type": "boolean",
+            "title": "Generate Script On Terminal",
+            "default": false
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Prevent Overlapping Runs",
+            "default": false
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
+          },
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "workflow_definition"
+        ],
+        "title": "WorkflowUpdateYAMLRequest",
+        "description": "Update-only definition that preserves titles stored before the create limit."
       },
       "skyvern__forge__sdk__schemas__credentials__CredentialType": {
         "type": "string",
