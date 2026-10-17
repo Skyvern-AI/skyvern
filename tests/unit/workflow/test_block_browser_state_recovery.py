@@ -667,6 +667,23 @@ async def test_reconnect_restores_stale_state_before_cancelled_replacement_shutd
     await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
 
 
+async def _reconnect_guarded_from_stop_start(state: RealBrowserState, stop_started: asyncio.Event) -> None:
+    # reconnect arms its BROWSER_CLOSE_TIMEOUT wait on a stop before the stop runs, so a guard armed once the stop has
+    # started cannot fire ahead of that cap during a main-thread pause such as a full GC.
+    reconnect = asyncio.create_task(state.reconnect(browser_address="ws://remote-browser"))
+    stop_started_wait = asyncio.create_task(stop_started.wait())
+    await asyncio.wait({reconnect, stop_started_wait}, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+    stop_started_wait.cancel()
+    if not stop_started.is_set() and not reconnect.done():
+        reconnect.cancel()
+        pytest.fail("reconnect did not reach the stop under test within 30s")
+    done, _ = await asyncio.wait({reconnect}, timeout=1)
+    if not done:
+        reconnect.cancel()
+        pytest.fail("reconnect kept waiting on a stop past BROWSER_CLOSE_TIMEOUT")
+    await reconnect
+
+
 @pytest.mark.asyncio
 async def test_reconnect_bounds_fresh_driver_shutdown_when_state_rebuild_fails(
     monkeypatch: pytest.MonkeyPatch,
@@ -694,7 +711,7 @@ async def test_reconnect_bounds_fresh_driver_shutdown_when_state_rebuild_fails(
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock(side_effect=RuntimeError("cdp handshake failed")))
 
     with pytest.raises(RuntimeError, match="cdp handshake failed"):
-        await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
+        await _reconnect_guarded_from_stop_start(state, stop_started)
 
     assert stop_started.is_set()
     fresh_pw.stop.assert_awaited_once()
@@ -1026,7 +1043,7 @@ async def test_reconnect_bounds_stale_driver_shutdown_after_guarded_replacement(
     check_and_fix = AsyncMock()
     monkeypatch.setattr(state, "check_and_fix_state", check_and_fix)
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
+    await _reconnect_guarded_from_stop_start(state, stop_started)
     await asyncio.wait_for(retry_started.wait(), timeout=1)
     await asyncio.gather(*list(state._detached_teardown_tasks), return_exceptions=True)
 
@@ -1041,9 +1058,11 @@ async def test_reconnect_bounds_stale_driver_shutdown_after_guarded_replacement(
 async def test_reconnect_does_not_retry_until_cancellation_resistant_stale_shutdown_completes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    stop_started = asyncio.Event()
     release_stop = asyncio.Event()
 
     async def cancellation_resistant_stop() -> None:
+        stop_started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -1063,7 +1082,7 @@ async def test_reconnect_does_not_retry_until_cancellation_resistant_stale_shutd
     state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
+    await _reconnect_guarded_from_stop_start(state, stop_started)
     await asyncio.sleep(0.02)
 
     # The first stop remains owned without racing a second stop.
@@ -1080,6 +1099,7 @@ async def test_reconnect_does_not_retry_until_cancellation_resistant_stale_shutd
 async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eventually_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    stop_started = asyncio.Event()
     release_stop = asyncio.Event()
     stop_attempts = 0
 
@@ -1088,6 +1108,7 @@ async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eve
         stop_attempts += 1
         if stop_attempts != 1:
             return
+        stop_started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -1108,7 +1129,7 @@ async def test_reconnect_retries_after_cancellation_resistant_stale_shutdown_eve
     state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))
     monkeypatch.setattr(state, "check_and_fix_state", AsyncMock())
 
-    await asyncio.wait_for(state.reconnect(browser_address="ws://remote-browser"), timeout=1)
+    await _reconnect_guarded_from_stop_start(state, stop_started)
     await asyncio.sleep(0.02)
     assert stale_pw.stop.await_count == 1
 

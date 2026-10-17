@@ -265,14 +265,18 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
 def reset_cli_runtime_entry() -> Iterator[None]:
     """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
 
+    A CLI command also labels the process's API client as the CLI, which must not leak into a later MCP test.
+
     Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
     against the default production URL in any later test that builds a cloud client. The env
     load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
     """
     entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    command_running = cli_bootstrap._CLI_COMMAND_RUNNING
     loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
     yield
     cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    cli_bootstrap._CLI_COMMAND_RUNNING = command_running
     for name, value in loaded.items():
         if value is None:
             os.environ.pop(name, None)

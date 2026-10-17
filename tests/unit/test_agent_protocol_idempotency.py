@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _commit_staged_workflow,
+    _restore_workflow_definition,
     workflow_copilot_apply_proposed_workflow,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1059,3 +1060,61 @@ async def test_workflow_setting_presence_preserves_persisted_values(
         )
         assert persisted is not None
         assert getattr(persisted, field_name) == expected
+
+
+@pytest.mark.asyncio
+async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "build-source.db") as lab:
+
+        async def build_source_of(workflow_id: str) -> str | None:
+            persisted = await lab.database.workflows.get_workflow(
+                workflow_id=workflow_id, organization_id=lab.organization.organization_id
+            )
+            assert persisted is not None
+            return persisted.build_source
+
+        created = await lab.client.post(
+            "/v1/agents", headers={"x-user-agent": "skyvern-mcp"}, json=WORKFLOW_CREATE_PAYLOAD
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["build_source"] == "mcp"
+        workflow_permanent_id = created.json()["workflow_permanent_id"]
+
+        definition = WORKFLOW_CREATE_PAYLOAD["json_definition"]
+        ui_save = await lab.client.put(
+            f"/v1/workflows/{workflow_permanent_id}",
+            content=yaml.safe_dump(definition),
+            headers={"Content-Type": "application/x-yaml", "x-user-agent": "skyvern-ui"},
+        )
+        cli_save = await lab.client.post(
+            f"/v1/workflows/{workflow_permanent_id}",
+            headers={"x-user-agent": "skyvern-cli"},
+            json={"json_definition": definition},
+        )
+        api_save = await lab.client.post(f"/v1/workflows/{workflow_permanent_id}", json={"json_definition": definition})
+        assert ui_save.status_code == 200 and cli_save.status_code == 200 and api_save.status_code == 200
+        assert await build_source_of(ui_save.json()["workflow_id"]) == "ui"
+        assert await build_source_of(cli_save.json()["workflow_id"]) == "cli"
+        api_version = Workflow.model_validate(api_save.json())
+        assert await build_source_of(api_version.workflow_id) == "api"
+
+        staged = await _process_workflow_yaml(
+            workflow_id=api_version.workflow_id,
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=lab.organization.organization_id,
+            workflow_yaml=yaml.safe_dump(definition),
+        )
+        await _commit_staged_workflow(
+            organization_id=lab.organization.organization_id,
+            workflow_id=api_version.workflow_id,
+            workflow_permanent_id=workflow_permanent_id,
+            staged_workflow=staged,
+        )
+        assert await build_source_of(api_version.workflow_id) == "copilot"
+
+        # A rolled-back copilot turn must not leave its stamp on the version the API caller wrote.
+        await _restore_workflow_definition(api_version, lab.organization.organization_id)
+        assert await build_source_of(api_version.workflow_id) == "api"
