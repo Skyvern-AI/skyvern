@@ -30,7 +30,7 @@ export type PermissionsResponse = Readonly<{
   user_id: string | null;
   auth_kind: string | null;
   org_role: string | null;
-  role: "admin" | "member" | null;
+  role: "admin" | "member" | "billing_admin" | null;
   capabilities: ReadonlyArray<PermissionCapability>;
 }>;
 
