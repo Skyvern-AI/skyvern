@@ -13,6 +13,7 @@ import { AxiosError } from "axios";
 import {
   CalendarIcon,
   InputIcon,
+  LightningBoltIcon,
   Pencil1Icon,
   PlayIcon,
   ReloadIcon,
@@ -22,6 +23,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { usePostHog } from "posthog-js/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { usePageSlots } from "@/store/PageSlots";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -294,7 +296,7 @@ function PanelToggle({
   label,
   icon,
 }: {
-  content: "parameters" | "schedules";
+  content: "parameters" | "schedules" | "triggers";
   label: string;
   icon: ReactNode;
 }) {
@@ -568,6 +570,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 }
 
 export function StudioTopBar() {
+  const { workflowTriggersPanel } = usePageSlots();
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
   const { panes, setOpenPanes } = useStudioPanes();
@@ -622,6 +625,13 @@ export function StudioTopBar() {
                       label="Schedule"
                       icon={<CalendarIcon className="size-4" />}
                     />
+                    {workflowTriggersPanel ? (
+                      <PanelToggle
+                        content="triggers"
+                        label="Triggers"
+                        icon={<LightningBoltIcon className="size-4" />}
+                      />
+                    ) : null}
                     <EditorOverflowMenu
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}
