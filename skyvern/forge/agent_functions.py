@@ -987,6 +987,15 @@ class AgentFunction:
     ) -> str | None:
         return None
 
+    async def enforce_request_role(
+        self,
+        principal: RequestPrincipal,
+        action: str | None,
+        bearer_identity_status: BearerIdentityStatus | None,
+    ) -> None:
+        """Runs inside auth, before the handler; action is None when the route recorded none. Raising rejects."""
+        return None
+
     async def should_redact_organization_credential_secrets(
         self,
         principal: RequestPrincipal | None,

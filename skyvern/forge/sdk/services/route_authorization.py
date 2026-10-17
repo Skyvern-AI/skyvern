@@ -5,7 +5,7 @@ from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from skyvern.forge import app
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import get_request_principal, pending_route_action
 
 LOG = structlog.get_logger()
 
@@ -318,8 +318,14 @@ async def _authorize_connection(connection: HTTPConnection) -> None:
 
 async def observe_request_authorization(connection: HTTPConnection) -> AsyncIterator[None]:
     try:
+        action, _ = _route_action(connection)
+    except Exception:  # noqa: BLE001 - observation failures are logged after the handler, never raised here.
+        action = None
+    token = pending_route_action.set(action)
+    try:
         yield
     finally:
+        pending_route_action.reset(token)
         await _authorize_connection(connection)
 
 
