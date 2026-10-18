@@ -413,6 +413,17 @@ def _entry_kind(entry: dict | None) -> str:
     else:
         command_name = Path(command).name if command else ""
     args = entry.get("args", [])
+    env = entry.get("env")
+    if (
+        command_name.replace(chr(92), "/").rsplit("/", 1)[-1].lower() in {"node", "node.exe"}
+        and isinstance(args, list)
+        and len(args) == 1
+        and isinstance(args[0], str)
+        and args[0].replace(chr(92), "/").rsplit("/", 1)[-1] == "proxy.mjs"
+        and isinstance(env, dict)
+        and isinstance(env.get("SKYVERN_MCP_URL"), str)
+    ):
+        return "api-key bridge"
     if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
         return "mcp-remote bridge"
 
@@ -583,6 +594,8 @@ def _select_profile(profile_name: str | None, discovered: list[SwitchTarget]) ->
 
 def _entry_location(entry: dict) -> str:
     kind = _entry_kind(entry)
+    if kind == "api-key bridge":
+        return str(entry["env"]["SKYVERN_MCP_URL"])
     if kind == "local stdio":
         env = entry.get("environment")
         if env is None:
@@ -765,6 +778,18 @@ def _patch_entry_with_profile(
 ) -> dict:
     patched = copy.deepcopy(entry)
     kind = _entry_kind(entry)
+
+    if kind == "api-key bridge":
+        from skyvern.cli.claude_bridge import bridge_entry  # noqa: PLC0415
+
+        target_url = _profile_to_mcp_url(profile.base_url)
+        bridge_entry(profile.api_key, target_url)  # Validate before changing either credential or destination.
+        env = dict(patched["env"])
+        env["SKYVERN_API_KEY"] = profile.api_key
+        env["SKYVERN_MCP_URL"] = target_url
+        env.pop("SKYVERN_BASE_URL", None)
+        patched["env"] = env
+        return patched
 
     if kind == "local stdio":
         env = dict(patched.get("environment") or patched.get("env") or {})

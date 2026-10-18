@@ -25,6 +25,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from skyvern.cli.auth_command import run_signup
+from skyvern.cli.claude_bridge import BridgeSetupError, bridge_entry, ensure_runtime
 from skyvern.cli.console import console
 from skyvern.cli.skill_commands import get_skill_dirs
 from skyvern.utils import detect_os, get_windows_appdata_roaming
@@ -112,18 +113,18 @@ def _build_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dic
 
 
 def _build_mcp_remote_bridge_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
-    """Build an npx mcp-remote entry for clients that only support stdio (e.g. Claude Desktop)."""
-    args = ["mcp-remote", url]
-    if api_key:
-        args.extend(["--header", f"x-api-key:{api_key}"])
-    return {
-        "command": "npx",
-        "args": args,
-    }
+    """Build the bundled API-key adapter entry for stdio-only clients."""
+    try:
+        return bridge_entry(api_key, url)
+    except (BridgeSetupError, OSError) as exc:
+        console.print(
+            "[red]Cannot configure the bundled API-key bridge: check HTTPS URL, key and package assets.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
 
 
 def _has_node_runtime() -> bool:
-    return shutil.which("node") is not None and shutil.which("npx") is not None
+    return shutil.which("node") is not None
 
 
 def _supports_claude_desktop_bundle() -> bool:
@@ -131,11 +132,23 @@ def _supports_claude_desktop_bundle() -> bool:
 
 
 def _claude_desktop_bundle_message() -> str:
+    connector_message = (
+        "Claude Desktop can connect to Skyvern Cloud directly: "
+        "Customize > Connectors > Add custom connector, "
+        "URL https://api.skyvern.com/mcp/, then sign in.\n"
+    )
+    bridge_message = "Manual JSON setup uses the bundled API-key adapter with pinned SDK 2.3.1 and requires Node.js.\n"
     if not _supports_claude_desktop_bundle():
-        return "Claude Desktop remote setup on this platform still requires Node.js because the one-click `.mcpb` installer is only available in Claude Desktop for macOS and Windows."
+        return (
+            connector_message
+            + bridge_message
+            + "The one-click `.mcpb` installer is only available in Claude Desktop for macOS and Windows."
+        )
     return (
-        "Claude Desktop remote setup via JSON still uses `mcp-remote`, which requires Node.js.\n"
-        f"Download the latest one-click Skyvern bundle (`skyvern-claude-desktop.mcpb`) from: {_DEFAULT_CLAUDE_DESKTOP_BUNDLE_URL}\n"
+        connector_message
+        + bridge_message
+        + f"Download the latest one-click Skyvern bundle (`skyvern-claude-desktop.mcpb`) from: "
+        f"{_DEFAULT_CLAUDE_DESKTOP_BUNDLE_URL}\n"
         "Then double-click the downloaded `.mcpb`, click Install in Claude Desktop, paste your API key, and click Save."
     )
 
@@ -602,6 +615,7 @@ def _upsert_mcp_config(
     server_key: str = "skyvern",
     dry_run: bool = False,
     yes: bool = False,
+    prepare: Callable[[], None] | None = None,
 ) -> None:
     """Read config, diff, prompt, and write. Idempotent."""
     existing = _read_mcp_config(config_path)
@@ -610,6 +624,12 @@ def _upsert_mcp_config(
     current = servers.get(resolved_server_key)
 
     if not _preview_upsert_change(current, skyvern_entry, tool_name):
+        if not dry_run and prepare is not None:
+            try:
+                prepare()
+            except (BridgeSetupError, OSError, ValueError) as exc:
+                console.print("[red]Cannot prepare the bundled MCP runtime; config was not changed.[/red]")
+                raise typer.Exit(code=1) from exc
         return
 
     if dry_run:
@@ -620,6 +640,12 @@ def _upsert_mcp_config(
         if not typer.confirm("\nApply changes?"):
             raise typer.Abort()
 
+    if prepare is not None:
+        try:
+            prepare()
+        except (BridgeSetupError, OSError, ValueError) as exc:
+            console.print("[red]Cannot prepare the bundled MCP runtime; config was not changed.[/red]")
+            raise typer.Exit(code=1) from exc
     servers[resolved_server_key] = skyvern_entry
     backup_path = _write_mcp_config(config_path, existing, create_backup=True)
     console.print(f"[green]Configured {tool_name} at {config_path}[/green]")
@@ -998,7 +1024,14 @@ def _run_setup(
         browser_remote_debugging_url=browser_remote_debugging_url,
         scope=scope,
     )
-    _upsert_mcp_config(config_path, tool_name, entry, dry_run=dry_run, yes=yes)
+    _upsert_mcp_config(
+        config_path,
+        tool_name,
+        entry,
+        dry_run=dry_run,
+        yes=yes,
+        prepare=ensure_runtime if use_mcp_remote_bridge and not local else None,
+    )
 
 
 def _install_skills(project_dir: Path, dry_run: bool = False) -> None:
@@ -1191,7 +1224,14 @@ def setup_guided(
                     browser_remote_debugging_url=env_browser_url,
                     scope=scope,
                 )
-                _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
+                _upsert_mcp_config(
+                    config_path,
+                    tool.name,
+                    entry,
+                    dry_run=dry_run,
+                    yes=True,
+                    prepare=ensure_runtime if use_bridge else None,
+                )
             if tool.name == "Claude Code":
                 _, install_skills = _claude_code_config_target()
                 if install_skills:
@@ -1258,7 +1298,10 @@ def setup_claude(
     browser_type: str | None = None,
     browser_remote_debugging_url: str | None = None,
 ) -> None:
-    """Register Skyvern MCP with Claude Desktop (remote mode requires Node.js; bundle is recommended otherwise)."""
+    """Write the Claude Desktop JSON bridge (requires Node.js).
+
+    For Skyvern Cloud, prefer a custom connector with browser sign-in.
+    """
     _run_setup(
         "Claude Desktop",
         _claude_desktop_config_path(),
