@@ -938,6 +938,7 @@ async def test_validate_mcp_oauth_token_negative_caches_401_errors(monkeypatch: 
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=AsyncMock(return_value=None),
             )
         ),
     )
@@ -1004,7 +1005,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
 
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="org_jwt")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_from_jwt")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_jwt", token="sk_live_from_jwt")),
     )
     monkeypatch.setattr(jwt, "PyJWK", _fake_jwk)
     monkeypatch.setattr(jwt, "decode", _fake_decode)
@@ -1018,6 +1019,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=AsyncMock(return_value=None),
             )
         ),
     )
@@ -1025,9 +1027,58 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
     resolution = await mcp_http_auth.validate_mcp_oauth_token(_jwtish_token())
 
     assert resolution.api_key == "sk_live_from_jwt"
+    assert resolution.api_key_token_id == "oat_jwt"
     assert captured["kwargs"]["leeway"] == mcp_http_auth._TOKEN_CLOCK_SKEW_SECONDS
     assert captured["kwargs"]["options"] == {"verify_aud": False}
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_jwt", "organization")
+
+
+@pytest.mark.asyncio
+async def test_validate_mcp_oauth_token_returns_role_403_without_negative_caching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jwt
+
+    def _fake_decode(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "iss": "https://clerk.example.com",
+            "aud": ["https://api.skyvern.com/mcp/"],
+            "resource": "https://api.skyvern.com/mcp/",
+            "sub": "user_123",
+            "org_id": "clerk_org_jwt",
+        }
+
+    resolve_member_key = AsyncMock(side_effect=mcp_http_auth.MCPOrgRoleRequiredError)
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="org_jwt")]),
+        get_valid_org_auth_token=AsyncMock(),
+    )
+    monkeypatch.setattr(jwt, "PyJWK", lambda key: key)
+    monkeypatch.setattr(jwt, "decode", _fake_decode)
+    _stub_auth_db(monkeypatch, fake_db)
+    monkeypatch.setattr(mcp_http_auth, "_looks_like_jwt", lambda _token: True)
+    monkeypatch.setattr(mcp_http_auth, "_get_oauth_issuer_url", lambda: "https://clerk.example.com")
+    monkeypatch.setattr(mcp_http_auth.settings, "SKYVERN_BASE_URL", "https://api.skyvern.com")
+    monkeypatch.setattr(
+        mcp_http_auth,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(
+                get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=resolve_member_key,
+            )
+        ),
+    )
+
+    for _ in range(2):
+        with pytest.raises(mcp_http_auth.MCPOrgRoleRequiredError) as exc_info:
+            await mcp_http_auth.validate_mcp_oauth_token(_jwtish_token())
+        assert exc_info.value.status_code == 403
+        assert "Admin or Member" in exc_info.value.detail
+
+    assert resolve_member_key.await_count == 2
+    fake_db.get_valid_org_auth_token.assert_not_awaited()
+    assert mcp_http_auth._oauth_cache_key(_jwtish_token()) not in mcp_http_auth._api_key_validation_cache
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1133,25 @@ async def test_mcp_http_auth_falls_back_to_api_key_after_invalid_oauth_token(
         "api_key": "sk_live_proxy_token",
         "organization_id": "org_from_api_key",
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_auth_returns_403_for_unsupported_org_role_without_api_key_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role_error = mcp_http_auth.MCPOrgRoleRequiredError()
+    validate_api_key = AsyncMock(side_effect=HTTPException(status_code=401, detail="Invalid API key"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", AsyncMock(side_effect=role_error))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+
+    response = await _request(app, "POST", "/mcp", headers={"authorization": "Bearer a.b.c"}, json={})
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": {"code": "FORBIDDEN", "message": role_error.detail},
+    }
+    validate_api_key.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1213,7 +1283,7 @@ async def test_resolve_oauth_subject_to_org_logs_missing_db_methods(monkeypatch:
 async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_123")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_org_123")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_org_123", token="sk_live_org_123")),
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
@@ -1223,6 +1293,7 @@ async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
 
     assert resolution.api_key == "sk_live_org_123"
     assert resolution.validation.organization_id == "skyvern_org_123"
+    assert resolution.api_key_token_id == "oat_org_123"
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_123", "organization")
     fake_db.get_valid_org_auth_token.assert_awaited_once_with(
         "skyvern_org_123", mcp_http_auth.OrganizationAuthTokenType.api
@@ -1239,7 +1310,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
     # exercises the same delegation contract without importing cloud modules.
     organizations_repo = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_cloud_org")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_cloud_org")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_cloud_org", token="sk_live_cloud_org")),
     )
     fake_db = SimpleNamespace(organizations=organizations_repo)
 
@@ -1262,6 +1333,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
 
     assert resolution.api_key == "sk_live_cloud_org"
     assert resolution.validation.organization_id == "skyvern_cloud_org"
+    assert resolution.api_key_token_id == "oat_cloud_org"
     organizations_repo.get_organization_entities.assert_awaited_once_with("clerk_org_cloud", "organization")
     organizations_repo.get_valid_org_auth_token.assert_awaited_once_with(
         "skyvern_cloud_org", mcp_http_auth.OrganizationAuthTokenType.api
@@ -1272,7 +1344,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
 async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> None:
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_compact")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_compact")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_compact", token="sk_live_compact")),
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
@@ -1282,6 +1354,7 @@ async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> No
 
     assert resolution.api_key == "sk_live_compact"
     assert resolution.validation.organization_id == "skyvern_org_compact"
+    assert resolution.api_key_token_id == "oat_compact"
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_compact", "organization")
 
 

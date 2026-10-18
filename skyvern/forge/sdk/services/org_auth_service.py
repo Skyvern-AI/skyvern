@@ -21,7 +21,11 @@ from skyvern.forge.sdk.core.organization_age_cache import remember_organization_
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
-from skyvern.forge.sdk.services.request_principal import resolve_request_principal, synthetic_user_id
+from skyvern.forge.sdk.services.request_principal import (
+    resolve_api_key_profile_identity,
+    resolve_request_principal,
+    synthetic_user_id,
+)
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
@@ -52,6 +56,8 @@ class ApiKeyValidationResult:
 class _CachedOrganizationAuth:
     organization: Organization
     token_id: str
+    access_mode: str = "full_org"
+    bound_user_id: str | None = None
 
 
 def _normalize_api_key_with_flags(raw_api_key: str) -> tuple[str, dict[str, bool]]:
@@ -287,12 +293,19 @@ async def _get_current_org_for_token_types(
         fern_language=fern_language,
     )
     apply_request_org_context(validation.organization)
+    api_key_profile = (
+        await resolve_api_key_profile_identity(validation.organization.organization_id, validation.token.id)
+        if validation.token.token_type == OrganizationAuthTokenType.api
+        else None
+    )
     await resolve_request_principal(
         validation.organization.organization_id,
         api_key_type=_api_key_type(_decode_token_before_cache(x_api_key)),
         api_key_token_id=(
             validation.token.id if validation.token.token_type == OrganizationAuthTokenType.api else None
         ),
+        api_key_profile=api_key_profile,
+        api_key_profile_resolved=api_key_profile is not None,
         bearer_token=_extract_bearer_token(authorization),
     )
     return validation.organization
@@ -746,7 +759,15 @@ async def _get_current_org_cached(
             user_agent=user_agent,
             fern_language=fern_language,
         )
-        cached_auth = _CachedOrganizationAuth(validation.organization, validation.token.id)
+        api_key_profile = await resolve_api_key_profile_identity(
+            validation.organization.organization_id, validation.token.id
+        )
+        cached_auth = _CachedOrganizationAuth(
+            validation.organization,
+            validation.token.id,
+            api_key_profile[0],
+            api_key_profile[1],
+        )
 
         if invalidation_generation == _current_org_cache_invalidation_generation:
             _current_org_cache[cache_key] = cached_auth
@@ -789,6 +810,13 @@ async def get_current_org_cached(
             user_agent=user_agent,
             fern_language=fern_language,
         )
+        api_key_profile = (cached_auth.access_mode, cached_auth.bound_user_id, True)
+        if cached_auth.access_mode == "member":
+            current_profile = await resolve_api_key_profile_identity(
+                cached_auth.organization.organization_id, cached_auth.token_id
+            )
+            if current_profile != api_key_profile:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
         organization = cached_auth.organization
         token_id = cached_auth.token_id
     apply_request_org_context(organization)
@@ -796,6 +824,8 @@ async def get_current_org_cached(
         organization.organization_id,
         api_key_type=_api_key_type(payload),
         api_key_token_id=token_id,
+        api_key_profile=api_key_profile if not _claims_ui_session(payload) else None,
+        api_key_profile_resolved=not _claims_ui_session(payload),
         bearer_token=_extract_bearer_token(authorization),
     )
     return organization
