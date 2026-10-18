@@ -109,6 +109,7 @@ async def _validate_parameter(parameter: CredentialParameter, existing_ids: list
     organization = SimpleNamespace(organization_id="org_test")
     existing = [SimpleNamespace(credential_id=credential_id) for credential_id in existing_ids or []]
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=existing)
         await service._validate_and_normalize_credential_rotation_parameters([parameter], organization)
 
@@ -119,7 +120,7 @@ async def test_workflow_save_validation_dedupes_fallback_credentials_preserving_
         fallback_credential_ids=["cred_b", "cred_c", "cred_b", "cred_d", "cred_c"],
     )
 
-    await _validate_parameter(parameter, ["cred_b", "cred_c", "cred_d"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b", "cred_c", "cred_d"])
 
     assert parameter.fallback_credential_ids == ["cred_b", "cred_c", "cred_d"]
     assert parameter.credential_id == "cred_primary"
@@ -130,7 +131,7 @@ async def test_workflow_save_validation_rejects_unknown_fallback_credential_id()
     parameter = _credential_parameter(fallback_credential_ids=["cred_missing"])
 
     with pytest.raises(InvalidCredentialId):
-        await _validate_parameter(parameter, [])
+        await _validate_parameter(parameter, ["cred_primary"])
 
 
 @pytest.mark.asyncio
@@ -138,7 +139,7 @@ async def test_workflow_save_validation_rejects_bad_fallback_trigger() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_b"], fallback_trigger="later")
 
     with pytest.raises(SkyvernHTTPException, match="fallback_trigger"):
-        await _validate_parameter(parameter, ["cred_b"])
+        await _validate_parameter(parameter, ["cred_primary", "cred_b"])
 
 
 @pytest.mark.asyncio
@@ -153,7 +154,7 @@ async def test_workflow_save_validation_rejects_trigger_without_fallback_list() 
 async def test_workflow_save_validation_normalizes_empty_fallback_list_to_none() -> None:
     parameter = _credential_parameter(fallback_credential_ids=[])
 
-    await _validate_parameter(parameter)
+    await _validate_parameter(parameter, ["cred_primary"])
 
     assert parameter.fallback_credential_ids is None
 
@@ -162,7 +163,7 @@ async def test_workflow_save_validation_normalizes_empty_fallback_list_to_none()
 async def test_workflow_save_validation_drops_primary_credential_from_fallbacks() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_primary", "cred_b"])
 
-    await _validate_parameter(parameter, ["cred_b"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b"])
 
     assert parameter.fallback_credential_ids == ["cred_b"]
 
@@ -206,7 +207,7 @@ async def test_workflow_save_validation_allows_rotation_without_fallback_credent
 async def test_workflow_save_validation_allows_fallback_credentials_without_rotation() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_b", "cred_c"])
 
-    await _validate_parameter(parameter, ["cred_b", "cred_c"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b", "cred_c"])
 
     assert parameter.credential_ids is None
     assert parameter.fallback_credential_ids == ["cred_b", "cred_c"]

@@ -3377,6 +3377,51 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs_and_titles_tuples
             ]
 
+    @db_operation("get_workflow_run_ids_by_browser_session_ids")
+    async def get_workflow_run_ids_by_browser_session_ids(
+        self, browser_session_ids: Collection[str], organization_id: str
+    ) -> dict[str, set[str]]:
+        """Return every run associated with each session, without applying caller visibility filters."""
+        if not browser_session_ids:
+            return {}
+
+        associations = union_all(
+            select(WorkflowRunModel.browser_session_id, WorkflowRunModel.workflow_run_id).where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.browser_session_id.in_(browser_session_ids),
+            ),
+            select(TaskModel.browser_session_id, TaskModel.workflow_run_id).where(
+                TaskModel.organization_id == organization_id,
+                TaskModel.browser_session_id.in_(browser_session_ids),
+                TaskModel.workflow_run_id.is_not(None),
+            ),
+            select(TaskV2Model.browser_session_id, TaskV2Model.workflow_run_id).where(
+                TaskV2Model.organization_id == organization_id,
+                TaskV2Model.browser_session_id.in_(browser_session_ids),
+                TaskV2Model.workflow_run_id.is_not(None),
+            ),
+            select(WorkflowRunAttemptModel.pinned_browser_session_id, WorkflowRunAttemptModel.workflow_run_id).where(
+                WorkflowRunAttemptModel.organization_id == organization_id,
+                WorkflowRunAttemptModel.pinned_browser_session_id.in_(browser_session_ids),
+            ),
+            select(
+                PersistentBrowserSessionModel.persistent_browser_session_id,
+                PersistentBrowserSessionModel.created_for_workflow_run_id,
+            ).where(
+                PersistentBrowserSessionModel.organization_id == organization_id,
+                PersistentBrowserSessionModel.persistent_browser_session_id.in_(browser_session_ids),
+                PersistentBrowserSessionModel.created_for_workflow_run_id.is_not(None),
+            ),
+        )
+        async with self.Session() as session:
+            rows = (await session.execute(associations)).all()
+
+        runs_by_session: dict[str, set[str]] = {}
+        for browser_session_id, workflow_run_id in rows:
+            if browser_session_id and workflow_run_id:
+                runs_by_session.setdefault(browser_session_id, set()).add(workflow_run_id)
+        return runs_by_session
+
     @db_operation("get_workflow_metadata_for_browser_session")
     async def get_workflow_metadata_for_browser_session(
         self, browser_session_id: str, organization_id: str

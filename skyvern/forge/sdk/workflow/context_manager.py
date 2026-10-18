@@ -1291,6 +1291,11 @@ class WorkflowRunContext:
         organization: Organization,
         fetch: CredentialFetch,
     ) -> None:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            organization.organization_id,
+            credential_id,
+            workflow_run_id=self.workflow_run_id,
+        )
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=organization.organization_id
         )

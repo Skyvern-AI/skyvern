@@ -356,8 +356,12 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
 async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(endpoint: str) -> None:
     """These endpoints already gather across sessions, so overlapping a session's two listings would
     only raise the request's peak pool checkouts from N to 2N."""
-    sessions = [MagicMock(), MagicMock()]
+    sessions = [MagicMock(browser_profile_id=None, persistent_browser_session_id=f"pbs_{index}") for index in range(2)]
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
+    app_mock.AGENT_FUNCTION.accessible_browser_session_ids = AsyncMock(
+        return_value={session.persistent_browser_session_id for session in sessions}
+    )
     app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=sessions)
     app_mock.PERSISTENT_SESSIONS_MANAGER.get_active_sessions = AsyncMock(return_value=sessions)
     app_mock.DATABASE.browser_sessions.get_folder_visible_browser_session_ids = AsyncMock(

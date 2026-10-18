@@ -11,12 +11,11 @@ from typing import Any, cast
 import structlog
 from mcp.types import CallToolResult, TextContent
 
-from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
-from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DEMONSTRATION_CANCELLED_TTL,
     DEMONSTRATION_TTL,
@@ -213,9 +212,7 @@ async def _replay_events(
             source_url = _safe_model_visible_url(_event_source_url(event))
             credentials = []
             if isinstance(credential_id, str):
-                credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-                    [credential_id], organization_id=ctx.organization_id
-                )
+                credentials = await load_credentials(ctx.organization_id, credential_ids=[credential_id])
                 policy = ctx.request_policy
                 if credentials and isinstance(policy, RequestPolicy):
                     policy.credential_ask_login_page_urls = [source_url]

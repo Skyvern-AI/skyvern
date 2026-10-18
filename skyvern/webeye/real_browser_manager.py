@@ -1037,6 +1037,14 @@ class RealBrowserManager(BrowserManager):
         task: Task,
         browser_session_id: str | None = None,
     ) -> BrowserState:
+        if task.workflow_run_id:
+            await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(
+                None,
+                task.workflow_run_id,
+                organization_id=task.organization_id,
+                browser_session_id=browser_session_id,
+            )
+
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         lost_external_browser = False
         if browser_state is not None:
@@ -1259,6 +1267,15 @@ class RealBrowserManager(BrowserManager):
         workflow_run_id = workflow_run.workflow_run_id
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
+
+        # Shared run/task/SDK attachment boundary; route guards remain early 403s.
+        await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(
+            None,
+            workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            browser_profile_id=browser_profile_id,
+            browser_session_id=browser_session_id,
+        )
 
         context = skyvern_context.current()
         # A synthetic run never begins the session; only an explicit runnable can acquire it.

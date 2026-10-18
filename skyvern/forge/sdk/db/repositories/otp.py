@@ -132,6 +132,7 @@ class OTPRepository(BaseRepository):
         self,
         organization_id: str,
         limit: int = 50,
+        offset: int = 0,
         valid_lifespan_minutes: int | None = None,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
@@ -155,7 +156,8 @@ class OTPRepository(BaseRepository):
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
             if totp_identifier:
                 query = query.filter(_identifier_filter(totp_identifier))
-            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
+            query = query.order_by(TOTPCodeModel.created_at.desc(), TOTPCodeModel.totp_code_id.desc())
+            query = query.offset(offset).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
 

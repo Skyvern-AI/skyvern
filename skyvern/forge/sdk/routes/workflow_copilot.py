@@ -75,7 +75,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     sign_in_site,
     start_manual_sign_in,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecorder,
     DemonstrationRejection,
@@ -111,7 +111,10 @@ from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, seri
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
 from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links
-from skyvern.forge.sdk.copilot.tools.credential_deletion import credential_delete_enabled
+from skyvern.forge.sdk.copilot.tools.credential_deletion import (
+    credential_delete_enabled,
+    enforce_credential_delete_access,
+)
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
     private_workflow_settings_from_proposal,
@@ -2188,6 +2191,7 @@ async def _commit_staged_workflow(
         build_source=WorkflowBuildSource.copilot,
         preserve_completion_contract=not clear_persisted_completion_contract,
         validate_code_block_templates=False,
+        preserve_redacted_credential_references_from=canonical,
     )
 
 
@@ -2272,6 +2276,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         build_source=original_workflow.build_source,
         preserve_completion_contract=False,
         validate_code_block_templates=False,
+        preserve_redacted_credential_references_from=original_workflow,
     )
     # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
     # mutable object shared by reference rather than a value set through the ContextVar.
@@ -4362,7 +4367,12 @@ async def _delete_one_credential(organization_id: str, credential_id: str) -> Cr
     # A timeout stops the wait but never cancels the delete, so a late vault delete still gets its audit, profile
     # reap, TOTP clear and item cleanup.
     hooks = BackgroundTasks()
-    deletion = _detach_credential_delete_task(delete_organization_credential(organization_id, credential_id, hooks))
+
+    async def delete() -> None:
+        await enforce_credential_delete_access(credential_id)
+        await delete_organization_credential(organization_id, credential_id, hooks)
+
+    deletion = _detach_credential_delete_task(delete())
     deletion.add_done_callback(lambda _: _detach_credential_delete_task(_run_post_delete_hooks(hooks)))
     try:
         await asyncio.wait_for(asyncio.shield(deletion), CREDENTIAL_DELETE_TIMEOUT.total_seconds())
@@ -4717,8 +4727,9 @@ async def workflow_copilot_credential_response(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="credential_id is required when action is 'connected'",
             )
-        existing = await app.DATABASE.credentials.get_credentials_by_ids(
-            [credential_id], organization_id=organization.organization_id
+        existing = await load_credentials(
+            organization_id=organization.organization_id,
+            credential_ids=[credential_id],
         )
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Credential {credential_id} not found")

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic_core import to_json
 from sqlalchemy import event, select, update
@@ -29,7 +29,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
 )
 from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.tools import copilot_native_tools
+from skyvern.forge.sdk.copilot.tools import copilot_native_tools, credential_deletion
 from skyvern.forge.sdk.copilot.tools.credential_deletion import delete_saved_credentials
 from skyvern.forge.sdk.db.models import CredentialModel, WorkflowCopilotChatMessageModel, WorkflowCopilotChatModel
 from skyvern.forge.sdk.routes import credentials as credential_routes
@@ -37,6 +37,7 @@ from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotPendingTurn
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender as Sender
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from tests.unit.conftest import RUN_GROUP_ORG, RUN_GROUP_WPID, GroupEnv
 
 SECRET = "vault-secret-fixture-55190"
@@ -220,6 +221,31 @@ async def test_confirm_deletes_only_the_checked_entries_and_reports_each_outcome
     assert chat.vault.deleted == ["cred_1"]
     for surface in (card, result, restored, confirmed.json()):
         assert SECRET not in to_json(surface).decode()
+
+
+@pytest.mark.asyncio
+async def test_confirmation_rechecks_delete_access_before_deleting_a_card_entry(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _start(chat, ["cred_1"])
+    card = await _card(chat)
+    viewer = RequestPrincipal(RUN_GROUP_ORG, AuthKind.bearer, "viewer", "org:member")
+    monkeypatch.setattr(credential_deletion, "get_request_principal", lambda: viewer)
+
+    async def deny_viewer(principal: RequestPrincipal | None, action: str, references: set[tuple[str, str]]) -> None:
+        assert principal == viewer
+        assert action == "credential.delete"
+        assert references == {("credential_id", "cred_1")}
+        raise HTTPException(status_code=403, detail="credential_folder_access_denied")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_credential_folder_access_for_ids", deny_viewer)
+    confirmed = await _confirm(chat, card, ["cred_1"])
+    result = await asyncio.wait_for(task, 5)
+
+    assert confirmed.status_code == 200
+    assert [(item["credential_id"], item["outcome"]) for item in result["outcomes"]] == [("cred_1", "failed")]
+    assert chat.vault.deleted == []
+    assert not chat.vault.entered.is_set()
 
 
 @pytest.mark.asyncio

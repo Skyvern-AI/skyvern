@@ -11102,6 +11102,17 @@
             ],
             "title": "Last Verified Login At"
           },
+          "linked_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Id"
+          },
           "linked_credential_name": {
             "anyOf": [
               {

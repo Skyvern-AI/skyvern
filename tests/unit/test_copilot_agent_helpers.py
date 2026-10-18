@@ -5767,7 +5767,12 @@ workflow_definition:
         assert "cred_missing" in error
         assert "not found in this organization" in error
         assert "Stop before creating, updating, or running the workflow" in error
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid", "cred_missing"],
+            organization_id="org-1",
+            allowed_folder_ids=None,
+            include_deleted=False,
+        )
 
     @pytest.mark.asyncio
     async def test_valid_tool_credential_reference_allows_tool_path(self, monkeypatch) -> None:
@@ -5783,7 +5788,9 @@ workflow_definition:
         error = await _credential_reference_validation_error({"credential_id": "cred_valid"}, _ctx())
 
         assert error is None
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
 
     @pytest.mark.asyncio
     async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
@@ -6432,7 +6439,9 @@ class TestRunBlocksCredentialApproval:
 
         assert result["ok"] is False
         assert result["error"] == "Organization not found"
-        database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_resolved"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
     @pytest.mark.asyncio
@@ -7025,7 +7034,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "unapproved_credential_reference" not in (result.get("error") or "")
         assert result["error"] == "Organization not found"
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
     @pytest.mark.asyncio
@@ -7167,7 +7176,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "not found in this organization" in result["error"]
         assert self.CREDENTIAL_ID in result["error"]
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
 

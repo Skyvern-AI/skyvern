@@ -989,6 +989,40 @@ class AgentFunction:
         """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
         return None
 
+    async def workflow_folders_restricted(self, organization_id: str) -> bool:
+        """Cloud reports folder restrictions; OSS has no workflow-folder ACLs."""
+        return False
+
+    async def accessible_workflow_reference_ids(
+        self, principal: RequestPrincipal | None, action: str, references: set[tuple[str, str]]
+    ) -> set[tuple[str, str]]:
+        """Return references visible to this principal; OSS has no workflow-folder ACLs."""
+        return references
+
+    async def accessible_credential_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
+        """Return visible credential-folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
+        return None
+
+    async def credential_folders_restricted(self, organization_id: str) -> bool:
+        """Cloud reports folder restrictions; OSS has no credential-folder ACLs."""
+        return False
+
+    async def credential_folder_admin_bypass(self, principal: RequestPrincipal | None) -> bool:
+        """Cloud reports the credential-folder Admin bypass; OSS has no credential-folder ACLs."""
+        return False
+
+    async def accessible_credential_ids(
+        self, principal: RequestPrincipal | None, action: str, credential_ids: set[str]
+    ) -> set[str]:
+        """Return credentials visible for an action; OSS has no credential-folder ACLs."""
+        return credential_ids
+
+    async def accessible_browser_session_ids(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_ids: set[str]
+    ) -> set[str]:
+        """Return sessions whose associated workflow credentials are usable; OSS has no credential-folder ACLs."""
+        return browser_session_ids
+
     async def enforce_folder_access(
         self, principal: RequestPrincipal | None, action: str, resource: Mapping[str, object]
     ) -> None:
@@ -1016,6 +1050,48 @@ class AgentFunction:
     ) -> None:
         """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
         return None
+
+    async def enforce_credential_folder_access_for_ids(
+        self,
+        principal: RequestPrincipal | None,
+        action: str,
+        references: set[tuple[str, str]],
+        *,
+        session: AsyncSession | None = None,
+    ) -> None:
+        """Cloud raises 403 when a credential folder denies the action on any referenced credential or folder."""
+        return None
+
+    async def enforce_credential_use(
+        self,
+        organization_id: str,
+        credential_id: str,
+        *,
+        principal: RequestPrincipal | None = None,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
+
+    async def enforce_totp_identifier_credential_use(
+        self, organization_id: str, totp_identifier: str, *, workflow_run_id: str | None = None
+    ) -> None:
+        """Cloud checks credentials bound to a TOTP identifier; OSS has no credential-folder ACLs."""
+
+    async def enforce_browser_session_credential_use(
+        self, principal: RequestPrincipal | None, browser_session_id: str
+    ) -> None:
+        """Cloud checks the credential linked to a saved profile before session access; OSS has no folder ACLs."""
+
+    async def enforce_workflow_run_credential_use(
+        self,
+        principal: RequestPrincipal | None,
+        workflow_run_id: str,
+        *,
+        organization_id: str | None = None,
+        browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> None:
+        """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
 
     async def hidden_workflow_permanent_ids(
         self, principal: RequestPrincipal | None, organization_id: str

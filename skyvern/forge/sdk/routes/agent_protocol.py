@@ -168,6 +168,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -1573,6 +1574,7 @@ async def update_workflow_legacy(
                 changed_fields=changed_fields,
             ),
         )
+    await _redact_inaccessible_workflow_credential_ids([workflow])
     return workflow
 
 
@@ -1673,6 +1675,7 @@ async def update_workflow(
                 changed_fields=changed_fields,
             ),
         )
+    await _redact_inaccessible_workflow_credential_ids([workflow])
     return workflow
 
 
@@ -2064,6 +2067,7 @@ async def update_workflow_folder(
             changed_fields=("folder_id",),
             related_resource_ids=(workflow.folder_id,) if workflow.folder_id else (),
         )
+        await _redact_inaccessible_workflow_credential_ids([workflow])
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
@@ -5810,12 +5814,15 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    return await run_service.coalesce_in_flight(
+    response = await run_service.coalesce_in_flight(
         _build_workflow_and_run_from_workflow_run_id,
         current_org.organization_id,
         workflow_run_id,
         caps_run_response_values(x_user_agent),
     )
+    response = response.model_copy(update={"workflow": response.workflow.model_copy(deep=True)})
+    await _redact_inaccessible_workflow_credential_ids([response.workflow])
+    return response
 
 
 async def _build_workflow_and_run_from_workflow_run_id(
@@ -6024,6 +6031,7 @@ async def get_workflows(
             search_key=effective_search or "",
             statuses=effective_statuses,
         )
+        await _redact_inaccessible_workflow_credential_ids(workflows)
         return workflows
 
     if only_saved_tasks and only_workflows:
@@ -6032,7 +6040,7 @@ async def get_workflows(
             detail="only_saved_tasks and only_workflows cannot be used together",
         )
 
-    return await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
+    workflows = await app.WORKFLOW_SERVICE.get_workflows_by_organization_id(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
@@ -6044,6 +6052,81 @@ async def get_workflows(
         statuses=effective_statuses,
         workflow_tags=workflow_tags or None,
     )
+    await _redact_inaccessible_workflow_credential_ids(workflows)
+    return workflows
+
+
+async def _redact_inaccessible_workflow_credential_ids(workflows: Sequence[Workflow]) -> None:
+    workflow_parameters = [
+        (
+            workflow.workflow_definition.parameters,
+            {
+                parameter.key
+                for parameter in workflow.workflow_definition.parameters
+                if isinstance(parameter, WorkflowParameter)
+                and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+            },
+        )
+        for workflow in workflows
+    ]
+    credential_ids: set[str] = set()
+    for parameters, parameter_keys in workflow_parameters:
+        for parameter in parameters:
+            if isinstance(parameter, CredentialParameter):
+                credential_ids.update(
+                    credential_id
+                    for credential_id in (
+                        parameter.credential_id if parameter.credential_id not in parameter_keys else None,
+                        *(parameter.credential_ids or []),
+                        *(parameter.fallback_credential_ids or []),
+                    )
+                    if credential_id
+                )
+            elif (
+                isinstance(parameter, WorkflowParameter)
+                and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                and isinstance(parameter.default_value, str)
+                and parameter.default_value
+            ):
+                credential_ids.add(parameter.default_value)
+    if not credential_ids:
+        return
+
+    principal = get_request_principal()
+    try:
+        accessible_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            principal, "credential.read", credential_ids
+        )
+    except Exception:
+        LOG.warning(
+            "Workflow credential visibility check failed; redacting credential references",
+            organization_id=principal.organization_id if principal else None,
+            exc_info=True,
+        )
+        accessible_ids = set()
+
+    for parameters, parameter_keys in workflow_parameters:
+        for parameter in parameters:
+            if isinstance(parameter, CredentialParameter):
+                if parameter.credential_id not in accessible_ids and parameter.credential_id not in parameter_keys:
+                    parameter.credential_id = ""
+                if parameter.credential_ids is not None:
+                    parameter.credential_ids = [
+                        credential_id for credential_id in parameter.credential_ids if credential_id in accessible_ids
+                    ]
+                if parameter.fallback_credential_ids is not None:
+                    parameter.fallback_credential_ids = [
+                        credential_id
+                        for credential_id in parameter.fallback_credential_ids
+                        if credential_id in accessible_ids
+                    ]
+            elif (
+                isinstance(parameter, WorkflowParameter)
+                and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                and isinstance(parameter.default_value, str)
+                and parameter.default_value not in accessible_ids
+            ):
+                parameter.default_value = None
 
 
 @base_router.put(
@@ -6101,6 +6184,7 @@ async def get_workflow_templates() -> list[Workflow]:
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
 
+    await _redact_inaccessible_workflow_credential_ids(workflows)
     return workflows
 
 
@@ -6151,6 +6235,7 @@ async def get_workflow(
         workflow.set_effective_default_engine(
             await effective_default_engine(workflow_permanent_id, current_org.organization_id)
         )
+    await _redact_inaccessible_workflow_credential_ids([workflow])
     return workflow
 
 
@@ -6185,10 +6270,12 @@ async def get_workflow_versions(
         if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
             raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
 
-    return await app.WORKFLOW_SERVICE.get_workflow_versions_by_permanent_id(
+    workflows = await app.WORKFLOW_SERVICE.get_workflow_versions_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=None if template else current_org.organization_id,
     )
+    await _redact_inaccessible_workflow_credential_ids(workflows)
+    return workflows
 
 
 @base_router.post(
