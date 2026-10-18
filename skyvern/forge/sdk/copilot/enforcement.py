@@ -2172,6 +2172,7 @@ async def run_with_enforcement(
         raise MaxTurnsExceeded("Budget drain already attempted")
     session = runner_kwargs.pop("session", None)
     copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
+    token_budget = runner_kwargs.pop("token_budget", None) or copilot_config.token_budget or TOKEN_BUDGET
     current_input: str | list = initial_input
     # A fallback or model-lookup retry resumes the turn's clock, so the turn keeps one deadline and one backstop.
     resumed = ctx.copilot_run_start_monotonic is not None
@@ -2207,11 +2208,11 @@ async def run_with_enforcement(
         if isinstance(current_input, list):
             est = estimate_tokens(current_input)
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
-            if est > copilot_config.token_budget:
+            if est > token_budget:
                 LOG.warning(
                     "Token estimate exceeds budget, aggressively pruning",
                     tokens=est,
-                    budget=copilot_config.token_budget,
+                    budget=token_budget,
                 )
                 current_input = aggressive_prune(current_input)
 
