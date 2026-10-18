@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "skyvern-claude-desktop",
   "display_name": "Skyvern",
-  "version": "0.0.0-dev",
-  "description": "Connect Claude Desktop to Skyvern Cloud browser automation without installing Node.js.",
-  "long_description": "Install Skyvern into Claude Desktop as a single bundle. The bundle asks for your Skyvern API key, then bridges Claude Desktop to Skyvern Cloud over HTTPS so Claude can drive browsers, extract data, and run workflows.",
+  "version": "1.0.52",
+  "description": "Connect Claude Desktop to a Skyvern HTTPS deployment using an API key.",
+  "long_description": "Bundle an API-key bridge for Skyvern Cloud or private HTTPS deployments using the legacy MCP initialize handshake. Configure the deployment key, final MCP URL, and optional PEM CA file. Claude Desktop can supply a compatible built-in Node runtime; the manual CLI route requires system Node. Local browser automation was verified separately; Cloud authentication requires a Cloud key.",
   "author": {
     "name": "Skyvern AI",
     "email": "info@skyvern.com",
@@ -36,36 +36,45 @@
       "win32"
     ],
     "runtimes": {
-      "node": ">=20.18.1"
+      "node": "^22.19.0 || >=24.5.0"
     }
   },
   "server": {
     "type": "node",
-    "entry_point": "node_modules/mcp-remote/dist/proxy.js",
+    "entry_point": "desktop.mjs",
     "mcp_config": {
       "command": "node",
       "args": [
-        "${__dirname}/node_modules/mcp-remote/dist/proxy.js",
-        "${user_config.server_url}",
-        "--header",
-        "x-api-key:${user_config.api_key}"
-      ]
+        "${__dirname}/desktop.mjs"
+      ],
+      "env": {
+        "SKYVERN_API_KEY": "${user_config.api_key}",
+        "SKYVERN_MCP_URL": "${user_config.server_url}",
+        "SKYVERN_CA_CERTIFICATE": "${user_config.ca_certificate}"
+      }
     }
   },
   "user_config": {
     "api_key": {
       "type": "string",
       "title": "Skyvern API Key",
-      "description": "Paste your API key from app.skyvern.com -> Settings. Claude cannot use Skyvern until this is set.",
+      "description": "API key issued by your Skyvern deployment. A local deployment key can be used without Skyvern Cloud.",
       "sensitive": true,
       "required": true
     },
     "server_url": {
       "type": "string",
       "title": "Skyvern MCP URL",
-      "description": "Advanced: change this only if you are connecting Claude Desktop to a different Skyvern deployment.",
+      "description": "HTTPS endpoint of your Skyvern deployment. Use the final URL; redirects are refused.",
       "required": false,
       "default": "https://api.skyvern.com/mcp/"
+    },
+    "ca_certificate": {
+      "type": "string",
+      "title": "Additional trusted CA certificate (optional)",
+      "description": "Absolute path to a PEM CA file for private HTTPS. Leave empty for public certificates. Added to existing trust only in this extension runtime.",
+      "required": false,
+      "default": ""
     }
   }
 }
