@@ -1,7 +1,9 @@
 import { OnePasswordIcon } from "@/components/icons/OnePasswordIcon";
+import CloudContext from "@/store/CloudContext";
 import { getHostname } from "@/util/getHostname";
 import { useOnePasswordItemsQuery } from "@/routes/workflows/hooks/useOnePasswordItemsQuery";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
+import { Link } from "react-router-dom";
 import { isOnePasswordItemOfType } from "./onePasswordItems";
 
 type Props = {
@@ -10,22 +12,26 @@ type Props = {
 };
 
 function OnePasswordCredentialsList({ search, folderId }: Props) {
+  const isCloud = useContext(CloudContext);
   const { data, isLoading, isError } = useOnePasswordItemsQuery();
   const normalizedSearch = search?.trim().toLowerCase() ?? "";
 
-  const filteredItems = useMemo(() => {
-    return (data?.items ?? []).filter((item) => {
-      if (!isOnePasswordItemOfType(item, "password")) {
-        return false;
-      }
-
-      if (!normalizedSearch) {
-        return true;
-      }
-
-      return item.title.toLowerCase().includes(normalizedSearch);
-    });
-  }, [data?.items, normalizedSearch]);
+  const passwordItems = useMemo(
+    () =>
+      (data?.items ?? []).filter((item) =>
+        isOnePasswordItemOfType(item, "password"),
+      ),
+    [data?.items],
+  );
+  const filteredItems = useMemo(
+    () =>
+      passwordItems.filter(
+        (item) =>
+          !normalizedSearch ||
+          item.title.toLowerCase().includes(normalizedSearch),
+      ),
+    [passwordItems, normalizedSearch],
+  );
 
   const header = (
     <div className="flex items-center gap-2">
@@ -50,6 +56,43 @@ function OnePasswordCredentialsList({ search, folderId }: Props) {
         <div className="rounded-lg bg-slate-elevation2 p-4 text-sm text-neutral-600 dark:text-slate-400">
           Couldn&apos;t load 1Password items.
         </div>
+      </div>
+    );
+  }
+
+  if (data?.source === "instance_default") {
+    return (
+      <div className="space-y-4">
+        {header}
+        <p className="rounded-lg bg-slate-elevation2 p-4 text-sm text-neutral-600 dark:text-slate-400">
+          Using the instance default 1Password account. Items cannot be listed
+          here; enter a vault ID and item ID in the login block instead.
+        </p>
+      </div>
+    );
+  }
+
+  if (
+    data?.configured &&
+    data.source === "organization" &&
+    passwordItems.length === 0
+  ) {
+    return (
+      <div className="space-y-4">
+        {header}
+        <p className="rounded-lg bg-slate-elevation2 p-4 text-sm text-neutral-600 dark:text-slate-400">
+          No login or password items were returned from readable 1Password
+          vaults. Check this service account&apos;s vault access. If those
+          vaults contain no login or password items, add one or check its token
+          in{" "}
+          <Link
+            className="font-medium text-blue-600 underline underline-offset-2 dark:text-blue-400"
+            to={isCloud ? "/integrations?query=1Password" : "/settings"}
+          >
+            1Password integration settings
+          </Link>
+          .
+        </p>
       </div>
     );
   }
