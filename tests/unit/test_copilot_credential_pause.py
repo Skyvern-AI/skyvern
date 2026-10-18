@@ -44,6 +44,7 @@ from skyvern.exceptions import HttpException as VaultHttpException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import credential_resolution
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _turn_credential_prompt_reason
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -1209,6 +1210,36 @@ async def test_route_404_when_credential_unknown_or_foreign_org(monkeypatch: pyt
             organization=organization,
         )
     assert excinfo.value.status_code == status.HTTP_404_NOT_FOUND
+    assert cache.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_route_404_when_connected_credential_is_in_a_hidden_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = _FakeCache()
+    _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
+    monkeypatch.setattr(app, "CACHE", cache, raising=False)
+    credential_lookup = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        app, "DATABASE", SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=credential_lookup))
+    )
+    monkeypatch.setattr(
+        credential_resolution, "credential_folder_ids_for_current_request", AsyncMock(return_value={"folder_visible"})
+    )
+    organization = SimpleNamespace(organization_id="org-1")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_credential_response(
+            _response_request(action="connected", credential_id="cred_hidden"),
+            organization=organization,
+        )
+
+    assert excinfo.value.status_code == status.HTTP_404_NOT_FOUND
+    credential_lookup.assert_awaited_once_with(
+        ["cred_hidden"],
+        organization_id="org-1",
+        allowed_folder_ids={"folder_visible"},
+        include_deleted=False,
+    )
     assert cache.set_calls == []
 
 
@@ -2509,6 +2540,21 @@ async def test_a_named_login_known_for_another_site_is_left_to_the_picker(
 
 
 @pytest.mark.asyncio
+async def test_denied_vault_site_read_leaves_a_named_login_to_the_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("skip"))
+    ctx.request_policy.current_turn_named_credential_ids = {"cred_1"}
+    monkeypatch.setattr(
+        credential_fill_module,
+        "_read_vault_named_sites",
+        AsyncMock(side_effect=PermissionError("credential not accessible")),
+    )
+
+    await _ask(ctx, "https://portal.example.com/login")
+
+    assert [card.named_credential_id for card in _sent_cards(ctx)] == [None]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("carried_as", ["approval", "proposal"])
 async def test_a_login_carried_in_for_another_site_is_left_to_the_picker_when_named_again(
     monkeypatch: pytest.MonkeyPatch, carried_as: str
@@ -2759,6 +2805,28 @@ async def test_origin_recovery_admits_no_credential_it_cannot_place_on_the_provi
 
     assert [card.credential_refs for card in _sent_cards(ctx)] == [[]]
     assert connected.credential_id not in ctx.request_policy.live_page_admitted_urls
+    assert ctx.credential_pause_outcome == "not_admitted"
+    _assert_declined(ctx, result, "connected_other_site")
+
+
+@pytest.mark.asyncio
+async def test_denied_vault_site_read_does_not_abort_origin_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _recovery_ctx(monkeypatch, _answered_cache("connected", "cred_idp"))
+    monkeypatch.setattr(
+        credential_fill_module,
+        "_read_vault_named_sites",
+        AsyncMock(side_effect=PermissionError("credential not accessible")),
+    )
+    _stub_credential_lookup(monkeypatch, _idp_credential())
+    monkeypatch.setattr(
+        credential_pause_module.app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(record_pending_copilot_turn_credential_resume=AsyncMock()),
+        raising=False,
+    )
+
+    result = await _ask(ctx, f"{_IDP_ORIGIN}/login")
+
     assert ctx.credential_pause_outcome == "not_admitted"
     _assert_declined(ctx, result, "connected_other_site")
 

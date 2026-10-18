@@ -206,7 +206,10 @@ class TestResolveCredentialFillValue:
         monkeypatch.setattr(
             object.__getattribute__(app, "_inst"),
             "AGENT_FUNCTION",
-            SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+            SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
+                parse_enterprise_totp_secret=AsyncMock(return_value=None),
+            ),
             raising=False,
         )
 
@@ -2727,7 +2730,7 @@ workflow_definition:
             policy.current_turn_named_credential_ids = {"cred_123"}
         if origin_arm == "saved_other_approved":
             with patch(
-                "skyvern.forge.sdk.copilot.request_policy.app.DATABASE.credentials.get_credentials_by_ids",
+                "skyvern.forge.sdk.copilot.credential_resolution.app.DATABASE.credentials.get_credentials_by_ids",
                 AsyncMock(return_value=[credential]),
             ):
                 await _seed_prior_approved_credentials(

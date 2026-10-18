@@ -341,6 +341,7 @@ def _install_credential_app(
             ),
             CREDENTIAL_VAULT_SERVICES={CredentialVaultType.AZURE_VAULT: vault_service},
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
                 process_registered_credential_item=AsyncMock(side_effect=lambda **kwargs: kwargs["credential_item"]),
                 parse_enterprise_totp_secret=AsyncMock(return_value=None),
             ),

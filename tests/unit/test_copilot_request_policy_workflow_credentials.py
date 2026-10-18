@@ -422,6 +422,7 @@ async def test_list_credentials_normalizes_pagination(
         organization_id="org-1",
         page=expected_page,
         page_size=expected_page_size,
+        allowed_folder_ids=None,
     )
     assert result["data"]["page"] == expected_page
     assert result["data"]["page_size"] == expected_page_size

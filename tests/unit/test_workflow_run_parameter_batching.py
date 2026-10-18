@@ -643,6 +643,7 @@ async def test_setup_workflow_run_still_validates_provided_credential_for_at_wil
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -672,6 +673,7 @@ async def test_setup_workflow_run_credential_with_default_uses_default() -> None
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_id_0")]
@@ -896,7 +898,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
                 organization=organization,
             )
 
-    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
+    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization, workflow_run_id="wr_test")
     service._resolve_and_stamp_run_seed.assert_not_awaited()
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
@@ -921,6 +923,7 @@ async def test_setup_workflow_run_batches_credential_validation() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id=f"cred_id_{i}") for i in range(3)]
@@ -982,6 +985,7 @@ async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> No
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -1015,6 +1019,7 @@ async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         # Only cred_id_0 exists; cred_id_1 and cred_id_2 are missing.
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
@@ -1054,6 +1059,7 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_shared")]

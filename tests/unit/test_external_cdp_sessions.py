@@ -982,7 +982,7 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
 ) -> None:
     session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
     if loss == "expired":
-        await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
+        await backdate_registration(stack, session_id, minutes=5 - 10 / 60)
     run_id = "tsk_1" if run_type == "task" else "wr_1"
     generation = await stack.manager.begin_session(
         browser_session_id=session_id, runnable_type=run_type, runnable_id=run_id, organization_id=ORG_A
@@ -991,7 +991,7 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
     with patch.object(manager_mod, "attach_registered_cdp_browser", AsyncMock(return_value=lost)):
         assert await acquire_lease(stack.manager, session_id, run_id, generation) is lost
     if loss == "expired":
-        await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
+        await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=15)
     if loss in ("closed", "vanished"):
         await stack.repo.close_persistent_browser_session(session_id, ORG_A)
     context.browser.is_connected.return_value = False
@@ -999,6 +999,7 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
     browser_manager.pages[run_id] = lost
     launch = AsyncMock()
     rbm_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)
+    rbm_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
     unreachable = AsyncMock(side_effect=ExternalBrowserUnavailable("connection failed"))
 
     with (
@@ -1129,9 +1130,11 @@ async def test_a_later_task_block_on_a_lost_registration_fails_with_its_fact_and
     browser_manager = RealBrowserManager()
     launch = AsyncMock()
 
+    browser_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)
+    browser_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
     with (
         mock_block_execute_deps(working_page_url="https://example.test/") as deps,
-        patch.object(real_browser_manager_mod, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)),
+        patch.object(real_browser_manager_mod, "app", browser_app),
         patch.object(browser_manager, "_create_browser_state", launch),
         pytest.raises(BrowserSessionClosed if end == "closed" else ExternalBrowserUnavailable),
     ):

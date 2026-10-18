@@ -615,6 +615,7 @@ async def test_browser_manager_adoption_rebinds_to_run_dir(browser_manager: Real
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(
             _workflow_attach_run(),
             browser_session_id="bs_block",
@@ -645,6 +646,7 @@ async def test_browser_manager_adoption_skips_rebind_when_session_dir_binding(
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(
             _workflow_attach_run(),
             browser_session_id="bs_block",
@@ -674,6 +676,7 @@ async def test_browser_manager_adoption_rebinds_via_context_page_without_owning_
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(
             _workflow_attach_run(),
             browser_session_id="bs_block",
@@ -700,6 +703,7 @@ async def test_browser_manager_adoption_no_browser_no_page_returns_state(browser
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(
             _workflow_attach_run(),
             browser_session_id="bs_block",
@@ -892,6 +896,7 @@ async def test_browser_manager_adoption_rebind_error_is_fail_open(browser_manage
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(
             _workflow_attach_run(),
             browser_session_id="bs_block",
@@ -1543,6 +1548,7 @@ async def test_real_browser_manager_adoption_resolves_context_run_id(browser_man
         patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=ctx),
     ):
         mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
         mock_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock()
         result = await manager.get_or_create_for_workflow_run(workflow_run, browser_session_id="bs")
