@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -300,6 +300,11 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')",
     )
+    vault_id: str | None = Field(default=None, description="1Password vault ID for linked credentials")
+    item_id: str | None = Field(default=None, description="1Password item ID for linked credentials")
+    upstream_missing_at: datetime | None = Field(
+        default=None, description="When the linked 1Password item was last found missing upstream"
+    )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     auto_profile_disabled: bool | None = Field(
         default=None,
@@ -359,6 +364,58 @@ class OnePasswordItemsResponse(BaseModel):
     source: OnePasswordTokenSource | None = None
 
 
+ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500
+
+
+class OnePasswordCredentialSelection(BaseModel):
+    vault_id: str = Field(..., min_length=1)
+    item_id: str = Field(..., min_length=1)
+
+
+class ImportOnePasswordCredentialsRequest(BaseModel):
+    folder_id: str | None = Field(default=None, min_length=1)
+    items: list[OnePasswordCredentialSelection] = Field(..., min_length=1)
+
+    @field_validator("items")
+    @classmethod
+    def enforce_item_limit(cls, items: list[OnePasswordCredentialSelection]) -> list[OnePasswordCredentialSelection]:
+        if len(items) > ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT:
+            raise ValueError(
+                f"Import at most {ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT} 1Password items per request; "
+                "split the request into smaller batches"
+            )
+        return items
+
+
+class OnePasswordCredentialImportResult(BaseModel):
+    vault_id: str
+    item_id: str
+    status: Literal["imported", "updated", "skipped"]
+    reason: str | None = None
+
+
+class ImportOnePasswordCredentialsResponse(BaseModel):
+    results: list[OnePasswordCredentialImportResult]
+
+
+class RefreshOnePasswordCredentialsRequest(BaseModel):
+    folder_id: str | None = Field(default=None, min_length=1)
+
+
+class OnePasswordCredentialRefreshResult(BaseModel):
+    vault_id: str
+    item_id: str
+    status: Literal["refreshed", "stale", "skipped"]
+    reason: str | None = None
+
+
+class RefreshOnePasswordCredentialsResponse(BaseModel):
+    refreshed: int
+    stale: int
+    skipped: int
+    results: list[OnePasswordCredentialRefreshResult]
+
+
 class BitwardenItemOverview(BaseModel):
     """Response model for Bitwarden item metadata."""
 
@@ -393,6 +450,9 @@ class Credential(BaseModel):
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
     vault_id: str | None = Field(
         default=None, description="ID of the credential's vault, when the provider requires it"
+    )
+    upstream_missing_at: datetime | None = Field(
+        default=None, description="When the linked 1Password item was last found missing upstream"
     )
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
     username: str | None = Field(..., description="For password credentials: the username")

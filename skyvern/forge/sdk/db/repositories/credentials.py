@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from typing import cast
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel, TOTPCodeModel
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
@@ -110,6 +115,187 @@ class CredentialRepository(BaseRepository):
             await session.commit()
             await session.refresh(credential)
             return Credential.model_validate(credential)
+
+    @db_operation("get_onepassword_credentials")
+    async def get_onepassword_credentials(
+        self,
+        organization_id: str,
+        *,
+        folder_id: str | None = None,
+        folder_id_is_null: bool = False,
+        item_keys: Sequence[tuple[str, str]] | None = None,
+        limit: int | None = None,
+    ) -> list[Credential]:
+        if item_keys is not None and not item_keys:
+            return []
+        async with self.Session() as session:
+            query = (
+                select(CredentialModel)
+                .where(
+                    CredentialModel.organization_id == organization_id,
+                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_id.is_not(None),
+                    CredentialModel.item_id.is_not(None),
+                    CredentialModel.deleted_at.is_(None),
+                )
+                .order_by(CredentialModel.created_at)
+            )
+            if folder_id_is_null:
+                query = query.where(CredentialModel.folder_id.is_(None))
+            elif folder_id is not None:
+                query = query.where(CredentialModel.folder_id == folder_id)
+            if item_keys is not None:
+                query = query.where(
+                    or_(
+                        *(
+                            and_(CredentialModel.vault_id == vault_id, CredentialModel.item_id == item_id)
+                            for vault_id, item_id in item_keys
+                        )
+                    )
+                )
+            if limit is not None:
+                query = query.limit(limit)
+            credentials = (await session.scalars(query)).all()
+            return [Credential.model_validate(credential) for credential in credentials]
+
+    @db_operation("upsert_onepassword_credential_metadata")
+    async def upsert_onepassword_credential_metadata(
+        self,
+        organization_id: str,
+        vault_id: str,
+        item_id: str,
+        name: str,
+        credential_type: CredentialType,
+        tested_url: str | None,
+        folder_id: str | None,
+        created_by: str | None,
+        set_folder_on_update: bool = True,
+        authorize_update: Callable[[AsyncSession, str], Awaitable[None]] | None = None,
+    ) -> tuple[Credential, bool]:
+        async with self.Session() as session:
+            insert = sqlite_insert if session.get_bind().dialect.name == "sqlite" else pg_insert
+            result = await session.execute(
+                insert(CredentialModel)
+                .values(
+                    organization_id=organization_id,
+                    vault_type=CredentialVaultType.ONEPASSWORD.value,
+                    vault_id=vault_id,
+                    item_id=item_id,
+                    name=name,
+                    credential_type=credential_type.value,
+                    username=None,
+                    totp_type="none",
+                    has_totp_seed=False,
+                    tested_url=tested_url,
+                    folder_id=folder_id,
+                    created_by=created_by,
+                    upstream_missing_at=None,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        CredentialModel.organization_id,
+                        CredentialModel.vault_id,
+                        CredentialModel.item_id,
+                    ],
+                    index_where=and_(CredentialModel.vault_id.is_not(None), CredentialModel.deleted_at.is_(None)),
+                )
+            )
+            created = result.rowcount == 1
+            credential = await session.scalar(
+                select(CredentialModel)
+                .where(
+                    CredentialModel.organization_id == organization_id,
+                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_id == vault_id,
+                    CredentialModel.item_id == item_id,
+                    CredentialModel.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if credential is None:
+                raise RuntimeError("1Password credential upsert did not return a credential row")
+            if authorize_update is not None:
+                await authorize_update(session, credential.credential_id)
+            if not created:
+                credential.name = name
+                credential.credential_type = credential_type.value
+                credential.tested_url = tested_url
+                if set_folder_on_update:
+                    credential.folder_id = folder_id
+                credential.upstream_missing_at = None
+            await session.commit()
+            await session.refresh(credential)
+            return Credential.model_validate(credential), created
+
+    @db_operation("update_onepassword_credential_metadata")
+    async def update_onepassword_credential_metadata(
+        self,
+        credential_id: str,
+        organization_id: str,
+        authorized_folder_id: str | None,
+        name: str,
+        credential_type: CredentialType,
+        tested_url: str | None,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(CredentialModel)
+                .where(
+                    CredentialModel.credential_id == credential_id,
+                    CredentialModel.organization_id == organization_id,
+                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.folder_id.is_not_distinct_from(authorized_folder_id),
+                    CredentialModel.deleted_at.is_(None),
+                )
+                .values(
+                    name=name,
+                    credential_type=credential_type.value,
+                    tested_url=tested_url,
+                    upstream_missing_at=None,
+                    modified_at=naive_utc_now(),
+                )
+                .returning(CredentialModel.credential_id)
+            )
+            updated = result.scalar_one_or_none() is not None
+            await session.commit()
+            return updated
+
+    @db_operation("set_onepassword_credentials_stale")
+    async def set_onepassword_credentials_stale(
+        self,
+        organization_id: str,
+        credential_folders: Sequence[tuple[str, str | None]],
+        *,
+        stale: bool,
+    ) -> set[str]:
+        if not credential_folders:
+            return set()
+        async with self.Session() as session:
+            result = await session.execute(
+                update(CredentialModel)
+                .where(
+                    CredentialModel.organization_id == organization_id,
+                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.deleted_at.is_(None),
+                    or_(
+                        *(
+                            and_(
+                                CredentialModel.credential_id == credential_id,
+                                CredentialModel.folder_id.is_not_distinct_from(folder_id),
+                            )
+                            for credential_id, folder_id in credential_folders
+                        )
+                    ),
+                )
+                .values(
+                    upstream_missing_at=naive_utc_now() if stale else None,
+                    modified_at=naive_utc_now(),
+                )
+                .returning(CredentialModel.credential_id)
+            )
+            updated_ids = set(result.scalars())
+            await session.commit()
+            return updated_ids
 
     @db_operation("get_credentials_by_browser_profile_id")
     async def get_credentials_by_browser_profile_id(

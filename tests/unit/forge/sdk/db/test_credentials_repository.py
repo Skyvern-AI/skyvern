@@ -1,5 +1,6 @@
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -89,3 +90,62 @@ async def test_vault_item_link_is_unique_per_organization_and_round_trips(repo_a
     await create(ORG_B, "vault-1")
     await create(ORG_A, None)
     await create(ORG_A, None)
+
+
+@pytest.mark.asyncio
+async def test_onepassword_metadata_upsert_is_idempotent_and_stale_state_clears(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    created, was_created = await repo.upsert_onepassword_credential_metadata(
+        organization_id=ORG_A,
+        vault_id="vault-1",
+        item_id="item-1",
+        name="Original title",
+        credential_type=CredentialType.PASSWORD,
+        tested_url="https://example.test/login",
+        folder_id=None,
+        created_by="user-1",
+    )
+    assert was_created
+    assert created.vault_type == CredentialVaultType.ONEPASSWORD
+    assert created.vault_id == "vault-1" and created.item_id == "item-1"
+
+    updated, was_created = await repo.upsert_onepassword_credential_metadata(
+        organization_id=ORG_A,
+        vault_id="vault-1",
+        item_id="item-1",
+        name="Updated title",
+        credential_type=CredentialType.CREDIT_CARD,
+        tested_url="https://example.test/card",
+        folder_id=None,
+        created_by="user-2",
+    )
+    assert not was_created
+    assert updated.credential_id == created.credential_id
+    assert updated.name == "Updated title"
+    assert updated.credential_type == CredentialType.CREDIT_CARD
+    assert updated.created_by == "user-1"
+    assert await repo.get_onepassword_credentials(ORG_A) == [updated]
+
+    await repo.set_onepassword_credentials_stale(ORG_A, [(updated.credential_id, None)], stale=True)
+    async with session_factory() as session:
+        stale_at = await session.scalar(
+            select(CredentialModel.upstream_missing_at).where(CredentialModel.credential_id == updated.credential_id)
+        )
+    assert stale_at is not None
+
+    refreshed, was_created = await repo.upsert_onepassword_credential_metadata(
+        organization_id=ORG_A,
+        vault_id="vault-1",
+        item_id="item-1",
+        name="Restored title",
+        credential_type=CredentialType.CREDIT_CARD,
+        tested_url="https://example.test/card",
+        folder_id=None,
+        created_by="user-2",
+    )
+    assert not was_created
+    async with session_factory() as session:
+        stale_at = await session.scalar(
+            select(CredentialModel.upstream_missing_at).where(CredentialModel.credential_id == refreshed.credential_id)
+        )
+    assert stale_at is None
