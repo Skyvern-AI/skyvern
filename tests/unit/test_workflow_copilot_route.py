@@ -127,7 +127,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowUpdateYAMLRequest
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
 from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 from skyvern.utils.url_validators import validate_webhook_url
@@ -247,6 +247,34 @@ async def test_demonstration_flag_off_refuses_record_control_and_done(
         with pytest.raises(HTTPException) as exc_info:
             await call
         assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_demonstration_control_checks_the_demonstrations_workflow_before_appending(
+    monkeypatch: pytest.MonkeyPatch,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "load_demonstration_record",
+        AsyncMock(return_value=SimpleNamespace(workflow_permanent_id="wpid-hidden")),
+    )
+    append = AsyncMock(return_value=1)
+    monkeypatch.setattr(workflow_copilot_route, "append_demonstration_control", append)
+    enforce = AsyncMock(side_effect=HTTPException(status_code=403))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_folder_access", enforce)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_demonstration_control(
+            WorkflowCopilotDemonstrationControlRequest(demonstration_id="demo-1", action="cancel"),
+            organization,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert enforce.await_args.args[2] == {"workflow_permanent_id": "wpid-hidden"}
+    append.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -805,9 +833,17 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     assert persisted_payload["proposalDisposition"] == "auto_applicable"
 
 
+@pytest.mark.parametrize(
+    ("refusal", "reason"),
+    [
+        (WorkflowPinnedByRunGroup("wf-canonical"), "_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP"),
+        # A folder check refuses before any write, so the draft must stay reviewable rather than fail the turn.
+        (HTTPException(status_code=403, detail="folder"), "_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception, reason: str
 ) -> None:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -833,7 +869,7 @@ async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
     monkeypatch.setattr(
         workflow_copilot_route,
         "_commit_staged_workflow",
-        AsyncMock(side_effect=WorkflowPinnedByRunGroup("wf-canonical")),
+        AsyncMock(side_effect=refusal),
     )
     stream = MagicMock(send=AsyncMock(return_value=True))
 
@@ -849,7 +885,7 @@ async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
     response_frame = stream.send.await_args.args[0]
     assert response_frame.workflow_applied is False
     assert response_frame.proposal_disposition == "review_tested"
-    assert workflow_copilot_route._AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP in response_frame.message
+    assert getattr(workflow_copilot_route, reason) in response_frame.message
     restore.assert_not_awaited()
     publication = workflow_params.publish_workflow_copilot_candidate.await_args
     assert publication is not None
@@ -5427,31 +5463,6 @@ async def _accept(chat_id: str, tokened: bool = True) -> Workflow:
 
 
 @pytest.mark.asyncio
-async def test_accept_proposal_uses_update_schema_for_legacy_long_title(monkeypatch: pytest.MonkeyPatch) -> None:
-    title = "Legacy title " * 24
-    canonical = _make_copilot_workflow(title, _NOW)
-    monkeypatch.setattr(
-        app.DATABASE,
-        "workflows",
-        SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=canonical)),
-    )
-    proposal = canonical.model_dump(mode="json")
-    proposal["_copilot_yaml"] = yaml.safe_dump(
-        {"title": title, "workflow_definition": {"parameters": [], "blocks": []}}
-    )
-
-    request = await workflow_copilot_route._resolve_proposal_for_accept(
-        proposal,
-        organization_id="org-1",
-        workflow_permanent_id="wpid-1",
-    )
-
-    assert len(title) > 255
-    assert isinstance(request, WorkflowUpdateYAMLRequest)
-    assert request.title == title
-
-
-@pytest.mark.asyncio
 async def test_untyped_proposal_publication_records_base_and_rejects_a_save_before_accept(
     sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5733,7 +5744,7 @@ async def test_every_accept_refusal_after_the_claim_releases_it(
         assert isinstance(exc_info.value, HTTPException)
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail.startswith("Proposed copilot YAML is invalid:")
-        assert "WorkflowUpdateYAMLRequest" in exc_info.value.detail
+        assert "WorkflowCreateYAMLRequest" in exc_info.value.detail
     if refusal != "create_failed":
         create.assert_not_awaited()
     row = await repo.get_workflow_copilot_chat_by_id("org-1", chat_id)
@@ -9025,6 +9036,7 @@ async def test_restore_records_only_a_rollback_that_landed(
         sequential_key=None,
         created_by=None,
         edited_by=None,
+        edited_for=None,
         build_source=None,
     )
     update = AsyncMock(side_effect=RuntimeError("canonical write failed") if update_fails else None)

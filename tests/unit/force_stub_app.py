@@ -84,6 +84,11 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.accessible_workflow_folder_ids = base_agent_function.accessible_workflow_folder_ids
+    fake_app_module.AGENT_FUNCTION.hidden_workflow_permanent_ids = base_agent_function.hidden_workflow_permanent_ids
+    fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
+    fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
+    fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
@@ -104,6 +109,8 @@ def create_forge_stub_app() -> ForgeApp:
     # Advisory scanner hook — _LazyNamespace would auto-mock this as an AsyncMock returning a
     # non-iterable MagicMock, silently exercising the fail-open path instead of the OSS no-op.
     fake_app_module.AGENT_FUNCTION.scan_code_block_source = AsyncMock(return_value=[])
+    # An AsyncMock would hand the create route's `async with` a coroutine. Match the OSS no-op.
+    fake_app_module.AGENT_FUNCTION.browser_session_create_admission = MagicMock(return_value=nullcontext())
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
@@ -129,33 +136,6 @@ def create_forge_stub_app() -> ForgeApp:
     # awaited value is a non-None MagicMock, poisoning the extract-information prompt/cache key.
     # Match the real OSS base no-op (None → no grid rows injected).
     fake_app_module.AGENT_FUNCTION.collect_virtualized_grid_rows = AsyncMock(return_value=None)
-    # Browser-defense seams — _LazyNamespace would auto-mock each as an AsyncMock, so the sync
-    # ones hand callers an unawaited coroutine (len(screenshots) blows up) and the predicates read
-    # as truthy, silently arming dismiss/block policies OSS ships inert. Bind the real base methods.
-    for browser_defense_seam in (
-        "begin_browser_observation",
-        "enforce_browser_action_egress_policy",
-        "enforce_browser_action_policy",
-        "enforce_cached_browser_script_policy",
-        "enforce_external_request_policy",
-        "filter_browser_screenshots",
-        "inspect_browser_dialog",
-        "inspect_browser_observation",
-        "needs_browser_observation",
-        "needs_browser_observation_text",
-        "prepare_browser_observation",
-        "record_browser_observation_failure",
-        "register_browser_origin_authority",
-        "should_block_browser_action",
-        "should_dismiss_browser_dialog",
-        "should_use_cached_browser_scripts",
-        "transform_browser_elements_for_prompt",
-    ):
-        setattr(
-            fake_app_module.AGENT_FUNCTION,
-            browser_defense_seam,
-            getattr(base_agent_function, browser_defense_seam),
-        )
     fake_app_module.agent = _LazyNamespace()
     fake_app_module.DATABASE.observer.update_workflow_run_block = AsyncMock()
     fake_app_module.DATABASE.observer.create_workflow_run_block = AsyncMock()

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,8 +12,10 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.api_app import handle_skyvern_http_exception
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
@@ -141,6 +144,7 @@ async def idempotency_lab(
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
     fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
     fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/v1")
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     transport = httpx.ASGITransport(app=fastapi_app)
     try:
@@ -357,7 +361,7 @@ async def test_create_workflow_honors_idempotency_key(
                 )
             assert active_row_count == 2
 
-            await workflow_service.delete_workflow_by_permanent_id(
+            await workflow_service.soft_delete_workflow_by_permanent_id(
                 original.json()["workflow_permanent_id"],
                 organization.organization_id,
             )
@@ -428,38 +432,25 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
 async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-database-timeout.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    organization = await database.organizations.create_organization(
-        organization_name="Test",
-        organization_id="o_test",
-    )
+    async with idempotency_lab(monkeypatch, tmp_path / "idempotency-database-timeout.db") as lab:
 
-    @asynccontextmanager
-    async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
-        raise TimeoutError("database timed out")
-        yield
+        @asynccontextmanager
+        async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
+            raise TimeoutError("database timed out")
+            yield
 
-    monkeypatch.setattr(database.workflows, "_workflow_creation_transaction", database_timeout)
-    monkeypatch.setattr(app, "DATABASE", database)
-    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+        monkeypatch.setattr(lab.database.workflows, "_workflow_creation_transaction", database_timeout)
 
-    try:
-        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
-            await agent_protocol.create_workflow(
-                data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
-                folder_id=None,
-                current_org=organization,
-                user_id="u_test",
-                idempotency_key="database-timeout-key",
-            )
-        # The internal cause reaches the logs and __cause__, never the client-visible message.
-        assert "database timed out" not in str(raised.value)
-        assert "database timed out" in str(raised.value.__cause__)
-    finally:
-        await database.engine.dispose()
+        with caplog.at_level(logging.ERROR):
+            response = await lab.create("database-timeout-key")
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Failed to create workflow. Error: An unexpected error occurred"}
+        assert "database timed out" in caplog.text
+        assert "database timed out" not in response.text
+        assert await lab.count_workflows() == 0
 
 
 @pytest.mark.asyncio
@@ -514,7 +505,6 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
                 user_id="u_test",
                 idempotency_key="rollback-key",
             )
-        # The internal cause reaches the logs and __cause__, never the client-visible message.
         assert "cache invalidation failed" not in str(raised.value)
         assert "cache invalidation failed" in str(raised.value.__cause__)
 
@@ -712,7 +702,6 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
                 user_id="u_test",
                 idempotency_key="write-rollback-key",
             )
-        # The internal cause reaches the logs and __cause__, never the client-visible message.
         assert "definition write failed" not in str(raised.value)
         assert "definition write failed" in str(raised.value.__cause__)
 

@@ -56,7 +56,11 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.sdk.workflow.retry_policy import (
+    LEASE_TAKEOVER_SECONDS,
+    WEBHOOK_FALLBACK_GRACE_SECONDS,
+    is_retry_eligible_run,
+)
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
@@ -4649,3 +4653,96 @@ async def test_get_all_runs_v2_hides_search_parameters_on_timeout_before_retry_l
     assert exc_info.value.hide_parameters is True
     assert search_key not in repr(logs)
     assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+def _final_webhook_claim_stale_before() -> datetime:
+    return naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS)
+
+
+async def _seed_canceled_runs(db: AgentDB, organization_id: str, finished_at: datetime, **runs: dict[str, Any]) -> None:
+    async with db.Session() as session:
+        for workflow_run_id, columns in runs.items():
+            run = _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=finished_at,
+                status=WorkflowRunStatus.canceled.value,
+                organization_id=organization_id,
+            )
+            run.finished_at = finished_at
+            for column, value in columns.items():
+                setattr(run, column, value)
+            session.add(run)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_has_one_winner_per_terminal_execution(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_canceled_runs(db, organization_id, finished_at, wr_claim_race={}, wr_claim_refinished={})
+
+    claims = await asyncio.gather(
+        *(
+            db.workflow_runs.claim_final_webhook_delivery(
+                "wr_claim_race",
+                expected_status=WorkflowRunStatus.canceled,
+                expected_finished_at=finished_at,
+                stale_before=_final_webhook_claim_stale_before(),
+            )
+            for _ in range(5)
+        )
+    )
+    stale_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.canceled,
+        expected_finished_at=finished_at - timedelta(seconds=1),
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+    other_status_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.completed,
+        expected_finished_at=finished_at,
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+    assert stale_claim is None
+    assert other_status_claim is None
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_takes_over_only_an_unrecorded_claim_past_the_delivery_bound(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # A sender that died mid-delivery leaves a claim with no outcome; once it outlives any bounded delivery,
+    # the next sender takes it rather than leaving the run's final webhook unsent forever.
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    abandoned_at = naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS + 1)
+    await _seed_canceled_runs(
+        db,
+        organization_id,
+        finished_at,
+        wr_claim_abandoned={"webhook_delivery_finalized_at": abandoned_at},
+        wr_claim_in_flight={"webhook_delivery_finalized_at": naive_utc_now()},
+        wr_claim_recorded={"webhook_delivery_finalized_at": abandoned_at, "webhook_delivery_status": "delivered"},
+    )
+
+    async def claim(workflow_run_id: str) -> datetime | None:
+        return await db.workflow_runs.claim_final_webhook_delivery(
+            workflow_run_id,
+            expected_status=WorkflowRunStatus.canceled,
+            expected_finished_at=finished_at,
+            stale_before=_final_webhook_claim_stale_before(),
+        )
+
+    taken_over = await claim("wr_claim_abandoned")
+    # The abandoned sender's late release names its own claim, so it cannot free the claim that replaced it.
+    await db.workflow_runs.release_final_webhook_delivery_claim("wr_claim_abandoned", claimed_at=abandoned_at)
+
+    assert taken_over is not None
+    assert await claim("wr_claim_abandoned") is None
+    assert await claim("wr_claim_in_flight") is None
+    assert await claim("wr_claim_recorded") is None

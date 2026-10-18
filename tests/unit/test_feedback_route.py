@@ -52,7 +52,9 @@ def _install_fakes(
         run_feedback=run_feedback,
     )
     monkeypatch.setattr(app, "DATABASE", database)
-    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(on_feedback_submitted=hook))
+    monkeypatch.setattr(
+        app, "AGENT_FUNCTION", SimpleNamespace(on_feedback_submitted=hook, enforce_folder_access=AsyncMock())
+    )
     return run_feedback
 
 

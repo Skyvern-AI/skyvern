@@ -142,7 +142,8 @@ def _run_ai_extract(
     scraped_page.support_economy_elements_tree = MagicMock(return_value=False)
     scraped_page.last_used_element_tree_html = None
 
-    page = module.RealSkyvernPageAi(scraped_page, MagicMock())
+    page = module.RealSkyvernPageAi.__new__(module.RealSkyvernPageAi)
+    page.scraped_page = scraped_page
     page.current_label = current_label
 
     async def fake_refresh(*_args: Any, **_kwargs: Any) -> None:

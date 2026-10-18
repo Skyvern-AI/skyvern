@@ -5,7 +5,7 @@ import contextlib
 import io
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -34,11 +34,14 @@ def _build_client(monkeypatch: pytest.MonkeyPatch, *, content: bytes = CONTENT) 
     async def _fake_org(**_: object) -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
-    artifact = SimpleNamespace(
+    now = datetime.now(UTC)
+    artifact = Artifact(
         artifact_id="a_42",
         artifact_type=ArtifactType.RECORDING,
         uri="s3://bucket/path/recording.webm",
         organization_id="org_oss",
+        created_at=now,
+        modified_at=now,
     )
 
     artifacts_db = MagicMock()

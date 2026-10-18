@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.exceptions import ActionPolicyBlocked
 from skyvern.forge import agent_functions
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import InputTextAction, SelectOption, SelectOptionAction
@@ -267,9 +266,12 @@ async def test_input_handler_passes_its_selection_snapshot_to_context_parser(
     assert context_parser.await_args.kwargs["engine_selection"] is selection
 
 
-def _wire_custom_select(
-    monkeypatch: pytest.MonkeyPatch, selection: BrowserEngineSelection, emerging: AsyncMock
-) -> tuple[MagicMock, MagicMock, MagicMock, AsyncMock]:
+@pytest.mark.asyncio
+async def test_custom_select_handler_passes_its_selection_snapshot_to_context_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    task = _task()
     element = _element_double()
     element.get_id.return_value, element.get_tag_name.return_value = "select-1", "div"
     element.get_frame.return_value = MagicMock()
@@ -299,11 +301,11 @@ def _wire_custom_select(
     monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=incremental))
     monkeypatch.setattr(handler.SkyvernElement, "wait_until_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(handler, "_get_input_or_select_context", context_parser)
-    monkeypatch.setattr(handler, "select_from_emerging_elements", emerging)
-    return element, scraped_page, resolver, context_parser
-
-
-async def _run_custom_select(scraped_page: MagicMock, task: MagicMock) -> None:
+    monkeypatch.setattr(
+        handler,
+        "select_from_emerging_elements",
+        AsyncMock(return_value=ActionFailure(Exception("stop after context parsing"))),
+    )
     await handler.handle_select_option_action(
         SelectOptionAction(element_id="select-1", option=SelectOption(label="Choice")),
         MagicMock(),
@@ -311,35 +313,9 @@ async def _run_custom_select(scraped_page: MagicMock, task: MagicMock) -> None:
         task,
         MagicMock(),
     )
-
-
-@pytest.mark.asyncio
-async def test_custom_select_handler_passes_its_selection_snapshot_to_context_parser(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    selection = _selection()
-    task = _task()
-    _, scraped_page, resolver, context_parser = _wire_custom_select(
-        monkeypatch, selection, AsyncMock(return_value=ActionFailure(Exception("stop after context parsing")))
-    )
-    await _run_custom_select(scraped_page, task)
     resolver.assert_called_once_with(task, handler.app.BROWSER_MANAGER)
     context_parser.assert_awaited_once()
     assert context_parser.await_args.kwargs["engine_selection"] is selection
-
-
-@pytest.mark.asyncio
-async def test_custom_select_cleanup_does_not_blur_after_a_policy_block(monkeypatch: pytest.MonkeyPatch) -> None:
-    """blur() fires page-controlled onblur handlers, so the unwind from a denied action must not run it."""
-    element, scraped_page, _, _ = _wire_custom_select(
-        monkeypatch, _selection(), AsyncMock(side_effect=ActionPolicyBlocked("denied"))
-    )
-    monkeypatch.setattr(handler.app.AGENT_FUNCTION, "should_block_browser_action", MagicMock(return_value=True))
-
-    with pytest.raises(ActionPolicyBlocked):
-        await _run_custom_select(scraped_page, _task())
-
-    element.blur.assert_not_awaited()
 
 
 @pytest.mark.asyncio

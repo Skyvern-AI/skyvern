@@ -35,22 +35,20 @@ def _mock_skyvern_context(code_version=2):
     return ctx
 
 
-def _make_page():
-    """Build a real wrapper so its private browser backing stays encapsulated."""
-    from skyvern.core.script_generations.skyvern_page import SkyvernPage
-
-    raw_page = MagicMock(spec=["locator"])
-    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
-        return SkyvernPage(page=raw_page, ai=MagicMock())
-
-
 @pytest.fixture
 def mock_page():
     """Create a minimal mock SkyvernPage with the retry method.
 
     Patches skyvern_context.current() to return code_version=2 so retries are enabled.
     """
-    page = _make_page()
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    page = MagicMock(spec=SkyvernPage)
+    page._locator_scope = MagicMock()
+    page.engine_selection = None
+
+    # Bind the real method to our mock
+    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
 
     # Patch skyvern_context.current() to return code_version=2 so retries are enabled
     with patch(
@@ -75,7 +73,7 @@ def _make_locator(wait_for_side_effect=None):
 async def test_element_found_immediately(mock_page):
     """When the element exists, return the locator on the first try — no retries."""
     locator = _make_locator()
-    mock_page.locator_scope.locator.return_value = locator
+    mock_page._locator_scope.locator.return_value = locator
 
     result = await mock_page._wait_for_selector_with_retry(
         "#my-button",
@@ -94,7 +92,7 @@ async def test_element_found_after_one_retry(mock_page):
     locator_miss = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     locator_hit = _make_locator()
 
-    mock_page.locator_scope.locator.side_effect = [locator_miss, locator_hit]
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#password-field",
@@ -104,7 +102,7 @@ async def test_element_found_after_one_retry(mock_page):
     )
 
     assert result is locator_hit
-    assert mock_page.locator_scope.locator.call_count == 2
+    assert mock_page._locator_scope.locator.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -114,7 +112,7 @@ async def test_element_found_after_two_retries(mock_page):
     locator_miss2 = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     locator_hit = _make_locator()
 
-    mock_page.locator_scope.locator.side_effect = [locator_miss1, locator_miss2, locator_hit]
+    mock_page._locator_scope.locator.side_effect = [locator_miss1, locator_miss2, locator_hit]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#sign-in",
@@ -124,14 +122,14 @@ async def test_element_found_after_two_retries(mock_page):
     )
 
     assert result is locator_hit
-    assert mock_page.locator_scope.locator.call_count == 3
+    assert mock_page._locator_scope.locator.call_count == 3
 
 
 @pytest.mark.asyncio
 async def test_all_retries_exhausted_raises(mock_page):
     """When element is never found, raise after all retries are exhausted."""
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
-    mock_page.locator_scope.locator.return_value = locator
+    mock_page._locator_scope.locator.return_value = locator
 
     with pytest.raises(PlaywrightTimeoutError):
         await mock_page._wait_for_selector_with_retry(
@@ -142,14 +140,14 @@ async def test_all_retries_exhausted_raises(mock_page):
         )
 
     # Initial attempt + 2 retries = 3 locator acquisitions
-    assert mock_page.locator_scope.locator.call_count == 3
+    assert mock_page._locator_scope.locator.call_count == 3
 
 
 @pytest.mark.asyncio
 async def test_zero_retries_fails_immediately(mock_page):
     """With max_retries=0, no retries — fail on first miss."""
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
-    mock_page.locator_scope.locator.return_value = locator
+    mock_page._locator_scope.locator.return_value = locator
 
     with pytest.raises(PlaywrightTimeoutError):
         await mock_page._wait_for_selector_with_retry(
@@ -159,7 +157,7 @@ async def test_zero_retries_fails_immediately(mock_page):
             retry_interval=0.01,
         )
 
-    assert mock_page.locator_scope.locator.call_count == 1
+    assert mock_page._locator_scope.locator.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -167,7 +165,7 @@ async def test_selected_engine_native_timeout_is_retried(mock_page):
     locator_miss = _make_locator(wait_for_side_effect=SelectedEngineTimeout("Timeout"))
     locator_hit = _make_locator()
     mock_page.engine_selection = _selected_engine()
-    mock_page.locator_scope.locator.side_effect = [locator_miss, locator_hit]
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#target",
@@ -183,7 +181,7 @@ async def test_selected_engine_native_timeout_is_retried(mock_page):
 async def test_selected_engine_foreign_timeout_is_not_retried(mock_page):
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     mock_page.engine_selection = _selected_engine()
-    mock_page.locator_scope.locator.return_value = locator
+    mock_page._locator_scope.locator.return_value = locator
 
     with pytest.raises(PlaywrightTimeoutError):
         await mock_page._wait_for_selector_with_retry(
@@ -193,7 +191,7 @@ async def test_selected_engine_foreign_timeout_is_not_retried(mock_page):
             retry_interval=0.01,
         )
 
-    assert mock_page.locator_scope.locator.call_count == 1
+    assert mock_page._locator_scope.locator.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -201,7 +199,7 @@ async def test_execution_context_error_remains_transient_with_selected_engine(mo
     locator_miss = _make_locator(wait_for_side_effect=RuntimeError("Execution context was destroyed"))
     locator_hit = _make_locator()
     mock_page.engine_selection = _selected_engine()
-    mock_page.locator_scope.locator.side_effect = [locator_miss, locator_hit]
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#target",
@@ -228,7 +226,7 @@ async def test_navigation_context_error_retried(mock_page):
     locator_miss = _make_locator(wait_for_side_effect=Exception("Execution context was destroyed"))
     locator_hit = _make_locator()
 
-    mock_page.locator_scope.locator.side_effect = [locator_miss, locator_hit]
+    mock_page._locator_scope.locator.side_effect = [locator_miss, locator_hit]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#target",
@@ -244,7 +242,7 @@ async def test_navigation_context_error_retried(mock_page):
 async def test_non_transient_error_not_retried(mock_page):
     """Non-transient errors (browser crashed, page closed) are NOT retried."""
     locator = _make_locator(wait_for_side_effect=Exception("Browser has been closed"))
-    mock_page.locator_scope.locator.return_value = locator
+    mock_page._locator_scope.locator.return_value = locator
 
     with pytest.raises(Exception, match="Browser has been closed"):
         await mock_page._wait_for_selector_with_retry(
@@ -255,7 +253,7 @@ async def test_non_transient_error_not_retried(mock_page):
         )
 
     # Should fail on first attempt — no retries for non-transient errors
-    assert mock_page.locator_scope.locator.call_count == 1
+    assert mock_page._locator_scope.locator.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -268,7 +266,7 @@ async def test_locator_reacquired_between_retries(mock_page):
     locator_old = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
     locator_new = _make_locator()
 
-    mock_page.locator_scope.locator.side_effect = [locator_old, locator_new]
+    mock_page._locator_scope.locator.side_effect = [locator_old, locator_new]
 
     result = await mock_page._wait_for_selector_with_retry(
         "#passwd",
@@ -280,17 +278,21 @@ async def test_locator_reacquired_between_retries(mock_page):
     # Should be the NEW locator, not the old one
     assert result is locator_new
     # Both calls should use the same selector
-    calls = mock_page.locator_scope.locator.call_args_list
+    calls = mock_page._locator_scope.locator.call_args_list
     assert all(c.args[0] == "#passwd" for c in calls)
 
 
 @pytest.mark.asyncio
 async def test_no_retry_for_code_v1():
     """Code version 1 scripts should NOT retry — fail immediately."""
-    page = _make_page()
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    page = MagicMock(spec=SkyvernPage)
+    page._locator_scope = MagicMock()
+    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
 
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
-    page.locator_scope.locator.return_value = locator
+    page._locator_scope.locator.return_value = locator
 
     with patch(
         "skyvern.core.script_generations.skyvern_page.skyvern_context.current",
@@ -305,16 +307,20 @@ async def test_no_retry_for_code_v1():
             )
 
     # Should only try once (no retries for v1)
-    assert page.locator_scope.locator.call_count == 1
+    assert page._locator_scope.locator.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_no_retry_without_context():
     """When there's no SkyvernContext (e.g. non-script execution), no retries."""
-    page = _make_page()
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
+    page = MagicMock(spec=SkyvernPage)
+    page._locator_scope = MagicMock()
+    page._wait_for_selector_with_retry = SkyvernPage._wait_for_selector_with_retry.__get__(page)
 
     locator = _make_locator(wait_for_side_effect=PlaywrightTimeoutError("Timeout"))
-    page.locator_scope.locator.return_value = locator
+    page._locator_scope.locator.return_value = locator
 
     with patch(
         "skyvern.core.script_generations.skyvern_page.skyvern_context.current",
@@ -328,4 +334,4 @@ async def test_no_retry_without_context():
                 retry_interval=0.01,
             )
 
-    assert page.locator_scope.locator.call_count == 1
+    assert page._locator_scope.locator.call_count == 1

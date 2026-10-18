@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from skyvern.config import settings
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.api_app import create_api_app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel
@@ -103,7 +104,9 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
     http_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
         organization_id=caller.organization_id
     )
-    route_app = SimpleNamespace(DATABASE=manager.database, PERSISTENT_SESSIONS_MANAGER=manager, STORAGE=None)
+    route_app = SimpleNamespace(
+        DATABASE=manager.database, PERSISTENT_SESSIONS_MANAGER=manager, STORAGE=None, AGENT_FUNCTION=AgentFunction()
+    )
     try:
         with (
             patch.object(routes_mod, "app", route_app),

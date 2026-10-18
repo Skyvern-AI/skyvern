@@ -1250,7 +1250,9 @@ def _principal_app() -> FastAPI:
 
     @fastapi_app.websocket("/stream")
     async def stream(websocket: WebSocket, apikey: str | None = None, token: str | None = None) -> None:
-        await streaming_auth(apikey, token, websocket)
+        await streaming_auth(
+            apikey, token, websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"}
+        )
         await websocket.send_json(principal())
         await websocket.close()
 

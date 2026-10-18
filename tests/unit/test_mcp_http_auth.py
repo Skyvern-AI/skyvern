@@ -1028,6 +1028,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
 
     assert resolution.api_key == "sk_live_from_jwt"
     assert resolution.api_key_token_id == "oat_jwt"
+    assert resolution.user_id == "user_123"
     assert captured["kwargs"]["leeway"] == mcp_http_auth._TOKEN_CLOCK_SKEW_SECONDS
     assert captured["kwargs"]["options"] == {"verify_aud": False}
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_jwt", "organization")
@@ -1051,8 +1052,10 @@ async def test_validate_mcp_oauth_token_returns_role_403_without_negative_cachin
     resolve_member_key = AsyncMock(side_effect=mcp_http_auth.MCPOrgRoleRequiredError)
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="org_jwt")]),
-        get_valid_org_auth_token=AsyncMock(),
+        get_valid_org_auth_token=AsyncMock(return_value=None),
     )
+    create_org_api_token = AsyncMock(return_value=SimpleNamespace(id="oat_stray", token="sk_stray"))
+    record_audit_event = AsyncMock()
     monkeypatch.setattr(jwt, "PyJWK", lambda key: key)
     monkeypatch.setattr(jwt, "decode", _fake_decode)
     _stub_auth_db(monkeypatch, fake_db)
@@ -1066,9 +1069,11 @@ async def test_validate_mcp_oauth_token_returns_role_403_without_negative_cachin
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
                 resolve_mcp_oauth_member_api_key=resolve_member_key,
+                record_audit_event=record_audit_event,
             )
         ),
     )
+    monkeypatch.setattr("skyvern.forge.sdk.services.org_auth_token_service.create_org_api_token", create_org_api_token)
 
     for _ in range(2):
         with pytest.raises(mcp_http_auth.MCPOrgRoleRequiredError) as exc_info:
@@ -1078,6 +1083,8 @@ async def test_validate_mcp_oauth_token_returns_role_403_without_negative_cachin
 
     assert resolve_member_key.await_count == 2
     fake_db.get_valid_org_auth_token.assert_not_awaited()
+    create_org_api_token.assert_not_awaited()
+    record_audit_event.assert_not_awaited()
     assert mcp_http_auth._oauth_cache_key(_jwtish_token()) not in mcp_http_auth._api_key_validation_cache
 
 
@@ -1294,6 +1301,7 @@ async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
     assert resolution.api_key == "sk_live_org_123"
     assert resolution.validation.organization_id == "skyvern_org_123"
     assert resolution.api_key_token_id == "oat_org_123"
+    assert resolution.user_id == "user_123"
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_123", "organization")
     fake_db.get_valid_org_auth_token.assert_awaited_once_with(
         "skyvern_org_123", mcp_http_auth.OrganizationAuthTokenType.api

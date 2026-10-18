@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import Base, MicrosoftOAuthCredentialModel  # noqa: F401 - registers model on Base
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import STATE_ACTIVE, STATE_REVOKED, MicrosoftOAuthRepository
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 
 
 @pytest_asyncio.fixture
@@ -104,6 +105,55 @@ async def test_update_email_address_authoritative_write_updates_address(
 
     assert stored_address == "fresh@example.test"
     assert updated is True
+
+
+@pytest.mark.asyncio
+async def test_update_active_refresh_token_only_rewrites_expected_ciphertext(
+    repo: MicrosoftOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    async with engine.begin() as conn:
+        await conn.execute(
+            MicrosoftOAuthCredentialModel.__table__.insert().values(
+                id="msoac_rotation",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token="encrypted-old",
+                encrypted_method="aes",
+                created_at=now,
+                modified_at=now,
+            )
+        )
+
+    rotated = await repo.update_active_refresh_token(
+        organization_id="o_test",
+        credential_id="msoac_rotation",
+        encrypted_refresh_token="encrypted-rotated",
+        encrypted_method=EncryptMethod.AES,
+        expected_encrypted_refresh_token="encrypted-old",
+        now=now + datetime.timedelta(minutes=1),
+    )
+    stale = await repo.update_active_refresh_token(
+        organization_id="o_test",
+        credential_id="msoac_rotation",
+        encrypted_refresh_token="encrypted-stale",
+        encrypted_method=EncryptMethod.AES,
+        expected_encrypted_refresh_token="encrypted-old",
+        now=now + datetime.timedelta(minutes=2),
+    )
+
+    async with engine.connect() as conn:
+        stored = await conn.scalar(
+            select(MicrosoftOAuthCredentialModel.encrypted_refresh_token).where(
+                MicrosoftOAuthCredentialModel.id == "msoac_rotation"
+            )
+        )
+
+    assert rotated is True
+    assert stale is False
+    assert stored == "encrypted-rotated"
 
 
 @pytest.mark.asyncio

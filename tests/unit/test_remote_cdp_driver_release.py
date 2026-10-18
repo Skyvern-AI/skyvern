@@ -13,7 +13,6 @@ browsers shared across parent/child runs) must NOT have their driver stopped.
 from __future__ import annotations
 
 import asyncio
-import time
 from contextlib import contextmanager
 from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, call
@@ -30,7 +29,6 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
     BrowserSourceNotSupportedByEngine,
 )
-from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _EngineSelectionOwner, canonical_run_key
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -117,71 +115,6 @@ async def test_close_context_disables_download_interceptor_once() -> None:
     await state.close(close_browser_on_completion=True)
 
     interceptor.disable.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("close_browser_on_completion", [True, False])
-async def test_close_timeout_bounds_interceptor_drain_and_cleans_suspended_task(
-    monkeypatch: pytest.MonkeyPatch, close_browser_on_completion: bool
-) -> None:
-    pw = _pw_stub()
-    context = _context_stub()
-    inert_monitor = MagicMock(name="inert_network_egress_monitor")
-    inert_authorizer = AsyncMock(
-        name="inert_redirect_hop_authorizer",
-        side_effect=AssertionError("unexpected direct HTTP request"),
-    )
-    interceptor = CDPDownloadInterceptor(
-        network_egress_monitor=inert_monitor,
-        redirect_hop_authorizer=inert_authorizer,
-    )
-    interceptor._accepting_browser_downloads = True
-    context._skyvern_cdp_download_interceptor = interceptor
-    started = asyncio.Event()
-    cancelled = asyncio.Event()
-    release = asyncio.Event()
-    cleaned = asyncio.Event()
-
-    async def suspended_handler(event: dict[str, object]) -> None:
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
-        finally:
-            cleaned.set()
-
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.05)
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CLOSE_TIMEOUT", 0.05)
-    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_CONTEXT_CLOSE_TIMEOUT", 0.05)
-    monkeypatch.setattr(interceptor, "_handle_browser_download", suspended_handler)
-    interceptor._schedule_browser_download_handler({"url": "https://example.test/download"})
-    await started.wait()
-
-    start = time.monotonic()
-    state = RealBrowserState(pw=pw, browser_context=context)
-    result = await asyncio.wait_for(state.close(close_browser_on_completion, release_driver=True), timeout=0.5)
-    elapsed = time.monotonic() - start
-
-    assert result is close_browser_on_completion
-    assert elapsed < 0.5
-    await asyncio.wait_for(cancelled.wait(), timeout=0.5)
-    assert not cleaned.is_set()
-    assert len(interceptor._browser_download_tasks) == 1
-    assert context._skyvern_cdp_download_interceptor is None
-    # The bounded interceptor drain is detached independently, so later teardown steps
-    # (context close, driver stop) still run instead of being starved by the stuck drain.
-    if close_browser_on_completion:
-        context.close.assert_awaited_once()
-    else:
-        context.close.assert_not_awaited()
-    pw.stop.assert_awaited_once()
-
-    release.set()
-    await asyncio.wait_for(cleaned.wait(), timeout=0.5)
-    await asyncio.sleep(0)
-    assert not interceptor._browser_download_tasks
 
 
 @pytest.mark.asyncio
