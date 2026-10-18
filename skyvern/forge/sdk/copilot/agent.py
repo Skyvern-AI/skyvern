@@ -150,7 +150,7 @@ from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
-from skyvern.forge.sdk.copilot.model_resolver import router_fallback_llm_key
+from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget, router_fallback_llm_key
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
@@ -4311,6 +4311,7 @@ async def _run_agent_loop_with_surface(
                                     run_config=run_config,
                                     session=session,
                                     copilot_config=copilot_config,
+                                    token_budget=copilot_token_budget(copilot_config, llm_key),
                                 )
                             break
                         except Exception as exc:

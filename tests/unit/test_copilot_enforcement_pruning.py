@@ -824,7 +824,7 @@ def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(settings, "ENV", "local")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -840,7 +840,7 @@ def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(settings, "ENV", "production")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 @pytest.mark.asyncio
