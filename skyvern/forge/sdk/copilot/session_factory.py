@@ -24,6 +24,7 @@ from skyvern.forge.sdk.agents.context import (
     replace_agent_message_field,
 )
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
@@ -368,7 +369,8 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
        then replace the latest unread outputs that do not fit with a notice that the call ran.
     3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
        then to 300 only if the softer pass was not enough.
-    4. If still over budget: aggressive prune as last resort.
+    4. If still over budget: aggressive prune as last resort, keeping the most recent screenshot unless
+       it predates every step the prune keeps.
     """
     if not items:
         return ModelInputData(input=items, instructions=instructions)
@@ -441,7 +443,27 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         and call_id.startswith("call_demo_")
         and get_agent_message_field(item, "type") == "function_call"
     }
-    items = aggressive_prune(items)
+    frame = next((item for item in reversed(items[1:]) if _screenshot_with_image(item)), None)
+    pruned = aggressive_prune(items)
+    # The prune drops every screenshot and appends a re-take note, or keeps an earlier note instead of adding one.
+    # A frame newer than the oldest kept step goes back in its input position without any note older than it; an
+    # older frame stays dropped because the steps taken after it were cut.
+    position = {id(item): index for index, item in enumerate(items)}
+    oldest_kept = next((position[id(item)] for item in pruned[1:] if id(item) in position), None)
+    if frame is not None and (oldest_kept is None or position[id(frame)] > oldest_kept):
+        retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
+        pruned = sorted(
+            (
+                item
+                for item in [*pruned, frame]
+                if id(item) in position
+                and (
+                    position[id(item)] > position[id(frame)] or get_agent_message_field(item, "content") != retake_note
+                )
+            ),
+            key=lambda item: position[id(item)],
+        )
+    items = pruned
     retained_demonstration_call_ids = {
         call_id
         for item in items
