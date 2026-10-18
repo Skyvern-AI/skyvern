@@ -897,10 +897,22 @@ def _saved_left_run_ids(ctx: CopilotContext) -> list[str]:
     return payload.get("budgetExpiry", {}).get("leftRunIds", [])
 
 
-def _expire_turn_soon(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0.3)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.1)
+async def _run_build_test_turn_to_hard_backstop(ctx: CopilotContext, model: ScriptedModel, owned: OwnedRunRow) -> None:
+    turn = asyncio.create_task(_run_build_test_turn(ctx, model))
+    polled = asyncio.create_task(owned.polled.wait())
+    done, _ = await asyncio.wait({turn, polled}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+    polled.cancel()
+    await asyncio.wait({polled})
+    if not done:
+        turn.cancel()
+        await asyncio.wait({turn}, timeout=5)
+        await settle_cancelled_tools()
+        pytest.fail("The build test never polled its dispatched run")
+    if not turn.done():
+        assert ctx.model_stream_deadline is not None, "The model stream ended before the hard backstop could be fired"
+        # Fired once the dispatched test polls: a wall-clock backstop can expire before the dispatch on a stalled loop.
+        ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    await turn
 
 
 def _make_prior_run_readable(monkeypatch: pytest.MonkeyPatch, workflow: Workflow) -> None:
@@ -915,10 +927,9 @@ async def test_hard_backstop_leaves_the_active_dispatched_test_to_its_worker(
     monkeypatch: pytest.MonkeyPatch, worker_outcome: str | None
 ) -> None:
     harness, owned, ctx, model = await _build_test_turn(monkeypatch, dispatch_to_worker=True)
-    _expire_turn_soon(monkeypatch)
 
     with pytest.raises(CopilotTotalTimeoutError):
-        await _run_build_test_turn(ctx, model)
+        await _run_build_test_turn_to_hard_backstop(ctx, model, owned)
     left_run_ids = _saved_left_run_ids(ctx)
     reported = await recorded_open_step_runs(ctx)
     await settle_cancelled_tools()
@@ -954,10 +965,9 @@ async def test_hard_backstop_still_cancels_a_test_it_cannot_leave_running(
     )
     if run != "on_chat_browser":
         install_secret_carrying_run_registry(monkeypatch, all_registered=run == "carries_registered_secrets")
-    _expire_turn_soon(monkeypatch)
 
     with pytest.raises(CopilotTotalTimeoutError):
-        await _run_build_test_turn(ctx, model)
+        await _run_build_test_turn_to_hard_backstop(ctx, model, owned)
     left_run_ids = _saved_left_run_ids(ctx)
     reported = await recorded_open_step_runs(ctx)
     await settle_cancelled_tools()
