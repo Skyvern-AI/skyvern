@@ -30,7 +30,7 @@ from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_goto_code_block
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import DEFAULT_TOKEN_BUDGET, BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_resolver import make_copilot_call_model_input_filter
@@ -4447,7 +4447,7 @@ async def test_noncompleted_test_result_handoff_survives_provider_input_merge_an
         model_provider=provider,
         tracing_disabled=True,
         session_input_callback=copilot_session_input_callback,
-        call_model_input_filter=make_copilot_call_model_input_filter(config.token_budget),
+        call_model_input_filter=make_copilot_call_model_input_filter(DEFAULT_TOKEN_BUDGET),
     )
     action_observations = run_execution_module._retained_action_observations(
         [
@@ -4805,7 +4805,7 @@ async def test_completed_test_result_handoff_uses_ordinary_acting_agent_surface(
         model_provider=provider,
         tracing_disabled=True,
         session_input_callback=copilot_session_input_callback,
-        call_model_input_filter=make_copilot_call_model_input_filter(config.token_budget),
+        call_model_input_filter=make_copilot_call_model_input_filter(DEFAULT_TOKEN_BUDGET),
     )
 
     async def fake_run(ctx: CopilotContext, actual_workflow_yaml: str) -> dict[str, Any]:
