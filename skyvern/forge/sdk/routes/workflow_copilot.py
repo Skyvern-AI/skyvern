@@ -762,6 +762,36 @@ async def _watch_for_cancel(
             return
 
 
+async def _stop_older_live_turns(
+    cache: BaseCache,
+    organization_id: str,
+    chat: WorkflowCopilotChat,
+    turn_id: str,
+    own_cancel_token: str | None,
+) -> None:
+    # ponytail: the markers come from the chat load, so a turn saved after this request loaded the chat is not seen.
+    # Returning the other markers from start_copilot_turn's locked read would close that window.
+    for entry in chat.pending_turns.values():
+        if (
+            entry.turn_id == turn_id
+            or not entry.cancel_token
+            or entry.cancel_token == own_cancel_token
+            or entry.recovering_at is not None
+        ):
+            continue
+        key = _copilot_cancel_key(organization_id, entry.cancel_token)
+        with contained_effect("copilot older-turn stop", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
+            # A Stop click may already have written its gesture; keep it.
+            if not await cache.get(key):
+                await cache.set(key, "superseded", ex=COPILOT_CANCEL_TTL)
+                LOG.info(
+                    "copilot_turn_superseded",
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                    superseded_turn_id=entry.turn_id,
+                )
+
+
 RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
@@ -3040,6 +3070,10 @@ async def _new_copilot_chat_post(
             # This ordering closes the race where Stop could otherwise persist the unscreened
             # request while starting the turn.
             cache = getattr(app, "CACHE", None)
+            if cache is not None:
+                await _stop_older_live_turns(
+                    cache, organization.organization_id, chat, turn_id, chat_request.cancel_token
+                )
             if chat_request.cancel_token and cache is not None:
                 handler_task = asyncio.current_task()
                 if handler_task is not None:
