@@ -1989,6 +1989,7 @@ class CredentialModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    upstream_missing_at = Column(DateTime, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
 
 

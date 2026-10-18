@@ -43,6 +43,7 @@ import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
+from onepassword.types import Item
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -85,6 +86,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
+    ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT,
     BitwardenItemsResponse,
     CancelTestResponse,
     CreateCredentialRequest,
@@ -94,11 +96,17 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
+    ImportOnePasswordCredentialsRequest,
+    ImportOnePasswordCredentialsResponse,
     NonEmptyPasswordCredential,
+    OnePasswordCredentialImportResult,
+    OnePasswordCredentialRefreshResult,
     OnePasswordItemOverview,
     OnePasswordItemsResponse,
     PasswordCredential,
     PasswordCredentialResponse,
+    RefreshOnePasswordCredentialsRequest,
+    RefreshOnePasswordCredentialsResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
     TestCredentialResponse,
@@ -184,6 +192,9 @@ from skyvern.utils.phone_validation import normalize_identifier
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
+_ONEPASSWORD_METADATA_TIMEOUT_SECONDS = 20.0
+# shortcut: caps refresh at 5 in-flight vault requests; raise only after validating provider rate limits.
+_ONEPASSWORD_MAX_CONCURRENT_VAULT_REQUESTS = 5
 
 # Strong references to background tasks to prevent GC before completion.
 # See: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
@@ -3304,6 +3315,338 @@ async def list_onepassword_items(
     return response
 
 
+async def _organization_onepassword_token(organization_id: str) -> str:
+    resolution = await resolve_onepassword_token(organization_id)
+    if resolution.source != "organization" or resolution.token is None:
+        raise HTTPException(
+            status_code=400,
+            detail="An organization-level 1Password service account token is required.",
+        )
+    return resolution.token
+
+
+async def _onepassword_metadata_by_vault(
+    token: str, vault_ids: set[str], *, fallback_detail: str
+) -> dict[str, list[Item]]:
+    try:
+
+        async def list_metadata() -> dict[str, list[Item]]:
+            client = await OnePasswordClient.authenticate(
+                auth=token,
+                integration_name="Skyvern",
+                integration_version="v1.0.0",
+            )
+            semaphore = asyncio.Semaphore(_ONEPASSWORD_MAX_CONCURRENT_VAULT_REQUESTS)
+
+            async def list_vault(vault_id: str) -> list[Item]:
+                async with semaphore:
+                    # items.list returns overviews; never fetch item fields during import or refresh.
+                    return await client.items.list(vault_id)
+
+            sorted_vault_ids = sorted(vault_ids)
+            vault_items = await asyncio.gather(*(list_vault(vault_id) for vault_id in sorted_vault_ids))
+            return dict(zip(sorted_vault_ids, vault_items, strict=True))
+
+        return await asyncio.wait_for(list_metadata(), timeout=_ONEPASSWORD_METADATA_TIMEOUT_SECONDS)
+    except Exception as error:
+        raise _onepassword_error_response(error, fallback_detail=fallback_detail) from error
+
+
+async def _authorize_onepassword_folder(organization_id: str, folder_id: str | None, action: str) -> None:
+    if folder_id is None:
+        return
+    if await app.DATABASE.credential_folders.get_credential_folder(folder_id, organization_id) is None:
+        raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        get_request_principal(), action, {("folder_id", folder_id)}
+    )
+
+
+def _onepassword_item_credential_type(item: Item) -> CredentialType | None:
+    category = "".join(character for character in item.category.value.casefold() if character.isalnum())
+    return {
+        "login": CredentialType.PASSWORD,
+        "creditcard": CredentialType.CREDIT_CARD,
+    }.get(category)
+
+
+def _onepassword_item_url(item: Item) -> str | None:
+    return item.websites[0].url if item.websites else None
+
+
+@base_router.post(
+    "/credentials/onepassword/import",
+    response_model=ImportOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/onepassword/import/",
+    response_model=ImportOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+async def import_onepassword_credentials(
+    background_tasks: BackgroundTasks,
+    data: Annotated[ImportOnePasswordCredentialsRequest, Body()],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+) -> ImportOnePasswordCredentialsResponse:
+    organization_id = current_org.organization_id
+    await _authorize_onepassword_folder(organization_id, data.folder_id, "credential.create")
+    item_keys = sorted({(item.vault_id, item.item_id) for item in data.items})
+    existing = await app.DATABASE.credentials.get_onepassword_credentials(
+        organization_id,
+        item_keys=item_keys,
+    )
+    existing_by_key = {(credential.vault_id, credential.item_id): credential for credential in existing}
+    set_folder_on_update = "folder_id" in data.model_fields_set
+    if existing:
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.update",
+            {("credential_id", credential.credential_id) for credential in existing},
+        )
+
+    token = await _organization_onepassword_token(organization_id)
+    metadata_by_vault = await _onepassword_metadata_by_vault(
+        token,
+        {vault_id for vault_id, _item_id in item_keys},
+        fallback_detail="Failed to import 1Password items.",
+    )
+    items_by_vault = {
+        vault_id: {item.id: item for item in vault_items} for vault_id, vault_items in metadata_by_vault.items()
+    }
+
+    async def authorize_upsert(session: AsyncSession, credential_id: str) -> None:
+        if data.folder_id is not None:
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.create", {("folder_id", data.folder_id)}, session=session
+            )
+        references = {("credential_id", credential_id)}
+        if set_folder_on_update and data.folder_id is not None:
+            references.add(("folder_id", data.folder_id))
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.move" if set_folder_on_update else "credential.update",
+            references,
+            session=session,
+        )
+
+    results: list[OnePasswordCredentialImportResult] = []
+    for selection in data.items:
+        item = items_by_vault.get(selection.vault_id, {}).get(selection.item_id)
+        if item is None:
+            results.append(
+                OnePasswordCredentialImportResult(
+                    vault_id=selection.vault_id,
+                    item_id=selection.item_id,
+                    status="skipped",
+                    reason="Item not found in the 1Password vault.",
+                )
+            )
+            continue
+        credential_type = _onepassword_item_credential_type(item)
+        if credential_type is None:
+            results.append(
+                OnePasswordCredentialImportResult(
+                    vault_id=selection.vault_id,
+                    item_id=selection.item_id,
+                    status="skipped",
+                    reason=f"Unsupported 1Password category: {item.category.value}",
+                )
+            )
+            continue
+
+        credential, created = await app.DATABASE.credentials.upsert_onepassword_credential_metadata(
+            organization_id=organization_id,
+            vault_id=selection.vault_id,
+            item_id=selection.item_id,
+            name=item.title,
+            credential_type=credential_type,
+            tested_url=_onepassword_item_url(item),
+            folder_id=data.folder_id,
+            created_by=current_user_id,
+            set_folder_on_update=set_folder_on_update,
+            authorize_update=authorize_upsert,
+        )
+        if created:
+            await record_request_audit_event(
+                organization_id, "credential.create", "credential", credential.credential_id
+            )
+            background_tasks.add_task(
+                app.AGENT_FUNCTION.on_credential_saved,
+                organization_id=organization_id,
+                credential_id=credential.credential_id,
+                credential_type=credential_type,
+                actor_user_id=current_user_id,
+                vault=CredentialVaultType.ONEPASSWORD.value,
+            )
+        else:
+            changed_fields = ["name", "credential_type", "tested_url"]
+            previous = existing_by_key.get((selection.vault_id, selection.item_id))
+            if set_folder_on_update and previous is not None and previous.folder_id != data.folder_id:
+                changed_fields.append("folder_id")
+            await record_request_audit_event(
+                organization_id,
+                "credential.update",
+                "credential",
+                credential.credential_id,
+                changed_fields=tuple(changed_fields),
+            )
+        results.append(
+            OnePasswordCredentialImportResult(
+                vault_id=selection.vault_id,
+                item_id=selection.item_id,
+                status="imported" if created else "updated",
+            )
+        )
+
+    return ImportOnePasswordCredentialsResponse(results=results)
+
+
+@base_router.post(
+    "/credentials/onepassword/refresh",
+    response_model=RefreshOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/onepassword/refresh/",
+    response_model=RefreshOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+async def refresh_onepassword_credentials(
+    data: Annotated[RefreshOnePasswordCredentialsRequest, Body()],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+) -> RefreshOnePasswordCredentialsResponse:
+    organization_id = current_org.organization_id
+    await _authorize_onepassword_folder(organization_id, data.folder_id, "credential.update")
+    folder_id_is_null = "folder_id" in data.model_fields_set and data.folder_id is None
+    credentials = await app.DATABASE.credentials.get_onepassword_credentials(
+        organization_id,
+        folder_id=data.folder_id,
+        folder_id_is_null=folder_id_is_null,
+        limit=ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT + 1,
+    )
+    if not credentials:
+        return RefreshOnePasswordCredentialsResponse(refreshed=0, stale=0, skipped=0, results=[])
+
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        get_request_principal(),
+        "credential.update",
+        {("credential_id", credential.credential_id) for credential in credentials},
+    )
+    if len(credentials) > ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"More than {ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT} 1Password credentials match; "
+                "scope the refresh to smaller folders and try again."
+            ),
+        )
+    token = await _organization_onepassword_token(organization_id)
+    metadata_by_vault = await _onepassword_metadata_by_vault(
+        token,
+        {credential.vault_id for credential in credentials if credential.vault_id is not None},
+        fallback_detail="Failed to refresh 1Password items.",
+    )
+    items_by_vault = {
+        vault_id: {item.id: item for item in vault_items} for vault_id, vault_items in metadata_by_vault.items()
+    }
+
+    missing_credentials: list[tuple[Credential, str, str]] = []
+    unsupported_credentials: list[tuple[Credential, Item, str, str]] = []
+    results_by_id: dict[str, OnePasswordCredentialRefreshResult] = {}
+    refreshed = 0
+    skipped = 0
+    for credential in credentials:
+        vault_id = credential.vault_id
+        item_id = credential.item_id
+        if vault_id is None or item_id is None:
+            continue
+        item = items_by_vault.get(vault_id, {}).get(item_id)
+        if item is None:
+            missing_credentials.append((credential, vault_id, item_id))
+            continue
+        credential_type = _onepassword_item_credential_type(item)
+        if credential_type is None:
+            unsupported_credentials.append((credential, item, vault_id, item_id))
+            continue
+        updated = await app.DATABASE.credentials.update_onepassword_credential_metadata(
+            credential_id=credential.credential_id,
+            organization_id=organization_id,
+            authorized_folder_id=credential.folder_id,
+            name=item.title,
+            credential_type=credential_type,
+            tested_url=_onepassword_item_url(item),
+        )
+        if updated:
+            refreshed += 1
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="refreshed",
+            )
+        else:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="skipped",
+                reason="Credential moved while refresh was in progress.",
+            )
+            skipped += 1
+
+    stale_ids = await app.DATABASE.credentials.set_onepassword_credentials_stale(
+        organization_id,
+        [(credential.credential_id, credential.folder_id) for credential, _vault_id, _item_id in missing_credentials],
+        stale=True,
+    )
+    unstale_ids = await app.DATABASE.credentials.set_onepassword_credentials_stale(
+        organization_id,
+        [
+            (credential.credential_id, credential.folder_id)
+            for credential, _item, _vault_id, _item_id in unsupported_credentials
+        ],
+        stale=False,
+    )
+    stale = len(stale_ids)
+    for credential, vault_id, item_id in missing_credentials:
+        if credential.credential_id in stale_ids:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="stale",
+            )
+        else:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="skipped",
+                reason="Credential moved while refresh was in progress.",
+            )
+            skipped += 1
+    for credential, item, vault_id, item_id in unsupported_credentials:
+        results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+            vault_id=vault_id,
+            item_id=item_id,
+            status="skipped",
+            reason=(
+                f"Unsupported 1Password category: {item.category.value}"
+                if credential.credential_id in unstale_ids
+                else "Credential moved while refresh was in progress."
+            ),
+        )
+        skipped += 1
+    return RefreshOnePasswordCredentialsResponse(
+        refreshed=refreshed,
+        stale=stale,
+        skipped=skipped,
+        results=[
+            results_by_id[credential.credential_id]
+            for credential in credentials
+            if credential.credential_id in results_by_id
+        ],
+    )
+
+
 @base_router.get(
     "/credentials/bitwarden/items",
     response_model=BitwardenItemsResponse,
@@ -4062,6 +4405,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
     credit card metadata, or secret values. See the module
     docstring for the full security invariant.
     """
+    is_onepassword = credential.vault_type == CredentialVaultType.ONEPASSWORD
     if credential.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=credential.username or credential.credential_id,
@@ -4075,6 +4419,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
@@ -4098,6 +4445,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
@@ -4118,6 +4468,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
