@@ -13417,6 +13417,43 @@
             ],
             "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
+          "vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault Id",
+            "description": "1Password vault ID for linked credentials"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id",
+            "description": "1Password item ID for linked credentials"
+          },
+          "upstream_missing_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Missing At",
+            "description": "When the linked 1Password item was last found missing upstream"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
