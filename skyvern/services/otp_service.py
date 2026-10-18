@@ -1004,6 +1004,11 @@ async def poll_otp_value(
     cancels this early (``asyncio.wait_for``) can pass its own contexts and then read
     ``observed_otp_types`` off them to report which kind of OTP did arrive.
     """
+    if totp_identifier:
+        await app.AGENT_FUNCTION.enforce_totp_identifier_credential_use(
+            organization_id, totp_identifier, workflow_run_id=workflow_run_id
+        )
+
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     if max_wait_seconds is not None:
         timeout = min(timeout, timedelta(seconds=max_wait_seconds))

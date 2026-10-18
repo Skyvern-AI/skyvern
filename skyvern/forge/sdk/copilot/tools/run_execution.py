@@ -3181,6 +3181,11 @@ async def _bind_origin_run_redaction_registry(
     awaiting_runtime_secret_values = False
     credential_parameters: dict[str, Any] = {}
     for index, credential_id in enumerate(credential_ids):
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            ctx.organization_id,
+            credential_id,
+            workflow_run_id=workflow_run_id,
+        )
         try:
             db_credential = await app.DATABASE.credentials.get_credential(
                 credential_id,

@@ -880,10 +880,7 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
     ]
     try:
         existing_credentials = (
-            await app.DATABASE.credentials.get_credentials_by_ids(
-                password_credential_ids,
-                organization_id=ctx.organization_id,
-            )
+            await load_credentials(ctx.organization_id, credential_ids=password_credential_ids)
             if password_credential_ids
             else []
         )
@@ -1107,11 +1104,7 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
 
     page = max(1, params.get("page", 1))
     page_size = min(max(1, params.get("page_size") or 10), LIST_CREDENTIALS_MAX_PAGE_SIZE)
-    credentials = await app.DATABASE.credentials.get_credentials(
-        organization_id=ctx.organization_id,
-        page=page,
-        page_size=page_size,
-    )
+    credentials = await load_credentials(ctx.organization_id, page=page, page_size=page_size)
     serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
     return {

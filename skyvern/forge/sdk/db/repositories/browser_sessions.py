@@ -355,6 +355,7 @@ class BrowserSessionsRepository(BaseRepository):
         page_size: int = 10,
         search_key: str | None = None,
         managed: bool | None = None,
+        exclude_search_profile_ids: set[str] | None = None,
     ) -> list[BrowserProfile]:
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -377,6 +378,8 @@ class BrowserSessionsRepository(BaseRepository):
                         BrowserProfileModel.description.ilike(search_like),
                     )
                 )
+                if exclude_search_profile_ids:
+                    query = query.filter(BrowserProfileModel.browser_profile_id.notin_(exclude_search_profile_ids))
             # The id tie-break only needs to be deterministic so pagination stays
             # stable when created_at collides; it isn't meant to encode recency.
             query = (
@@ -391,17 +394,23 @@ class BrowserSessionsRepository(BaseRepository):
             # without a per-row usage fetch (which fanned out one 3-table join per row on every list load).
             if profiles:
                 credential_rows = await session.execute(
-                    select(CredentialModel.browser_profile_id, CredentialModel.name).where(
+                    select(
+                        CredentialModel.browser_profile_id,
+                        CredentialModel.credential_id,
+                        CredentialModel.name,
+                    ).where(
                         CredentialModel.browser_profile_id.in_([p.browser_profile_id for p in profiles]),
                         CredentialModel.organization_id == organization_id,
                         CredentialModel.deleted_at.is_(None),
                     )
                 )
-                name_by_profile: dict[str, str] = {}
-                for browser_profile_id, name in credential_rows.all():
-                    name_by_profile.setdefault(browser_profile_id, name)
+                credential_by_profile: dict[str, tuple[str, str]] = {}
+                for browser_profile_id, credential_id, name in credential_rows.all():
+                    credential_by_profile.setdefault(browser_profile_id, (credential_id, name))
                 for profile in profiles:
-                    profile.linked_credential_name = name_by_profile.get(profile.browser_profile_id)
+                    linked_credential = credential_by_profile.get(profile.browser_profile_id)
+                    if linked_credential is not None:
+                        profile.linked_credential_id, profile.linked_credential_name = linked_credential
 
             return profiles
 
@@ -536,9 +545,7 @@ class BrowserSessionsRepository(BaseRepository):
 
             linked_credentials = (
                 await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(browser_profile_id=profile_id, organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
+                    select(CredentialModel).filter_by(browser_profile_id=profile_id, organization_id=organization_id)
                 )
             ).all()
             cleared_credential_ids = [credential.credential_id for credential in linked_credentials]

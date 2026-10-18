@@ -56,12 +56,43 @@ async def _close_unauthenticated(websocket: WebSocket, **log_kwargs: t.Any) -> N
 
 async def folder_access_denied(websocket: WebSocket, action: str, resource: t.Mapping[str, str | None]) -> bool:
     """Close the stream when the caller's workflow folders do not cover the run behind it."""
+    principal = get_request_principal()
     try:
         # The evaluator judges one identifier per call, so each id behind the stream is checked on its own.
         for key, value in resource.items():
             if value:
-                await app.AGENT_FUNCTION.enforce_folder_access(get_request_principal(), action, {key: value})
-    except HTTPException:
+                await app.AGENT_FUNCTION.enforce_folder_access(principal, action, {key: value})
+                if key == "browser_session_id":
+                    await app.AGENT_FUNCTION.enforce_browser_session_credential_use(principal, value)
+                elif key == "workflow_run_id":
+                    await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(principal, value)
+                elif key == "task_id":
+                    try:
+                        organization_id = principal.organization_id if principal else None
+                        task = await app.DATABASE.tasks.get_task(value, organization_id=organization_id)
+                        if task is None:
+                            continue
+                        if task.workflow_run_id:
+                            await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(
+                                principal, task.workflow_run_id
+                            )
+                        session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+                            value, organization_id=task.organization_id
+                        )
+                        if session:
+                            await app.AGENT_FUNCTION.enforce_browser_session_credential_use(
+                                principal, session.persistent_browser_session_id
+                            )
+                    except (HTTPException, PermissionError):
+                        raise
+                    except Exception as exc:
+                        LOG.warning(
+                            "Task stream credential authorization failed; denying",
+                            task_id=value,
+                            exc_info=True,
+                        )
+                        raise PermissionError("credential not accessible") from exc
+    except (HTTPException, PermissionError):
         LOG.info("Rejecting streaming connection outside the caller's workflow folders.", action=action)
         try:
             await websocket.close(code=4403)

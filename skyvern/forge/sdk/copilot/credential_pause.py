@@ -40,7 +40,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    load_credentials,
+    loggable_origin,
+    safe_admitted_url,
+    url_parts,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -914,7 +919,7 @@ async def _try_resolve_credential_response(
         return CredentialPauseResolution(action="signed_in", signed_in=signed_in) if signed_in else None
     if not credential_id:
         return None
-    existing = await app.DATABASE.credentials.get_credentials_by_ids([credential_id], organization_id=organization_id)
+    existing = await load_credentials(organization_id, credential_ids=[credential_id])
     if not existing:
         return None
     return CredentialPauseResolution(action="connected", credential=existing[0])
@@ -1063,7 +1068,10 @@ async def _run_credential_pause(
         from skyvern.forge.sdk.copilot.tools.credential_fill import _read_vault_named_sites  # circular import
 
         # The vault entry's sites grant whole-site, so they are compared by site; an unreadable entry offers nothing.
-        vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        try:
+            vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        except PermissionError:
+            vault_sites = None
         if vault_sites is None or (vault_sites and not any(same_site(login_page_urls[0], uri) for uri in vault_sites)):
             named_credential_id = None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds

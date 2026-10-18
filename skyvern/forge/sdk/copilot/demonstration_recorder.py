@@ -19,12 +19,11 @@ from playwright.async_api import Page
 from skyvern.cli.mcp_tools._localhost import is_localhost_url
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
-from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
-from skyvern.forge.sdk.copilot.credential_resolution import safe_admitted_url
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
 from skyvern.forge.sdk.copilot.demonstration_tap import DEMONSTRATION_MAX_EVENTS, PageTap, TapEvent
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
@@ -870,9 +869,7 @@ class DemonstrationRecorder:
             or self.page is None
         ):
             return
-        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            [credential_id], organization_id=self.organization_id
-        )
+        credentials = await load_credentials(self.organization_id, credential_ids=[credential_id])
         if not credentials:
             await self._notice("The saved credential is no longer available.", level="error")
             return

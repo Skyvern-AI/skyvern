@@ -44,6 +44,7 @@ from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path,
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -178,6 +179,7 @@ from skyvern.services.otp_service import (
 )
 from skyvern.services.run_service import cancel_workflow_run
 from skyvern.utils.email_validation import normalize_identifier_if_email
+from skyvern.utils.phone_validation import normalize_identifier
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
@@ -540,6 +542,34 @@ async def send_totp_code(
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
+    workflow_references = {
+        (kind, value)
+        for kind, value in (
+            ("task_id", data.task_id),
+            ("workflow_id", data.workflow_id),
+            ("workflow_run_id", data.workflow_run_id),
+        )
+        if value is not None
+    }
+    if await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id) and workflow_references:
+        accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
+            get_request_principal(), "workflow_run.update", workflow_references
+        )
+        if workflow_references - accessible_references:
+            raise HTTPException(status_code=403, detail="Workflow folder access denied.")
+    if await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id):
+        credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
+            {totp_identifier}, curr_org.organization_id
+        )
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.use",
+            {
+                ("credential_id", credential_id)
+                for credential_ids in credential_ids_by_identifier.values()
+                for credential_id in credential_ids
+            },
+        )
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content)
     otp_parse_skipped_for_insufficient_credits = False
@@ -660,16 +690,81 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    codes = await app.DATABASE.otp.get_recent_otp_codes(
-        organization_id=curr_org.organization_id,
-        limit=limit,
-        valid_lifespan_minutes=None,
-        otp_type=otp_type,
-        workflow_run_id=workflow_run_id,
-        totp_identifier=totp_identifier,
-    )
+    principal = get_request_principal()
+    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
+    if (workflow_restricted or credential_restricted) and principal is None:
+        return []
 
-    return codes
+    restricted = workflow_restricted or credential_restricted
+    page_size = max(limit, 50) if restricted else limit
+    # shortcut: scan at most 1,000 OTPs; return 503 for incomplete results, use SQL ACL filtering to search older codes.
+    scan_limit = min(page_size * 10, 1_000) if restricted else limit
+    codes: list[TOTPCode] = []
+    offset = 0
+    while len(codes) < limit and offset < scan_limit:
+        page_limit = min(page_size, scan_limit - offset)
+        page = await app.DATABASE.otp.get_recent_otp_codes(
+            organization_id=curr_org.organization_id,
+            limit=page_limit,
+            offset=offset,
+            valid_lifespan_minutes=None,
+            otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
+            totp_identifier=totp_identifier,
+        )
+        if not page:
+            break
+        page_length = len(page)
+        offset += page_length
+
+        if workflow_restricted:
+            references_by_code = {
+                code.totp_code_id: {
+                    (kind, value)
+                    for kind, value in (
+                        ("workflow_id", code.workflow_id),
+                        ("workflow_run_id", code.workflow_run_id),
+                        ("task_id", code.task_id),
+                    )
+                    if value is not None
+                }
+                for code in page
+            }
+            accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
+                principal, "workflow_run.read", set().union(*references_by_code.values())
+            )
+            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+
+        if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
+            credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
+                {normalize_identifier(code.totp_identifier) for code in page}, curr_org.organization_id
+            )
+            credential_ids = set().union(*credential_ids_by_identifier.values())
+            allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+                principal, "credential.use", credential_ids
+            )
+            page = [
+                code
+                for code in page
+                if (
+                    (linked_ids := credential_ids_by_identifier.get(normalize_identifier(code.totp_identifier))) is None
+                    and (code.workflow_id or code.workflow_run_id or code.task_id)
+                )
+                or (linked_ids is not None and linked_ids <= allowed_credential_ids)
+            ]
+
+        codes.extend(page)
+        if page_length < page_limit:
+            break
+
+    if offset >= scan_limit and len(codes) < limit:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OTP search reached its access scan limit; add a filter and retry.",
+        )
+
+    return codes[:limit]
 
 
 async def _validate_credential_browser_profile_id(
@@ -692,10 +787,13 @@ async def _validate_credential_browser_profile_id(
             status_code=400,
             detail="A credential can only link a plain browser profile, not a workflow-managed one.",
         )
-    owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
-        browser_profile_id=browser_profile_id, organization_id=organization_id
+    links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+        {browser_profile_id}, organization_id
     )
-    if any(owner.credential_id != current_credential_id for owner in owners):
+    if any(
+        credential_id != current_credential_id
+        for credential_id, _folder_id in links_by_profile.get(browser_profile_id, [])
+    ):
         raise HTTPException(
             status_code=400,
             detail="This browser profile is already linked to another credential.",
@@ -1481,6 +1579,22 @@ def _humanize_test_failure(raw_reason: str | None) -> str:
     return "The login test was unsuccessful. Please verify your credentials and the login URL, then try again."
 
 
+async def _get_credential_test_run(credential_id: str, workflow_run_id: str, organization_id: str) -> Any:
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    if workflow_run is None:
+        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    parameters = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id)
+    if not any(
+        workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+        and run_parameter.value == credential_id
+        for workflow_parameter, run_parameter in parameters
+    ):
+        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    return workflow_run
+
+
 @base_router.get(
     "/credentials/{credential_id}/test/{workflow_run_id}",
     response_model=TestCredentialStatusResponse,
@@ -1512,12 +1626,7 @@ async def get_test_credential_status(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
-
-    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
-    if not workflow_run:
-        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    workflow_run = await _get_credential_test_run(credential_id, workflow_run_id, organization_id)
 
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=organization_id
@@ -1623,6 +1732,7 @@ async def cancel_credential_test(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CancelTestResponse:
     organization_id = current_org.organization_id
+    await _get_credential_test_run(credential_id, workflow_run_id, organization_id)
 
     LOG.info(
         "Canceling credential test",
@@ -2615,6 +2725,10 @@ async def get_credentials(
     SECURITY: Like ``get_credential``, this endpoint never returns raw secret
     material. See the module docstring for the full security invariant.
     """
+    principal = get_request_principal()
+    allowed_folder_ids = (
+        await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+    )
     credentials = await app.DATABASE.credentials.get_credentials(
         current_org.organization_id,
         page=page,
@@ -2623,6 +2737,7 @@ async def get_credentials(
         credential_type=credential_type.value if isinstance(credential_type, CredentialType) else None,
         search=search if isinstance(search, str) else None,
         folder_id=folder_id if isinstance(folder_id, str) else None,
+        allowed_folder_ids=allowed_folder_ids,
     )
     return [_convert_to_response(credential) for credential in credentials]
 
@@ -2719,11 +2834,16 @@ async def get_credential_folders(
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> list[CredentialFolder]:
+    principal = get_request_principal()
+    allowed_folder_ids = (
+        await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+    )
     folders = await app.DATABASE.credential_folders.get_credential_folders(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         search_query=search,
+        allowed_folder_ids=allowed_folder_ids,
     )
 
     if folders:
@@ -2800,10 +2920,13 @@ async def delete_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> dict:
-    success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
-        folder_id=folder_id,
-        organization_id=current_org.organization_id,
-    )
+    try:
+        success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
+            folder_id=folder_id,
+            organization_id=current_org.organization_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not success:
         raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
 
@@ -2833,11 +2956,24 @@ async def update_credential_folder_assignment(
     data: UpdateCredentialFolderRequest = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
+    principal = get_request_principal()
+
+    async def reauthorize_move(session: AsyncSession) -> None:
+        if principal is None:
+            return
+        references = {("credential_id", credential_id)}
+        if data.folder_id:
+            references.add(("folder_id", data.folder_id))
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            principal, "credential.move", references, session=session
+        )
+
     try:
         credential = await app.DATABASE.credential_folders.set_credential_folder(
             credential_id=credential_id,
             organization_id=current_org.organization_id,
             folder_id=data.folder_id,
+            authorize_move=reauthorize_move,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

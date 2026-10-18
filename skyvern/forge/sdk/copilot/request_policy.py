@@ -14,7 +14,6 @@ import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -214,10 +213,7 @@ async def _saved_credential_ids(citations: list[str], organization_id: str) -> s
     connection_ids = {citation for citation in citations if citation.startswith("goac_")}
     verified_ids: set[str] = set()
     if credential_ids:
-        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=organization_id,
-        )
+        credentials = await _load_credentials(organization_id, credential_ids=credential_ids)
         verified_ids.update(credential.credential_id for credential in credentials)
     if connection_ids:
         connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
@@ -4363,10 +4359,7 @@ async def _seed_prior_approved_credentials(
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        missing_ids,
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4391,10 +4384,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [seed.credential_id],
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return

@@ -168,6 +168,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
@@ -356,8 +357,10 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
+    CredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowParameterYAML,
     WorkflowStatus,
 )
 from skyvern.services import script_service, uploaded_file_service, workflow_script_service
@@ -2821,10 +2824,33 @@ class WorkflowService:
                 )
         return value
 
-    async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> list[Credential]:
+    async def _validate_credential_ids(
+        self,
+        credential_ids: list[str],
+        organization: Organization,
+        *,
+        principal: RequestPrincipal | None = None,
+        workflow_run_id: str | None = None,
+        skip_credential_use_ids: set[str] | None = None,
+    ) -> list[Credential]:
         if not credential_ids:
             return []
         unique_ids = list(dict.fromkeys(credential_ids))
+        principal = principal or get_request_principal()
+        for credential_id in unique_ids:
+            if skip_credential_use_ids and credential_id in skip_credential_use_ids:
+                continue
+            try:
+                await app.AGENT_FUNCTION.enforce_credential_use(
+                    organization.organization_id,
+                    credential_id,
+                    principal=principal,
+                    workflow_run_id=workflow_run_id,
+                )
+            except PermissionError as exc:
+                raise SkyvernHTTPException(
+                    message="Credential not accessible", status_code=HTTPStatus.FORBIDDEN
+                ) from exc
         existing = await app.DATABASE.credentials.get_credentials_by_ids(
             unique_ids, organization_id=organization.organization_id
         )
@@ -2899,7 +2925,9 @@ class WorkflowService:
                 continue
             if isinstance(credential_id, str) and credential_id:
                 bound_credential_ids.append(credential_id)
-        validated_bound_credentials = await self._validate_credential_ids(bound_credential_ids, organization)
+        validated_bound_credentials = await self._validate_credential_ids(
+            bound_credential_ids, organization, workflow_run_id=workflow_run.workflow_run_id
+        )
         sequential_ids = sorted(
             {credential.credential_id for credential in validated_bound_credentials if credential.run_sequentially}
         )
@@ -2918,8 +2946,12 @@ class WorkflowService:
         self,
         parameters: list[Any],
         organization: Organization,
+        *,
+        preserved_credential_references: set[tuple[str, str, str]] | None = None,
     ) -> None:
         credential_ids_to_validate: list[str] = []
+        credential_ids_requiring_use: set[str] = set()
+        preserved_credential_references = preserved_credential_references or set()
         for parameter in parameters:
             key = getattr(parameter, "key", None) or "<unknown>"
             credential_ids = getattr(parameter, "credential_ids", None)
@@ -2942,6 +2974,11 @@ class WorkflowService:
                     )
                 parameter.credential_id = credential_ids[0]
                 credential_ids_to_validate.extend(credential_ids)
+                credential_ids_requiring_use.update(
+                    credential_id
+                    for credential_id in credential_ids
+                    if (key, "credential_ids", credential_id) not in preserved_credential_references
+                )
 
             fallback_credential_ids = getattr(parameter, "fallback_credential_ids", None)
             if fallback_credential_ids is not None:
@@ -2955,6 +2992,11 @@ class WorkflowService:
                     ]
                 parameter.fallback_credential_ids = fallback_credential_ids or None
                 credential_ids_to_validate.extend(fallback_credential_ids)
+                credential_ids_requiring_use.update(
+                    credential_id
+                    for credential_id in fallback_credential_ids
+                    if (key, "fallback_credential_ids", credential_id) not in preserved_credential_references
+                )
 
             if (
                 getattr(parameter, "credential_ids", None) is not None
@@ -2983,7 +3025,17 @@ class WorkflowService:
                     status_code=400,
                 )
 
-        await self._validate_credential_ids(credential_ids_to_validate, organization)
+            if credential_id := getattr(parameter, "credential_id", None):
+                credential_ids_to_validate.append(credential_id)
+                if (key, "credential_id", credential_id) not in preserved_credential_references:
+                    credential_ids_requiring_use.add(credential_id)
+
+        # A hidden id reused in a different field is a new reference and still needs use access.
+        await self._validate_credential_ids(
+            credential_ids_to_validate,
+            organization,
+            skip_credential_use_ids=set(credential_ids_to_validate) - credential_ids_requiring_use,
+        )
 
     @staticmethod
     def _get_rotating_credential_parameters(workflow: Workflow) -> list[CredentialParameter]:
@@ -3132,7 +3184,9 @@ class WorkflowService:
 
         return overrides
 
-    async def _rotation_candidates_may_require_serialization(self, workflow: Workflow, organization_id: str) -> bool:
+    async def _rotation_candidates_may_require_serialization(
+        self, workflow: Workflow, organization_id: str, *, workflow_run_id: str | None = None
+    ) -> bool:
         """Conservatively decide whether a failed rotating-credential selection could still have
         resolved to a credential opted into sequential execution. Any candidate flagged
         run_sequentially — or any candidate we cannot verify — fails closed so a serialized lane is
@@ -3148,7 +3202,9 @@ class WorkflowService:
         if organization is None:
             return True
         try:
-            credentials = await self._validate_credential_ids(sorted(candidate_ids), organization)
+            credentials = await self._validate_credential_ids(
+                sorted(candidate_ids), organization, workflow_run_id=workflow_run_id
+            )
         except Exception:
             # Cannot verify the candidate pool (missing/invalid id or lookup error) — fail closed.
             return True
@@ -3223,7 +3279,7 @@ class WorkflowService:
             # candidate. A keyless workflow whose pool is provably non-sequential keeps the legacy
             # best-effort partial selection — the pre-feature behavior for runs outside serialization.
             if workflow.browser_profile_key or await self._rotation_candidates_may_require_serialization(
-                workflow, organization_id
+                workflow, organization_id, workflow_run_id=workflow_run.workflow_run_id
             ):
                 raise
             return selections
@@ -3233,6 +3289,7 @@ class WorkflowService:
         workflow: Workflow,
         organization: Organization,
         request_data: dict[str, Any] | None,
+        credential_use_principal: RequestPrincipal | None = None,
     ) -> None:
         all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
         schedule_parameters = [
@@ -3290,7 +3347,9 @@ class WorkflowService:
                 )
             )
 
-        await self._validate_credential_ids(credential_ids_to_validate, organization)
+        await self._validate_credential_ids(
+            credential_ids_to_validate, organization, principal=credential_use_principal
+        )
 
     async def resolve_workflow_for_run(
         self,
@@ -3676,7 +3735,9 @@ class WorkflowService:
                 parameter_values = {param.key: value for param, value in workflow_parameter_values}
                 if prevalidated_workflow_parameters is None:
                     await self._validate_credential_ids(
-                        self._credential_id_values(workflow_parameter_values), organization
+                        self._credential_id_values(workflow_parameter_values),
+                        organization,
+                        workflow_run_id=workflow_run.workflow_run_id,
                     )
                     await self._validate_bitwarden_item_ids(workflow=workflow, parameter_values=parameter_values)
                 run_credential_parameter_overrides = await self._apply_run_credential_parameter_overrides(
@@ -11422,6 +11483,102 @@ class WorkflowService:
                 exc_info=True,
             )
 
+    async def _preserve_redacted_credential_references(
+        self,
+        workflow_definition: WorkflowDefinition | WorkflowDefinitionYAML,
+        previous_workflow: Workflow | None,
+    ) -> set[tuple[str, str, str]]:
+        if previous_workflow is None:
+            return set()
+
+        previous_parameters = {
+            parameter.key: parameter
+            for parameter in previous_workflow.workflow_definition.parameters
+            if isinstance(parameter, CredentialParameter)
+        }
+        previous_workflow_parameters = {
+            parameter.key: parameter
+            for parameter in previous_workflow.workflow_definition.parameters
+            if isinstance(parameter, WorkflowParameter)
+            and parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+        }
+        credential_parameter_keys = set(previous_workflow_parameters)
+        credential_ids = {
+            credential_id
+            for parameter in previous_parameters.values()
+            for credential_id in (
+                parameter.credential_id if parameter.credential_id not in credential_parameter_keys else None,
+                *(parameter.credential_ids or []),
+                *(parameter.fallback_credential_ids or []),
+            )
+            if credential_id
+        }
+        credential_ids.update(
+            parameter.default_value
+            for parameter in previous_workflow_parameters.values()
+            if isinstance(parameter.default_value, str) and parameter.default_value
+        )
+        if not credential_ids:
+            return set()
+
+        visible_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            get_request_principal(), "credential.read", credential_ids
+        )
+        preserved_references: set[tuple[str, str, str]] = set()
+        for parameter in workflow_definition.parameters:
+            if isinstance(parameter, (WorkflowParameter, WorkflowParameterYAML)):
+                previous_workflow_parameter = previous_workflow_parameters.get(parameter.key)
+                if (
+                    previous_workflow_parameter is not None
+                    and isinstance(previous_workflow_parameter.default_value, str)
+                    and previous_workflow_parameter.default_value not in visible_ids
+                ):
+                    if not parameter.default_value:
+                        parameter.default_value = previous_workflow_parameter.default_value
+                    if parameter.default_value == previous_workflow_parameter.default_value:
+                        preserved_references.add(
+                            (parameter.key, "default_value", previous_workflow_parameter.default_value)
+                        )
+                continue
+            if not isinstance(parameter, (CredentialParameter, CredentialParameterYAML)):
+                continue
+            previous = previous_parameters.get(parameter.key)
+            if previous is None:
+                continue
+
+            if (
+                previous.credential_id
+                and previous.credential_id not in credential_parameter_keys
+                and previous.credential_id not in visible_ids
+            ):
+                if not parameter.credential_id:
+                    parameter.credential_id = previous.credential_id
+                if parameter.credential_id == previous.credential_id:
+                    preserved_references.add((parameter.key, "credential_id", previous.credential_id))
+
+            for field_name in ("credential_ids", "fallback_credential_ids"):
+                previous_values = getattr(previous, field_name) or []
+                hidden_values = [value for value in previous_values if value not in visible_ids]
+                if not hidden_values:
+                    continue
+
+                # The workflow read serializer filters hidden ids; restore them in their prior positions.
+                values = list(getattr(parameter, field_name) or [])
+                hidden_after: dict[str | None, list[str]] = {}
+                preceding_visible: str | None = None
+                for value in previous_values:
+                    if value in visible_ids and value in values:
+                        preceding_visible = value
+                    elif value in hidden_values and value not in values:
+                        hidden_after.setdefault(preceding_visible, []).append(value)
+                for visible_value, hidden in hidden_after.items():
+                    insert_at = values.index(visible_value) + 1 if visible_value in values else 0
+                    values[insert_at:insert_at] = hidden
+                setattr(parameter, field_name, list(dict.fromkeys(values)))
+                preserved_references.update((parameter.key, field_name, value) for value in hidden_values)
+
+        return preserved_references
+
     async def update_workflow_definition(
         self,
         workflow_id: str,
@@ -11460,17 +11617,24 @@ class WorkflowService:
         preserve_completion_contract: bool = True,
         created_via: str | None = None,
         validate_code_block_templates: bool = True,
+        preserve_redacted_credential_references_from: Workflow | None = None,
+        preserved_credential_references: set[tuple[str, str, str]] | None = None,
     ) -> Workflow:
         if workflow_definition is not None:
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
+            if preserved_credential_references is None:
+                preserved_credential_references = await self._preserve_redacted_credential_references(
+                    workflow_definition, preserve_redacted_credential_references_from
+                )
             if organization_id is not None:
                 organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
                 if organization is not None:
                     await self._validate_and_normalize_credential_rotation_parameters(
                         workflow_definition.parameters,
                         organization,
+                        preserved_credential_references=preserved_credential_references,
                     )
             await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             updated_workflow = await app.DATABASE.workflows.update_workflow_and_reconcile_definition_params(
@@ -17219,10 +17383,6 @@ class WorkflowService:
                     return (workflow, ()) if return_write_result else workflow
                 recording_id_to_attach = None
 
-        await self._validate_and_normalize_credential_rotation_parameters(
-            request.workflow_definition.parameters,
-            organization,
-        )
         new_workflow_id: str | None = None
         attached_recording_to_new_version = False
         refresh_schedule_runtime_limits = False
@@ -17246,6 +17406,14 @@ class WorkflowService:
         else:
             existing_latest_workflow = None
 
+        preserved_credential_references = await self._preserve_redacted_credential_references(
+            request.workflow_definition, existing_latest_workflow
+        )
+        await self._validate_and_normalize_credential_rotation_parameters(
+            request.workflow_definition.parameters,
+            organization,
+            preserved_credential_references=preserved_credential_references,
+        )
         if request.webhook_callback_url and (
             existing_latest_workflow is None
             or request.webhook_callback_url != existing_latest_workflow.webhook_callback_url
@@ -17294,6 +17462,7 @@ class WorkflowService:
                     created_via=created_via,
                     notify_workflow_saved=False,
                     validate_code_block_templates=validate_code_block_templates,
+                    preserved_credential_references=preserved_credential_references,
                 )
 
             self._schedule_workflow_saved_hook_best_effort(
