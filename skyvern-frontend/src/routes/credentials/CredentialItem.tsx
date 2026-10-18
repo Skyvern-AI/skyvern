@@ -33,6 +33,7 @@ import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
 import { SaveIcon } from "@/components/icons/SaveIcon";
+import { OnePasswordIcon } from "@/components/icons/OnePasswordIcon";
 import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
@@ -409,9 +410,23 @@ function CredentialItem({
         </div>
       )}
       <div className="w-48 space-y-2">
-        <p className="w-full truncate" title={credential.name}>
-          {credential.name}
-        </p>
+        <div className="flex min-w-0 items-center gap-2">
+          <p className="min-w-0 flex-1 truncate" title={credential.name}>
+            {credential.name}
+          </p>
+          {credential.vault_type === "onepassword" && (
+            <span className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
+              <OnePasswordIcon className="size-3" />
+              1Password
+            </span>
+          )}
+        </div>
+        {credential.vault_type === "onepassword" &&
+          credential.upstream_missing_at && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              missing in 1Password
+            </p>
+          )}
         <p className="text-sm text-neutral-600 dark:text-slate-400">
           {credential.credential_id}
         </p>
