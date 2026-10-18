@@ -235,7 +235,7 @@ Use `run_id`, `attempt`, and `retry_pending` together as your idempotency key. E
 |---|---|---|
 | `completed` | Finished. Check `output`. | No need |
 | `failed` | Something broke: browser, network, or the run used all its steps (`failure_reason` starts with "Reached the maximum steps"). | Often helps |
-| `terminated` | The agent decided the goal can't be reached, for example a rejected login. | No. Change the input first. |
+| `terminated` | The agent decided the goal can't be reached, for example a rejected login. A [Terminate block](/reference/blocks#terminate) also ends a run this way, by your own rule. | No. Change the input first. |
 | `timed_out` | The run passed its time limit. | After simplifying the goal |
 | `canceled` | Stopped by you or a teammate. | Only if you meant it to run |
 
@@ -404,6 +404,7 @@ A browser profile does not keep the proxy it was created with. To reach a site f
 - **Run cached code.** After a successful agent run, Skyvern can replay the recorded actions as code instead of calling the AI at every step. Pass `run_with="code"` to use it, or `"agent"` to force the AI. If the code fails and `ai_fallback` is on, the AI takes over.
 - **Skip the login.** A [browser profile](/browsers) that is already signed in saves the steps a login takes on every run.
 - **Start on the right page.** Pass the deepest `url` you can and a `data_extraction_schema` so the agent doesn't wander.
+- **Check the target first.** When an API can tell you a target is not worth trying, call it before the browser opens. See [pre-flight check](#pre-flight-check).
 
 <CodeGroup>
 ```python Python
@@ -426,6 +427,51 @@ const run = await client.runWorkflow({
 </CodeGroup>
 
 Plans and credit prices are on [skyvern.com/pricing](https://www.skyvern.com/pricing). Self-hosted servers set the default step limit with `MAX_STEPS_PER_RUN` and choose the model with `LLM_KEY`. See [configuration](/reference/configuration).
+
+### Pre-flight check
+
+A run that a site blocks at the last step still spends every step before it. When an API can tell you in advance that a target is not worth trying, call it first and end the run when the answer is no. The source can be a reachability service, your own allowlist, or a cache of what happened yesterday. Three blocks make the gate, and none of them opens a browser:
+
+1. **HTTP Request** with the label `precheck`, which calls the API with the target as a parameter reference.
+2. **Conditional**, where one branch continues into the rest of the agent and the default branch handles everything else.
+3. **Terminate** on the default branch, with a reason and an error code you can filter runs by.
+
+```yaml
+blocks:
+  - block_type: http_request
+    label: precheck
+    next_block_label: gate
+    method: GET
+    url: "https://reachability.example.com/precheck?url={{ target_url | urlencode }}"
+    headers:
+      Accept: application/json
+    timeout: 10
+    continue_on_failure: true
+  - block_type: conditional
+    label: gate
+    branch_conditions:
+      - criteria:
+          expression: "{{ precheck_output.response_body.reachable }}"
+        next_block_label: purchase
+      - is_default: true
+        next_block_label: skip_target
+  - block_type: task
+    label: purchase
+    url: "{{ target_url }}"
+    navigation_goal: "Add the item to the cart and check out. COMPLETE when the order confirmation is shown."
+  - block_type: terminate
+    label: skip_target
+    reason: "Pre-flight reported {{ target_url }} is not reachable"
+    error_code: PRECHECK_UNREACHABLE
+```
+
+`target_url` is an agent input. Each block that continues names its successor in `next_block_label`, because sequential ordering stops applying once an agent contains a Conditional block.
+
+The HTTP Request block's output carries `status_code`, `response_headers`, and `response_body`. `response_body` is the parsed JSON when the response is JSON, so read fields straight off it: `{{ precheck_output.response_body.reachable }}`. An API that nests its JSON as a string inside another field needs a Code block to parse it first.
+
+Put the positive signal on the branch that continues, not the negative one on the branch that stops. A branch whose expression is a single `{{ ... }}` is evaluated on the server, with no model call and no page, which is what lets it run before any browser block. A missing field or a 2xx HTML page where JSON was expected renders no truthy value, so the default branch terminates the run. `continue_on_failure: true` also sends non-2xx responses and timeouts through the Conditional to its default branch.
+
+Runs stopped this way end `terminated`, with your reason in `failure_reason` and your code in `errors[].error_code`, so you can count what you skipped against what you let through.
 
 ## Next
 

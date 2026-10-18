@@ -483,12 +483,29 @@ LLM_KEY=OPENAI_COMPATIBLE
 
 | Variable | Default | What it does |
 |---|---|---|
+| `OPENAI_COMPATIBLE_SUPPORTS_VISION` | `false` | Whether Skyvern sends screenshots to the model. Set to `true` only if the selected model supports images. |
 | `OPENAI_COMPATIBLE_REASONING_EFFORT` | unset | Reasoning effort sent to the model, for example `low`, `medium` or `high` |
 
 This is useful for:
 - Running local models with a unified API
 - Using LiteLLM as a proxy to switch between providers
 - Connecting to self-hosted inference servers
+
+### Example: DemonRoute
+
+DemonRoute serves models through an OpenAI-compatible endpoint. Point the same variables at its base URL and set the model name to a model ID from DemonRoute's catalog:
+
+```bash .env
+ENABLE_OPENAI_COMPATIBLE=true
+OPENAI_COMPATIBLE_MODEL_NAME=your-model-id
+OPENAI_COMPATIBLE_API_KEY=your-demonroute-api-key
+OPENAI_COMPATIBLE_API_BASE=https://api.demonroute.com/v1
+LLM_KEY=OPENAI_COMPATIBLE
+```
+
+<Note>
+Third-party providers are not tested or endorsed by Skyvern. Skyvern sends page content from your runs to the provider you configure, so review its models and terms before you use it.
+</Note>
 
 ---
 
