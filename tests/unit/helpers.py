@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
 from unittest.mock import AsyncMock, MagicMock
@@ -344,6 +345,131 @@ def setup_parallel_verification_mocks(
         update_step=update_step_mock,
         update_task=update_task_mock,
     )
+
+
+# The repository's update_step adds these deltas to the step's own running totals, as the SQL update does.
+_STEP_COUNTER_COLUMNS = {
+    "incremental_cost": "step_cost",
+    "incremental_input_tokens": "input_token_count",
+    "incremental_output_tokens": "output_token_count",
+    "incremental_reasoning_tokens": "reasoning_token_count",
+    "incremental_cached_tokens": "cached_token_count",
+}
+
+
+@dataclass
+class InMemoryTaskStepRepo:
+    """Backs app.DATABASE.tasks for one task and step, so the real ForgeAgent update methods read back their writes."""
+
+    task: Task | None = None
+    step: Step | None = None
+
+    async def create_task(self, *, url: str, organization_id: str | None, **fields: Any) -> Task:
+        fields["max_screenshot_scrolls"] = fields.pop("max_screenshot_scrolling_times", None)
+        now = datetime.now(UTC)
+        self.task = Task(
+            task_id=f"tsk_{secrets.token_hex(6)}",
+            url=url,
+            organization_id=organization_id,
+            status=TaskStatus.created,
+            created_at=now,
+            modified_at=now,
+            **{name: value for name, value in fields.items() if value is not None},
+        )
+        return self.task
+
+    async def create_step(self, task_id: str, *, order: int, retry_index: int, organization_id: str | None) -> Step:
+        now = datetime.now(UTC)
+        self.step = Step(
+            task_id=task_id,
+            step_id=f"stp_{secrets.token_hex(6)}",
+            status=StepStatus.created,
+            order=order,
+            retry_index=retry_index,
+            is_last=False,
+            organization_id=organization_id,
+            created_at=now,
+            modified_at=now,
+        )
+        return self.step
+
+    async def get_task(self, task_id: str, organization_id: str | None = None) -> Task | None:
+        return self.task if self.task is not None and self.task.task_id == task_id else None
+
+    async def update_task(self, task_id: str, organization_id: str | None = None, **updates: Any) -> Task:
+        updated, _ = await self.update_task_and_claim_finish(task_id, organization_id=organization_id, **updates)
+        return updated
+
+    async def update_task_and_claim_finish(
+        self,
+        task_id: str,
+        status: TaskStatus | None = None,
+        organization_id: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
+        **updates: Any,
+    ) -> tuple[Task, bool]:
+        task = self.task
+        assert task is not None and task.task_id == task_id, f"no task {task_id}"
+        if keep_final_status and task.status.is_final():
+            return task, False
+        finish_claimed = False
+        if status is not None:
+            task.status = status
+            if status == TaskStatus.running and task.started_at is None:
+                task.started_at = datetime.now(UTC)
+            if status.is_final() and task.finished_at is None:
+                task.finished_at = datetime.now(UTC)
+                finish_claimed = True
+        if errors is not None:
+            task.errors = [*(task.errors or []), *errors]
+        for key, value in updates.items():
+            if value is not None:
+                setattr(task, key, value)
+        return task, finish_claimed
+
+    async def update_step(self, task_id: str, step_id: str, organization_id: str | None = None, **updates: Any) -> Step:
+        assert self.step is not None and self.step.step_id == step_id, f"no step {step_id}"
+        for key, value in updates.items():
+            if key in _STEP_COUNTER_COLUMNS:
+                column = _STEP_COUNTER_COLUMNS[key]
+                if value is not None:
+                    setattr(self.step, column, (getattr(self.step, column) or 0) + value)
+            else:
+                setattr(self.step, key, value)
+        return self.step
+
+    async def get_first_step(self, task_id: str, organization_id: str | None = None) -> None:
+        return None
+
+    async def get_task_steps(self, task_id: str, organization_id: str | None = None) -> list[Step]:
+        return [self.step] if self.step is not None and self.step.task_id == task_id else []
+
+    async def get_latest_step(self, task_id: str, organization_id: str | None = None) -> Step | None:
+        steps = await self.get_task_steps(task_id, organization_id)
+        return steps[-1] if steps else None
+
+    async def get_run(self, run_id: str, organization_id: str | None = None) -> None:
+        return None
+
+    def install(self, monkeypatch: MonkeyPatch) -> None:
+        for name in (
+            "create_task",
+            "create_step",
+            "get_task",
+            "update_task",
+            "update_task_and_claim_finish",
+            "update_step",
+            "get_first_step",
+            "get_task_steps",
+            "get_latest_step",
+            "get_run",
+        ):
+            monkeypatch.setattr(app.DATABASE.tasks, name, getattr(self, name))
+        monkeypatch.setattr(
+            app.DATABASE.observer, "get_workflow_run_block_engine_by_task_id", AsyncMock(return_value=None)
+        )
 
 
 def make_browser_state() -> tuple[MagicMock, MagicMock, MagicMock]:
