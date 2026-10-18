@@ -1,5 +1,6 @@
 """Fixtures shared by every suite."""
 
+import functools
 import gc
 import inspect
 import io
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.services import organization_log_scope
 
 _monkeypatch_setattr = pytest.MonkeyPatch.setattr
@@ -86,6 +88,41 @@ def _configure_logging_once_per_process() -> None:
 def _url_validation_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """URL validation is off by default; tests assert the validated behavior unless they opt out."""
     monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", True)
+
+
+LOOP_OWNER = ("skyvern/forge/agent.py", "_execute_task_v3")
+# The loop's own contract tests call it directly by design.
+LOOP_OWNER_EXEMPT_TEST_FILES = frozenset({"test_taskv3_engine.py"})
+
+
+def loop_entered_through_executor() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        if code.co_name == LOOP_OWNER[1] and code.co_filename.endswith(LOOP_OWNER[0]):
+            return True
+        frame = frame.f_back
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _loop_runs_only_inside_the_executor(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runtime half of tests/cloud/test_taskv3_single_loop_call_site.py: it sees calls the static scan cannot,
+    such as a name computed at runtime."""
+    if request.node.path.name in LOOP_OWNER_EXEMPT_TEST_FILES:
+        return
+    loop = taskv3_engine.run_task_v3_agent_loop
+
+    @functools.wraps(loop)
+    async def guarded(*args: Any, **kwargs: Any) -> taskv3_engine.LoopOutcome:
+        if not loop_entered_through_executor():
+            raise AssertionError(
+                "run_task_v3_agent_loop ran outside ForgeAgent._execute_task_v3; run the task through the executor "
+                "(tests/browser_e2e/taskv3_fixture_helpers.run_production_task_v3)"
+            )
+        return await loop(*args, **kwargs)
+
+    monkeypatch.setattr(taskv3_engine, "run_task_v3_agent_loop", guarded)
 
 
 @pytest.fixture(autouse=True)
