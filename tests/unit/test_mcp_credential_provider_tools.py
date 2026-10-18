@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,6 +9,34 @@ import skyvern.cli.mcp_tools.credential as credential_tools
 from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import NotFoundError
+
+
+@pytest.mark.asyncio
+async def test_credential_list_includes_imported_onepassword_row_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported = SimpleNamespace(
+        credential_id="cred_onepassword_imported",
+        name="Imported login",
+        credential_type="password",
+        credential=SimpleNamespace(username="imported-user", password="runtime-only-secret", totp_type=None),
+    )
+    get_credentials = AsyncMock(return_value=[imported])
+    monkeypatch.setattr(credential_tools, "get_skyvern", lambda: SimpleNamespace(get_credentials=get_credentials))
+
+    result = await credential_tools.skyvern_credential_list()
+
+    get_credentials.assert_awaited_once_with(page=1, page_size=10)
+    assert result["data"]["credentials"] == [
+        {
+            "credential_id": "cred_onepassword_imported",
+            "name": "Imported login",
+            "credential_type": "password",
+            "username": "imported-user",
+            "totp_type": None,
+        }
+    ]
+    assert "runtime-only-secret" not in str(result)
 
 
 @pytest.mark.asyncio

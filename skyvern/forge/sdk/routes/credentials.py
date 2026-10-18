@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserProfileNotFound,
+    CredentialSourceNotConfiguredError,
 )
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import (
@@ -2567,6 +2568,15 @@ async def get_credential_totp_code(
             detail="Custom credential service is not configured for this organization",
         ) from e
     except Exception as e:
+        if vault_type == CredentialVaultType.ONEPASSWORD:
+            http_error = _onepassword_error_response(e, fallback_detail="Unable to retrieve credential from vault")
+            if http_error.status_code == 500:
+                LOG.exception(
+                    "Failed to retrieve credential item for TOTP code preview",
+                    credential_id=credential_id,
+                    organization_id=current_org.organization_id,
+                )
+            raise http_error from e
         LOG.exception(
             "Failed to retrieve credential item for TOTP code preview",
             credential_id=credential_id,
@@ -3067,6 +3077,8 @@ async def get_onepassword_token_status(
 
 
 def _onepassword_error_response(error: Exception, *, fallback_detail: str) -> HTTPException:
+    if isinstance(error, CredentialSourceNotConfiguredError):
+        return HTTPException(status_code=400, detail=str(error))
     if isinstance(error, TimeoutError):
         return HTTPException(
             status_code=502,
