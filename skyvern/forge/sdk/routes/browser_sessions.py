@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern.exceptions import (
+    TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE,
     BrowserSessionExtensionUnconfirmed,
     BrowserSessionNotExtendable,
     ExternalBrowserUnavailable,
@@ -229,6 +230,22 @@ async def get_browser_session_metadata(
         400: {"description": "Invalid request"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
         404: {"description": "Browser profile not found"},
+        429: {
+            "description": "Too many browser sessions are starting for this organization at once. "
+            "Retry after the number of seconds in the Retry-After header.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail", "error_code"],
+                        "properties": {
+                            "detail": {"type": "string"},
+                            "error_code": {"type": "string", "enum": [TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE]},
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.post(
@@ -284,21 +301,22 @@ async def create_browser_session(
         organization_id=current_org.organization_id,
         feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
     )
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-        organization_id=current_org.organization_id,
-        url=browser_session_request.url,
-        timeout_minutes=timeout_minutes,
-        proxy_location=proxy_location,
-        proxy_session_id=proxy_session_id,
-        extensions=browser_session_request.extensions,
-        browser_type=browser_session_request.browser_type,
-        browser_profile_id=browser_session_request.browser_profile_id,
-        generate_browser_profile=browser_session_request.generate_browser_profile,
-        needs_live_view=browser_session_request.needs_live_view,
-        created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
-        session_kind=BrowserSessionKind.api,
-        browser_settings=browser_session_request.browser_settings,
-    )
+    async with app.AGENT_FUNCTION.browser_session_create_admission(organization_id=current_org.organization_id):
+        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=current_org.organization_id,
+            url=browser_session_request.url,
+            timeout_minutes=timeout_minutes,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            extensions=browser_session_request.extensions,
+            browser_type=browser_session_request.browser_type,
+            browser_profile_id=browser_session_request.browser_profile_id,
+            generate_browser_profile=browser_session_request.generate_browser_profile,
+            needs_live_view=browser_session_request.needs_live_view,
+            created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+            session_kind=BrowserSessionKind.api,
+            browser_settings=browser_session_request.browser_settings,
+        )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
     return response
@@ -704,10 +722,19 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
+    visible_ids = await app.DATABASE.browser_sessions.get_folder_visible_browser_session_ids(
+        current_org.organization_id,
+        [browser_session.persistent_browser_session_id for browser_session in browser_sessions],
+    )
+    visible_sessions = [
+        browser_session
+        for browser_session in browser_sessions
+        if browser_session.persistent_browser_session_id in visible_ids
+    ]
     return await asyncio.gather(
         *[
             BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
-            for browser_session in browser_sessions
+            for browser_session in visible_sessions
         ]
     )
 

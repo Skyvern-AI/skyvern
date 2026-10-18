@@ -34,6 +34,7 @@ from skyvern.forge.sdk.schemas.sms import (
     TwilioPhoneNumberInfo,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.services.twilio_service import (
     TwilioApiError,
     build_client_from_credential,
@@ -667,6 +668,7 @@ async def get_twilio_credential(
 )
 async def delete_twilio_credential(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"credential.delete"}))),
 ) -> dict[str, bool]:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id

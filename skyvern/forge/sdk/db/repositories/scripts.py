@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, or_, select, update
+from sqlalchemy import and_, delete, distinct, exists, func, not_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -21,9 +21,12 @@ from skyvern.forge.sdk.db.models import (
     ScriptFallbackEpisodeModel,
     ScriptFileModel,
     ScriptModel,
+    TaskModel,
+    TaskV2Model,
     WorkflowRunModel,
     WorkflowScriptModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     convert_to_script,
     convert_to_script_block,
@@ -131,6 +134,7 @@ class ScriptsRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
     ) -> list[Script]:
+        hidden_script_clauses = await self._hidden_script_clauses(organization_id)
         async with self.Session() as session:
             # Calculate offset for pagination
             offset = (page - 1) * page_size
@@ -156,12 +160,62 @@ class ScriptsRepository(BaseRepository):
                 )
                 .filter(ScriptModel.organization_id == organization_id)
                 .filter(ScriptModel.deleted_at.is_(None))
+                .filter(*hidden_script_clauses)
                 .order_by(ScriptModel.created_at.desc())
                 .limit(page_size)
                 .offset(offset)
             )
             scripts = (await session.scalars(get_scripts_query)).all()
             return [convert_to_script(script) for script in scripts]
+
+    async def _hidden_script_clauses(self, organization_id: str) -> list[Any]:
+        """Exclude scripts tied to a workflow or originating run in a folder the caller cannot see."""
+        workflow_visible = await _folder_access_filter(organization_id, WorkflowScriptModel.workflow_permanent_id)
+        run_visible = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+        task_v2_visible = await _folder_access_filter(organization_id, TaskV2Model.workflow_permanent_id)
+        if workflow_visible is None or run_visible is None or task_v2_visible is None:
+            return []
+        return [
+            ~exists().where(
+                WorkflowScriptModel.organization_id == organization_id,
+                WorkflowScriptModel.script_id == ScriptModel.script_id,
+                not_(workflow_visible),
+            ),
+            ~exists().where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.workflow_run_id == ScriptModel.run_id,
+                not_(run_visible),
+            ),
+            # A legacy task id names its workflow only through the task's workflow run.
+            ~exists().where(
+                TaskModel.organization_id == organization_id,
+                TaskModel.task_id == ScriptModel.run_id,
+                TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                not_(run_visible),
+            ),
+            # A TaskV2 run id names the observer cruise, which records its workflow directly or only its workflow run.
+            ~exists().where(
+                TaskV2Model.organization_id == organization_id,
+                TaskV2Model.observer_cruise_id == ScriptModel.run_id,
+                not_(task_v2_visible),
+            ),
+            ~exists().where(
+                TaskV2Model.organization_id == organization_id,
+                TaskV2Model.observer_cruise_id == ScriptModel.run_id,
+                TaskV2Model.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                not_(run_visible),
+            ),
+        ]
+
+    @db_operation("get_script_id_for_artifact")
+    async def get_script_id_for_artifact(self, organization_id: str, artifact_id: str) -> str | None:
+        """The script a SCRIPT_FILE artifact holds code for; the artifact row itself names no run or workflow."""
+        async with self.Session() as session:
+            return await session.scalar(
+                select(ScriptFileModel.script_id)
+                .where(ScriptFileModel.organization_id == organization_id, ScriptFileModel.artifact_id == artifact_id)
+                .limit(1)
+            )
 
     @db_operation("get_script")
     async def get_script(

@@ -21,6 +21,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunTagEventModel,
     WorkflowTagEventModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagEventType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
@@ -979,6 +980,7 @@ class TagsRepository(BaseRepository):
     async def count_active_workflows_per_key(self, organization_id: str) -> dict[str, int]:
         """Map of tag key -> number of workflows carrying it (one active SET per
         (workflow, key), so a row count suffices). Standalone labels are excluded."""
+        folder_filter = await _folder_access_filter(organization_id, WorkflowTagEventModel.workflow_permanent_id)
         async with self.Session() as session:
             stmt = (
                 select(WorkflowTagEventModel.key, func.count(WorkflowTagEventModel.tag_event_id))
@@ -989,6 +991,7 @@ class TagsRepository(BaseRepository):
                         WorkflowTagEventModel.event_type == TagEventType.SET.value,
                         WorkflowTagEventModel.deleted_at.is_(None),
                         WorkflowTagEventModel.key.isnot(None),
+                        *([folder_filter] if folder_filter is not None else []),
                     )
                 )
                 .group_by(WorkflowTagEventModel.key)
@@ -1034,6 +1037,7 @@ class TagsRepository(BaseRepository):
         """Map of grouped ``(key, value)`` -> number of non-deleted workflows carrying
         it. Powers the per-label delete blast-radius warning. Standalone labels (no
         key) are excluded; covered by the existing org/key/value active partial index."""
+        folder_filter = await _folder_access_filter(organization_id, WorkflowTagEventModel.workflow_permanent_id)
         async with self.Session() as session:
             stmt = (
                 select(
@@ -1049,6 +1053,7 @@ class TagsRepository(BaseRepository):
                         WorkflowTagEventModel.deleted_at.is_(None),
                         WorkflowTagEventModel.key.isnot(None),
                         self._non_deleted_workflow_exists(organization_id),
+                        *([folder_filter] if folder_filter is not None else []),
                     )
                 )
                 .group_by(WorkflowTagEventModel.key, WorkflowTagEventModel.value)
@@ -1084,6 +1089,7 @@ class TagsRepository(BaseRepository):
         """Number of non-deleted workflows with an active SET on grouped ``(key, value)``.
         Targeted single-pair count for the recolor/rename response, avoiding the full-org
         GROUP BY that ``count_active_workflows_per_value`` runs for the list endpoint."""
+        folder_filter = await _folder_access_filter(organization_id, WorkflowTagEventModel.workflow_permanent_id)
         async with self.Session() as session:
             stmt = select(func.count(func.distinct(WorkflowTagEventModel.workflow_permanent_id))).where(
                 and_(
@@ -1094,6 +1100,7 @@ class TagsRepository(BaseRepository):
                     WorkflowTagEventModel.event_type == TagEventType.SET.value,
                     WorkflowTagEventModel.deleted_at.is_(None),
                     self._non_deleted_workflow_exists(organization_id),
+                    *([folder_filter] if folder_filter is not None else []),
                 )
             )
             return (await session.execute(stmt)).scalar_one()
@@ -1101,6 +1108,7 @@ class TagsRepository(BaseRepository):
     @db_operation("count_active_workflows_for_key")
     async def count_active_workflows_for_key(self, organization_id: str, key: str) -> int:
         """Number of non-deleted workflows with an active SET on grouped ``key``."""
+        folder_filter = await _folder_access_filter(organization_id, WorkflowTagEventModel.workflow_permanent_id)
         async with self.Session() as session:
             stmt = select(func.count(func.distinct(WorkflowTagEventModel.workflow_permanent_id))).where(
                 and_(
@@ -1110,6 +1118,7 @@ class TagsRepository(BaseRepository):
                     WorkflowTagEventModel.event_type == TagEventType.SET.value,
                     WorkflowTagEventModel.deleted_at.is_(None),
                     self._non_deleted_workflow_exists(organization_id),
+                    *([folder_filter] if folder_filter is not None else []),
                 )
             )
             return (await session.execute(stmt)).scalar_one()

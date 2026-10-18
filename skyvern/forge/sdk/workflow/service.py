@@ -353,7 +353,6 @@ from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
-    WORKFLOW_TITLE_MAX_LENGTH,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -381,6 +380,7 @@ from skyvern.services.script_reviewer import (
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
 from skyvern.services.webhook_delivery import (
+    FinalWebhookFinalizer,
     PreparedWorkflowWebhook,
     WebhookDeliveryAttempts,
     classify_exhausted_webhook_delivery,
@@ -448,6 +448,8 @@ WORKFLOW_ATTEMPT_LOOKUP_RETRY_DELAY_SECONDS = 0.1
 WORKFLOW_VERSION_ALLOCATION_ATTEMPTS = 3
 MAX_REPORTED_PARAMETER_KEYS = 20
 MAX_REPORTED_PARAMETER_KEY_LENGTH = 64
+BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS = 10.0
+BACKEND_SCHEDULE_DELETE_CONCURRENCY = 10
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -1496,7 +1498,7 @@ async def _load_user_script_module(
     fails loads as None — blocks drop to the agent — because exec-ing its
     stored body would resurrect the same staleness, and the marker-only pin
     check would never supersede it. Only a markerless pin (a generated script)
-    may proceed through the execution policy to its stored body.
+    executes its stored body.
     """
     loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
     if loaded_script_module is not None:
@@ -1973,6 +1975,13 @@ async def _roll_back_after_swallowed_write() -> None:
             await session.rollback()
     except Exception:
         LOG.warning("Failed to roll back the ambient session after a best-effort write failed", exc_info=True)
+
+
+async def _delete_backend_schedule(backend_schedule_id: str, slots: asyncio.Semaphore) -> None:
+    # The timeout covers the wait for a slot, so a hung backend bounds the whole fan-out rather than each batch.
+    async with asyncio.timeout(BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS):
+        async with slots:
+            await app.AGENT_FUNCTION.delete_workflow_schedule(backend_schedule_id)
 
 
 class WorkflowService:
@@ -3328,6 +3337,7 @@ class WorkflowService:
         fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        requested_by: str | None = None,
         resolved_workflow_id: str | None = None,
         tag_write_context: TagWriteContext | None = None,
         block_scoped: bool = False,
@@ -3504,6 +3514,7 @@ class WorkflowService:
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
+                requested_by=requested_by,
                 workflow=workflow,
                 block_scoped=block_scoped,
                 created_by=created_by,
@@ -6990,7 +7001,7 @@ class WorkflowService:
         except WorkflowAttemptDispatchSuperseded:
             raise
         except Exception as error:
-            if isinstance(error, SkyvernHTTPException) and error.status_code == 402:
+            if isinstance(error, SkyvernHTTPException) and error.status_code in (402, 403):
                 LOG.info("Workflow run refused at admission", workflow_run_id=workflow_run_id, reason=str(error))
             else:
                 LOG.exception("Workflow run admission failed", workflow_run_id=workflow_run_id)
@@ -8336,7 +8347,7 @@ class WorkflowService:
 
         # Set script_mode on context so downstream code can skip expensive LLM calls
         # Only enable when we actually have a script to run
-        script_mode_active = bool(script and is_script_run and loaded_script_module and script_blocks_by_label)
+        script_mode_active = bool(script and is_script_run and script_blocks_by_label)
         if script_mode_active:
             ctx = skyvern_context.current()
             if ctx:
@@ -8372,7 +8383,6 @@ class WorkflowService:
             execution_mode = "code_generation"
         else:
             execution_mode = "agent"
-
         LOG.info(
             "Workflow run execution mode resolved",
             execution_mode=execution_mode,
@@ -11444,6 +11454,7 @@ class WorkflowService:
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        edited_for: str | None | object = _UNSET,
         build_source: WorkflowBuildSource | None | object = _UNSET,
         notify_workflow_saved: bool = True,
         preserve_completion_contract: bool = True,
@@ -11493,6 +11504,7 @@ class WorkflowService:
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
+                edited_for=edited_for,
                 build_source=build_source,
                 preserve_completion_contract=preserve_completion_contract,
                 refuse_if_pinned_by_run_group=True,
@@ -11695,31 +11707,60 @@ class WorkflowService:
                         to_delete_cnt=len(to_delete),
                     )
 
-    async def delete_workflow_by_permanent_id(
+    async def soft_delete_workflow_by_permanent_id(
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> str | None:
-        # Delete workflow and schedules in one DB transaction so we do not leave
-        # the workflow active if a process exits between separate commits.
+    ) -> tuple[list[tuple[str, str | None]], str | None]:
+        """Soft-delete a workflow and its schedules in one transaction; the caller owes `delete_backend_schedules`."""
+        # One transaction so we do not leave the workflow active if a process exits between separate commits.
         (
-            deleted_schedule_ids,
+            deleted_schedules,
             deleted_workflow_id,
         ) = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
-        if deleted_workflow_id is None:
-            return None
-        if deleted_schedule_ids:
+        if deleted_schedules:
             LOG.info(
                 "Cascade-deleted schedules during workflow deletion",
                 workflow_permanent_id=deleted_workflow_id,
                 organization_id=organization_id,
-                deleted_schedule_ids=deleted_schedule_ids,
-                count=len(deleted_schedule_ids),
+                deleted_schedule_ids=[schedule_id for schedule_id, _ in deleted_schedules],
+                count=len(deleted_schedules),
             )
-        return deleted_workflow_id
+        return deleted_schedules, deleted_workflow_id
+
+    async def delete_backend_schedules(
+        self,
+        deleted_schedules: list[tuple[str, str | None]],
+        organization_id: str | None,
+    ) -> None:
+        """Best effort: a failed backend delete is logged and left for the backend's own cleanup."""
+        targets = [(schedule_id, backend_id) for schedule_id, backend_id in deleted_schedules if backend_id]
+        slots = asyncio.Semaphore(BACKEND_SCHEDULE_DELETE_CONCURRENCY)
+        outcomes = await asyncio.gather(
+            *(_delete_backend_schedule(backend_id, slots) for _, backend_id in targets), return_exceptions=True
+        )
+        deleted_backend_ids: list[str] = []
+        for (workflow_schedule_id, backend_schedule_id), outcome in zip(targets, outcomes, strict=True):
+            if outcome is None:
+                deleted_backend_ids.append(backend_schedule_id)
+                continue
+            LOG.warning(
+                "Failed to delete the backend schedule of a deleted workflow schedule; leaving it to the backend",
+                organization_id=organization_id,
+                workflow_schedule_id=workflow_schedule_id,
+                backend_schedule_id=backend_schedule_id,
+                exc_info=outcome,
+            )
+        if deleted_backend_ids:
+            LOG.info(
+                "Deleted backend schedules of deleted workflow schedules",
+                organization_id=organization_id,
+                backend_schedule_ids=deleted_backend_ids,
+                count=len(deleted_backend_ids),
+            )
 
     async def delete_workflow_by_id(
         self,
@@ -11845,6 +11886,7 @@ class WorkflowService:
         fallback_attempt: int | None = None,
         ignore_inherited_workflow_system_prompt: bool = False,
         copilot_session_id: str | None = None,
+        requested_by: str | None = None,
         workflow: Workflow | None = None,
         block_scoped: bool = False,
         created_by: str | None = None,
@@ -11978,6 +12020,7 @@ class WorkflowService:
                     ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                     copilot_session_id=copilot_session_id,
                     created_by=created_by,
+                    requested_by=requested_by,
                     workflow_definition_sha256=definition_sha256,
                     browser_settings=workflow.workflow_definition.browser_settings,
                 )
@@ -12054,6 +12097,7 @@ class WorkflowService:
             ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
             copilot_session_id=copilot_session_id,
             created_by=created_by,
+            requested_by=requested_by,
             workflow_definition_sha256=definition_sha256,
             browser_settings=workflow.workflow_definition.browser_settings,
         )
@@ -13172,7 +13216,9 @@ class WorkflowService:
                         workflow_run=workflow_run,
                     )
                 if is_final_decision:
-                    await self.execute_workflow_webhook(workflow_run, api_key, claim_kind=None)
+                    await self.execute_workflow_webhook(
+                        workflow_run, api_key, claim_kind=None, finalizer="terminal_side_effects"
+                    )
                 elif decision is not None and decision.send_webhook_now:
                     await self.execute_workflow_webhook(workflow_run, api_key, claim_kind="interim")
 
@@ -15884,7 +15930,7 @@ class WorkflowService:
                     assert terminal_decision is not None
                     await self._run_terminal_side_effects_with_retries(workflow_run, terminal_decision, api_key=api_key)
                 elif not policy_run:
-                    await self.execute_workflow_webhook(workflow_run, api_key)
+                    await self.execute_workflow_webhook(workflow_run, api_key, finalizer="worker_cleanup")
         finally:
             # Run contexts hold parameters/secrets/outputs and are keyed per
             # run; without eviction they accumulate for the process lifetime.
@@ -16089,12 +16135,16 @@ class WorkflowService:
         *,
         delivered_projection: WebhookDeliveryStatus | None = None,
         exhausted_projection: WebhookDeliveryStatus | None = None,
+        finalizer: FinalWebhookFinalizer | None = None,
+        attempt_claimed: bool = False,
     ) -> bool:
         async with organization_log_scope(webhook.organization_id):
             return await self._deliver_prepared_workflow_webhook(
                 webhook,
                 delivered_projection=delivered_projection,
                 exhausted_projection=exhausted_projection,
+                finalizer=finalizer,
+                attempt_claimed=attempt_claimed,
             )
 
     async def _deliver_prepared_workflow_webhook(
@@ -16103,6 +16153,8 @@ class WorkflowService:
         *,
         delivered_projection: WebhookDeliveryStatus | None,
         exhausted_projection: WebhookDeliveryStatus | None,
+        finalizer: FinalWebhookFinalizer | None,
+        attempt_claimed: bool,
     ) -> bool:
         async def record_delivery(failure_reason: str, projection: WebhookDeliveryStatus | None) -> None:
             if delivered_projection is None and exhausted_projection is None:
@@ -16130,6 +16182,54 @@ class WorkflowService:
                     status_code=status_code,
                     attempts=attempts.count,
                     finished_at=webhook.execution_finished_at,
+                )
+
+        # An attempt row's reservation already claims a policy run's send. Any other final send of an exact
+        # terminal execution, the only kind that can record an outcome, claims the run row.
+        run_claim: datetime | None = None
+        if (
+            delivered_projection is not None
+            and not attempt_claimed
+            and webhook.execution_status is not None
+            and webhook.execution_finished_at is not None
+        ):
+            claim_stale_before = naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS)
+            try:
+                run_claim = await app.DATABASE.workflow_runs.claim_final_webhook_delivery(
+                    webhook.workflow_run_id,
+                    expected_status=webhook.execution_status,
+                    expected_finished_at=webhook.execution_finished_at,
+                    stale_before=claim_stale_before,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to claim the final workflow webhook; delivering it unclaimed",
+                    workflow_run_id=webhook.workflow_run_id,
+                    finalizer=finalizer,
+                    exc_info=True,
+                )
+            else:
+                if run_claim is None:
+                    await self._log_missed_final_webhook_claim(
+                        webhook, finalizer=finalizer, stale_before=claim_stale_before
+                    )
+                    return False
+
+        async def release_run_claim_unless_terminal(projection: WebhookDeliveryStatus | None) -> None:
+            # No current caller sends a final webhook without an exhausted projection, the only kind that fails with no
+            # outcome. This is for a one-shot early send, whose claim goes back so the later sender retrying it can claim.
+            if run_claim is None or projection is not None:
+                return
+            try:
+                await app.DATABASE.workflow_runs.release_final_webhook_delivery_claim(
+                    webhook.workflow_run_id, claimed_at=run_claim
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to release the final workflow webhook claim",
+                    workflow_run_id=webhook.workflow_run_id,
+                    finalizer=finalizer,
+                    exc_info=True,
                 )
 
         LOG.info(
@@ -16177,6 +16277,7 @@ class WorkflowService:
                     workflow_run_id=webhook.workflow_run_id,
                     exc_info=True,
                 )
+            await release_run_claim_unless_terminal(exhausted_outcome)
             return False
 
         if resp.status_code >= 200 and resp.status_code < 300:
@@ -16224,7 +16325,36 @@ class WorkflowService:
                     workflow_run_id=webhook.workflow_run_id,
                     exc_info=True,
                 )
+            await release_run_claim_unless_terminal(exhausted_outcome)
             return False
+
+    @staticmethod
+    async def _log_missed_final_webhook_claim(
+        webhook: PreparedWorkflowWebhook, *, finalizer: FinalWebhookFinalizer | None, stale_before: datetime
+    ) -> None:
+        try:
+            claim_free = await app.DATABASE.workflow_runs.final_webhook_delivery_claim_is_free(
+                webhook.workflow_run_id, stale_before=stale_before
+            )
+        except Exception:
+            # The read logs its own failure; the miss is then reported as a held claim.
+            claim_free = False
+        if claim_free:
+            # The claim was free, so the miss came from this sender's snapshot of status or finished_at.
+            LOG.warning(
+                "Final workflow webhook claim missed on a stale snapshot; nobody holds it",
+                workflow_run_id=webhook.workflow_run_id,
+                finalizer=finalizer,
+                execution_status=webhook.execution_status,
+                execution_finished_at=webhook.execution_finished_at,
+            )
+            return
+        LOG.info(
+            "Skipping final workflow webhook another finalizer already claimed",
+            workflow_run_id=webhook.workflow_run_id,
+            finalizer=finalizer,
+            execution_status=webhook.execution_status,
+        )
 
     @staticmethod
     def _webhook_delivery_projection_kwargs(status: WebhookDeliveryStatus | None) -> dict[str, Any]:
@@ -16241,6 +16371,7 @@ class WorkflowService:
         side_effects_claim_at: datetime | None = None,
         attempt_number: int | None = None,
         skip_side_effects_lease_check: bool = False,
+        finalizer: FinalWebhookFinalizer | None = None,
     ) -> None:
         if claim_kind != "interim" and not workflow_run.status.is_final():
             return
@@ -16352,6 +16483,8 @@ class WorkflowService:
             webhook,
             delivered_projection=delivered_projection,
             exhausted_projection=exhausted_projection,
+            finalizer=finalizer,
+            attempt_claimed=selected_attempt is not None,
         )
         if not delivered:
             if delivery_attempt == WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS:
@@ -17112,16 +17245,6 @@ class WorkflowService:
                     raise WorkflowVersionConflict(workflow_permanent_id)
         else:
             existing_latest_workflow = None
-
-        if (
-            existing_latest_workflow
-            and len(request.title) > WORKFLOW_TITLE_MAX_LENGTH
-            and request.title != existing_latest_workflow.title
-        ):
-            raise SkyvernHTTPException(
-                message=f"Workflow title must be at most {WORKFLOW_TITLE_MAX_LENGTH} characters.",
-                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
-            )
 
         if request.webhook_callback_url and (
             existing_latest_workflow is None
@@ -18595,8 +18718,10 @@ class WorkflowService:
         we then ran agent." That's the precise definition of a mid-execution
         script→AI fallback.
 
-        Callers invoke this only after `block.execute_safe` ran, so the flag
-        excludes denied, skipped, and agent-only blocks.
+        Caller must only invoke this AFTER `block.execute_safe` actually ran
+        (i.e., the fallback agent execution happened). Calling before would
+        risk false positives in the `ai_fallback=False` kept-the-failure
+        case where `execute_safe` is never reached.
 
         Wrapped in try/except so a transient DB error on the flag flip can't
         abort downstream block post-processing. Regression-locked by

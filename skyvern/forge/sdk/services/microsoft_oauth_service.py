@@ -26,6 +26,7 @@ from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import oauth_consent
+from skyvern.forge.sdk.workflow import secret_encryption
 from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
 LOG = structlog.get_logger()
@@ -41,6 +42,7 @@ MICROSOFT_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
 
 CONSENT_TTL_SECONDS = 600
 _SAFE_EMAIL_ADDRESS = SAFE_EMAIL_ADDRESS_PATTERN
+_REFRESH_TOKEN_FIELD_NAME = "microsoft_oauth_credentials.encrypted_refresh_token"
 
 
 def microsoft_access_token_cache_key(organization_id: str, credential_id: str) -> str:
@@ -75,6 +77,7 @@ class UnsupportedScopeProfileError(ValueError):
 class MicrosoftCredentialSecrets:
     refresh_token: str
     scopes: list[str] = field(default_factory=list)
+    encrypted_refresh_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,28 @@ def _require_encryption() -> None:
             "Microsoft OAuth credentials require AES encryption. Set ENABLE_ENCRYPTION=true and "
             "configure ENCRYPTOR_AES_SECRET_KEY/SALT/IV on the deployment."
         )
+
+
+def _require_gcm_encryption() -> None:
+    if not secret_encryption.encryption_available():
+        raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
+
+
+async def _encrypt_refresh_token(refresh_token: str, organization_id: str) -> str:
+    _require_gcm_encryption()
+    encrypted_token = await secret_encryption.encrypt_secret_field_value(
+        refresh_token,
+        organization_id=organization_id,
+        field_name=_REFRESH_TOKEN_FIELD_NAME,
+        full_template_reference_only=True,
+    )
+    if (
+        not isinstance(encrypted_token, str)
+        or not secret_encryption.is_encrypted_secret(encrypted_token)
+        or encrypted_token == refresh_token
+    ):
+        raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
+    return encrypted_token
 
 
 def _require_client_credentials() -> tuple[str, str]:
@@ -138,6 +163,19 @@ def has_required_scopes(
 
 
 def email_from_id_token(id_token: str) -> str | None:
+    claims = _claims_from_id_token(id_token)
+    if claims is None:
+        return None
+    for claim in ("email", "preferred_username"):
+        value = claims.get(claim)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if _SAFE_EMAIL_ADDRESS.fullmatch(candidate):
+                return candidate
+    return None
+
+
+def _claims_from_id_token(id_token: str | None) -> dict[str, object] | None:
     if not isinstance(id_token, str):
         return None
     segments = id_token.split(".")
@@ -152,13 +190,18 @@ def email_from_id_token(id_token: str) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    for claim in ("email", "preferred_username"):
-        value = payload.get(claim)
-        if isinstance(value, str):
-            candidate = value.strip()
-            if _SAFE_EMAIL_ADDRESS.fullmatch(candidate):
-                return candidate
-    return None
+    return payload
+
+
+def identity_from_id_token(id_token: str | None) -> tuple[str | None, str | None]:
+    claims = _claims_from_id_token(id_token)
+    if claims is None:
+        return None, None
+    tenant_id, object_id = claims.get("tid"), claims.get("oid")
+    return (
+        tenant_id if isinstance(tenant_id, str) and tenant_id else None,
+        object_id if isinstance(object_id, str) and object_id else None,
+    )
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -301,9 +344,11 @@ async def promote_pending_credential(
     initiator_id: str | None,
     refresh_token: str,
     scopes_granted: str | list[str] | tuple[str, ...] | None,
+    tenant_id: str | None = None,
+    object_id: str | None = None,
 ) -> MicrosoftOAuthCredentialBase:
     _require_encryption()
-    encrypted_token = await encryptor.encrypt(refresh_token, EncryptMethod.AES)
+    encrypted_token = await _encrypt_refresh_token(refresh_token, organization_id)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     return await app.DATABASE.microsoft_oauth.promote_pending_to_active(
         organization_id=organization_id,
@@ -311,6 +356,9 @@ async def promote_pending_credential(
         encrypted_refresh_token=encrypted_token,
         encrypted_method=EncryptMethod.AES,
         scopes_granted=_coerce_scopes(scopes_granted),
+        initiating_user_id=initiator_id,
+        tenant_id=tenant_id,
+        object_id=object_id,
         now=now,
     )
 
@@ -414,8 +462,25 @@ async def load_credential_secrets(
     )
     if payload is None:
         raise ValueError(f"No active Microsoft OAuth credential found: {credential_id}")
-    refresh_token = await encryptor.decrypt(payload.encrypted_refresh_token, payload.encrypted_method)
-    return MicrosoftCredentialSecrets(refresh_token=refresh_token, scopes=payload.scopes_granted)
+    if secret_encryption.is_encrypted_secret(payload.encrypted_refresh_token):
+        if not secret_encryption.encryption_available():
+            raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
+        refresh_token = await secret_encryption.decrypt_secret_field_value(
+            payload.encrypted_refresh_token,
+            organization_id=organization_id,
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+    else:
+        if payload.encrypted_method is None:
+            raise ValueError("Microsoft OAuth credential is missing its encryption method")
+        refresh_token = await encryptor.decrypt(
+            payload.encrypted_refresh_token, EncryptMethod(payload.encrypted_method)
+        )
+    return MicrosoftCredentialSecrets(
+        refresh_token=refresh_token,
+        scopes=payload.scopes_granted,
+        encrypted_refresh_token=payload.encrypted_refresh_token,
+    )
 
 
 async def access_token_from_secrets(credential_secrets: MicrosoftCredentialSecrets) -> str:
@@ -433,39 +498,64 @@ async def refresh_and_rotate(
     organization_id: str,
     credential_id: str,
     credential_secrets: MicrosoftCredentialSecrets,
+    connection_id: str | None = None,
+    initiating_user_id: str | None = None,
+    custody_mode: str | None = None,
 ) -> str:
     if not credential_secrets.refresh_token:
         raise ValueError("OAuth credential is missing refresh_token")
+    if not credential_secrets.encrypted_refresh_token:
+        raise ValueError("Microsoft OAuth credential is missing its stored refresh token")
+    _require_gcm_encryption()
     token_data = await refresh_access_token(credential_secrets.refresh_token, credential_secrets.scopes)
     access_token = token_data.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         raise MissingAccessTokenError("Microsoft token response did not include access_token")
 
     new_refresh_token = token_data.get("refresh_token")
-    if (
-        isinstance(new_refresh_token, str)
-        and new_refresh_token
-        and new_refresh_token != credential_secrets.refresh_token
-    ):
-        try:
-            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
-            now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    refresh_token_to_store = (
+        new_refresh_token
+        if isinstance(new_refresh_token, str) and new_refresh_token
+        else credential_secrets.refresh_token
+    )
+    tenant_id, object_id = identity_from_id_token(token_data.get("id_token"))
+    try:
+        encrypted_refresh_token = await _encrypt_refresh_token(refresh_token_to_store, organization_id)
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        updated = await app.DATABASE.microsoft_oauth.update_active_refresh_token(
+            organization_id=organization_id,
+            credential_id=credential_id,
+            encrypted_refresh_token=encrypted_refresh_token,
+            encrypted_method=EncryptMethod.AES,
+            expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
+            tenant_id=tenant_id,
+            object_id=object_id,
+            initiating_user_id=initiating_user_id,
+            connection_id=connection_id,
+            custody_mode=custody_mode,
+            now=now,
+        )
+        if not updated and any((tenant_id, object_id, initiating_user_id, connection_id, custody_mode)):
             await app.DATABASE.microsoft_oauth.update_active_refresh_token(
                 organization_id=organization_id,
                 credential_id=credential_id,
-                encrypted_refresh_token=encrypted_refresh_token,
-                encrypted_method=EncryptMethod.AES,
+                tenant_id=tenant_id,
+                object_id=object_id,
+                initiating_user_id=initiating_user_id,
+                connection_id=connection_id,
+                custody_mode=custody_mode,
                 now=now,
+                touch_modified_at=False,
             )
-        except Exception as exc:
-            LOG.exception(
-                "Failed to persist rotated Microsoft refresh token",
-                organization_id=organization_id,
-                credential_id=credential_id,
-            )
-            raise MicrosoftOAuthError(
-                "Failed to persist rotated Microsoft refresh token; reconnect the Microsoft account"
-            ) from exc
+    except Exception as exc:
+        LOG.exception(
+            "Failed to persist Microsoft credential refresh",
+            organization_id=organization_id,
+            credential_id=credential_id,
+        )
+        raise MicrosoftOAuthError(
+            "Failed to persist Microsoft credential refresh; reconnect the Microsoft account"
+        ) from exc
     return access_token
 
 

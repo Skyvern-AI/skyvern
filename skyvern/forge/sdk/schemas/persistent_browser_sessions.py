@@ -140,6 +140,8 @@ class PersistentBrowserSession(BaseModel):
     browser_settings_receipt: BrowserSettingsReceipt | None = None
     # The workflow run whose own setup created this session; never set for a session a caller attaches.
     created_for_workflow_run_id: str | None = None
+    # The workflow a Copilot chat provisioned this browser for.
+    created_for_workflow_permanent_id: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True

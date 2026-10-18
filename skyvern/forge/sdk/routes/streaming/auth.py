@@ -11,6 +11,7 @@ from websockets.exceptions import ConnectionClosedOK
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 LOG = structlog.get_logger()
 
@@ -53,7 +54,32 @@ async def _close_unauthenticated(websocket: WebSocket, **log_kwargs: t.Any) -> N
         LOG.info("WebSocket connection closed due to invalid credentials.", **log_kwargs)
 
 
-async def auth(apikey: str | None, token: str | None, websocket: WebSocket, **log_kwargs: t.Any) -> str | None:
+async def folder_access_denied(websocket: WebSocket, action: str, resource: t.Mapping[str, str | None]) -> bool:
+    """Close the stream when the caller's workflow folders do not cover the run behind it."""
+    try:
+        # The evaluator judges one identifier per call, so each id behind the stream is checked on its own.
+        for key, value in resource.items():
+            if value:
+                await app.AGENT_FUNCTION.enforce_folder_access(get_request_principal(), action, {key: value})
+    except HTTPException:
+        LOG.info("Rejecting streaming connection outside the caller's workflow folders.", action=action)
+        try:
+            await websocket.close(code=4403)
+        except ConnectionClosedOK:
+            pass
+        return True
+    return False
+
+
+async def auth(
+    apikey: str | None,
+    token: str | None,
+    websocket: WebSocket,
+    *,
+    folder_action: str,
+    folder_resource: t.Mapping[str, str | None],
+    **log_kwargs: t.Any,
+) -> str | None:
     """
     Accepts the websocket connection.
 
@@ -94,4 +120,6 @@ async def auth(apikey: str | None, token: str | None, websocket: WebSocket, **lo
         await _close_unauthenticated(websocket, **log_kwargs)
         return None
 
+    if await folder_access_denied(websocket, folder_action, folder_resource):
+        return None
     return organization_id

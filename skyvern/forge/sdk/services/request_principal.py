@@ -56,15 +56,21 @@ class BearerIdentityResolution:
 class RequestPrincipal:
     organization_id: str
     auth_kind: AuthKind
-    api_key_token_id: str | None = None
     user_id: str | None = None
     org_role: str | None = None
     org_role_claim: str | None = None
     token_has_organization_claim: bool | None = None
+    # Last, so callers that build a principal positionally as (organization, kind, user, role) keep their meaning.
+    api_key_token_id: str | None = None
 
 
 def synthetic_user_id(organization_id: str) -> str:
     return f"{organization_id}_user"
+
+
+def requesting_user_id(organization_id: str) -> str | None:
+    """The actor behind the live request, recorded like a Trigger owner; None for a background job."""
+    return trigger_owner_id(get_request_principal(), organization_id)
 
 
 _ResolutionKey = tuple[str, str | None, str | None, bytes | None]
@@ -83,6 +89,21 @@ def get_request_principal() -> RequestPrincipal | None:
         return request_state.principal
     resolved = _request_principal.get()
     return resolved[1] if resolved else None
+
+
+def human_user_id(principal: RequestPrincipal | None, organization_id: str) -> str | None:
+    """The person behind the request (a bearer user, or the member a member-bound key acts as); None for organization
+    API keys, which act for the whole organization."""
+    if (
+        principal is None
+        or principal.organization_id != organization_id
+        or principal.auth_kind
+        not in {AuthKind.bearer, AuthKind.ui_session, AuthKind.ui_session_and_bearer, AuthKind.member_api_key}
+        or principal.user_id is None
+        or principal.user_id == synthetic_user_id(organization_id)
+    ):
+        return None
+    return principal.user_id
 
 
 def reject_non_admin_api_key_secret_access(principal: RequestPrincipal | None) -> None:
@@ -257,3 +278,28 @@ async def _resolve_request_principal(
     )
     _request_principal.set((resolution_key, principal, identity_result.status))
     return principal
+
+
+def api_key_actor_id(organization_id: str) -> str | None:
+    """The actor a key authorized the live request as: the org's admin-equivalent synthetic user for an organization
+    key, even with a bearer that names a narrower member, or the member a member-bound key acts as; None otherwise."""
+    principal = get_request_principal()
+    if principal is None or principal.organization_id != organization_id:
+        return None
+    if principal.auth_kind == AuthKind.member_api_key:
+        return human_user_id(principal, organization_id)
+    return (
+        synthetic_user_id(organization_id)
+        if principal.auth_kind in {AuthKind.api_key, AuthKind.api_key_and_bearer}
+        else None
+    )
+
+
+def trigger_owner_id(principal: RequestPrincipal | None, organization_id: str) -> str | None:
+    """Owner recorded on schedules and run groups; an API key records the org's admin-equivalent synthetic user."""
+    if principal is None or principal.organization_id != organization_id:
+        return None
+    if principal.auth_kind in {AuthKind.api_key, AuthKind.api_key_and_bearer}:
+        return synthetic_user_id(organization_id)
+    # An unidentified UI session stays ownerless, so its runs fail closed in restricted folders.
+    return human_user_id(principal, organization_id)

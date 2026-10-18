@@ -44,6 +44,7 @@ from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import CompoundSelect, Join
 
 from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.forge import app
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -95,6 +96,7 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log_attempt
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.services.request_principal import api_key_actor_id, get_request_principal
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -418,6 +420,33 @@ async def _first_queued_at(
             session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run.workflow_run_id
         )
     return naive_utc_now()
+
+
+async def _hidden_workflow_ids(organization_id: str) -> frozenset[str] | None:
+    """Workflows in folders the caller cannot see, resolved once per request; await it before opening a session."""
+    return await app.AGENT_FUNCTION.hidden_workflow_permanent_ids(get_request_principal(), organization_id)
+
+
+async def _folder_access_filter(
+    organization_id: str, workflow_permanent_id: ColumnElement[str | None]
+) -> ColumnElement[bool] | None:
+    hidden = await _hidden_workflow_ids(organization_id)
+    if not hidden:
+        return None
+    # Runs with no workflow (standalone tasks) stay org-wide, as before folder ACLs.
+    return or_(workflow_permanent_id.is_(None), workflow_permanent_id.not_in(hidden))
+
+
+def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
+    # The claim is a finalized_at with no status yet: recording the outcome completes it, and a reset clears both.
+    # An unrecorded claim older than stale_before outlived any bounded delivery, so its sender is gone.
+    return and_(
+        WorkflowRunModel.webhook_delivery_status.is_(None),
+        or_(
+            WorkflowRunModel.webhook_delivery_finalized_at.is_(None),
+            WorkflowRunModel.webhook_delivery_finalized_at < stale_before,
+        ),
+    )
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -903,6 +932,7 @@ class WorkflowRunsRepository(BaseRepository):
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
         created_by: str | None = None,
+        requested_by: str | None = None,
         workflow_definition_sha256: str | None = None,
         browser_settings: BrowserSettings | None = None,
     ) -> WorkflowRun:
@@ -910,6 +940,18 @@ class WorkflowRunsRepository(BaseRepository):
             kwargs: dict[str, Any] = {}
             if workflow_run_id is not None:
                 kwargs["workflow_run_id"] = workflow_run_id
+            if retried_from_workflow_run_id is not None and created_by is None and requested_by is None:
+                # A retry is started outside the request, so it runs as whoever started the run it retries.
+                source = (
+                    await session.execute(
+                        select(WorkflowRunModel.created_by, WorkflowRunModel.requested_by).where(
+                            WorkflowRunModel.workflow_run_id == retried_from_workflow_run_id,
+                            WorkflowRunModel.organization_id == organization_id,
+                        )
+                    )
+                ).first()
+                if source is not None:
+                    created_by, requested_by = source
             if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             workflow_run = WorkflowRunModel(
@@ -948,6 +990,8 @@ class WorkflowRunsRepository(BaseRepository):
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=copilot_session_id,
                 created_by=created_by,
+                # created_by names who to show; run start judges the actor that authorized the request instead.
+                requested_by=requested_by or api_key_actor_id(organization_id),
                 **kwargs,
             )
             session.add(workflow_run)
@@ -1000,6 +1044,56 @@ class WorkflowRunsRepository(BaseRepository):
                     target_cluster=target_cluster,
                     modified_at=WorkflowRunModel.modified_at,
                 )
+            )
+            await session.commit()
+
+    @db_operation("claim_final_webhook_delivery")
+    async def claim_final_webhook_delivery(
+        self,
+        workflow_run_id: str,
+        *,
+        expected_status: WorkflowRunStatus,
+        expected_finished_at: datetime,
+        stale_before: datetime,
+    ) -> datetime | None:
+        """Claim this terminal execution's one final webhook send; None means another sender holds it."""
+        claimed_at = naive_utc_now()
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status == expected_status,
+                    WorkflowRunModel.finished_at == to_naive_utc(expected_finished_at),
+                    _final_webhook_claim_is_free(stale_before),
+                )
+                .values(webhook_delivery_finalized_at=claimed_at, modified_at=WorkflowRunModel.modified_at)
+            )
+            await session.commit()
+        return claimed_at if result.rowcount == 1 else None
+
+    @db_operation("final_webhook_delivery_claim_is_free")
+    async def final_webhook_delivery_claim_is_free(self, workflow_run_id: str, *, stale_before: datetime) -> bool:
+        async with self.Session() as session:
+            free_run_id = await session.scalar(
+                select(WorkflowRunModel.workflow_run_id).where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    _final_webhook_claim_is_free(stale_before),
+                )
+            )
+        return free_run_id is not None
+
+    @db_operation("release_final_webhook_delivery_claim")
+    async def release_final_webhook_delivery_claim(self, workflow_run_id: str, *, claimed_at: datetime) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.webhook_delivery_status.is_(None),
+                    WorkflowRunModel.webhook_delivery_finalized_at == claimed_at,
+                )
+                .values(webhook_delivery_finalized_at=None, modified_at=WorkflowRunModel.modified_at)
             )
             await session.commit()
 
@@ -1566,6 +1660,7 @@ class WorkflowRunsRepository(BaseRepository):
         include_debugger_runs: bool = False,
         search_key: str | None = None,
     ) -> list[WorkflowRun | Task]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             # temporary limit to 10 pages
             if page > 10:
@@ -1580,6 +1675,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                workflow_run_query = workflow_run_query.where(folder_access_filter)
 
             if not include_debugger_runs:
                 workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
@@ -1659,6 +1757,7 @@ class WorkflowRunsRepository(BaseRepository):
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
         failure_category: str | None = None,
     ) -> list[dict[str, Any]]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
 
             async def execute_list_query(query: Select[Any]) -> Any:
@@ -1749,6 +1848,20 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(TaskRunModel.debug_session_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
+            task_v2_wpid = (
+                select(task_v2_workflow_run.workflow_permanent_id)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
+                .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
+                .scalar_subquery()
+            )
+            folder_access_filter = await _folder_access_filter(
+                organization_id,
+                func.coalesce(effective_wpid, case((TaskRunModel.task_run_type == RunType.task_v2, task_v2_wpid))),
+            )
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
 
             if status:
                 query = query.filter(effective_status.in_(status))
@@ -1837,6 +1950,10 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.copilot_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
+                    if folder_access_filter is not None:
+                        fallback_query = fallback_query.filter(
+                            await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+                        )
                     if search_key:
                         fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
@@ -2443,12 +2560,19 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str | None = None,
         organization_id: str | None = None,
     ) -> list[WorkflowRun]:
+        if organization_id:
+            await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
             if workflow_permanent_id:
                 query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
+                folder_access_filter = await _folder_access_filter(
+                    organization_id, WorkflowRunModel.workflow_permanent_id
+                )
+                if folder_access_filter is not None:
+                    query = query.where(folder_access_filter)
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
@@ -3028,6 +3152,7 @@ class WorkflowRunsRepository(BaseRepository):
         search_key: str | None = None,
         error_code: str | None = None,
     ) -> list[WorkflowRun]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             statement_timeout_seconds: float | None = None
             if _is_bounded_runs_list_read(session, search_key):
@@ -3044,6 +3169,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
 
             query = self._apply_workflow_run_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code, organization_id)
@@ -3094,12 +3222,16 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str,
         status: list[WorkflowRunStatus] | None = None,
     ) -> int:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             count_query = (
                 select(func.count())
                 .select_from(WorkflowRunModel)
                 .filter(WorkflowRunModel.organization_id == organization_id)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                count_query = count_query.where(folder_access_filter)
             if status:
                 count_query = count_query.filter(WorkflowRunModel.status.in_(status))
             return (await session.execute(count_query)).scalar_one()
@@ -3166,6 +3298,7 @@ class WorkflowRunsRepository(BaseRepository):
         Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
         and complete browser or credential identifiers.
         """
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             statement_timeout_seconds: float | None = None
             if _is_bounded_runs_list_read(session, search_key):
@@ -3181,6 +3314,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
             if exclude_child_runs:
                 query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
             query = self._apply_workflow_run_search_key_filter(query, search_key)
@@ -3220,6 +3356,7 @@ class WorkflowRunsRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
     ) -> list[WorkflowRun]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             db_page = page - 1
             query = (
@@ -3229,10 +3366,11 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
-                .order_by(WorkflowRunModel.created_at.desc())
-                .limit(page_size)
-                .offset(db_page * page_size)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.where(folder_access_filter)
+            query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             return [
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
@@ -3250,6 +3388,7 @@ class WorkflowRunsRepository(BaseRepository):
             WorkflowRunAttemptModel.organization_id == organization_id,
             WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
         )
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             query = (
                 select(
@@ -3272,8 +3411,11 @@ class WorkflowRunsRepository(BaseRepository):
                     )
                 )
                 .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
-                .limit(101)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.where(folder_access_filter)
+            query = query.limit(101)
             result = await session.execute(query)
             return [
                 {**dict(row), "association_browser_session_id": browser_session_id} for row in result.mappings().all()

@@ -1924,6 +1924,7 @@ async def _provision_browser_session(
                 timeout_minutes=30,
                 created_by="copilot",
                 session_kind=BrowserSessionKind.copilot,
+                created_for_workflow_permanent_id=ctx.workflow_permanent_id,
                 **creation_kwargs,
             )
         if ctx.browser_session_id:

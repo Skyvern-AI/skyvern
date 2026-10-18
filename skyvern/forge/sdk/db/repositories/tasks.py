@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     as_stored_json,
     convert_to_step,
@@ -765,6 +766,7 @@ class TasksRepository(BaseRepository):
                 task.queued_at = None
                 task.started_at = None
                 task.finished_at = None
+                task.task_queue = None
                 await session.commit()
                 await session.refresh(task)
                 reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -777,6 +779,17 @@ class TasksRepository(BaseRepository):
             status=TaskStatus.created.value,
         )
         return reset_task
+
+    @db_operation("update_task_routing")
+    async def update_task_routing(self, task_id: str, task_queue: str) -> None:
+        """Record the latest selected Temporal queue without refreshing the task's lifecycle or reaper clocks."""
+        async with self.Session() as session:
+            await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .values(task_queue=task_queue, modified_at=TaskModel.modified_at)
+            )
+            await session.commit()
 
     @db_operation("update_task_2fa_state")
     async def update_task_2fa_state(
@@ -974,6 +987,9 @@ class TasksRepository(BaseRepository):
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
 
+        folder_access_filter = None
+        if organization_id is not None:
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
         async with self.Session() as session:
             db_page = page - 1  # offset logic is 0 based
             query = (
@@ -981,6 +997,8 @@ class TasksRepository(BaseRepository):
                 .join(WorkflowRunModel, TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id, isouter=True)
                 .filter(TaskModel.organization_id == organization_id)
             )
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
             if task_status:
                 query = query.filter(TaskModel.status.in_(task_status))
             if workflow_run_id:

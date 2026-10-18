@@ -40,11 +40,6 @@ class FailureCategory(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
-# Cloud-only condition (custom proxy URLs are rejected there, never in OSS), but the message text
-# is the one source of truth cloud/exceptions.py and cloud/webeye/proxy.py both raise verbatim —
-# skyvern/ cannot import cloud/, so the string lives here and cloud imports it, not the reverse.
-CUSTOM_PROXY_URL_REJECTION_MESSAGE = "Custom proxy URLs are not supported in Skyvern Cloud"
-
 # Matches the activity/heartbeat timeout tokens the worker persists when a Temporal-activity
 # timeout finalizes a run. Word-anchored so "inactivity timeout" (a distinct page-level reason)
 # is NOT caught and correctly stays PAGE_LOAD_TIMEOUT.
@@ -203,7 +198,6 @@ def classify_from_failure_reason(
     reason = (failure_reason or "").lower()
     auth_scan_reason = _SELECTOR_PAYLOAD_RE.sub(" ", reason)
     exc_name = type(exception).__name__ if exception else (exception_name or "")
-    is_custom_proxy_url_rejection = CUSTOM_PROXY_URL_REJECTION_MESSAGE.lower() in reason
 
     categories: list[dict] = []
 
@@ -307,9 +301,8 @@ def classify_from_failure_reason(
         )
 
     # Browser errors — only match if not already classified as PROXY_ERROR above
-    elif not is_custom_proxy_url_rejection and (
-        any(kw in exc_name for kw in ["Browser", "CDP", "TargetClosed"])
-        or any(kw in reason for kw in ["browser context closed", "page closed", "browser crash"])
+    elif any(kw in exc_name for kw in ["Browser", "CDP", "TargetClosed"]) or any(
+        kw in reason for kw in ["browser context closed", "page closed", "browser crash"]
     ):
         categories.append(
             {
@@ -541,7 +534,6 @@ def classify_from_failure_reason(
         "should have already been set through workflow run parameters",
         "should have already been set through workflow run context init",
         "pre-run invariant: workflow_definition and persisted parameter rows disagree",
-        CUSTOM_PROXY_URL_REJECTION_MESSAGE.lower(),
     ]
     if any(kw in reason for kw in _param_binding_keywords):
         categories.append(

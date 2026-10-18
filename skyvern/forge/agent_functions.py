@@ -5,7 +5,7 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -88,24 +88,20 @@ from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerification
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
-from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraped_page import (
-    ELEMENT_NODE_ATTRIBUTES,
-    CleanupElementTreeFunc,
-    ScrapedPage,
-    json_to_html,
-)
+from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -980,7 +976,59 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+OnePasswordTelemetryEvent = Literal[
+    "onepassword.token_saved",
+    "onepassword.token_cleared",
+    "onepassword.items_loaded",
+]
+OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeout", "upstream", "internal"]
+
+
 class AgentFunction:
+    async def accessible_workflow_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
+        """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
+        return None
+
+    async def enforce_folder_access(
+        self, principal: RequestPrincipal | None, action: str, resource: Mapping[str, object]
+    ) -> None:
+        """Cloud raises 403 when a workflow folder denies the action; OSS has no folder ACLs."""
+        return None
+
+    async def enforce_folder_access_for_references(
+        self, principal: RequestPrincipal | None, action: str, payload: Mapping[str, object]
+    ) -> None:
+        """Cloud raises 403 when any resource named anywhere in the payload is in a folder that denies the action."""
+        return None
+
+    async def enforce_folder_access_for_ids(
+        self, principal: RequestPrincipal | None, action: str, references: set[tuple[str, str]]
+    ) -> None:
+        """Cloud raises 403 when a folder denies the action on any (resource key, id) pair; OSS allows."""
+        return None
+
+    async def enforce_folder_access_everywhere(self, principal: RequestPrincipal | None, action: str) -> None:
+        """Cloud raises 403 unless the action is allowed in every restricted folder; OSS allows."""
+        return None
+
+    async def enforce_folder_access_for_runs(
+        self, principal: RequestPrincipal | None, action: str, run_ids: Sequence[str]
+    ) -> None:
+        """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
+        return None
+
+    async def hidden_workflow_permanent_ids(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> frozenset[str] | None:
+        """Cloud returns the workflows in folders the caller cannot see; OSS hides nothing."""
+        return None
+
+    async def on_folder_created(
+        self, session: AsyncSession, folder: FolderModel, principal: RequestPrincipal | None
+    ) -> None:
+        """Cloud uses this transaction hook to initialize folder ACLs; OSS has no ACL store."""
+        return None
+
     async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
         """OSS has no customer audit store; cloud overrides this best-effort hook."""
         return None
@@ -991,6 +1039,9 @@ class AgentFunction:
         action: str,
         resource: Mapping[str, object],
     ) -> str | None:
+        return None
+
+    async def enforce_request_authorization(self, principal: RequestPrincipal | None, action: str) -> None:
         return None
 
     async def enforce_request_role(
@@ -1137,97 +1188,6 @@ class AgentFunction:
     def supports_sequential_credentials(self) -> bool:
         """Whether this deployment can execute credentials marked run_sequentially."""
         return False
-
-    def begin_browser_observation(self, page: Page | None = None, *, frame: Frame | None = None) -> object | None:
-        """Notify an extension that a new browser observation is starting."""
-        return None
-
-    async def prepare_browser_observation(self, page: Page) -> None:
-        pass
-
-    def record_browser_observation_failure(self, reason: str) -> None:
-        """Notify an extension that browser content could not be fully observed."""
-
-    async def inspect_browser_observation(
-        self,
-        inner_text: str,
-        element_tree: list[dict[str, Any]],
-        semantic_text: str | None,
-        document: object | None = None,
-    ) -> None:
-        """Offer a complete browser observation to an extension."""
-
-    def filter_browser_screenshots(self, screenshots: list[bytes] | None) -> list[bytes] | None:
-        """Return the browser screenshots that may enter an agent prompt."""
-        return screenshots
-
-    def needs_browser_observation(self) -> bool:
-        """Return whether an extension consumes browser observations at all.
-
-        Call sites use this to skip building an observation nothing will read.
-        """
-        return False
-
-    def needs_browser_observation_text(self) -> bool:
-        """Return whether the extension needs supplemental rendered text."""
-        return False
-
-    def transform_browser_elements_for_prompt(self, elements: str) -> str:
-        """Transform browser-derived elements before they enter an agent prompt."""
-        return elements
-
-    async def inspect_browser_dialog(
-        self,
-        dialog_type: str,
-        message: str,
-        default_value: str | None,
-        page: Page | None = None,
-    ) -> bool:
-        """Return whether asynchronous inspection requires the browser dialog to be dismissed."""
-        return False
-
-    def should_dismiss_browser_dialog(
-        self,
-        dialog_type: str,
-        message: str,
-        default_value: str | None,
-        page: Page | None = None,
-    ) -> bool:
-        """Return whether an extension requires the browser dialog to be dismissed."""
-        return False
-
-    def should_block_browser_action(self, action_type: ActionType, page: Page | None = None) -> bool:
-        """Return whether an extension policy blocks a proposed browser action."""
-        return False
-
-    def enforce_browser_action_policy(self, action_type: ActionType, page: Page | None = None) -> None:
-        """Allow an extension to stop a browser action before it mutates the page."""
-
-    def register_browser_origin_authority(
-        self,
-        *,
-        task_id: str,
-        workflow_run_id: str | None,
-        url: str,
-    ) -> None:
-        """Offer a task's explicitly declared browser origin to an extension."""
-
-    async def enforce_browser_action_egress_policy(
-        self,
-        *,
-        action: Action,
-        task: Task,
-        page: Page,
-        scraped_page: ScrapedPage,
-    ) -> None:
-        """Allow an extension to enforce browser destination policy for a proposed action."""
-
-    def enforce_cached_browser_script_policy(self) -> None:
-        """Allow an extension to stop cached browser code before it executes."""
-
-    def should_use_cached_browser_scripts(self) -> bool:
-        """Return whether cached browser code may be selected for this run."""
-        return True
 
     def is_wait_time_optimization_enabled(self) -> bool:
         return False
@@ -1423,6 +1383,16 @@ class AgentFunction:
         the worker's local browser.
         """
         return False
+
+    def on_origin_scoped_headers_route_installed(
+        self, browser_context: BrowserContext, target_origin: tuple[str, str, int] | None
+    ) -> None:
+        """A context route now rewrites headers for requests to ``target_origin``.
+
+        Cloud registers an exemption so its CodeBlock egress filter yields matching requests
+        back to that route instead of fulfilling them itself; OSS has no such filter.
+        """
+        return None
 
     def serialize_codeblock_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
         """Cloud overrides this with the runner's canonical parameter serialization."""
@@ -1636,6 +1606,17 @@ class AgentFunction:
         has_reason: bool,
     ) -> None:
         """Forward a thumbs rating to product analytics. OSS builds have no product analytics sink."""
+
+    async def capture_onepassword_telemetry(
+        self,
+        *,
+        organization_id: str,
+        event: OnePasswordTelemetryEvent,
+        success: bool,
+        item_count: int | None = None,
+        error_class: OnePasswordTelemetryErrorClass | None = None,
+    ) -> None:
+        """Capture safe 1Password funnel telemetry; OSS has no product analytics sink."""
 
     async def get_workflow_run_execution_status(
         self, workflow_run: WorkflowRun
@@ -1867,6 +1848,10 @@ class AgentFunction:
         feature_names: set[str] | None = None,
     ) -> None:
         return
+
+    def browser_session_create_admission(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+        """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
+        return nullcontext()
 
     async def parse_enterprise_totp_secret(
         self,
@@ -2264,6 +2249,9 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         required_scopes: list[str] | None = None,
+        connection_id: str | None = None,
+        initiating_user_id: str | None = None,
+        custody_mode: str | None = None,
     ) -> str | None:
         try:
             secrets = await microsoft_oauth_service.load_credential_secrets(
@@ -2282,6 +2270,9 @@ class AgentFunction:
                 organization_id=organization_id,
                 credential_id=credential_id,
                 credential_secrets=secrets,
+                connection_id=connection_id,
+                initiating_user_id=initiating_user_id,
+                custody_mode=custody_mode,
             )
         except Exception:
             LOG.exception(
@@ -2778,20 +2769,6 @@ class AgentFunction:
                 headers=headers,
                 timeout=httpx.Timeout(timeout_seconds),
             )
-
-    def enforce_external_request_policy(
-        self,
-        *,
-        declared_url: str,
-        rendered_url: str,
-        destination_is_dynamic: bool,
-    ) -> str | None:
-        """Validate an external request and optionally constrain redirects to one origin.
-
-        OSS intentionally leaves this extension seam inert. Cloud deployments may return
-        the canonical origin that redirects must retain or raise to block the request.
-        """
-        return None
 
     async def post_totp_verification_request(
         self,

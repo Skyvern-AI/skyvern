@@ -1,4 +1,5 @@
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from typing import Any
 
 import structlog
 from fastapi import Depends
@@ -129,6 +130,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.credentials.create_credential": "credential.create",
     "skyvern.forge.sdk.routes.credentials.create_credential_folder": "credential_folder.create",
     "skyvern.forge.sdk.routes.credentials.delete_credential": "credential.delete",
+    "skyvern.forge.sdk.routes.credentials.delete_temporary_credential": "credential.temporary.delete",
     "skyvern.forge.sdk.routes.credentials.delete_credential_folder": "credential_folder.delete",
     "skyvern.forge.sdk.routes.credentials.get_azure_client_secret_credential": "vault_provider.read",
     "skyvern.forge.sdk.routes.credentials.get_bitwarden_credential": "vault_provider.status",
@@ -138,6 +140,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.credentials.get_credential_totp_code": "credential.read",
     "skyvern.forge.sdk.routes.credentials.get_credentials": "credential.list",
     "skyvern.forge.sdk.routes.credentials.get_custom_credential_service_config": "vault_provider.read",
+    "skyvern.forge.sdk.routes.credentials.get_custom_credential_service_status": "vault_provider.status",
     "skyvern.forge.sdk.routes.credentials.get_onepassword_token": "vault_provider.read",
     "skyvern.forge.sdk.routes.credentials.get_onepassword_token_status": "vault_provider.status",
     "skyvern.forge.sdk.routes.credentials.get_test_credential_status": "credential.list",
@@ -164,7 +167,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.debug_sessions.get_debug_session_runs": "debug_session.list",
     "skyvern.forge.sdk.routes.debug_sessions.get_debug_session_viewer_state": "debug_session.read",
     "skyvern.forge.sdk.routes.debug_sessions.get_login_block_compatibility": "debug_session.read",
-    "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.read",
+    "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.new_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.prewarm_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
@@ -194,7 +197,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.prompts.generate_workflow_title": "prompt.execute",
     "skyvern.forge.sdk.routes.prompts.improve_prompt": "prompt.execute",
     "skyvern.forge.sdk.routes.prompts.summarize_output": "prompt.execute",
-    "skyvern.forge.sdk.routes.run_blocks.download_files": "workflow_run.read",
+    "skyvern.forge.sdk.routes.run_blocks.download_files": "workflow_run.execute",
     "skyvern.forge.sdk.routes.run_blocks.login": "workflow_run.execute",
     "skyvern.forge.sdk.routes.runtime_config.get_runtime_config": "runtime_config.read",
     "skyvern.forge.sdk.routes.scripts.clear_workflow_cache": "script.delete",
@@ -289,16 +292,29 @@ def register_route_actions(route_actions: Mapping[str, str]) -> None:
     _REGISTERED_ROUTE_ACTIONS.update(route_actions)
 
 
+def endpoint_action(endpoint: Any) -> str | None:
+    handler = f"{endpoint.__module__}.{endpoint.__name__}" if endpoint else ""
+    return _REGISTERED_ROUTE_ACTIONS.get(handler) or ROUTE_ACTIONS.get(handler)
+
+
 def _route_action(connection: HTTPConnection) -> tuple[str | None, dict[str, object]]:
     route = connection.scope.get("route")
     route_path = getattr(route, "path", connection.url.path)
-    endpoint = getattr(route, "endpoint", None)
-    handler = f"{endpoint.__module__}.{endpoint.__name__}" if endpoint else ""
-    action = _REGISTERED_ROUTE_ACTIONS.get(handler)
-    if action is None:
-        action = ROUTE_ACTIONS.get(handler)
+    action = endpoint_action(getattr(route, "endpoint", None))
     resource = {"$route": route_path, **connection.path_params}
     return action, resource
+
+
+def require_request_actions(actions: frozenset[str]) -> Callable[[], Awaitable[None]]:
+    if not actions:
+        raise ValueError("require_request_actions needs at least one action")
+
+    async def enforce_request_action() -> None:
+        principal = get_request_principal()
+        for action in actions:
+            await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
+
+    return enforce_request_action
 
 
 async def _authorize_connection(connection: HTTPConnection) -> None:

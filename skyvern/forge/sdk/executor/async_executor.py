@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Request
 
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 
 
 class AsyncExecutor(abc.ABC):
@@ -15,6 +15,10 @@ class AsyncExecutor(abc.ABC):
     async def stop_retry_recovery(self) -> None:
         """Stop any periodic retry recovery started by recover_pending_retries."""
         return
+
+    async def sends_final_webhook_after_cancel(self, workflow_run: WorkflowRun) -> bool:
+        """Whether a started run's own finalizer still sends its final webhook after a cancel, even if its process dies."""
+        return False
 
     @abc.abstractmethod
     async def execute_task(

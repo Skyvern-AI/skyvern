@@ -41,6 +41,7 @@ class TapSessionState(TypedDict):
     frames: dict[str, dict[str, Any]]
     main_frame_id: str
     seen_navigation_entry_ids: set[str]
+    main_frame_navigations: int
     drain_acks: dict[str, tuple[str | None, int]]
     seen_event_sequences: dict[str, dict[str, int]]
     worlds: dict[str, int]
@@ -185,6 +186,7 @@ class PageTap:
             "frames": {},
             "main_frame_id": str(tree["frameTree"]["frame"]["id"]),
             "seen_navigation_entry_ids": seen_navigation_entry_ids,
+            "main_frame_navigations": 0,
             "drain_acks": {},
             "seen_event_sequences": {},
             "worlds": {},
@@ -218,11 +220,16 @@ class PageTap:
         state["worlds"].pop(frame_id, None)
         if not state["is_page_session"] or frame_id != state["main_frame_id"]:
             return
+        state["main_frame_navigations"] += 1
         self._spawn(
             self._enqueue_navigation_event(
                 session_key,
                 state,
                 frame_id,
+                committed_url=str(
+                    frame.get("unreachableUrl") or f"{frame.get('url') or ''}{frame.get('urlFragment') or ''}"
+                ),
+                navigation_seq=state["main_frame_navigations"],
                 previous_url=previous_url,
                 timestamp_ms=time.time() * 1000,
                 suppressed=bool(self._control_navigation_depth),
@@ -235,23 +242,55 @@ class PageTap:
         state: TapSessionState,
         frame_id: str,
         *,
+        committed_url: str,
+        navigation_seq: int,
         previous_url: str,
         timestamp_ms: float,
         suppressed: bool,
     ) -> None:
-        try:
-            history = await state["session"].send("Page.getNavigationHistory")
-            current_index = history.get("currentIndex")
-            entries = history.get("entries")
-            if not isinstance(current_index, int) or not isinstance(entries, list):
+        session = state["session"]
+        seen = state["seen_navigation_entry_ids"]
+        entry: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            current_index, entries = await _navigation_history(session)
+            entry = entries[current_index]
+        if (
+            entry is None
+            or entry.get("url") != committed_url
+            or _entry_id(entry) in seen
+            or state["main_frame_navigations"] != navigation_seq
+        ):
+            # The first read can be stale or fail because the renderer reports frameNavigated before the browser
+            # records the entry, or hold a later navigation's entry. Chromium holds renderer-bound commands like
+            # getFrameTree until pending navigations finish.
+            try:
+                await asyncio.wait_for(session.send("Page.getFrameTree"), timeout=3)
+                current_index, entries = await _navigation_history(session)
+            except Exception:  # noqa: BLE001
                 return
             entry = entries[current_index]
-        except Exception:  # noqa: BLE001
+            # Without a later navigation the current entry is this one, even after a same-document URL change.
+            # Otherwise take the oldest unseen entry with this URL, since a later navigation to it owns any newer one.
+            if state["main_frame_navigations"] != navigation_seq:
+                entry = next(
+                    (
+                        candidate
+                        for candidate in entries
+                        if _entry_id(candidate) not in seen and _is_navigation_entry(candidate, committed_url)
+                    ),
+                    None,
+                )
+        entry_id = _entry_id(entry) if entry is not None else ""
+        if entry is None or not entry_id or entry_id in seen:
+            LOG.debug(
+                "copilot_demonstration_navigation_entry_unmatched",
+                session_key=session_key,
+                navigation_seq=navigation_seq,
+                latest_navigation_seq=state["main_frame_navigations"],
+                entry_id=entry_id or None,
+            )
             return
-        entry_id = str(entry.get("id") or "")
-        if not entry_id or entry_id in state["seen_navigation_entry_ids"]:
-            return
-        state["seen_navigation_entry_ids"].add(entry_id)
+        seen.add(entry_id)
         if suppressed:
             return
         transition_type = entry.get("transitionType")
@@ -606,6 +645,27 @@ class PageTap:
         self._page_sessions.clear()
         self._oopif_sessions.clear()
         self._refused_frames.clear()
+
+
+def _entry_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("id") or "")
+
+
+def _is_navigation_entry(entry: dict[str, Any], committed_url: str) -> bool:
+    # userTypedURL survives a page rewriting its own URL with replaceState; pushState entries inherit it, so only
+    # user navigations match on it.
+    return entry.get("url") == committed_url or (
+        entry.get("userTypedURL") == committed_url and entry.get("transitionType") in USER_NAVIGATION_TRANSITIONS
+    )
+
+
+async def _navigation_history(session: CDPSession) -> tuple[int, list[dict[str, Any]]]:
+    history = await session.send("Page.getNavigationHistory")
+    current_index = history.get("currentIndex")
+    entries = history.get("entries")
+    if not isinstance(current_index, int) or not isinstance(entries, list) or not 0 <= current_index < len(entries):
+        raise ValueError("navigation history has no current entry")
+    return current_index, entries
 
 
 def _is_detached_session_error(exc: Exception) -> bool:

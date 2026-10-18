@@ -56,6 +56,7 @@ class WorkflowRunGroup(BaseModel):
     submission_key: str
     input_fingerprint: str
     status: WorkflowRunGroupStatus
+    created_by: str | None = Field(default=None, exclude=True)
     created_at: datetime
     modified_at: datetime
     finished_at: datetime | None
