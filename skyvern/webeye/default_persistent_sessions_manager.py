@@ -804,6 +804,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected_browser_session_id: str | None = None,
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
@@ -838,6 +839,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 created_by=created_by,
                 browser_settings=browser_settings,
                 created_for_workflow_run_id=created_for_workflow_run_id,
+                created_for_workflow_permanent_id=created_for_workflow_permanent_id,
             )
         except BaseException as error:
             # A failed acknowledgement does not prove the committed session is an orphan.

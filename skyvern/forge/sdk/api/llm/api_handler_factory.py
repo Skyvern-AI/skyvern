@@ -2152,7 +2152,6 @@ class LLMAPIHandlerFactory:
                                 )
                             )
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
-                screenshots = app.AGENT_FUNCTION.filter_browser_screenshots(screenshots)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
                 _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
@@ -3033,7 +3032,6 @@ class LLMAPIHandlerFactory:
                             )
 
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
-                screenshots = app.AGENT_FUNCTION.filter_browser_screenshots(screenshots)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
                 _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
@@ -4023,7 +4021,6 @@ class LLMCaller:
                         )
 
             screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
-            screenshots = app.AGENT_FUNCTION.filter_browser_screenshots(screenshots)
             llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
             _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 

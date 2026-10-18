@@ -13,6 +13,8 @@ import {
 } from "@radix-ui/react-icons";
 import { CustomLLM, CustomLLMConfig, CustomLLMProvider } from "@/api/types";
 import { useCustomLLMs } from "@/hooks/useCustomLLMs";
+import { AdminOnlyTooltip } from "@/components/AdminOnlyTooltip";
+import { useHasCapability } from "@/store/PageSlots";
 import { Button } from "@/components/ui/button";
 import {
   Form,
@@ -209,6 +211,9 @@ export function CustomLLMConfigForm() {
     isUpdating,
     isDeleting,
   } = useCustomLLMs();
+  const canCreate = useHasCapability("custom_model.create");
+  const canUpdate = useHasCapability("custom_model.update");
+  const canDelete = useHasCapability("custom_model.delete");
 
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
@@ -216,6 +221,8 @@ export function CustomLLMConfigForm() {
   });
   const provider = form.watch("config.provider");
   const isMutating = isCreating || isUpdating || isDeleting;
+  const formControlsDisabled =
+    isLoading || isMutating || !(editing ? canUpdate : canCreate);
 
   useEffect(() => {
     if (!editing) {
@@ -250,6 +257,9 @@ export function CustomLLMConfigForm() {
     setExtraParams((rows) => rows.filter((_, i) => i !== index));
 
   const onSubmit = (values: FormData) => {
+    if (editing ? !canUpdate : !canCreate) {
+      return;
+    }
     const { params, error } = buildExtraParameters(extraParams);
     if (error) {
       setExtraParamsError(error);
@@ -311,26 +321,32 @@ export function CustomLLMConfigForm() {
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={isMutating}
-                  onClick={() => setEditing(customLLM)}
-                >
-                  <Pencil1Icon className="mr-2 h-4 w-4" />
-                  Edit
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="destructive"
-                  disabled={isMutating}
-                  onClick={() => deleteCustomLLM(customLLM)}
-                >
-                  <TrashIcon className="mr-2 h-4 w-4" />
-                  Delete
-                </Button>
+                <AdminOnlyTooltip allowed={canUpdate}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={isMutating || !canUpdate}
+                    onClick={() => setEditing(customLLM)}
+                  >
+                    <Pencil1Icon className="mr-2 h-4 w-4" />
+                    Edit
+                  </Button>
+                </AdminOnlyTooltip>
+                <AdminOnlyTooltip allowed={canDelete}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="destructive"
+                    disabled={isMutating || !canDelete}
+                    onClick={() => {
+                      if (canDelete) deleteCustomLLM(customLLM);
+                    }}
+                  >
+                    <TrashIcon className="mr-2 h-4 w-4" />
+                    Delete
+                  </Button>
+                </AdminOnlyTooltip>
               </div>
             </div>
           ))}
@@ -350,7 +366,7 @@ export function CustomLLMConfigForm() {
                     <Input
                       {...field}
                       placeholder="Local Llama"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormMessage />
@@ -369,7 +385,7 @@ export function CustomLLMConfigForm() {
                     onValueChange={(value) =>
                       onProviderChange(value as CustomLLMProvider)
                     }
-                    disabled={isLoading || isMutating}
+                    disabled={formControlsDisabled}
                   >
                     <FormControl>
                       <SelectTrigger>
@@ -408,7 +424,7 @@ export function CustomLLMConfigForm() {
                             ? "gemini-2.5-flash"
                             : "mistral"
                     }
-                    disabled={isLoading || isMutating}
+                    disabled={formControlsDisabled}
                   />
                 </FormControl>
                 <FormDescription>
@@ -433,7 +449,7 @@ export function CustomLLMConfigForm() {
                       {...field}
                       value={field.value ?? ""}
                       placeholder="https://api.example.com/v1"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormMessage />
@@ -458,7 +474,7 @@ export function CustomLLMConfigForm() {
                         placeholder={
                           provider === "ollama" ? "optional" : "sk-..."
                         }
-                        disabled={isLoading || isMutating}
+                        disabled={formControlsDisabled}
                       />
                     </FormControl>
                     <Button
@@ -468,7 +484,7 @@ export function CustomLLMConfigForm() {
                       aria-label={showApiKey ? "Hide API key" : "Show API key"}
                       className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
                       onClick={() => setShowApiKey((value) => !value)}
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     >
                       {showApiKey ? (
                         <EyeClosedIcon className="h-4 w-4" />
@@ -496,7 +512,7 @@ export function CustomLLMConfigForm() {
                         {...field}
                         value={field.value ?? ""}
                         placeholder="optional"
-                        disabled={isLoading || isMutating}
+                        disabled={formControlsDisabled}
                       />
                     </FormControl>
                     <FormMessage />
@@ -518,7 +534,7 @@ export function CustomLLMConfigForm() {
                       type="number"
                       min={1}
                       placeholder="default"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormMessage />
@@ -541,7 +557,7 @@ export function CustomLLMConfigForm() {
                       max={2}
                       step="0.1"
                       placeholder="default"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormMessage />
@@ -560,7 +576,7 @@ export function CustomLLMConfigForm() {
                       {...field}
                       value={field.value ?? ""}
                       placeholder="optional"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormMessage />
@@ -579,7 +595,7 @@ export function CustomLLMConfigForm() {
                     <Switch
                       checked={field.value}
                       onCheckedChange={field.onChange}
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormLabel className="text-sm font-normal">
@@ -598,7 +614,7 @@ export function CustomLLMConfigForm() {
                     <Switch
                       checked={field.value}
                       onCheckedChange={field.onChange}
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                     />
                   </FormControl>
                   <FormLabel className="text-sm font-normal">
@@ -630,7 +646,7 @@ export function CustomLLMConfigForm() {
                       value={row.key}
                       placeholder="Parameter name"
                       className="md:w-1/3"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                       onChange={(event) =>
                         updateExtraParam(index, "key", event.target.value)
                       }
@@ -639,7 +655,7 @@ export function CustomLLMConfigForm() {
                       value={row.value}
                       placeholder='Value (e.g. flex or {"type":"enabled"})'
                       className="md:flex-1"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                       onChange={(event) =>
                         updateExtraParam(index, "value", event.target.value)
                       }
@@ -649,7 +665,7 @@ export function CustomLLMConfigForm() {
                       variant="outline"
                       size="icon"
                       aria-label="Remove parameter"
-                      disabled={isLoading || isMutating}
+                      disabled={formControlsDisabled}
                       onClick={() => removeExtraParam(index)}
                     >
                       <TrashIcon className="h-4 w-4" />
@@ -665,7 +681,7 @@ export function CustomLLMConfigForm() {
               type="button"
               variant="outline"
               size="sm"
-              disabled={isLoading || isMutating}
+              disabled={formControlsDisabled}
               onClick={addExtraParam}
             >
               <PlusIcon className="mr-2 h-4 w-4" />
@@ -674,20 +690,22 @@ export function CustomLLMConfigForm() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <Button type="submit" disabled={isLoading || isMutating}>
-              {editing ? (
-                <CheckIcon className="mr-2 h-4 w-4" />
-              ) : (
-                <PlusIcon className="mr-2 h-4 w-4" />
-              )}
-              {editing
-                ? isUpdating
-                  ? "Saving..."
-                  : "Save Custom LLM"
-                : isCreating
-                  ? "Adding..."
-                  : "Add Custom LLM"}
-            </Button>
+            <AdminOnlyTooltip allowed={editing ? canUpdate : canCreate}>
+              <Button type="submit" disabled={formControlsDisabled}>
+                {editing ? (
+                  <CheckIcon className="mr-2 h-4 w-4" />
+                ) : (
+                  <PlusIcon className="mr-2 h-4 w-4" />
+                )}
+                {editing
+                  ? isUpdating
+                    ? "Saving..."
+                    : "Save Custom LLM"
+                  : isCreating
+                    ? "Adding..."
+                    : "Add Custom LLM"}
+              </Button>
+            </AdminOnlyTooltip>
             {editing && (
               <Button
                 type="button"

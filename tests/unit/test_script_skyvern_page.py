@@ -347,11 +347,15 @@ async def test_wait_for_page_ready_before_action_handles_no_page(mock_scraped_pa
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
+        # Create a mock page first, then set page to None after construction
+        mock_page = create_mock_page()
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
-            page=None,  # type: ignore[arg-type]
+            page=mock_page,
             ai=mock_ai,
         )
+        # Simulate page being None (e.g., after page was closed)
+        script_page.page = None
 
         # This should return early without raising an error
         with patch(
@@ -437,8 +441,9 @@ async def test_wait_for_page_ready_attribute_access_regression():
     """
     source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
 
-    # The fixed code reads the encapsulated raw page rather than a writable alias.
-    assert "_get_raw_page(self)" in source, "Method should access the wrapped raw page"
+    # The fixed code should use self.page
+    # nosemgrep false positive: "self.page" is an attribute name, not a URL.
+    assert "self.page" in source, "Method should access self.page"  # nosemgrep: incomplete-url-substring-sanitization
 
     # The fixed code should NOT use self._page (except in comments)
     # Remove comments and docstrings first
@@ -462,7 +467,7 @@ async def test_wait_for_page_ready_attribute_access_regression():
             if "self._page" in line and not line.strip().startswith("#"):
                 pytest.fail(
                     f"Found 'self._page' in code at line {i}: {line.strip()}\n"
-                    "This is a regression! SkyvernPage stores browser state outside the wrapper instance."
+                    "This is a regression! SkyvernPage uses self.page, not self._page."
                 )
 
 
@@ -545,15 +550,18 @@ async def test_ensure_element_ids_handles_no_page(mock_scraped_page, mock_ai):
     """
     When self.page is None, should return early without error.
     """
+    mock_page = create_mock_page()
+
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
-            page=None,  # type: ignore[arg-type]
+            page=mock_page,
             ai=mock_ai,
         )
+        script_page.page = None
 
         with patch(
             "skyvern.core.script_generations.script_skyvern_page.SkyvernFrame.create_instance",
@@ -1161,7 +1169,7 @@ async def test_fill_autocomplete_rejects_raw_totp_placeholder_after_resolution(m
 
 
 @pytest.mark.asyncio
-async def test_fill_autocomplete_proactive_preserves_unresolved_totp_for_ai_policy(mock_scraped_page, mock_ai):
+async def test_fill_autocomplete_proactive_rejects_raw_totp_placeholder_before_ai(mock_scraped_page, mock_ai):
     mock_page = create_mock_page()
 
     with patch(
@@ -1174,19 +1182,18 @@ async def test_fill_autocomplete_proactive_preserves_unresolved_totp_for_ai_poli
             ai=mock_ai,
         )
 
-        script_page.get_actual_value = AsyncMock()
+        script_page.get_actual_value = AsyncMock(return_value="placeholder_AbCd_totp")
         script_page._ai.ai_input_text = AsyncMock(return_value="placeholder_AbCd_totp")
 
-        result = await script_page.fill_autocomplete(
-            selector="#otp",
-            value="placeholder_AbCd_totp",
-            prompt="Enter the verification code",
-            ai="proactive",
-        )
+        with pytest.raises(NoTOTPSecretFound):
+            await script_page.fill_autocomplete(
+                selector="#otp",
+                value="placeholder_AbCd_totp",
+                prompt="Enter the verification code",
+                ai="proactive",
+            )
 
-        assert result == "placeholder_AbCd_totp"
-        assert script_page._ai.ai_input_text.await_args.kwargs["value"] == "placeholder_AbCd_totp"
-        script_page.get_actual_value.assert_not_awaited()
+        script_page._ai.ai_input_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1254,11 +1261,7 @@ async def test_input_text_does_not_send_unresolved_totp_placeholder_to_ai_fallba
             ai=mock_ai,
         )
 
-        locator = MagicMock()
-        locator.fill = AsyncMock()
-        script_page._wait_for_selector_with_retry = AsyncMock(return_value=locator)
-        script_page._prepare_element = AsyncMock()
-        script_page._resolve_totp_placeholder_or_raise = AsyncMock(side_effect=NoTOTPSecretFound())
+        script_page.get_actual_value = AsyncMock(side_effect=NoTOTPSecretFound())
         script_page._ai.ai_input_text = AsyncMock(return_value="placeholder_AbCd_totp")
 
         with pytest.raises(NoTOTPSecretFound):
@@ -1295,12 +1298,13 @@ async def test_input_text_secret_failure_is_sanitized(mock_scraped_page, mock_ai
 
 
 @pytest.mark.asyncio
-async def test_input_text_selector_failure_redacts_sensitive_value_from_raised_exception(
+async def test_input_text_selector_failure_redacts_resolved_value_from_raised_exception(
     mock_scraped_page,
     mock_ai,
 ) -> None:
     sentinel_secret = "sentinel-secret-SKY-13079"
     script_page = _make_script_page(mock_scraped_page, mock_ai)
+    script_page.get_actual_value = AsyncMock(return_value=sentinel_secret)
     script_page._wait_for_selector_with_retry = AsyncMock(
         side_effect=RuntimeError(f"selector failed after resolving {sentinel_secret}")
     )
@@ -1308,7 +1312,7 @@ async def test_input_text_selector_failure_redacts_sensitive_value_from_raised_e
     with pytest.raises(SkyvernActionFailed) as exc_info:
         await script_page._input_text(
             selector="#secret",
-            value=ResolvedSensitiveValue(sentinel_secret),
+            value="secret_parameter",
             ai="fallback",
         )
 
@@ -1325,7 +1329,8 @@ async def test_input_text_selector_failure_redacts_sensitive_value_from_raised_e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sentinel_secret", ["sentinel-secret-SKY-13079", "sentinel-sécrét-SKY-13079"])
 async def test_fallback_episode_redacts_sensitive_metadata(sentinel_secret: str) -> None:
-    page_ai = RealSkyvernPageAi(MagicMock(), SimpleNamespace(url=f"https://example.com/{sentinel_secret}"))
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url=f"https://example.com/{sentinel_secret}")
     page_ai.current_label = "Login"
     context = SimpleNamespace(
         code_version=2,
@@ -1377,7 +1382,8 @@ async def test_setup_performed_episode_omits_selector_suggestions() -> None:
     # SKY-14052: the cached script's selector path is a raw Playwright click that never runs the
     # click setup. Handing the reviewer a selector for an action the setup performed would let it
     # bake a raw click that drops the setup semantics and re-toggles the control.
-    page_ai = RealSkyvernPageAi(MagicMock(), SimpleNamespace(url="https://example.com/form"))
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url="https://example.com/form")
     page_ai.current_label = "Agreements"
 
     with patch("skyvern.core.script_generations.real_skyvern_page_ai.app.DATABASE.scripts") as scripts:
@@ -1402,7 +1408,8 @@ async def test_setup_performed_episode_omits_selector_suggestions() -> None:
 
 @pytest.mark.asyncio
 async def test_ordinary_episode_still_carries_selector_suggestions() -> None:
-    page_ai = RealSkyvernPageAi(MagicMock(), SimpleNamespace(url="https://example.com/form"))
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url="https://example.com/form")
     page_ai.current_label = "Agreements"
 
     with patch("skyvern.core.script_generations.real_skyvern_page_ai.app.DATABASE.scripts") as scripts:
@@ -1421,7 +1428,7 @@ async def test_ordinary_episode_still_carries_selector_suggestions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_input_text_resolves_totp_after_selector_preparation(mock_scraped_page, mock_ai):
+async def test_input_text_regenerates_totp_after_selector_preparation(mock_scraped_page, mock_ai):
     mock_page = create_mock_page()
 
     with patch(
@@ -1435,7 +1442,7 @@ async def test_input_text_resolves_totp_after_selector_preparation(mock_scraped_
         )
 
         events: list[str] = []
-        generated_codes = iter(("123456",))
+        generated_codes = iter(("123456", "654321"))
         script_page.get_actual_value = AsyncMock(
             side_effect=lambda *_args, **_kwargs: events.append("generate") or next(generated_codes)
         )
@@ -1453,8 +1460,8 @@ async def test_input_text_resolves_totp_after_selector_preparation(mock_scraped_
         )
 
         assert result == "placeholder_AbCd_totp"
-        assert events == ["selector", "prepare", "generate", "fill:123456"]
-        locator.fill.assert_awaited_once_with("123456", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        assert events == ["generate", "selector", "prepare", "generate", "fill:654321"]
+        locator.fill.assert_awaited_once_with("654321", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
 
 
 @pytest.mark.asyncio
@@ -1540,11 +1547,7 @@ async def test_input_text_rejects_raw_totp_placeholder_after_resolution(mock_scr
             ai=mock_ai,
         )
 
-        locator = MagicMock()
-        locator.fill = AsyncMock()
-        script_page._wait_for_selector_with_retry = AsyncMock(return_value=locator)
-        script_page._prepare_element = AsyncMock()
-        script_page._resolve_totp_placeholder_or_raise = AsyncMock(return_value="placeholder_AbCd_totp")
+        script_page.get_actual_value = AsyncMock(return_value="placeholder_AbCd_totp")
         script_page._ai.ai_input_text = AsyncMock(return_value="placeholder_AbCd_totp")
 
         with pytest.raises(NoTOTPSecretFound):
@@ -1559,7 +1562,8 @@ async def test_input_text_rejects_raw_totp_placeholder_after_resolution(mock_scr
 
 
 @pytest.mark.asyncio
-async def test_input_text_rejects_raw_totp_placeholder_in_direct_mode(mock_scraped_page, mock_ai):
+@pytest.mark.parametrize("ai", [None, "proactive"])
+async def test_input_text_rejects_raw_totp_placeholder_in_nonfallback_modes(mock_scraped_page, mock_ai, ai):
     mock_page = create_mock_page()
 
     with patch(
@@ -1579,7 +1583,7 @@ async def test_input_text_rejects_raw_totp_placeholder_in_direct_mode(mock_scrap
             await script_page._input_text(
                 selector="#otp",
                 value="placeholder_AbCd_totp",
-                ai=None,
+                ai=ai,
                 intention="Enter the verification code",
             )
 
@@ -1638,7 +1642,7 @@ async def test_input_text_rejects_raw_totp_markers_in_direct_mode(mock_scraped_p
 
 @pytest.mark.asyncio
 async def test_real_page_ai_rejects_raw_totp_placeholder_before_fallback() -> None:
-    page_ai = RealSkyvernPageAi(MagicMock(), MagicMock())
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
     page_ai._maybe_run_v3_midrun = AsyncMock(return_value=(None, False))
 
     with (
@@ -3147,8 +3151,9 @@ class TestScriptSkyvernPageMagicLink:
         monkeypatch.setattr(module, "render_template", fake_render)
         monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
 
-        page = SimpleNamespace(goto=fake_goto, fill=fake_fill, url="https://portal.example.com")
-        script_page = ScriptSkyvernPage(scraped_page=MagicMock(), page=page, ai=MagicMock())
+        page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
+        script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+        script_page.page = page
         return script_page, state
 
     @staticmethod
@@ -3256,12 +3261,7 @@ class TestAiClickRunsRegisteredClickSetup:
     _MODULE = "skyvern.core.script_generations.real_skyvern_page_ai"
 
     def _build_page_ai(self):
-        page = MagicMock()
-        page.url = "https://example.com"
-        locator = MagicMock()
-        locator.click = AsyncMock()
-        page.locator.return_value = locator
-        page_ai = RealSkyvernPageAi(MagicMock(), page)
+        page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
         page_ai._maybe_run_v3_midrun = AsyncMock(return_value=(None, False))
         page_ai._refresh_scraped_page = AsyncMock()
         page_ai._record_element_fallback_episode = AsyncMock()
@@ -3269,6 +3269,12 @@ class TestAiClickRunsRegisteredClickSetup:
         scraped = MagicMock()
         scraped.build_element_tree.return_value = "tree"
         page_ai.scraped_page = scraped
+        page = MagicMock()
+        page.url = "https://example.com"
+        locator = MagicMock()
+        locator.click = AsyncMock()
+        page.locator.return_value = locator
+        page_ai.page = page
         return page_ai, locator
 
     @staticmethod
@@ -3505,15 +3511,16 @@ class TestAiActAppliesDesiredStateGuard:
     _MODULE = "skyvern.core.script_generations.real_skyvern_page_ai"
 
     def _build_page_ai(self):
-        page = MagicMock()
-        page.url = "https://example.test/page"
-        page.evaluate = AsyncMock(return_value=False)
-        page_ai = RealSkyvernPageAi(MagicMock(), page)
+        page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
         page_ai._refresh_scraped_page = AsyncMock()
         scraped = MagicMock()
         scraped.build_element_tree.return_value = "tree"
         scraped.support_economy_elements_tree.return_value = False
         page_ai.scraped_page = scraped
+        page = MagicMock()
+        page.url = "https://example.test/page"
+        page.evaluate = AsyncMock(return_value=False)
+        page_ai.page = page
         return page_ai
 
     @staticmethod
@@ -4140,7 +4147,8 @@ async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monke
     monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
     monkeypatch.setattr(module, "render_template", lambda value: value)
     monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
-    script_page = _make_script_page(MagicMock(), MagicMock())
+    script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+    script_page.page = SimpleNamespace()
 
     with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
         value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
@@ -4149,35 +4157,3 @@ async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monke
     typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
     assert value == "482913"
     assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required
-
-
-@pytest.mark.asyncio
-async def test_wrapped_action_runs_without_a_forge_app() -> None:
-    """SDK remote mode and stdio MCP drive SkyvernPage without starting a ForgeApp."""
-    from skyvern.forge import app as app_holder
-
-    previous = object.__getattribute__(app_holder, "_inst")
-    object.__setattr__(app_holder, "_inst", None)
-    try:
-        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
-            page = SkyvernPage(create_mock_page(), MagicMock())
-
-        async def execute(_page: SkyvernPage, **_kwargs: object) -> str:
-            return "done"
-
-        assert await page._decorate_call(execute, ActionType.CLICK, selector="#btn") == "done"
-    finally:
-        object.__setattr__(app_holder, "_inst", previous)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://sso.example.com/saml?" + "a" * 2100,
-        "https://example.com/list?f={%22status%22:1}",
-    ],
-)
-def test_cached_goto_policy_action_keeps_the_rendered_url(url: str) -> None:
-    """goto renders once; the policy action must not re-render it or apply HttpUrl's length cap."""
-    action = ScriptSkyvernPage._build_policy_action(ActionType.GOTO_URL, {"url": url})
-    assert action.url == url

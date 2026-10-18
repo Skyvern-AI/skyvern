@@ -16,6 +16,7 @@ keywords:
   - validation block
   - file download block
   - conditional block
+  - terminate block
 ---
 
 Agents are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the Cloud UI [Studio editor](/cloud/studio), grouped by category.
@@ -32,7 +33,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
 | [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
-| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait |
+| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait, Terminate |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction, Email Inbox |
 
@@ -413,6 +414,24 @@ Pause agent execution for a specified duration.
 <Frame>
 <img width="400" src="/images/cloud/wait_block.png" alt="Wait block configuration with Wait Time (in seconds) field" />
 </Frame>
+
+### Terminate
+
+End the run as `terminated` with a reason you write. Put one on a Conditional branch to stop a run before the part that spends steps. See [pre-flight check](/developers/production#pre-flight-check).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Reason** | text | Required. Why the run stops here. Becomes the run's `failure_reason`. Supports [parameter references](/cloud/studio#inputs), for example `No account matches {{ account_number }}`. |
+| **Error Code (Optional)** | text | A code added to the run's `errors`, so a retry rule, the run list filter, or a webhook can tell this stop apart. At most 128 characters of ASCII letters, digits, underscores, periods, colons, and hyphens. Supports parameter references. |
+
+Neither field can reference a credential or a secret. A template that references one is dropped, and the run still stops with a reason that names the block. **Continue on Failure** does not apply: the run always ends here.
+
+```yaml
+block_type: terminate
+label: skip_target
+reason: "Pre-flight reported {{ target_url }} is not reachable"
+error_code: PRECHECK_UNREACHABLE
+```
 
 ---
 

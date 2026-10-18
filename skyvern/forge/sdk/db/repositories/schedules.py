@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge import app
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.schemas.workflow_schedules import (
     OrganizationScheduleItem,
     WorkflowSchedule,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal, trigger_owner_id
 from skyvern.forge.sdk.workflow.schedules import as_utc, compute_next_run
 
 if TYPE_CHECKING:
@@ -45,6 +48,16 @@ _NOT_TERMINAL_ONE_TIME = or_(
     WorkflowScheduleModel.run_at.is_(None),
     WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
 )
+
+
+def _adopt_schedule(workflow_schedule: WorkflowScheduleModel, organization_id: str) -> None:
+    # A schedule runs as whoever last edited it, so an edit cannot borrow the previous owner's folder access.
+    principal = get_request_principal()
+    if principal is None:
+        # Background writes (no request) keep the owner.
+        return
+    # An unidentified editor clears it instead, so the next run fails closed in restricted folders.
+    workflow_schedule.created_by = trigger_owner_id(principal, organization_id)
 
 
 class SchedulesRepository(BaseRepository):
@@ -91,6 +104,7 @@ class SchedulesRepository(BaseRepository):
                 backend_schedule_id=backend_schedule_id,
                 name=name,
                 description=description,
+                created_by=trigger_owner_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()
@@ -216,6 +230,7 @@ class SchedulesRepository(BaseRepository):
                 parameters=parameters,
                 name=name,
                 description=description,
+                created_by=trigger_owner_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()
@@ -283,6 +298,7 @@ class SchedulesRepository(BaseRepository):
             if not workflow_schedule:
                 return None
 
+            _adopt_schedule(workflow_schedule, organization_id)
             workflow_schedule.cron_expression = cron_expression
             if interval_seconds is not _UNSET:
                 workflow_schedule.interval_seconds = interval_seconds
@@ -310,17 +326,16 @@ class SchedulesRepository(BaseRepository):
         self,
         workflow_schedule_id: str,
         organization_id: str,
+        include_deleted: bool = False,
     ) -> WorkflowSchedule | None:
+        query = select(WorkflowScheduleModel).filter_by(
+            workflow_schedule_id=workflow_schedule_id,
+            organization_id=organization_id,
+        )
+        if not include_deleted:
+            query = query.filter_by(deleted_at=None)
         async with self.Session() as session:
-            workflow_schedule = (
-                await session.scalars(
-                    select(WorkflowScheduleModel).filter_by(
-                        workflow_schedule_id=workflow_schedule_id,
-                        organization_id=organization_id,
-                        deleted_at=None,
-                    )
-                )
-            ).first()
+            workflow_schedule = (await session.scalars(query)).first()
             if not workflow_schedule:
                 return None
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -566,6 +581,7 @@ class SchedulesRepository(BaseRepository):
             ).first()
             if not workflow_schedule:
                 return None
+            _adopt_schedule(workflow_schedule, organization_id)
             workflow_schedule.enabled = enabled
             workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
@@ -617,6 +633,7 @@ class SchedulesRepository(BaseRepository):
             if not workflow_schedule:
                 return None
 
+            _adopt_schedule(workflow_schedule, organization_id)
             workflow_schedule.deleted_at = None
             workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
@@ -638,6 +655,7 @@ class SchedulesRepository(BaseRepository):
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
         db_page = page - 1
         async with self.Session() as session:
             # Subquery to get the latest version title per workflow_permanent_id
@@ -664,6 +682,18 @@ class SchedulesRepository(BaseRepository):
                 )
                 .subquery()
             )
+            current_folder_id = (
+                select(WorkflowModel.folder_id)
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.workflow_permanent_id == WorkflowScheduleModel.workflow_permanent_id,
+                    WorkflowModel.deleted_at.is_(None),
+                )
+                .order_by(WorkflowModel.version.desc())
+                .limit(1)
+                .correlate(WorkflowScheduleModel)
+                .scalar_subquery()
+            )
 
             # Base query: schedules joined with workflow titles
             base_filter = (
@@ -675,6 +705,11 @@ class SchedulesRepository(BaseRepository):
                 .where(WorkflowScheduleModel.organization_id == organization_id)
                 .where(WorkflowScheduleModel.deleted_at.is_(None))
             )
+            if accessible_folder_ids is not None:
+                base_filter = base_filter.where(
+                    workflow_title_sq.c.workflow_permanent_id.is_not(None),
+                    or_(current_folder_id.is_(None), current_folder_id.in_(accessible_folder_ids)),
+                )
 
             if enabled_filter is not None:
                 base_filter = base_filter.where(WorkflowScheduleModel.enabled == enabled_filter, _NOT_TERMINAL_ONE_TIME)

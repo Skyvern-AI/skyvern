@@ -35,7 +35,6 @@ import { stringify as convertToYAML } from "yaml";
 import { convert } from "../editor/workflowEditorUtils";
 import { Tag, TagKey } from "../types/tagTypes";
 import { WorkflowApiResponse } from "../types/workflowTypes";
-import { getClonedWorkflowTitle } from "../cloneWorkflowTitle";
 import { FolderPickerCommand } from "./FolderPickerCommand";
 import { TagPickerCommand } from "./tagging/TagPickerCommand";
 
@@ -130,7 +129,7 @@ function BulkActionBar({
         selectedWorkflows.map((workflow) => () => {
           const yaml = convertToYAML(
             convert(
-              { ...workflow, title: getClonedWorkflowTitle(workflow.title) },
+              { ...workflow, title: `Copy of ${workflow.title}` },
               { asNewWorkflow: true },
             ),
           );

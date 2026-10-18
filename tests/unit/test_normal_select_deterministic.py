@@ -133,7 +133,6 @@ async def _run_normal_select(
     )
     result = await handler.normal_select(
         action=action,
-        page=MagicMock(),  # type: ignore[arg-type]
         skyvern_element=_FakeSelectElement(options, locator, selected_attr),  # type: ignore[arg-type]
         task=_task(),  # type: ignore[arg-type]
         step=MagicMock(),
@@ -194,18 +193,15 @@ async def test_normal_select_does_not_deterministically_select_after_cancel_duri
     cancellation_reader = AsyncMock(
         side_effect=lambda *_args, **_kwargs: cancellation if context_parse_finished else None
     )
-    agent_function = AgentFunction()
-    monkeypatch.setattr(
-        agent_function,
-        "resolve_field_option",
-        AsyncMock(
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
             return_value=SimpleNamespace(
                 fallback_to_llm=False,
                 matched_index=0,
                 matched_label="United States",
                 matched_value="US",
             )
-        ),
+        )
     )
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
@@ -238,18 +234,15 @@ async def test_normal_select_does_not_deterministically_select_after_cancel_duri
     monkeypatch.setattr(handler, "_best_effort_focus_click_before_select", focus_before_select)
     cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
     cancellation_reader = AsyncMock(side_effect=lambda *_args, **_kwargs: cancellation if focus_finished else None)
-    agent_function = AgentFunction()
-    monkeypatch.setattr(
-        agent_function,
-        "resolve_field_option",
-        AsyncMock(
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
             return_value=SimpleNamespace(
                 fallback_to_llm=False,
                 matched_index=0,
                 matched_label="United States",
                 matched_value="US",
             )
-        ),
+        )
     )
 
     result, locator, normal_select_llm = await _run_normal_select(
@@ -282,18 +275,15 @@ async def test_normal_select_does_not_try_fallback_after_cancel_between_attempts
         locator.select_option.side_effect = Exception("timed out")
 
     monkeypatch.setattr(handler, "_best_effort_focus_click_before_select", focus_before_select)
-    agent_function = AgentFunction()
-    monkeypatch.setattr(
-        agent_function,
-        "resolve_field_option",
-        AsyncMock(
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
             return_value=SimpleNamespace(
                 fallback_to_llm=False,
                 matched_index=0,
                 matched_label="United States",
                 matched_value="US",
             )
-        ),
+        )
     )
     result, locator, _ = await _run_normal_select(
         monkeypatch,
@@ -604,8 +594,6 @@ async def test_normal_select_readback_index_mismatch_falls_back_to_llm(monkeypat
 async def test_normal_select_flag_off_uses_llm_path(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = AsyncMock(return_value=False)
     resolver = AsyncMock()
-    agent_function = AgentFunction()
-    agent_function.resolve_field_option = resolver
     action = _select_action("United States")
     result, locator, normal_select_llm = await _run_normal_select(
         monkeypatch,
@@ -615,7 +603,7 @@ async def test_normal_select_flag_off_uses_llm_path(monkeypatch: pytest.MonkeyPa
         selected_value="US",
         llm_response={"value": "US", "index": None},
         collapse_gate=gate,
-        agent_function=agent_function,
+        agent_function=SimpleNamespace(resolve_field_option=resolver),
     )
 
     assert handler._normal_select_successful(result)

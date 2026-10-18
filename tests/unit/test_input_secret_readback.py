@@ -158,7 +158,6 @@ async def _fill(
 ) -> ActionFailure | None:
     return await _fill_secret_with_readback(
         skyvern_element=element,
-        page=MagicMock(),
         tag_name="input",
         text=text,
         input_type=input_type,
@@ -649,7 +648,6 @@ async def test_fill_secret_threads_engine_selection_to_both_readbacks() -> None:
     ) as get_input_value:
         result = await _fill_secret_with_readback(
             skyvern_element=element,
-            page=MagicMock(),
             tag_name="input",
             text=SECRET,
             input_type="password",

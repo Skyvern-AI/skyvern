@@ -3,24 +3,16 @@ import ipaddress
 import os
 import socket
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any
 from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
-import idna
 import structlog
-from aiohttp.abc import AbstractResolver, ResolveResult
+from aiohttp.abc import AbstractCookieJar, AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
 
 from skyvern.exceptions import HttpException, InvalidUrl
-from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
-from skyvern.forge.sdk.core.http_request_authorization import (
-    RedirectHopAuthorization,
-    RedirectHopAuthorizer,
-    authorize_request_hop_once,
-)
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
@@ -34,27 +26,13 @@ DEFAULT_REQUEST_TIMEOUT = 30
 _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"accept", "accept-language", "user-agent"})
 
 
-@dataclass(frozen=True, slots=True)
-class _AiohttpRedirect:
-    status: int
-    location: str
-
-
-_AiohttpResult: TypeAlias = tuple[int, dict[str, str], Any] | _AiohttpRedirect
-
-
 def _url_origin(url: str) -> tuple[str, str, int | None]:
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     port = parsed.port
     if port is None:
         port = 443 if scheme == "https" else 80 if scheme == "http" else None
-    host = (parsed.hostname or "").lower().rstrip(".")
-    try:
-        host = idna.encode(host, uts46=True, transitional=False).decode("ascii")
-    except UnicodeError:
-        pass
-    return scheme, host, port
+    return scheme, (parsed.hostname or "").lower().rstrip("."), port
 
 
 def strip_cross_origin_redirect_credentials(
@@ -62,9 +40,12 @@ def strip_cross_origin_redirect_credentials(
     cookies: dict[str, str] | None,
     current_url: str,
     next_url: str,
+    *,
+    cookie_jar: AbstractCookieJar,
 ) -> tuple[dict[str, str], dict[str, str] | None]:
     if _url_origin(current_url) == _url_origin(next_url):
         return headers, cookies
+    cookie_jar.clear()
     return {key: value for key, value in headers.items() if key.lower() in _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS}, None
 
 
@@ -155,9 +136,7 @@ async def aiohttp_request(
     cookies: dict[str, str] | None = None,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     follow_redirects: bool = True,
-    allowed_redirect_origin: str | None = None,
     proxy: str | None = None,
-    authorize_request_hop: RedirectHopAuthorizer[_AiohttpResult] | None = None,
     authorize_redirect: Callable[[str], bool] | None = None,
 ) -> tuple[int, dict[str, str], Any]:
     """
@@ -173,11 +152,7 @@ async def aiohttp_request(
         cookies: Request cookies
         timeout: Request timeout in seconds
         follow_redirects: Whether to follow redirects
-        allowed_redirect_origin: Optional origin that every redirect must retain
         proxy: Proxy URL
-        authorize_request_hop: Optional run-scoped authorization callback. Each initial
-            request and redirect invokes it after independent SSRF validation and DNS
-            pinning, but before the network attempt.
         authorize_redirect: Refuses a redirect (rather than following it) when it returns False for
             the next URL; the caller decides which destinations the request's contents may reach
 
@@ -189,20 +164,10 @@ async def aiohttp_request(
     if proxy:
         resolver.trust_proxy_url(proxy)
     current_url = await validate_and_pin_fetch_url(url, resolver)
-    # Only the egress-authorized path needs a canonicalizable origin, because that is what the
-    # authority is expressed in. Requiring it unconditionally would reject every URL carrying
-    # basic-auth userinfo -- canonicalize_origin returns None for those by design -- and break
-    # HTTP Request blocks and custom-credential calls that authenticate through the URL.
-    requires_canonical_origin = authorize_request_hop is not None
-    if requires_canonical_origin and canonicalize_origin(current_url) is None:
-        raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
-    if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
-        raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
     request_method = method.upper()
     request_headers = dict(headers or {})
     request_cookies = cookies
     strip_body_headers = False
-    source_url: str | None = None
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout), connector=ssrf_guarded_tcp_connector(resolver)
@@ -250,59 +215,50 @@ async def aiohttp_request(
         for _ in range(MAX_SAFE_REDIRECTS + 1):
             request_kwargs = await build_request_kwargs()
             request_kwargs["url"] = current_url
+            async with session.request(request_method, **request_kwargs) as response:
+                if (
+                    follow_redirects
+                    and response.status in SAFE_REDIRECT_STATUS_CODES
+                    and response.headers.get("Location")
+                ):
+                    next_url = await validate_and_pin_redirect_url(current_url, response.headers["Location"], resolver)
+                    if authorize_redirect is not None and not authorize_redirect(next_url):
+                        raise HttpException(400, current_url, "Redirect blocked by policy")
+                    redirects_to_get = response.status == 303 or (
+                        response.status in (301, 302) and request_method == "POST"
+                    )
+                    data_is_json = (
+                        "application/json"
+                        in (request_headers.get("Content-Type") or request_headers.get("content-type") or "").lower()
+                    )
+                    replays_entity = (
+                        not redirects_to_get
+                        and request_method != "GET"
+                        and (
+                            json_data is not None or bool(files) or (data is not None and (bool(data) or data_is_json))
+                        )
+                    )
+                    cross_origin = _url_origin(current_url) != _url_origin(next_url)
+                    if cross_origin and replays_entity:
+                        raise HttpException(400, "[redacted]", "Cross-origin redirect would replay a request entity")
+                    request_headers, request_cookies = strip_cross_origin_redirect_credentials(
+                        request_headers, request_cookies, current_url, next_url, cookie_jar=session.cookie_jar
+                    )
+                    current_url = next_url
+                    if redirects_to_get:
+                        request_method = "GET"
+                        strip_body_headers = True
+                    continue
 
-            async def dispatch(_resolved_values: tuple[str, ...]) -> _AiohttpResult:
-                async with session.request(request_method, **request_kwargs) as response:
-                    location = response.headers.get("Location")
-                    if follow_redirects and response.status in SAFE_REDIRECT_STATUS_CODES and location:
-                        return _AiohttpRedirect(status=response.status, location=location)
+                response_headers = dict(response.headers)
 
-                    response_headers = dict(response.headers)
-                    try:
-                        response_body = await response.json()
-                    except (aiohttp.ContentTypeError, Exception):
-                        response_body = await response.text()
-                    return response.status, response_headers, response_body
+                try:
+                    response_body = await response.json()
+                except (aiohttp.ContentTypeError, Exception):
+                    response_body = await response.text()
 
-            authorization = RedirectHopAuthorization(
-                source_url=source_url,
-                target_url=current_url,
-                method=request_method,
-            )
-            result = (
-                await authorize_request_hop_once(authorize_request_hop, authorization, dispatch)
-                if authorize_request_hop is not None
-                else await dispatch(())
-            )
-            if not isinstance(result, _AiohttpRedirect):
-                return result
-
-            next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
-            if authorize_redirect is not None and not authorize_redirect(next_url):
-                raise HttpException(400, current_url, "Redirect blocked by policy")
-            if requires_canonical_origin and canonicalize_origin(next_url) is None:
-                raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
-            if allowed_redirect_origin is not None and _url_origin(next_url) != _url_origin(allowed_redirect_origin):
-                raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
-            redirects_to_get = result.status == 303 or (result.status in (301, 302) and request_method == "POST")
-            replays_entity = (
-                not redirects_to_get
-                and request_method != "GET"
-                and (data is not None or json_data is not None or files is not None)
-            )
-            if _url_origin(current_url) != _url_origin(next_url) and replays_entity:
-                raise HttpException(400, "[redacted]", "Cross-origin redirect would replay a request entity")
-            request_headers, request_cookies = strip_cross_origin_redirect_credentials(
-                request_headers,
-                request_cookies,
-                current_url,
-                next_url,
-            )
-            source_url, current_url = current_url, next_url
-            if redirects_to_get:
-                request_method = "GET"
-                strip_body_headers = True
-        raise HttpException(400, "[redacted]", "Too many redirects while making HTTP request")
+                return response.status, response_headers, response_body
+        raise HttpException(400, current_url, "Too many redirects while making HTTP request")
 
 
 async def aiohttp_get_json(

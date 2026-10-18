@@ -57,7 +57,7 @@ async def _workflow_side_effects(run: WorkflowRun, attempt_number: int | None, h
     await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
     api_key = await _api_key(run.organization_id)
     if api_key:
-        await app.WORKFLOW_SERVICE.execute_workflow_webhook(run, api_key, claim_kind=None)
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(run, api_key, claim_kind=None, finalizer="orphan_reaper")
 
 
 async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:

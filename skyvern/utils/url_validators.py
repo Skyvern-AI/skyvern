@@ -165,16 +165,6 @@ def prepend_scheme_and_validate_url(url: str, *, field_name: str = "url") -> str
     return url
 
 
-def prepend_scheme_and_validate_navigation_url(url: str) -> str:
-    """Like ``prepend_scheme_and_validate_url`` without HttpUrl's 2083-char ceiling, matching ``validate_fetch_url``."""
-    url = _prepend_scheme(url)
-    try:
-        AnyHttpUrl(url)
-    except ValidationError:
-        raise InvalidUrl(url=url) from None
-    return url
-
-
 def canonical_navigation_host(url: str) -> str | None:
     """Host a browser resolves ``url`` against, via pydantic's WHATWG URL model.
 

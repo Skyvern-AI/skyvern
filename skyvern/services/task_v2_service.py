@@ -94,7 +94,6 @@ from skyvern.schemas.runs import (
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
-    WORKFLOW_TITLE_MAX_LENGTH,
     BlockResult,
     BlockStatus,
     CodeBlockYAML,
@@ -515,7 +514,7 @@ async def initialize_task_v2_metadata(
     url: str = user_url or metadata_response.get("url", "")
     if not url:
         raise UrlGenerationFailure()
-    title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)[:WORKFLOW_TITLE_MAX_LENGTH]
+    title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
     metadata = TaskV2Metadata(
         url=url,
         workflow_title=title,
@@ -1270,7 +1269,7 @@ async def run_task_v2_helper(
             blocks=yaml_blocks,
         )
         workflow_create_request = WorkflowCreateYAMLRequest(
-            title=workflow.title[:WORKFLOW_TITLE_MAX_LENGTH],
+            title=workflow.title,
             description=workflow.description,
             proxy_location=runtime_proxy_location(task_v2.proxy_location),
             workflow_definition=workflow_definition_yaml,

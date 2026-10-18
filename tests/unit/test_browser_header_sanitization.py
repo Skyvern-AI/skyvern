@@ -72,6 +72,7 @@ class _FakeAgentFunction:
         self.route_permission_kwargs: dict[str, Any] | None = None
         self.extension_setup_calls = 0
         self.extension_setup_kwargs: dict[str, Any] | None = None
+        self.header_route_origins: list[Any] = []
 
     def strip_proxy_session_extra_http_headers(
         self,
@@ -92,6 +93,9 @@ class _FakeAgentFunction:
     async def setup_browser_context_extensions(self, **kwargs: Any) -> None:
         self.extension_setup_calls += 1
         self.extension_setup_kwargs = kwargs
+
+    def on_origin_scoped_headers_route_installed(self, browser_context: Any, target_origin: Any) -> None:
+        self.header_route_origins.append(target_origin)
 
 
 async def _factory_context(

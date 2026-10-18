@@ -758,6 +758,7 @@ async def test_resetting_a_task_for_rerun_re_arms_its_finish_claim(sqlite_engine
                 queued_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 started_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 errors=[],
+                task_queue="previous-dispatch-queue",
             )
         )
         await session.commit()
@@ -771,6 +772,9 @@ async def test_resetting_a_task_for_rerun_re_arms_its_finish_claim(sqlite_engine
 
     assert reset_task.status == TaskStatus.created
     assert (reset_task.queued_at, reset_task.started_at, reset_task.finished_at) == (None, None, None)
+    async with factory() as session:
+        stored = await session.get(TaskModel, "tsk_rerun")
+        assert stored is not None and stored.task_queue is None
 
     _, rerun_claim = await repo.update_task_and_claim_finish(
         "tsk_rerun", status=TaskStatus.completed, organization_id="o_rerun"

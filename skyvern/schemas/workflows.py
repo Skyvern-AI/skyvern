@@ -1884,11 +1884,8 @@ class WorkflowDefinitionYAML(BaseModel):
         return self
 
 
-WORKFLOW_TITLE_MAX_LENGTH = 255
-
-
 class WorkflowCreateYAMLRequest(BaseModel):
-    title: str = Field(max_length=WORKFLOW_TITLE_MAX_LENGTH)
+    title: str
     recording_id: str | None = Field(
         default=None,
         description="Durable browser recording to attach to the workflow version created by this save.",
@@ -1965,15 +1962,6 @@ class WorkflowCreateYAMLRequest(BaseModel):
     sequential_key: str | None = None
     folder_id: str | None = None
 
-    @field_validator("title", mode="before")
-    @classmethod
-    def _bound_oversized_title_for_validation(cls, value: Any) -> Any:
-        """Keep validation responses bounded without accepting truncated titles."""
-        if cls is WorkflowCreateYAMLRequest and isinstance(value, str) and len(value) > WORKFLOW_TITLE_MAX_LENGTH:
-            # Keep one excess character so Pydantic rejects instead of accepting a truncated title.
-            return value[: WORKFLOW_TITLE_MAX_LENGTH + 1]
-        return value
-
     @field_validator("max_elapsed_time_minutes", mode="before")
     @classmethod
     def validate_max_elapsed_time_minutes(cls, value: object) -> object:
@@ -2007,17 +1995,4 @@ class WorkflowRequest(BaseModel):
     yaml_definition: str | None = Field(
         default=None,
         description="Workflow definition in YAML format",
-    )
-
-
-class WorkflowUpdateYAMLRequest(WorkflowCreateYAMLRequest):
-    """Update-only definition that preserves titles stored before the create limit."""
-
-    title: str
-
-
-class WorkflowUpdateRequest(WorkflowRequest):
-    json_definition: WorkflowUpdateYAMLRequest | None = Field(
-        default=None,
-        description="Workflow definition in JSON format",
     )

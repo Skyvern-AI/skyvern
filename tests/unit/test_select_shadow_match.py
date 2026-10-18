@@ -5,7 +5,6 @@ from zoneinfo import ZoneInfo
 import pytest
 import structlog.testing
 
-from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
@@ -18,12 +17,6 @@ _SHADOW_OPTION = {
     "text": "Committed Value",
     "interactable": True,
 }
-
-
-def _agent_function(resolver: AsyncMock) -> AgentFunction:
-    agent_function = AgentFunction()
-    agent_function.resolve_field_option = resolver
-    return agent_function
 
 
 def _shadow_task() -> SimpleNamespace:
@@ -93,7 +86,6 @@ async def _run_normal_select_with_shadow_log(
         with structlog.testing.capture_logs() as logs:
             results = await handler.normal_select(
                 action=action,
-                page=MagicMock(),  # type: ignore[arg-type]
                 skyvern_element=_FakeSelectElement(options),
                 task=_shadow_task(),
                 step=SimpleNamespace(step_id="step-1"),
@@ -789,7 +781,7 @@ async def _run_outcome_case(
     )
     get_skyvern_element = AsyncMock(return_value=selected)
     monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
-    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", _agent_function(resolver))
+    monkeypatch.setattr(handler.app, "AGENT_FUNCTION", SimpleNamespace(resolve_field_option=resolver))
     monkeypatch.setattr(
         handler,
         "_read_custom_select_matched_state",
@@ -1101,8 +1093,8 @@ async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: 
     monkeypatch.setattr(
         handler.app,
         "AGENT_FUNCTION",
-        _agent_function(
-            AsyncMock(
+        SimpleNamespace(
+            resolve_field_option=AsyncMock(
                 return_value=SimpleNamespace(
                     fallback_to_llm=False,
                     matched_index=0,
@@ -1194,8 +1186,8 @@ async def _run_post_reset_fallback_case(
     monkeypatch.setattr(
         handler.app,
         "AGENT_FUNCTION",
-        _agent_function(
-            AsyncMock(
+        SimpleNamespace(
+            resolve_field_option=AsyncMock(
                 return_value=SimpleNamespace(
                     fallback_to_llm=False,
                     matched_index=0,

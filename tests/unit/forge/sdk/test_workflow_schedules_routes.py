@@ -540,3 +540,53 @@ async def test_mcp_tools_create_edit_cancel_and_read_back_every_one_time_state(
         ("failed", "wr_sched_failed"),
         ("fired", "wr_sched_fired"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempts", "statuses", "deleted"),
+    [
+        (["fails"], [502], False),
+        (["deletes"], [200], True),
+        (["deletes, then times out", "deletes"], [502, 200], True),
+    ],
+    ids=["backend-delete-fails", "backend-delete-succeeds", "retry-after-a-backend-delete-that-landed"],
+)
+async def test_deleting_a_schedule_deletes_its_backend_schedule_before_its_row(
+    schedules_client: httpx.AsyncClient,
+    agent_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: list[str],
+    statuses: list[int],
+    deleted: bool,
+) -> None:
+    created = await _request(
+        schedules_client, NOW, "POST", "", json={"cron_expression": "0 9 * * *", "timezone": "UTC"}
+    )
+    schedule_id = created.json()["schedule"]["workflow_schedule_id"]
+    stored = await agent_db.schedules.get_workflow_schedule_by_id(schedule_id, ORG_ID)
+    assert stored is not None and stored.backend_schedule_id is not None
+    live_backend = {stored.backend_schedule_id}
+    pending = iter(attempts)
+
+    async def delete_backend(backend_schedule_id: str) -> None:
+        attempt = next(pending)
+        if attempt == "fails":
+            raise RuntimeError("scheduler unavailable")
+        # Like the cloud backend, deleting a schedule that is already gone succeeds.
+        live_backend.discard(backend_schedule_id)
+        if attempt == "deletes, then times out":
+            raise TimeoutError
+
+    monkeypatch.setattr(workflow_schedule_routes.app.AGENT_FUNCTION, "delete_workflow_schedule", delete_backend)
+
+    responses = [await _request(schedules_client, NOW, "DELETE", f"/{schedule_id}") for _ in attempts]
+
+    assert [response.status_code for response in responses] == statuses
+    assert all(
+        response.json()["detail"] == workflow_schedule_routes.SCHEDULE_SYNC_ERROR_DETAIL
+        for response in responses
+        if response.status_code == 502
+    )
+    assert (await agent_db.schedules.get_workflow_schedule_by_id(schedule_id, ORG_ID) is None) == deleted
+    assert live_backend == (set() if deleted else {stored.backend_schedule_id})

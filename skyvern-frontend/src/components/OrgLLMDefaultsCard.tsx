@@ -5,6 +5,8 @@ import { getClient } from "@/api/AxiosClient";
 import type { CustomLLM, OrganizationApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCustomLLMs } from "@/hooks/useCustomLLMs";
+import { useHasCapability } from "@/store/PageSlots";
+import { AdminOnlyTooltip } from "@/components/AdminOnlyTooltip";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -101,6 +103,7 @@ function OrgLLMDefaultsCard() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canUpdate = useHasCapability("organization.settings.update");
   const { customLLMs, isLoading: customLLMsAreLoading } = useCustomLLMs();
   const [smartDraft, setSmartDraft] = useState<string | null | undefined>(
     undefined,
@@ -155,10 +158,11 @@ function OrgLLMDefaultsCard() {
     organization === undefined ||
     organizationsQuery.isLoading ||
     customLLMsAreLoading ||
-    updateDefaultsMutation.isPending;
+    updateDefaultsMutation.isPending ||
+    !canUpdate;
 
   function saveDefaults() {
-    if (!organization) {
+    if (!organization || !canUpdate) {
       return;
     }
 
@@ -190,31 +194,37 @@ function OrgLLMDefaultsCard() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6 p-8">
-        <ModelSelect
-          id="smart-llm-default"
-          label="Smart LLM"
-          description="Used for planning and main reasoning."
-          value={smartLLMKey}
-          customLLMs={customLLMs}
-          disabled={controlsAreDisabled}
-          onValueChange={setSmartDraft}
-        />
-        <ModelSelect
-          id="fast-llm-default"
-          label="Fast LLM"
-          description="Used for lightweight operations like validation, parsing, and mini-agents."
-          value={fastLLMKey}
-          customLLMs={customLLMs}
-          disabled={controlsAreDisabled}
-          onValueChange={setFastDraft}
-        />
-        <Button
-          type="button"
-          onClick={saveDefaults}
-          disabled={!hasChanges || controlsAreDisabled}
-        >
-          {updateDefaultsMutation.isPending ? "Saving..." : "Save"}
-        </Button>
+        <AdminOnlyTooltip allowed={canUpdate} className="w-full">
+          <ModelSelect
+            id="smart-llm-default"
+            label="Smart LLM"
+            description="Used for planning and main reasoning."
+            value={smartLLMKey}
+            customLLMs={customLLMs}
+            disabled={controlsAreDisabled}
+            onValueChange={setSmartDraft}
+          />
+        </AdminOnlyTooltip>
+        <AdminOnlyTooltip allowed={canUpdate} className="w-full">
+          <ModelSelect
+            id="fast-llm-default"
+            label="Fast LLM"
+            description="Used for lightweight operations like validation, parsing, and mini-agents."
+            value={fastLLMKey}
+            customLLMs={customLLMs}
+            disabled={controlsAreDisabled}
+            onValueChange={setFastDraft}
+          />
+        </AdminOnlyTooltip>
+        <AdminOnlyTooltip allowed={canUpdate}>
+          <Button
+            type="button"
+            onClick={saveDefaults}
+            disabled={!hasChanges || controlsAreDisabled}
+          >
+            {updateDefaultsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </AdminOnlyTooltip>
       </CardContent>
     </Card>
   );

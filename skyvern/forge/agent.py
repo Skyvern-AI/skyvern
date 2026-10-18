@@ -52,7 +52,6 @@ from skyvern.errors.errors import (
     resolve_error_code_mapping_key,
 )
 from skyvern.exceptions import (
-    ActionPolicyBlocked,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionDegraded,
@@ -951,9 +950,18 @@ def _mask_multi_field_totp_rejection_digits(value: str | None) -> str:
     return re.sub(r"[0-9]", "*", value or "")
 
 
+def _planner_confirmed_verification_code_intent(json_response: dict[str, Any]) -> bool:
+    return (
+        json_response.get("place_to_enter_verification_code") is True
+        and json_response.get("should_enter_verification_code") is True
+    )
+
+
 def _multi_field_totp_action_indices(
     actions: Sequence[Action | dict[str, Any]],
     attempt: MultiFieldTotpAttempt,
+    *,
+    allow_partial: bool = False,
 ) -> set[int]:
     expected_value = attempt.hint_code
     if not expected_value or not expected_value.isdigit() or len(expected_value) != attempt.expected_digits:
@@ -974,15 +982,20 @@ def _multi_field_totp_action_indices(
         if isinstance(element_id, str) and element_id in box_indices:
             group_actions.append((box_indices[element_id], action_index, text if isinstance(text, str) else ""))
 
+    if not group_actions:
+        return set()
     if not all(
         text == expected_value or (box_index < len(expected_value) and text == expected_value[box_index])
         for box_index, _, text in group_actions
     ):
         return set()
-    if any(text == expected_value for _, _, text in group_actions) or sorted(
-        box_index for box_index, _, _ in group_actions
-    ) == list(range(attempt.expected_digits)):
+    if (
+        allow_partial
+        or any(text == expected_value for _, _, text in group_actions)
+        or sorted(box_index for box_index, _, _ in group_actions) == list(range(attempt.expected_digits))
+    ):
         return {action_index for _, action_index, _ in group_actions}
+    # Without explicit verification intent, a matching digit in one box could arm a PIN entry.
     return set()
 
 
@@ -1118,12 +1131,13 @@ def _first_plan_carries_consumable_totp(
     attempt: MultiFieldTotpAttempt,
     *,
     task_id: str | None = None,
+    allow_partial: bool = False,
 ) -> bool:
     """Whether the first plan contains a consumable action for the armed OTP group."""
     return (
         multi_field_source_ready
         and not skyvern_context.multi_field_totp_retry_budget_exhausted(task_id)
-        and bool(_multi_field_totp_action_indices(actions, attempt))
+        and bool(_multi_field_totp_action_indices(actions, attempt, allow_partial=allow_partial))
     )
 
 
@@ -2141,8 +2155,6 @@ class ForgeAgent:
         for parameter in task_block_parameters:
             navigation_payload[parameter.key] = workflow_run_context.get_value(parameter.key)
 
-        # A URL rendered from workflow input is untrusted, so it must not become trusted authority.
-        declares_static_origin = task_block.declares_static_browser_origin(workflow_run_context)
         task_url = task_block.url
         if task_url is None:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
@@ -2190,12 +2202,6 @@ class ForgeAgent:
             download_timeout=task_block.download_timeout,
             include_extracted_text=task_block.include_extracted_text,
         )
-        if declares_static_origin:
-            app.AGENT_FUNCTION.register_browser_origin_authority(
-                task_id=task.task_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                url=task.url,
-            )
         LOG.info(
             "Created a new task for workflow run",
             sampling=True,
@@ -3973,17 +3979,6 @@ class ForgeAgent:
             # complete here. Returns next_step=None, so neither retry nor execute-all-steps
             # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
             task_v3_available = engine == RunEngine.skyvern_v3 and task_block_supports_v3
-            if task_v3_available and app.AGENT_FUNCTION.needs_browser_observation():
-                # Task V3 tools neither scan pages nor enforce the browser action policy, so a guarded
-                # run stays on the step engine the guard covers.
-                LOG.info(
-                    "Prompt-injection guard is on; running the task on the step engine",
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                    route_reason="prompt_injection_guard",
-                )
-                task_v3_available = False
-                engine = RunEngine.skyvern_v1
             if task_v3_available:
                 try:
                     task_v3_available = not await task_v3_disabled(
@@ -4423,8 +4418,7 @@ class ForgeAgent:
                 list_files_before=list_files_before,
             )
             return last_step, detailed_output, None
-        except (StepTerminationError, ActionPolicyBlocked) as e:
-            # Action policy blocks use a BaseException signal so they reach this explicit run boundary.
+        except StepTerminationError as e:
             LOG.warning(
                 "Step cannot be executed, marking task as failed",
                 exc_info=True,
@@ -4852,7 +4846,7 @@ class ForgeAgent:
         step: Step | None,
         reason: str | None,
         browser_state: BrowserState | None = None,
-        exception: BaseException | None = None,
+        exception: Exception | None = None,
     ) -> bool:
         try:
             if step is not None and step.status != StepStatus.completed:
@@ -4877,18 +4871,13 @@ class ForgeAgent:
             if reason and run_secrets:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
-            # A policy block is a BaseException, not a generic runtime failure, so keep it out of the
-            # Exception-typed classifier.
-            classifier_exception = exception if isinstance(exception, Exception) else None
-            failure_category = classify_from_failure_reason(
-                reason, exception=classifier_exception, fallback_to_unknown=True
-            )
+            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
             if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
                 unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
                 if unsolved_captcha_exception:
                     failure_category = classify_from_failure_reason(
                         reason,
-                        exception=classifier_exception,
+                        exception=exception,
                         fallback_to_unknown=True,
                         unsolved_captcha_exception=unsolved_captcha_exception,
                     )
@@ -5111,7 +5100,12 @@ class ForgeAgent:
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
-            actions, pdf_auto_download_src, pdf_auto_download_used_bytes = await self._generate_step_actions(
+            (
+                actions,
+                pdf_auto_download_src,
+                pdf_auto_download_used_bytes,
+                allow_partial_multi_field_totp_plan,
+            ) = await self._generate_step_actions(
                 task=task,
                 step=step,
                 browser_state=browser_state,
@@ -5163,6 +5157,7 @@ class ForgeAgent:
                 file_download_false_click_eligible=isinstance(task_block, FileDownloadBlock),
                 _step_span=_step_span,
                 artifact_tracker=artifact_tracker,
+                allow_partial_multi_field_totp_plan=allow_partial_multi_field_totp_plan,
             )
             if early_return is not None:
                 return early_return
@@ -5207,7 +5202,6 @@ class ForgeAgent:
             ScrapingFailed,
             MissingBrowserStatePage,
             ScreenshotTargetClosed,
-            StepTerminationError,
             BrowserSessionDegraded,
         ) as e:
             # Stamp the accumulated step output (e.g. a download action's observed HTTP failure status)
@@ -5266,6 +5260,7 @@ class ForgeAgent:
         file_download_false_click_eligible: bool,
         _step_span: otel_trace.Span,
         artifact_tracker: _BackgroundArtifactTaskTracker,
+        allow_partial_multi_field_totp_plan: bool = False,
     ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
         # Execute the actions
         action_results: list[ActionResult] = []
@@ -5315,7 +5310,11 @@ class ForgeAgent:
         totp_group_filled = False
         context = skyvern_context.ensure_context()
         attempt = context.multi_field_totp.get(task.task_id)
-        totp_action_indices = _multi_field_totp_action_indices(actions, attempt) if attempt is not None else set()
+        totp_action_indices = (
+            _multi_field_totp_action_indices(actions, attempt, allow_partial=allow_partial_multi_field_totp_plan)
+            if attempt is not None
+            else set()
+        )
         first_totp_action_index = min(totp_action_indices, default=None)
         totp_dispatch_page = scraped_page
         for action_idx, action in enumerate(actions):
@@ -5829,9 +5828,10 @@ class ForgeAgent:
         speculative_llm_metadata: SpeculativeLLMMetadata | None,
         context: SkyvernContext | None,
         allowed_credential_parameter_keys: Sequence[str] | None = None,
-    ) -> tuple[list[Action], str | None, bool]:
+    ) -> tuple[list[Action], str | None, bool, bool]:
         pdf_auto_download_src: str | None = None
         pdf_auto_download_used_bytes = False
+        allow_partial_multi_field_totp_plan = False
         actions: list[Action]
         # Provenance is opt-in per branch, so a branch added later is unstamped until someone
         # decides it was derived from the scrape. A blanket stamp at the end of this method had the
@@ -6015,6 +6015,9 @@ class ForgeAgent:
                             allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                         )
                         otp_json_response, otp_actions = otp_result
+                        allow_partial_multi_field_totp_plan = _planner_confirmed_verification_code_intent(
+                            otp_json_response
+                        )
                         if isinstance(otp_result, ReplacedOTPPlan) or otp_actions:
                             detailed_agent_step_output.llm_response = otp_json_response
                             actions = otp_actions
@@ -6096,7 +6099,7 @@ class ForgeAgent:
             # actions injected before the scrape ran, a magic-link navigation aimed at a page nobody
             # scraped, a TOTP timeout terminate — stays unstamped and is judged on that.
             stamp_parsed_actions(actions)
-        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes
+        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes, allow_partial_multi_field_totp_plan
 
     async def _generate_cua_actions(
         self,
@@ -8339,7 +8342,6 @@ class ForgeAgent:
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
-        elements_for_prompt = app.AGENT_FUNCTION.transform_browser_elements_for_prompt(elements_for_prompt)
 
         open_tabs_context = await build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
@@ -11491,6 +11493,7 @@ class ForgeAgent:
                 multi_field_source_ready,
                 multi_field_attempt,
                 task_id=task.task_id,
+                allow_partial=_planner_confirmed_verification_code_intent(json_response),
             )
             and (
                 multi_field_attempt.code_source == "external"

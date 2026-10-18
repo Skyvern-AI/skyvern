@@ -468,6 +468,111 @@ async def test_page_tap_captures_trusted_actions_navigation_and_oopif() -> None:
 
 @skip_no_browser
 @pytest.mark.asyncio
+async def test_page_tap_captures_every_typed_navigation_when_the_renderer_commits_slowly() -> None:
+    paths = ["/a", "/b", "/c"]
+    tap: PageTap | None = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route: Any) -> None:
+                await route.fulfill(status=200, content_type="text/html", body=b"<html><body>Page</body></html>")
+
+            await context.route("**/*", serve)
+            page = await context.new_page()
+            await page.goto("http://main.test/")
+            tap = PageTap(context)
+            await tap.start([page])
+            # A throttled renderer reports frameNavigated well before the browser records the new history entry.
+            throttle = await context.new_cdp_session(page)
+            await throttle.send("Emulation.setCPUThrottlingRate", {"rate": 100})
+
+            navigated: list[str] = []
+            for path in paths:
+                await page.goto(f"http://main.test{path}")
+                navigation, _ = await _wait_for_event(tap, kind="navigate")
+                navigated.append(navigation.payload["url"])
+            assert navigated == [f"http://main.test{path}" for path in paths]
+            await browser.close()
+    finally:
+        if tap is not None:
+            await tap.stop()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_credits_each_navigation_to_its_own_entry_when_the_url_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = ["/a", "/b", "/a", "/c", "/a"]
+    arrived = 0
+    delivered = asyncio.Event()
+    read_done = [asyncio.Event() for _ in paths]
+    read_history = PageTap._enqueue_navigation_event
+
+    async def read_in_order_after_every_navigation(
+        self: PageTap, *args: Any, navigation_seq: int, **kwargs: Any
+    ) -> None:
+        # A busy event loop reads history only after later navigations are recorded, so hold every read until then.
+        nonlocal arrived
+        arrived += 1
+        if arrived == len(paths):
+            delivered.set()
+        await delivered.wait()
+        if navigation_seq > 1:
+            await read_done[navigation_seq - 2].wait()
+        try:
+            await read_history(self, *args, navigation_seq=navigation_seq, **kwargs)
+        finally:
+            read_done[navigation_seq - 1].set()
+
+    monkeypatch.setattr(PageTap, "_enqueue_navigation_event", read_in_order_after_every_navigation)
+    tap: PageTap | None = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            loads: list[str] = []
+            scripts = {
+                # The first /a rewrites its URL and then pushes a state, which inherits the typed URL.
+                ("/a", 1): "history.replaceState(null, '', '/a-rewritten'); history.pushState(null, '', '/a-pushed')",
+                ("/b", 1): "history.replaceState(null, '', '/b-rewritten')",
+            }
+
+            async def serve(route: Any) -> None:
+                path = urlparse(route.request.url).path
+                loads.append(path)
+                script = scripts.get((path, loads.count(path)), "")
+                body = f"<html><body>Page<script>{script}</script></body></html>".encode()
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await context.route("**/*", serve)
+            page = await context.new_page()
+            await page.goto("http://main.test/")
+            tap = PageTap(context)
+            await tap.start([page])
+            for path in paths:
+                await page.goto(f"http://main.test{path}")
+            await asyncio.wait_for(read_done[-1].wait(), timeout=10)
+
+            navigations = [event.payload for event in tap.drain_events() if event.payload.get("kind") == "navigate"]
+            assert [(payload["source_url"], payload["url"]) for payload in navigations] == [
+                ("http://main.test/", "http://main.test/a-rewritten"),
+                ("http://main.test/a", "http://main.test/b-rewritten"),
+                ("http://main.test/b", "http://main.test/a"),
+                ("http://main.test/a", "http://main.test/c"),
+                ("http://main.test/c", "http://main.test/a"),
+            ]
+            await browser.close()
+    finally:
+        if tap is not None:
+            await tap.stop()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
 async def test_page_tap_protects_labelled_secrets_and_captures_combobox_typing() -> None:
     tap: PageTap | None = None
     async with async_playwright() as playwright:

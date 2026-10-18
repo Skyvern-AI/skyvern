@@ -61,6 +61,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowModel,
     WorkflowParameterModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
     convert_to_output_parameter,
@@ -2213,6 +2214,7 @@ class WorkflowParametersRepository(BaseRepository):
     ) -> list[WorkflowCopilotChatSummary]:
         page = max(page, 1)
         page_size = max(min(page_size, 100), 1)
+        folder_filter = await _folder_access_filter(organization_id, WorkflowCopilotChatModel.workflow_permanent_id)
         async with self.Session() as session:
             # Each chat's first message (earliest created_at) is its title source and proves the
             # chat is non-empty; DISTINCT ON keeps one opening row per chat.
@@ -2245,6 +2247,8 @@ class WorkflowParametersRepository(BaseRepository):
             )
             if workflow_permanent_id is not None:
                 query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+            if folder_filter is not None:
+                query = query.where(folder_filter)
             if search and search.strip():
                 # Unindexed substring match over each chat's opening message (one row per chat);
                 # add a pg_trgm index on content if per-org chat counts grow large.

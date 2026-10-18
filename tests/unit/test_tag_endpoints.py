@@ -200,6 +200,9 @@ def app_with_routes(
     test_app, app_mock = _route_app
     app_mock.DATABASE.tags = repo
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    # OSS visibility: no folder hides anything, so tag cascades are allowed.
+    app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
+    app_mock.AGENT_FUNCTION.enforce_folder_access_everywhere = AsyncMock(return_value=None)
     monkeypatch.setattr(ap, "app", app_mock)
     return test_app
 

@@ -225,14 +225,15 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import (
+    WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
-    WorkflowUpdateYAMLRequest,
 )
 from skyvern.services.browser_recording.evidence import build_recording_evidence
 from skyvern.services.browser_recording.session_registry import interpretation_registry
@@ -272,6 +273,10 @@ _AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP = (
     "I did not apply this change automatically because a group of account runs is still running the saved "
     "version. Accept the change when you are ready; it is saved as a new version and the running group is "
     "not affected."
+)
+_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS = (
+    "I didn't save this automatically: it names a browser session, profile or workflow in a folder you can't run. "
+    "Remove that reference, or ask someone with access to accept it."
 )
 
 
@@ -1936,6 +1941,19 @@ async def _finalise_normal_turn(
             agent_result.proposal_disposition = "review_tested"
             agent_result.user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP}"
             user_response = agent_result.user_response
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_403_FORBIDDEN:
+                raise
+            # The folder check runs before any write, so nothing landed; keep the draft for review instead of
+            # failing the turn, so the user can edit out the hidden reference.
+            LOG.info(
+                "copilot auto-accept deferred by folder access",
+                auto_accept_deferred_reason="workflow_folder_access",
+            )
+            otel_trace.get_current_span().set_attribute("copilot.auto_accept_deferred_reason", "workflow_folder_access")
+            agent_result.proposal_disposition = "review_tested"
+            agent_result.user_response = f"{user_response}\n\n{_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS}"
+            user_response = agent_result.user_response
         except Exception:
             # Undo any mid-turn degraded write so a failed commit fails the turn
             # atomically instead of leaving canonical on a partial intermediate.
@@ -2041,10 +2059,10 @@ async def _finalise_normal_turn(
 
 async def _resolve_proposal_for_accept(
     proposal: dict[str, Any], *, organization_id: str, workflow_permanent_id: str
-) -> WorkflowUpdateYAMLRequest:
+) -> WorkflowCreateYAMLRequest:
     data = safe_load_no_dates(proposal["_copilot_yaml"])
     if not isinstance(data, dict):
-        return _normalize_copilot_yaml(proposal["_copilot_yaml"], request_type=WorkflowUpdateYAMLRequest)
+        return _normalize_copilot_yaml(proposal["_copilot_yaml"])
     submitted = private_workflow_settings_from_proposal(proposal)
     stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
@@ -2057,13 +2075,10 @@ async def _resolve_proposal_for_accept(
     data.pop("extra_http_headers", None)
     data.pop("cdp_connect_headers", None)
     data.update({key: value for key, value in private_settings.items() if key not in data})
-    yaml_request = _normalize_copilot_yaml(dump_workflow_yaml(data), request_type=WorkflowUpdateYAMLRequest)
+    yaml_request = _normalize_copilot_yaml(dump_workflow_yaml(data))
     if "workflow_definition" in proposal:
         # Header snapshots can be masked or stale; only authored YAML overrides saved headers.
         resolved = Workflow.model_validate(proposal).model_dump(mode="json")
-        if resolved["run_sequentially"] is None:
-            # Stored workflows allow legacy nulls; update requests use a boolean default.
-            resolved.pop("run_sequentially")
         if (
             "max_elapsed_time_minutes" not in yaml_request.model_fields_set
             and resolved["max_elapsed_time_minutes"] is None
@@ -2085,7 +2100,7 @@ async def _resolve_proposal_for_accept(
         resolved.update(yaml_request.model_dump(exclude_unset=True))
         if "cdp_connect_headers" in yaml_request.model_fields_set:
             resolved["cdp_connect_headers"] = yaml_request.cdp_connect_headers
-        yaml_request = WorkflowUpdateYAMLRequest.model_validate(resolved)
+        yaml_request = WorkflowCreateYAMLRequest.model_validate(resolved)
 
     return yaml_request
 
@@ -2135,6 +2150,12 @@ async def _commit_staged_workflow(
         organization_id=organization_id,
     )
     title = _accepted_workflow_title(staged_workflow.title, canonical, metadata)
+    # Auto-accept saves without the update route, so the staged definition gets the same reference check.
+    await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+        get_request_principal(),
+        "workflow.run",
+        staged_workflow.model_dump(exclude={"folder_id", "workflow_id", "workflow_permanent_id"}),
+    )
     return await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=workflow_id,
         organization_id=organization_id,
@@ -2246,6 +2267,8 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         sequential_key=original_workflow.sequential_key,
         created_by=original_workflow.created_by,
         edited_by=original_workflow.edited_by,
+        # The rollback restores who the saved version answers to, not whoever's request is rolling it back.
+        edited_for=original_workflow.edited_for,
         build_source=original_workflow.build_source,
         preserve_completion_contract=False,
         validate_code_block_templates=False,
@@ -4394,11 +4417,18 @@ async def workflow_copilot_credential_deletion(
     deletion_request: WorkflowCopilotCredentialDeletionRequest,
     organization: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"credential.delete"}))),
 ) -> QuestionInteraction:
     """Confirm a deletion card: claim it once, delete the chosen credentials, and record each outcome on it."""
     if not credential_delete_enabled():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential deletion from Copilot is off")
     organization_id = organization.organization_id
+    # Credential routes sit outside the folder guard, but this one acts on a chat that belongs to a workflow.
+    await app.AGENT_FUNCTION.enforce_folder_access(
+        get_request_principal(),
+        "workflow_copilot.update",
+        {"workflow_copilot_chat_id": deletion_request.workflow_copilot_chat_id},
+    )
     try:
         claimed = await app.DATABASE.workflow_params.claim_copilot_credential_deletion(
             organization_id,
@@ -4788,6 +4818,16 @@ async def workflow_copilot_demonstration_control(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="credential_id, selector, and field are required when action is 'fill_credential'",
+        )
+    demonstration = await load_demonstration_record(
+        cache, organization.organization_id, control_request.demonstration_id
+    )
+    if demonstration is not None:
+        # The control targets the demonstration's workflow, so it needs the same folder access as editing it.
+        await app.AGENT_FUNCTION.enforce_folder_access(
+            get_request_principal(),
+            "workflow_copilot.manage",
+            {"workflow_permanent_id": demonstration.workflow_permanent_id},
         )
     try:
         seq = await append_demonstration_control(
@@ -5235,6 +5275,10 @@ async def workflow_copilot_apply_proposed_workflow(
             )
             yaml_request.title = live_title
 
+        # The proposal can name another workflow's seed profile or session, so it is checked like a direct save.
+        await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+            get_request_principal(), "workflow.run", yaml_request.model_dump(exclude={"folder_id"})
+        )
         try:
             new_workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
                 organization=organization,

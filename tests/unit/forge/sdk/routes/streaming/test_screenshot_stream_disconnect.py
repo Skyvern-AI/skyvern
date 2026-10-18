@@ -71,7 +71,11 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_streaming_file=AsyncMock(return_value=b"jpeg")))
-    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(mark_streaming_viewer_active=AsyncMock()))
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(mark_streaming_viewer_active=AsyncMock(), enforce_folder_access=AsyncMock()),
+    )
 
     with capture_logs() as logs:
         await asyncio.wait_for(
@@ -162,7 +166,11 @@ def run_stream(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_Watc
     monkeypatch.setattr(screenshot.settings, "BROWSER_STREAMING_MODE", "vnc")
     monkeypatch.setattr(screenshot, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
-    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(mark_streaming_viewer_active=AsyncMock()))
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(mark_streaming_viewer_active=AsyncMock(), enforce_folder_access=AsyncMock()),
+    )
 
     async def _connect(
         runs: _ScriptedRuns,

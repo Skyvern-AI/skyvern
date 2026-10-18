@@ -226,7 +226,7 @@ async def test_skyvern_page_analysis_timeout_is_engine_neutral() -> None:
 
 @pytest.mark.asyncio
 async def test_incremental_element_tree_retries_without_wait_after_skyvern_page_analysis_timeout() -> None:
-    frame = SimpleNamespace(page=MagicMock(), url="https://example.com")
+    frame = SimpleNamespace(url="https://example.com")
     get_incremental_element_tree = AsyncMock(
         side_effect=[
             SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page"),
@@ -253,7 +253,7 @@ async def test_incremental_element_tree_retries_without_wait_after_skyvern_page_
 def _incremental_page(
     selection: BrowserEngineSelection | None, side_effect: list
 ) -> tuple[scraper.IncrementalScrapePage, AsyncMock]:
-    frame = SimpleNamespace(page=MagicMock(), url="https://example.com")
+    frame = SimpleNamespace(url="https://example.com")
     get_incremental_element_tree = AsyncMock(side_effect=side_effect)
     skyvern_frame = SimpleNamespace(
         get_frame=lambda: frame,

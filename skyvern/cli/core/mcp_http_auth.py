@@ -92,6 +92,7 @@ class _OAuthResolution:
     api_key: str
     validation: MCPAPIKeyValidation
     api_key_token_id: str | None = None
+    user_id: str | None = None
 
 
 class MissingOrgContextError(HTTPException):
@@ -342,11 +343,14 @@ async def _resolve_oauth_subject_to_org(
         raise HTTPException(status_code=401, detail="No organization found for this user")
 
     org_id = org_entities[0].organization_id
+    # Check the sign-in role before looking up or provisioning an org-wide key.
     member_api_key = await app.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key(org_id, payload)
     if member_api_key is not None:
         api_key_token_id, api_key = member_api_key
         validation = MCPAPIKeyValidation(organization_id=org_id, token_type=OrganizationAuthTokenType.api)
-        return _OAuthResolution(api_key=api_key, validation=validation, api_key_token_id=api_key_token_id)
+        return _OAuthResolution(
+            api_key=api_key, validation=validation, api_key_token_id=api_key_token_id, user_id=subject
+        )
 
     api_token = await get_auth_token(org_id, OrganizationAuthTokenType.api)
     if not api_token:
@@ -362,7 +366,9 @@ async def _resolve_oauth_subject_to_org(
         )
 
     validation = MCPAPIKeyValidation(organization_id=org_id, token_type=OrganizationAuthTokenType.api)
-    return _OAuthResolution(api_key=api_token.token, validation=validation, api_key_token_id=api_token.id)
+    return _OAuthResolution(
+        api_key=api_token.token, validation=validation, api_key_token_id=api_token.id, user_id=subject
+    )
 
 
 def _resolve_api_key_cache_ttl_seconds() -> float:

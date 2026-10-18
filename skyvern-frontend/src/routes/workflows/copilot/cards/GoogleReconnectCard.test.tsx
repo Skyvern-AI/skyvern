@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GoogleReconnectCard } from "./GoogleReconnectCard";
+import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
 const { hookState, startAuthorize, storeIntegration, toast } = vi.hoisted(
   () => ({
@@ -51,6 +52,18 @@ const notice = {
   condition: "unusable" as const,
 };
 
+const memberPermissions: PermissionsState = {
+  status: "ready",
+  data: {
+    organization_id: "org_1",
+    user_id: "user_1",
+    auth_kind: "bearer",
+    org_role: "org:member",
+    role: "member",
+    capabilities: [],
+  },
+};
+
 describe("GoogleReconnectCard", () => {
   beforeEach(() => {
     hookState.current = {
@@ -63,6 +76,21 @@ describe("GoogleReconnectCard", () => {
     storeIntegration.mockReset();
     toast.mockReset();
     vi.unstubAllEnvs();
+  });
+
+  it("disables OAuth reconnect for Members", () => {
+    render(
+      <PageSlotsProvider value={{ permissions: memberPermissions }}>
+        <GoogleReconnectCard notice={notice} />
+      </PageSlotsProvider>,
+    );
+
+    const reconnectButton = screen.getByRole("button", {
+      name: "Admin required",
+    });
+    expect(reconnectButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(reconnectButton);
+    expect(startAuthorize).not.toHaveBeenCalled();
   });
 
   it("shows success only when a fresh lookup says the exact connection is active", () => {
@@ -271,6 +299,35 @@ describe("GoogleReconnectCard", () => {
     expect(onSelect).not.toHaveBeenCalled();
     open.mockRestore();
   });
+
+  it("lets Members choose a saved account for an unbound Sheets block", () => {
+    hookState.current.credentials = [
+      {
+        id: "goac_saved",
+        credential_name: "Saved Sheets",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/spreadsheets"],
+      },
+    ];
+    const onSelect = vi.fn();
+    const unbound = {
+      provider: "google" as const,
+      connectionId: null,
+      displayName: null,
+      condition: "unbound" as const,
+      choices: [],
+    };
+
+    render(
+      <PageSlotsProvider value={{ permissions: memberPermissions }}>
+        <GoogleReconnectCard notice={unbound} onSelect={onSelect} />
+      </PageSlotsProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Saved Sheets/ }));
+    expect(onSelect).toHaveBeenCalledWith("goac_saved");
+  });
+
   it("allows saved choices during a list-fetch error but keeps historical choices disabled", () => {
     hookState.current.error = new Error("offline");
     const onSelect = vi.fn();

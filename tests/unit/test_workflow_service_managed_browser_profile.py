@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
 from types import SimpleNamespace
@@ -109,6 +110,8 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         workflow_id="wf_1",
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
+        created_by=None,
+        workflow_schedule_id=None,
         browser_session_id=None,
         browser_profile_id="bp_managed",
         browser_seed_source=BrowserSeedSource.own_memory,
@@ -1065,7 +1068,7 @@ async def test_cleanup_uses_legacy_path_when_retry_attempt_lookup_fails(
         run_id=workflow_run.workflow_run_id,
     )
     delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
-    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None, finalizer="worker_cleanup")
     policy_effects.assert_not_awaited()
 
 
@@ -1194,7 +1197,7 @@ async def test_cleanup_uses_legacy_path_when_policy_run_has_no_attempt_row(monke
         is_final_attempt=True,
     )
     delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
-    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None, finalizer="worker_cleanup")
     policy_effects.assert_not_awaited()
 
 
@@ -1258,7 +1261,7 @@ async def _assert_policy_definition_uses_legacy_cleanup_for_ineligible_run(
         is_final_attempt=True,
     )
     delete_attachments.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
-    legacy_webhook.assert_awaited_once_with(workflow_run, None)
+    legacy_webhook.assert_awaited_once_with(workflow_run, None, finalizer="worker_cleanup")
     policy_effects.assert_not_awaited()
 
 
@@ -2016,7 +2019,7 @@ async def test_clean_up_workflow_closes_owned_session_when_webhook_raises(
 async def forced_session_setup(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: AsyncEngine,
-) -> tuple[AgentDB, WorkflowService, Workflow]:
+) -> AsyncIterator[tuple[AgentDB, WorkflowService, Workflow]]:
     database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
     await database.organizations.create_organization("Test", organization_id="o_test")
     async with database.Session() as session:
@@ -2065,7 +2068,9 @@ async def forced_session_setup(
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", AsyncMock(side_effect=create_session))
     service = WorkflowService()
     monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
-    return database, service, workflow
+    yield database, service, workflow
+    while service._background_tasks:
+        await asyncio.gather(*list(service._background_tasks))
 
 
 @pytest.mark.asyncio

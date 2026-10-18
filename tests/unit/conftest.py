@@ -49,6 +49,7 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1086,11 +1087,20 @@ RUN_GROUP_WPID = "wpid_test"
 
 
 @dataclass
-class FakeExecutor:
+class FakeExecutor(AsyncExecutor):
     database: AgentDB
     executed: list[str] = field(default_factory=list)
     submitted: list[str] = field(default_factory=list)
     before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_task(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_task_v2(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_script(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
 
     async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
         self.executed.append(workflow_run_id)

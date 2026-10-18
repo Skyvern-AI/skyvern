@@ -47,10 +47,6 @@ else:
     app = AppHolder()  # type: ignore
 
 
-def is_forge_app_initialized() -> bool:
-    return object.__getattribute__(app, "_inst") is not None
-
-
 def set_force_app_instance(inst: ForgeApp) -> None:
     app.set_app(inst)  # type: ignore
 

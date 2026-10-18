@@ -8,13 +8,12 @@ import os
 import re
 import time
 import uuid
-import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
-from playwright.async_api import Frame, Locator, Page
+from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
@@ -26,7 +25,7 @@ from skyvern.exceptions import (
     SkyvernActionFailed,
     StaleFrameSelectionError,
 )
-from skyvern.forge import app, is_forge_app_initialized
+from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
@@ -47,99 +46,11 @@ from skyvern.webeye.utils.page import mask_otp_values_in_html
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
     from skyvern.webeye.actions.responses import ActionResult
+    from skyvern.webeye.browser_engine import EngineFrame
 
 LOG = structlog.get_logger()
 
 _EXTRACT_FORM_FIELDS_JS: str | None = None
-
-CACHED_SCRIPT_PAGE_API = frozenset(
-    {
-        "classify",
-        "click",
-        "complete",
-        "download_file",
-        "drag",
-        "dynamic_field_map",
-        "element_fallback",
-        "extract",
-        "extract_form_fields",
-        "fill",
-        "fill_autocomplete",
-        "fill_from_mapping",
-        "fill_multipage_form",
-        "get_totp_digit",
-        "goto",
-        "hover",
-        "keypress",
-        "left_mouse",
-        "magic_link",
-        "move",
-        "null_action",
-        "prompt",
-        "quality_audit",
-        "reload_page",
-        "scroll",
-        "select_option",
-        "solve_captcha",
-        "structural_validate",
-        "terminate",
-        "type",
-        "upload_file",
-        "url",
-        "validate",
-        "validate_mapping",
-        "verification_code",
-        "wait",
-    }
-)
-
-
-@dataclass
-class _PageInternals:
-    page: Page
-    ai: SkyvernPageAi
-    working_frame: Frame | None = None
-
-
-_PAGE_INTERNALS: weakref.WeakKeyDictionary[object, _PageInternals] = weakref.WeakKeyDictionary()
-
-
-def _get_raw_page(page: object) -> Page:
-    return _PAGE_INTERNALS[page() if type(page) is weakref.ReferenceType else page].page  # Avoid isinstance recursion.
-
-
-def _get_page_ai(page: object) -> SkyvernPageAi:
-    return _PAGE_INTERNALS[page].ai
-
-
-def _owned_working_frame(page: object) -> Frame | None:
-    """Return the working iframe, refusing one that names a different owning page."""
-    internals = _PAGE_INTERNALS[page]
-    frame = internals.working_frame
-    if frame is None:
-        return None
-    if frame.page is not internals.page:
-        raise StaleFrameSelectionError(frame.name, redact_url_secrets(frame.url))
-    return frame
-
-
-def _get_frame_scoped_ai(page: object) -> SkyvernPageAi:
-    """AI surface for actions that retarget a failed frame-scoped selector: their broad fallback
-    handlers swallow the scope refusal and would reissue the action against the focused page.
-    """
-    _owned_working_frame(page)
-    return _PAGE_INTERNALS[page].ai
-
-
-def _get_locator_scope(page: object) -> Page | Frame:
-    frame = _owned_working_frame(page)
-    if frame is not None:
-        return frame
-    return _PAGE_INTERNALS[page].page
-
-
-def _set_working_frame(page: object, frame: Frame | None) -> None:
-    _PAGE_INTERNALS[page].working_frame = frame
 
 
 class ResolvedSensitiveValue(str):
@@ -178,7 +89,7 @@ class ActionCall:
     error: Exception | None = None  # populated if failed
 
 
-class _SkyvernPageBase:
+class SkyvernPage(Page):
     """
     A lightweight adapter for the selected driver that:
     1. Executes actual browser commands
@@ -187,6 +98,7 @@ class _SkyvernPageBase:
     """
 
     engine_selection: BrowserEngineSelection | None = None
+    _working_frame: EngineFrame | None = None
 
     def __init__(
         self,
@@ -194,41 +106,62 @@ class _SkyvernPageBase:
         ai: SkyvernPageAi,
         engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
-        _PAGE_INTERNALS[self] = _PageInternals(page=page, ai=ai)
+        super().__init__(page)
+        self.page = page
         self.engine_selection = engine_selection
         self.current_label: str | None = None
+        self._ai = ai
+
+    def __getattribute__(self, name: str) -> Any:
+        page = object.__getattribute__(self, "page")
+        if hasattr(page, name):
+            for cls in type(self).__mro__:
+                if cls is Page:
+                    break
+                if name in cls.__dict__:
+                    return object.__getattribute__(self, name)
+            return getattr(page, name)
+
+        return object.__getattribute__(self, name)
+
+    def _owned_working_frame(self) -> EngineFrame | None:
+        """Return the working iframe, refusing one that names a different owning page."""
+        frame = object.__getattribute__(self, "_working_frame")
+        if frame is None:
+            return None
+        if frame.page is not object.__getattribute__(self, "page"):
+            raise StaleFrameSelectionError(frame.name, redact_url_secrets(frame.url))
+        return frame
 
     @property
-    def url(self) -> str:
-        """The only native-page attribute exposed to cached caller code."""
-        return _get_raw_page(self).url
-
-    @property
-    def _working_frame(self) -> None:
-        raise AttributeError("_working_frame is an internal browser capability")
-
-    @_working_frame.setter
-    def _working_frame(self, frame: Frame | None) -> None:
-        _set_working_frame(self, frame)
-
-    @property
-    def _locator_scope(self) -> Page | Frame:
+    def _locator_scope(self) -> Page | EngineFrame:
         """Return the current locator scope: the working iframe if set, otherwise the page.
 
-        Use for element interaction (locator, click, fill). Keep the raw page for
+        Use for element interaction (locator, click, fill). Keep self.page for
         page-level operations (goto, keyboard, url, title, reload, content).
         """
-        return _get_locator_scope(self)
+        frame = self._owned_working_frame()
+        if frame is not None:
+            return frame
+        return object.__getattribute__(self, "page")
 
     @property
-    def locator_scope(self) -> Page | Frame:
+    def _frame_scoped_ai(self) -> SkyvernPageAi:
+        """AI surface for actions that retarget a failed frame-scoped selector: their broad fallback
+        handlers swallow the scope refusal and would reissue the action against the focused page.
+        """
+        self._owned_working_frame()
+        return object.__getattribute__(self, "_ai")
+
+    @property
+    def locator_scope(self) -> Page | EngineFrame:
         """Public read-only view of the current locator scope for callers outside this class."""
-        return _get_locator_scope(self)
+        return self._locator_scope
 
     @property
-    def working_frame(self) -> Frame | None:
+    def working_frame(self) -> EngineFrame | None:
         """Public read-only view of the working iframe (None means the main frame)."""
-        return _PAGE_INTERNALS[self].working_frame
+        return object.__getattribute__(self, "_working_frame")
 
     async def _decorate_call(
         self,
@@ -237,10 +170,6 @@ class _SkyvernPageBase:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        # Cached actions share this wrapper; apply the extension policy before mutation. SDK remote mode and
-        # stdio MCP drive pages without a ForgeApp, where no extension policy can be bound.
-        if is_forge_app_initialized():
-            app.AGENT_FUNCTION.enforce_browser_action_policy(action, _get_raw_page(self))
         context = skyvern_context.current()
         # label = self.current_label
         # action_override = None
@@ -264,7 +193,7 @@ class _SkyvernPageBase:
     ) -> Callable:
         def decorator(fn: Callable) -> Callable:
             async def wrapper(
-                skyvern_page: _SkyvernPageBase,
+                skyvern_page: SkyvernPage,
                 *args: Any,
                 **kwargs: Any,
             ) -> Any:
@@ -279,7 +208,7 @@ class _SkyvernPageBase:
     async def goto(self, url: str, **kwargs: Any) -> None:
         url = await asyncio.to_thread(validate_fetch_url, url)
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
-        await _get_raw_page(self).goto(url, timeout=timeout, **kwargs)
+        await self.page.goto(url, timeout=timeout, **kwargs)
 
     async def get_actual_value(
         self,
@@ -390,7 +319,7 @@ class _SkyvernPageBase:
         if not ctx or ctx.code_version != 2:
             max_retries = 0
 
-        locator = _get_locator_scope(self).locator(selector).first
+        locator = self._locator_scope.locator(selector).first
         for attempt in range(1 + max_retries):
             try:
                 # First attempt uses full timeout; retries use a shorter check
@@ -418,7 +347,7 @@ class _SkyvernPageBase:
                     )
                     await asyncio.sleep(retry_interval)
                     # Re-acquire locator in case the DOM was replaced entirely
-                    locator = _get_locator_scope(self).locator(selector).first
+                    locator = self._locator_scope.locator(selector).first
                 else:
                     raise
 
@@ -544,7 +473,7 @@ class _SkyvernPageBase:
             if not selector:
                 raise ValueError("mode='direct' requires a selector.")
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
-            locator = _get_locator_scope(self).locator(selector).first
+            locator = self._locator_scope.locator(selector).first
             await locator.click(timeout=timeout, **kwargs)
             return selector
 
@@ -571,7 +500,7 @@ class _SkyvernPageBase:
                     # Retry selector lookup to handle page transitions (redirects,
                     # slow renders) before burning an expensive AI fallback call.
                     if _skip_element_prep:
-                        locator = _get_locator_scope(self).locator(selector).first
+                        locator = self._locator_scope.locator(selector).first
                     else:
                         locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
                         await self._prepare_element(locator, timeout=timeout)
@@ -602,9 +531,9 @@ class _SkyvernPageBase:
                     # Escape to dismiss it and retry once before falling to AI.
                     if should_retry_after_escape:
                         try:
-                            await _get_raw_page(self).keyboard.press("Escape")
+                            await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
-                            locator = _get_locator_scope(self).locator(selector).first
+                            locator = self._locator_scope.locator(selector).first
                             # The primary click may have dispatched and reached the desired state
                             # before raising, in which case retrying would toggle it back off.
                             if await self._click_is_redundant(locator, desired_state, timeout):
@@ -635,7 +564,7 @@ class _SkyvernPageBase:
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_click(
+                return await self._frame_scoped_ai.ai_click(
                     selector=selector,
                     intention=prompt,
                     data=data,
@@ -650,7 +579,7 @@ class _SkyvernPageBase:
                 return selector
         elif ai == "proactive":
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_click(
+                return await self._frame_scoped_ai.ai_click(
                     selector=selector,
                     intention=prompt,
                     data=data,
@@ -660,7 +589,7 @@ class _SkyvernPageBase:
                 )
 
         if selector:
-            locator = _get_locator_scope(self).locator(selector).first
+            locator = self._locator_scope.locator(selector).first
             if not await self._click_is_redundant(locator, desired_state, timeout):
                 await locator.click(timeout=timeout, **kwargs)
 
@@ -690,7 +619,7 @@ class _SkyvernPageBase:
         if not selector:
             raise ValueError("Hover requires a selector.")
 
-        locator = _get_locator_scope(self).locator(selector, **kwargs)
+        locator = self._locator_scope.locator(selector, **kwargs)
         await locator.scroll_into_view_if_needed()
         await locator.hover(timeout=timeout)
         if hold_seconds and hold_seconds > 0:
@@ -800,7 +729,7 @@ class _SkyvernPageBase:
                 totp_url=totp_url,
             )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
-            locator = _get_locator_scope(self).locator(selector).first
+            locator = self._locator_scope.locator(selector).first
             element = None
             if _direct_fill_release_guard is not None:
                 element = await locator.element_handle(timeout=timeout)
@@ -1004,26 +933,31 @@ class _SkyvernPageBase:
             ai = context.ai_mode_override
 
         original_value = value or ""
-        value_is_sensitive = isinstance(original_value, ResolvedSensitiveValue) or bool(
-            kwargs.get("totp_identifier") or kwargs.get("totp_url")
-        )
+        value_is_sensitive = isinstance(original_value, ResolvedSensitiveValue)
         try:
             value_is_sensitive = value_is_sensitive or self._is_secret_reference(original_value)
         except Exception:
             pass
+        resolved_totp_value: str | None = None
+        if value is not None and is_unresolved_totp_value(value):
+            resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
+                value,
+                totp_identifier=kwargs.get("totp_identifier"),
+                totp_url=kwargs.get("totp_url"),
+            )
+            value_is_sensitive = True
+
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
 
         # For proactive mode, delegate entirely to the AI — it knows how to handle
         # autocomplete via the agent's full action handler.
         if ai == "proactive" and prompt:
-            return await _get_frame_scoped_ai(self).ai_input_text(
+            return await self._frame_scoped_ai.ai_input_text(
                 selector=selector,
                 value=value or "",
                 intention=prompt,
                 data=data,
-                totp_identifier=kwargs.get("totp_identifier"),
-                totp_url=kwargs.get("totp_url"),
                 timeout=timeout,
                 value_is_sensitive=value_is_sensitive,
             )
@@ -1032,29 +966,28 @@ class _SkyvernPageBase:
         if not selector:
             # No selector, fall through to AI fallback below
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=None,
                     value=value or "",
                     intention=prompt,
                     data=data,
-                    totp_identifier=kwargs.get("totp_identifier"),
-                    totp_url=kwargs.get("totp_url"),
                     timeout=timeout,
                     value_is_sensitive=value_is_sensitive,
                 )
             raise ValueError("Selector is required but was not provided")
 
-        actual_value = value or ""
-        try:
-            actual_value = await self.get_actual_value(
-                actual_value,
-                totp_identifier=kwargs.get("totp_identifier"),
-                totp_url=kwargs.get("totp_url"),
-            )
-        except NoTOTPSecretFound:
-            raise
-        except Exception:
-            pass  # use original value
+        actual_value = resolved_totp_value if resolved_totp_value is not None else value or ""
+        if resolved_totp_value is None:
+            try:
+                actual_value = await self.get_actual_value(
+                    actual_value,
+                    totp_identifier=kwargs.get("totp_identifier"),
+                    totp_url=kwargs.get("totp_url"),
+                )
+            except NoTOTPSecretFound:
+                raise
+            except Exception:
+                pass  # use original value
         value_is_sensitive = value_is_sensitive or actual_value != original_value
         if is_unresolved_totp_value(actual_value):
             raise NoTOTPSecretFound()
@@ -1078,13 +1011,11 @@ class _SkyvernPageBase:
                 error=redact_sensitive_value(str(e), redaction_value),
             )
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=None,
-                    value=original_value if value_is_sensitive else actual_value,
+                    value=value if resolved_totp_value is not None else actual_value,
                     intention=prompt,
                     data=data,
-                    totp_identifier=kwargs.get("totp_identifier"),
-                    totp_url=kwargs.get("totp_url"),
                     timeout=timeout,
                     value_is_sensitive=value_is_sensitive,
                 )
@@ -1113,7 +1044,7 @@ class _SkyvernPageBase:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
         """Type into an autocomplete input and click the best matching dropdown option."""
-        locator = _get_locator_scope(self).locator(selector).first
+        locator = self._locator_scope.locator(selector).first
 
         # Clear existing value and type character-by-character to trigger autocomplete
         await locator.clear(timeout=timeout)
@@ -1192,7 +1123,7 @@ class _SkyvernPageBase:
 
         for sel in selectors_to_try:
             try:
-                locator = _get_locator_scope(self).locator(sel)
+                locator = self._locator_scope.locator(sel)
                 count = await locator.count()
                 if count > 0:
                     return [locator.nth(i) for i in range(min(count, 10))]  # cap at 10
@@ -1260,6 +1191,13 @@ class _SkyvernPageBase:
             ai = context.ai_mode_override
 
         original_value = value
+        resolved_totp_value: str | None = None
+        if is_unresolved_totp_value(value):
+            resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
+                value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+            )
 
         # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
         # so that we use the exact digit value instead of having AI generate a new one
@@ -1269,37 +1207,37 @@ class _SkyvernPageBase:
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
-            value_is_sensitive = (
-                isinstance(original_value, ResolvedSensitiveValue)
-                or self._is_secret_reference(original_value)
-                or is_unresolved_totp_value(original_value)
-                or bool(totp_identifier or totp_url)
-            )
+            value_is_sensitive = False
             original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
-                    # Retry selector lookup before resolving a protected value. If it fails,
-                    # the AI fallback receives only the opaque reference and picks an element.
-                    if _skip_element_prep:
-                        locator = _get_locator_scope(self).locator(selector).first
-                    else:
-                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
-                        await self._prepare_element(locator, timeout=timeout)
-                    if is_unresolved_totp_value(original_value):
-                        value = await self._resolve_totp_placeholder_or_raise(
-                            original_value,
-                            totp_identifier=totp_identifier,
-                            totp_url=totp_url,
-                        )
+                    value_is_sensitive = isinstance(
+                        original_value, ResolvedSensitiveValue
+                    ) or self._is_secret_reference(original_value)
+                    if resolved_totp_value is not None:
+                        value = resolved_totp_value
                     else:
                         value = await self.get_actual_value(
-                            original_value,
+                            value,
                             totp_identifier=totp_identifier,
                             totp_url=totp_url,
                         )
                     value_is_sensitive = value_is_sensitive or value != original_value
                     if is_unresolved_totp_value(value):
                         raise NoTOTPSecretFound()
+                    # Retry selector lookup to handle page transitions (redirects,
+                    # slow renders) before burning an expensive AI fallback call.
+                    if _skip_element_prep:
+                        locator = self._locator_scope.locator(selector).first
+                    else:
+                        locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
+                        await self._prepare_element(locator, timeout=timeout)
+                    if resolved_totp_value is not None:
+                        value = await self._resolve_totp_placeholder_or_raise(
+                            original_value,
+                            totp_identifier=totp_identifier,
+                            totp_url=totp_url,
+                        )
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
                     # dropdowns on search bars and typeaheads which destabilise the DOM
@@ -1322,9 +1260,9 @@ class _SkyvernPageBase:
                     selector = None
 
             if intention:
-                return await _get_frame_scoped_ai(self).ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=selector,
-                    value=original_value if value_is_sensitive else value,
+                    value=original_value if resolved_totp_value is not None else value,
                     intention=intention,
                     data=data,
                     totp_identifier=totp_identifier,
@@ -1340,7 +1278,7 @@ class _SkyvernPageBase:
             else:
                 return original_value
         elif ai == "proactive" and intention:
-            return await _get_frame_scoped_ai(self).ai_input_text(
+            return await self._frame_scoped_ai.ai_input_text(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -1355,13 +1293,13 @@ class _SkyvernPageBase:
         if not selector:
             raise ValueError("Selector is required but was not provided")
 
-        if is_unresolved_totp_value(original_value):
+        locator = self._locator_scope.locator(selector).first
+        if resolved_totp_value is not None:
             value = await self._resolve_totp_placeholder_or_raise(
                 original_value,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
             )
-        locator = _get_locator_scope(self).locator(selector).first
         await locator.fill(value, timeout=timeout)
         return value
 
@@ -1435,7 +1373,7 @@ class _SkyvernPageBase:
                         files,
                         organization_id=await self._get_file_organization_id(files),
                     )
-                    locator = _get_locator_scope(self).locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
                 except StaleFrameSelectionError:
                     raise
@@ -1444,7 +1382,7 @@ class _SkyvernPageBase:
                     selector = None
 
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_upload_file(
+                return await self._frame_scoped_ai.ai_upload_file(
                     selector=selector,
                     files=files,
                     intention=prompt,
@@ -1458,7 +1396,7 @@ class _SkyvernPageBase:
             else:
                 return files
         elif ai == "proactive" and prompt:
-            return await _get_frame_scoped_ai(self).ai_upload_file(
+            return await self._frame_scoped_ai.ai_upload_file(
                 selector=selector,
                 files=files,
                 intention=prompt,
@@ -1472,7 +1410,7 @@ class _SkyvernPageBase:
             raise ValueError("Parameter 'files' is required but was not provided")
 
         file_path = await download_file_from_url(files, organization_id=await self._get_file_organization_id(files))
-        locator = _get_locator_scope(self).locator(selector)
+        locator = self._locator_scope.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
 
@@ -1560,7 +1498,7 @@ class _SkyvernPageBase:
             error_to_raise = None
             if selector:
                 try:
-                    locator = _get_locator_scope(self).locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     await locator.select_option(value, timeout=timeout, **kwargs)
                     return value
                 except StaleFrameSelectionError:
@@ -1570,7 +1508,7 @@ class _SkyvernPageBase:
                     selector = None
 
             if prompt:
-                return await _get_frame_scoped_ai(self).ai_select_option(
+                return await self._frame_scoped_ai.ai_select_option(
                     selector=selector,
                     value=value,
                     intention=prompt,
@@ -1582,7 +1520,7 @@ class _SkyvernPageBase:
             else:
                 return value
         elif ai == "proactive" and prompt:
-            return await _get_frame_scoped_ai(self).ai_select_option(
+            return await self._frame_scoped_ai.ai_select_option(
                 selector=selector,
                 value=value,
                 intention=prompt,
@@ -1590,7 +1528,7 @@ class _SkyvernPageBase:
                 timeout=timeout,
             )
         if selector:
-            locator = _get_locator_scope(self).locator(selector)
+            locator = self._locator_scope.locator(selector)
             await locator.select_option(value, timeout=timeout, **kwargs)
         return value
 
@@ -1676,7 +1614,7 @@ class _SkyvernPageBase:
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:
         """Reload the current page, recorded as an action."""
-        await _get_raw_page(self).reload(**kwargs)
+        await self.page.reload(**kwargs)
         return
 
     @action_wrap(ActionType.EXTRACT)
@@ -1721,7 +1659,7 @@ class _SkyvernPageBase:
         extra_kwargs: dict[str, Any] = {}
         if "system_prompt" in kwargs:
             extra_kwargs["system_prompt"] = kwargs.pop("system_prompt")
-        return await _get_page_ai(self).ai_extract(
+        return await self._ai.ai_extract(
             prompt=prompt,
             schema=schema,
             error_code_mapping=error_code_mapping,
@@ -1771,7 +1709,7 @@ class _SkyvernPageBase:
         elif model is not None:
             normalized_model = model
 
-        return await _get_page_ai(self).ai_validate(prompt=prompt, model=normalized_model)
+        return await self._ai.ai_validate(prompt=prompt, model=normalized_model)
 
     async def classify(
         self,
@@ -1826,7 +1764,7 @@ class _SkyvernPageBase:
                 await page.element_fallback(navigation_goal="Complete the form submission")
             ```
         """
-        return await _get_page_ai(self).ai_classify(
+        return await self._ai.ai_classify(
             options=options,
             url_patterns=url_patterns,
             text_patterns=text_patterns,
@@ -1844,7 +1782,7 @@ class _SkyvernPageBase:
         """
         base_js = _get_extract_form_fields_js()
 
-        ext_js = app.AGENT_FUNCTION.get_form_field_extraction_js(url=_get_raw_page(self).url)
+        ext_js = app.AGENT_FUNCTION.get_form_field_extraction_js(url=self.page.url)
         if ext_js:
             marker = "// PLATFORM_EXTENSION_POINT"
             if marker not in base_js:
@@ -1852,7 +1790,7 @@ class _SkyvernPageBase:
             else:
                 base_js = base_js.replace(marker, ext_js)
 
-        return await _get_raw_page(self).evaluate(base_js)
+        return await self.page.evaluate(base_js)
 
     async def dynamic_field_map(
         self,
@@ -1967,10 +1905,6 @@ class _SkyvernPageBase:
             mapping: Output of :meth:`dynamic_field_map` (index -> value).
             data: Original data dict for post-fill file upload matching.
         """
-        # This helper mutates fields via raw locator calls that bypass the @action_wrap gate, so
-        # enforce once up front; a blocked run aborts before any field is touched.
-        page = _get_raw_page(self)
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
         ai_fallback_count = 0
         max_ai_fallbacks = 10
 
@@ -2054,13 +1988,11 @@ class _SkyvernPageBase:
                                 )
 
                 elif field_tag == "select":
-                    locator = _get_locator_scope(self).locator(selector)
+                    locator = self._locator_scope.locator(selector)
                     try:
-                        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.SELECT_OPTION, page)
                         await locator.select_option(label=str(value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                     except Exception:
                         try:
-                            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.SELECT_OPTION, page)
                             await locator.select_option(str(value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                         except Exception:
                             # Dropdown value didn't match — AI fallback (Code 2.0 style)
@@ -2111,7 +2043,7 @@ class _SkyvernPageBase:
                     )
                     if _budget_available():
                         filled = await app.AGENT_FUNCTION.fill_custom_widget(
-                            _get_raw_page(self),
+                            self.page,
                             field,
                             value,
                             label,
@@ -2132,23 +2064,18 @@ class _SkyvernPageBase:
                     # Combobox / React Select: click to open, type to filter,
                     # click the matching option.
                     str_value = str(value)
-                    locator = _get_locator_scope(self).locator(selector).first
-                    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
+                    locator = self._locator_scope.locator(selector).first
                     await locator.click(timeout=5000)
                     await asyncio.sleep(0.3)
-                    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
                     await locator.fill("")
                     search_text = str_value.split(",")[0].strip()[:25]
-                    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
-                    await _get_raw_page(self).keyboard.type(search_text, delay=50)
+                    await self.page.keyboard.type(search_text, delay=50)
                     await asyncio.sleep(0.5)
-                    option = _get_locator_scope(self).locator('[class*="select__option"]:visible').first
+                    option = self._locator_scope.locator('[class*="select__option"]:visible').first
                     try:
-                        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
                         await option.click(timeout=3000)
                     except Exception:
-                        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
-                        await _get_raw_page(self).keyboard.press("Enter")
+                        await self.page.keyboard.press("Enter")
                     await asyncio.sleep(0.3)
 
                 else:
@@ -2425,7 +2352,7 @@ class _SkyvernPageBase:
             ts = datetime.datetime.now().strftime("%H%M%S_%f")[:-3]
             filename = f"{ts}_{label}.html"
             filepath = os.path.join(debug_dir, filename)
-            html = mask_otp_values_in_html(await _get_raw_page(self).content())
+            html = mask_otp_values_in_html(await self.page.content())
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(html)
             LOG.info("_dump_html: saved", path=filepath, size=len(html))
@@ -2623,7 +2550,7 @@ class _SkyvernPageBase:
                 from skyvern.webeye.utils.page import SkyvernFrame
 
                 skyvern_frame = await SkyvernFrame.create_instance(
-                    frame=_get_raw_page(self),
+                    frame=self.page,
                     engine_selection=self.engine_selection,
                 )
                 await skyvern_frame.wait_for_page_ready(
@@ -2639,7 +2566,7 @@ class _SkyvernPageBase:
             # Check for validation errors AFTER clicking next (some sites show
             # errors only after clicking Save and Continue)
             try:
-                post_click_errors = await _get_raw_page(self).evaluate("""() => {
+                post_click_errors = await self.page.evaluate("""() => {
                     const errs = [];
                     // Common error patterns: inline error messages, alert banners
                     const selectors = '[data-automation-id*="error"], [data-automation-id*="Error"], [class*="errorMessage"], [class*="fieldError"], [role="alert"], [aria-invalid="true"]';
@@ -3349,7 +3276,7 @@ class _SkyvernPageBase:
             elif method == "select_option":
                 # Planned values are typically option labels (display text) from the batch planner.
                 # Try matching by label first, then fall back to value attribute.
-                locator = _get_locator_scope(self).locator(selector)
+                locator = self._locator_scope.locator(selector)
                 try:
                     await locator.select_option(label=str(planned_value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                 except Exception:
@@ -3378,7 +3305,7 @@ class _SkyvernPageBase:
                     if method == "fill_autocomplete":
                         await self.fill_autocomplete(selector=alt_selector, value=str(planned_value), ai=None)
                     elif method == "select_option":
-                        locator = _get_locator_scope(self).locator(alt_selector)
+                        locator = self._locator_scope.locator(alt_selector)
                         try:
                             await locator.select_option(
                                 label=str(planned_value), timeout=settings.BROWSER_ACTION_TIMEOUT_MS
@@ -3423,7 +3350,7 @@ class _SkyvernPageBase:
         # Post-fill validation for text fields: detect essays in short-text fields
         if method in ("fill", "fill_autocomplete") and hint == "short text":
             try:
-                actual = await _get_locator_scope(self).locator(selector).input_value(timeout=2000)
+                actual = await self._locator_scope.locator(selector).input_value(timeout=2000)
                 if actual and len(actual) > 100:
                     LOG.warning(
                         "fill_with_planned_value: value too long for short text field, re-filling with AI",
@@ -3453,7 +3380,7 @@ class _SkyvernPageBase:
         Returns False to signal the caller should fall back to LLM validation.
         """
         try:
-            field_values = await _get_raw_page(self).evaluate(
+            field_values = await self.page.evaluate(
                 """() => {
                 const results = [];
                 const elements = document.querySelectorAll('input, select, textarea');
@@ -3513,14 +3440,10 @@ class _SkyvernPageBase:
             # frame (e.g. payment form errors). Main-page error badges are not
             # visible from within an iframe — this is intentional for frame-scoped
             # validation but callers should be aware of the scoping.
-            error_count = (
-                await _get_locator_scope(self)
-                .locator(
-                    "[class*='error']:visible, [class*='invalid']:visible, "
-                    "[role='alert']:visible, [aria-invalid='true']:visible"
-                )
-                .count()
-            )
+            error_count = await self._locator_scope.locator(
+                "[class*='error']:visible, [class*='invalid']:visible, "
+                "[role='alert']:visible, [aria-invalid='true']:visible"
+            ).count()
 
             if error_count > 0:
                 LOG.info(
@@ -3550,7 +3473,7 @@ class _SkyvernPageBase:
         """
         try:
             # Read current values of all visible form fields
-            field_values = await _get_raw_page(self).evaluate(
+            field_values = await self.page.evaluate(
                 """() => {
                 const results = [];
                 const elements = document.querySelectorAll('input, select, textarea');
@@ -3739,7 +3662,7 @@ class _SkyvernPageBase:
                 )
             ```
         """
-        return await _get_frame_scoped_ai(self).ai_element_fallback(
+        return await self._frame_scoped_ai.ai_element_fallback(
             navigation_goal=navigation_goal,
             max_steps=max_steps,
             validate_first=validate_first,
@@ -3793,7 +3716,7 @@ class _SkyvernPageBase:
         elif model is not None:
             normalized_model = model
 
-        return await _get_page_ai(self).ai_prompt(prompt=prompt, schema=schema, model=normalized_model)
+        return await self._ai.ai_prompt(prompt=prompt, schema=schema, model=normalized_model)
 
     @overload
     def locator(
@@ -3872,8 +3795,8 @@ class _SkyvernPageBase:
             if selector and prompt:
                 # Try selector first, then AI
                 return AILocator(
-                    _get_raw_page(self),
-                    _get_frame_scoped_ai(self),
+                    self.page,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=selector,
                     selector_kwargs=kwargs,
@@ -3881,12 +3804,12 @@ class _SkyvernPageBase:
                 )
 
             if selector:
-                return _get_locator_scope(self).locator(selector, **kwargs)
+                return self._locator_scope.locator(selector, **kwargs)
 
             if prompt:
                 return AILocator(
-                    _get_raw_page(self),
-                    _get_frame_scoped_ai(self),
+                    self.page,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=None,
                     selector_kwargs=kwargs,
@@ -3896,8 +3819,8 @@ class _SkyvernPageBase:
             if prompt:
                 # Try AI first, then selector
                 return AILocator(
-                    _get_raw_page(self),
-                    _get_frame_scoped_ai(self),
+                    self.page,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=selector,
                     selector_kwargs=kwargs,
@@ -3905,7 +3828,7 @@ class _SkyvernPageBase:
                 )
 
         if selector:
-            return _get_locator_scope(self).locator(selector, **kwargs)
+            return self._locator_scope.locator(selector, **kwargs)
 
         raise ValueError("Selector is required but was not provided")
 
@@ -3926,7 +3849,7 @@ class _SkyvernPageBase:
             scroll_x: Pixels to scroll horizontally (negative scrolls left).
             scroll_y: Pixels to scroll vertically (negative scrolls up).
         """
-        await _get_raw_page(self).evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
+        await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
     @action_wrap(ActionType.KEYPRESS)
     async def keypress(
@@ -3943,7 +3866,7 @@ class _SkyvernPageBase:
             hold: Hold the keys down for `duration` seconds instead of tapping them.
             duration: How long to hold the keys, in seconds, when `hold` is true.
         """
-        await handler_utils.keypress(_get_raw_page(self), keys, hold=hold, duration=duration)
+        await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
     @action_wrap(ActionType.MOVE)
     async def move(
@@ -3958,7 +3881,7 @@ class _SkyvernPageBase:
             x: Horizontal position in pixels from the left of the viewport.
             y: Vertical position in pixels from the top of the viewport.
         """
-        await EventStrategyFactory.move_cursor(_get_raw_page(self), x, y)
+        await EventStrategyFactory.move_cursor(self.page, x, y)
 
     @action_wrap(ActionType.DRAG)
     async def drag(
@@ -3975,7 +3898,7 @@ class _SkyvernPageBase:
             start_y: Vertical start position in pixels.
             path: Points `(x, y)` to drag through, ending where the mouse is released.
         """
-        await handler_utils.drag(_get_raw_page(self), start_x, start_y, path)
+        await handler_utils.drag(self.page, start_x, start_y, path)
 
     @action_wrap(ActionType.LEFT_MOUSE)
     async def left_mouse(
@@ -3985,55 +3908,7 @@ class _SkyvernPageBase:
         direction: Literal["down", "up"],
         **kwargs: Any,
     ) -> None:
-        await handler_utils.left_mouse(_get_raw_page(self), x, y, direction)
-
-
-class SkyvernPage(_SkyvernPageBase, Page):
-    """SDK wrapper that preserves the legacy Playwright-compatible surface.
-
-    ``__getattribute__`` below forwards anything not explicitly overridden to the
-    raw Playwright ``Page``, so this class (and :class:`ScriptSkyvernPage`, which
-    subclasses it and is what cached blocks actually receive) grants full,
-    uncontained driver access at runtime. Cached-script containment is enforced
-    only at deploy time, by the ``CACHED_SCRIPT_PAGE_API`` AST gate in
-    ``cached_script_deploy_service``, not by a runtime facade here.
-    """
-
-    def __init__(
-        self,
-        page: Page,
-        ai: SkyvernPageAi,
-        engine_selection: BrowserEngineSelection | None = None,
-    ) -> None:
-        Page.__init__(self, page)
-        _SkyvernPageBase.__init__(self, page=page, ai=ai, engine_selection=engine_selection)
-
-    @property
-    def page(self) -> Page:
-        return _get_raw_page(self)
-
-    @property
-    def _ai(self) -> SkyvernPageAi:
-        return _get_page_ai(self)
-
-    @property
-    def _working_frame(self) -> Frame | None:
-        return _PAGE_INTERNALS[self].working_frame
-
-    @_working_frame.setter
-    def _working_frame(self, frame: Frame | None) -> None:
-        _set_working_frame(self, frame)
-
-    def __getattribute__(self, name: str) -> Any:
-        page = _get_raw_page(self)
-        if hasattr(page, name):
-            for cls in type(self).__mro__:
-                if cls is Page:
-                    break
-                if name in cls.__dict__:
-                    return object.__getattribute__(self, name)
-            return getattr(page, name)
-        return object.__getattribute__(self, name)
+        await handler_utils.left_mouse(self.page, x, y, direction)
 
 
 class SafeParameters(dict):
@@ -4053,7 +3928,7 @@ class RunContext:
     def __init__(
         self,
         parameters: dict[str, Any],
-        page: _SkyvernPageBase,
+        page: SkyvernPage,
         generated_parameters: dict[str, Any] | None = None,
         extracted_params: dict[str, str | None] | None = None,
     ) -> None:

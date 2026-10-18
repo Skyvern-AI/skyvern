@@ -14,7 +14,6 @@ import structlog
 from agents import FunctionTool
 from agents.tool_context import ToolContext
 
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_FRAMES_KEY,
     ChallengeKind,
@@ -134,7 +133,6 @@ _POST_RUN_CHILD_FRAME_READ_TIMEOUT_SECONDS = 5.0
 _MAX_POST_RUN_FRAME_URLS = 64
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
-_COMPOSITION_SCREENSHOT_FILTERED = "screenshot filtered by browser policy"
 
 
 def _attach_field_upload_routes(data: dict[str, Any], upload_routes: list[dict[str, str]]) -> None:
@@ -366,22 +364,19 @@ async def _composition_summarize_screenshot(
     screenshot_b64: str,
     requested_targets: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
+    handler = await _composition_visual_handler(ctx)
+    if handler is None:
+        return None, "workflow copilot LLM handler is not configured"
     try:
         screenshot_bytes = base64.b64decode(screenshot_b64, validate=True)
     except Exception:
         return None, "screenshot payload was not valid base64"
-    screenshots = app.AGENT_FUNCTION.filter_browser_screenshots([screenshot_bytes])
-    if not screenshots:
-        return None, _COMPOSITION_SCREENSHOT_FILTERED
-    handler = await _composition_visual_handler(ctx)
-    if handler is None:
-        return None, "workflow copilot LLM handler is not configured"
     try:
         response = await asyncio.wait_for(
             handler(
                 prompt=_composition_visual_prompt(evidence, requested_targets),
                 prompt_name=_COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME,
-                screenshots=screenshots,
+                screenshots=[screenshot_bytes],
                 organization_id=getattr(ctx, "organization_id", None),
                 force_dict=True,
             ),
@@ -446,8 +441,6 @@ async def _composition_capture_visual_summary(
         screenshot_b64=screenshot_b64,
         requested_targets=requested_targets,
     )
-    if visual_error == _COMPOSITION_SCREENSHOT_FILTERED:
-        return VisualSummaryCapture(error=visual_error)
     return VisualSummaryCapture(summary=visual_summary, error=visual_error, frame=captured_frame)
 
 
@@ -455,8 +448,6 @@ def _merge_visual_summary_capture(
     evidence: dict[str, Any],
     captured: VisualSummaryCapture,
 ) -> dict[str, Any]:
-    if captured.error == _COMPOSITION_SCREENSHOT_FILTERED:
-        return _composition_add_evidence_omission(evidence, "screenshot_filtered_by_browser_policy")
     if captured.screenshot_failure is not None:
         return _composition_add_visual_capture_omission(
             evidence, "screenshot_capture_failed", captured.screenshot_failure

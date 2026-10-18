@@ -39,9 +39,7 @@ async def test_a_caller_cancelled_before_the_call_takes_its_first_step_still_sta
     finally:
         instrumentor.uninstrument()
 
-    # gc.collect() also reports un-awaited AsyncMock coroutines that earlier tests in the shard left behind.
-    dropped = [str(entry.message) for entry in caught if "never awaited" in str(entry.message)]
-    assert [message for message in dropped if "AsyncMockMixin" not in message] == []
+    assert [str(entry.message) for entry in caught if "never awaited" in str(entry.message)] == []
     assert entered.is_set()
 
 

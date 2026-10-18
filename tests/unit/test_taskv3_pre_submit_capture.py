@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -19,7 +21,13 @@ from skyvern.forge.taskv3.loop import RoundAction, SubmitWatch, make_finish_tool
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, PreSubmitFrame, is_run_sampled
 from skyvern.forge.taskv3.tools import build_browser_tools, pending_marker
 from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _skip_no_browser
+from tests.unit.test_taskv3_tools import (  # noqa: F401 — the fixtures register in this module
+    _cleanup_test_tasks,
+    _module_browser,
+    _page_context,
+    _skip_no_browser,
+    event_loop,
+)
 
 FIELD_COUNT = 10
 VALUES = {f"f{i}": f"synthetic-answer-{i:02d}" for i in range(FIELD_COUNT)}
@@ -116,21 +124,18 @@ async def _run_loop(page: Any, script: list[list[tuple[str, dict[str, Any]]]], r
     )
 
 
-async def _browser_page(html: str) -> Any:
-    from playwright.async_api import async_playwright
-
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-    page = await browser.new_page()
-    await page.set_content(html)
-    return pw, browser, page
+@asynccontextmanager
+async def _browser_page(html: str) -> AsyncIterator[Any]:
+    async with _page_context() as context:
+        page = await context.new_page()
+        await page.set_content(html)
+        yield page
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_thirty_click_form_with_post_submit_close_keeps_every_typed_value_next_to_its_label() -> None:
-    pw, browser, page = await _browser_page(_form_fixture())
-    try:
+    async with _browser_page(_form_fixture()) as page:
 
         async def _provider() -> Any:
             return page
@@ -173,9 +178,6 @@ async def test_thirty_click_form_with_post_submit_close_keeps_every_typed_value_
         assert await ring.persist(_write) == 2 * RING_SIZE
         assert [k for k, _ in written] == ["html", "screenshot"] * RING_SIZE
         assert await ring.persist(_write) == 0  # idempotent: the loop's finally must not double-write
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 @_skip_no_browser
@@ -184,8 +186,7 @@ async def test_nine_post_submit_clicks_evict_the_submit_frame_and_read_as_indete
     # The coverage limit: the terminal frame survives at most RING_SIZE - 1 later submit-shaped
     # actions. Past that the ring holds only confirmation pages, and the offline pick must say so
     # rather than return one of them.
-    pw, browser, page = await _browser_page(_form_fixture())
-    try:
+    async with _browser_page(_form_fixture()) as page:
 
         async def _provider() -> Any:
             return page
@@ -207,16 +208,12 @@ async def test_nine_post_submit_clicks_evict_the_submit_frame_and_read_as_indete
         assert all(f.meta["selector"] != "#submit" for f in frames)
         assert all(_filled_pairs(f.html) == {} for f in frames)
         assert _terminal_frame(frames) is None
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_two_step_form_yields_the_frame_before_the_terminal_submit() -> None:
-    pw, browser, page = await _browser_page(_two_step_fixture())
-    try:
+    async with _browser_page(_two_step_fixture()) as page:
 
         async def _provider() -> Any:
             return page
@@ -239,16 +236,12 @@ async def test_two_step_form_yields_the_frame_before_the_terminal_submit() -> No
             "Step one answer": "first-step-value",
             "Step two answer": "second-step-value",
         }
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_run_without_a_submit_shaped_action_persists_nothing() -> None:
-    pw, browser, page = await _browser_page(_form_fixture())
-    try:
+    async with _browser_page(_form_fixture()) as page:
 
         async def _provider() -> Any:
             return page
@@ -266,9 +259,6 @@ async def test_run_without_a_submit_shaped_action_persists_nothing() -> None:
             raise AssertionError("nothing to write")
 
         assert await ring.persist(_write) == 0
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 class _FakePage:
@@ -439,8 +429,7 @@ async def test_capture_reads_live_values_without_mutating_the_page() -> None:
 <p><label for="a">Answer</label><input id="a" type="text"></p>
 <input id="pw" type="password"><textarea id="ta"></textarea>
 <iframe srcdoc="<input id='inner'>"></iframe></form></body></html>"""
-    pw, browser, page = await _browser_page(html)
-    try:
+    async with _browser_page(html) as page:
         await page.fill("#a", "typed-live")
         await page.fill("#pw", "secret-live")
         await page.fill("#ta", "long-live")
@@ -464,9 +453,6 @@ async def test_capture_reads_live_values_without_mutating_the_page() -> None:
             " document.getElementById('a').getAttribute('data-tv3-pre'), document.getElementById('ta').textContent]"
         )
         assert live == [None, "1", ""]
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 @_skip_no_browser
@@ -494,8 +480,7 @@ async def test_password_shaped_values_stay_out_and_the_match_over_includes_on_pu
 <div id="host"></div>
 <script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '<input id="inner">';</script>
 </body></html>"""
-    pw, browser, page = await _browser_page(html)
-    try:
+    async with _browser_page(html) as page:
         secrets = {
             "#password": "secret-one",
             "#shown": "secret-two",
@@ -535,9 +520,6 @@ async def test_password_shaped_values_stay_out_and_the_match_over_includes_on_pu
             assert leaked not in text, leaked
         assert 'value="synthetic-first-name"' in text
         assert frame.filled == 1 and frame.shadow_hosts == 1
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 def _side_effect_fixture() -> str:
@@ -591,14 +573,13 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
     from skyvern.forge.taskv3.pre_submit_capture import pre_submit_screenshot
     from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
-    pw, browser, page = await _browser_page("<html></html>")
-    requests: list[str] = []
+    async with _browser_page("<html></html>") as page:
+        requests: list[str] = []
 
-    async def _route(route: Any) -> None:
-        requests.append(route.request.url)
-        await route.fulfill(status=200, body=b"", content_type="image/png")
+        async def _route(route: Any) -> None:
+            requests.append(route.request.url)
+            await route.fulfill(status=200, body=b"", content_type="image/png")
 
-    try:
         await page.route("http://synthetic.invalid/**", _route)
         await page.set_content(_side_effect_fixture())
         await page.evaluate("""() => {
@@ -674,9 +655,6 @@ async def test_a_capture_has_no_observable_side_effect_on_the_page_it_captures()
                     if box.get(name):
                         assert set(box[name]) == {"*"}
         assert after["x"] != "matrix(1, 0, 0, 1, 500, 0)", "transition was jumped to its end state"
-    finally:
-        await browser.close()
-        await pw.stop()
 
 
 @pytest.mark.asyncio
@@ -744,8 +722,7 @@ async def test_a_mark_click_on_a_submit_still_in_flight_holds_the_completed_verd
     # so the loop's _names_submit_control saw no selector, recorded no watch, and a run that submitted
     # via a mark could call the job done while the page was still submitting. Real page, real probe,
     # real loop -- the deferral has to fire on the mark path exactly as it does on the selector path.
-    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
-    try:
+    async with _browser_page(_MARK_SUBMIT_FIXTURE) as page:
         watch = SubmitWatch()
 
         async def _provider() -> Any:
@@ -762,9 +739,6 @@ async def test_a_mark_click_on_a_submit_still_in_flight_holds_the_completed_verd
         ]
         with capture_logs() as logs:
             outcome = await _run_with_submit_watch(page, script, watch)
-    finally:
-        await browser.close()
-        await pw.stop()
 
     held = [e for e in logs if e["event"] == "taskv3 completed verdict held: submission still in flight"]
     assert len(held) == 1, [e["event"] for e in logs]
@@ -778,8 +752,7 @@ async def test_a_mark_click_on_a_non_submit_control_does_not_hold_the_verdict() 
     # The other half of the discrimination: carrying the resolved selector must not make EVERY mark
     # click arm the deferral. A checkbox is clicked through the same wrapper and records the same
     # kind of watch; it is the probe, not the carrier, that decides, and it must stay silent here.
-    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
-    try:
+    async with _browser_page(_MARK_SUBMIT_FIXTURE) as page:
         watch = SubmitWatch()
 
         async def _provider() -> Any:
@@ -795,9 +768,6 @@ async def test_a_mark_click_on_a_non_submit_control_does_not_hold_the_verdict() 
         ]
         with capture_logs() as logs:
             outcome = await _run_with_submit_watch(page, script, watch)
-    finally:
-        await browser.close()
-        await pw.stop()
 
     assert [e for e in logs if e["event"].startswith("taskv3 completed verdict held")] == []
     assert outcome.status == "completed"
@@ -810,13 +780,11 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
     # They are the mark-based ones -- the loop appends the dispatched args to round_actions and the
     # action builder reads args["selector"] off it, so a wrapper that resolved into a copy left the
     # persisted row naming no element at all. Asserted through to the Action the row is built from.
-    pw, browser, page = await _browser_page(_MARK_SUBMIT_FIXTURE)
-    rounds: list[list[RoundAction]] = []
+    async with _browser_page(_MARK_SUBMIT_FIXTURE) as page:
+        rounds: list[list[RoundAction]] = []
 
-    async def _capture(actions: list[RoundAction], _text: str | None, *, round_done: bool) -> None:
-        rounds.append(actions)
-
-    try:
+        async def _capture(actions: list[RoundAction], _text: str | None, *, round_done: bool) -> None:
+            rounds.append(actions)
 
         async def _provider() -> Any:
             return page
@@ -837,9 +805,6 @@ async def test_a_mark_click_persists_the_element_it_acted_on() -> None:
             max_tool_calls=50,
             on_action_round=_capture,
         )
-    finally:
-        await browser.close()
-        await pw.stop()
 
     clicked = [entry for round_ in rounds for entry in round_ if entry.tool == "click" and entry.succeeded]
     assert len(clicked) == 1, rounds

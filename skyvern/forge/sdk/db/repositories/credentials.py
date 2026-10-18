@@ -45,6 +45,7 @@ class CredentialRepository(BaseRepository):
         proxy_location: ProxyLocationInput = None,
         proxy_session_id: str | None = None,
         created_by: str | None = None,
+        vault_id: str | None = None,
     ) -> Credential:
         proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
             proxy_location=proxy_location,
@@ -56,6 +57,7 @@ class CredentialRepository(BaseRepository):
                 organization_id=organization_id,
                 name=name,
                 vault_type=vault_type,
+                vault_id=vault_id,
                 item_id=item_id,
                 credential_type=credential_type,
                 username=username,

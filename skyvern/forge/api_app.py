@@ -86,7 +86,7 @@ async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPExcept
     content: dict[str, str | None] = {"detail": exc.message}
     if exc.error_code is not None:
         content["error_code"] = exc.error_code
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
 
 async def db_unavailable_handler(
@@ -155,7 +155,7 @@ def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
         **cors_middleware_kwargs(
-            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor"]
+            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor", "Retry-After"]
         ),
     )
 
@@ -289,6 +289,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
+    ("tasks", "task_queue", "VARCHAR"),
 )
 
 

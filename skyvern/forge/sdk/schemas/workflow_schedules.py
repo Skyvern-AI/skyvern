@@ -49,6 +49,9 @@ class WorkflowSchedule(BaseModel):
     backend_schedule_id: str | None = Field(default=None, alias="temporal_schedule_id")
     name: str | None = None
     description: str | None = None
+    created_by: str | None = Field(
+        default=None, description="Who the schedule runs as; null for schedules created before owners were recorded."
+    )
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

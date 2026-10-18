@@ -233,12 +233,6 @@ async def _apply_origin_scoped_headers(
 
     normalized_headers = {name.lower(): (name, value) for name, value in scoped_headers.items()}
     baseline_headers: dict[str, tuple[str, str] | None] = {}
-    # CodeBlock's higher-priority route.fetch runs before this route can apply the scoped headers.
-    browser_context._skyvern_origin_scoped_headers = (  # type: ignore[attr-defined]
-        target_origin,
-        normalized_headers,
-        baseline_headers,
-    )
 
     async def apply_headers(route: Route, request: Request) -> None:
         request_origin = _browser_origin(request.url)
@@ -281,6 +275,7 @@ async def _apply_origin_scoped_headers(
         else:
             await route.fallback()
 
+    app.AGENT_FUNCTION.on_origin_scoped_headers_route_installed(browser_context, target_origin)
     await browser_context.route("**/*", apply_headers)
 
 

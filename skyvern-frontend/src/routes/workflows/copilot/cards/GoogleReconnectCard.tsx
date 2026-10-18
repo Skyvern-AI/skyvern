@@ -12,6 +12,7 @@ import {
 } from "@/routes/integrations/googleOAuth";
 import { markGoogleOAuthPopup } from "@/routes/integrations/googleOAuthPopup";
 import { toast } from "@/components/ui/use-toast";
+import { useHasCapability } from "@/store/PageSlots";
 import { GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import type { GoogleConnectionNotice } from "../narrativeState";
@@ -32,6 +33,7 @@ export function GoogleReconnectCard({
     useGoogleOAuthCredentials({
       refetchOnMount: notice.condition === "unbound" ? undefined : "always",
     });
+  const canAuthorize = useHasCapability("google_oauth.authorize");
   const [isStarting, setIsStarting] = useState(false);
   const isUnbound = notice.condition === "unbound";
   const choices =
@@ -158,10 +160,19 @@ export function GoogleReconnectCard({
       <button
         type="button"
         className="mt-3 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-60"
-        disabled={isStarting}
+        disabled={isStarting || !canAuthorize}
+        title={
+          canAuthorize ? undefined : "Organization admin access is required."
+        }
         onClick={() => void reconnect()}
       >
-        {isStarting ? "Opening Google…" : isUnbound ? "Connect" : "Reconnect"}
+        {isStarting
+          ? "Opening Google…"
+          : canAuthorize
+            ? isUnbound
+              ? "Connect"
+              : "Reconnect"
+            : "Admin required"}
       </button>
     </div>
   );

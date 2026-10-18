@@ -52,6 +52,8 @@ const mocks = vi.hoisted(() => ({
     data: WorkflowStartNodeData;
   }>,
   updateNodeData: vi.fn(),
+  capture: vi.fn(),
+  organizationId: "org_test" as string | undefined,
 }));
 
 vi.mock("@xyflow/react", () => ({
@@ -73,6 +75,13 @@ vi.mock("@/routes/workflows/hooks/useCredentialQuery", () => ({
 }));
 vi.mock("@/routes/workflows/hooks/useOnePasswordItemsQuery", () => ({
   useOnePasswordItemsQuery: () => mocks.onePasswordItems,
+}));
+vi.mock("@/hooks/useCurrentOrgId", () => ({
+  useCurrentOrgId: () => mocks.organizationId,
+}));
+vi.mock("posthog-js/react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("posthog-js/react")>()),
+  usePostHog: () => ({ capture: mocks.capture }),
 }));
 vi.mock("@/routes/credentials/CredentialsModal", () => ({
   CredentialsModal: () => null,
@@ -135,6 +144,7 @@ beforeEach(() => {
       );
     },
   );
+  mocks.organizationId = "org_test";
   useWorkflowParametersStore.setState({ parameters: [] });
 });
 
@@ -721,6 +731,19 @@ describe("LoginBlockCredentialSelector 1Password items", () => {
       vaultId: "op_vault_1",
       itemId: "op_item_1",
     });
+    expect(mocks.capture).toHaveBeenCalledWith("onepassword.item_picked", {
+      organization_id: "org_test",
+      $groups: { organization: "org_test" },
+    });
+    expect(mocks.capture.mock.calls).toEqual([
+      [
+        "onepassword.item_picked",
+        {
+          organization_id: "org_test",
+          $groups: { organization: "org_test" },
+        },
+      ],
+    ]);
   });
 
   it("renders a saved 1Password selection as the item, not the raw parameter key", async () => {

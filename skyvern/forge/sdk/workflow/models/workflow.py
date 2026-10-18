@@ -281,6 +281,8 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Kept out of the API: a Copilot rollback writes it back, so a restored version answers to its original person.
+    edited_for: str | None = Field(default=None, exclude=True)
     build_source: WorkflowBuildSource | None = Field(
         default=None,
         description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",

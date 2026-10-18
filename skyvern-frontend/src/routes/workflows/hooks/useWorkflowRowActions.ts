@@ -6,7 +6,6 @@ import { AxiosError } from "axios";
 import { stringify as convertToYAML } from "yaml";
 import { useNodeCollapseStore } from "../editor/collapse/useNodeCollapseStore";
 import { convert } from "../editor/workflowEditorUtils";
-import { getClonedWorkflowTitle } from "../cloneWorkflowTitle";
 import { useCreateWorkflowMutation } from "./useCreateWorkflowMutation";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 
@@ -98,7 +97,7 @@ function useWorkflowRowActions(workflow: WorkflowApiResponse) {
 
   function clone() {
     const clonedWorkflow = convert(
-      { ...workflow, title: getClonedWorkflowTitle(workflow.title) },
+      { ...workflow, title: `Copy of ${workflow.title}` },
       { asNewWorkflow: true },
     );
     createWorkflowMutation.mutate(clonedWorkflow);

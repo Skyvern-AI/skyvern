@@ -1407,6 +1407,8 @@ async def test_cached_script_successor_settles_capture_before_browser_reads(monk
 
 @pytest.mark.asyncio
 async def test_capture_settlement_failure_uses_protected_block_failure_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This test exercises settlement handling, independent of process-wide log processors.
+    monkeypatch.setattr(block_module, "LOG", MagicMock())
     context = _context()
     context.cancel_failure_evidence_capture = AsyncMock(side_effect=RuntimeError("capture settlement failed"))
     create_run_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_successor"))

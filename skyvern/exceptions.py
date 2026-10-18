@@ -143,11 +143,13 @@ class SkyvernHTTPException(SkyvernException):
         message: str | None = None,
         status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST,
         error_code: str | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.status_code = int(status_code)
         # Serialized alongside `detail` only when set, so a caller can branch on the cause without
         # matching on prose. Treat a code as a published contract once a response carries it.
         self.error_code = error_code
+        self.headers = headers
         super().__init__(message)
 
 
@@ -470,6 +472,17 @@ class MissingElement(SkyvernException):
         super().__init__(
             f"Found no elements. Might be due to previous actions which removed this element."
             f" selector={selector} element_id={element_id}",
+        )
+
+
+class FrameChainLoop(MissingElement):
+    """Subclasses MissingElement so action handlers treat it as a known failure; the element was not removed."""
+
+    def __init__(self, frame_id: str) -> None:
+        SkyvernException.__init__(
+            self,
+            "The element's iframe chain in the scraped page loops back on itself or nests too deeply, so the"
+            f" element cannot be located on this page state. frame_id={frame_id}",
         )
 
 
@@ -1330,20 +1343,6 @@ class TaskTerminationError(TerminationError):
         super().__init__(f"Task {task_id} failed. Reason: {reason}")
 
 
-class ActionPolicyBlocked(BaseException):
-    """Fail-closed signal raised when an extension policy blocks a browser action.
-
-    Deliberately derives from BaseException so broad action-recovery handlers cannot convert a policy
-    decision into a retry or fallback. It is caught only at the run's explicit termination boundaries.
-    """
-
-    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
-        self.message = f"Browser action blocked by policy. Reason: {reason}"
-        self.step_id = step_id
-        self.task_id = task_id
-        super().__init__(self.message)
-
-
 class BlockTerminationError(SkyvernException):
     def __init__(self, workflow_run_block_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(
@@ -1852,6 +1851,7 @@ REREGISTER_EXTERNAL_BROWSER = (
 BROWSER_SESSION_EXPIRED_ERROR_CODE = "browser_session_expired"
 BROWSER_SESSION_CLOSED_ERROR_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE = "browser_session_startup_timeout"
+TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE = "too_many_starting_browser_sessions"
 
 
 class BrowserSessionClosed(SkyvernHTTPException):
@@ -1985,6 +1985,17 @@ class BrowserSessionStartupTimeout(SkyvernHTTPException):
             "Create a new browser session and retry with its id.",
             status_code=HTTPStatus.GATEWAY_TIMEOUT,
             error_code=BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE,
+        )
+
+
+class TooManyStartingBrowserSessions(SkyvernHTTPException):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__(
+            "Too many browser sessions are starting for this organization at once. "
+            f"Retry in {retry_after_seconds} seconds.",
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            error_code=TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE,
+            headers={"Retry-After": str(retry_after_seconds)},
         )
 
 

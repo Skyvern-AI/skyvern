@@ -58,7 +58,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     load_custom_llm_configs_for_organization,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
@@ -159,13 +159,13 @@ from skyvern.forge.sdk.services.request_principal import (
     get_request_principal,
     reject_non_admin_api_key_secret_access,
 )
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key_from_digest
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
     InvalidTemplateWorkflowPermanentId,
-    InvalidWaitBlockTime,
     WorkflowDefinitionValidationException,
 )
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
@@ -245,8 +245,6 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowRequest,
     WorkflowStatus,
-    WorkflowUpdateRequest,
-    WorkflowUpdateYAMLRequest,
     sanitize_workflow_yaml_with_references,
 )
 from skyvern.services import (
@@ -916,6 +914,9 @@ async def bulk_cancel_runs(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> BulkCancelRunsResponse:
     analytics.capture("skyvern-oss-agent-bulk-cancel-runs")
+    await app.AGENT_FUNCTION.enforce_folder_access_for_runs(
+        get_request_principal(), "workflow_run.cancel", data.run_ids
+    )
 
     return await run_service.bulk_cancel_runs(
         data.run_ids, organization_id=current_org.organization_id, api_key=x_api_key
@@ -967,6 +968,9 @@ async def create_workflow_legacy(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_create_request.folder_id = folder_id
+        if workflow_create_request.folder_id:
+            await _enforce_folder_access("workflow.create", {"folder_id": workflow_create_request.folder_id})
+        await _authorize_definition_references(workflow_create_request)
         workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
@@ -992,10 +996,8 @@ async def create_workflow_legacy(
         return workflow
     except WorkflowDefinitionValidationException as e:
         raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+    except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         raise e
-    except InvalidWaitBlockTime as e:
-        raise FailedToCreateWorkflow(str(e)) from e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow("An unexpected error occurred") from e
@@ -1079,11 +1081,14 @@ async def create_workflow(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_definition.folder_id = folder_id
+        if workflow_definition.folder_id:
+            await _enforce_folder_access("workflow.create", {"folder_id": workflow_definition.folder_id})
+        await _authorize_definition_references(workflow_definition)
         if idempotency_key is not None:
             digest = calculate_sha256(f"create_workflow\0{current_org.organization_id}\0{idempotency_key}")
             workflow_permanent_id = f"wpid_{digest}"
             try:
-                return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                existing = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
                     workflow_permanent_id=workflow_permanent_id,
                     organization_id=current_org.organization_id,
                     version=1,
@@ -1091,6 +1096,10 @@ async def create_workflow(
                 )
             except WorkflowNotFound:
                 pass
+            else:
+                # Idempotency keys are org-scoped, so a replay must not hand back a workflow from a hidden folder.
+                await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+                return existing
             resolved_title = await app.WORKFLOW_SERVICE.resolve_workflow_creation_title(
                 current_org.organization_id,
                 workflow_definition,
@@ -1138,8 +1147,6 @@ async def create_workflow(
         raise e
     except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         raise e
-    except InvalidWaitBlockTime as e:
-        raise FailedToCreateWorkflow(str(e)) from e
     except Exception as e:
         LOG.error("Failed to create workflow", exc_info=True, organization_id=current_org.organization_id)
         raise FailedToCreateWorkflow("An unexpected error occurred") from e
@@ -1357,6 +1364,8 @@ async def import_workflow_from_pdf(
     # Read file and validate early (before creating import record)
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    if folder_id:
+        await _enforce_folder_access("workflow.create", {"folder_id": folder_id})
 
     try:
         file_contents = await file.read()
@@ -1399,16 +1408,23 @@ async def import_workflow_from_pdf(
         ),
     )
 
+    # The background save runs after the request, so it checks references as the requester.
+    principal = get_request_principal()
+
     # Process PDF import in background (LLM call is the slow part)
     async def process_pdf_import() -> None:
         try:
             # Create workflow from extracted text (LLM processing)
             result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+            imported = WorkflowCreateYAMLRequest.model_validate(result)
+            await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+                principal, "workflow.run", imported.model_dump(exclude={"folder_id"})
+            )
 
             # Create v2 with real content
             await app.WORKFLOW_SERVICE.create_workflow_from_request(
                 organization=current_org,
-                request=WorkflowCreateYAMLRequest.model_validate(result),
+                request=imported,
                 workflow_permanent_id=empty_workflow.workflow_permanent_id,
                 created_by=user_id,
                 edited_by=user_id,
@@ -1463,7 +1479,7 @@ async def import_workflow_from_pdf(
     "/workflows/{workflow_id}",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
         "x-fern-sdk-method-name": "update_workflow",
@@ -1475,7 +1491,7 @@ async def import_workflow_from_pdf(
     "/workflows/{workflow_id}/",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
     },
@@ -1511,10 +1527,15 @@ async def update_workflow_legacy(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
-        workflow_update_request = WorkflowUpdateYAMLRequest.model_validate(workflow_yaml)
+        workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+    except ValidationError as e:
+        log_save_rejected(e)
+        raise
+    await _authorize_definition_references(workflow_create_request)
+    try:
         workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
-            request=workflow_update_request,
+            request=workflow_create_request,
             workflow_permanent_id=workflow_id,
             created_by=user_id,
             edited_by=user_id,
@@ -1582,7 +1603,7 @@ async def update_workflow_legacy(
     "/agents/{workflow_id}/",
     openapi_extra={
         "requestBody": {
-            "content": {"application/x-yaml": {"schema": WorkflowUpdateYAMLRequest.model_json_schema()}},
+            "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
     },
@@ -1593,7 +1614,7 @@ async def update_workflow_legacy(
 @base_router.post("/workflows/{workflow_id}", response_model=Workflow, include_in_schema=False)
 @base_router.post("/workflows/{workflow_id}/", response_model=Workflow, include_in_schema=False)
 async def update_workflow(
-    data: WorkflowUpdateRequest,
+    data: WorkflowRequest,
     workflow_id: str = Path(
         ..., description="The ID of the agent to update. Starts with `wpid_`.", examples=["wpid_123"]
     ),
@@ -1607,7 +1628,7 @@ async def update_workflow(
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
             workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
-            workflow_definition = WorkflowUpdateYAMLRequest.model_validate(workflow_json_from_yaml)
+            workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
         else:
@@ -1615,6 +1636,7 @@ async def update_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
+        await _authorize_definition_references(workflow_definition)
         workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -1678,10 +1700,7 @@ async def update_workflow(
     },
     description="Delete an agent",
     summary="Delete an agent",
-    responses={
-        200: {"description": "Successfully deleted agent"},
-        404: {"description": "Agent not found"},
-    },
+    responses={200: {"description": "Successfully deleted agent"}},
 )
 @base_router.post("/agents/{workflow_id}/delete/", include_in_schema=False)
 # Backwards-compatible aliases: an agent is a workflow. Hidden from schema in favor of /agents/{...}/delete.
@@ -1694,20 +1713,26 @@ async def delete_workflow(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
-    deleted_workflow_id = await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(
+    deleted_schedules, deleted_workflow_id = await app.WORKFLOW_SERVICE.soft_delete_workflow_by_permanent_id(
         workflow_id, current_org.organization_id
     )
-    if deleted_workflow_id is None:
-        raise WorkflowNotFound(workflow_permanent_id=workflow_id)
-    await app.AGENT_FUNCTION.record_audit_event(
-        get_request_principal(),
-        AuditEvent(
-            organization_id=current_org.organization_id,
-            action="workflow.delete",
-            resource_type="workflow",
-            resource_id=deleted_workflow_id,
-        ),
-    )
+    # Audit before the cancellable backend cleanup: the delete has already committed. Schedules are soft-deleted
+    # even when no live workflow was, so their backend schedules are deleted either way.
+    try:
+        if deleted_workflow_id is not None:
+            await app.AGENT_FUNCTION.record_audit_event(
+                get_request_principal(),
+                AuditEvent(
+                    organization_id=current_org.organization_id,
+                    action="workflow.delete",
+                    resource_type="workflow",
+                    resource_id=deleted_workflow_id,
+                ),
+            )
+    finally:
+        await app.WORKFLOW_SERVICE.delete_backend_schedules(
+            deleted_schedules, organization_id=current_org.organization_id
+        )
 
 
 ################# Folder Endpoints #################
@@ -1968,22 +1993,27 @@ async def delete_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
-    deleted_workflow_ids = await app.DATABASE.folders.soft_delete_folder(
+    deleted_folder = await app.DATABASE.folders.soft_delete_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
         delete_workflows=delete_workflows,
     )
-    if deleted_workflow_ids is None:
+    if deleted_folder is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
-
-    await record_request_audit_event(
-        current_org.organization_id,
-        "workflow_folder.delete",
-        "workflow_folder",
-        folder_id,
-        changed_fields=("delete_workflows",) if delete_workflows else (),
-        related_resource_ids=tuple(deleted_workflow_ids),
-    )
+    # Audit before the cancellable backend cleanup: the delete has already committed.
+    try:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "workflow_folder.delete",
+            "workflow_folder",
+            folder_id,
+            changed_fields=("delete_workflows",) if delete_workflows else (),
+            related_resource_ids=tuple(deleted_folder.workflow_permanent_ids),
+        )
+    finally:
+        await app.WORKFLOW_SERVICE.delete_backend_schedules(
+            deleted_folder.deleted_schedules, organization_id=current_org.organization_id
+        )
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
@@ -2013,6 +2043,9 @@ async def update_workflow_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     try:
+        await _enforce_folder_access("workflow.move", {"workflow_permanent_id": workflow_permanent_id})
+        if data.folder_id:
+            await _enforce_folder_access("workflow.create", {"folder_id": data.folder_id})
         workflow = await app.DATABASE.folders.update_workflow_folder(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
@@ -2683,6 +2716,7 @@ async def delete_tag_key(
 ) -> TagKeyDeleteResponse:
     analytics.capture("skyvern-oss-tag-key-delete")
     _validate_path_key(key)
+    await _require_write_in_every_folder()
     context = _tag_write_context_from_caller(caller)
     organization_id = caller.organization.organization_id
     delete_result = await app.DATABASE.tags.delete_tag_key(
@@ -2842,6 +2876,7 @@ async def rename_tag_value(
 ) -> TagValueRenameResponse:
     analytics.capture("skyvern-oss-tag-value-rename")
     _validate_path_key(key)
+    await _require_write_in_every_folder()
     context = _tag_write_context_from_caller(caller)
     try:
         result = await _rename_tag_value_with_retry(
@@ -2899,6 +2934,7 @@ async def delete_tag_value(
 ) -> TagValueDeleteResponse:
     analytics.capture("skyvern-oss-tag-value-delete")
     _validate_path_key(key)
+    await _require_write_in_every_folder()
     context = _tag_write_context_from_caller(caller)
     organization_id = caller.organization.organization_id
     delete_result = await app.DATABASE.tags.delete_tag_value(
@@ -3182,6 +3218,9 @@ async def get_run_tag_suggestions(
     _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> RunTagSuggestionsResponse:
     organization_id = current_org.organization_id
+    # Suggestions span every run's tags; a caller with hidden folders gets none rather than another folder's values.
+    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal()) is not None:
+        return RunTagSuggestionsResponse(keys=[], values_by_key={}, labels=[])
     pairs = await app.DATABASE.tags.get_run_tag_suggestions(organization_id=organization_id)
     keys: list[str] = []
     values_by_key: dict[str, list[str]] = {}
@@ -3252,6 +3291,54 @@ async def convert_curl_to_http(
         raise HTTPException(status_code=400, detail=f"Failed to convert curl command: {str(e)}")
 
 
+async def _enforce_folder_access(action: str, resource: dict[str, object]) -> None:
+    await app.AGENT_FUNCTION.enforce_folder_access(get_request_principal(), action, resource)
+
+
+async def _authorize_definition_references(definition: WorkflowCreateYAMLRequest) -> None:
+    # Every run of the saved workflow uses what it names (a seed profile, a Trigger target, a session), so the saver
+    # must be able to run each one. Its own folder is checked as workflow.create by the caller.
+    await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+        get_request_principal(), "workflow.run", definition.model_dump(exclude={"folder_id"})
+    )
+
+
+async def _require_write_in_every_folder() -> None:
+    # Org-wide tag cascades rewrite every workflow and run carrying the tag, so the caller must be able to edit
+    # workflows in every restricted folder; seeing them is not enough.
+    await app.AGENT_FUNCTION.enforce_folder_access_everywhere(get_request_principal(), "workflow.update")
+
+
+_COPILOT_CHAT_LOG_PATH = re.compile(rf"/logs/{LogEntityType.WORKFLOW_COPILOT_CHAT}/([^/]+)/")
+
+
+async def _authorize_artifact_read(artifact: Artifact) -> None:
+    # Any folder grant allows reads, so a caller who can see every folder needs no lookups.
+    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal()) is None:
+        return
+    for artifact_key, resource_key in (
+        ("workflow_run_id", "workflow_run_id"),
+        ("task_id", "task_id"),
+        ("run_id", "run_id"),
+        ("workflow_run_block_id", "workflow_run_block_id"),
+        ("observer_cruise_id", "task_id"),
+        ("browser_session_id", "browser_session_id"),
+    ):
+        if resource_id := getattr(artifact, artifact_key):
+            await _enforce_folder_access("workflow_run.read", {resource_key: resource_id})
+            return
+    if artifact.artifact_type == ArtifactType.SCRIPT_FILE:
+        script_id = await app.DATABASE.scripts.get_script_id_for_artifact(
+            artifact.organization_id, artifact.artifact_id
+        )
+        if script_id:
+            await _enforce_folder_access("script.read", {"script_id": script_id})
+        return
+    # Copilot screenshots and audio name their chat only in the log path create_log_artifact writes.
+    if chat_match := _COPILOT_CHAT_LOG_PATH.search(artifact.uri or ""):
+        await _enforce_folder_access("workflow_copilot.read", {"workflow_copilot_chat_id": chat_match.group(1)})
+
+
 @base_router.get(
     "/artifacts/{artifact_id}",
     tags=["Artifacts"],
@@ -3282,6 +3369,7 @@ async def get_artifact(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
+    await _authorize_artifact_read(artifact)
     signed_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
     artifact.signed_url = signed_url
     await app.ARTIFACT_MANAGER.mark_archived_artifacts([artifact])
@@ -3603,8 +3691,10 @@ async def get_artifact_content(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
-    media_type, content_disposition = _artifact_response_config(artifact)
     is_signed = sig is not None and expiry is not None and kid is not None
+    if not is_signed:
+        await _authorize_artifact_read(artifact)
+    media_type, content_disposition = _artifact_response_config(artifact)
     signed_expiry_unix: int | None = None
     if is_signed and expiry is not None:
         try:
@@ -3679,6 +3769,7 @@ async def get_artifact_signed_url(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
+    await _authorize_artifact_read(artifact)
     signed_url = await app.ARTIFACT_MANAGER.resolve_share_url(
         artifact,
         expiry_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
@@ -5094,6 +5185,9 @@ async def get_artifacts(
         organization_id=current_org.organization_id,
         **params,  # type: ignore[arg-type]
     )
+    # Every artifact of one entity belongs to the same run.
+    if artifacts:
+        await _authorize_artifact_read(artifacts[0])
 
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
@@ -6301,6 +6395,7 @@ async def generate_task(
 async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"organization.settings.update"}))),
 ) -> Organization:
     if "slug" in org_update.model_fields_set and org_update.slug is None:
         raise HTTPException(
@@ -6469,6 +6564,7 @@ async def get_current_organization(
 async def get_api_keys(
     organization_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org_with_api_token),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"api_key.list"}))),
     principal: RequestPrincipal | None = Depends(get_request_principal),
 ) -> GetOrganizationAPIKeysResponse:
     reject_non_admin_api_key_secret_access(principal)

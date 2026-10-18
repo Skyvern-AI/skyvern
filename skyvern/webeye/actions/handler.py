@@ -43,7 +43,6 @@ from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     ActionExecutionTimeout,
-    ActionPolicyBlocked,
     BlockedHost,
     CaptchaSolveError,
     CardNumberInputMismatch,
@@ -92,7 +91,6 @@ from skyvern.exceptions import (
     SkyvernException,
     SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
-    StepTerminationError,
     UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
@@ -216,7 +214,6 @@ from skyvern.webeye.browser_factory import (
     resolve_artifact_path,
     was_download_cancelled_by_skyvern,
 )
-from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
@@ -1100,7 +1097,6 @@ async def _reset_autocomplete_for_llm_fallback(
     if engine_selection is UNSET_SELECTION:
         engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     await current_incremental_scraped.stop_listen_dom_increment()
-    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
     await skyvern_element.input_clear()
 
     incremental_scraped = IncrementalScrapePage(
@@ -3553,7 +3549,6 @@ def _is_navigation_teardown_error(exc: BaseException, engine_selection: BrowserE
 async def _fill_secret_with_readback(
     *,
     skyvern_element: SkyvernElement,
-    page: Page,
     tag_name: str,
     text: str,
     input_type: str,
@@ -3583,8 +3578,6 @@ async def _fill_secret_with_readback(
     readback_expected = text
     date_recovered = False
     await skyvern_element.refresh_locator_if_stale()
-    # The re-resolve may refresh page state; recheck the extension policy before mutation.
-    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
     if sequential_first:
         await skyvern_element.input_sequentially(text=text)
     else:
@@ -3651,7 +3644,6 @@ async def _fill_secret_with_readback(
     # instead re-fills the canonical ISO atomically: the per-character seam hard-throws on a structured date
     # input and the locale text is not what the field accepts.
     await skyvern_element.refresh_locator_if_stale()
-    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
     await skyvern_element.input_clear()
     if date_recovered:
         await skyvern_element.input_fill(text=readback_expected)
@@ -4838,18 +4830,6 @@ class ActionHandler:
         # Re-evaluated here, against the page as it is now, before anything downstream looks up a
         # browser, chooses the download-capturing path or persists a row.
         preflight_action(action, page, site="handle_action")
-        egress_policy_result = app.AGENT_FUNCTION.enforce_browser_action_egress_policy(
-            action=action,
-            task=task,
-            page=page,
-            scraped_page=scraped_page,
-        )
-        if inspect.isawaitable(egress_policy_result):
-            await egress_policy_result
-        app.AGENT_FUNCTION.enforce_browser_action_policy(action.action_type, page)
-        # Authorization reads the latest page/origin state before execution timing is mutated.
-        # Hydrated/cached actions can arrive with prior timestamps; leave them intact when a guard
-        # blocks, and reset them only after every guard authorizes this execution.
         action.started_at = naive_utc_now()
         # A later action running means the earlier navigation failure did not end the task, so its
         # code no longer describes the failure this task will report. Terminate and complete are the
@@ -9384,24 +9364,23 @@ async def _handle_input_text_action(
                 )
                 await skyvern_element.scroll_into_view()
             finally:
-                if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.KEYPRESS, page):
-                    if await skyvern_element.is_visible():
-                        blocking_element, exist = await skyvern_element.find_blocking_element(
-                            dom=dom, incremental_page=incremental_scraped
+                if await skyvern_element.is_visible():
+                    blocking_element, exist = await skyvern_element.find_blocking_element(
+                        dom=dom, incremental_page=incremental_scraped
+                    )
+                    if blocking_element and exist:
+                        LOG.info(
+                            "Find a blocking element to the current element, going to blur the blocking element first",
+                            blocking_element=blocking_element.get_locator(),
                         )
-                        if blocking_element and exist:
-                            LOG.info(
-                                "Find a blocking element to the current element, going to blur the blocking element first",
-                                blocking_element=blocking_element.get_locator(),
-                            )
-                            if await blocking_element.get_locator().count():
-                                await blocking_element.press_key("Escape")
-                            if await blocking_element.get_locator().count():
-                                await blocking_element.blur()
+                        if await blocking_element.get_locator().count():
+                            await blocking_element.press_key("Escape")
+                        if await blocking_element.get_locator().count():
+                            await blocking_element.blur()
 
-                    if try_to_quit_dropdown and await skyvern_element.is_visible():
-                        await skyvern_element.press_key("Escape")
-                        await skyvern_element.blur()
+                if try_to_quit_dropdown and await skyvern_element.is_visible():
+                    await skyvern_element.press_key("Escape")
+                    await skyvern_element.blur()
                 await incremental_scraped.stop_listen_dom_increment()
 
     ### Start filling text logic
@@ -9449,9 +9428,6 @@ async def _handle_input_text_action(
                 "Failed to check the phone number format, using the original text",
                 error_type=type(exc).__name__,
             )
-        # The helper may refresh page state; recheck the extension policy before mutation.
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
-
     await _apply_secret_visual_mask_if_needed(
         skyvern_element,
         workflow_run_id=task.workflow_run_id,
@@ -9713,7 +9689,6 @@ async def _handle_input_text_action(
         if _caret_readback_eligible(tag_name=tag_name, input_type=totp_input_type, text=text, maxlength=totp_maxlength):
             totp_failure = await _fill_secret_with_readback(
                 skyvern_element=skyvern_element,
-                page=page,
                 tag_name=tag_name,
                 text=text,
                 input_type=totp_input_type,
@@ -9871,7 +9846,6 @@ async def _handle_input_text_action(
             elif verify_secret_input:
                 secret_failure = await _fill_secret_with_readback(
                     skyvern_element=skyvern_element,
-                    page=page,
                     tag_name=tag_name,
                     text=text,
                     input_type=secret_input_type,
@@ -10179,9 +10153,6 @@ async def _handle_input_text_action(
         # HACK: force to finish missing auto completion input
         if (
             auto_complete_hacky_flag
-            # A blocked policy state must not commit a suggestion via Tab while another
-            # exception is unwinding through this finally block.
-            and not app.AGENT_FUNCTION.should_block_browser_action(ActionType.KEYPRESS, page)
             and await skyvern_element.is_visible()
             and not await skyvern_element.is_raw_input()
             and not action.skip_auto_complete_tab
@@ -10554,7 +10525,6 @@ async def handle_select_option_action(
             try:
                 normal_select_result = await normal_select(
                     action=action,
-                    page=page,
                     skyvern_element=skyvern_element,
                     builder=dom.scraped_page,
                     task=task,
@@ -10705,7 +10675,6 @@ async def handle_select_option_action(
                 element_id=skyvern_element.get_id(),
             )
             await skyvern_element.scroll_into_view()
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
             await skyvern_element.press_key("ArrowDown")
             # wait for options to load
             await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
@@ -10808,19 +10777,17 @@ async def handle_select_option_action(
         results.append(ActionFailure(exception=e))
         return results
     finally:
-        if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.CLICK, page):
-            if (
-                await skyvern_element.is_visible()
-                and is_open
-                and len(results) > 0
-                and not isinstance(results[-1], ActionSuccess)
-            ):
-                await skyvern_element.scroll_into_view()
-                await skyvern_element.coordinate_click(page=page)
-                await skyvern_element.press_key("Escape")
-            # blur() fires page-controlled onblur handlers, so it is skipped with the rest on a denied unwind.
-            await skyvern_element.blur()
+        if (
+            await skyvern_element.is_visible()
+            and is_open
+            and len(results) > 0
+            and not isinstance(results[-1], ActionSuccess)
+        ):
+            await skyvern_element.scroll_into_view()
+            await skyvern_element.coordinate_click(page=page)
+            await skyvern_element.press_key("Escape")
         is_open = False
+        await skyvern_element.blur()
         await incremental_scraped.stop_listen_dom_increment()
 
     LOG.info(
@@ -10835,7 +10802,6 @@ async def handle_select_option_action(
 
         try:
             await EventStrategyFactory.move_to_element(page, skyvern_element.get_locator())
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
             await skyvern_element.get_locator().click(timeout=timeout)
         except Exception:
             LOG.info(
@@ -10843,7 +10809,6 @@ async def handle_select_option_action(
                 element_id=skyvern_element.get_id(),
             )
             await skyvern_element.scroll_into_view()
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
             await skyvern_element.press_key("ArrowDown")
 
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.fallback")
@@ -10868,19 +10833,17 @@ async def handle_select_option_action(
         return results
 
     finally:
-        if not app.AGENT_FUNCTION.should_block_browser_action(ActionType.CLICK, page):
-            if (
-                await skyvern_element.is_visible()
-                and is_open
-                and len(results) > 0
-                and not isinstance(results[-1], ActionSuccess)
-            ):
-                await skyvern_element.scroll_into_view()
-                await skyvern_element.coordinate_click(page=page)
-                await skyvern_element.press_key("Escape")
-            # blur() fires page-controlled onblur handlers, so it is skipped with the rest on a denied unwind.
-            await skyvern_element.blur()
+        if (
+            await skyvern_element.is_visible()
+            and is_open
+            and len(results) > 0
+            and not isinstance(results[-1], ActionSuccess)
+        ):
+            await skyvern_element.scroll_into_view()
+            await skyvern_element.coordinate_click(page=page)
+            await skyvern_element.press_key("Escape")
         is_open = False
+        await skyvern_element.blur()
         await incremental_scraped.stop_listen_dom_increment()
 
 
@@ -12343,6 +12306,7 @@ async def choose_auto_completion_dropdown(
     is_location_input: bool = False,
     collapse_autocomplete_fanout_enabled: bool = False,
     action: InputTextAction | None = None,
+    allow_full_page_rescrape: bool = True,
     *,
     is_secret_value: bool,
 ) -> AutoCompletionResult:
@@ -12459,7 +12423,6 @@ async def choose_auto_completion_dropdown(
                                 matched_index=matched_index,
                                 matched_label=matched_label,
                             )
-                            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
                             try:
                                 await matched_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                                 if await _verify_autocomplete_input_readback(
@@ -12553,7 +12516,6 @@ async def choose_auto_completion_dropdown(
                             element_id=fast_path_element_id,
                             input_value=text,
                         )
-                        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
                         try:
                             await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
                             clear_input = False
@@ -12568,6 +12530,9 @@ async def choose_auto_completion_dropdown(
             if not html:
                 html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         else:
+            if not allow_full_page_rescrape:
+                raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+
             scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
             new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(
                 scraped_page.id_to_css_dict.keys()
@@ -12629,7 +12594,6 @@ async def choose_auto_completion_dropdown(
                 "Decided to directly search with the current value",
                 value=text,
             )
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
             await skyvern_element.press_key("Enter")
             clear_input = False
             return result
@@ -12674,7 +12638,6 @@ async def choose_auto_completion_dropdown(
 
         async def _click_selected_option() -> None:
             await selected_element.scroll_into_view()
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
             await selected_element.click(page=page, engine_selection=engine_selection)
 
         result.action_result = await _click_autocomplete_option_with_commit_evidence(
@@ -12689,9 +12652,6 @@ async def choose_auto_completion_dropdown(
         clear_input = False
         return result
 
-    except ActionPolicyBlocked:
-        clear_input = False
-        raise
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -12705,7 +12665,6 @@ async def choose_auto_completion_dropdown(
         await incremental_scraped.stop_listen_dom_increment()
         if clear_input and await skyvern_element.is_visible():
             try:
-                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
                 await skyvern_element.input_clear()
             except Exception:
                 # Best-effort cleanup of the probe text typed above; an exception raised here
@@ -12798,6 +12757,10 @@ async def input_or_auto_complete_input(
             )
             return None
 
+        initial_probe_found_no_options = (
+            isinstance(result.action_result, ActionFailure)
+            and result.action_result.exception_type == NoIncrementalElementFoundForAutoCompletion.__name__
+        )
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
 
@@ -12807,6 +12770,7 @@ async def input_or_auto_complete_input(
             else input_or_select_context.intention
         )
 
+        values: list[dict] = []
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
@@ -12827,7 +12791,7 @@ async def input_or_auto_complete_input(
         json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
         )
-        values: list[dict] = json_respone.get("potential_values", [])
+        values = json_respone.get("potential_values", [])
 
         for each_value in values:
             value: str = each_value.get("value", "")
@@ -12855,6 +12819,7 @@ async def input_or_auto_complete_input(
                 is_location_input=is_location,
                 collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 action=action,
+                allow_full_page_rescrape=not initial_probe_found_no_options,
                 is_secret_value=is_secret_value,
             )
             if isinstance(result.action_result, ActionSuccess):
@@ -12952,7 +12917,6 @@ async def discover_and_select_from_full_dropdown(
 
     try:
         await skyvern_element.scroll_into_view()
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
         await skyvern_element.input_clear()
 
         # Try click first to open the dropdown (most combobox components respond to click)
@@ -12980,7 +12944,6 @@ async def discover_and_select_from_full_dropdown(
                 "Discover fallback: no options after click, trying ArrowDown",
                 element_id=skyvern_element.get_id(),
             )
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
             try:
                 await skyvern_element.press_key("ArrowDown")
             except Exception as exc:
@@ -13087,14 +13050,12 @@ async def discover_and_select_from_full_dropdown(
         # Instead of clicking the option directly (dropdown may have closed during re-scrape),
         # input the discovered value into the combobox. Since it's an exact match, the combobox's
         # filter will show it as the only option. Then find and click it directly via Playwright.
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
         await skyvern_element.input_clear()
         await skyvern_element.press_fill(discovered_value)
         await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.exact_match")
 
         # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
         # This avoids needing to locate the option element in shadow DOM.
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.KEYPRESS, page)
         try:
             await skyvern_element.press_key("ArrowDown")
             await skyvern_element.press_key("Enter")
@@ -13111,8 +13072,6 @@ async def discover_and_select_from_full_dropdown(
             )
             return None
 
-    except StepTerminationError:
-        raise
     except Exception:
         LOG.warning(
             "Discover fallback failed",
@@ -13296,7 +13255,6 @@ async def sequentially_select_from_dropdown(
     if input_or_select_context.is_date_related:
         return await _give_up_date_walk(
             skyvern_element=skyvern_element,
-            page=page,
             skyvern_frame=skyvern_frame,
             date_label=action.option.label,
             entry_action_type=entry_action_type,
@@ -13313,7 +13271,6 @@ async def sequentially_select_from_dropdown(
 
 async def _give_up_date_walk(
     *,
-    page: Page,
     skyvern_element: SkyvernElement,
     skyvern_frame: SkyvernFrame,
     date_label: str | None,
@@ -13355,7 +13312,6 @@ async def _give_up_date_walk(
                 return result
 
             LOG.info("Try to input the date directly")
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
             # input_sequentially appends a value this short, so whatever the picker left in the
             # field has to go first or the two dates concatenate.
             await skyvern_element.input_clear()
@@ -14322,7 +14278,6 @@ async def _select_deterministic_custom_option(
                 )
                 emit(CustomSelectFamilyOutcome.llm_fallback_pre_click_error)
                 return None
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
         click_attempted = True
         if on_click_attempted is not None:
             on_click_attempted()
@@ -14339,8 +14294,6 @@ async def _select_deterministic_custom_option(
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
             return ActionSuccess(), matched_label
-    except StepTerminationError:
-        raise
     except Exception as exc:
         if not click_attempted or isinstance(exc, InteractWithDisabledElement):
             LOG.info(
@@ -14808,7 +14761,6 @@ async def select_from_emerging_elements(
             )
             return ActionFailure(InputToReadonlyElement(element_id=element_id))
 
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
         await input_element.input_clear()
         await input_element.input_sequentially(actual_value)
         return ActionSuccess()
@@ -14820,7 +14772,6 @@ async def select_from_emerging_elements(
 
     original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
     await selected_element.scroll_into_view()
-    app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
     await selected_element.click(
         page=page,
         engine_selection=engine_selection,
@@ -15255,13 +15206,10 @@ async def select_from_dropdown(
                         return _terminal_post_reset_fallback_result()
                     return single_select_result
 
-                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.INPUT_TEXT, page)
                 await input_element.input_clear()
                 await input_element.input_sequentially(actual_value)
                 single_select_result.action_result = ActionSuccess()
                 return _proceeded_post_reset_fallback_result()
-            except StepTerminationError:
-                raise
             except Exception as e:
                 single_select_result.action_result = ActionFailure(exception=e)
                 if post_reset_fallback:
@@ -15279,10 +15227,8 @@ async def select_from_dropdown(
                     option=SelectOption(label=value),
                     input_or_select_context=context,
                 )
-                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.SELECT_OPTION, page)
                 results = await normal_select(
                     action=action,
-                    page=page,
                     skyvern_element=selected_element,
                     task=task,
                     step=step,
@@ -15304,7 +15250,6 @@ async def select_from_dropdown(
                 return single_select_result
 
             await selected_element.scroll_into_view()
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
             await selected_element.click(
                 page=page,
                 timeout=timeout,
@@ -15329,25 +15274,21 @@ async def select_from_dropdown(
             if post_reset_fallback:
                 return _terminal_post_reset_fallback_result()
             return single_select_result
+
         try:
             LOG.info(
                 "Find an alternative option with the same value. Try to select the option.",
                 value=value,
             )
-            app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
             await EventStrategyFactory.move_to_element(page, locator)
             await locator.click(timeout=timeout)
             single_select_result.action_result = ActionSuccess()
             return _proceeded_post_reset_fallback_result()
-        except StepTerminationError:
-            raise
         except Exception as e:
             single_select_result.action_result = ActionFailure(exception=e)
             if post_reset_fallback:
                 return _terminal_post_reset_fallback_result()
             return single_select_result
-    except StepTerminationError:
-        raise
     except Exception:
         if post_reset_fallback:
             return _terminal_post_reset_fallback_result()
@@ -15382,7 +15323,6 @@ async def select_from_dropdown_by_value(
 
     element_locator = await incremental_scraped.select_one_element_by_value(value=value)
     if element_locator is not None:
-        app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
         await element_locator.click(timeout=timeout)
         return ActionSuccess()
 
@@ -15428,7 +15368,6 @@ async def select_from_dropdown_by_value(
             # The lookups above can outlast the loop's poll, so recheck right before clicking.
             click_cancellation = await read_run_cancellation(task)
             if click_cancellation is None:
-                app.AGENT_FUNCTION.enforce_browser_action_policy(ActionType.CLICK, page)
                 await element_locator.click(timeout=timeout)
                 selected = True
             return False
@@ -15754,7 +15693,6 @@ async def scroll_down_to_load_all_options(
 
 async def normal_select(
     action: actions.SelectOptionAction,
-    page: Page,
     skyvern_element: SkyvernElement,
     task: Task,
     step: Step,
@@ -15789,23 +15727,8 @@ async def normal_select(
         context=input_or_select_context,
     )
 
-    needs_browser_observation = app.AGENT_FUNCTION.needs_browser_observation()
-    document = None
-    if needs_browser_observation:
-        observation_source = skyvern_element.get_frame()
-        observation_frame = observation_source.main_frame if is_page_like(observation_source) else observation_source
-        document = app.AGENT_FUNCTION.begin_browser_observation(page, frame=observation_frame)
     select_options_result = await skyvern_element.refresh_select_options()
     select_options = select_options_result[0] if select_options_result else skyvern_element.get_options()
-    # build_HTML deepcopies and renders, so the deterministic fast path below only pays for it when
-    # an extension actually consumes the observation; the LLM path builds it on demand instead.
-    options_html: str | None = None
-    if needs_browser_observation:
-        options_html = skyvern_element.build_HTML()
-        await app.AGENT_FUNCTION.inspect_browser_observation(
-            options_html, cast(list[dict[str, Any]], select_options), None, document
-        )
-    app.AGENT_FUNCTION.enforce_browser_action_policy(action.action_type, page)
     target_value = _select_option_target_value(action.option)
     if target_value and select_options and collapse_select_fanout_enabled:
         option_labels, option_values = _select_option_labels_and_values(select_options)
@@ -15856,6 +15779,7 @@ async def normal_select(
 
     if collapse_select_fanout_enabled:
         action.set_has_mini_agent()
+    options_html = skyvern_element.build_HTML()
     field_information = (
         input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
     )
@@ -15865,7 +15789,7 @@ async def normal_select(
         required_field=input_or_select_context.is_required,
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
-        options=options_html if options_html is not None else skyvern_element.build_HTML(),
+        options=options_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 

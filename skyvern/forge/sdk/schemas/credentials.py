@@ -18,6 +18,7 @@ class CredentialVaultType(StrEnum):
     AZURE_VAULT = "azure_vault"
     GCP = "gcp"
     CUSTOM = "custom"
+    ONEPASSWORD = "onepassword"
 
 
 class CredentialType(StrEnum):
@@ -390,6 +391,9 @@ class Credential(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
     vault_type: CredentialVaultType | None = Field(..., description="Where the secret is stored")
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
+    vault_id: str | None = Field(
+        default=None, description="ID of the credential's vault, when the provider requires it"
+    )
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
     username: str | None = Field(..., description="For password credentials: the username")
     totp_type: TotpType = Field(
