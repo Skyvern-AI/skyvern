@@ -90,6 +90,19 @@ export function selectEditorMutationLocked(
   return state.commitInProgress || state.copilotAcceptance !== null;
 }
 
+export const AUTHORING_SAVE_MESSAGE =
+  "Finish the current authoring action before saving";
+
+// Our own in-flight save shows a spinner, not a reason.
+export function selectSaveLockReason(
+  state: WorkflowYamlEditorState,
+): string | null {
+  if (state.authoringInProgress) return AUTHORING_SAVE_MESSAGE;
+  if (state.lockKind === "save" || !selectEditorMutationLocked(state))
+    return null;
+  return getWorkflowLockMessage(state);
+}
+
 export function isEditorMutationLocked(): boolean {
   return selectEditorMutationLocked(useWorkflowYamlEditorStore.getState());
 }
@@ -637,8 +650,9 @@ export function withCopilotAcceptance(
   }
 }
 
-export function getWorkflowLockMessage(): string {
-  const state = useWorkflowYamlEditorStore.getState();
+export function getWorkflowLockMessage(
+  state: WorkflowYamlEditorState = useWorkflowYamlEditorStore.getState(),
+): string {
   if (state.lockKind === "save") return "A save is in progress";
   if (
     state.lockKind === "copilot" ||
