@@ -38,7 +38,7 @@ function RecordingRefinementProgressCard({
         </span>
         <span className="min-w-0 flex-1">
           <span className="block text-[12.5px] font-semibold text-foreground">
-            Recorded {actionCount} action{actionCount === 1 ? "" : "s"}
+            Captured {actionCount} action{actionCount === 1 ? "" : "s"}
           </span>
           <span className="mt-0.5 block text-[10.5px] text-muted-foreground">
             Task demonstration captured
@@ -55,10 +55,10 @@ function RecordingRefinementProgressCard({
           : complete
             ? awaitingReview
               ? "The draft workflow is ready for you to review. I didn’t run it while refining."
-              : "I drafted a workflow from the recording without running it. Run it to check it works."
+              : "I drafted a workflow from your demonstration without running it. Run it to check it works."
             : status === "cancelled"
-              ? "I stopped refining this recording."
-              : "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again."}
+              ? "I stopped refining this demonstration."
+              : "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again."}
       </p>
 
       <div className="flex items-center gap-2 pl-1 text-xs text-muted-foreground">
@@ -71,7 +71,7 @@ function RecordingRefinementProgressCard({
         )}
         <span>
           {working
-            ? `Reviewing ${actionCount} recorded action${actionCount === 1 ? "" : "s"}`
+            ? `Reviewing ${actionCount} captured action${actionCount === 1 ? "" : "s"}`
             : complete
               ? awaitingReview
                 ? "Draft ready for review"

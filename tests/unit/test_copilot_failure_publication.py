@@ -24,7 +24,6 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _ExecutionResult,
     _record_run_blocks_result,
     _recorded_run_block_result,
-    _run_blocks_and_collect_debug,
     _RunExecution,
     finalize_build_test_result,
 )
@@ -430,6 +429,7 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
 
     result = await block._resolve_failure_with_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -506,6 +506,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
     task = asyncio.create_task(
         block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=build_failure_result,
@@ -581,6 +582,7 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     result = await asyncio.wait_for(
         block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=AsyncMock(),
@@ -642,6 +644,7 @@ async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatc
 
     result = await block._resolve_failure_with_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -1404,6 +1407,8 @@ async def test_cached_script_successor_settles_capture_before_browser_reads(monk
 
 @pytest.mark.asyncio
 async def test_capture_settlement_failure_uses_protected_block_failure_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This test exercises settlement handling, independent of process-wide log processors.
+    monkeypatch.setattr(block_module, "LOG", MagicMock())
     context = _context()
     context.cancel_failure_evidence_capture = AsyncMock(side_effect=RuntimeError("capture settlement failed"))
     create_run_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_successor"))
@@ -1666,11 +1671,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert packet["failure"]["error_codes"] == ["browser_operation_failed"]
     assert persisted_row.output == {"failure": "specific runner failure"}
 
-    dispatch_lookup = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.run_execution.app.DATABASE.workflows.get_workflow_by_permanent_id",
-        dispatch_lookup,
-    )
     first_result = SimpleNamespace(context_wrapper=SimpleNamespace(usage=None), cancel=MagicMock())
     unfinished_report = SimpleNamespace(
         context_wrapper=SimpleNamespace(usage=None),
@@ -1696,8 +1696,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
             return
         assert copilot_context.last_run_outcome is outcome
         assert workflow_context.has_failure_evidence_capture is True
-        denial = await _run_blocks_and_collect_debug({"block_labels": ["run_code"]}, copilot_context)
-        assert denial["data"] == {"budget_expired": True, "run_dispatched": False, "source": "deadline"}
         report_started.set()
         try:
             await asyncio.Event().wait()
@@ -1732,7 +1730,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert copilot_context.budget_expiry_state.drain_attempted is True
     assert copilot_context.budget_expiry_state.hard_backstop_reached is True
     assert unfinished_report.final_output is None
-    dispatch_lookup.assert_not_awaited()
     assert workflow_context.has_failure_evidence_capture is True
 
     hard_result = _build_timeout_exit_result(copilot_context, global_llm_context=None)
@@ -1789,7 +1786,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert emitted.narrative_payload["turnFacts"]["recordedFailure"] == "specific runner failure"
     assert emitted.narrative_payload["turnFacts"]["runId"] == "wr_test"
     assert emitted.narrative_payload["turnFacts"]["evaluationState"] == "not_demonstrated"
-    dispatch_lookup.assert_not_awaited()
     assert workflow_context.has_failure_evidence_capture is True
 
     capture_release.set()

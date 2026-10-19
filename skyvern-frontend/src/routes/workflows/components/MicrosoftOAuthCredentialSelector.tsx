@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useHasCapability } from "@/store/PageSlots";
 import {
   getDefaultMicrosoftOAuthCredentialId,
   hasMicrosoftOAuthCredentialScopes,
@@ -40,6 +41,7 @@ function MicrosoftOAuthCredentialSelector({
     isLoading,
     isFetching,
   } = useMicrosoftOAuthCredentials();
+  const canAuthorize = useHasCapability("microsoft_oauth.authorize");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentials = allCredentials.filter((credential) =>
     hasMicrosoftOAuthCredentialScopes(credential, requiredScopes),
@@ -135,10 +137,14 @@ function MicrosoftOAuthCredentialSelector({
                 </CustomSelectItem>
               ))}
 
-              <SelectItem value={SETTINGS_OPTION}>
+              <SelectItem value={SETTINGS_OPTION} disabled={!canAuthorize}>
                 <div className="flex items-center gap-2">
                   <PlusIcon className="size-4" />
-                  <span>Connect new account</span>
+                  <span>
+                    {canAuthorize
+                      ? "Connect new account"
+                      : "Connect new account (admin required)"}
+                  </span>
                 </div>
               </SelectItem>
 

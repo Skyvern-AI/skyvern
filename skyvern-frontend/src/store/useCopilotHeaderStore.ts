@@ -14,18 +14,24 @@ export type CopilotHeaderControls = {
 };
 
 // What the docked Copilot chat is waiting on the user for.
-export type CopilotAttention = "question" | "credential" | "account";
+export type CopilotAttention =
+  | "question"
+  | "credential"
+  | "account"
+  | "demonstration";
 
 export const COPILOT_ATTENTION_LABEL: Record<CopilotAttention, string> = {
   question: "waiting for your answer",
   credential: "needs to sign in",
   account: "needs a Google account",
+  demonstration: "waiting for your demonstration",
 };
 
 export const COPILOT_ATTENTION_DOT: Record<CopilotAttention, string> = {
   question: "Copilot needs your answer",
   credential: "Copilot needs to sign in",
   account: "Copilot needs a Google account",
+  demonstration: "Copilot is watching your demonstration",
 };
 
 /**

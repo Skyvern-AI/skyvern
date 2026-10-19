@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
@@ -65,18 +66,19 @@ from skyvern.forge.sdk.workflow.page_derived_templates import CLOSE as PAGE_DERI
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN as PAGE_DERIVED_OPEN
 from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3 import provider_downloads as taskv3_provider_downloads
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
-from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
+from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
+from skyvern.forge.taskv3.goal_check import (
+    BLOCK_COMPLETION_CHECK_PROMPT_NAME,
+)
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
-    COMPLETION_GATE_REFUSAL,
     NAV_DEAD_END_GUARD,
-    TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
     RoundAction,
     ToolSpec,
@@ -88,6 +90,7 @@ from skyvern.forge.taskv3.run_arms import (
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
+from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -103,11 +106,22 @@ from skyvern.webeye.actions.actions import (
     SolveCaptchaAction,
     UploadFileAction,
 )
-from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
+from tests.unit._download_provider_fakes import (
+    _ActionDownloadSource,
+    _FakeActionDownloadObservation,
+    _FakeBrowserDownloadMonitor,
+    _GatedCleanupObservation,
+    _secret_bearing_validation_error,
+    _StallingActionDownloadObservation,
+)
+from tests.unit.helpers import (
+    make_action_row,
+    make_browser_state,
+    make_organization,
+    make_step,
+    make_task,
+)
 from tests.unit.scoped_asyncio import ScopedAsyncio
-from tests.unit.test_taskv3_engine import _fixed_read_tool, _ReaskAnsweringCaller
-from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
 
 
 async def _run_execute_task_v3(
@@ -151,8 +165,6 @@ async def _run_execute_task_v3(
     # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
     on_loop: Callable[[dict[str, Any]], None] | None = None,
     on_loop_async: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    # Replaces the canned `outcome`: receives the kwargs agent.py built and returns the loop's outcome.
-    loop_body: Callable[[dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
     llm_caller_factory: Any = None,
@@ -223,8 +235,6 @@ async def _run_execute_task_v3(
             on_loop(kwargs)
         if on_loop_async is not None:
             await on_loop_async(kwargs)
-        if loop_body is not None:
-            return await loop_body(kwargs)
         if provider_probe_calls:
             provider = kwargs["page_provider"]
             loop_mock.resolved_pages = [await provider() for _ in range(provider_probe_calls)]
@@ -350,6 +360,24 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model_name", "marks"), [("anthropic/claude-haiku-5-5", True), ("gpt-5.4", False)])
+async def test_execute_task_v3_sends_cache_marks_only_to_claude(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, marks: bool
+) -> None:
+    caller = MagicMock(llm_config=LLMConfig(model_name, [], True, False))
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        llm_caller_factory=MagicMock(return_value=caller),
+    )
+
+    assert loop_mock.call_args.kwargs["anthropic_cache_markers"] is marks
 
 
 @pytest.mark.asyncio
@@ -1204,11 +1232,24 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_resolve_v3_llm_key_ignores_unregistered_flag_value(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("variant", "registered"),
+    [
+        ("TYPO_KEY", {}),
+        # LLMCaller sends a non-router ANTHROPIC key down its native Anthropic path, which cannot run a v3 transcript.
+        (
+            "ANTHROPIC_CLAUDE5_5_HAIKU",
+            {"ANTHROPIC_CLAUDE5_5_HAIKU": LLMConfig("anthropic/claude-haiku-5-5", [], True, False)},
+        ),
+    ],
+)
+async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
+    monkeypatch: pytest.MonkeyPatch, variant: str, registered: dict[str, LLMConfig]
+) -> None:
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value="TYPO_KEY")
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=variant)
     )
-    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: False)
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "_configs", registered)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
@@ -1225,6 +1266,55 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
     assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger_type, expected_key",
+    [
+        (WorkflowRunTriggerType.manual, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.mcp, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.api, "FLEX_ROUTER"),
+        (WorkflowRunTriggerType.scheduled, "FLEX_ROUTER"),
+    ],
+)
+async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
+    monkeypatch: pytest.MonkeyPatch,
+    trigger_type: WorkflowRunTriggerType,
+    expected_key: str,
+) -> None:
+    """Task V3 builds its caller from the resolved key rather than the handler factory."""
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "FLEX_ROUTER")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=lambda key: "STANDARD_ROUTER" if key == "FLEX_ROUTER" else None),
+    )
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit task.llm_key is a deliberate caller choice, matching get_override_llm_api_handler."""
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=AssertionError("explicit keys must not be downgraded")),
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+    finally:
+        skyvern_context.reset()
 
 
 @pytest.mark.asyncio
@@ -2291,6 +2381,10 @@ async def _run_execute_task_v3_download(
     loop_fn: Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     complete_on_download: bool = True,
     browser_session_id: str | None = None,
+    provider_source: object | None = None,
+    download_monitor: object | None = None,
+    download_timeout: float | None = None,
+    cancel_after_checks: int | None = None,
 ) -> dict[str, Any]:
     """Drive _execute_task_v3 for a complete_on_download block, capturing the loop kwargs.
 
@@ -2321,9 +2415,30 @@ async def _run_execute_task_v3_download(
     browser_state.get_working_page = AsyncMock(return_value=page)
     browser_state.take_post_action_screenshot = AsyncMock(return_value=b"png-bytes")
 
-    block = _make_block(block_cls, complete_on_download=complete_on_download, download_suffix=download_suffix)
+    # A real session without a provider-owned download store attaches no source; the bare MagicMock
+    # default would otherwise look like one.
+    browser_state.browser_artifacts.get_action_download_source = MagicMock(return_value=provider_source)
+    browser_state.browser_context._skyvern_cdp_download_interceptor = download_monitor
 
-    captured: dict[str, Any] = {}
+    block_overrides: dict[str, Any] = {"complete_on_download": complete_on_download, "download_suffix": download_suffix}
+    if download_timeout is not None:
+        block_overrides["download_timeout"] = download_timeout
+    block = _make_block(block_cls, **block_overrides)
+
+    cancel_checks = {"count": 0}
+
+    async def _get_task(**_kwargs: Any) -> Any:
+        cancel_checks["count"] += 1
+        canceled = cancel_after_checks is not None and cancel_checks["count"] > cancel_after_checks
+        return SimpleNamespace(status=TaskStatus.canceled if canceled else TaskStatus.running)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running)),
+    )
+
+    captured: dict[str, Any] = {"cancel_checks": cancel_checks}
 
     async def _default_loop_body(**kwargs: Any) -> LoopOutcome:
         if drop_file:
@@ -3040,75 +3155,6 @@ async def test_execute_task_v3_action_block_target_reserve_answers_to_the_run_po
     assert kwargs["max_action_steps"] == 1
     assert kwargs["max_action_steps_ceiling"] == 1
     assert kwargs["target_action_reserve"] == reserve
-
-
-class _AdvancingFormPage(_FakePage):
-    """Every action advances the form, so the next observe is fresh page-change evidence."""
-
-    # Takes the probe's argument, as Playwright's evaluate does, so the real settle sampler reads this page.
-    async def evaluate(self, _js: str, _arg: Any = None) -> str:
-        raw = await super().evaluate(_js)
-        if "document.readyState" in _js:
-            return raw
-        section = sum(1 for name, _args in self.calls if name in ("click", "fill", "type"))
-        data = json.loads(raw)
-        data["title"] = f"Apply, section {section}"
-        data["elements"][0]["label"] = f"Section {section} first name"
-        return json.dumps(data)
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_extended(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A long form resends a growing transcript, so the token backstop trips while most of the step budget is
-    # unspent. Driven through agent.py with the real engine and loop, so the step floor, ceilings and backstops
-    # agent.py configures are the ones the grant must survive. The form is filled one field per round, and each
-    # new field followed by a changed page renews the grant.
-    script: list[list[tuple[str, dict[str, Any]]]] = []
-    for i in range(5):
-        script.append([("observe", {})])
-        script.append([("type", {"selector": f"#field-{i}", "text": f"answer {i}"})])
-    script.append([("observe", {})])
-    script.append([("click", {"selector": "#submit"})])
-    script.append([("finish", {"status": "completed", "reason": "submitted"})])
-    # The first call is the normal-size fixed prompt; the burn after it is the transcript growing.
-    caller = _ScriptedCaller(
-        script,
-        usage_for_call=lambda call: {"prompt_tokens": 15_000 if call == 0 else 200_000, "completion_tokens": 0},
-    )
-    page = _AdvancingFormPage()
-    loop_kwargs: dict[str, Any] = {}
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return await run_task_v3_agent_loop(
-            # The scripted caller takes no step-scoped call kwargs.
-            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
-        )
-
-    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=None))
-    with capture_logs() as logs:
-        _step, task, _loop_mock, _post = await _run_execute_task_v3(
-            monkeypatch,
-            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-            task_block=_make_block(NavigationBlock, navigation_goal="Fill and submit the application"),
-            workflow_run_id="wr_long_form",
-            max_steps_per_run=10,
-            data_extraction_goal=None,
-            extracted_information_schema=None,
-            loop_body=_real_loop,
-            working_page=page,
-        )
-    assert loop_kwargs["max_action_steps"] == MIN_ACTION_STEPS
-    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
-    assert [(entry["guard"], entry["original_max_tokens"]) for entry in granted] == [
-        ("max_tokens", loop_kwargs["max_tokens"]),
-        ("max_tokens", granted[0]["max_tokens"]),
-    ]
-    assert granted[0]["action_steps"] < MIN_ACTION_STEPS
-    assert caller.calls == len(script)
-    assert task.status == TaskStatus.completed
 
 
 @pytest.mark.asyncio
@@ -4093,97 +4139,6 @@ async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdic
 
     assert task.status == TaskStatus.terminated
     assert task.failure_reason == "the site offers no way to continue"
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_gate_veto_is_refused_in_loop_and_the_approved_retry_skips_the_post_loop_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    block = _make_block(NavigationBlock, navigation_goal="Submit the application")
-    page = _AdvancingFormPage()
-    caller = _ScriptedCaller(
-        [
-            [("finish", {"status": "completed", "reason": "looks done"})],
-            [("observe", {})],
-            [("finish", {"status": "completed", "reason": "confirmed"})],
-        ]
-    )
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        return await run_task_v3_agent_loop(
-            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
-        )
-
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-        task_block=block,
-        loop_body=_real_loop,
-        working_page=page,
-        # A post-loop consult would draw the trailing veto and fail the task.
-        completion_gate_raises=[False, True, False],
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.status == TaskStatus.completed
-    assert loop_mock.completion_gate.await_args.kwargs["task_block"] is block
-    assert sum(COMPLETION_GATE_REFUSAL in str(m.get("content")) for m in caller.message_history) == 1
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_a_vetoed_reask_conversion_restores_the_models_verdict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The model terminated; the re-ask converted it; the deployment gate rejects the completion. The task must
-    # end as the model's own terminated verdict, not as a failed completion the model never claimed.
-    page = _FakePage()
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(page),
-        llm_caller=_ReaskAnsweringCaller(
-            [
-                [("type", {"selector": "#email", "text": "applicant@example.com"})],
-                [("click", {"selector": "#create"})],
-                [("read_fixture", {})],
-                [("observe", {})],
-                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
-            ],
-            answer={
-                "verdict": "completed",
-                "terminate_criterion_holds": False,
-                "skipped_screen": "the PIN screen",
-                "quote": "Email: applicant@example.com",
-                "evidence": "The next form carries the account's email.",
-            },
-        ),
-        goal="Create the account.",
-        parameters={"email": "applicant@example.com"},
-        extra_tools=[
-            _fixed_read_tool(
-                "Application\nEmail: applicant@example.com", page=page, lands_at="https://example.test/apply/section/1"
-            )
-        ],
-        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
-    )
-    assert outcome.status == "completed" and outcome.converted_from == "terminated"
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        task_block=_make_block(NavigationBlock, navigation_goal="Create the account"),
-        completion_gate_vetoes=True,
-        complete_criterion="a PIN screen is shown",
-        terminate_criterion="the create-account submission fails",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert loop_mock.await_args is not None
-    assert loop_mock.await_args.kwargs["unlisted_reask_criteria"] == (
-        "a PIN screen is shown",
-        "the create-account submission fails",
-    )
-    assert task.status == TaskStatus.terminated
-    assert task.failure_reason == "The PIN screen was never shown."
 
 
 @pytest.mark.asyncio
@@ -6535,55 +6490,6 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
     assert off_the_page in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
 
 
-@pytest.mark.parametrize("initial", [False, True])
-@pytest.mark.asyncio
-async def test_execute_task_v3_logs_a_dead_task_url_with_a_query_as_task_supplied(
-    monkeypatch: pytest.MonkeyPatch, initial: bool
-) -> None:
-    # agent.py's task-target set and requested start URL, through the real engine and navigate tool: a
-    # task URL whose query names the page is the task's own target, whether the in-loop navigate or the
-    # setup navigation (redirected first) is the one that 404s.
-    import skyvern.utils.url_validators as urlv
-
-    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
-    task_url = "https://jobs.example.test/portal.action?page=apply&id=42"
-    page = _FakePage()
-
-    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
-        page.url = url
-        return SimpleNamespace(status=404, url=url)
-
-    page.goto = _goto  # type: ignore[method-assign]
-    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        return await run_task_v3_agent_loop(
-            **{
-                **kwargs,
-                "page_provider": _fixed_page_provider(page),
-                "llm_caller": _ScriptedCaller(script),
-                "step": None,
-            }
-        )
-
-    with capture_logs() as logs:
-        await _run_execute_task_v3(
-            monkeypatch,
-            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-            url=task_url,
-            navigation_goal="Apply.",
-            navigation_status=404 if initial else None,
-            landed_url="https://jobs.example.test/expired" if initial else None,
-            data_extraction_goal=None,
-            extracted_information_schema=None,
-            loop_body=_real_loop,
-            working_page=page,
-        )
-
-    event = "taskv3 loop initial navigation dead end" if initial else "taskv3 loop navigation dead end"
-    assert [entry["provenance"] for entry in logs if entry["event"] == event] == ["task_supplied"]
-
-
 @pytest.mark.asyncio
 async def test_execute_task_v3_publishes_no_path_for_a_block_that_never_reached_the_pin(
     monkeypatch: pytest.MonkeyPatch,
@@ -6776,3 +6682,545 @@ async def test_goal_judge_prompt_never_carries_a_registered_runtime_secret(monke
     for _ in range(3):
         assert redact("verification_code: 482913") == f"verification_code: {REDACTED_SECRET_PLACEHOLDER}"
     assert secret_set_builds == 1
+
+
+# ---------------------------------------------------------------------------
+# Provider-owned downloads: a vendor session can keep the browser's own save while the run's
+# out-of-band replay of the URL fails. The v3 download probe reads that file back into the run
+# download dir so the existing finalize/complete path sees it.
+# ---------------------------------------------------------------------------
+
+
+def _click_then_probe(
+    tmp_path: Path,
+    monitor: _FakeBrowserDownloadMonitor | None,
+    source: _ActionDownloadSource | None = None,
+    *,
+    local_file: str | None = None,
+    raise_event: bool = True,
+) -> Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]]:
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["begin_calls_at_loop_start"] = source.begin_calls if source is not None else None
+        if monitor is not None and raise_event:
+            monitor.browser_download_event_count += 1
+        if local_file is not None:
+            (tmp_path / local_file).write_bytes(b"local-bytes")
+        probe = kwargs["completion_probe"]
+        captured["probe_started_at"] = time.monotonic()
+        captured["probe_reason"] = await probe(frozenset())
+        captured["probe_returned_at"] = time.monotonic()
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    return _loop
+
+
+def _record_provider_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    sleeps: list[float] = []
+
+    async def _record(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(taskv3_provider_downloads, "asyncio", ScopedAsyncio(sleep=_record))
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_v3_download_reads_a_provider_owned_file_back_when_the_replay_saves_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")], empty_polls=2)
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        block_cls=FileDownloadBlock,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["begin_calls_at_loop_start"] == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+    assert len(observation.poll_deadlines) == 3
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_poll_the_provider_when_a_local_capture_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, local_file="report.pdf"),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert observation.poll_calls == 0
+    assert (tmp_path / "invoice.pdf").read_bytes() == b"local-bytes"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_waits_for_the_monitor_replay_before_polling_the_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A replay that is still in flight and then lands must win; polling the provider first would
+    # publish a second copy of the same download.
+    monitor = _FakeBrowserDownloadMonitor(
+        pending_checks=2, on_settle=lambda: (tmp_path / "report.pdf").write_bytes(b"replayed")
+    )
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert observation.poll_calls == 0
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["invoice.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_returns_promptly_without_polling_when_no_download_began(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = _record_provider_sleeps(monkeypatch)
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, raise_event=False),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_calls == 0
+    assert sleeps == [taskv3_provider_downloads.EVENT_ADMISSION_GRACE_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_keeps_distinct_provider_files_with_equal_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("summary.csv", b"same-bytes"), ("detail.csv", b"same-bytes")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (2 new file(s))"
+    landed = [p for p in tmp_path.iterdir() if p.is_file()]
+    assert len(landed) == 2
+    assert all(p.read_bytes() == b"same-bytes" for p in landed)
+
+
+@pytest.mark.asyncio
+async def test_v3_download_credits_only_files_new_since_the_block_began(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An earlier block's file is already in the run dir; it is neither a local capture for this
+    # block (which would suppress the provider read) nor a file this block delivered.
+    (tmp_path / "earlier.pdf").write_bytes(b"earlier")
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "earlier.pdf").read_bytes() == b"earlier"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_stops_reading_the_provider_when_the_run_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _StallingActionDownloadObservation()
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_calls == 1
+    # Returned well before the stalled poll's own deadline, so the cancel ended it.
+    assert captured["probe_returned_at"] < observation.poll_deadlines[0]
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_complete_from_a_provider_file_read_after_the_run_was_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The cancel lands during the action and the provider answers inside its first wait, so no cancel
+    # check runs between the read and finalize unless recover makes one.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_monitor_does_not_complete_from_a_provider_file_after_a_cancel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        cancel_after_checks=0,
+        loop_fn=_click_then_probe(tmp_path, None, source),
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("baseline", ["listed", "unavailable", "failed"])
+async def test_v3_download_does_not_credit_a_file_that_landed_while_the_provider_baseline_was_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, baseline: str
+) -> None:
+    # An earlier block's download finishes while this block awaits the provider baseline, after the
+    # local baseline was already listed; the read may succeed, list nothing usable, or fail.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([])
+    source = _ActionDownloadSource(
+        None if baseline == "unavailable" else observation,
+        begin_error=RuntimeError("provider down") if baseline == "failed" else None,
+        on_begin=lambda: (tmp_path / "earlier.pdf").write_bytes(b"earlier-block"),
+    )
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source, raise_event=False),
+    )
+
+    assert captured["probe_reason"] is None
+    assert (tmp_path / "earlier.pdf").read_bytes() == b"earlier-block"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_complete_from_a_local_file_after_the_run_was_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # No partial file means the in-flight wait never checks; the cancel must still win over finalize.
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=True, cancel_after_checks=0)
+
+    assert captured["probe_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"late")], empty_polls=10_000)
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=2.0,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["probe_reason"] is None
+    assert observation.poll_deadlines
+    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
+        taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
+    )
+    assert all(
+        started < deadline
+        for started, deadline in zip(observation.poll_started_at, observation.poll_deadlines, strict=True)
+    )
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_keeps_the_local_path_when_the_provider_baseline_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    presigned = "https://downloads.example/file.csv?X-Amz-Signature=deadbeefsecret"
+    source = _ActionDownloadSource(
+        _StallingActionDownloadObservation(), begin_error=_secret_bearing_validation_error(presigned)
+    )
+    monitor = _FakeBrowserDownloadMonitor()
+
+    with capture_logs() as logs:
+        captured = await _run_execute_task_v3_download(
+            monkeypatch,
+            tmp_path,
+            drop_file=False,
+            provider_source=source,
+            download_monitor=monitor,
+            loop_fn=_click_then_probe(tmp_path, monitor, source, local_file="report.pdf"),
+        )
+
+    assert source.begin_calls == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert "deadbeefsecret" not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_v3_download_does_not_take_a_staged_upload_for_the_admitted_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A file_upload staged into the run dir in the same round must not settle the provider read.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        (tmp_path / "upload.pdf").write_bytes(b"staged-upload")
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset({"upload.pdf"}))
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_loop,
+    )
+
+    assert len(observation.poll_deadlines) == 1
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "upload.pdf").read_bytes() == b"staged-upload"
+
+
+@pytest.mark.asyncio
+async def test_v3_wait_only_download_does_not_read_the_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Only a complete_on_download block owns a provider read-back; a download_timeout-only block keeps its
+    # native in-flight wait.
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        complete_on_download=False,
+        download_timeout=10.0,
+        provider_source=source,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, source),
+    )
+
+    assert captured["begin_calls_at_loop_start"] == 0
+    assert captured["probe_reason"] is None
+    assert observation.poll_deadlines == []
+    assert not [p for p in tmp_path.iterdir() if p.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_monitor_reads_the_provider_once_per_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=None,
+        loop_fn=_click_then_probe(tmp_path, None, source),
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert len(observation.poll_deadlines) == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_download_without_a_provider_source_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sleeps = _record_provider_sleeps(monkeypatch)
+    monitor = _FakeBrowserDownloadMonitor()
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        download_monitor=monitor,
+        loop_fn=_click_then_probe(tmp_path, monitor, None),
+    )
+
+    assert captured["probe_reason"] is None
+    assert sleeps == []
+
+
+def _probe_twice(
+    monitor: _FakeBrowserDownloadMonitor, between: Callable[[], None]
+) -> Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]]:
+    # One click, two probes: the second follows an unrelated billable tool, with no new download event.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        probe = kwargs["completion_probe"]
+        captured["first_reason"] = await probe(frozenset())
+        between()
+        captured["probe_reason"] = await probe(frozenset())
+        if captured["probe_reason"]:
+            return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    return _loop
+
+
+@pytest.mark.asyncio
+async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_the_first_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor(pending_checks=10**6)
+    observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
+    source = _ActionDownloadSource(observation)
+
+    def _settle() -> None:
+        monitor._pending_checks = 0
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=1.0,
+        loop_fn=_probe_twice(monitor, _settle),
+    )
+
+    assert captured["first_reason"] is None
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"real-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monitor = _FakeBrowserDownloadMonitor()
+    observation = _FakeActionDownloadObservation([("export.csv", b"late-export")], empty_polls=10**6)
+    source = _ActionDownloadSource(observation)
+
+    def _list_late() -> None:
+        observation._empty_polls = 0
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        download_timeout=1.0,
+        loop_fn=_probe_twice(monitor, _list_late),
+    )
+
+    assert captured["first_reason"] is None
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert (tmp_path / "invoice.csv").read_bytes() == b"late-export"
+
+
+@pytest.mark.asyncio
+async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cleaned_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = asyncio.Event()
+    observation = _GatedCleanupObservation(gate)
+    source = _ActionDownloadSource(observation)
+    monitor = _FakeBrowserDownloadMonitor()
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        monitor.browser_download_event_count += 1
+        asyncio.get_running_loop().call_later(2.0, gate.set)
+        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        captured["cleanup_finished_at_return"] = observation.cleanup_finished
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_monitor=monitor,
+        cancel_after_checks=0,
+        loop_fn=_loop,
+    )
+
+    assert captured["probe_reason"] is None
+    assert captured["cleanup_finished_at_return"] is True

@@ -9,6 +9,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -53,6 +54,17 @@ def _make_org(organization_id: str = "o_1") -> Organization:
     )
 
 
+def _patch_app() -> Any:
+    # The artifact routes check the owning run's workflow folder, which awaits the agent function.
+    return patch(
+        "skyvern.forge.sdk.routes.agent_protocol.app",
+        **{
+            "AGENT_FUNCTION.accessible_workflow_folder_ids": AsyncMock(return_value=None),
+            "AGENT_FUNCTION.enforce_folder_access": AsyncMock(),
+        },
+    )
+
+
 def _make_client() -> TestClient:
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
@@ -65,7 +77,7 @@ class TestGetArtifactSignedUrl:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -96,7 +108,7 @@ class TestGetArtifactSignedUrl:
     def test_unknown_artifact_returns_404(self) -> None:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -117,7 +129,7 @@ class TestGetArtifactSignedUrl:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org("o_2")),
@@ -143,7 +155,7 @@ class TestMintedUrlAgainstContentEndpoint:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -193,7 +205,7 @@ class TestMintedUrlAgainstContentEndpoint:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -237,7 +249,7 @@ class TestSensitiveArtifactEmbeddedUrl:
         real_time = time.time
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch("skyvern.forge.sdk.artifact.signing.time.time", new=lambda: real_time() + age_seconds),
         ):
             app_module.DATABASE.artifacts.get_artifact_by_id_no_org = AsyncMock(return_value=artifact)
@@ -270,7 +282,7 @@ class TestKeyringUnsetFallback:
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -307,7 +319,7 @@ class TestArtifactContentCsp:
         test_app.include_router(base_router, prefix="/v1")
         test_app.add_middleware(SecurityHeadersMiddleware)
         with (
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),

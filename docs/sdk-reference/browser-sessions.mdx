@@ -41,16 +41,53 @@ skyvern.createBrowserSession(request?: CreateBrowserSessionRequest): Promise<Bro
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `url` | `url` | `str \| None` | No | — | Optional URL to open when the standalone browser session starts. |
-| `timeout` | `timeout` | `int \| None` | No | — | Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60. |
-| `proxy_location` | `proxy_location` | `CreateBrowserSessionRequestProxyLocation \| None` | No | — | Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
-| `proxy_session_id` | `proxy_session_id` | `str \| None` | No | — | Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions. |
-| `extensions` | `extensions` | `Sequence[Extensions] \| None` | No | — | A list of extensions to install in the browser session. |
-| `browser_type` | `browser_type` | `PersistentBrowserType \| None` | No | — | The type of browser to use for the session. |
-| `browser_profile_id` | `browser_profile_id` | `str \| None` | No | — | ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`. |
-| `generate_browser_profile` | `generate_browser_profile` | `bool \| None` | No | — | When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag. |
+<ParamField path={"url"} type={"str | None"}>
+Optional URL to open when the standalone browser session starts.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"timeout"} type={"int | None"}>
+Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"CreateBrowserSessionRequestProxyLocation | None"}>
+Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_session_id"} type={"str | None"}>
+Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"extensions"} type={"Sequence[Extensions] | None"}>
+A list of extensions to install in the browser session.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_type"} type={"PersistentBrowserType | None"}>
+The type of browser to use for the session.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"generate_browser_profile"} type={"bool | None"}>
+When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
 
@@ -127,9 +164,11 @@ skyvern.getBrowserSession(browserSessionId: string): Promise<BrowserSessionRespo
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `browser_session_id` | `browserSessionId` | `str` | Yes | — | The ID of the browser session. browser_session_id starts with `pbs_` |
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
 
 **Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
 
@@ -283,10 +322,15 @@ skyvern.updateBrowserSession(browserSessionId: string, request: UpdateBrowserSes
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `browser_session_id` | `browserSessionId` | `str` | Yes | — | The ID of the browser session. browser_session_id starts with `pbs_` |
-| `generate_browser_profile` | `generate_browser_profile` | `bool` | Yes | — | Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown. |
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
+
+<ParamField path={"generate_browser_profile"} type={"bool"} required>
+Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown.
+</ParamField>
 
 **Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
 
@@ -354,8 +398,6 @@ console.log(result);
 
 Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
 
-<Note>Python only: the TypeScript SDK has no equivalent.</Note>
-
 <CodeGroup>
 ```python Python
 await skyvern.extend_browser_session(
@@ -364,16 +406,25 @@ await skyvern.extend_browser_session(
     additional_minutes: int,
 ) -> BrowserSessionResponse
 ```
+
+```typescript TypeScript
+skyvern.extendBrowserSession(browserSessionId: string, request: ExtendBrowserSessionRequest): Promise<BrowserSessionResponse>
+```
 </CodeGroup>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `browser_session_id` | — | `str` | Yes | — | The ID of the browser session. browser_session_id starts with `pbs_` |
-| `additional_minutes` | — | `int` | Yes | — | Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning. |
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
 
-**Returns** `BrowserSessionResponse`
+TypeScript: `browserSessionId`
+</ParamField>
+
+<ParamField path={"additional_minutes"} type={"int"} required>
+Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
+</ParamField>
+
+**Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
 
 <Accordion title="BrowserSessionResponse fields">
 
@@ -423,6 +474,14 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.extendBrowserSession("pbs_123", { additional_minutes: 60 });
+console.log(result);
+```
 </CodeGroup>
 
 ---
@@ -443,11 +502,13 @@ skyvern.closeBrowserSession(browserSessionId: string): Promise<unknown>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `browser_session_id` | `browserSessionId` | `str` | Yes | — | The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_` |
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`
 
-**Returns** `Any \| None` · TypeScript `Promise<unknown>`
+TypeScript: `browserSessionId`
+</ParamField>
+
+**Returns** `Any | None` · TypeScript `Promise<unknown>`
 
 **Example**
 

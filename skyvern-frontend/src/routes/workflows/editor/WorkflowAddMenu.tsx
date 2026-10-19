@@ -14,6 +14,7 @@ type WorkflowAddMenuProps = {
   rotateText?: boolean;
   startAt?: number;
   isUploadingSOP?: boolean;
+  canRecordTask?: boolean;
   //   --
   onAdd: () => void;
   onRecord: () => void;
@@ -29,6 +30,7 @@ function WorkflowAddMenu({
   rotateText = true,
   startAt = 90,
   isUploadingSOP = false,
+  canRecordTask = true,
   //   --
   onAdd,
   onRecord,
@@ -51,15 +53,18 @@ function WorkflowAddMenu({
       },
     ];
 
-    // Show Record Task whenever a browser session exists (ready or still
+    // Show Demonstrate task whenever a browser session exists (ready or still
     // connecting). Disable it until the browser is actually ready so users
     // can see the action will be available without it popping in mid-load.
     if (settingsStore.isUsingABrowser || settingsStore.isLoadingABrowser) {
       menuItems.push({
         id: "2",
         icon: <SquareIcon className={buttonSize ? "h-3 w-3" : undefined} />,
-        enabled: settingsStore.isUsingABrowser && !recordingStore.isRecording,
-        text: "Record Task",
+        enabled:
+          canRecordTask &&
+          settingsStore.isUsingABrowser &&
+          !recordingStore.isRecording,
+        text: "Demonstrate task",
         onClick: () => {
           onRecord();
         },
@@ -80,6 +85,7 @@ function WorkflowAddMenu({
     return menuItems;
   }, [
     buttonSize,
+    canRecordTask,
     onAdd,
     onRecord,
     onUploadSOP,

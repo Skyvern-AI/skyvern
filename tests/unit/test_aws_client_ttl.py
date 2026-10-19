@@ -582,7 +582,9 @@ async def test_upload_file_from_path_cancelled_mid_multipart_aborts_upload_and_s
 
 
 @contextlib.asynccontextmanager
-async def _local_s3(barrier: asyncio.Barrier | None = None, port: int = 0):  # type: ignore[no-untyped-def]
+async def _local_s3(  # type: ignore[no-untyped-def]
+    barrier: asyncio.Barrier | None = None, port: int = 0, body: bytes = b"payload"
+):
     """A plain-HTTP stand-in for S3 that records which connection and credential served each request."""
     seen: list[tuple[int, str, asyncio.BaseTransport]] = []
 
@@ -593,7 +595,7 @@ async def _local_s3(barrier: asyncio.Barrier | None = None, port: int = 0):  # t
         seen.append((transport.get_extra_info("peername")[1], request.headers.get("Authorization", ""), transport))
         if barrier is not None:
             await barrier.wait()
-        return web.Response(body=b"payload" if request.method == "GET" else b"")
+        return web.Response(body=body if request.method == "GET" else b"")
 
     app = web.Application()
     app.router.add_route("*", "/{tail:.*}", handler)
@@ -699,3 +701,47 @@ def test_s3_client_keeps_working_across_event_loops() -> None:
 
     assert asyncio.run(download_once()) == b"payload"
     assert asyncio.run(download_once()) == b"payload"
+
+
+@pytest.mark.asyncio
+async def test_open_download_stream_keeps_its_client_open_until_closed_across_a_session_replacement() -> None:
+    """A streamed body outlives get_object, so the shared client it came from must not close under it."""
+    payload = bytes(range(256)) * 16 * 1024
+    async with _local_s3(body=payload) as (endpoint_url, _):
+        client = _local_client(endpoint_url)
+        stream = await client.open_download_stream("s3://bucket/large.zip")
+        replaced_client = client._shared_s3_clients[asyncio.get_running_loop()]
+        chunks = stream.iter_chunks(64 * 1024)
+        received = [await anext(chunks)]
+
+        client.session = aws.aioboto3.Session(aws_access_key_id="AKIAROTATED", aws_secret_access_key="rotated")
+        assert await client.download_file("s3://bucket/k") == payload
+        received.extend([chunk async for chunk in chunks])
+        assert not replaced_client._owner.done()
+        await stream.aclose()
+
+        async with asyncio.timeout(5):
+            await replaced_client._owner
+        assert stream.content_length == len(payload)
+        assert b"".join(received) == payload
+
+
+@pytest.mark.asyncio
+async def test_open_download_stream_releases_its_client_when_closing_the_body_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _local_s3() as (endpoint_url, _):
+        client = _local_client(endpoint_url)
+        stream = await client.open_download_stream("s3://bucket/k")
+        shared = client._shared_s3_clients[asyncio.get_running_loop()]
+        close_body = stream._body.close
+
+        def close_then_fail() -> None:
+            close_body()
+            raise RuntimeError("body close failed")
+
+        monkeypatch.setattr(stream._body, "close", close_then_fail)
+        with pytest.raises(RuntimeError):
+            await stream.aclose()
+
+        assert shared.leases == 0

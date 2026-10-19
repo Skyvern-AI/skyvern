@@ -1,3 +1,4 @@
+import { usePageSlots } from "@/store/PageSlots";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { RetryPolicyEditor } from "./RetryPolicyEditor";
 import { collectKnownErrorCodes } from "./retryPolicyUtils";
@@ -111,6 +112,7 @@ function WorkflowSettingsEditorBody({
   data: WorkflowStartNodeData;
 }) {
   const workflowPermanentId = useWorkflowPermanentId();
+  const { workflowCuratorSettings: CuratorSettings } = usePageSlots();
   const nodes = useNodes<AppNode>();
   const readOnly = useWorkflowScopeReadOnly();
   const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
@@ -183,6 +185,12 @@ function WorkflowSettingsEditorBody({
       onKeyDownCapture={preventLockedInteraction}
       onChangeCapture={preventLockedInteraction}
     >
+      {CuratorSettings && workflowPermanentId && (
+        <CuratorSettings
+          workflowPermanentId={workflowPermanentId}
+          readOnly={readOnly || !data.editable || mutationLocked}
+        />
+      )}
       <RetryPolicyEditor
         value={data.retryPolicy ?? null}
         onChange={(retryPolicy) => update({ retryPolicy })}

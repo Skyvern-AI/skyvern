@@ -39,14 +39,39 @@ skyvern.createBrowserProfile(request: CreateBrowserProfileRequest): Promise<Brow
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `name` | `name` | `str` | Yes | — | Name for the browser profile |
-| `description` | `description` | `str \| None` | No | — | Optional profile description |
-| `browser_session_id` | `browser_session_id` | `str \| None` | No | — | Persistent browser session to convert into a profile. Omit for a blank profile. |
-| `workflow_run_id` | `workflow_run_id` | `str \| None` | No | — | Workflow run whose persisted session should be captured. Omit for a blank profile. |
-| `proxy_location` | `proxy_location` | `CreateBrowserProfileRequestProxyLocation \| None` | No | — | Optional proxy location for this profile's pinned proxy identity. |
-| `proxy_session_id` | `proxy_session_id` | `str \| None` | No | — | Explicit sticky-session id for this profile's pinned proxy identity. |
+<ParamField path={"name"} type={"str"} required>
+Name for the browser profile
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+Optional profile description
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+Persistent browser session to convert into a profile. Omit for a blank profile.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"workflow_run_id"} type={"str | None"}>
+Workflow run whose persisted session should be captured. Omit for a blank profile.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"CreateBrowserProfileRequestProxyLocation | None"}>
+Optional proxy location for this profile's pinned proxy identity.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_session_id"} type={"str | None"}>
+Explicit sticky-session id for this profile's pinned proxy identity.
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
 
@@ -121,9 +146,11 @@ skyvern.getBrowserProfile(profileId: string): Promise<BrowserProfile>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile. browser_profile_id starts with `bp_` |
+<ParamField path={"profile_id"} type={"str"} required>
+The ID of the browser profile. browser_profile_id starts with `bp_`
+
+TypeScript: `profileId`
+</ParamField>
 
 **Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
 
@@ -199,13 +226,31 @@ skyvern.listBrowserProfiles(request?: ListBrowserProfilesRequest): Promise<Brows
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | `page` | `int \| None` | No | `None` |  |
-| `page_size` | `page_size` | `int \| None` | No | `None` |  |
-| `include_deleted` | `include_deleted` | `bool \| None` | No | `None` | Include deleted browser profiles |
-| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches. |
-| `managed` | `managed` | `bool \| None` | No | `None` | Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles. |
+<ParamField path={"page"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"include_deleted"} type={"bool | None"}>
+Include deleted browser profiles
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"search_key"} type={"str | None"}>
+Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"managed"} type={"bool | None"}>
+Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles.
+
+Default: `None`
+</ParamField>
 
 **Returns** `list[BrowserProfile]` · TypeScript `Promise<BrowserProfile[]>`
 
@@ -282,14 +327,41 @@ skyvern.updateBrowserProfile(profileId: string, request?: UpdateBrowserProfileRe
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile to update. browser_profile_id starts with `bp_` |
-| `name` | `name` | `str \| None` | No | — | New name for the browser profile |
-| `description` | `description` | `str \| None` | No | — | New description for the browser profile |
-| `proxy_location` | `proxy_location` | `UpdateBrowserProfileRequestProxyLocation \| None` | No | — | Optional proxy location for this profile's pinned proxy identity. |
-| `proxy_session_id` | `proxy_session_id` | `str \| None` | No | — | Opaque Skyvern-managed proxy sticky-session id. |
-| `rotate_proxy_session_id` | `rotate_proxy_session_id` | `bool \| None` | No | — | Rotate the Skyvern-managed proxy sticky-session id for this profile. |
+<ParamField path={"profile_id"} type={"str"} required>
+The ID of the browser profile to update. browser_profile_id starts with `bp_`
+
+TypeScript: `profileId`
+</ParamField>
+
+<ParamField path={"name"} type={"str | None"}>
+New name for the browser profile
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+New description for the browser profile
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"UpdateBrowserProfileRequestProxyLocation | None"}>
+Optional proxy location for this profile's pinned proxy identity.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_session_id"} type={"str | None"}>
+Opaque Skyvern-managed proxy sticky-session id.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"rotate_proxy_session_id"} type={"bool | None"}>
+Rotate the Skyvern-managed proxy sticky-session id for this profile.
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `BrowserProfile` · TypeScript `Promise<BrowserProfile>`
 
@@ -358,9 +430,11 @@ skyvern.deleteBrowserProfile(profileId: string): Promise<void>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `profile_id` | `profileId` | `str` | Yes | — | The ID of the browser profile to delete. browser_profile_id starts with `bp_` |
+<ParamField path={"profile_id"} type={"str"} required>
+The ID of the browser profile to delete. browser_profile_id starts with `bp_`
+
+TypeScript: `profileId`
+</ParamField>
 
 **Returns** `None` · TypeScript `Promise<void>`
 

@@ -108,7 +108,7 @@ describe("requestRecordingStart", () => {
     act(() => requestRecordingStart(start, "auto_record"));
     expect(start).not.toHaveBeenCalled();
     expect(
-      screen.getByText("Save or discard changes before recording"),
+      screen.getByText("Save or discard changes before demonstrating"),
     ).toBeTruthy();
     expect(screen.getByText(/This can't be undone/)).toBeTruthy();
     expect(blockedEvents()).toEqual([
@@ -124,8 +124,8 @@ describe("requestRecordingStart", () => {
   });
 
   it.each([
-    ["Save and record", "save"],
-    ["Discard and record", "discard"],
+    ["Save and demonstrate", "save"],
+    ["Discard and demonstrate", "discard"],
   ])("%s resolves the pending change, then starts", async (label) => {
     setPending();
     const onSave = vi.fn(async () => clearChanges());
@@ -171,14 +171,16 @@ describe("requestRecordingStart", () => {
     });
     const start = vi.fn();
     act(() => requestRecordingStart(start, "launcher"));
-    await act(async () => fireEvent.click(screen.getByText("Save and record")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Save and demonstrate")),
+    );
     expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
       "br-pending",
     );
     expect(start).not.toHaveBeenCalled();
   });
 
-  it("resumes Save and record after the code-cache confirmation saves", async () => {
+  it("resumes Save and demonstrate after the code-cache confirmation saves", async () => {
     setPending();
     renderDialog(async () => {
       useWorkflowHasChangesStore
@@ -188,10 +190,12 @@ describe("requestRecordingStart", () => {
     });
     const start = vi.fn();
     act(() => requestRecordingStart(start, "launcher"));
-    await act(async () => fireEvent.click(screen.getByText("Save and record")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Save and demonstrate")),
+    );
     expect(start).not.toHaveBeenCalled();
     expect(
-      screen.queryByText("Save or discard changes before recording"),
+      screen.queryByText("Save or discard changes before demonstrating"),
     ).toBeNull();
     act(() => {
       clearChanges();
@@ -202,7 +206,7 @@ describe("requestRecordingStart", () => {
     expect(start).toHaveBeenCalledOnce();
   });
 
-  it("keeps Save and record when the confirmation closes while its save is running", async () => {
+  it("keeps Save and demonstrate when the confirmation closes while its save is running", async () => {
     setPending();
     renderDialog(async () => {
       useWorkflowHasChangesStore
@@ -212,7 +216,9 @@ describe("requestRecordingStart", () => {
     });
     const start = vi.fn();
     act(() => requestRecordingStart(start, "launcher"));
-    await act(async () => fireEvent.click(screen.getByText("Save and record")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Save and demonstrate")),
+    );
     // Yes was clicked; its save holds the editor when the dialog is dismissed.
     act(() => {
       useWorkflowYamlEditorStore.setState({ commitInProgress: true });
@@ -238,7 +244,9 @@ describe("requestRecordingStart", () => {
     });
     const start = vi.fn();
     act(() => requestRecordingStart(start, "launcher"));
-    await act(async () => fireEvent.click(screen.getByText("Save and record")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Save and demonstrate")),
+    );
     act(() =>
       useWorkflowHasChangesStore
         .getState()
@@ -278,7 +286,7 @@ describe("requestRecordingStart", () => {
     const start = vi.fn();
     act(() => requestRecordingStart(start, "edge"));
     act(() => {
-      fireEvent.click(screen.getByText("Save and record"));
+      fireEvent.click(screen.getByText("Save and demonstrate"));
     });
     act(change);
     await act(async () => finishSave());
@@ -299,7 +307,7 @@ describe("requestRecordingStart", () => {
           recordsAfterDiscard: false,
         }),
       );
-      expect(screen.queryByText("Discard and record")).toBeNull();
+      expect(screen.queryByText("Discard and demonstrate")).toBeNull();
       await act(async () =>
         fireEvent.click(screen.getByText("Discard changes")),
       );
@@ -310,11 +318,11 @@ describe("requestRecordingStart", () => {
     },
   );
 
-  it("focuses Save and record when the prompt opens, never Discard", () => {
+  it("focuses Save and demonstrate when the prompt opens, never Discard", () => {
     setPending();
     renderDialog();
     act(() => requestRecordingStart(vi.fn(), "launcher"));
-    expect(document.activeElement?.textContent).toBe("Save and record");
+    expect(document.activeElement?.textContent).toBe("Save and demonstrate");
   });
 
   it("while save is paused, focuses Cancel and disables Save and Discard", () => {
@@ -326,10 +334,10 @@ describe("requestRecordingStart", () => {
     act(() => requestRecordingStart(vi.fn(), "launcher"));
     expect(document.activeElement?.textContent).toBe("Cancel");
     expect(
-      screen.getByText("Save and record").closest("button")!.disabled,
+      screen.getByText("Save and demonstrate").closest("button")!.disabled,
     ).toBe(true);
     expect(
-      screen.getByText("Discard and record").closest("button")!.disabled,
+      screen.getByText("Discard and demonstrate").closest("button")!.disabled,
     ).toBe(true);
   });
 
@@ -359,10 +367,10 @@ describe("requestRecordingStart", () => {
       expect(document.activeElement?.textContent).toBe("Cancel");
       expect(screen.getByText(message)).toBeTruthy();
       expect(
-        screen.getByText("Save and record").closest("button")!.disabled,
+        screen.getByText("Save and demonstrate").closest("button")!.disabled,
       ).toBe(true);
       expect(
-        screen.getByText("Discard and record").closest("button")!.disabled,
+        screen.getByText("Discard and demonstrate").closest("button")!.disabled,
       ).toBe(true);
     },
   );
@@ -373,7 +381,7 @@ describe("requestRecordingStart", () => {
     const start = vi.fn();
     act(() => requestRecordingStart(start, "launcher"));
     await act(async () =>
-      fireEvent.click(screen.getByText("Discard and record")),
+      fireEvent.click(screen.getByText("Discard and demonstrate")),
     );
     expect(start).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith(
@@ -393,11 +401,13 @@ describe("requestRecordingStart", () => {
     );
     canRecord = false;
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+      fireEvent.click(
+        screen.getByRole("button", { name: "Save and demonstrate" }),
+      ),
     );
     expect(start).not.toHaveBeenCalled();
     expect(toast).toHaveBeenCalledWith(
-      expect.objectContaining({ title: "Recording didn't start" }),
+      expect.objectContaining({ title: "Demonstration didn't start" }),
     );
   });
 
@@ -411,7 +421,7 @@ describe("requestRecordingStart", () => {
       registerEditorOwner(createYamlCommitOwner("wpid_other"));
     });
     expect(
-      screen.queryByText("Save or discard changes before recording"),
+      screen.queryByText("Save or discard changes before demonstrating"),
     ).toBeNull();
     expect(usePendingRecordingStartGate.getState().blockedStart).toBe(null);
     expect(start).not.toHaveBeenCalled();
@@ -426,7 +436,7 @@ describe("requestRecordingStart", () => {
     expect(usePendingRecordingStartGate.getState().blockedStart).toBe(null);
     act(() => setPending());
     expect(
-      screen.queryByText("Save or discard changes before recording"),
+      screen.queryByText("Save or discard changes before demonstrating"),
     ).toBeNull();
     expect(start).not.toHaveBeenCalled();
   });

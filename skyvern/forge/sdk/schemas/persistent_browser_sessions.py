@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import TypeGuard
+from typing import Literal, TypeGuard
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.exceptions import (
@@ -21,6 +22,8 @@ from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsRec
 from skyvern.schemas.external_cdp import EXTERNAL_CDP_BROWSER_VENDOR
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
+
+LOG = structlog.get_logger(__name__)
 
 
 class PersistentBrowserSessionStatus(StrEnum):
@@ -137,6 +140,8 @@ class PersistentBrowserSession(BaseModel):
     browser_settings_receipt: BrowserSettingsReceipt | None = None
     # The workflow run whose own setup created this session; never set for a session a caller attaches.
     created_for_workflow_run_id: str | None = None
+    # The workflow a Copilot chat provisioned this browser for.
+    created_for_workflow_permanent_id: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
@@ -218,7 +223,10 @@ def assert_runnable_owner(
 
 
 def unusable_browser_session_error(
-    session: PersistentBrowserSession, *, refused_at_submission: bool = False
+    session: PersistentBrowserSession,
+    *,
+    refused_at_submission: bool = False,
+    submission_path: Literal["workflow_run", "task_v1", "task_v2"] | None = None,
 ) -> SkyvernHTTPException | None:
     """The error a run sent to this session fails (or, at submission, is refused) with, or None while it is usable.
 
@@ -234,11 +242,12 @@ def unusable_browser_session_error(
         return None
     session_id = session.persistent_browser_session_id
     timed_out = session.status == PersistentBrowserSessionStatus.timeout
+    error: SkyvernHTTPException
     if timed_out and session.started_at is None:
-        return BrowserSessionStartupTimeout(session_id)
+        error = BrowserSessionStartupTimeout(session_id)
     # A session that reaches its lifetime ends with status timeout, or is closed as completed with close reason
     # expired, a reason a retirement can also stamp before the lifetime is up.
-    if (
+    elif (
         timed_out
         or expired_open_registration
         or (
@@ -248,7 +257,7 @@ def unusable_browser_session_error(
             )
         )
     ):
-        return BrowserSessionExpired(
+        error = BrowserSessionExpired(
             session_id,
             started_at=session.started_at,
             ended_at=session.completed_at,
@@ -258,11 +267,20 @@ def unusable_browser_session_error(
             refused_at_submission=refused_at_submission,
             registered=is_external_cdp_session(session),
         )
-    return BrowserSessionClosed(
-        session_id,
-        reason=f"is no longer usable (status: {session.status})",
-        registered=is_external_cdp_session(session),
-    )
+    else:
+        error = BrowserSessionClosed(
+            session_id,
+            reason=f"is no longer usable (status: {session.status})",
+            registered=is_external_cdp_session(session),
+        )
+    if refused_at_submission:
+        LOG.warning(
+            "browser_session_run_refused",
+            error_code=error.error_code,
+            browser_session_id=session_id,
+            submission_path=submission_path,
+        )
+    return error
 
 
 def lost_external_browser_error(session: PersistentBrowserSession | None) -> SkyvernHTTPException:

@@ -2549,7 +2549,7 @@ describe("regular save transactions", () => {
     });
     return { owner, view, client };
   }
-  test("legacy save refuses a Copilot lock without an unhandled rejection", async () => {
+  test("legacy save is disabled under a Copilot lock without an unhandled rejection", async () => {
     const { view, client } = mountSave();
     client.setDefaultOptions({
       queries: { staleTime: Infinity, retry: false },
@@ -2575,13 +2575,9 @@ describe("regular save transactions", () => {
       ),
     );
     try {
-      fireEvent.click(control.getByRole("button"));
-      await waitFor(() =>
-        expect(toast).toHaveBeenCalledWith({
-          title: "Wait for the Copilot change to finish",
-          variant: "destructive",
-        }),
-      );
+      const save = control.getByRole("button");
+      expect(save.matches(":disabled")).toBe(true);
+      fireEvent.click(save);
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
       });

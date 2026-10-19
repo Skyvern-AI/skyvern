@@ -40,7 +40,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    load_credentials,
+    loggable_origin,
+    safe_admitted_url,
+    url_parts,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -811,7 +816,7 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
     return admitted_url
 
 
-def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
+def apply_connected_credential_to_policy(ctx: CopilotContext, policy: RequestPolicy, credential: Credential) -> None:
     """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
     (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
     raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn."""
@@ -862,7 +867,10 @@ def signed_in_facts(signed_in: SignedInProfile) -> str:
     return (
         f"The user signed in to {signed_in.site} themselves in the live browser via the credential card. "
         f"Skyvern saved that sign-in as browser profile {defang_card_text(signed_in.profile_name)} "
-        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. No credential was provided."
+        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. No credential was provided. "
+        "This profile seeds this turn's tests only. Later turns and saved runs start from it only if it is set as "
+        "the workflow's browser profile and the user accepts. Sites often end cookie-only sign-ins within minutes "
+        "or hours, so saved runs may start signed out."
     )
 
 
@@ -911,7 +919,7 @@ async def _try_resolve_credential_response(
         return CredentialPauseResolution(action="signed_in", signed_in=signed_in) if signed_in else None
     if not credential_id:
         return None
-    existing = await app.DATABASE.credentials.get_credentials_by_ids([credential_id], organization_id=organization_id)
+    existing = await load_credentials(organization_id, credential_ids=[credential_id])
     if not existing:
         return None
     return CredentialPauseResolution(action="connected", credential=existing[0])
@@ -1060,7 +1068,10 @@ async def _run_credential_pause(
         from skyvern.forge.sdk.copilot.tools.credential_fill import _read_vault_named_sites  # circular import
 
         # The vault entry's sites grant whole-site, so they are compared by site; an unreadable entry offers nothing.
-        vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        try:
+            vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        except PermissionError:
+            vault_sites = None
         if vault_sites is None or (vault_sites and not any(same_site(login_page_urls[0], uri) for uri in vault_sites)):
             named_credential_id = None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
@@ -1271,7 +1282,7 @@ async def _run_credential_pause(
         await answered("not_admitted")
         return resolution
     if isinstance(policy, RequestPolicy):
-        _apply_connected_credential_to_policy(ctx, policy, credential)
+        apply_connected_credential_to_policy(ctx, policy, credential)
     ctx.credential_pause_outcome = "connected"
     await answered("connected", credential)
     return replace(resolution, generated=True) if is_generated else resolution

@@ -28,7 +28,7 @@ Every integration with a **Connect**, **Configure** or **Set up →** button is 
 |---|---|---|---|
 | Google Sheets | Workspace | Read and write sheets in your agents | **Connect** |
 | Google Drive | Workspace | Upload run files to Drive folders | **Connect** |
-| Gmail | Communication | Find verification codes and emails in your inbox | **Connect** |
+| Gmail | Communication | Read verification codes and send email from your agents | **Connect** |
 | Outlook | Communication | Find verification codes and emails in your inbox | **Connect** |
 | 1Password | Credentials | Use logins from your 1Password vaults | **Configure** |
 | Bitwarden | Credentials | Use logins from your Bitwarden vault | **Configure** |
@@ -49,7 +49,7 @@ Google Sheets, Google Drive, Gmail and Outlook connect through Google or Microso
     Click **Connect** on the tile.
   </Step>
   <Step title="Name the connection">
-    Enter a name, such as "Finance Gmail". You pick the account by this name in your agent's blocks. Click **Continue to Google** (or **Continue to Microsoft** for Outlook).
+    Enter a name, such as "Finance Gmail". You pick the account by this name in your agent's blocks. For Gmail, choose what agents may do: **Read inbox** (on by default) and **Send email**. Click **Continue to Google** (or **Continue to Microsoft** for Outlook).
   </Step>
   <Step title="Approve access">
     Sign in and approve every permission on the consent screen. Skyvern sends you back to Integrations, where the account appears under **Connected**.
@@ -62,7 +62,7 @@ What each connection asks for, and where you use it:
 |---|---|---|
 | Google Sheets | Read and write spreadsheets, read Drive file metadata | **Google Sheets Read** and **Google Sheets Write** blocks |
 | Google Drive | Full Drive access | **Cloud Storage** block with storage type **Google Drive**; **File Download** block for Drive links |
-| Gmail | Read-only mail | **Email Inbox** block, and email-based 2FA on [credentials](/credentials) |
+| Gmail | **Read inbox**: read-only mail. **Send email**: send mail as the account. | **Email Inbox** block and email-based 2FA on [credentials](/credentials) (read); **Send Email** block with **Send with** set to the account (send) |
 | Outlook | Read mail (`Mail.Read`) | **Email Inbox** block, and email-based 2FA on [credentials](/credentials) |
 
 Block settings are in the [blocks reference](/reference/blocks).
@@ -73,6 +73,7 @@ Each connected card lists its accounts. From there you can:
 
 - **Add another account**: click **Add another Gmail account** (or the matching name) to connect a second inbox or Google account.
 - **Rename** or **Disconnect**: open the **...** menu on the account row. The name you set is what agent blocks show in their account picker.
+- **Turn on reading or sending** (Gmail): the account row shows **Read inbox** and **Send email**. Click the one that isn't on yet and approve the extra permission. Sending needs the account's address, so an older connection may ask you to reconnect first.
 - **Reconnect** (Google only): if the card shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and approve again. Agents that use the account resume without edits.
 
 <Warning>
@@ -104,33 +105,31 @@ Per-client details, tool scopes and troubleshooting are on [MCP and coding agent
 
 ## Automation platforms
 
-Zapier, Make, n8n and Workato connect from their side: you add Skyvern inside the platform and paste your [API key](/cloud/account#api-keys). The tiles on the Integrations page link to each platform's Skyvern listing.
+Build a workflow in Skyvern before adding its run action in a builder. All four connections use an organization API key from [Settings → API keys](/cloud/account#api-keys), sent in the `x-api-key` header. Save the key in the builder's Skyvern connection, not in a workflow input. Organization keys have full access to your organization; scoped API keys are coming.
 
-All four follow the same pattern:
+For Skyvern Cloud, the API base URL is `https://api.skyvern.com`. For a self-hosted deployment, use its API origin and make sure the builder can reach it. The n8n node exposes a **Base URL** credential field (default: `https://api.skyvern.com`); enter the origin only, without `/api/v1`, because the node adds API paths itself. The Zapier, Make and Workato listings do not show a custom base URL field; contact Skyvern Support to confirm self-hosted support before connecting.
 
-1. **Build the agent in Skyvern first.** The platform's "run an agent" step only lists agents that already exist.
-2. **Run it.** Choose the agent and fill in its inputs. Add a webhook callback URL if you want the platform to hear back when the run finishes, rather than polling.
-3. **Get the result.** Use the platform's "get" step with the run ID: agent run IDs start with `wr_`, task run IDs with `tsk_`.
+### Zapier
+
+[Add Skyvern from the Zapier listing](https://zapier.com/apps/skyvern/integrations), create a connection with your organization API key, then add **Run a Workflow** to your Zap. Use **Get a Workflow** with the returned workflow run ID to retrieve its result. The current Run a Workflow action's workflow and input fields may not load reliably; verify the workflow exists and the connection uses the right key, but setup alone cannot fix an app-side loading issue.
+
+### Make
+
+[Add a Skyvern module from the Make listing](https://www.make.com/en/integrations/skyvern-ai) to your scenario and click **Create a connection**. Enter your organization API key, then choose **Run a Workflow** or **Run a Task**. Use **Get a Workflow** or **Get a Task** with the returned run ID to retrieve the result.
+
+### n8n
+
+The [verified Skyvern node listing](https://n8n.io/integrations/skyvern/) requires a one-time install by an n8n instance owner or admin: open the Nodes panel (+), find Skyvern under **More from the community**, and select **Install**. Everyone on the instance can then add it to workflows. On n8n Cloud, the owner controls verified-node availability in the Cloud Admin Panel; on self-hosted n8n, the admin controls it through environment variables. Create a Skyvern API credential with your organization key and, for self-hosted Skyvern, the API **Base URL**. Choose the **Workflow** or **Task** resource and a dispatch operation, then use the matching Get operation with the returned run ID. For **Get Workflow**, also select the same workflow (or provide its ID) in **Workflow Name or ID**, and enter the returned run ID in **Workflow Run ID**. The node's workflow selector lists at most 100 workflows.
+
+### Workato
+
+[Add the Skyvern connector from the Workato listing](https://www.workato.com/integrations/skyvern) to a recipe and create its connection with your organization API key. Choose **Run a Workflow** or **Create and Run Task**. Workato's **Get Workflow** action looks up a workflow by workflow ID; it does not retrieve a workflow run. Pair **Create and Run Task V2** with **Get Task V2** and its returned `tsk_v2_...` ID; for v1 tasks, use **Get Task** with the task ID.
+
+Workflow run IDs start with `wr_`; v1 task IDs start with `tsk_`, and Task V2 IDs start with `tsk_v2_`. A run may finish after the builder's action returns. Use the matching Get action when that builder provides one, or watch the run in Skyvern history. If a Run action offers a webhook callback URL, you can provide one that Skyvern can reach instead of polling.
 
 <Tip>
 Watch progress in the Skyvern app while you test. Every run started from a platform appears in your run history like any other run. See [Runs and schedules](/cloud/runs).
 </Tip>
-
-### Zapier
-
-Add Skyvern in your Zap and paste your API key. Listing: [zapier.com/apps/skyvern](https://zapier.com/apps/skyvern/integrations).
-
-### Make
-
-Add Skyvern in your scenario and paste your API key. Listing: [make.com/en/integrations/skyvern-ai](https://www.make.com/en/integrations/skyvern-ai).
-
-### n8n
-
-Install the community node [`n8n-nodes-skyvern`](https://www.npmjs.com/package/n8n-nodes-skyvern), add it to your workflow and paste your API key.
-
-### Workato
-
-Add the Skyvern connector to your recipe and paste your API key. Listing: [workato.com/integrations/skyvern](https://www.workato.com/integrations/skyvern).
 
 ## Next
 

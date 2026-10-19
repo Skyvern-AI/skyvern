@@ -30,10 +30,15 @@ skyvern.createFolder(request: FolderCreate): Promise<Folder>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `title` | `title` | `str` | Yes | — | Folder title |
-| `description` | `description` | `str \| None` | No | — | Folder description |
+<ParamField path={"title"} type={"str"} required>
+Folder title
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+Folder description
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `Folder` · TypeScript `Promise<Folder>`
 
@@ -96,9 +101,11 @@ skyvern.getFolder(folderId: string): Promise<Folder>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
+<ParamField path={"folder_id"} type={"str"} required>
+Folder ID
+
+TypeScript: `folderId`
+</ParamField>
 
 **Returns** `Folder` · TypeScript `Promise<Folder>`
 
@@ -166,11 +173,23 @@ skyvern.getFolders(request?: GetFoldersRequest): Promise<Folder[]>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | `page` | `int \| None` | No | `None` | Page number |
-| `page_size` | `page_size` | `int \| None` | No | `None` | Number of folders per page |
-| `search` | `search` | `str \| None` | No | `None` | Search folders by title or description |
+<ParamField path={"page"} type={"int | None"}>
+Page number
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Number of folders per page
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"search"} type={"str | None"}>
+Search folders by title or description
+
+Default: `None`
+</ParamField>
 
 **Returns** `list[Folder]` · TypeScript `Promise<Folder[]>`
 
@@ -238,11 +257,23 @@ skyvern.updateFolder(folderId: string, request?: FolderUpdate): Promise<Folder>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
-| `title` | `title` | `str \| None` | No | — | Folder title |
-| `description` | `description` | `str \| None` | No | — | Folder description |
+<ParamField path={"folder_id"} type={"str"} required>
+Folder ID
+
+TypeScript: `folderId`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+Folder title
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+Folder description
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `Folder` · TypeScript `Promise<Folder>`
 
@@ -309,12 +340,19 @@ skyvern.deleteFolder(folderId: string, request?: DeleteFolderRequest): Promise<R
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `folder_id` | `folderId` | `str` | Yes | — | Folder ID |
-| `delete_workflows` | `delete_workflows` | `bool \| None` | No | `None` | If true, also delete all workflows in this folder |
+<ParamField path={"folder_id"} type={"str"} required>
+Folder ID
 
-**Returns** `dict[str, Any \| None]` · TypeScript `Promise<Record<string, unknown>>`
+TypeScript: `folderId`
+</ParamField>
+
+<ParamField path={"delete_workflows"} type={"bool | None"}>
+If true, also delete all workflows in this folder
+
+Default: `None`
+</ParamField>
+
+**Returns** `dict[str, Any | None]` · TypeScript `Promise<Record<string, unknown>>`
 
 **Example**
 
@@ -365,10 +403,17 @@ skyvern.updateWorkflowFolder(workflowPermanentId: string, request?: UpdateWorkfl
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | Workflow permanent ID |
-| `folder_id` | `folder_id` | `str \| None` | No | — | Folder ID to assign workflow to. Set to null to remove from folder. |
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+Workflow permanent ID
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"folder_id"} type={"str | None"}>
+Folder ID to assign workflow to. Set to null to remove from folder.
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `Workflow` · TypeScript `Promise<Workflow>`
 

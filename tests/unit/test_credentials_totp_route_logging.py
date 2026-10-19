@@ -7,12 +7,18 @@ import pytest
 import structlog.testing
 from fastapi import FastAPI, HTTPException, Response
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialNotConfiguredError
 from skyvern.services.otp_service import OTPValue
+
+
+@pytest.fixture(autouse=True)
+def _oss_agent_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(credentials.app, "AGENT_FUNCTION", AgentFunction())
 
 
 def _raw_row(totp_code_id: str = "otp_raw") -> RawTOTPCode:
@@ -193,6 +199,8 @@ async def test_send_totp_code_insufficient_credits_returns_402_when_raw_content_
         credentials.app,
         "AGENT_FUNCTION",
         SimpleNamespace(
+            workflow_folders_restricted=AsyncMock(return_value=False),
+            credential_folders_restricted=AsyncMock(return_value=False),
             has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
             charge_for_otp_parse=charge,
         ),
@@ -239,6 +247,8 @@ async def test_send_totp_code_insufficient_credits_persists_raw_within_cap(
         credentials.app,
         "AGENT_FUNCTION",
         SimpleNamespace(
+            workflow_folders_restricted=AsyncMock(return_value=False),
+            credential_folders_restricted=AsyncMock(return_value=False),
             has_sufficient_credit_for_otp_parse=AsyncMock(return_value=False),
             charge_for_otp_parse=charge,
         ),

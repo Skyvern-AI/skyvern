@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.errors.errors import LoginUnconfirmedError, TimeoutGetTOTPVerificationCodeError, UserDefinedError
+from skyvern.errors.errors import TimeoutGetTOTPVerificationCodeError, UserDefinedError
 from skyvern.webeye.actions.actions import TerminateAction
 from skyvern.webeye.actions.handler import extract_user_defined_errors, handle_terminate_action
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -180,45 +180,6 @@ async def test_terminate_preserves_errors_when_extract_fails() -> None:
     # The original errors from LLM reasoning must be preserved
     assert len(action.errors) == 1
     assert action.errors[0].error_code == "OTP_TIMEOUT"
-
-
-@pytest.mark.asyncio
-async def test_terminate_gates_merged_credential_verdicts_only_once() -> None:
-    task = _make_task(error_code_mapping={"invalid_credentials": "the submitted credentials were rejected"})
-    step = _make_step()
-    scraped_page = _make_scraped_page()
-    original = UserDefinedError(
-        error_code="invalid_credentials",
-        reasoning="The login failed",
-        confidence_float=1.0,
-    )
-    original._skyvern_defined = True
-    action = TerminateAction(reasoning="The login failed", errors=[original])
-    extracted = UserDefinedError(
-        error_code="invalid_credentials",
-        reasoning="The page says the login failed",
-        confidence_float=0.9,
-    )
-
-    with (
-        patch(
-            "skyvern.webeye.actions.handler.extract_user_defined_errors",
-            new_callable=AsyncMock,
-            return_value=[extracted],
-        ) as extract,
-        patch(
-            "skyvern.webeye.actions.handler.confirm_credential_verdicts",
-            new_callable=AsyncMock,
-            return_value=[LoginUnconfirmedError().to_user_defined_error()],
-        ) as confirm,
-    ):
-        await handle_terminate_action(action=action, page=MagicMock(), scraped_page=scraped_page, task=task, step=step)
-
-    extract.assert_awaited_once()
-    assert extract.await_args.kwargs["confirm_credentials"] is False
-    confirm.assert_awaited_once()
-    assert [error.error_code for error in confirm.await_args.kwargs["errors"]] == ["invalid_credentials"]
-    assert [error.error_code for error in action.errors] == ["CREDENTIAL_LOGIN_UNCONFIRMED"]
 
 
 @pytest.mark.asyncio

@@ -72,12 +72,12 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     candidate_page_context,
     value_designation_probe_expression,
 )
-from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
-from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
+from skyvern.forge.sdk.copilot.tools.composition_capture import _PAGE_STATE_RESERVE_CHARS, _model_facing_inspect_result
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
@@ -4371,6 +4371,7 @@ async def test_candidate_counts_reach_an_author_only_where_a_selector_is_not_uni
         "source": "class",
         "match_count": 3,
         "visible_match_count": 1,
+        "first_match_visible": False,
     }
     assert candidates["#q"] == {"selector": "#q", "source": "id"}
     assert [control["pointer_at_center"] for control in authoring] == ["reaches_control", "reaches_control"]
@@ -4390,6 +4391,31 @@ async def test_candidate_counts_reach_an_author_only_where_a_selector_is_not_uni
     assert all(
         "pointer_at_center" not in control for control in controls(model_visible_composition_evidence(structured))
     )
+
+    visible_first_raw, _ = await _capture_live_dom(
+        url,
+        (
+            "<html><head><style>.legacy{display:none}</style></head><body>"
+            '<form id="search"><input id="q" name="q" type="text">'
+            '<button type="submit" class="go">Search</button>'
+            '<button type="submit" class="go legacy">Search</button></form></body></html>'
+        ),
+        "#q",
+    )
+    visible_first = parse_composition_structured(json.loads(visible_first_raw), inspected_url=url, current_url=url)
+    assert visible_first is not None
+    visible_first_candidates = {
+        candidate["selector"]: candidate
+        for control in controls(model_visible_composition_evidence(visible_first, authoring_facts=True))
+        for candidate in control["selector_candidates"]
+    }
+    assert visible_first_candidates["button.go"] == {
+        "selector": "button.go",
+        "source": "class",
+        "match_count": 2,
+        "visible_match_count": 1,
+        "first_match_visible": True,
+    }
 
 
 _VISUALLY_HIDDEN = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"
@@ -5126,7 +5152,9 @@ async def test_capture_over_its_bound_drops_pointer_states_and_visible_counts_be
         "return boundedStructuredEvidence(structuredEvidence);",
         "return JSON.stringify(structuredEvidence);",
     )
-    html = _full_forms_under_a_page_wide_layer_html(placeholder_chars=placeholder_chars)
+    html = _full_forms_under_a_page_wide_layer_html(placeholder_chars=placeholder_chars).replace(
+        "<nav>", '<button type="submit" class="submit-btn" hidden>Submit</button><nav>'
+    )
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -5147,6 +5175,11 @@ async def test_capture_over_its_bound_drops_pointer_states_and_visible_counts_be
     assert all("pointer_at_center" in control and "element_at_center" in control for control in controls)
     assert all(
         "visible_match_count" in candidate for control in controls for candidate in control["selector_candidates"]
+    )
+    assert any(
+        candidate.get("first_match_visible") is False
+        for control in controls
+        for candidate in control["selector_candidates"]
     )
     over_the_bound = len(json.dumps(unbounded, separators=(",", ":"))) > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
 
@@ -5188,6 +5221,94 @@ async def test_inspect_result_over_the_model_bound_is_the_packet_without_authori
     head = model_facing(data)[:_RECENT_TOOL_OUTPUT_CHAR_CAP]
     for key in ("modal_overlays", "page_obstructions", "clickable_controls"):
         assert data[key] and json.dumps({key: data[key]})[1:-1] in head
+
+
+@pytest.mark.parametrize("reader", ["inspect_result", "post_run_result"])
+@pytest.mark.parametrize(
+    ("relation_first_match_visible", "fitting", "expected"),
+    [
+        (False, "projected", "projected"),
+        (False, "read_counts", "read_counts"),
+        (False, "without_counts", "without_counts"),
+        (False, "nothing", "read_counts"),
+        (True, "read_counts", "without_counts"),
+        (True, "nothing", "without_counts"),
+    ],
+)
+def test_size_fallback_keeps_counts_only_on_a_value_relation_whose_first_match_is_hidden(
+    reader: str, relation_first_match_visible: bool, fitting: str, expected: str
+) -> None:
+    relation_candidate = {
+        "selector": "span.stat",
+        "source": "class",
+        "match_count": 4,
+        "visible_match_count": 2,
+        "first_match_visible": relation_first_match_visible,
+    }
+    # A hidden-first candidate unrelated to the read, such as a responsive nav copy, must not keep counts.
+    field_candidate = {
+        "selector": "input.nav",
+        "source": "class",
+        "match_count": 2,
+        "visible_match_count": 1,
+        "first_match_visible": False,
+    }
+    evidence = {
+        "page_title": "Stats",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "id": f"f{index}",
+                        "type": "text",
+                        "selector_candidates": [field_candidate],
+                        "pointer_at_center": "reaches_other_element",
+                        "element_at_center": {"tag": "div", "label_context": "Promo banner"},
+                    }
+                    for index in range(100)
+                ]
+            }
+        ],
+        "key_value_relations": [{"value_text": "23.2k", "selector_candidates": [relation_candidate] * 40}],
+    }
+    bare_fields = [
+        {"id": f"f{index}", "type": "text", "selector_candidates": [{"selector": "input.nav", "source": "class"}]}
+        for index in range(100)
+    ]
+    tiers = {
+        "projected": evidence,
+        "read_counts": {
+            "page_title": "Stats",
+            "forms": [{"fields": bare_fields}],
+            "key_value_relations": [{"value_text": "23.2k", "selector_candidates": [relation_candidate] * 40}],
+        },
+        "without_counts": {
+            "page_title": "Stats",
+            "forms": [{"fields": bare_fields}],
+            "key_value_relations": [
+                {"value_text": "23.2k", "selector_candidates": [{"selector": "span.stat", "source": "class"}] * 40}
+            ],
+        },
+    }
+
+    def result(packet: dict[str, Any], padding: int) -> dict[str, Any]:
+        padded = {**packet, "visible_text_excerpt": "x" * padding}
+        if reader == "inspect_result":
+            return {"ok": True, "data": padded}
+        return {"ok": True, "data": {"workflow_run_id": "wr_1", "blocks": [], "post_run_page_evidence": padded}}
+
+    bound = _RECENT_TOOL_OUTPUT_CHAR_CAP - (_PAGE_STATE_RESERVE_CHARS if reader == "inspect_result" else 0)
+    padding = bound if fitting == "nothing" else bound - len(json.dumps(result(tiers[fitting], 0)))
+    captured = result(evidence, padding)
+
+    shaped = (
+        _model_facing_inspect_result(captured)
+        if reader == "inspect_result"
+        else sanitize_tool_result_for_llm("run_blocks_and_collect_debug", captured)
+    )
+
+    packet = shaped["data"] if reader == "inspect_result" else shaped["data"]["post_run_page_evidence"]
+    assert {key: value for key, value in packet.items() if key != "visible_text_excerpt"} == tiers[expected]
 
 
 def test_inspect_result_with_authoring_facts_fits_the_largest_page_state_stamp() -> None:
@@ -7550,59 +7671,68 @@ _TWO_PANEL_TABLE = (
 )
 
 
+async def _emitted_label_anchors(page: Page, html: str, total: str) -> dict[str, list[str]]:
+    """The label-anchored candidates each emitter produces for the Visitors total: page capture, HTML parse, probe."""
+    await page.set_content(html)
+    raw = await page.evaluate(composition_structured_evidence_expression(("Visitors",)))
+    live = parse_composition_structured(json.loads(raw), inspected_url="about:blank", current_url="about:blank")
+    probe = await page.evaluate(value_designation_probe_expression(total, "Visitors"))
+    parsed = parse_composition_html(
+        html, inspected_url="about:blank", current_url="about:blank", requested_targets=("Visitors",)
+    )
+    assert live is not None
+    return {
+        "live": [
+            candidate["selector"]
+            for relation in live["key_value_relations"]
+            if relation["key_text"] == "Visitors"
+            for candidate in relation["selector_candidates"]
+            if ":text-is(" in candidate["selector"]
+        ],
+        "parsed": [
+            candidate["selector"]
+            for relation in parsed["key_value_relations"]
+            if relation["key_text"] == "Visitors"
+            for candidate in relation["selector_candidates"]
+            if ":text-is(" in candidate["selector"]
+        ],
+        "probe": [
+            candidate["selector"] for candidate in probe["selector_candidates"] if ":text-is(" in candidate["selector"]
+        ],
+    }
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("panels", "total", "anchored"),
+    ("panels", "total", "label_shape"),
     [
-        (_TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header="Visitors"), "10.2K", True),
-        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_CARD.format(total="11.3K"), "11.3K", True),
-        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_ROW_CARD.format(total="11.3K"), "11.3K", True),
+        (_TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header="Visitors"), "10.2K", "span"),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_CARD.format(total="11.3K"), "11.3K", "span"),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_ROW_CARD.format(total="11.3K"), "11.3K", "span"),
         (
             _TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header='<span class="lbl">Visitors</span>'),
             "10.2K",
-            False,
+            None,
+        ),
+        (
+            _TWO_PANEL_CARD.format(total="10.2K")
+            + _TWO_PANEL_TABLE.format(header='<span class="legend">Visitors</span>'),
+            "10.2K",
+            "span.lbl",
         ),
     ],
-    ids=["original", "reordered", "row_with_delta", "header_shares_label_shape"],
+    ids=["original", "reordered", "row_with_delta", "header_shares_label_shape", "header_shares_label_tag"],
 )
 async def test_label_anchor_names_the_panel_whose_label_a_same_class_panel_repeats(
-    panels: str, total: str, anchored: bool
+    panels: str, total: str, label_shape: str | None
 ) -> None:
     html = f"<html><head><style>th{{text-transform:uppercase}}</style></head><body><main>{panels}</main></body></html>"
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         try:
             page = await browser.new_page()
-            await page.set_content(html)
-            raw = await page.evaluate(composition_structured_evidence_expression(("Visitors",)))
-            live = parse_composition_structured(json.loads(raw), inspected_url="about:blank", current_url="about:blank")
-            probe = await page.evaluate(value_designation_probe_expression(total, "Visitors"))
-            parsed = parse_composition_html(
-                html, inspected_url="about:blank", current_url="about:blank", requested_targets=("Visitors",)
-            )
-            assert live is not None
-            emitted = {
-                "live": [
-                    candidate["selector"]
-                    for relation in live["key_value_relations"]
-                    if relation["key_text"] == "Visitors"
-                    for candidate in relation["selector_candidates"]
-                    if ":text-is(" in candidate["selector"]
-                ],
-                "parsed": [
-                    candidate["selector"]
-                    for relation in parsed["key_value_relations"]
-                    if relation["key_text"] == "Visitors"
-                    for candidate in relation["selector_candidates"]
-                    if ":text-is(" in candidate["selector"]
-                ],
-                "probe": [
-                    candidate["selector"]
-                    for candidate in probe["selector_candidates"]
-                    if ":text-is(" in candidate["selector"]
-                ],
-            }
+            emitted = await _emitted_label_anchors(page, html, total)
             resolved = {
                 selector: (await page.locator(selector).count(), await page.locator(selector).first.inner_text())
                 for selectors in emitted.values()
@@ -7614,8 +7744,42 @@ async def test_label_anchor_names_the_panel_whose_label_a_same_class_panel_repea
     for selector, (count, text) in resolved.items():
         assert count == 1, f"{selector} resolves to {count} elements"
         assert total in text and "6,621" not in text, f"{selector} resolves to {text!r}"
-    if anchored:
+    if label_shape:
         assert len(emitted["live"]) == 1 and emitted["parsed"] == emitted["live"], emitted
+        assert emitted["live"][0].startswith(f'div.panel:has({label_shape}:text-is("Visitors"))'), emitted
         assert len(emitted["probe"]) == 1, emitted
     else:
         assert emitted["live"] == [] and emitted["parsed"] == [], emitted
+
+
+_DRIFT_CARD = (
+    '<div class="card"><div class="{classes}">Visitors</div><div class="text-2xl font-bold">{total}</div></div>'
+)
+_DRIFT_TABLE = '<div class="card"><table><thead><tr><th>Region</th><th>Visitors</th></tr></thead></table></div>'
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_label_anchor_resolves_after_the_label_class_set_changes() -> None:
+    def dashboard(classes: str) -> str:
+        cards = _DRIFT_CARD.format(classes=classes, total="10.2K") + _DRIFT_TABLE
+        return f"<html><body><main>{cards}</main></body></html>"
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            emitted = await _emitted_label_anchors(page, dashboard("text-sm font-medium"), "10.2K")
+            await page.set_content(dashboard("text-sm font-semibold"))
+            resolved = {
+                selector: (await page.locator(selector).count(), await page.locator(selector).first.inner_text())
+                for selectors in emitted.values()
+                for selector in selectors
+            }
+        finally:
+            await browser.close()
+
+    assert len(emitted["live"]) == 1 and emitted["parsed"] == emitted["live"], emitted
+    assert len(emitted["probe"]) == 1, emitted
+    for selector, (count, text) in resolved.items():
+        assert count == 1 and "10.2K" in text, f"{selector} resolves to {count} elements reading {text!r}"

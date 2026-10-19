@@ -420,7 +420,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
 
     webhook_statuses: list[WorkflowRunStatus] = []
 
-    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None) -> None:
+    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None, **_claim: object) -> None:
         webhook_statuses.append(workflow_run.status)
 
     monkeypatch.setattr(svc, "execute_workflow_webhook", record_webhook)
@@ -570,7 +570,7 @@ async def test_cancel_no_policy_run_deletes_attachments_before_webhook(
 ) -> None:
     workflow_run = _make_updated_row()
     workflow_run.workflow_run_id = "wr_no_policy_cancel"
-    workflow_run.status = WorkflowRunStatus.running
+    workflow_run.status = WorkflowRunStatus.queued
     canceled_run = _make_updated_row()
     canceled_run.workflow_run_id = workflow_run.workflow_run_id
     monkeypatch.setattr(

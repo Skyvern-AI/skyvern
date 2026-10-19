@@ -23,7 +23,11 @@ import { useLogging } from "@/hooks/useLogging";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { useManualSignInControl } from "@/store/useManualSignInStore";
+import {
+  useDemonstrationControl,
+  useManualSignInControl,
+} from "@/store/useManualSignInStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
@@ -245,6 +249,13 @@ function BrowserStream({
   useManualSignInControl(
     showControlButtons ? browserSessionId : undefined,
     setUserIsControlling,
+  );
+  const demonstrating = useRecordingLauncherStore(
+    (state) => state.demonstrationBrowserSessionId === browserSessionId,
+  );
+  const recordingDemonstration = useRecordingLauncherStore(
+    (state) =>
+      state.demonstrationRecordingBrowserSessionId === browserSessionId,
   );
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
@@ -791,12 +802,14 @@ function BrowserStream({
 
   // When control can no longer be offered (buttons hidden and not inherently
   // interactive), a prior grab must be released or its input keeps flowing.
-  // Recording is exempt: it holds take-control for exfiltration.
+  // Recording and demonstration modes hold control while their control buttons are hidden.
   useEffect(() => {
-    if (!interactive && !showControlButtons && !isRecording) {
+    if (!interactive && !showControlButtons && !isRecording && !demonstrating) {
       setUserIsControlling(false);
     }
-  }, [interactive, showControlButtons, isRecording]);
+  }, [interactive, showControlButtons, isRecording, demonstrating]);
+
+  useDemonstrationControl(recordingDemonstration, true, setUserIsControlling);
 
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
@@ -1044,7 +1057,7 @@ function BrowserStream({
                   })}
                 />
                 {/* Recording holds control for capture, so it offers no way to cede it. */}
-                {userIsControlling && !isRecording && (
+                {userIsControlling && !isRecording && !demonstrating && (
                   <StreamControlBar
                     onStop={() => setUserIsControlling(false)}
                     onPaste={pasteIntoVnc}
@@ -1062,7 +1075,7 @@ function BrowserStream({
               <div className="relative h-full w-full">
                 <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2">
                   <RecordingPill />
-                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Stop when you are ready, or discard from the recording menu.">
+                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Finish when you are ready, or discard from the demonstration menu.">
                     <div className="cursor-pointer text-red-500">
                       <InfoCircledIcon />
                     </div>

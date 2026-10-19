@@ -120,6 +120,7 @@ import {
   START_ANCHOR_MIN_ZOOM,
 } from "./paneFit";
 import { useBlockerExit } from "./useBlockerExit";
+import { changesIncludeWorkflowEdit } from "./workflowEditChanges";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
@@ -2727,7 +2728,7 @@ function FlowRenderer({
                     !readOnly &&
                     !isInitialLoadRef.current &&
                     internalUpdateCount === 0 &&
-                    hasStructuralChange
+                    changesIncludeWorkflowEdit(changes, nodes)
                   ) {
                     workflowChangesStore.setHasChanges(true);
                   }

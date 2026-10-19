@@ -6,8 +6,25 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.feedback import FeedbackEvent, RunFeedback, RunFeedbackRequest, RunFeedbackTargetType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 LOG = structlog.get_logger()
+
+
+async def _enforce_target_folder_access(
+    target_type: RunFeedbackTargetType, target_id: str, organization_id: str, action: str
+) -> None:
+    """Reading feedback needs read access to the target's workflow folder; submitting it needs write access."""
+    if target_type == "workflow_run":
+        resource: dict[str, object] = {"workflow_run_id": target_id}
+    elif target_type == "browser_recording":
+        recording = await app.DATABASE.browser_recordings.get_recording(target_id, organization_id)
+        if recording is None or recording.workflow_permanent_id is None:
+            return
+        resource = {"workflow_permanent_id": recording.workflow_permanent_id}
+    else:
+        resource = {"task_id": target_id}
+    await app.AGENT_FUNCTION.enforce_folder_access(get_request_principal(), action, resource)
 
 
 async def _resolve_target_context(
@@ -61,6 +78,8 @@ async def submit_run_feedback(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunFeedback | None:
     organization_id = current_org.organization_id
+    # Submitting writes feedback and notifies people, so a folder viewer cannot do it.
+    await _enforce_target_folder_access(request.target_type, request.target_id, organization_id, "workflow_run.update")
     context_id = await _resolve_target_context(request.target_type, request.target_id, organization_id)
     previous = await app.DATABASE.run_feedback.get_run_feedback(
         organization_id=organization_id, target_type=request.target_type, target_id=request.target_id
@@ -108,6 +127,7 @@ async def get_run_feedback(
     target_id: str = Query(..., min_length=1, max_length=128),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunFeedback | None:
+    await _enforce_target_folder_access(target_type, target_id, current_org.organization_id, "workflow_run.read")
     return await app.DATABASE.run_feedback.get_run_feedback(
         organization_id=current_org.organization_id, target_type=target_type, target_id=target_id
     )

@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Minimum seconds between the full gc.collect() runs after multi-viewport screenshot stitches, per
+    # process. Each run pauses every browser session on the event loop; 0 collects after every stitch.
+    SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS: float = 60.0
     # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
     # a run stops starting new steps against that browser. Sized so a healthy run — which lands
     # hundreds of successful operations per step, any one of which resets the count — cannot reach
@@ -285,6 +288,7 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    WORKFLOW_COPILOT_DEMONSTRATION_ENABLED: bool = False
     # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
     WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
@@ -302,6 +306,7 @@ class Settings(BaseSettings):
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
+    RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -432,11 +437,6 @@ class Settings(BaseSettings):
     # model keeps the click->labeled-draft latency low. Falls back to the default
     # LLM_API_HANDLER when the key is unset or not registered in this environment.
     RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
-    # A login that the same credential completed on the same workflow inside this window contradicts
-    # a credential-rejection verdict on a later run.
-    CREDENTIAL_VERDICT_LOGIN_HISTORY_HOURS: int = 24
-    # Additional login-block parameter keys that carry credential references as plain strings.
-    CREDENTIAL_VERDICT_HISTORY_PARAMETER_KEYS: list[str] = []
     # Server-side kill switch for delta interpretation updates. Deltas are also
     # gated per-connection on the client declaring support (begin-exfiltration
     # supports_interpretation_deltas); this only force-disables them everywhere.
@@ -1082,6 +1082,13 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    @field_validator("RUN_HEARTBEAT_TIMEOUT_MINUTES")
+    @classmethod
+    def _run_heartbeat_timeout_minutes_bounds(cls, value: int) -> int:
+        if value != 0 and not 2 <= value <= 1440:
+            raise ValueError("RUN_HEARTBEAT_TIMEOUT_MINUTES must be 0 (off) or between 2 and 1440 minutes")
+        return value
 
     @field_validator("API_LIMIT_CONCURRENCY", mode="before")
     @classmethod

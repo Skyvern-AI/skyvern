@@ -37,8 +37,6 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
@@ -247,21 +245,14 @@ export function BrowserPaneViewPills() {
 
 export function BrowserPaneActions() {
   const workflowPermanentId = useWorkflowPermanentId();
-  const compact = useStudioPaneCompact();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { debugBrowserSessionId: browserSessionId, liveSurface } =
     useBrowserPaneView();
-  const isRecording = useRecordingStore((s) => s.isRecording);
-  const startRecordingAtEnd = useRecordingLauncherStore(
-    (s) => s.startRecordingAtEnd,
-  );
   // These act on the debug browser; while the pane streams the run's own
-  // browser instead, they'd hit an invisible session. Record explains itself
-  // with a disabled tooltip; the ⋯ menu's session actions are hidden.
+  // browser instead, they'd hit an invisible session, so the ⋯ menu's session
+  // actions are hidden.
   const debugHidden = liveSurface === "run";
-  const blockedTitle =
-    "Showing the run's browser — debug browser controls come back after the run";
   const reload = useStudioBrowserStore((s) => s.reload);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const moreActionsRef = useRef<HTMLButtonElement>(null);
@@ -311,35 +302,6 @@ export function BrowserPaneActions() {
 
   return (
     <>
-      {!isRecording
-        ? (() => {
-            const disabled =
-              !browserSessionId || debugHidden || !startRecordingAtEnd;
-            const tooltip = debugHidden
-              ? blockedTitle
-              : startRecordingAtEnd
-                ? "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps."
-                : "Recording is available when the editor is ready";
-            return (
-              <ControlTooltip
-                content={<span className="block max-w-[260px]">{tooltip}</span>}
-                blocked={disabled}
-              >
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
-                  aria-label="Record task"
-                  disabled={disabled}
-                  onClick={() => startRecordingAtEnd?.()}
-                >
-                  <span className="h-2 w-2 rounded-full bg-red-500" />
-                  {compact ? null : "Record task"}
-                </Button>
-              </ControlTooltip>
-            );
-          })()
-        : null}
       {browserSessionId && !debugHidden ? (
         <DropdownMenu>
           <ControlTooltip content="More browser actions">

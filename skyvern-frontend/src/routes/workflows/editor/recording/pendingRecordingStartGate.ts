@@ -28,7 +28,7 @@ export const usePendingRecordingStartGate = create<{
   owner: null,
 }));
 
-// Every Record Browser entry point starts through here: processing refuses a
+// Every demonstration entry point starts through here: processing refuses a
 // recording while generated changes are pending, so asking afterwards would
 // waste the new demonstration.
 export function requestRecordingStart(

@@ -75,6 +75,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       lastHeaderHeight.current = undefined;
       const observer = new ResizeObserver(() => {
         const height = Math.round(el.offsetHeight);
+        // A header hidden with display:none measures 0, which is not a height:
+        // layout would fall back to its default margin.
+        if (height === 0) return;
         if (lastHeaderHeight.current !== height) {
           lastHeaderHeight.current = height;
           updateNodeData(id, { _headerHeight: height });

@@ -276,6 +276,53 @@ _JS_SELECTOR_CANDIDATES_HELPER = (
     "};"
 )
 
+_JS_SCOUT_PRE_ACTION_PACKET = (
+    "function scoutPreActionPacket(el, requested, parsedRole, parsedName, maxScanElements) {"
+    "  let roleName = parsedRole || parsedName ? { role: parsedRole, accessible_name: parsedName } : null;"
+    "  if (!roleName && el) {"
+    "    try {"
+    "      const r = text(el.getAttribute('role')) || implicitRole(el);"
+    "      const n = accessibleName(el, r);"
+    "      if (r || n) roleName = { role: r, accessible_name: n };"
+    "    } catch (e) { roleName = null; }"
+    "  }"
+    "  const targetRole = roleName ? roleName.role : '';"
+    "  const targetName = roleName ? roleName.accessible_name : '';"
+    "  let roleNameMatchCount = -1;"
+    "  if (targetRole && targetName &&"
+    "      (maxScanElements == null || document.getElementsByTagName('*').length <= maxScanElements)) {"
+    "    try {"
+    "      let count = 0;"
+    "      for (const node of document.querySelectorAll('*')) {"
+    "        const r = text(node.getAttribute('role')) || implicitRole(node);"
+    "        if (r !== targetRole) continue;"
+    "        if (accessibleName(node, r) === targetName) count++;"
+    "      }"
+    "      roleNameMatchCount = count;"
+    "    } catch (e) { roleNameMatchCount = -1; }"
+    "  }"
+    "  let selectorMatchCount = -1;"
+    "  try { selectorMatchCount = document.querySelectorAll(requested).length; }"
+    "  catch (e) { selectorMatchCount = -1; }"
+    "  let candidates = [];"
+    "  try { candidates = el ? collectCandidates(el, requested) : []; } catch (e) { candidates = []; }"
+    "  return { role_name: roleName, role_name_match_count: roleNameMatchCount,"
+    "    selector_match_count: selectorMatchCount, selector_candidates: candidates };"
+    "}"
+)
+
+
+def scout_pre_action_packet_js() -> str:
+    return (
+        _JS_TEXT_HELPER
+        + _JS_IS_EDITABLE_HELPER
+        + _JS_IMPLICIT_ROLE_HELPER
+        + _JS_NAME_FROM_CONTENT_ROLES
+        + _JS_ACCESSIBLE_NAME_HELPER
+        + _JS_SELECTOR_CANDIDATES_HELPER
+        + _JS_SCOUT_PRE_ACTION_PACKET
+    )
+
 
 def selector_candidates_expression(css_selector: str) -> str:
     """Return every bounded CSS identity observed for the selected source-page element.
@@ -315,50 +362,13 @@ def scout_pre_action_expression(css_selector: str, role: str | None = None, name
     parsed_name = json.dumps(name or "")
     return (
         "(() => {"
-        f"  {_JS_TEXT_HELPER}"
-        f"  {_JS_IS_EDITABLE_HELPER}"
-        f"  {_JS_IMPLICIT_ROLE_HELPER}"
-        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
-        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
-        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        f"  {scout_pre_action_packet_js()}"
         f"  const requested = {sel};"
         f"  const parsedRole = {parsed_role};"
         f"  const parsedName = {parsed_name};"
         "  let el = null;"
         "  try { el = document.querySelector(requested); } catch (e) { el = null; }"
-        "  let roleName = null;"
-        "  if (parsedRole || parsedName) roleName = { role: parsedRole, accessible_name: parsedName };"
-        "  else if (el) {"
-        "    try {"
-        "      const r = text(el.getAttribute('role')) || implicitRole(el);"
-        "      const n = accessibleName(el, r);"
-        "      if (r || n) roleName = { role: r, accessible_name: n };"
-        "    } catch (e) { roleName = null; }"
-        "  }"
-        "  const targetRole = roleName ? roleName.role : '';"
-        "  const targetName = roleName ? roleName.accessible_name : '';"
-        "  let roleNameMatchCount = -1;"
-        "  if (targetRole && targetName) {"
-        "    try {"
-        "      let count = 0;"
-        "      for (const node of document.querySelectorAll('*')) {"
-        "        const r = text(node.getAttribute('role')) || implicitRole(node);"
-        "        if (r !== targetRole) continue;"
-        "        if (accessibleName(node, r) === targetName) count++;"
-        "      }"
-        "      roleNameMatchCount = count;"
-        "    } catch (e) { roleNameMatchCount = -1; }"
-        "  }"
-        "  let selectorMatchCount = -1;"
-        "  try { selectorMatchCount = document.querySelectorAll(requested).length; } catch (e) { selectorMatchCount = -1; }"
-        "  let candidates = [];"
-        "  try { candidates = el ? collectCandidates(el, requested) : []; } catch (e) { candidates = []; }"
-        "  return {"
-        "    role_name: roleName,"
-        "    role_name_match_count: roleNameMatchCount,"
-        "    selector_match_count: selectorMatchCount,"
-        "    selector_candidates: candidates,"
-        "  };"
+        "  return scoutPreActionPacket(el, requested, parsedRole, parsedName);"
         "})()"
     )
 
@@ -540,13 +550,12 @@ const cssMatchesFor = (selector) => {
 // controls would otherwise rescan its N matches for every one of them.
 const elementVisibilityCache = new WeakMap();
 const visibleMatchCountCache = new WeakMap();
+const matchVisible = (el) => {
+  if (!elementVisibilityCache.has(el)) elementVisibilityCache.set(el, controlVisible(el));
+  return elementVisibilityCache.get(el);
+};
 const visibleMatchCount = (matches) => {
-  if (!visibleMatchCountCache.has(matches)) {
-    visibleMatchCountCache.set(matches, matches.filter((el) => {
-      if (!elementVisibilityCache.has(el)) elementVisibilityCache.set(el, controlVisible(el));
-      return elementVisibilityCache.get(el);
-    }).length);
-  }
+  if (!visibleMatchCountCache.has(matches)) visibleMatchCountCache.set(matches, matches.filter(matchVisible).length);
   return visibleMatchCountCache.get(matches);
 };
 const resolvesUniquely = (sel, el) => {
@@ -783,6 +792,9 @@ const selectorCandidatesFor = (
     const matches = cssMatchesFor(selector);
     const candidate = { selector: selector, source: source, match_count: matches === null ? null : matches.length };
     if (matches !== null) candidate.visible_match_count = visibleMatchCount(matches);
+    if (matches !== null && candidate.visible_match_count < matches.length) {
+      candidate.first_match_visible = matchVisible(matches[0]);
+    }
     candidates.push(candidate);
   };
   const id = attr(el, 'id');
@@ -846,30 +858,35 @@ const labelAnchorCandidateFor = (carrier, labelEl, label) => {
     anchor = anchor.parentElement;
   }
   const base = shapeSelector(anchor);
-  const labelShape = shapeSelector(labelEl);
   const inner = anchor === carrier ? '' : shapeSelector(carrier);
-  const selector = base + ':has(' + labelShape + ':text-is("' + cssAttr(label) + '"))' + (inner ? ' ' + inner : '');
-  if (selector.length > MAX_SELECTOR_CHARS) return null;
-  const anchors = new Set();
-  for (const root of openRoots()) {
-    let nodes; try { nodes = Array.from(root.querySelectorAll(labelShape)); } catch (e) { return null; }
-    for (const node of nodes) {
-      if (!ownTextRuns(node).includes(label)) continue;
-      for (let up = composedParent(node); up; up = composedParent(up)) if (up.matches && up.matches(base)) anchors.add(up);
-    }
-  }
-  let matched = Array.from(anchors);
-  if (inner) {
-    matched = [];
+  // A label's classes are styling that can differ between the scouted frame and a run, so they are named only
+  // where the bare tag would not leave this carrier as the single match.
+  for (const labelShape of new Set([(labelEl.tagName || '*').toLowerCase(), shapeSelector(labelEl)])) {
+    const selector = base + ':has(' + labelShape + ':text-is("' + cssAttr(label) + '"))' + (inner ? ' ' + inner : '');
+    if (selector.length > MAX_SELECTOR_CHARS) continue;
+    const anchors = new Set();
     for (const root of openRoots()) {
-      let nodes; try { nodes = Array.from(root.querySelectorAll(inner)); } catch (e) { return null; }
+      let nodes; try { nodes = Array.from(root.querySelectorAll(labelShape)); } catch (e) { return null; }
       for (const node of nodes) {
-        for (let up = composedParent(node); up; up = composedParent(up)) if (anchors.has(up)) { matched.push(node); break; }
+        if (!ownTextRuns(node).includes(label)) continue;
+        for (let up = composedParent(node); up; up = composedParent(up)) if (up.matches && up.matches(base)) anchors.add(up);
       }
     }
+    let matched = Array.from(anchors);
+    if (inner) {
+      matched = [];
+      for (const root of openRoots()) {
+        let nodes; try { nodes = Array.from(root.querySelectorAll(inner)); } catch (e) { return null; }
+        for (const node of nodes) {
+          for (let up = composedParent(node); up; up = composedParent(up)) if (anchors.has(up)) { matched.push(node); break; }
+        }
+      }
+    }
+    if (matched.length === 1 && matched[0] === carrier) {
+      return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([carrier]) };
+    }
   }
-  if (matched.length !== 1 || matched[0] !== carrier) return null;
-  return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([carrier]) };
+  return null;
 };
 // A relation's key can provide one additional factual representation. It is appended after the
 // generic capture so its presence does not reorder or privilege another source.
@@ -1745,6 +1762,7 @@ const boundedStructuredEvidence = (payload) => {
     delete value.pointer_at_center;
     delete value.element_at_center;
     delete value.visible_match_count;
+    delete value.first_match_visible;
     Object.values(value).forEach(dropAuthoringFacts);
   };
   dropAuthoringFacts(payload);

@@ -414,6 +414,7 @@ async def _run_combobox_input(
     is_location_input: bool = False,
     is_date_related: bool = False,
     is_secret: bool = False,
+    auto_completion_input: bool = False,
     prefilter_typeahead: bool = False,
     prefilter_raises: bool = False,
     use_base_action: bool = False,
@@ -423,6 +424,7 @@ async def _run_combobox_input(
     nonterminal_failure_skip: bool = False,
 ) -> tuple[list, MagicMock, MagicMock]:
     skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
+    skyvern_el.is_auto_completion_input = AsyncMock(return_value=auto_completion_input)
     if prefilter_raises:
         # Simulate the prefilter typing a prefix then raising mid-dispatch (field left dirty). Raise only on
         # the first call (the Block A prefilter); later calls succeed, so the rest of the flow runs normally.
@@ -514,6 +516,33 @@ async def _run_combobox_input(
 
 
 _INVALID_BOTH = {"role": "combobox", "aria-autocomplete": "both", "aria-invalid": "true"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attrs", "auto_completion_input", "is_location_input"),
+    [
+        ({"class": "autocomplete-input"}, True, False),
+        ({}, False, True),
+    ],
+)
+async def test_production_routes_queryable_inputs_through_candidate_fallback(
+    attrs: dict[str, object], auto_completion_input: bool, is_location_input: bool
+) -> None:
+    route = AsyncMock(return_value=ActionSuccess())
+    with patch("skyvern.webeye.actions.handler.input_or_auto_complete_input", new=route):
+        results, _element, _select = await _run_combobox_input(
+            attrs=attrs,
+            options=[],
+            select_success=False,
+            stop_flag=False,
+            is_location_input=is_location_input,
+            auto_completion_input=auto_completion_input,
+            first_block_incremental=[],
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    route.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 ---
 title: MCP and coding agents
-subtitle: Give Claude Code, Cursor, Codex and other AI clients a real browser
-description: Connect Skyvern's hosted MCP server to Claude Code, Cursor, Codex, Claude Desktop, ChatGPT, Windsurf and other clients with browser sign-in or an API key, run it locally over stdio, or give coding agents the Skyvern skill and CLI.
+subtitle: Give Claude Code, Cursor, Codex, Grok Build and other AI clients a real browser
+description: Connect Skyvern's hosted MCP server to Claude Code, Cursor, Codex, Grok Build, Claude Desktop, ChatGPT, Windsurf and other clients with browser sign-in or an API key, run it locally over stdio, or give coding agents the Skyvern skill and CLI.
 slug: developers/getting-started/mcp
 keywords:
   - MCP
@@ -12,6 +12,7 @@ keywords:
   - Codex
   - ChatGPT
   - Windsurf
+  - Grok Build
   - Hermes
   - OpenClaw
   - OAuth
@@ -42,7 +43,7 @@ The sections below show the same setups.
 
 ## Sign in with your browser (OAuth)
 
-Use this for Claude Code, Cursor, Codex CLI, ChatGPT and Claude custom connectors. There is no API key in the config. The client opens your browser, you sign in to Skyvern, and the client stores the token.
+Use this for Claude Code, Cursor, Codex CLI, Grok Build, ChatGPT and Claude custom connectors. There is no API key in the config. The client opens your browser, you sign in to Skyvern, and the client stores the token.
 
 <Tabs>
 <Tab title="Claude Code">
@@ -93,6 +94,21 @@ codex mcp add skyvern --url https://api.skyvern.com/mcp/ --oauth-resource https:
 ```
 
 If Skyvern already has an `x-api-key` header, run `codex mcp remove skyvern` first.
+
+</Tab>
+<Tab title="Grok Build">
+
+Install the Skyvern plugin from the Grok Build marketplace. In [Grok Build](https://docs.x.ai/build/overview), run `/marketplace`, search for **skyvern** and press `i`. Or from a terminal:
+
+```bash
+grok plugin install skyvern --trust
+```
+
+Open `/mcps` in Grok, select **skyvern**, and sign in with your Skyvern account in the browser.
+
+The plugin connects the `browser` scope (`https://api.skyvern.com/mcp/x/browser`), so it has no `skyvern_run_task`, `skyvern_extract`, `skyvern_validate`, agent or credential tools. For every tool, change the `url` in the installed plugin's `.mcp.json` to `https://api.skyvern.com/mcp/`. A plugin update may undo that edit. See [Limit the tool list with scopes](#limit-the-tool-list-with-scopes).
+
+Grok Build also loads MCP servers from `~/.claude.json`, `.cursor/mcp.json` and the project's `.mcp.json`. If one of them already defines a server named `skyvern`, Grok may use that one instead. Run `grok mcp doctor skyvern` to see which URL is in use, and rename or remove the other entry to use the plugin's.
 
 </Tab>
 <Tab title="ChatGPT">

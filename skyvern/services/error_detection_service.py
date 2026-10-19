@@ -21,7 +21,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.services.action_service import get_action_history
-from skyvern.services.credential_verdict_service import CredentialVerdictContext, confirm_credential_verdicts
 from skyvern.webeye.actions.handler import extract_user_defined_errors
 from skyvern.webeye.browser_state import BrowserState
 
@@ -264,17 +263,7 @@ async def _detect_errors_from_context(
             errors=[e.error_code for e in user_defined_errors],
         )
 
-        # No page and no screenshots here, so a credential-rejection verdict from this path rests on
-        # the agent's own notes. The confirmation gate is told exactly that.
-        return await confirm_credential_verdicts(
-            task=task,
-            step=step,
-            errors=user_defined_errors,
-            context=CredentialVerdictContext(
-                action_history=json.dumps(action_history),
-                agent_reasoning=failure_reason,
-            ),
-        )
+        return user_defined_errors
 
     except Exception:
         LOG.warning(

@@ -27,6 +27,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import google_gmail_service, google_oauth_service, org_auth_service
 from skyvern.forge.sdk.services.google_oauth_service import InvalidAppOriginError
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_email_address
 
@@ -132,6 +133,7 @@ async def google_oauth_authorize(
     request: CreateGoogleOAuthAuthorizeRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.authorize"}))),
 ) -> GoogleOAuthAuthorizeResponse:
     """Kick off the Google OAuth 2.0 authorization flow."""
     try:
@@ -169,6 +171,7 @@ async def google_oauth_callback(
     request: CreateGoogleOAuthCallbackRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.callback"}))),
 ) -> GoogleOAuthCredentialResponse:
     """Handle the Google OAuth 2.0 authorization callback."""
     context = await google_oauth_service.load_pending_consent_context(
@@ -355,6 +358,7 @@ async def google_oauth_callback(
 @google_oauth_router.get("/oauth/config")
 async def get_google_oauth_client_config(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.read"}))),
 ) -> GoogleOAuthClientConfigResponse:
     """Return the effective Google OAuth client configuration without the client secret."""
     _require_organization_client_config_enabled()
@@ -369,6 +373,7 @@ async def get_google_oauth_client_config(
 async def update_google_oauth_client_config(
     request: UpdateGoogleOAuthClientConfigRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.update"}))),
 ) -> GoogleOAuthClientConfigResponse:
     """Store an organization-level Google OAuth client configuration."""
     _require_organization_client_config_enabled()
@@ -430,6 +435,7 @@ async def update_google_oauth_client_config(
 @google_oauth_router.delete("/oauth/config")
 async def delete_google_oauth_client_config(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.delete"}))),
 ) -> dict[str, bool]:
     """Clear the organization-level Google OAuth client config and fall back to environment config."""
     _require_organization_client_config_enabled()
@@ -475,6 +481,7 @@ async def rename_google_oauth_credential(
     credential_id: str,
     request: UpdateGoogleOAuthCredentialRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.update"}))),
 ) -> GoogleOAuthCredentialResponse:
     """Renames an existing Google OAuth credential for the specified organization"""
     updated = await google_oauth_service.rename_credential(
@@ -500,6 +507,7 @@ async def rename_google_oauth_credential(
 async def delete_google_oauth_credential(
     credential_id: str,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.delete"}))),
 ) -> dict[str, bool]:
     """Deletes a specific Google OAuth credential associated with an organization"""
     revoked = await google_oauth_service.revoke_credential(

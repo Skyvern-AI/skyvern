@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     INTERNAL_VALIDATION_FAILURE_PREFIX,
+    fit_authoring_facts,
     model_visible_composition_evidence,
 )
 from skyvern.forge.sdk.copilot.context import (
@@ -1642,8 +1643,15 @@ def _fit_post_run_page_evidence(result: dict[str, Any]) -> None:
     packet = data.get("post_run_page_evidence") if isinstance(data, dict) else None
     if not isinstance(data, dict) or not isinstance(packet, dict):
         return
-    if len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
-        data["post_run_page_evidence"] = model_visible_composition_evidence(packet)
+    if len(json.dumps(result)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        return
+
+    def fits(candidate: dict[str, Any]) -> bool:
+        return len(json.dumps({**result, "data": {**data, "post_run_page_evidence": candidate}})) <= (
+            _RECENT_TOOL_OUTPUT_CHAR_CAP
+        )
+
+    data["post_run_page_evidence"] = fit_authoring_facts(packet, model_visible_composition_evidence(packet), fits)
 
 
 def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 CredentialUrlTier = Literal["url_exact", "url_path", "url_host"]
 CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole"]
@@ -32,15 +33,54 @@ class CredentialResolution:
         return any(candidate.credential_id == credential_id for candidate in self.candidates)
 
 
-async def load_credentials(organization_id: str) -> list[Credential]:
+async def credential_folder_ids_for_current_request() -> set[str] | None:
+    principal = get_request_principal()
+    return await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+
+
+async def load_credentials(
+    organization_id: str,
+    *,
+    credential_ids: Sequence[str] | None = None,
+    page: int | None = None,
+    page_size: int = 50,
+    include_deleted: bool = False,
+) -> list[Credential]:
+    allowed_folder_ids = await credential_folder_ids_for_current_request()
+    if credential_ids is not None:
+        return await app.DATABASE.credentials.get_credentials_by_ids(
+            list(credential_ids),
+            organization_id=organization_id,
+            allowed_folder_ids=allowed_folder_ids,
+            include_deleted=include_deleted,
+        )
+    if page is not None:
+        return await app.DATABASE.credentials.get_credentials(
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            allowed_folder_ids=allowed_folder_ids,
+        )
+
     page = 1
     credentials: list[Credential] = []
     while True:
-        items = await app.DATABASE.credentials.get_credentials(organization_id=organization_id, page=page, page_size=50)
+        items = await app.DATABASE.credentials.get_credentials(
+            organization_id=organization_id,
+            page=page,
+            page_size=50,
+            allowed_folder_ids=allowed_folder_ids,
+        )
         credentials.extend(items)
         if len(items) < 50:
             return sorted(credentials, key=lambda c: getattr(c, "created_at", None) or "", reverse=True)
         page += 1
+
+
+async def count_visible_credentials(organization_id: str) -> int:
+    return await app.DATABASE.credentials.count_credentials(
+        organization_id, allowed_folder_ids=await credential_folder_ids_for_current_request()
+    )
 
 
 def _parse_url(url: str) -> ParseResult | None:

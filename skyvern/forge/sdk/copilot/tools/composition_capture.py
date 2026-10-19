@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_KEY_VALUE_RELATIONS,
     CONSENT_OBSTRUCTION_KIND,
+    fit_authoring_facts,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
@@ -67,6 +68,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
@@ -167,11 +169,17 @@ def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentCo
     shaped = copy.deepcopy(result)
     data = shaped.get("data")
     if isinstance(data, dict):
-        for authoring_facts in (True, False):
-            shaped["data"] = model_visible_composition_evidence(data, authoring_facts=authoring_facts)
-            _attach_field_upload_routes(shaped["data"], upload_routes_for(copilot_ctx))
-            if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS:
-                break
+        upload_routes = upload_routes_for(copilot_ctx)
+        projected, bare = (model_visible_composition_evidence(data, authoring_facts=facts) for facts in (True, False))
+        for packet in (projected, bare):
+            _attach_field_upload_routes(packet, upload_routes)
+
+        def fits(packet: dict[str, Any]) -> bool:
+            return (
+                len(json.dumps({**shaped, "data": packet})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS
+            )
+
+        shaped["data"] = fit_authoring_facts(projected, bare, fits)
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")
@@ -422,6 +430,7 @@ async def _composition_capture_visual_summary(
             dispatch_browser_session_id=capture_session_id,
             producer_browser_session_id=producer_session_id,
             session_binding=session_binding,
+            viewport_css_px=screenshot_viewport_css_px(screenshot_result),
         )
         if screenshot_b64
         else None
@@ -1488,6 +1497,7 @@ async def _inspect_page_for_composition_under_custody(
                 dispatch_browser_session_id=visual_fallback_frame.dispatch_browser_session_id,
                 producer_browser_session_id=visual_fallback_frame.producer_browser_session_id,
                 session_binding=visual_fallback_frame.session_binding,
+                viewport_css_px=visual_fallback_frame.viewport_css_px,
             ),
             captured_at=visual_fallback_frame.captured_at,
         )

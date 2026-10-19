@@ -75,6 +75,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     browser_session_turn,
     close_browser_session_quietly,
     current_call_browser_session_override,
+    current_demonstrated_action,
     effective_browser_session_id,
     ensure_browser_session,
     mcp_browser_context,
@@ -87,6 +88,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     capturing_tool_call,
     enqueue_screenshot_from_result,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     encoded_secret_variants,
@@ -1832,17 +1834,20 @@ class SkyvernOverlayMCPServer(MCPServer):
         propagated_error: BaseException
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
+        demonstrated_action = current_demonstrated_action()
         # Bound out here so one call's browser reaches everything it touches: pre-hooks, session
         # preparation, dispatch and post-hooks. Binding only the dispatch would collect evidence
         # from one browser, act in another, then record the result from the first.
         # Resolved once. A sibling call in the same turn can record or clear the run session, so
         # resolving again for dispatch could bind the hooks to one browser and the dispatch to another.
         call_binding = (
-            resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None
+            (resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None)
+            if demonstrated_action is None
+            else None
         )
         owning_call_id = (meta or {}).get(_TOOL_CALL_ID_META_KEY)
         try:
-            if overlay.requires_browser:
+            if overlay.requires_browser and demonstrated_action is None:
                 async with browser_session_turn(
                     copilot_ctx, session_id=call_binding.session_id_for(copilot_ctx) if call_binding else None
                 ):
@@ -1891,6 +1896,71 @@ class SkyvernOverlayMCPServer(MCPServer):
         mcp_name = self._alias_map.get(tool_name, tool_name)
         if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
             raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
+        held_failures = HeldRequestFailures()
+        demonstrated_action = current_demonstrated_action()
+        if demonstrated_action is not None:
+            existing_interactions = {id(item) for item in copilot_ctx.scouted_interactions}
+            existing_trajectory = {id(item) for item in copilot_ctx.scout_trajectory}
+
+            def stamp_user_actor() -> None:
+                for item in copilot_ctx.scouted_interactions:
+                    if id(item) not in existing_interactions:
+                        item["actor"] = "user"
+                for item in copilot_ctx.scout_trajectory:
+                    if id(item) not in existing_trajectory:
+                        item["actor"] = "user"
+
+            if overlay.pre_hook is not None:
+                refusal = await overlay.pre_hook(arguments, copilot_ctx)
+                if refusal is not None:
+                    LOG.info("copilot_demonstration_replay_refused", tool=tool_name)
+                    stamp_user_actor()
+                    projected_refusal = scrub_model_facing_tool_result(copilot_ctx, refusal, tool_name=mcp_name)
+                    projected_refusal = _scrub_stamped_tool_result(
+                        copilot_ctx, held_failures, projected_refusal, tool_name=mcp_name
+                    )
+                    record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, projected_refusal)
+                    return _copilot_to_call_tool_result(projected_refusal, tool_name)
+
+            raw_mcp = scrub_model_facing_tool_result(
+                copilot_ctx,
+                deepcopy(demonstrated_action.synthesized_result),
+                tool_name=mcp_name,
+            )
+            copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
+            if overlay.post_hook is not None:
+                async with browser_evidence_commit_lock(copilot_ctx):
+                    base_copilot_result = deepcopy(copilot_result)
+                    ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                    held_token = POST_HOOK_HELD_REQUEST_FAILURES.set(held_failures)
+                    try:
+                        copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+                    except asyncio.CancelledError:
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        raise
+                    except Exception:  # noqa: BLE001
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        copilot_result = (
+                            {
+                                "ok": False,
+                                "error": f"{tool_name} result could not be prepared for display and is withheld.",
+                            }
+                            if overlay.post_hook_fails_closed
+                            else base_copilot_result
+                        )
+                    finally:
+                        POST_HOOK_HELD_REQUEST_FAILURES.reset(held_token)
+            stamp_user_actor()
+            copilot_result = _scrub_stamped_tool_result(copilot_ctx, held_failures, copilot_result, tool_name=mcp_name)
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
+            held_failures.release()
+            return _copilot_to_call_tool_result(copilot_result, tool_name)
+
         observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
         attempt_browser_session_id = current_call_browser_session_override() or getattr(
             copilot_ctx, "browser_session_id", None
@@ -1901,8 +1971,6 @@ class SkyvernOverlayMCPServer(MCPServer):
 
         if binding is None:
             binding = resolve_browser_session_binding(copilot_ctx, arguments or {})
-
-        held_failures = HeldRequestFailures()
 
         async def _stamp_page_state(result: dict[str, Any], *, probe: bool = True) -> None:
             reader = self._page_state_reader
@@ -2236,6 +2304,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         if isinstance(workflow_run_id, str) and workflow_run_id
                         else None,
                         action_relation=ScreenshotActionRelation.TOOL_RESULT,
+                        viewport_css_px=screenshot_viewport_css_px(copilot_result),
                     ),
                 )
 
@@ -2522,6 +2591,22 @@ class SkyvernOverlayMCPServer(MCPServer):
         call_session_override = current_call_browser_session_override()
         attempt_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
         uses_shared_browser_outcome = mcp_tool_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        if current_demonstrated_action() is not None:
+            result = {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=copilot_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
         dispatch_started = False
         if not self._client:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "not_connected")

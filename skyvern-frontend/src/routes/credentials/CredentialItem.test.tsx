@@ -240,3 +240,21 @@ describe("CredentialItem saved browser session", () => {
     ).toBeGreaterThan(0);
   });
 });
+
+describe("CredentialItem 1Password metadata", () => {
+  it("shows the 1Password badge and missing-upstream note", () => {
+    render(
+      <CredentialItem
+        credential={makePasswordCredential({
+          vault_type: "onepassword",
+          vault_id: "vault-1",
+          item_id: "item-1",
+          upstream_missing_at: "2026-10-18T12:00:00Z",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("1Password")).toBeTruthy();
+    expect(screen.getByText("missing in 1Password")).toBeTruthy();
+  });
+});

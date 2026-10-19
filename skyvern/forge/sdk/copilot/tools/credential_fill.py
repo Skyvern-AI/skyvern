@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    DemonstrationNavigationSiteURLSource,
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
@@ -82,6 +83,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
@@ -284,7 +286,10 @@ async def _credential_evidence_admits_origin(
     """Whether the credential itself places it on the recovery origin, and nowhere else."""
     if credential.credential_id == recovery.refused_credential_id:
         return False
-    vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
+    try:
+        vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
+    except PermissionError:
+        return False
     if vault_sites is None:
         return False
     evidence = ([credential.tested_url] if credential.tested_url else []) + vault_sites
@@ -398,6 +403,11 @@ async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> l
 
 async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str] | None:
     """Sites the credential's own vault entry names (only Bitwarden items carry any), or None when the read failed."""
+    await app.AGENT_FUNCTION.enforce_credential_use(
+        copilot_ctx.organization_id,
+        credential_id,
+        principal=get_request_principal(),
+    )
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
         return cached
@@ -454,6 +464,8 @@ def _log_fill_grant(
         source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
     elif isinstance(source, SteerMessageSiteURLSource):
         source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
+    elif isinstance(source, DemonstrationNavigationSiteURLSource):
+        source_fields = {"source_kind": source.kind}
     LOG.info(
         "copilot credential fill grant",
         route=route,
@@ -1038,6 +1050,14 @@ async def _load_vault_credential_item(
     copilot_ctx: AgentContext, credential_id: str
 ) -> tuple[CredentialItem | None, str]:
     try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            copilot_ctx.organization_id,
+            credential_id,
+            principal=get_request_principal(),
+        )
+    except PermissionError:
+        return None, "Credential not accessible."
+    try:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=copilot_ctx.organization_id
         )
@@ -1328,7 +1348,7 @@ async def _submit_after_credential_fill(
     )
 
 
-async def _fill_credential_field_impl(
+async def fill_credential_field(
     copilot_ctx: AgentContext,
     selector: str,
     credential_id: str,
@@ -1375,7 +1395,10 @@ async def _fill_credential_field_impl_serial(
                 "error": f"fill_credential_field `field` must be one of: {', '.join(CREDENTIAL_FILL_FIELD_NAMES)}.",
             }
         )
-    origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    try:
+        origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    except PermissionError:
+        return finish({"ok": False, "error": "Credential not accessible."})
     if policy_error or origin_grant is None:
         LOG.info(
             "copilot fill_credential_field rejected tool-side",

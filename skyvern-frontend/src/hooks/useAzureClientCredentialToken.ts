@@ -7,16 +7,19 @@ import {
   CreateAzureClientSecretCredentialRequest,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useHasCapability } from "@/store/PageSlots";
 import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useAzureClientCredentialToken() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canReadConfig = useHasCapability("vault_provider.read");
 
   const { data: azureOrganizationAuthToken, isLoading } =
     useQuery<AzureOrganizationAuthToken | null>({
       queryKey: ["azureOrganizationAuthToken"],
+      enabled: canReadConfig,
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
         return await client
@@ -66,8 +69,11 @@ export function useAzureClientCredentialToken() {
   });
 
   return {
-    azureOrganizationAuthToken,
-    isLoading,
+    azureOrganizationAuthToken: canReadConfig
+      ? azureOrganizationAuthToken
+      : undefined,
+    isLoading: canReadConfig && isLoading,
+    canReadConfig,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
     clearCredential: clearCredentialMutation.mutate,

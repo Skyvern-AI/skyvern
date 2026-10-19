@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "1.0.55",
+    "version": "1.0.56",
     "private": false,
     "repository": {
         "type": "git",
@@ -81,7 +81,8 @@
             "rollup": "^4.59.0",
             "serialize-javascript": "^7.0.3",
             "fast-uri": "^3.1.7",
-            "source-map-js": "^1.2.2"
+            "source-map-js": "^1.2.2",
+            "ajv": "^8.18.0"
         }
     }
 }

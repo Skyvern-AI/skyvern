@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import functools
+import io
 import json
+import math
 import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import structlog
@@ -19,10 +23,13 @@ from agents.memory.session import Session
 from agents.run import Runner
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
+from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
+from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiredReplyObservation,
     BudgetExpirySource,
@@ -60,7 +67,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_TOKEN_BUDGET,
     CopilotConfig,
 )
-from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME
+from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
@@ -102,7 +109,11 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    CarriesPendingScreenshots,
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+)
 from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -140,6 +151,8 @@ LOG = structlog.get_logger()
 
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
+ToolT = TypeVar("ToolT", bound=Tool)
+BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # A turn whose budget is already spent may have no backstop time left for its one final reply, so
 # that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.
@@ -178,10 +191,7 @@ _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
-# OpenAI detail=high cost per resized image. If we support other providers,
-# pull from model config — this value will silently over/undercount otherwise.
-# See screenshot_utils.resize_screenshot_b64 for the dimension contract this
-# token count assumes.
+# Charged for an image whose pixel size cannot be read.
 TOKENS_PER_RESIZED_IMAGE = 765
 
 # Keep the last N function_call_output items at full (head-truncated) size.
@@ -354,21 +364,14 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
-    elapsed = _elapsed_run_seconds(ctx, start_time)
-    if elapsed >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-
-
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
-    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+    """Record a cancellation raised at a model-call boundary; the turn deadline never arrives as a cancellation.
 
     Synchronous and never raising, so the caller's ``raise`` re-raises the original
     cancellation neither masked nor delayed.
     """
     try:
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
         ctx.copilot_turn_cancelled_iteration = iteration
         LOG.warning(
             "copilot_turn_cancelled",
@@ -481,7 +484,13 @@ def _same_page(left: str | None, right: str | None) -> bool:
     return left_path == right_path
 
 
-def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
+def pending_screenshot_entry(ctx: object) -> ScreenshotEntry | None:
+    if not isinstance(ctx, CarriesPendingScreenshots) or not ctx.pending_screenshots:
+        return None
+    return ctx.pending_screenshots[0]
+
+
+def pending_screenshot_message(ctx: Any, *, sharp: bool = False) -> dict[str, Any] | None:
     """Build the synthetic user message for the staged frame without draining it.
 
     Tool results stay text-only because OpenAI rejects images in tool
@@ -495,8 +504,12 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
+    images = [
+        (entry.sharp_b64, entry.sharp_px) if sharp and entry.sharp_b64 else (entry.b64, entry.image_px)
+        for entry in screenshots
+    ]
     provenance_lines: list[str] = []
-    for entry in screenshots:
+    for entry, (_, image_px) in zip(screenshots, images):
         provenance = entry.provenance
         fields = {
             "capture_id": entry.capture_id,
@@ -512,6 +525,8 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "session_binding": provenance.session_binding.value,
             "workflow_run_id": provenance.workflow_run_id or "unavailable",
             "action_relation": provenance.action_relation.value,
+            "image_px": _px(image_px),
+            "viewport_css_px": _px(provenance.viewport_css_px),
         }
         rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
         relation = (
@@ -533,15 +548,19 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
-    for entry in screenshots:
+    for entry, (b64, _) in zip(screenshots, images):
         content.append(
             {
                 "type": "input_image",
-                "image_url": f"data:{entry.mime};base64,{entry.b64}",
+                "image_url": f"data:{entry.mime};base64,{b64}",
                 "detail": "high",
             }
         )
     return {"role": "user", "content": content}
+
+
+def _px(size: tuple[int, int] | None) -> str:
+    return f"{size[0]}x{size[1]}" if size else "unavailable"
 
 
 def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
@@ -1115,32 +1134,49 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     return result
 
 
+@functools.lru_cache(maxsize=16)
+def _image_tokens(image_url: str) -> int:
+    """OpenAI's patch formula x 1.2, which matched terra's billing at 1024x576 (692) and 1600x900 (1,741).
+    `skyvern.utils.image_token_estimator` uses 1.0 for gpt-5.x and needs a model name, which this budget check lacks.
+    """
+    _, _, encoded = image_url.partition(";base64,")
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+            width, height = image.size
+    except Exception:
+        return TOKENS_PER_RESIZED_IMAGE
+    return math.floor(1.2 * math.ceil(width / 32) * math.ceil(height / 32)) + 1
+
+
 def _sanitize_for_token_estimation(value: Any) -> tuple[Any, int]:
     """Build a sanitized copy of *value*, replacing base64 image data with
     a short placeholder so blobs don't inflate the token count.
 
-    Returns ``(sanitized_value, image_count)``.
+    Returns ``(sanitized_value, image_tokens)``.
     """
     if isinstance(value, dict):
         is_image = value.get("type") == "input_image"
         sanitized: dict[str, Any] = {}
-        image_count = 1 if is_image else 0
+        image_tokens = 0
+        if is_image:
+            image_url = value.get("image_url")
+            image_tokens = _image_tokens(image_url) if isinstance(image_url, str) else TOKENS_PER_RESIZED_IMAGE
         for key, child in value.items():
             if is_image and key == "image_url":
                 sanitized[key] = "[image]"
                 continue
-            sanitized_child, child_images = _sanitize_for_token_estimation(child)
+            sanitized_child, child_tokens = _sanitize_for_token_estimation(child)
             sanitized[key] = sanitized_child
-            image_count += child_images
-        return sanitized, image_count
+            image_tokens += child_tokens
+        return sanitized, image_tokens
     if isinstance(value, list):
         sanitized_list: list[Any] = []
-        image_count = 0
+        image_tokens = 0
         for item in value:
-            sanitized_item, item_images = _sanitize_for_token_estimation(item)
+            sanitized_item, item_tokens = _sanitize_for_token_estimation(item)
             sanitized_list.append(sanitized_item)
-            image_count += item_images
-        return sanitized_list, image_count
+            image_tokens += item_tokens
+        return sanitized_list, image_tokens
     return value, 0
 
 
@@ -1148,9 +1184,9 @@ def estimate_tokens(items: list[Any]) -> int:
     """Token estimate for an input list using tiktoken."""
     if not items:
         return 0
-    sanitized, image_count = _sanitize_for_token_estimation(items)
+    sanitized, image_tokens = _sanitize_for_token_estimation(items)
     text = json.dumps(sanitized, separators=(",", ":"), ensure_ascii=False, default=str)
-    return count_tokens(text) + image_count * TOKENS_PER_RESIZED_IMAGE
+    return count_tokens(text) + image_tokens
 
 
 _AGGRESSIVE_PRUNE_TAIL = 7
@@ -1404,18 +1440,15 @@ async def _run_streamed_with_deadline(
     return result
 
 
-async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
-    """Results by call id when the response in progress names a tool the request did not offer, else None.
+def budget_drain_tools(tools: Sequence[ToolT]) -> list[ToolT]:
+    return [tool for tool in tools if tool.name not in BUDGET_DRAIN_EXCLUDED_TOOLS]
+
+
+def unrun_call_outputs(calls: Sequence[ResponseFunctionToolCall], offered: set[str]) -> dict[str, str] | None:
+    """Results by call id when a response names a tool the request did not offer, else None.
     The SDK rejects such a response before running any of its calls, so every call gets a result."""
-    response = ctx.last_model_response
-    if response is None:
+    if all(call.name in offered for call in calls):
         return None
-    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
-    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
-    unknown = sorted({call.name for call in calls if call.name not in offered})
-    if not unknown:
-        return None
-    LOG.warning("copilot_unknown_tool_call", tool_names=unknown, call_count=len(calls))
     return {
         call.call_id: json.dumps(
             {
@@ -1429,6 +1462,22 @@ async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, st
         )
         for call in calls
     }
+
+
+async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
+    response = ctx.last_model_response
+    if response is None:
+        return None
+    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
+    outputs = unrun_call_outputs(calls, offered)
+    if outputs is not None:
+        LOG.warning(
+            "copilot_unknown_tool_call",
+            tool_names=sorted({call.name for call in calls if call.name not in offered}),
+            call_count=len(calls),
+        )
+    return outputs
 
 
 async def _save_unrun_call_results(
@@ -1543,7 +1592,7 @@ async def _run_budget_drain(
     )
     try:
         result = await _run_drain(
-            agent,
+            agent.clone(tools=budget_drain_tools(agent.tools)),
             observation,
             ctx,
             session,
@@ -2118,10 +2167,16 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
+    # A retry after a failed drain would otherwise restart the full tool set.
+    if ctx.budget_expiry_state.drain_attempted:
+        raise MaxTurnsExceeded("Budget drain already attempted")
     session = runner_kwargs.pop("session", None)
     copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
+    token_budget = runner_kwargs.pop("token_budget", None) or copilot_config.token_budget or TOKEN_BUDGET
     current_input: str | list = initial_input
-    start_time = time.monotonic()
+    # A fallback or model-lookup retry resumes the turn's clock, so the turn keeps one deadline and one backstop.
+    resumed = ctx.copilot_run_start_monotonic is not None
+    start_time = ctx.copilot_run_start_monotonic if resumed else time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
     install_pending_operation_slot(ctx)
     iteration = 0
@@ -2134,7 +2189,7 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
+        if (iteration > 0 or resumed) and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             return await _run_budget_drain(
                 agent,
@@ -2153,11 +2208,11 @@ async def run_with_enforcement(
         if isinstance(current_input, list):
             est = estimate_tokens(current_input)
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
-            if est > copilot_config.token_budget:
+            if est > token_budget:
                 LOG.warning(
                     "Token estimate exceeds budget, aggressively pruning",
                     tokens=est,
-                    budget=copilot_config.token_budget,
+                    budget=token_budget,
                 )
                 current_input = aggressive_prune(current_input)
 
@@ -2352,9 +2407,16 @@ async def run_with_enforcement(
 
         # OpenAI rejects images in tool messages, so a queued post-run
         # screenshot rides as its own user message just before the nudge.
+        entry = pending_screenshot_entry(ctx)
         screenshot_msg = _consume_pending_screenshots(ctx)
         if screenshot_msg is not None:
-            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
+            LOG.info(
+                "Injecting screenshot user message",
+                count=len(screenshot_msg["content"]) - 1,
+                source_tool=entry.provenance.source_tool if entry else None,
+                capture_id=entry.capture_id if entry else None,
+                capture_event_id=entry.capture_event_id if entry else None,
+            )
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
             extra_msgs = _assemble_enforcement_messages(screenshot_msg, decision.message)

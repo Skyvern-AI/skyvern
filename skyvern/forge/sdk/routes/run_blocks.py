@@ -9,6 +9,7 @@ from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
+from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.routes.code_samples import (
     DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
     DOWNLOAD_FILES_CODE_SAMPLE_TS,
@@ -298,6 +299,7 @@ async def login(
         organization=organization,
         request=workflow_create_request,
         workflow_permanent_id=new_workflow.workflow_permanent_id,
+        build_source=WorkflowBuildSource.internal,
     )
     LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
@@ -401,6 +403,7 @@ async def download_files(
         organization=organization,
         request=workflow_create_request,
         workflow_permanent_id=new_workflow.workflow_permanent_id,
+        build_source=WorkflowBuildSource.internal,
     )
     LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 

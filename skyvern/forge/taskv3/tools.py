@@ -123,7 +123,18 @@ from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_time
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
-from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, OTP_SAFE_FRAGMENT_HTML_JS, mask_otp_values_in_html
+from skyvern.webeye.utils.flutter_semantics import (
+    FLUTTER_STATE_JS,
+    FlutterSemanticsState,
+    SemanticsActivation,
+    activate_flutter_semantics,
+)
+from skyvern.webeye.utils.page import (
+    OTP_INPUT_PRIVACY_JS,
+    OTP_SAFE_FRAGMENT_HTML_JS,
+    SkyvernFrame,
+    mask_otp_values_in_html,
+)
 
 if TYPE_CHECKING:
     # opaque_refs imports auth_tools which imports this module, so it can only be referenced for
@@ -4982,6 +4993,21 @@ _OWN_LABEL_HIT_JS = (
 """
 )
 
+# The probe's target lookup and readonly rule, shared with the type tool's readonly re-read so the two cannot
+# disagree. Needs `_q`, `arg` and `_NATIVE_LABEL_JS` in scope; defines `el`, `ctl` and `readOnly`.
+_TARGET_READONLY_JS = r"""
+  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
+  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
+  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return { exists: false };
+  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
+  let ctl = el;
+  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+  let readOnly = false;
+  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
+"""
+
 _TYPE_TARGET_PROBE_JS = (
     r"""(arg) => {
   const _q = """
@@ -4995,20 +5021,11 @@ _TYPE_TARGET_PROBE_JS = (
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
-
-  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
-  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
-  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
-  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
-  if (!el) return { exists: false };
-  const RETEST_SCROLLABLE_CLIP = false;
-  // A LABEL's own disabled/readOnly/type attributes mean nothing; its genuinely associated control's do.
-  let ctl = el;
-  try { if (_isLabel(el)) ctl = nativeControlOf(el) || el; } catch (e) { ctl = el; }
+"""
+    + _TARGET_READONLY_JS
+    + r"""  const RETEST_SCROLLABLE_CLIP = false;
   let disabled = false;
   try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
-  let readOnly = false;
-  try { readOnly = !!ctl.readOnly; } catch (e) { /* best-effort */ }
   const out = { exists: true, disabled, readOnly };
   try {
     if (_isToggle(ctl)) {
@@ -5884,6 +5901,20 @@ _TYPE_TARGET_PROBE_JS = (
 # The typing path's probe: the same reading, except that a field which only needs its scroller scrolled is re-tested.
 _TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
     "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
+)
+
+# The probe's readonly reading alone. Unlike the probe it scrolls nothing and re-mints no cover markers, so it can
+# be repeated without invalidating the markers the probe's verdict names.
+_TYPING_READONLY_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+"""
+    + _NATIVE_LABEL_JS
+    + _TARGET_READONLY_JS
+    + r"""  return { exists: true, readOnly };
+}"""
 )
 
 _ACTIVE_IS_JS = (
@@ -10937,7 +10968,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -10954,6 +10985,7 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
         .replace("__OBSERVE_TEXT_DELTA__", _OBSERVE_TEXT_DELTA_JS, 1)
+        .replace("__OBSERVE_FLUTTER__", FLUTTER_STATE_JS, 1)
     )
 
 
@@ -12269,6 +12301,8 @@ class _Observation(NamedTuple):
     # Frames left out by the walk's own caps (count or depth), which is a different fact from a frame
     # that refused to be read and is disclosed separately.
     capped_frames: int = 0
+    # Whether this reading switched a canvas-drawn app's accessibility tree on, or found it still off after trying.
+    semantics: SemanticsActivation | None = None
 
 
 # Summed across realms: each is a count of something the reading gave up, and the model needs the
@@ -12850,6 +12884,46 @@ def build_browser_tools(
         return data, handles, after
 
     async def _read_observation(page: Any) -> _Observation:
+        """The page's reading, taken again whenever switching on a canvas-drawn app's accessibility tree may have
+        changed the page under the first one."""
+        observation = await _read_settled_observation(page)
+        first = FlutterSemanticsState.from_raw(observation.data.get("flutter"))
+        if not first.needs_activation:
+            return observation
+        keep_first = False
+        try:
+            activation = await activate_flutter_semantics(SkyvernFrame(frame=page))
+            if not activation.reading_stale:
+                keep_first = True
+                # Clicked earlier in this document, so the note says only what this reading shows.
+                return observation if first.tree else observation._replace(semantics=SemanticsActivation.NOT_ACTIVATED)
+            reading = await _read_settled_observation(page)
+        finally:
+            # Released here, even when the second read raises or is cancelled: the pairing step only ever
+            # sees the reading that is returned.
+            if not keep_first:
+                for discarded in observation.handles:
+                    if discarded is None:
+                        continue
+                    try:
+                        await discarded.dispose()
+                    except Exception:
+                        pass
+        # A realm whose numbering restarted on the first reading looks unchanged on the second, which would keep refs a
+        # reload made stale. Carried whatever document the second reading found: a restart reported that did not happen
+        # only renumbers that realm's refs.
+        refs_fresh = {
+            realm: fresh or observation.refs_fresh.get(realm, False) for realm, fresh in reading.refs_fresh.items()
+        }
+        if activation is SemanticsActivation.PLACEHOLDER_GONE:
+            return reading._replace(refs_fresh=refs_fresh)
+        state = FlutterSemanticsState.from_raw(reading.data.get("flutter"))
+        semantics = (
+            SemanticsActivation.ACTIVATED if state.tree and not state.placeholder else SemanticsActivation.NOT_ACTIVATED
+        )
+        return reading._replace(refs_fresh=refs_fresh, semantics=semantics)
+
+    async def _read_settled_observation(page: Any) -> _Observation:
         """One reading, retried once if a document was replaced while it was being assembled.
 
         A page or frame navigating across a read is ordinary; navigating across two consecutive reads is
@@ -13086,6 +13160,18 @@ def build_browser_tools(
             f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > OBSERVE_URL_MAX_CHARS else ""
         )
         lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        # Said either way: observe clicked the page to get this reading, and when that did not work the model would
+        # otherwise read the framework's placeholder as the page.
+        if observation.semantics is SemanticsActivation.ACTIVATED:
+            lines.append(
+                "note: this page draws its interface on a canvas; observe switched on its accessibility tree so its "
+                "controls could be listed"
+            )
+        elif observation.semantics is SemanticsActivation.NOT_ACTIVATED:
+            lines.append(
+                "note: this page draws its interface on a canvas and its accessibility tree did not come up, so its "
+                "controls are not listed; use look to see the page"
+            )
         hidden_kept = data.get("hiddenListed") or 0
         if hidden_kept:
             lines.append(
@@ -15479,6 +15565,17 @@ def build_browser_tools(
         except Exception:
             LOG.debug("taskv3 could not enumerate frames under the covering layer", exc_info=True)
 
+    async def _readonly_now(page: Any, selector: str) -> bool:
+        # Resolved afresh on every read: a control the page replaces leaves a cached handle disconnected.
+        arg = await _probe_arg(page, selector)
+        try:
+            read = await _probe_evaluate(page, _TYPING_READONLY_JS, selector, arg)
+        finally:
+            if arg["el"] is not None:
+                with contextlib.suppress(Exception):
+                    await arg["el"].dispose()
+        return isinstance(read, dict) and bool(read.get("exists")) and bool(read.get("readOnly"))
+
     async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool, dict[str, Any] | None]:
         """(reachable, occluded, occluder). Raises when the field cannot accept typed text at all. Shared
         by both typing paths: fill() does no hit-testing, so without this a covered password or email
@@ -15503,21 +15600,26 @@ def build_browser_tools(
             # the driver is asked for the rest of its rule -- see the click gate. Held for that gate's
             # grace rather than refused outright, because fill()'s own wait used to cover a field the
             # page releases a moment later.
-            enable_deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
-            while not await _engine_enabled(page, selector):
-                if time.monotonic() >= enable_deadline:
-                    raise _FieldNotEditable(selector, False)
+            deadline = time.monotonic() + _DISABLED_CLICK_GRACE_SECONDS
+            released = False
+            enabled = await _engine_enabled(page, selector)
+            read_only = False  # not read for a field answered enabled here: fill() waits out its lock itself
+            while not enabled or read_only:
+                if time.monotonic() >= deadline:
+                    raise _FieldNotEditable(selector, read_only)
                 await asyncio.sleep(0.1)
+                enabled = await _engine_enabled(page, selector)
                 # Re-read rather than only polling the driver: a page that answers the grace by making
                 # the field readonly has made it un-typable for a different reason, and the accurate
                 # message is the one the caller renders.
-                held: Any = None
+                read_only = False
                 with contextlib.suppress(Exception):
-                    held = await _probe_evaluate(
-                        page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector)
-                    )
-                if isinstance(held, dict) and held.get("exists") and held.get("readOnly"):
-                    raise _FieldNotEditable(selector, True)
+                    read_only = await _readonly_now(page, selector)
+                if enabled and not released:
+                    # From here fill() would have waited, so a lock gets fill()'s budget rather than the
+                    # disabled grace; a lock still held at its end is refused instead of timing fill() out.
+                    released = True
+                    deadline = time.monotonic() + _ACTION_TIMEOUT_MS / 1000
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and not probe.get("skinned"):

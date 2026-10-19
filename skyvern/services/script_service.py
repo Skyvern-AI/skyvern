@@ -37,6 +37,7 @@ from skyvern.exceptions import (
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
+    TaskNotFound,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -58,6 +59,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -65,7 +67,11 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, register_secret_derived_output
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    InsecureCodeDetected,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     filter_downloaded_files_for_current_iteration as _filter_downloaded_files_for_current_iteration,
 )
@@ -119,7 +125,6 @@ from skyvern.schemas.scripts import (
 )
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
-from skyvern.services.credential_verdict_service import CredentialVerdictContext, confirm_credential_verdicts
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
 from skyvern.utils.templating import reject_jinja_transformations_on_variable
@@ -473,14 +478,10 @@ async def load_scripts(
     script: Script,
     script_files: list[ScriptFile],
 ) -> set[str]:
-    """Copy the revision's files locally and return the paths actually written by THIS call.
+    """Copy a revision's files locally and return the paths actually written by this call.
 
-    Callers must gate on the returned set rather than os.path.exists: TEMP_PATH is reused across
-    runs and keyed by script_id rather than revision, so a file on disk may belong to an earlier
-    run whose code has since been retention-deleted. Absence from the set means "this run has no
-    code for that path", which is the only question the caller can answer from here -- a retention
-    deletion and an exhausted-retry S3 failure both surface as empty content and are not
-    distinguishable at this layer.
+    Callers gate on this set rather than os.path.exists because a failed or expired artifact read
+    must not let a cached copy stand in for a file that was not loaded for this revision.
     """
     organization_id = script.organization_id
     written: set[str] = set()
@@ -493,7 +494,7 @@ async def load_scripts(
             LOG.error("Artifact not found", artifact_id=file.artifact_id, script_id=script.script_id)
             continue
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
+        file_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, file.file_path)
         if not file_content:
             continue
         # create the directory if it doesn't exist
@@ -520,6 +521,15 @@ async def load_scripts(
     return written
 
 
+def _validate_stored_script_sources(main_script_path: str) -> None:
+    main_path = Path(main_script_path)
+    if not main_path.is_file():
+        raise InsecureCodeDetected("stored script files are unavailable")
+    for script_path in main_path.parent.rglob("*"):
+        if script_path.is_file() and script_path.suffix.lower() == ".py":
+            is_safe_script_code(script_path.read_text(encoding="utf-8"))
+
+
 async def execute_script(
     script_id: str,
     organization_id: str,
@@ -542,7 +552,7 @@ async def execute_script(
     )
 
     # step 3: copy the script files to the local directory
-    await load_scripts(script, script_files)
+    written_paths = await load_scripts(script, script_files)
 
     # step 4: execute the script
     if workflow_run_id and not parameters:
@@ -550,7 +560,10 @@ async def execute_script(
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
-    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
+    script_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, "main.py")
+    if script_path not in written_paths:
+        LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
+        raise Exception(f"Script main.py not found at {script_path}")
 
     if background_tasks:
         # Execute asynchronously in background
@@ -566,19 +579,15 @@ async def execute_script(
         )
     else:
         # Execute synchronously
-        if os.path.exists(script_path):
-            await run_script(
-                script_path,
-                parameters=parameters,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-                script_id=script_id,
-                script_revision_id=script.script_revision_id,
-            )
-        else:
-            LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
-            raise Exception(f"Script main.py not found at {script_path}")
+        await run_script(
+            script_path,
+            parameters=parameters,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+            script_id=script_id,
+            script_revision_id=script.script_revision_id,
+        )
 
     LOG.info("Script executed successfully", script_id=script_id)
 
@@ -998,6 +1007,7 @@ async def _update_workflow_block(
 
         final_output = output
         if task_id:
+            lease_lost = await run_lease_lost(context.workflow_run_id)
             if step_id:
                 # Build step output from script actions similar to agent flow
                 step_output = None
@@ -1016,6 +1026,30 @@ async def _update_workflow_block(
                         errors=errors,
                     )
 
+                if not lease_lost:
+                    await app.DATABASE.tasks.update_step(
+                        step_id=step_id,
+                        task_id=task_id,
+                        organization_id=context.organization_id,
+                        status=step_status,
+                        is_last=is_last,
+                        output=step_output,
+                    )
+            if lease_lost and not task_status.is_final():
+                updated_task = await app.DATABASE.tasks.get_task(task_id, context.organization_id)
+                if updated_task is None:
+                    raise TaskNotFound(task_id)
+            else:
+                updated_task = await app.DATABASE.tasks.update_task(
+                    task_id=task_id,
+                    organization_id=context.organization_id,
+                    status=task_status,
+                    failure_reason=failure_reason,
+                    extracted_information=output,
+                    errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
+                    keep_final_status=lease_lost,
+                )
+            if lease_lost and step_id and updated_task.status == task_status:
                 await app.DATABASE.tasks.update_step(
                     step_id=step_id,
                     task_id=task_id,
@@ -1024,14 +1058,8 @@ async def _update_workflow_block(
                     is_last=is_last,
                     output=step_output,
                 )
-            updated_task = await app.DATABASE.tasks.update_task(
-                task_id=task_id,
-                organization_id=context.organization_id,
-                status=task_status,
-                failure_reason=failure_reason,
-                extracted_information=output,
-                errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
-            )
+            if run_lease_tasks_enabled() and lease_lost:
+                return
             downloaded_files: list[FileInfo] = []
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -1095,6 +1123,8 @@ async def _update_workflow_block(
             # final_output is already set to `output` at line 596.
             pass
 
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
         updated_block = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=context.organization_id if context else None,
@@ -1115,6 +1145,8 @@ async def _update_workflow_block(
                     "Failed to record cached block outcome", workflow_run_block_id=workflow_run_block_id, exc_info=True
                 )
 
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
         recorded_output_parameter = await _record_output_parameter_value(
             context.workflow_run_id,
             context.workflow_id,
@@ -1444,16 +1476,7 @@ async def _detect_user_defined_errors(
             errors=[e.error_code for e in user_defined_errors],
         )
 
-        return await confirm_credential_verdicts(
-            task=task,
-            step=step,
-            errors=user_defined_errors,
-            context=CredentialVerdictContext(
-                current_url=current_url,
-                elements=elements,
-                screenshots=screenshots,
-            ),
-        )
+        return user_defined_errors
 
     except Exception as e:
         LOG.exception(
@@ -3573,6 +3596,18 @@ async def run_script(
     spec = importlib.util.spec_from_file_location("user_script", path)
     if not spec or not spec.loader:
         raise Exception(f"Failed to import script from {path}")
+    if script_id is not None:
+        try:
+            _validate_stored_script_sources(path)
+        except Exception as exc:
+            LOG.warning(
+                "Refusing to load unsafe stored script body",
+                script_id=script_id,
+                script_revision_id=script_revision_id,
+                reason="safety_validation_failed",
+                error_type=type(exc).__name__,
+            )
+            raise InsecureCodeDetected("stored script safety validation failed") from None
     user_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(user_script)
 

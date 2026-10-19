@@ -8,6 +8,7 @@ import time
 import warnings
 from asyncio import CancelledError
 from collections.abc import Collection
+from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
@@ -18,6 +19,7 @@ from anthropic import NOT_GIVEN
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
+from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
 
@@ -55,6 +57,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -92,6 +95,7 @@ from skyvern.utils.url_validators import validate_fetch_url
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
+use_anthropic_reported_thinking_tokens()
 
 LOG = structlog.get_logger()
 _HASHED_HREF_PLACEHOLDER = re.compile(r"\{\{\s*(_[0-9a-f]{64})\s*\}\}")
@@ -375,7 +379,13 @@ LLM_REQUEST_SPAN_NAME = "skyvern.llm.request"
 LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
-CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination", "check-user-goal-after-click"}
+# In the check-user-goal templates, everything from the first of these sections on changes between calls.
+_CHECK_USER_GOAL_PER_CALL_SECTIONS = (
+    "\nAction History:\n",
+    "\nIDs for emerging HTML elements\n",
+    "\nElements on the page:\n",
+)
 VISION_REQUIRED_PROMPT_NAMES = {
     "workflow-copilot-video-perception",
     "workflow-copilot-video-secret-safety",
@@ -819,12 +829,37 @@ def _response_provider(response: object) -> str | None:
     return provider if isinstance(provider, str) else None
 
 
+def _response_finish_reason(response: object) -> str | None:
+    # The raw Anthropic SDK reports a stop_reason; map it to litellm's vocabulary so every path logs the same values.
+    if isinstance(response, AnthropicMessage):
+        return map_finish_reason(response.stop_reason) if response.stop_reason else None
+    if isinstance(response, ModelResponse) and response.choices:
+        return response.choices[0].finish_reason
+    return None
+
+
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
     for field_name in field_names:
         field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
         if isinstance(field, int) and not isinstance(field, bool):
             return field
     return None
+
+
+def _cache_creation_tokens(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
+    tokens = (
+        _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens") if details is not None else None
+    )
+    if tokens is None and details is not None:
+        model_extra = getattr(details, "model_extra", None)
+        if isinstance(model_extra, dict):
+            tokens = _usage_int_field(model_extra, "cache_write_tokens")
+    if tokens is None:
+        tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+    return tokens
 
 
 def _copilot_model_usage_event(
@@ -849,17 +884,7 @@ def _copilot_model_usage_event(
         cache_read_tokens = _usage_int_field(details, "cached_tokens") if details is not None else None
         if cache_read_tokens is None and usage is not None:
             cache_read_tokens = _usage_int_field(usage, "cache_read_input_tokens")
-        cache_creation_tokens = (
-            _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens")
-            if details is not None
-            else None
-        )
-        if cache_creation_tokens is None and details is not None:
-            model_extra = getattr(details, "model_extra", None)
-            if isinstance(model_extra, dict):
-                cache_creation_tokens = _usage_int_field(model_extra, "cache_write_tokens")
-        if cache_creation_tokens is None and usage is not None:
-            cache_creation_tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+        cache_creation_tokens = _cache_creation_tokens(usage)
     except Exception:
         input_tokens = None
         output_tokens = None
@@ -1080,6 +1105,16 @@ def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> Allow
 # can validate against the same set instead of duplicating the values.
 VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
 
+# A run's LLM experiment settings. A worker running several activities in one process shares the factory, so each run
+# keeps its own values in its context rather than on the class.
+_THINKING_BUDGET_SETTINGS: ContextVar[dict[str, int] | None] = ContextVar("llm_thinking_budget_settings", default=None)
+_PROMPT_CACHING_SETTINGS: ContextVar[dict[str, bool] | None] = ContextVar("llm_prompt_caching_settings", default=None)
+# When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to `thinkingLevel` in Vertex) instead of the legacy
+# `thinking={budget_tokens:N}` payload, which litellm silently drops for Gemini 3 (SKY-9785).
+_GEMINI_3_REASONING_EFFORT_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "llm_gemini_3_reasoning_effort_override", default=None
+)
+
 
 def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
     """Build a litellm.Router from a router config.
@@ -1161,13 +1196,6 @@ class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
-    _thinking_budget_settings: dict[str, int] | None = None
-    _prompt_caching_settings: dict[str, bool] | None = None
-    # When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to
-    # `thinkingLevel` in Vertex) instead of the legacy `thinking={budget_tokens:N}`
-    # payload — which litellm silently drops for Gemini 3, leaving the model at
-    # its default HIGH thinking level (SKY-9785).
-    _gemini_3_reasoning_effort_override: str | None = None
 
     @staticmethod
     def _strip_static_prompt_from_messages(messages: list[dict[str, Any]], static_prompt: str) -> bool:
@@ -1204,7 +1232,9 @@ class LLMAPIHandlerFactory:
         return prompt_stripped
 
     @staticmethod
-    def _cache_static_prompt_for_anthropic(messages: list[dict[str, Any]], static_prompt: str) -> bool:
+    def _cache_static_prompt_for_anthropic(
+        messages: list[dict[str, Any]], static_prompt: str, task_prompt: str | None = None
+    ) -> bool:
         marked_static_block = {
             "type": "text",
             "text": static_prompt.rstrip(),
@@ -1216,13 +1246,36 @@ class LLMAPIHandlerFactory:
             content = message.get("content")
             if not isinstance(content, list):
                 return False
-            if content and content[0] == marked_static_block:
-                return True
-            if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
-                return False
-            content.insert(0, marked_static_block)
+            if not (content and content[0] == marked_static_block):
+                if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
+                    return False
+                content.insert(0, marked_static_block)
+            if task_prompt and len(content) > 1:
+                LLMAPIHandlerFactory._mark_cached_prefix(content, 1, task_prompt)
             return True
         return False
+
+    @staticmethod
+    def _cache_check_user_goal_prefix_for_anthropic(messages: list[dict[str, Any]]) -> bool:
+        user_message = next((message for message in messages if message.get("role") == "user"), None)
+        content = user_message.get("content") if user_message else None
+        if not isinstance(content, list) or not content or content[0].get("type") != "text":
+            return False
+        text = content[0].get("text", "")
+        cut = min((at for at in map(text.find, _CHECK_USER_GOAL_PER_CALL_SECTIONS) if at > 0), default=0)
+        return cut > 0 and LLMAPIHandlerFactory._mark_cached_prefix(content, 0, text[:cut])
+
+    @staticmethod
+    def _mark_cached_prefix(content: list[dict[str, Any]], index: int, prefix: str) -> bool:
+        block = content[index]
+        text = block.get("text", "")
+        if block.get("type") != "text" or not text.startswith(prefix) or len(text) <= len(prefix):
+            return False
+        content[index : index + 1] = [
+            {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+            {**block, "text": text[len(prefix) :]},
+        ]
+        return True
 
     @staticmethod
     def _models_equivalent(left: str | None, right: str | None) -> bool:
@@ -1607,12 +1660,17 @@ class LLMAPIHandlerFactory:
         check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
         if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
+            effort = (
+                llm_config.reasoning_effort
+                if llm_config.pin_reasoning_effort and llm_config.reasoning_effort
+                else LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            )
             parameters["thinking"] = {"type": "adaptive"}
-            parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            parameters.setdefault("output_config", {})["effort"] = effort
             LOG.debug(
                 "Applied thinking budget optimization (adaptive)",
                 prompt_name=prompt_name,
-                effort=LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT,
+                effort=effort,
                 model=model_label,
             )
             return
@@ -1692,7 +1750,7 @@ class LLMAPIHandlerFactory:
         # into `parameters`. Without this ordering, the guard would fire and the
         # override would silently skip direct Gemini 3 configs (task/workflow-level
         # model overrides that bypass the router).
-        override = LLMAPIHandlerFactory._gemini_3_reasoning_effort_override
+        override = _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
         if override and LLMAPIHandlerFactory._is_gemini_3_model(llm_config):
             parameters["reasoning_effort"] = override
             # litellm raises 400 if both reasoning_effort and thinking_budget land
@@ -1833,19 +1891,27 @@ class LLMAPIHandlerFactory:
             return None
 
     @staticmethod
-    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
-        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
-        default for its non-flex twin when `trigger_type` is manual-like."""
+    def resolve_non_flex_llm_key_for_manual_run(llm_key: str | None) -> str | None:
+        """Return a registered non-flex twin for a manual-like run, or None."""
         ctx = skyvern_context.current()
         if ctx is None or not is_manual_like_workflow_run_trigger_type(ctx.trigger_type):
             return None
+        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(llm_key)
+        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+            return None
+        return non_flex_key
+
+    @staticmethod
+    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
+        default for its non-flex twin when `trigger_type` is manual-like."""
         effective_key = (
             getattr(default, "llm_key", None)
             or getattr(getattr(default, "__self__", None), "llm_key", None)
             or settings.LLM_KEY
         )
-        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(effective_key)
-        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+        non_flex_key = LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(effective_key)
+        if not non_flex_key:
             return None
         try:
             non_flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(non_flex_key)
@@ -2003,11 +2069,9 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             # Apply thinking budget optimization if settings are available
-            if (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
+            if thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, new_budget, llm_config, prompt_name
                 )
@@ -2130,8 +2194,16 @@ class LLMAPIHandlerFactory:
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                         and uses_only_anthropic_models(llm_config)
                         and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
-                            messages, redacted_cached_static_prompt
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
                         )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
                     ):
                         LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
@@ -2658,6 +2730,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -2870,13 +2945,11 @@ class LLMAPIHandlerFactory:
             # nested dict retained in llm_config.litellm_params via the shallow merge above). SKY-13345.
             customer_owns_thinking = LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters)
             # Apply thinking budget optimization if settings are available
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
             if customer_owns_thinking:
                 pass
-            elif (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            elif thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, new_budget, llm_config, prompt_name
                 )
@@ -2984,8 +3057,16 @@ class LLMAPIHandlerFactory:
                         and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                         and uses_only_anthropic_models(llm_config)
                         and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
-                            messages, redacted_cached_static_prompt
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
                         )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
                     ):
                         LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
@@ -3317,6 +3398,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -3517,14 +3601,46 @@ class LLMAPIHandlerFactory:
     @classmethod
     def set_thinking_budget_settings(cls, settings: dict[str, int] | None) -> None:
         """Set thinking budget optimization settings for the current task/workflow."""
-        cls._thinking_budget_settings = settings
+        _THINKING_BUDGET_SETTINGS.set(settings)
         if settings:
             LOG.info("Thinking budget optimization settings applied", settings=settings)
+
+    @staticmethod
+    def begin_run_settings() -> tuple[Token[Any], ...]:
+        """Start a run with no thinking budget, prompt caching or Gemini 3 effort settings; see end_run_settings."""
+        return (
+            _THINKING_BUDGET_SETTINGS.set(None),
+            _PROMPT_CACHING_SETTINGS.set(None),
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None),
+        )
+
+    @staticmethod
+    def end_run_settings(tokens: tuple[Token[Any], ...]) -> None:
+        """Drop the run's settings, restoring those of any run that encloses it on the same task."""
+        thinking_budget, prompt_caching, gemini_3_effort = tokens
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.reset(gemini_3_effort)
+        _PROMPT_CACHING_SETTINGS.reset(prompt_caching)
+        _THINKING_BUDGET_SETTINGS.reset(thinking_budget)
+
+    @staticmethod
+    def thinking_budget_settings() -> dict[str, int] | None:
+        """The current run's thinking budget settings, if any were set."""
+        return _THINKING_BUDGET_SETTINGS.get()
+
+    @staticmethod
+    def gemini_3_reasoning_effort_override() -> str | None:
+        """The current run's Gemini 3 reasoning_effort override, if one was set."""
+        return _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
+
+    @staticmethod
+    def prompt_caching_settings() -> dict[str, bool] | None:
+        """The current run's prompt caching settings, if any were set."""
+        return _PROMPT_CACHING_SETTINGS.get()
 
     @classmethod
     def set_prompt_caching_settings(cls, settings: dict[str, bool] | None) -> None:
         """Set prompt caching optimization settings for the current task/workflow."""
-        cls._prompt_caching_settings = settings
+        _PROMPT_CACHING_SETTINGS.set(settings)
         if settings:
             LOG.info("Prompt caching optimization settings applied", settings=settings)
 
@@ -3537,7 +3653,7 @@ class LLMAPIHandlerFactory:
         and logged.
         """
         if not value:
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
         normalized = value.strip().lower() if isinstance(value, str) else None
         if normalized not in VALID_GEMINI_3_REASONING_EFFORTS:
@@ -3546,9 +3662,9 @@ class LLMAPIHandlerFactory:
                 value=value,
                 valid_values=list(VALID_GEMINI_3_REASONING_EFFORTS),
             )
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
-        cls._gemini_3_reasoning_effort_override = normalized
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(normalized)
         LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
 
 
@@ -4144,6 +4260,9 @@ class LLMCaller:
                     "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
                 ),
                 cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                cache_creation_tokens=_generated_log_value(
+                    "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                ),
                 llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
                 image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                 image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -4151,6 +4270,7 @@ class LLMCaller:
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
+                finish_reason=_response_finish_reason(response),
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
                 served_model_group=_model_log_value("served_model_group", served_model_group),
@@ -4643,7 +4763,7 @@ class LLMCaller:
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=cached_tokens,
-                reasoning_tokens=0,
+                reasoning_tokens=usage.output_tokens_details.thinking_tokens if usage.output_tokens_details else 0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(

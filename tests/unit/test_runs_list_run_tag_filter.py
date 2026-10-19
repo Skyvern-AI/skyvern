@@ -305,6 +305,7 @@ def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.DATABASE.workflow_runs = workflow_runs_mock
     app_mock.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
 
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
@@ -357,6 +358,7 @@ def agent_runs_route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock = MagicMock()
     app_mock.WORKFLOW_SERVICE = workflow_service_mock
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
 
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
@@ -463,6 +465,7 @@ def run_tag_suggestions_route_client(monkeypatch: pytest.MonkeyPatch) -> TestCli
     app_mock = MagicMock()
     app_mock.DATABASE.tags = tags_mock
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
+    app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
 
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")

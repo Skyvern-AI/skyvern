@@ -5,7 +5,9 @@ import { TrashSolidIcon } from "@/components/icons/TrashSolidIcon";
 import { SelectionBar, SelectionBarDivider } from "@/components/SelectionBar";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AdminOnlyTooltip } from "@/components/AdminOnlyTooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useHasCapability } from "@/store/PageSlots";
 import { bulkResultToast } from "@/util/bulkResultToast";
 import {
   BULK_CONCURRENCY_LIMIT,
@@ -32,6 +34,7 @@ function CredentialsBulkBar({
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const canDelete = useHasCapability("credential.delete");
   const [deleteDialog, setDeleteDialog] = useState<{
     open: boolean;
     targets: string[];
@@ -82,6 +85,9 @@ function CredentialsBulkBar({
   }
 
   async function handleBulkDeleteConfirm() {
+    if (!canDelete) {
+      return;
+    }
     const targets = deleteDialog.targets;
     if (targets.length === 0) {
       return;
@@ -146,23 +152,25 @@ function CredentialsBulkBar({
           }
         />
         <SelectionBarDivider />
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-          disabled={isOperating}
-          onClick={() =>
-            setDeleteDialog({
-              open: true,
-              targets: selectedCredentials.map(
-                (credential) => credential.credential_id,
-              ),
-            })
-          }
-        >
-          <TrashSolidIcon className="mr-1.5 h-4 w-4" />
-          Delete
-        </Button>
+        <AdminOnlyTooltip allowed={canDelete}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            disabled={isOperating || !canDelete}
+            onClick={() =>
+              setDeleteDialog({
+                open: true,
+                targets: selectedCredentials.map(
+                  (credential) => credential.credential_id,
+                ),
+              })
+            }
+          >
+            <TrashSolidIcon className="mr-1.5 h-4 w-4" />
+            Delete
+          </Button>
+        </AdminOnlyTooltip>
       </SelectionBar>
       <ConfirmDialog
         open={deleteDialog.open}
@@ -183,6 +191,7 @@ function CredentialsBulkBar({
         }
         itemCount={deleteDialog.targets.length}
         isPending={isOperating}
+        confirmDisabled={!canDelete}
         onConfirm={() => {
           void handleBulkDeleteConfirm();
         }}

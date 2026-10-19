@@ -36,11 +36,17 @@ page.act(prompt: string): Promise<void>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | Natural language description of the action to perform. |
-| `skip_refresh` | — | `bool` | No | `False` |  |
-| `use_economy_tree` | — | `bool` | No | `False` |  |
+<ParamField path={"prompt"} type={"str"} required>
+Natural language description of the action to perform.
+</ParamField>
+
+<ParamField path={"skip_refresh"} type={"bool"}>
+Default: `False` · Python only
+</ParamField>
+
+<ParamField path={"use_economy_tree"} type={"bool"}>
+Default: `False` · Python only
+</ParamField>
 
 **Returns** `None` · TypeScript `Promise<void>`
 
@@ -100,15 +106,33 @@ page.extract(options: { prompt: string; schema?: Record<string, unknown> | unkno
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | Natural language description of what data to extract. |
-| `schema` | `schema` | `dict[str, Any] \| list \| str \| None` | No | `None` | JSON Schema defining the structure of data to extract. |
-| `error_code_mapping` | `errorCodeMapping` | `dict[str, str] \| None` | No | `None` | Mapping of error codes to custom error messages. |
-| `intention` | `intention` | `str \| None` | No | `None` | Additional context about the extraction intent. |
-| — | `data` | `string \| Record<string, unknown>` | No | — | TypeScript only. |
+<ParamField path={"prompt"} type={"str"} required>
+Natural language description of what data to extract.
+</ParamField>
 
-**Returns** `dict[str, Any] \| list \| str \| None` · TypeScript `Promise<Record<string, unknown> \| unknown[] \| string \| null>` — Extracted data matching the provided schema, or None if extraction fails.
+<ParamField path={"schema"} type={"dict[str, Any] | list | str | None"}>
+JSON Schema defining the structure of data to extract.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code_mapping"} type={"dict[str, str] | None"}>
+Mapping of error codes to custom error messages.
+
+Default: `None` · TypeScript: `errorCodeMapping`
+</ParamField>
+
+<ParamField path={"intention"} type={"str | None"}>
+Additional context about the extraction intent.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"data"} type={"string | Record<string, unknown>"}>
+TypeScript only
+</ParamField>
+
+**Returns** `dict[str, Any] | list | str | None` · TypeScript `Promise<Record<string, unknown> | unknown[] | string | null>` — Extracted data matching the provided schema, or None if extraction fails.
 
 **Example**
 
@@ -165,10 +189,15 @@ page.validate(prompt: string, model?: Record<string, unknown> | string): Promise
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | Validation criteria or condition to check |
-| `model` | `model` | `dict[str, Any] \| str \| None` | No | `None` | Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gpt-4") |
+<ParamField path={"prompt"} type={"str"} required>
+Validation criteria or condition to check
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | str | None"}>
+Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gpt-4")
+
+Default: `None`
+</ParamField>
 
 **Returns** `bool` · TypeScript `Promise<boolean>` — True if validation passes, False otherwise
 
@@ -232,13 +261,23 @@ page.prompt(prompt: string, schema?: Record<string, unknown>, model?: Record<str
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | The prompt to send to the LLM |
-| `schema` | `schema` | `dict[str, Any] \| None` | No | `None` | Optional JSON schema to structure the response. If provided, the LLM response will be validated against this schema. |
-| `model` | `model` | `dict[str, Any] \| str \| None` | No | `None` | Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gemini-2.5-flash-lite") |
+<ParamField path={"prompt"} type={"str"} required>
+The prompt to send to the LLM
+</ParamField>
 
-**Returns** `dict[str, Any] \| list \| str \| None` · TypeScript `Promise<Record<string, unknown> \| unknown[] \| string \| null>` — LLM response structured according to the schema if provided, or unstructured response otherwise.
+<ParamField path={"schema"} type={"dict[str, Any] | None"}>
+Optional JSON schema to structure the response. If provided, the LLM response will be validated against this schema.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | str | None"}>
+Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+
+Default: `None`
+</ParamField>
+
+**Returns** `dict[str, Any] | list | str | None` · TypeScript `Promise<Record<string, unknown> | unknown[] | string | null>` — LLM response structured according to the schema if provided, or unstructured response otherwise.
 
 **Example**
 
@@ -277,67 +316,6 @@ await browser.close();
 
 ---
 
-### page.classify
-
-Classify the current page state against named options using a tiered cascade.
-
-This method uses a three-tier approach to minimize cost:
-1. URL pattern matching against current URL (FREE)
-2. Text substring check in page content (FREE)
-3. LLM-based classification as last resort (~$0.001)
-
-<Note>Python only: the TypeScript SDK has no equivalent.</Note>
-
-<CodeGroup>
-```python Python
-await page.classify(
-    options: dict[str, str],
-    url_patterns: dict[str, str] | None = None,
-    text_patterns: dict[str, str | list[str]] | None = None,
-) -> str
-```
-</CodeGroup>
-
-**Parameters**
-
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `options` | — | `dict[str, str]` | Yes | — | Dict mapping option keys to descriptions. e.g. \{"eligible": "The page shows eligibility confirmation", "not_eligible": "The page shows a rejection message"\} |
-| `url_patterns` | — | `dict[str, str] \| None` | No | `None` | Optional dict mapping option keys to regex patterns to match against the current URL. |
-| `text_patterns` | — | `dict[str, str \| list[str]] \| None` | No | `None` | Optional dict mapping option keys to text substrings to search for in the page's extracted text. |
-
-**Returns** `str` — The matching option key, or "UNKNOWN" if no option matches.
-
-**Example**
-
-<CodeGroup>
-```python Python
-import asyncio
-
-from skyvern import Skyvern
-
-
-async def main() -> None:
-    skyvern = Skyvern(api_key="YOUR_API_KEY")
-    browser = await skyvern.launch_cloud_browser()
-    page = await browser.get_working_page()
-    await page.goto("https://example.com")
-    result = await page.classify(
-        options={
-            "logged_in": "The page shows the account dashboard",
-            "logged_out": "The page shows a sign-in form",
-        },
-    )
-    print(result)
-    await browser.close()
-
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
 ### page.locator
 
 Get a Playwright locator using a CSS selector, AI-powered prompt, or both.
@@ -367,12 +345,29 @@ page.locator(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str \| None` | No | `None` | CSS selector for the target element. |
-| `prompt` | — | `str \| None` | No | `None` | Natural language description of which element to locate. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. Defaults to "fallback" which tries selector first, then AI. |
-| `**kwargs` | — | `Any` | No | — | All Playwright locator parameters (has_text, has, etc.) |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which element to locate.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'`
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+All Playwright locator parameters (has_text, has, etc.)
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `Locator` — A Playwright Locator object (or AILocator proxy that acts like one).
 
@@ -392,60 +387,6 @@ async def main() -> None:
     await page.goto("https://example.com")
     result = page.locator(prompt="the search box")
     print(result)
-    await browser.close()
-
-
-asyncio.run(main())
-```
-</CodeGroup>
-
----
-
-### page.element_fallback
-
-Activate the AI agent from the CURRENT page position to achieve a goal.
-
-Instead of re-running the entire block when cached code encounters an unknown
-state, this method activates the AI agent from the current page position.
-Much cheaper than a full block re-execution.
-
-<Note>Python only: the TypeScript SDK has no equivalent.</Note>
-
-<CodeGroup>
-```python Python
-await page.element_fallback(
-    navigation_goal: str,
-    max_steps: int = 5,
-    validate_first: bool = False,
-) -> None
-```
-</CodeGroup>
-
-**Parameters**
-
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `navigation_goal` | — | `str` | Yes | — | The goal for the AI agent to achieve from the current page. |
-| `max_steps` | — | `int` | No | `5` | Maximum number of agent steps before giving up. Defaults to 5. |
-| `validate_first` | — | `bool` | No | `False` | When True, run an AI validation before the first action to short-circuit if the page already satisfies the goal. Defaults to False because the documented call site (else branch of `classify`) cannot be on the success state — pass True for defensive calls that may invoke this on a possibly-complete page. |
-
-**Returns** `None`
-
-**Example**
-
-<CodeGroup>
-```python Python
-import asyncio
-
-from skyvern import Skyvern
-
-
-async def main() -> None:
-    skyvern = Skyvern(api_key="YOUR_API_KEY")
-    browser = await skyvern.launch_cloud_browser()
-    page = await browser.get_working_page()
-    await page.goto("https://example.com")
-    await page.element_fallback(navigation_goal="Open the most recent invoice")
     await browser.close()
 
 
@@ -486,17 +427,49 @@ page.click(selector: string, options: { prompt: string; } & Partial<Parameters<P
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | `selector` | `str \| None` | No | `None` | CSS selector for the target element. |
-| `prompt` | `prompt` | `str \| None` | No | `None` | Natural language description of which element to click. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. Defaults to "fallback" which tries selector first, then AI. |
-| `mode` | — | `str \| None` | No | `None` | When `"direct"`, perform a raw Playwright click with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline. |
-| `desired_state` | — | `bool \| None` | No | `None` | Level-triggered toggle intent recorded with the action. When set, a selector-first click is suppressed if the control already holds that state, so a replay never toggles an already-satisfied control back off. Ignored by `mode="direct"`. |
-| `**kwargs` | — | `Any` | No | — | All Playwright click parameters (timeout, force, modifiers, etc.) |
-| — | `options` | `Parameters<Page["click"]>[1]` | No | — | Playwright options for this call. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target element.
 
-**Returns** `str \| None` · TypeScript `Promise<void>` — The selector string that was successfully used to click the element, or None.
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which element to click.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"mode"} type={"str | None"}>
+When `"direct"`, perform a raw Playwright click with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"desired_state"} type={"bool | None"}>
+Level-triggered toggle intent recorded with the action. When set, a selector-first click is suppressed if the control already holds that state, so a replay never toggles an already-satisfied control back off. Ignored by `mode="direct"`.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+All Playwright click parameters (timeout, force, modifiers, etc.)
+
+Sent only when you pass it · Python only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"click\"]>[1]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
+
+**Returns** `str | None` · TypeScript `Promise<void>` — The selector string that was successfully used to click the element, or None.
 
 **Example**
 
@@ -566,16 +539,53 @@ page.fill(selector: string, value: string, options: { prompt: string; } & Partia
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | `selector` | `str \| None` | No | `None` | CSS selector for the target input element. |
-| `value` | `value` | `str \| None` | No | `None` | The text value to input into the field. |
-| `prompt` | `prompt` | `str \| None` | No | `None` | Natural language description of which field to fill and what value. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. Defaults to "fallback" which tries selector first, then AI. |
-| `mode` | — | `str \| None` | No | `None` | When `"direct"`, perform a raw Playwright fill with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline. |
-| `totp_identifier` | — | `str \| None` | No | `None` | TOTP identifier for time-based one-time password fields. |
-| `totp_url` | — | `str \| None` | No | `None` | URL to fetch TOTP codes from for authentication. |
-| — | `options` | `Parameters<Page["fill"]>[2]` | No | — | Playwright options for this call. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target input element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The text value to input into the field.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which field to fill and what value.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"mode"} type={"str | None"}>
+When `"direct"`, perform a raw Playwright fill with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+TOTP identifier for time-based one-time password fields.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from for authentication.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"fill\"]>[2]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
 
 **Returns** `str` · TypeScript `Promise<void>` — The value that was successfully filled into the field.
 
@@ -644,16 +654,41 @@ page.selectOption(selector: string, values: string | string[], options: { prompt
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | `selector` | `str \| None` | No | `None` | CSS selector for the target select/dropdown element. |
-| `value` | `value` | `str \| None` | No | `None` | The option value to select. |
-| `prompt` | `prompt` | `str \| None` | No | `None` | Natural language description of which option to select. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. Defaults to "fallback" which tries selector first, then AI. |
-| — | `values` | `string \| string[]` | No | — | TypeScript only. |
-| — | `options` | `Parameters<Page["selectOption"]>[2]` | No | — | Playwright options for this call. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target select/dropdown element.
 
-**Returns** `str \| None` · TypeScript `Promise<void>` — The value that was successfully selected.
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The option value to select.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which option to select.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"values"} type={"string | string[]"}>
+TypeScript only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"selectOption\"]>[2]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
+
+**Returns** `str | None` · TypeScript `Promise<void>` — The value that was successfully selected.
 
 **Example**
 
@@ -716,15 +751,47 @@ await page.type(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str \| None` | No | `None` | CSS selector for the input. |
-| `value` | — | `str \| None` | No | `None` | The text to enter. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. Defaults to "fallback", which tries the selector first, then AI. |
-| `prompt` | — | `str \| None` | No | `None` | Natural language description of which input to type into. |
-| `totp_identifier` | — | `str \| None` | No | `None` | Identifier of the 2FA code to type, when `value` is a TOTP placeholder. |
-| `totp_url` | — | `str \| None` | No | `None` | URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder. |
-| `**kwargs` | — | `Any` | No | — | Playwright options such as `timeout`. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the input.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The text to enter.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback", which tries the selector first, then AI.
+
+Default: `'fallback'`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which input to type into.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier of the 2FA code to type, when `value` is a TOTP placeholder.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+Playwright options such as `timeout`.
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `str` — The value that was entered.
 
@@ -773,12 +840,27 @@ await page.hover(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str` | Yes | — | CSS selector for the element. |
-| `timeout` | — | `float` | No | `5000` | Maximum time to wait for the element, in milliseconds. |
-| `hold_seconds` | — | `float` | No | `0.0` | How long to keep the mouse over the element, in seconds. |
-| `intention` | — | `str \| None` | No | `None` | Description of why you are hovering, recorded with the action. |
+<ParamField path={"selector"} type={"str"} required>
+CSS selector for the element.
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for the element, in milliseconds.
+
+Default: `5000`
+</ParamField>
+
+<ParamField path={"hold_seconds"} type={"float"}>
+How long to keep the mouse over the element, in seconds.
+
+Default: `0.0`
+</ParamField>
+
+<ParamField path={"intention"} type={"str | None"}>
+Description of why you are hovering, recorded with the action.
+
+Default: `None`
+</ParamField>
 
 **Returns** `str` — The selector that was hovered.
 
@@ -827,12 +909,29 @@ await page.upload_file(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str \| None` | No | `None` | CSS selector for the file input. |
-| `files` | — | `str \| None` | No | `None` | URL of the file to upload. One file per call. |
-| `prompt` | — | `str \| None` | No | `None` | Natural language description of which file input to use. |
-| `ai` | — | `str \| None` | No | `'fallback'` | AI behavior mode. With the default "fallback", a selector-only call uploads through the selector. When a prompt is passed, the selector is tried first and AI then always runs the upload, using the selector only if it worked. |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the file input.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"files"} type={"str | None"}>
+URL of the file to upload. One file per call.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which file input to use.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. With the default "fallback", a selector-only call uploads through the selector. When a prompt is passed, the selector is tried first and AI then always runs the upload, using the selector only if it worked.
+
+Default: `'fallback'`
+</ParamField>
 
 **Returns** `str` — The file URL that was uploaded.
 
@@ -878,11 +977,21 @@ await page.keypress(keys: list[str], hold: bool = False, duration: float = 0) ->
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `keys` | — | `list[str]` | Yes | — | Keys to press, using Playwright key names. |
-| `hold` | — | `bool` | No | `False` | Hold the keys down for `duration` seconds instead of tapping them. |
-| `duration` | — | `float` | No | `0` | How long to hold the keys, in seconds, when `hold` is true. |
+<ParamField path={"keys"} type={"list[str]"} required>
+Keys to press, using Playwright key names.
+</ParamField>
+
+<ParamField path={"hold"} type={"bool"}>
+Hold the keys down for `duration` seconds instead of tapping them.
+
+Default: `False`
+</ParamField>
+
+<ParamField path={"duration"} type={"float"}>
+How long to hold the keys, in seconds, when `hold` is true.
+
+Default: `0`
+</ParamField>
 
 **Returns** `None`
 
@@ -924,10 +1033,13 @@ await page.scroll(scroll_x: int, scroll_y: int) -> None
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `scroll_x` | — | `int` | Yes | — | Pixels to scroll horizontally (negative scrolls left). |
-| `scroll_y` | — | `int` | Yes | — | Pixels to scroll vertically (negative scrolls up). |
+<ParamField path={"scroll_x"} type={"int"} required>
+Pixels to scroll horizontally (negative scrolls left).
+</ParamField>
+
+<ParamField path={"scroll_y"} type={"int"} required>
+Pixels to scroll vertically (negative scrolls up).
+</ParamField>
 
 **Returns** `None`
 
@@ -969,11 +1081,17 @@ await page.drag(start_x: int, start_y: int, path: list[tuple[int, int]]) -> None
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `start_x` | — | `int` | Yes | — | Horizontal start position in pixels. |
-| `start_y` | — | `int` | Yes | — | Vertical start position in pixels. |
-| `path` | — | `list[tuple[int, int]]` | Yes | — | Points `(x, y)` to drag through, ending where the mouse is released. |
+<ParamField path={"start_x"} type={"int"} required>
+Horizontal start position in pixels.
+</ParamField>
+
+<ParamField path={"start_y"} type={"int"} required>
+Vertical start position in pixels.
+</ParamField>
+
+<ParamField path={"path"} type={"list[tuple[int, int]]"} required>
+Points `(x, y)` to drag through, ending where the mouse is released.
+</ParamField>
 
 **Returns** `None`
 
@@ -1015,10 +1133,13 @@ await page.move(x: int, y: int) -> None
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `x` | — | `int` | Yes | — | Horizontal position in pixels from the left of the viewport. |
-| `y` | — | `int` | Yes | — | Vertical position in pixels from the top of the viewport. |
+<ParamField path={"x"} type={"int"} required>
+Horizontal position in pixels from the left of the viewport.
+</ParamField>
+
+<ParamField path={"y"} type={"int"} required>
+Vertical position in pixels from the top of the viewport.
+</ParamField>
 
 **Returns** `None`
 
@@ -1060,9 +1181,11 @@ await page.wait(seconds: float | None = None) -> None
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `seconds` | — | `float \| None` | No | `None` | How long to wait, in seconds. |
+<ParamField path={"seconds"} type={"float | None"}>
+How long to wait, in seconds.
+
+Default: `None`
+</ParamField>
 
 **Returns** `None`
 
@@ -1107,10 +1230,17 @@ await page.download_file(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `file_name` | — | `str \| None` | No | `None` | The original file name (for logging/reference). Defaults to UUID if empty. |
-| `download_url` | — | `str \| None` | No | `None` | The URL to download the file from. |
+<ParamField path={"file_name"} type={"str | None"}>
+The original file name (for logging/reference). Defaults to UUID if empty.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"download_url"} type={"str | None"}>
+The URL to download the file from.
+
+Default: `None`
+</ParamField>
 
 **Returns** `str` — The local file path where the file was saved.
 

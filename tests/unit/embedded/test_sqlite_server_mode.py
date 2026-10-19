@@ -193,7 +193,7 @@ async def test_sqlite_bootstrap_adds_attempt_columns_to_existing_tables(
     sqlite_bootstrap_db,
     patched_env_writes,
 ) -> None:
-    """Bootstrap adds the retry attempt columns to a database created before them, so ORM reads work again."""
+    """Bootstrap adds the retry attempt and task queue columns to a database created before them, so ORM reads work."""
     from sqlalchemy import select
 
     from skyvern.forge.api_app import _bootstrap_sqlite
@@ -202,6 +202,7 @@ async def test_sqlite_bootstrap_adds_attempt_columns_to_existing_tables(
     async with sqlite_bootstrap_db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN attempt_number")
+        await conn.exec_driver_sql("ALTER TABLE tasks DROP COLUMN task_queue")
         await conn.exec_driver_sql("ALTER TABLE workflow_run_blocks DROP COLUMN attempt_number")
 
     await _bootstrap_sqlite()

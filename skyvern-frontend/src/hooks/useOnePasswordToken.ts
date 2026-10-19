@@ -9,6 +9,16 @@ import {
 import { useToast } from "@/components/ui/use-toast";
 import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
+type ApiError = {
+  response?: { data?: { detail?: string } };
+  message?: string;
+};
+
+function extractApiErrorMessage(error: unknown, fallback: string): string {
+  const err = error as ApiError | null;
+  return err?.response?.data?.detail || err?.message || fallback;
+}
+
 export function useOnePasswordToken() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -44,11 +54,10 @@ export function useOnePasswordToken() {
       });
     },
     onError: (error: unknown) => {
-      const message =
-        (error as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ||
-        (error as Error)?.message ||
-        "Failed to update 1Password token";
+      const message = extractApiErrorMessage(
+        error,
+        "Failed to update 1Password token",
+      );
       toast({
         title: "Error",
         description: message,
@@ -72,6 +81,12 @@ export function useOnePasswordToken() {
     isError,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
+    createOrUpdateTokenError: createOrUpdateTokenMutation.isError
+      ? extractApiErrorMessage(
+          createOrUpdateTokenMutation.error,
+          "Failed to update 1Password token",
+        )
+      : null,
     clearToken: clearTokenMutation.mutate,
     isClearing: clearTokenMutation.isPending,
   };

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
+from fastapi import HTTPException
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import (
@@ -46,7 +47,6 @@ from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiryState,
     RecordedBlockState,
     RecordedRunState,
-    budget_run_denial,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -254,6 +254,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import (
@@ -376,6 +377,12 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
 COPILOT_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
+
+
+COPILOT_FOLDER_REFERENCE_ERROR = (
+    "This test run names a browser session, profile or workflow in a folder you cannot run; remove that reference "
+    "and try again. Execution was not started."
+)
 _PROPOSAL_BIND_REFUSED_KEY = "proposal_bind_refused"
 COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR = (
     "This request's workflow settings differ from the pending Copilot proposal's; "
@@ -2772,6 +2779,7 @@ async def _capture_and_store_post_run_page(
                     dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                     producer_browser_session_id=captured_frame.producer_browser_session_id,
                     session_binding=captured_frame.session_binding,
+                    viewport_css_px=captured_frame.viewport_css_px,
                 ),
                 captured_at=captured_frame.captured_at,
             )
@@ -3013,6 +3021,7 @@ async def _capture_dispatched_terminal_page_evidence(
                 dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
                 producer_browser_session_id=captured_frame.producer_browser_session_id,
                 session_binding=captured_frame.session_binding,
+                viewport_css_px=captured_frame.viewport_css_px,
             ),
             captured_at=captured_frame.captured_at,
         )
@@ -3172,6 +3181,11 @@ async def _bind_origin_run_redaction_registry(
     awaiting_runtime_secret_values = False
     credential_parameters: dict[str, Any] = {}
     for index, credential_id in enumerate(credential_ids):
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            ctx.organization_id,
+            credential_id,
+            workflow_run_id=workflow_run_id,
+        )
         try:
             db_credential = await app.DATABASE.credentials.get_credential(
                 credential_id,
@@ -3742,8 +3756,6 @@ async def _run_blocks_and_collect_debug(
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
-    if ctx.budget_expiry_state.drain_active:
-        return dict(budget_run_denial(ctx.budget_expiry_state))
     new_exit_prior_session_id = ctx.last_run_blocks_browser_session_id
     if new_exit and new_exit_prior_session_id is None:
         return {
@@ -4312,6 +4324,23 @@ async def _run_blocks_and_collect_debug(
         # The snapshot is soft-deleted once the run resolves so it never lingers as the latest version.
         # The persisted dispatch version (its own regenerated parameter ids) used for post-run output
         # mapping on the dispatch path; runtime_workflow / ctx.staged_workflow is left unmutated.
+        # The test run uses everything its definition names, so it gets the same reference check as a saved workflow.
+        # Its browser session is judged here too: only this live request knows who asked for the run.
+        try:
+            await app.AGENT_FUNCTION.enforce_folder_access_for_references(
+                get_request_principal(),
+                "workflow.run",
+                {
+                    **runtime_workflow.model_dump(exclude={"folder_id", "workflow_id", "workflow_permanent_id"}),
+                    "browser_session_id": run_session_id,
+                },
+            )
+        except HTTPException:
+            return {
+                "ok": False,
+                "error": COPILOT_FOLDER_REFERENCE_ERROR,
+                "data": {"workflow_run_id": None, "failure_reason": COPILOT_FOLDER_REFERENCE_ERROR, "blocks": []},
+            }
         dispatch_workflow: Workflow | None = None
         if dispatch_to_worker or snapshot.provenance == "staged" or runtime_workflow != snapshot.workflow:
             # Persist the wrapped runtime workflow as a real new version (with its own parameter /
@@ -4473,6 +4502,7 @@ async def _run_blocks_and_collect_debug(
                 ),
                 copilot_session_id=ctx.workflow_copilot_chat_id,
                 created_by="copilot",
+                requested_by=requesting_user_id(ctx.organization_id),
             )
         except (BrowserSessionClosed, BrowserSessionStartupTimeout) as refused:
             # Submission refuses a session that has already ended, so no run exists to carry the
@@ -4556,7 +4586,7 @@ async def _run_blocks_and_collect_debug(
                         conflict.reason,
                         await adopt_stored_workflow_candidate(ctx) if ctx_holds_call_token else "kept",
                     )
-                except Exception:  # noqa: BLE001 - any custody failure must stop dispatch.
+                except Exception:
                     bind_unexpected = True
                     LOG.warning(
                         "copilot candidate run bind failed",
@@ -7005,9 +7035,7 @@ def _is_undispatched_run(result: Mapping[str, object]) -> bool:
 def _skips_build_test_finalize(result: Mapping[str, object]) -> bool:
     data = result.get("data")
     return (
-        isinstance(data, dict)
-        and data.get("run_dispatched") is False
-        and (data.get("budget_expired") is True or data.get(_PROPOSAL_BIND_REFUSED_KEY) is True)
+        isinstance(data, dict) and data.get("run_dispatched") is False and data.get(_PROPOSAL_BIND_REFUSED_KEY) is True
     )
 
 

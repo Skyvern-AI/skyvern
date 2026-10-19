@@ -348,6 +348,36 @@ class ObserverRepository(BaseRepository):
                 return Thought.model_validate(thought_obj)
             raise NotFoundError(f"Thought {thought_id}")
 
+    @db_operation("update_task_v2_status_if_not_final")
+    async def update_task_v2_status_if_not_final(
+        self,
+        task_v2_id: str,
+        organization_id: str,
+        status: TaskV2Status,
+        *,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        now = naive_utc_now()
+        values: dict[str, Any] = {"status": status.value, "modified_at": now}
+        if status.is_final():
+            values["finished_at"] = func.coalesce(TaskV2Model.finished_at, now)
+        if failure_category is not None:
+            values["failure_category"] = failure_category
+        async with self.Session() as session:
+            result = await session.execute(
+                update(TaskV2Model)
+                .where(
+                    TaskV2Model.observer_cruise_id == task_v2_id,
+                    TaskV2Model.organization_id == organization_id,
+                    TaskV2Model.status.in_([s.value for s in TaskV2Status if not s.is_final()]),
+                )
+                .values(**values)
+                .returning(TaskV2Model.observer_cruise_id)
+            )
+            won = result.scalar_one_or_none() is not None
+            await session.commit()
+            return won
+
     @db_operation("update_task_v2")
     async def update_task_v2(
         self,
@@ -363,16 +393,19 @@ class ObserverRepository(BaseRepository):
         organization_id: str | None = None,
         webhook_failure_reason: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> TaskV2:
         async with self.Session() as session:
-            task_v2 = (
-                await session.scalars(
-                    select(TaskV2Model)
-                    .filter_by(observer_cruise_id=task_v2_id)
-                    .filter_by(organization_id=organization_id)
-                )
-            ).first()
+            query = (
+                select(TaskV2Model).filter_by(observer_cruise_id=task_v2_id).filter_by(organization_id=organization_id)
+            )
+            if keep_final_status:
+                query = query.with_for_update()
+            task_v2 = (await session.scalars(query)).first()
             if task_v2:
+                if keep_final_status and TaskV2Status(task_v2.status).is_final():
+                    return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
                 if status:
                     task_v2.status = status
                     if status == TaskV2Status.queued and task_v2.queued_at is None:

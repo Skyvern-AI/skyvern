@@ -35,6 +35,7 @@ import json
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Annotated, Any, NoReturn
 
 import pyotp
@@ -42,18 +43,28 @@ import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
+from onepassword.types import Item
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
-from skyvern.exceptions import BrowserProfileNotFound
+from skyvern.exceptions import (
+    BrowserProfileNotFound,
+    CredentialSourceNotConfiguredError,
+)
 from skyvern.exceptions import HttpException as SkyvernHttpException
-from skyvern.exceptions import SkyvernHTTPException
+from skyvern.exceptions import (
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+    OnePasswordSessionExpiredError,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
-from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -75,6 +86,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
+    ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT,
     BitwardenItemsResponse,
     CancelTestResponse,
     CreateCredentialRequest,
@@ -84,11 +96,17 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     CreditCardCredentialResponse,
+    ImportOnePasswordCredentialsRequest,
+    ImportOnePasswordCredentialsResponse,
     NonEmptyPasswordCredential,
+    OnePasswordCredentialImportResult,
+    OnePasswordCredentialRefreshResult,
     OnePasswordItemOverview,
     OnePasswordItemsResponse,
     PasswordCredential,
     PasswordCredentialResponse,
+    RefreshOnePasswordCredentialsRequest,
+    RefreshOnePasswordCredentialsResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
     TestCredentialResponse,
@@ -100,6 +118,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredentialResponse,
+    AzureOrganizationAuthToken,
     BitwardenCredentialResponse,
     BitwardenCredentialSafe,
     BitwardenOrganizationAuthToken,
@@ -110,9 +129,12 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateCustomCredentialServiceConfigRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
+    CustomCredentialServiceConfig,
     CustomCredentialServiceConfigResponse,
+    CustomCredentialServiceStatusResponse,
     OnePasswordTokenStatusResponse,
     Organization,
+    OrganizationAuthToken,
     OrganizationAuthTokenMetadata,
     TestConnectionResponse,
 )
@@ -133,6 +155,8 @@ from skyvern.forge.sdk.services.credentials import (
     parse_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -164,9 +188,13 @@ from skyvern.services.otp_service import (
 )
 from skyvern.services.run_service import cancel_workflow_run
 from skyvern.utils.email_validation import normalize_identifier_if_email
+from skyvern.utils.phone_validation import normalize_identifier
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
+_ONEPASSWORD_METADATA_TIMEOUT_SECONDS = 20.0
+# shortcut: caps refresh at 5 in-flight vault requests; raise only after validating provider rate limits.
+_ONEPASSWORD_MAX_CONCURRENT_VAULT_REQUESTS = 5
 
 # Strong references to background tasks to prevent GC before completion.
 # See: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
@@ -199,6 +227,9 @@ _SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
     "or full otpauth:// URI from the website's 2FA setup screen."
 )
 CREDENTIAL_WRITE_CONFLICT_DETAIL = "Credential was modified by another request. Please retry."
+# Reserved: the settings forms echo this mask back, so a submitted secret equal to it means "keep the stored one".
+# ponytail: value-based marker; switch to an explicit keep-secret field if a provider ever issues this as a secret.
+_REDACTED_ORG_CREDENTIAL_SECRET = "********"
 _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 
 
@@ -206,6 +237,49 @@ _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 class _TotpCodePreviewCacheEntry:
     code: str
     expires_at: int
+
+
+async def _should_redact_org_credential_secrets(organization_id: str) -> bool:
+    return await app.AGENT_FUNCTION.should_redact_organization_credential_secrets(
+        get_request_principal(), organization_id
+    )
+
+
+async def _restore_redacted_custom_credential_secret(
+    organization_id: str,
+    config: CustomCredentialServiceConfig,
+) -> CustomCredentialServiceConfig:
+    if config.api_token != _REDACTED_ORG_CREDENTIAL_SECRET:
+        return config
+    existing = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.custom_credential_service.value,
+    )
+    if existing is None:
+        raise HTTPException(status_code=409, detail="Credential changed; refresh and enter the secret again")
+    stored_config = json.loads(existing.token)
+    if not isinstance(stored_config, dict) or not isinstance(stored_config.get("api_token"), str):
+        raise ValueError("Stored custom credential configuration has no API token")
+    if stored_config.get("api_base_url") != config.api_base_url:
+        raise HTTPException(status_code=409, detail="Credential service URL changed; enter the secret again")
+    return config.model_copy(update={"api_token": stored_config["api_token"]})
+
+
+def _redact_azure_client_secret(token: AzureOrganizationAuthToken) -> AzureOrganizationAuthToken:
+    return token.model_copy(
+        update={"credential": token.credential.model_copy(update={"client_secret": _REDACTED_ORG_CREDENTIAL_SECRET})}
+    )
+
+
+def _redact_custom_credential_secret(token: OrganizationAuthToken) -> OrganizationAuthToken:
+    try:
+        config = json.loads(token.token)
+    except (TypeError, json.JSONDecodeError):
+        config = None
+    if not isinstance(config, dict) or not isinstance(config.get("api_token"), str):
+        return token.model_copy(update={"token": _REDACTED_ORG_CREDENTIAL_SECRET})
+    config["api_token"] = _REDACTED_ORG_CREDENTIAL_SECRET
+    return token.model_copy(update={"token": json.dumps(config)})
 
 
 _TOTP_CODE_PREVIEW_CACHE: dict[tuple[str, str], _TotpCodePreviewCacheEntry] = {}
@@ -480,6 +554,34 @@ async def send_totp_code(
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(data.workflow_run_id, curr_org.organization_id)
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
+    workflow_references = {
+        (kind, value)
+        for kind, value in (
+            ("task_id", data.task_id),
+            ("workflow_id", data.workflow_id),
+            ("workflow_run_id", data.workflow_run_id),
+        )
+        if value is not None
+    }
+    if await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id) and workflow_references:
+        accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
+            get_request_principal(), "workflow_run.update", workflow_references
+        )
+        if workflow_references - accessible_references:
+            raise HTTPException(status_code=403, detail="Workflow folder access denied.")
+    if await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id):
+        credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
+            {totp_identifier}, curr_org.organization_id
+        )
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.use",
+            {
+                ("credential_id", credential_id)
+                for credential_ids in credential_ids_by_identifier.values()
+                for credential_id in credential_ids
+            },
+        )
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content)
     otp_parse_skipped_for_insufficient_credits = False
@@ -600,16 +702,81 @@ async def get_totp_codes(
         description="Maximum number of codes to return.",
     ),
 ) -> list[TOTPCode]:
-    codes = await app.DATABASE.otp.get_recent_otp_codes(
-        organization_id=curr_org.organization_id,
-        limit=limit,
-        valid_lifespan_minutes=None,
-        otp_type=otp_type,
-        workflow_run_id=workflow_run_id,
-        totp_identifier=totp_identifier,
-    )
+    principal = get_request_principal()
+    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
+    if (workflow_restricted or credential_restricted) and principal is None:
+        return []
 
-    return codes
+    restricted = workflow_restricted or credential_restricted
+    page_size = max(limit, 50) if restricted else limit
+    # shortcut: scan at most 1,000 OTPs; return 503 for incomplete results, use SQL ACL filtering to search older codes.
+    scan_limit = min(page_size * 10, 1_000) if restricted else limit
+    codes: list[TOTPCode] = []
+    offset = 0
+    while len(codes) < limit and offset < scan_limit:
+        page_limit = min(page_size, scan_limit - offset)
+        page = await app.DATABASE.otp.get_recent_otp_codes(
+            organization_id=curr_org.organization_id,
+            limit=page_limit,
+            offset=offset,
+            valid_lifespan_minutes=None,
+            otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
+            totp_identifier=totp_identifier,
+        )
+        if not page:
+            break
+        page_length = len(page)
+        offset += page_length
+
+        if workflow_restricted:
+            references_by_code = {
+                code.totp_code_id: {
+                    (kind, value)
+                    for kind, value in (
+                        ("workflow_id", code.workflow_id),
+                        ("workflow_run_id", code.workflow_run_id),
+                        ("task_id", code.task_id),
+                    )
+                    if value is not None
+                }
+                for code in page
+            }
+            accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
+                principal, "workflow_run.read", set().union(*references_by_code.values())
+            )
+            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+
+        if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
+            credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
+                {normalize_identifier(code.totp_identifier) for code in page}, curr_org.organization_id
+            )
+            credential_ids = set().union(*credential_ids_by_identifier.values())
+            allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+                principal, "credential.use", credential_ids
+            )
+            page = [
+                code
+                for code in page
+                if (
+                    (linked_ids := credential_ids_by_identifier.get(normalize_identifier(code.totp_identifier))) is None
+                    and (code.workflow_id or code.workflow_run_id or code.task_id)
+                )
+                or (linked_ids is not None and linked_ids <= allowed_credential_ids)
+            ]
+
+        codes.extend(page)
+        if page_length < page_limit:
+            break
+
+    if offset >= scan_limit and len(codes) < limit:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OTP search reached its access scan limit; add a filter and retry.",
+        )
+
+    return codes[:limit]
 
 
 async def _validate_credential_browser_profile_id(
@@ -632,10 +799,13 @@ async def _validate_credential_browser_profile_id(
             status_code=400,
             detail="A credential can only link a plain browser profile, not a workflow-managed one.",
         )
-    owners = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
-        browser_profile_id=browser_profile_id, organization_id=organization_id
+    links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+        {browser_profile_id}, organization_id
     )
-    if any(owner.credential_id != current_credential_id for owner in owners):
+    if any(
+        credential_id != current_credential_id
+        for credential_id, _folder_id in links_by_profile.get(browser_profile_id, [])
+    ):
         raise HTTPException(
             status_code=400,
             detail="This browser profile is already linked to another credential.",
@@ -1098,6 +1268,7 @@ async def test_login(
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
+            build_source=WorkflowBuildSource.internal,
         )
 
         credential_proxy_session_id = getattr(credential, "proxy_session_id", None)
@@ -1293,6 +1464,7 @@ async def test_credential(
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
+            build_source=WorkflowBuildSource.internal,
         )
 
         # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
@@ -1419,6 +1591,22 @@ def _humanize_test_failure(raw_reason: str | None) -> str:
     return "The login test was unsuccessful. Please verify your credentials and the login URL, then try again."
 
 
+async def _get_credential_test_run(credential_id: str, workflow_run_id: str, organization_id: str) -> Any:
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    if workflow_run is None:
+        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    parameters = await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id)
+    if not any(
+        workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+        and run_parameter.value == credential_id
+        for workflow_parameter, run_parameter in parameters
+    ):
+        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    return workflow_run
+
+
 @base_router.get(
     "/credentials/{credential_id}/test/{workflow_run_id}",
     response_model=TestCredentialStatusResponse,
@@ -1450,12 +1638,7 @@ async def get_test_credential_status(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
-
-    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-        workflow_run_id=workflow_run_id, organization_id=organization_id
-    )
-    if not workflow_run:
-        raise HTTPException(status_code=404, detail=f"Workflow run {workflow_run_id} not found")
+    workflow_run = await _get_credential_test_run(credential_id, workflow_run_id, organization_id)
 
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=organization_id
@@ -1561,6 +1744,7 @@ async def cancel_credential_test(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CancelTestResponse:
     organization_id = current_org.organization_id
+    await _get_credential_test_run(credential_id, workflow_run_id, organization_id)
 
     LOG.info(
         "Canceling credential test",
@@ -1968,6 +2152,8 @@ async def update_credential(
     )
     if not existing_credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+    if existing_credential.vault_type == CredentialVaultType.ONEPASSWORD:
+        raise HTTPException(status_code=405, detail="Updating 1Password-backed credentials is not supported")
 
     requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
         credential=data.credential,
@@ -2137,18 +2323,73 @@ async def delete_credential(
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"credential.delete"}))),
 ) -> None:
     await delete_organization_credential(current_org.organization_id, credential_id, background_tasks)
 
 
+TEMP_CREDENTIAL_CLEANUP_WINDOW = timedelta(hours=24)
+
+
+@legacy_base_router.delete(
+    "/credentials/{credential_id}/temporary",
+    status_code=204,
+    summary="Delete a recently created credential",
+    description="Deletes only a credential created by the current user in the last 24 hours.",
+    tags=["Credentials"],
+    include_in_schema=False,
+)
+@legacy_base_router.delete(
+    "/credentials/{credential_id}/temporary/",
+    status_code=204,
+    include_in_schema=False,
+)
+async def delete_temporary_credential(
+    background_tasks: BackgroundTasks,
+    credential_id: str = Path(..., description="The unique identifier of the credential to clean up"),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    principal: RequestPrincipal | None = Depends(get_request_principal),
+) -> None:
+    synthetic_id = synthetic_user_id(current_org.organization_id)
+    # This endpoint is Member-only even while broad credential enforcement is dormant.
+    if (
+        principal is None
+        or principal.organization_id != current_org.organization_id
+        or principal.user_id is None
+        or principal.user_id == synthetic_id
+        or principal.org_role not in {"org:member", "member"}
+    ):
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+    await delete_organization_credential(
+        current_org.organization_id,
+        credential_id,
+        background_tasks,
+        expected_created_by=principal.user_id,
+    )
+
+
+def _is_recent_credential_created_by(credential: Credential, user_id: str) -> bool:
+    created_at = to_naive_utc(credential.created_at)
+    if credential.created_by != user_id or created_at is None:
+        return False
+    age = naive_utc_now() - created_at
+    return timedelta(0) <= age <= TEMP_CREDENTIAL_CLEANUP_WINDOW
+
+
 async def delete_organization_credential(
-    organization_id: str, credential_id: str, background_tasks: BackgroundTasks
+    organization_id: str,
+    credential_id: str,
+    background_tasks: BackgroundTasks,
+    *,
+    expected_created_by: str | None = None,
 ) -> None:
     """Delete one credential the organization owns; raises HTTPException 404, 409, 400 or 502 on refusal."""
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=organization_id
     )
     if not credential:
+        raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+    if expected_created_by is not None and not _is_recent_credential_created_by(credential, expected_created_by):
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
     requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
@@ -2167,6 +2408,10 @@ async def delete_organization_credential(
             credential_id=credential_id, organization_id=organization_id
         )
         if not latest_credential:
+            raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+        if expected_created_by is not None and not _is_recent_credential_created_by(
+            latest_credential, expected_created_by
+        ):
             raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
         if not requires_write_lock and (
             await _write_lock_decision_is_stale(
@@ -2266,7 +2511,12 @@ async def delete_organization_credential(
             )
 
     _clear_cached_totp_code_preview(organization_id=organization_id, credential_id=credential_id)
-    await record_request_audit_event(organization_id, "credential.delete", "credential", credential_id)
+    await record_request_audit_event(
+        organization_id,
+        "credential.temporary.delete" if expected_created_by is not None else "credential.delete",
+        "credential",
+        credential_id,
+    )
 
 
 @base_router.get(
@@ -2329,6 +2579,15 @@ async def get_credential_totp_code(
             detail="Custom credential service is not configured for this organization",
         ) from e
     except Exception as e:
+        if vault_type == CredentialVaultType.ONEPASSWORD:
+            http_error = _onepassword_error_response(e, fallback_detail="Unable to retrieve credential from vault")
+            if http_error.status_code == 500:
+                LOG.exception(
+                    "Failed to retrieve credential item for TOTP code preview",
+                    credential_id=credential_id,
+                    organization_id=current_org.organization_id,
+                )
+            raise http_error from e
         LOG.exception(
             "Failed to retrieve credential item for TOTP code preview",
             credential_id=credential_id,
@@ -2487,6 +2746,10 @@ async def get_credentials(
     SECURITY: Like ``get_credential``, this endpoint never returns raw secret
     material. See the module docstring for the full security invariant.
     """
+    principal = get_request_principal()
+    allowed_folder_ids = (
+        await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+    )
     credentials = await app.DATABASE.credentials.get_credentials(
         current_org.organization_id,
         page=page,
@@ -2495,6 +2758,7 @@ async def get_credentials(
         credential_type=credential_type.value if isinstance(credential_type, CredentialType) else None,
         search=search if isinstance(search, str) else None,
         folder_id=folder_id if isinstance(folder_id, str) else None,
+        allowed_folder_ids=allowed_folder_ids,
     )
     return [_convert_to_response(credential) for credential in credentials]
 
@@ -2591,11 +2855,16 @@ async def get_credential_folders(
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> list[CredentialFolder]:
+    principal = get_request_principal()
+    allowed_folder_ids = (
+        await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+    )
     folders = await app.DATABASE.credential_folders.get_credential_folders(
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         search_query=search,
+        allowed_folder_ids=allowed_folder_ids,
     )
 
     if folders:
@@ -2672,10 +2941,13 @@ async def delete_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> dict:
-    success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
-        folder_id=folder_id,
-        organization_id=current_org.organization_id,
-    )
+    try:
+        success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
+            folder_id=folder_id,
+            organization_id=current_org.organization_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not success:
         raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
 
@@ -2705,11 +2977,24 @@ async def update_credential_folder_assignment(
     data: UpdateCredentialFolderRequest = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
+    principal = get_request_principal()
+
+    async def reauthorize_move(session: AsyncSession) -> None:
+        if principal is None:
+            return
+        references = {("credential_id", credential_id)}
+        if data.folder_id:
+            references.add(("folder_id", data.folder_id))
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            principal, "credential.move", references, session=session
+        )
+
     try:
         credential = await app.DATABASE.credential_folders.set_credential_folder(
             credential_id=credential_id,
             organization_id=current_org.organization_id,
             folder_id=data.folder_id,
+            authorize_move=reauthorize_move,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2742,6 +3027,7 @@ async def update_credential_folder_assignment(
 )
 async def get_onepassword_token(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.read"}))),
 ) -> CreateOnePasswordTokenResponse:
     """
     Get the current OnePassword service account token for the organization.
@@ -2801,6 +3087,56 @@ async def get_onepassword_token_status(
         ) from e
 
 
+def _onepassword_error_response(error: Exception, *, fallback_detail: str) -> HTTPException:
+    if isinstance(error, CredentialSourceNotConfiguredError):
+        return HTTPException(status_code=400, detail=str(error))
+    if isinstance(error, TimeoutError):
+        return HTTPException(
+            status_code=502,
+            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+        )
+    if isinstance(error, (OnePasswordRateLimitError, RateLimitExceededException)):
+        return HTTPException(
+            status_code=429,
+            detail="1Password rate limit exceeded. Please retry in a few minutes.",
+        )
+    if isinstance(error, (OnePasswordSessionExpiredError, DesktopSessionExpiredException)):
+        return HTTPException(
+            status_code=400,
+            detail="Your 1Password session appears to be expired. Please update your token in Settings and try again.",
+        )
+    if isinstance(error, OnePasswordServiceUnavailableError):
+        return HTTPException(
+            status_code=502,
+            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+        )
+
+    raw = str(error)
+    if is_onepassword_credential_error(raw):
+        return HTTPException(
+            status_code=400,
+            detail=(
+                "Your 1Password service account token appears to be invalid or expired. "
+                "Please update it in Settings and try again."
+            ),
+        )
+    if extract_onepassword_upstream_5xx_status(raw) is not None:
+        return HTTPException(
+            status_code=502,
+            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
+        )
+    return HTTPException(status_code=500, detail=fallback_detail)
+
+
+async def _validate_onepassword_service_account_token(token: str) -> None:
+    client = await OnePasswordClient.authenticate(
+        auth=token,
+        integration_name="Skyvern",
+        integration_version="v1.0.0",
+    )
+    await client.vaults.list()
+
+
 @base_router.get(
     "/credentials/onepassword/items",
     response_model=OnePasswordItemsResponse,
@@ -2816,7 +3152,16 @@ async def get_onepassword_token_status(
 async def list_onepassword_items(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> OnePasswordItemsResponse:
-    resolution = await resolve_onepassword_token(current_org.organization_id)
+    try:
+        resolution = await resolve_onepassword_token(current_org.organization_id)
+    except Exception:
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="internal",
+        )
+        raise
     # Org-scoped only: never fall back to the global OP_SERVICE_ACCOUNT_TOKEN here. In a shared
     # deployment that would let any org without its own token browse the instance/global account's
     # 1Password item metadata. (Runtime resolution may still use the global token for an item the
@@ -2841,6 +3186,90 @@ async def list_onepassword_items(
             timeout=20.0,
         )
 
+    except TimeoutError as e:
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="timeout",
+        )
+        LOG.warning(
+            "Timed out while listing 1Password items",
+            organization_id=current_org.organization_id,
+            exc_info=True,
+        )
+        raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+    except RateLimitExceededException as e:
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="rate_limited",
+        )
+        LOG.warning(
+            "1Password rate limit exceeded while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+    except DesktopSessionExpiredException as e:
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="invalid_token",
+        )
+        LOG.warning(
+            "1Password session expired while listing items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+        )
+        raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+    except Exception as e:
+        raw = str(e)
+        # The 1Password SDK exposes these as plain string exceptions; credential
+        # evidence takes precedence over embedded status text.
+        if is_onepassword_credential_error(raw):
+            await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+                organization_id=current_org.organization_id,
+                event="onepassword.items_loaded",
+                success=False,
+                error_class="invalid_token",
+            )
+            LOG.warning(
+                "Invalid 1Password service account token while listing items",
+                organization_id=current_org.organization_id,
+                error=raw,
+            )
+            raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+        upstream_status = extract_onepassword_upstream_5xx_status(raw)
+        if upstream_status is not None:
+            await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+                organization_id=current_org.organization_id,
+                event="onepassword.items_loaded",
+                success=False,
+                error_class="upstream",
+            )
+            LOG.warning(
+                "1Password is temporarily unavailable while listing items",
+                organization_id=current_org.organization_id,
+                upstream_status=upstream_status,
+            )
+            raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+        LOG.error(
+            "Unexpected failure while listing 1Password items",
+            organization_id=current_org.organization_id,
+            exc_info=True,
+        )
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="upstream",
+        )
+        raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
+
+    try:
         items: list[OnePasswordItemOverview] = []
         for vault, vault_items in zip(vaults, vault_items_by_vault, strict=True):
             if isinstance(vault_items, BaseException):
@@ -2863,74 +3292,359 @@ async def list_onepassword_items(
                         url=item.websites[0].url if item.websites else None,
                     )
                 )
+        response = OnePasswordItemsResponse(configured=True, items=items, source="organization")
+    except Exception as e:
+        LOG.exception(
+            "Failed to convert 1Password items into response metadata",
+            organization_id=current_org.organization_id,
+        )
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.items_loaded",
+            success=False,
+            error_class="internal",
+        )
+        raise _onepassword_error_response(e, fallback_detail="Failed to list 1Password items.") from e
 
-        return OnePasswordItemsResponse(configured=True, items=items, source="organization")
-    except asyncio.TimeoutError as e:
-        LOG.warning(
-            "Timed out while listing 1Password items",
-            organization_id=current_org.organization_id,
-            exc_info=True,
-        )
+    await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+        organization_id=current_org.organization_id,
+        event="onepassword.items_loaded",
+        success=True,
+        item_count=len(items),
+    )
+    return response
+
+
+async def _organization_onepassword_token(organization_id: str) -> str:
+    resolution = await resolve_onepassword_token(organization_id)
+    if resolution.source != "organization" or resolution.token is None:
         raise HTTPException(
-            status_code=502,
-            detail="1Password is temporarily unavailable. Please retry in a few minutes.",
-        ) from e
-    except RateLimitExceededException as e:
-        LOG.warning(
-            "1Password rate limit exceeded while listing items",
-            organization_id=current_org.organization_id,
-            error=str(e),
+            status_code=400,
+            detail="An organization-level 1Password service account token is required.",
         )
-        raise HTTPException(
-            status_code=429,
-            detail="1Password rate limit exceeded. Please retry in a few minutes.",
-        ) from e
-    except DesktopSessionExpiredException as e:
-        LOG.warning(
-            "1Password session expired while listing items",
-            organization_id=current_org.organization_id,
-            error=str(e),
+    return resolution.token
+
+
+async def _onepassword_metadata_by_vault(
+    token: str, vault_ids: set[str], *, fallback_detail: str
+) -> dict[str, list[Item]]:
+    try:
+
+        async def list_metadata() -> dict[str, list[Item]]:
+            client = await OnePasswordClient.authenticate(
+                auth=token,
+                integration_name="Skyvern",
+                integration_version="v1.0.0",
+            )
+            semaphore = asyncio.Semaphore(_ONEPASSWORD_MAX_CONCURRENT_VAULT_REQUESTS)
+
+            async def list_vault(vault_id: str) -> list[Item]:
+                async with semaphore:
+                    # items.list returns overviews; never fetch item fields during import or refresh.
+                    return await client.items.list(vault_id)
+
+            sorted_vault_ids = sorted(vault_ids)
+            vault_items = await asyncio.gather(*(list_vault(vault_id) for vault_id in sorted_vault_ids))
+            return dict(zip(sorted_vault_ids, vault_items, strict=True))
+
+        return await asyncio.wait_for(list_metadata(), timeout=_ONEPASSWORD_METADATA_TIMEOUT_SECONDS)
+    except Exception as error:
+        raise _onepassword_error_response(error, fallback_detail=fallback_detail) from error
+
+
+async def _authorize_onepassword_folder(organization_id: str, folder_id: str | None, action: str) -> None:
+    if folder_id is None:
+        return
+    if await app.DATABASE.credential_folders.get_credential_folder(folder_id, organization_id) is None:
+        raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        get_request_principal(), action, {("folder_id", folder_id)}
+    )
+
+
+def _onepassword_item_credential_type(item: Item) -> CredentialType | None:
+    category = "".join(character for character in item.category.value.casefold() if character.isalnum())
+    return {
+        "login": CredentialType.PASSWORD,
+        "creditcard": CredentialType.CREDIT_CARD,
+    }.get(category)
+
+
+def _onepassword_item_url(item: Item) -> str | None:
+    return item.websites[0].url if item.websites else None
+
+
+@base_router.post(
+    "/credentials/onepassword/import",
+    response_model=ImportOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/onepassword/import/",
+    response_model=ImportOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+async def import_onepassword_credentials(
+    background_tasks: BackgroundTasks,
+    data: Annotated[ImportOnePasswordCredentialsRequest, Body()],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+) -> ImportOnePasswordCredentialsResponse:
+    organization_id = current_org.organization_id
+    await _authorize_onepassword_folder(organization_id, data.folder_id, "credential.create")
+    item_keys = sorted({(item.vault_id, item.item_id) for item in data.items})
+    existing = await app.DATABASE.credentials.get_onepassword_credentials(
+        organization_id,
+        item_keys=item_keys,
+    )
+    existing_by_key = {(credential.vault_id, credential.item_id): credential for credential in existing}
+    set_folder_on_update = "folder_id" in data.model_fields_set
+    if existing:
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.update",
+            {("credential_id", credential.credential_id) for credential in existing},
         )
+
+    token = await _organization_onepassword_token(organization_id)
+    metadata_by_vault = await _onepassword_metadata_by_vault(
+        token,
+        {vault_id for vault_id, _item_id in item_keys},
+        fallback_detail="Failed to import 1Password items.",
+    )
+    items_by_vault = {
+        vault_id: {item.id: item for item in vault_items} for vault_id, vault_items in metadata_by_vault.items()
+    }
+
+    async def authorize_upsert(session: AsyncSession, credential_id: str) -> None:
+        if data.folder_id is not None:
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.create", {("folder_id", data.folder_id)}, session=session
+            )
+        references = {("credential_id", credential_id)}
+        if set_folder_on_update and data.folder_id is not None:
+            references.add(("folder_id", data.folder_id))
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.move" if set_folder_on_update else "credential.update",
+            references,
+            session=session,
+        )
+
+    results: list[OnePasswordCredentialImportResult] = []
+    for selection in data.items:
+        item = items_by_vault.get(selection.vault_id, {}).get(selection.item_id)
+        if item is None:
+            results.append(
+                OnePasswordCredentialImportResult(
+                    vault_id=selection.vault_id,
+                    item_id=selection.item_id,
+                    status="skipped",
+                    reason="Item not found in the 1Password vault.",
+                )
+            )
+            continue
+        credential_type = _onepassword_item_credential_type(item)
+        if credential_type is None:
+            results.append(
+                OnePasswordCredentialImportResult(
+                    vault_id=selection.vault_id,
+                    item_id=selection.item_id,
+                    status="skipped",
+                    reason=f"Unsupported 1Password category: {item.category.value}",
+                )
+            )
+            continue
+
+        credential, created = await app.DATABASE.credentials.upsert_onepassword_credential_metadata(
+            organization_id=organization_id,
+            vault_id=selection.vault_id,
+            item_id=selection.item_id,
+            name=item.title,
+            credential_type=credential_type,
+            tested_url=_onepassword_item_url(item),
+            folder_id=data.folder_id,
+            created_by=current_user_id,
+            set_folder_on_update=set_folder_on_update,
+            authorize_update=authorize_upsert,
+        )
+        if created:
+            await record_request_audit_event(
+                organization_id, "credential.create", "credential", credential.credential_id
+            )
+            background_tasks.add_task(
+                app.AGENT_FUNCTION.on_credential_saved,
+                organization_id=organization_id,
+                credential_id=credential.credential_id,
+                credential_type=credential_type,
+                actor_user_id=current_user_id,
+                vault=CredentialVaultType.ONEPASSWORD.value,
+            )
+        else:
+            changed_fields = ["name", "credential_type", "tested_url"]
+            previous = existing_by_key.get((selection.vault_id, selection.item_id))
+            if set_folder_on_update and previous is not None and previous.folder_id != data.folder_id:
+                changed_fields.append("folder_id")
+            await record_request_audit_event(
+                organization_id,
+                "credential.update",
+                "credential",
+                credential.credential_id,
+                changed_fields=tuple(changed_fields),
+            )
+        results.append(
+            OnePasswordCredentialImportResult(
+                vault_id=selection.vault_id,
+                item_id=selection.item_id,
+                status="imported" if created else "updated",
+            )
+        )
+
+    return ImportOnePasswordCredentialsResponse(results=results)
+
+
+@base_router.post(
+    "/credentials/onepassword/refresh",
+    response_model=RefreshOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/onepassword/refresh/",
+    response_model=RefreshOnePasswordCredentialsResponse,
+    include_in_schema=False,
+)
+async def refresh_onepassword_credentials(
+    data: Annotated[RefreshOnePasswordCredentialsRequest, Body()],
+    current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+) -> RefreshOnePasswordCredentialsResponse:
+    organization_id = current_org.organization_id
+    await _authorize_onepassword_folder(organization_id, data.folder_id, "credential.update")
+    folder_id_is_null = "folder_id" in data.model_fields_set and data.folder_id is None
+    credentials = await app.DATABASE.credentials.get_onepassword_credentials(
+        organization_id,
+        folder_id=data.folder_id,
+        folder_id_is_null=folder_id_is_null,
+        limit=ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT + 1,
+    )
+    if not credentials:
+        return RefreshOnePasswordCredentialsResponse(refreshed=0, stale=0, skipped=0, results=[])
+
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        get_request_principal(),
+        "credential.update",
+        {("credential_id", credential.credential_id) for credential in credentials},
+    )
+    if len(credentials) > ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Your 1Password session appears to be expired. Please update your token in Settings and try again."
+                f"More than {ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT} 1Password credentials match; "
+                "scope the refresh to smaller folders and try again."
             ),
-        ) from e
-    except Exception as e:
-        raw = str(e)
-        # The 1Password SDK exposes these as plain string exceptions; credential
-        # evidence takes precedence over embedded status text.
-        if is_onepassword_credential_error(raw):
-            LOG.warning(
-                "Invalid 1Password service account token while listing items",
-                organization_id=current_org.organization_id,
-                error=raw,
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Your 1Password service account token appears to be invalid or expired. "
-                    "Please update it in Settings and try again."
-                ),
-            ) from e
-        upstream_status = extract_onepassword_upstream_5xx_status(raw)
-        if upstream_status is not None:
-            LOG.warning(
-                "1Password is temporarily unavailable while listing items",
-                organization_id=current_org.organization_id,
-                upstream_status=upstream_status,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="1Password is temporarily unavailable. Please retry in a few minutes.",
-            ) from e
-        LOG.error(
-            "Unexpected failure while listing 1Password items",
-            organization_id=current_org.organization_id,
-            exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="Failed to list 1Password items.") from e
+    token = await _organization_onepassword_token(organization_id)
+    metadata_by_vault = await _onepassword_metadata_by_vault(
+        token,
+        {credential.vault_id for credential in credentials if credential.vault_id is not None},
+        fallback_detail="Failed to refresh 1Password items.",
+    )
+    items_by_vault = {
+        vault_id: {item.id: item for item in vault_items} for vault_id, vault_items in metadata_by_vault.items()
+    }
+
+    missing_credentials: list[tuple[Credential, str, str]] = []
+    unsupported_credentials: list[tuple[Credential, Item, str, str]] = []
+    results_by_id: dict[str, OnePasswordCredentialRefreshResult] = {}
+    refreshed = 0
+    skipped = 0
+    for credential in credentials:
+        vault_id = credential.vault_id
+        item_id = credential.item_id
+        if vault_id is None or item_id is None:
+            continue
+        item = items_by_vault.get(vault_id, {}).get(item_id)
+        if item is None:
+            missing_credentials.append((credential, vault_id, item_id))
+            continue
+        credential_type = _onepassword_item_credential_type(item)
+        if credential_type is None:
+            unsupported_credentials.append((credential, item, vault_id, item_id))
+            continue
+        updated = await app.DATABASE.credentials.update_onepassword_credential_metadata(
+            credential_id=credential.credential_id,
+            organization_id=organization_id,
+            authorized_folder_id=credential.folder_id,
+            name=item.title,
+            credential_type=credential_type,
+            tested_url=_onepassword_item_url(item),
+        )
+        if updated:
+            refreshed += 1
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="refreshed",
+            )
+        else:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="skipped",
+                reason="Credential moved while refresh was in progress.",
+            )
+            skipped += 1
+
+    stale_ids = await app.DATABASE.credentials.set_onepassword_credentials_stale(
+        organization_id,
+        [(credential.credential_id, credential.folder_id) for credential, _vault_id, _item_id in missing_credentials],
+        stale=True,
+    )
+    unstale_ids = await app.DATABASE.credentials.set_onepassword_credentials_stale(
+        organization_id,
+        [
+            (credential.credential_id, credential.folder_id)
+            for credential, _item, _vault_id, _item_id in unsupported_credentials
+        ],
+        stale=False,
+    )
+    stale = len(stale_ids)
+    for credential, vault_id, item_id in missing_credentials:
+        if credential.credential_id in stale_ids:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="stale",
+            )
+        else:
+            results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+                vault_id=vault_id,
+                item_id=item_id,
+                status="skipped",
+                reason="Credential moved while refresh was in progress.",
+            )
+            skipped += 1
+    for credential, item, vault_id, item_id in unsupported_credentials:
+        results_by_id[credential.credential_id] = OnePasswordCredentialRefreshResult(
+            vault_id=vault_id,
+            item_id=item_id,
+            status="skipped",
+            reason=(
+                f"Unsupported 1Password category: {item.category.value}"
+                if credential.credential_id in unstale_ids
+                else "Credential moved while refresh was in progress."
+            ),
+        )
+        skipped += 1
+    return RefreshOnePasswordCredentialsResponse(
+        refreshed=refreshed,
+        stale=stale,
+        skipped=skipped,
+        results=[
+            results_by_id[credential.credential_id]
+            for credential in credentials
+            if credential.credential_id in results_by_id
+        ],
+    )
 
 
 @base_router.get(
@@ -2992,6 +3706,7 @@ async def list_bitwarden_items(
 async def update_onepassword_token(
     data: CreateOnePasswordTokenRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> CreateOnePasswordTokenResponse:
     """
     Create or update a OnePassword service account token for the current organization.
@@ -2999,6 +3714,34 @@ async def update_onepassword_token(
     This endpoint ensures only one valid OnePassword token exists per organization.
     If a valid token already exists, it will be invalidated before creating the new one.
     """
+    try:
+        await asyncio.wait_for(_validate_onepassword_service_account_token(data.token), timeout=10.0)
+    except Exception as e:
+        error_class: OnePasswordTelemetryErrorClass = "internal"
+        if isinstance(e, TimeoutError):
+            error_class = "timeout"
+        elif isinstance(e, RateLimitExceededException):
+            error_class = "rate_limited"
+        elif isinstance(e, DesktopSessionExpiredException) or is_onepassword_credential_error(str(e)):
+            error_class = "invalid_token"
+        elif extract_onepassword_upstream_5xx_status(str(e)) is not None:
+            error_class = "upstream"
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.token_saved",
+            success=False,
+            error_class=error_class,
+        )
+        LOG.warning(
+            "Failed to validate 1Password service account token",
+            organization_id=current_org.organization_id,
+            error_type=type(e).__name__,
+        )
+        raise _onepassword_error_response(
+            e,
+            fallback_detail="Failed to validate 1Password service account token.",
+        ) from e
+
     try:
         # Invalidate any existing valid OnePassword tokens for this organization
         await app.DATABASE.organizations.invalidate_org_auth_tokens(
@@ -3024,10 +3767,21 @@ async def update_onepassword_token(
             "vault_provider",
             OrganizationAuthTokenType.onepassword_service_account.value,
         )
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.token_saved",
+            success=True,
+        )
 
         return CreateOnePasswordTokenResponse(token=OrganizationAuthTokenMetadata.from_token(auth_token))
 
     except Exception as e:
+        await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+            organization_id=current_org.organization_id,
+            event="onepassword.token_saved",
+            success=False,
+            error_class="internal",
+        )
         LOG.error(
             "Failed to create or update OnePassword service account token",
             organization_id=current_org.organization_id,
@@ -3054,6 +3808,7 @@ async def update_onepassword_token(
 async def clear_org_auth_credential(
     credential_provider: str = Path(..., description="The organization auth credential provider to clear."),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.delete"}))),
 ) -> ClearOrganizationAuthTokenResponse:
     """
     Clear the current organization auth credential for the organization.
@@ -3072,8 +3827,21 @@ async def clear_org_auth_credential(
             await record_request_audit_event(
                 current_org.organization_id, "vault_provider.delete", "vault_provider", token_type.value
             )
+        if credential_provider == "onepassword" and invalidated_count > 0:
+            await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+                organization_id=current_org.organization_id,
+                event="onepassword.token_cleared",
+                success=True,
+            )
         return ClearOrganizationAuthTokenResponse(success=True)
     except Exception as e:
+        if credential_provider == "onepassword":
+            await app.AGENT_FUNCTION.capture_onepassword_telemetry(
+                organization_id=current_org.organization_id,
+                event="onepassword.token_cleared",
+                success=False,
+                error_class="internal",
+            )
         LOG.error(
             "Failed to clear organization auth token",
             organization_id=current_org.organization_id,
@@ -3159,6 +3927,7 @@ async def get_bitwarden_credential(
 async def update_bitwarden_credential(
     request: CreateBitwardenCredentialRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> BitwardenCredentialResponse:
     """
     Create or update a Bitwarden credential for the current organization.
@@ -3217,6 +3986,7 @@ async def update_bitwarden_credential(
 )
 async def get_azure_client_secret_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.read"}))),
 ) -> AzureClientSecretCredentialResponse:
     """
     Get the current Azure Client Secret Credential for the organization.
@@ -3232,6 +4002,8 @@ async def get_azure_client_secret_credential(
                 detail="No Azure Client Secret Credential found for this organization",
             )
 
+        if await _should_redact_org_credential_secrets(current_org.organization_id):
+            auth_token = _redact_azure_client_secret(auth_token)
         return AzureClientSecretCredentialResponse(token=auth_token)
 
     except HTTPException:
@@ -3264,6 +4036,7 @@ async def get_azure_client_secret_credential(
 async def update_azure_client_secret_credential(
     request: CreateAzureClientSecretCredentialRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> AzureClientSecretCredentialResponse:
     """
     Create or update an Azure Client Secret Credential for the current organization.
@@ -3272,6 +4045,23 @@ async def update_azure_client_secret_credential(
     If a valid token already exists, it will be invalidated before creating the new one.
     """
     try:
+        credential = request.credential
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        # A redacted form echoes the sentinel even if the caller's role changed since the read.
+        if credential.client_secret == _REDACTED_ORG_CREDENTIAL_SECRET:
+            existing = await app.DATABASE.organizations.get_valid_org_auth_token(
+                organization_id=current_org.organization_id,
+                token_type=OrganizationAuthTokenType.azure_client_secret_credential.value,
+            )
+            if existing is None:
+                raise HTTPException(status_code=409, detail="Credential changed; refresh and enter the secret again")
+            if (existing.credential.tenant_id, existing.credential.client_id) != (
+                credential.tenant_id,
+                credential.client_id,
+            ):
+                raise HTTPException(status_code=409, detail="Azure tenant or client changed; enter the secret again")
+            credential = credential.model_copy(update={"client_secret": existing.credential.client_secret})
+
         # Invalidate any existing valid Azure Client Secret Credential for this organization
         await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
@@ -3282,7 +4072,7 @@ async def update_azure_client_secret_credential(
         auth_token = await app.DATABASE.organizations.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
-            token=request.credential,
+            token=credential,
         )
 
         LOG.info(
@@ -3297,8 +4087,12 @@ async def update_azure_client_secret_credential(
             OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
 
+        if redact_secrets:
+            auth_token = _redact_azure_client_secret(auth_token)
         return AzureClientSecretCredentialResponse(token=auth_token)
 
+    except HTTPException:
+        raise
     except Exception as e:
         LOG.error(
             "Failed to create or update Azure Client Secret Credential",
@@ -3310,6 +4104,26 @@ async def update_azure_client_secret_credential(
             status_code=500,
             detail=f"Failed to create or update Azure Client Secret Credential: {str(e)}",
         )
+
+
+@base_router.get(
+    "/credentials/custom_credential/status",
+    response_model=CustomCredentialServiceStatusResponse,
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/custom_credential/status/",
+    response_model=CustomCredentialServiceStatusResponse,
+    include_in_schema=False,
+)
+async def get_custom_credential_service_status(
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+) -> CustomCredentialServiceStatusResponse:
+    auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id=current_org.organization_id,
+        token_type=OrganizationAuthTokenType.custom_credential_service.value,
+    )
+    return CustomCredentialServiceStatusResponse(configured=auth_token is not None)
 
 
 @base_router.get(
@@ -3326,6 +4140,7 @@ async def update_azure_client_secret_credential(
 )
 async def get_custom_credential_service_config(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.read"}))),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Get the current custom credential service configuration for the organization.
@@ -3341,6 +4156,9 @@ async def get_custom_credential_service_config(
                 detail="No custom credential service configuration found for this organization",
             )
 
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        if redact_secrets:
+            auth_token = _redact_custom_credential_secret(auth_token)
         return CustomCredentialServiceConfigResponse(token=auth_token)
 
     except HTTPException:
@@ -3373,6 +4191,7 @@ async def get_custom_credential_service_config(
 async def update_custom_credential_service_config(
     request: CreateCustomCredentialServiceConfigRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Create or update a custom credential service configuration for the current organization.
@@ -3381,6 +4200,9 @@ async def update_custom_credential_service_config(
     If a valid configuration already exists, it will be invalidated before creating the new one.
     """
     try:
+        redact_secrets = await _should_redact_org_credential_secrets(current_org.organization_id)
+        config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
+
         # Invalidate any existing valid custom credential service configuration for this organization
         await app.DATABASE.organizations.invalidate_org_auth_tokens(
             organization_id=current_org.organization_id,
@@ -3388,7 +4210,7 @@ async def update_custom_credential_service_config(
         )
 
         # Store the configuration as JSON in the token field
-        config_json = json.dumps(request.config.model_dump())
+        config_json = json.dumps(config.model_dump())
 
         # Create the new configuration
         auth_token = await app.DATABASE.organizations.create_org_auth_token(
@@ -3409,8 +4231,12 @@ async def update_custom_credential_service_config(
             OrganizationAuthTokenType.custom_credential_service.value,
         )
 
+        if redact_secrets:
+            auth_token = _redact_custom_credential_secret(auth_token)
         return CustomCredentialServiceConfigResponse(token=auth_token)
 
+    except HTTPException:
+        raise
     except Exception as e:
         LOG.error(
             "Failed to create or update custom credential service configuration",
@@ -3445,8 +4271,9 @@ async def test_custom_credential_service_connection(
     to verify the service is reachable and the token is valid.
     Uses the shared URL validator for scheme/host validation (respects ALLOWED_HOSTS / BLOCKED_HOSTS).
     """
-    api_base_url = request.config.api_base_url
-    api_token = request.config.api_token
+    config = await _restore_redacted_custom_credential_secret(current_org.organization_id, request.config)
+    api_base_url = config.api_base_url
+    api_token = config.api_token
 
     try:
         validated_url = validate_url(api_base_url)
@@ -3530,6 +4357,8 @@ async def _get_credential_vault_service(
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
         service = app.CUSTOM_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.ONEPASSWORD:
+        service = app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
 
@@ -3576,6 +4405,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
     credit card metadata, or secret values. See the module
     docstring for the full security invariant.
     """
+    is_onepassword = credential.vault_type == CredentialVaultType.ONEPASSWORD
     if credential.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=credential.username or credential.credential_id,
@@ -3589,6 +4419,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
@@ -3612,6 +4445,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
@@ -3632,6 +4468,9 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             credential_type=credential.credential_type,
             name=credential.name,
             vault_type=credential.vault_type,
+            vault_id=credential.vault_id if is_onepassword else None,
+            item_id=credential.item_id if is_onepassword else None,
+            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
             browser_profile_id=credential.browser_profile_id,
             auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,

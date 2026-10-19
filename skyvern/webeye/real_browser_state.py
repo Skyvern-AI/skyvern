@@ -67,7 +67,7 @@ from skyvern.webeye.driver_connection import (
     driver_transport_error_future,
     kill_driver_process,
 )
-from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
+from skyvern.webeye.navigation import driver_nav_error_code, is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -78,6 +78,7 @@ LOG = structlog.get_logger()
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
 RECOVERABLE_BLANK_PAGE_URLS = {":"}
+BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS = 0.5
 
 
 class _BrowserConnectionProbeFailed(str):
@@ -216,6 +217,8 @@ class RealBrowserState(BrowserState):
             weakref.WeakKeyDictionary()
         )
         self.__page = page
+        self._browser_address: str | None = None
+        self._navigation_run_id: str | None = None
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
         # last-page default in get_working_page so multi-tab targeting is deterministic.
         self.__active_page: Page | None = None
@@ -648,6 +651,67 @@ class RealBrowserState(BrowserState):
         # No initial navigation ran (page already existed, or no/same URL): arm now that a working page exists.
         self._arm_display_recorder()
 
+    def begin_navigation(self) -> None:
+        browser_context = getattr(self, "_browser_context", None)
+        interceptor = getattr(browser_context, "_skyvern_cdp_download_interceptor", None)
+        consume_auth_challenges = getattr(interceptor, "consume_navigation_auth_challenges", None)
+        if consume_auth_challenges is not None:
+            consume_auth_challenges()
+
+    async def record_navigation_result(self, error: BaseException | None, url: str | None = None) -> None:
+        browser_context = getattr(self, "_browser_context", None)
+        interceptor = getattr(browser_context, "_skyvern_cdp_download_interceptor", None)
+        consume_auth_challenges = getattr(interceptor, "consume_navigation_auth_challenges", None)
+        proxy_auth_rejection_seen, auth_challenge_seen = (
+            consume_auth_challenges() if consume_auth_challenges is not None else (False, False)
+        )
+        context = skyvern_context.current()
+        browser_address = getattr(self, "_browser_address", None)
+        if not browser_address or context is None or not context.browser_address_is_server_assigned:
+            return
+
+        run_id = (
+            context.workflow_run_id or getattr(self, "_navigation_run_id", None) or context.task_id or context.run_id
+        )
+        try:
+            if error is None:
+                if (
+                    url is not None
+                    and urlparse(url).scheme.lower() in {"http", "https"}
+                    and getattr(interceptor, "proxy_auth_credentials", None)
+                ):
+                    await asyncio.wait_for(
+                        app.AGENT_FUNCTION.record_server_assigned_address_navigation_success(
+                            browser_address=browser_address,
+                            run_id=run_id,
+                        ),
+                        timeout=BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS,
+                    )
+            else:
+                if not getattr(interceptor, "proxy_auth_credentials", None) or (
+                    auth_challenge_seen and not proxy_auth_rejection_seen
+                ):
+                    return
+                nav_error_code = (
+                    error.nav_error_code
+                    if isinstance(error, FailedToNavigateToUrl)
+                    else driver_nav_error_code(str(error))
+                )
+                await asyncio.wait_for(
+                    app.AGENT_FUNCTION.record_server_assigned_address_navigation_failure(
+                        browser_address=browser_address,
+                        nav_error_code=nav_error_code,
+                        run_id=run_id,
+                        workflow_permanent_id=context.workflow_permanent_id,
+                    ),
+                    timeout=BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to record a navigation result against the run's assigned browser address",
+                exc_info=True,
+            )
+
     def _arm_display_recorder(self) -> None:
         """Begin the whole-display recorder's timeline once a working page exists (two-phase capture,
         SKY-15466). Exactly-once and ownership-neutral in the recorder; a failed arm is surfaced, never raised."""
@@ -685,14 +749,20 @@ class RealBrowserState(BrowserState):
             landed_url = response_url if isinstance(response_url, str) else None
             return response
 
-        self.last_navigation_status = await navigate_with_retry(
-            navigate=goto,
-            url=url,
-            retry_times=retry_times,
-            settle=self._wait_for_settle,
-            wait_until=wait_until,
-        )
+        self.begin_navigation()
+        try:
+            self.last_navigation_status = await navigate_with_retry(
+                navigate=goto,
+                url=url,
+                retry_times=retry_times,
+                settle=self._wait_for_settle,
+                wait_until=wait_until,
+            )
+        except Exception as navigation_error:
+            await self.record_navigation_result(navigation_error)
+            raise
         self.last_navigation_url = landed_url
+        await self.record_navigation_result(None, url=url)
         await self._wait_for_challenge_solver(page=page)
 
     async def _wait_for_challenge_solver(self, page: Page) -> None:
@@ -832,7 +902,12 @@ class RealBrowserState(BrowserState):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        navigation_run_id: str | None = None,
     ) -> Page:
+        if browser_address is not None:
+            self._browser_address = browser_address
+        if navigation_run_id or workflow_run_id or task_id:
+            self._navigation_run_id = navigation_run_id or workflow_run_id or task_id
         page = await self.get_working_page()
         if page is not None:
             return page

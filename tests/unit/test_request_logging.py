@@ -33,6 +33,8 @@ from skyvern.forge.request_logging import (
     _sanitize_body,
     _sanitize_headers,
     _sanitize_response_body,
+    get_request_principal_state,
+    integration_platform_from_user_agent,
     log_raw_request_exception,
     log_raw_request_middleware,
     set_request_organization,
@@ -71,6 +73,26 @@ class TestClientIpFromHeaders:
 
     def test_empty_header_returns_none(self) -> None:
         assert _client_ip_from_headers({"x-forwarded-for": ""}) is None
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "expected"),
+    [
+        ("Zapier", "zapier"),
+        ("n8n", "n8n"),
+        ("make.com", "make"),
+        ("Make/production", "make"),
+        ("Integromat", "make"),
+        ("Workato", "workato"),
+        ("Mozilla/5.0", "other"),
+        ("Power Automate", "other"),
+        ("Pipedream", "other"),
+        (None, None),
+        ("  ", None),
+    ],
+)
+def test_integration_platform_from_user_agent(user_agent: str | None, expected: str | None) -> None:
+    assert integration_platform_from_user_agent(user_agent) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +644,14 @@ class TestSanitizeBody:
         result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
         assert result == REDACTED
 
+    @pytest.mark.parametrize("path", ["/api/v1/skyplane/authority/session", "/api/v1/skyplane/authority/feedback"])
+    def test_skyplane_authority_request_and_response_are_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = '{"job_capability":"cap-secret","summary":"customer text","details":"more customer text"}'
+
+        assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+        assert _sanitize_response_body(request, body, "application/json") == REDACTED
+
     def test_non_sensitive_endpoint_request_preserved(self) -> None:
         request = _make_request("GET", "/v1/tasks")
         result = _sanitize_body(request, b'{"user": "alice"}', "application/json")
@@ -694,6 +724,13 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
         log_raw_request_exception(response.status_code)
         return response
 
+    @app.get("/ndjson-stream")
+    async def ndjson_stream() -> StreamingResponse:
+        async def lines() -> typing.AsyncIterator[bytes]:
+            yield b'{"task_id":"tsk_1"}\n'
+
+        return StreamingResponse(lines(), media_type="application/x-ndjson")
+
     @app.get("/heartbeat")
     async def heartbeat() -> dict:
         return {"ok": True}
@@ -706,6 +743,11 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
                 "https://api.skyvern.com/v1/artifacts/art_response/content?expiry=1800000300&kid=k1&sig=response-secret"
             ),
         }
+
+    @app.post("/integration-platform")
+    async def integration_platform() -> dict:
+        identity = get_request_principal_state()
+        return {"integration_platform": identity.integration_platform if identity else None}
 
     @app.post("/v1/browser_sessions/{browser_session_id}/action_logs")
     async def create_action_logs(browser_session_id: str) -> dict:
@@ -835,6 +877,20 @@ class TestMiddlewareLogVolume:
         assert "x-api-key" not in fields["headers"]
         assert "SYNTHETIC_SECRET" not in repr(call)
         assert "sk-test-" not in repr(call)
+
+    def test_ndjson_stream_logs_once_without_reading_body(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+        read_body = AsyncMock(side_effect=AssertionError("NDJSON must not be buffered for logging"))
+        monkeypatch.setattr(request_logging, "_get_response_body_str", read_body)
+
+        response = TestClient(_make_app()).get("/ndjson-stream")
+
+        assert response.status_code == 200
+        assert response.content == b'{"task_id":"tsk_1"}\n'
+        read_body.assert_not_awaited()
+        assert log_mock.info.call_args.kwargs["response_body"] == "<streaming>"
 
     @pytest.mark.parametrize("method", ["POST", "GET"])
     def test_mcp_stream_logs_once_without_reading_body(
@@ -1052,11 +1108,26 @@ class TestMiddlewareLogVolume:
 
     def test_successful_post_is_logged(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
-        response = client.post("/tasks")
+        response = client.post("/tasks", headers={"user-agent": "Zapier"})
         assert response.status_code == 200
         log_mock.info.assert_called_once()
         assert log_mock.info.call_args.args[0] == "api.raw_request"
+        assert log_mock.info.call_args.kwargs["integration_platform"] == "zapier"
         assert log_mock.info.call_count + log_mock.warning.call_count + log_mock.error.call_count == 1
+
+    def test_normalized_platform_is_available_to_run_routes(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.post("/integration-platform", headers={"user-agent": "n8n"})
+
+        assert response.status_code == 200
+        assert response.json() == {"integration_platform": "n8n"}
+        assert log_mock.info.call_args_list[0].kwargs["integration_platform"] == "n8n"
+
+        missing_user_agent = client.post("/integration-platform", headers={"user-agent": ""})
+
+        assert missing_user_agent.status_code == 200
+        assert missing_user_agent.json() == {"integration_platform": None}
+        assert "integration_platform" not in log_mock.info.call_args.kwargs
 
     def test_successful_post_survives_log_failure(self, log_mock: MagicMock) -> None:
         log_mock.info.side_effect = RuntimeError("log sink unavailable")
@@ -1110,11 +1181,12 @@ class TestMiddlewareLogVolume:
         self, log_mock: MagicMock, unhandled_exception_status: int
     ) -> None:
         client = TestClient(_make_app(unhandled_exception_status), raise_server_exceptions=False)
-        response = client.get("/boom")
+        response = client.get("/boom", headers={"user-agent": "Workato"})
         assert response.status_code == unhandled_exception_status
         log_mock.error.assert_called_once()
         assert log_mock.error.call_args.args[0] == "api.raw_request"
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+        assert log_mock.error.call_args.kwargs["integration_platform"] == "workato"
 
     def test_exception_path_reraises_the_original_error_if_logging_fails(self, log_mock: MagicMock) -> None:
         log_mock.error.side_effect = RuntimeError("log sink unavailable")

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from skyvern.cli.core.browser_ops import NavigateResult
+from skyvern.cli.core.browser_ops import NavigateResult, ScreenshotResult
 from skyvern.cli.core.result import Artifact, BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
@@ -394,7 +394,7 @@ async def test_every_registered_extract_tool_caps_an_oversize_extraction(
         "do_navigate",
         AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=ScreenshotResult(data=b"png")))
     monkeypatch.setattr(
         mcp_browser,
         "save_artifact",
@@ -428,7 +428,7 @@ def _stub_browser(monkeypatch: pytest.MonkeyPatch) -> None:
         "do_navigate",
         AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=ScreenshotResult(data=b"png")))
     monkeypatch.setattr(
         mcp_browser,
         "save_artifact",
@@ -443,7 +443,7 @@ async def test_navigate_and_screenshot_caps_an_oversize_inline_screenshot(monkey
     tool-result limit with no truncation warning."""
     _stub_browser(monkeypatch)
     oversize_png = b"\x89PNG" + b"z" * MCP_MAX_RESPONSE_CHARS
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=oversize_png)))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=ScreenshotResult(data=oversize_png)))
 
     tool = await mcp.get_tool("skyvern_navigate_and_screenshot")
     result = await tool.fn(url="https://example.test", inline=True)

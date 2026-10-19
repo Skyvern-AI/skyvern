@@ -70,10 +70,10 @@ function lastItems(): RadialMenuItem[] {
 }
 
 function recordTaskItem(items: RadialMenuItem[]) {
-  return items.find((i) => i.text === "Record Task");
+  return items.find((i) => i.text === "Demonstrate task");
 }
 
-describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => {
+describe("WorkflowAddMenu — Demonstrate task item visibility/enabled state", () => {
   beforeEach(() => {
     radialMenuMock.mockClear();
   });
@@ -84,7 +84,7 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     cleanup();
   });
 
-  it("does NOT show the Record Task item when no session is using or loading (CORR-1 regression guard)", () => {
+  it("does NOT show the Demonstrate task item when no session is using or loading (CORR-1 regression guard)", () => {
     useSettingsStore.getState().setIsUsingABrowser(false);
     useSettingsStore.getState().setIsLoadingABrowser(false);
 
@@ -93,7 +93,7 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     expect(recordTaskItem(lastItems())).toBeUndefined();
   });
 
-  it("shows the Record Task item as DISABLED while a session is loading", () => {
+  it("shows the Demonstrate task item as DISABLED while a session is loading", () => {
     useSettingsStore.getState().setIsUsingABrowser(false);
     useSettingsStore.getState().setIsLoadingABrowser(true);
 
@@ -104,7 +104,7 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     expect(item?.enabled).toBe(false);
   });
 
-  it("shows the Record Task item as ENABLED once the browser is ready and not recording", () => {
+  it("shows the Demonstrate task item as ENABLED once the browser is ready and not recording", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
     useRecordingStore.setState({ isRecording: false });
@@ -116,7 +116,7 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     expect(item?.enabled).toBe(true);
   });
 
-  it("disables the Record Task item while recording is in progress, even when isUsingABrowser is true", () => {
+  it("disables the Demonstrate task item while recording is in progress, even when isUsingABrowser is true", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
     useRecordingStore.setState({ isRecording: true });

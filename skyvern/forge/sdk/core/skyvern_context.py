@@ -770,6 +770,7 @@ class SkyvernContext:
     enable_page_ready_wait: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
+    cached_task_prompt: str | None = None
     vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache

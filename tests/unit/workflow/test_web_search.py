@@ -4,7 +4,7 @@ import pytest
 
 from skyvern.forge.sdk.browser_egress_policy import DestinationBlockedError
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow import web_search
+from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.web_search import search_web
 from tests.unit.conftest import SearchApiReply, arm_search_api, serpapi_page
 
@@ -67,6 +67,60 @@ async def test_a_malformed_body_reports_the_status_it_was_served_with(monkeypatc
 
     assert observed["error_kind"] == "WebSearchError"
     assert observed["http_status"] == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timeouts", "error_kind"),
+    [(1, None), (web_search_client.REQUEST_ATTEMPTS, "TimeoutError")],
+    ids=["retry-is-served", "attempts-are-bounded"],
+)
+async def test_a_timed_out_attempt_is_retried_within_a_bounded_number_of_attempts(
+    monkeypatch: pytest.MonkeyPatch, timeouts: int, error_kind: str | None
+) -> None:
+    api = arm_search_api(monkeypatch, *([TimeoutError()] * timeouts), (200, PAGE))
+
+    observed = await search_web("roofing")
+
+    # The page queued behind the timeouts proves the bound: once the attempts are spent it goes unread.
+    assert observed["error_kind"] == error_kind
+    assert len(api.urls) == (timeouts if error_kind else timeouts + 1)
+    assert [result["url"] for result in observed["results"]] == ([] if error_kind else [FIRST, SECOND, THIRD])
+
+
+@pytest.mark.asyncio
+async def test_a_best_effort_snippet_lookup_is_not_retried_and_keeps_the_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Google is rejected outright so the run falls back to Exa, whose search lands and whose
+    # snippet lookup never completes: the results it already holds must survive that.
+    api = arm_search_api(
+        monkeypatch,
+        (401, {"error": "refused"}),
+        (200, {"results": [{"url": FIRST, "title": "Title"}]}),
+        TimeoutError(),
+        exa_key="exa-test-key",
+    )
+
+    observed = await search_web("roofing")
+
+    assert observed["error_kind"] is None
+    assert [result["url"] for result in observed["results"]] == [FIRST]
+    assert [result["snippet"] for result in observed["results"]] == [""]
+    assert len(api.urls) == 3
+
+
+@pytest.mark.asyncio
+async def test_an_off_site_refetch_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The uncached refetch is the slowest request of a search and the page it would replace is not
+    # in response.results yet, so it gets one attempt rather than spending the global deadline.
+    api = arm_search_api(monkeypatch, (200, PAGE), TimeoutError())
+
+    observed = await search_web("roofing site:elsewhere.example")
+
+    assert observed["error_kind"] is None
+    assert len(api.urls) == 2
+    assert "no_cache" in api.urls[1]
 
 
 @pytest.mark.asyncio

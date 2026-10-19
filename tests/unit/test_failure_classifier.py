@@ -22,8 +22,11 @@ from skyvern.forge.failure_classifier import (
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
+    partition_failure_categories,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError as ProviderLLMError
+from skyvern.utils.prompt_engine import MaxStepsReasonResponse
+from skyvern.webeye.actions.actions import CompleteVerifyResult
 from skyvern.webeye.scraper.scraper import build_scraping_failed_reason
 
 
@@ -764,12 +767,17 @@ async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
+@pytest.mark.parametrize("canvas_app", [False, True])
+async def test_non_timeout_scraping_reason_stays_data_extraction(canvas_app: bool) -> None:
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
 
-    generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
+    generic_reason = await build_scraping_failed_reason(
+        browser_state, "https://example.com/path", timed_out=False, canvas_app=canvas_app
+    )
     assert "timeout" not in generic_reason.lower()
+    # The page-load log filter and reporting queries match this phrase, so the canvas wording must keep it.
+    assert "failed to load the website" in generic_reason
     assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
 
 
@@ -1340,3 +1348,67 @@ def test_browser_lease_producer_reason_codes_round_trip_through_attribution() ->
     assert derive_failure_attribution(_browser_lease_failure_category(expired, workflow_run))["failure_category"] == (
         FailureCategory.BROWSER_SESSION_EXPIRED
     )
+
+
+_UNKNOWN_MODEL_CATEGORY = {
+    "category": "UNKNOWN",
+    "confidence_float": 0.5,
+    "reasoning": "Model returned no recognized failure category",
+}
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (
+            [{"category": "AUTH_FAILURE", "confidence_float": 0.9}],
+            ([{"category": "AUTH_FAILURE", "confidence_float": 0.9}], []),
+        ),
+        ([{"category": "auth_failure"}], ([_UNKNOWN_MODEL_CATEGORY], ["auth_failure"])),
+        ([{"category": " ANTI_BOT_DETECTION "}], ([_UNKNOWN_MODEL_CATEGORY], [" ANTI_BOT_DETECTION "])),
+        (
+            [{"category": "SITE_UNDER_MAINTENANCE", "confidence_float": 0.9}],
+            ([_UNKNOWN_MODEL_CATEGORY], ["SITE_UNDER_MAINTENANCE"]),
+        ),
+        # Hostile shapes do not raise or become raw persisted categories.
+        ([{"category": ["UNKNOWN"]}, "UNKNOWN", {"reasoning": "no category at all"}], ([_UNKNOWN_MODEL_CATEGORY], [])),
+        ("UNKNOWN", ([], [])),
+        (None, ([], [])),
+    ],
+)
+def test_partition_failure_categories_keeps_only_known_literals(value: object, expected: tuple) -> None:
+    assert partition_failure_categories(value) == expected
+
+
+def test_model_written_categories_are_bounded_without_changing_verification_input() -> None:
+    """Keep categories raw for the TOTP verdict; only the persisted task category is bounded."""
+    invented = {"category": "SITE_UNDER_MAINTENANCE", "confidence_float": 0.9, "reasoning": "Maintenance page"}
+    known = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "reasoning": "Challenge page"}
+
+    verdict = CompleteVerifyResult.model_validate(
+        {"status": "terminate", "thoughts": "blocked", "failure_categories": [invented, known]}
+    )
+    summary = MaxStepsReasonResponse.model_validate(
+        {"page_info": "", "reasoning": "blocked", "failure_categories": [invented, known]}
+    )
+
+    assert verdict.failure_categories == [invented, known]
+    assert summary.failure_categories == [known]
+    assert summary._rejected_failure_categories == ["SITE_UNDER_MAINTENANCE"]
+
+
+@pytest.mark.parametrize("untrusted_rejected_categories", [None, "not a list", ["ELEMENT_NOT_FOUND", 3]])
+def test_summary_ignores_model_provided_rejected_categories(untrusted_rejected_categories: object) -> None:
+    summary = MaxStepsReasonResponse.model_validate(
+        {
+            "page_info": "",
+            "reasoning": "valid model reasoning",
+            "errors": [],
+            "failure_categories": [{"category": "AUTH_FAILURE", "confidence_float": 0.9}],
+            "rejected_failure_categories": untrusted_rejected_categories,
+        }
+    )
+
+    assert summary.reasoning == "valid model reasoning"
+    assert summary.failure_categories == [{"category": "AUTH_FAILURE", "confidence_float": 0.9}]
+    assert summary._rejected_failure_categories == []

@@ -223,6 +223,8 @@ class TestWorkflowRoutesThreadUser:
                 return_value=(MagicMock(), ("workflow_definition",))
             )
             mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
             await create_workflow(
                 data=data,
                 folder_id=None,
@@ -249,6 +251,8 @@ class TestWorkflowRoutesThreadUser:
             )
             mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
             mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
             await update_workflow(
                 data=data,
                 workflow_id="wpid_1",
@@ -277,6 +281,8 @@ class TestWorkflowRoutesThreadUser:
                 return_value=(MagicMock(), ("workflow_definition",))
             )
             mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
             await create_workflow_legacy(
                 request=raw_request,
                 folder_id=None,
@@ -334,6 +340,8 @@ class TestWorkflowRoutesThreadUser:
             )
             mock_app.AGENT_FUNCTION.on_workflow_updated_by_user = AsyncMock()
             mock_app.AGENT_FUNCTION.record_audit_event = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock()
+            mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
             await update_workflow_legacy(
                 request=raw_request,
                 workflow_id="wpid_1",

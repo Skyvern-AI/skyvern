@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   } | null,
   isLoading: false,
   isError: false,
+  createOrUpdateTokenError: null as string | null,
 }));
 
 vi.mock("@/hooks/useOnePasswordToken", () => ({
@@ -19,6 +20,7 @@ vi.mock("@/hooks/useOnePasswordToken", () => ({
     isLoading: mocks.isLoading,
     isError: mocks.isError,
     createOrUpdateToken: vi.fn(),
+    createOrUpdateTokenError: mocks.createOrUpdateTokenError,
     isUpdating: false,
     clearToken: vi.fn(),
     isClearing: false,
@@ -38,6 +40,7 @@ beforeEach(() => {
   };
   mocks.isLoading = false;
   mocks.isError = false;
+  mocks.createOrUpdateTokenError = null;
 });
 
 afterEach(cleanup);
@@ -83,5 +86,14 @@ describe("OnePasswordTokenForm setup guide", () => {
     view.rerender(<OnePasswordTokenForm />);
 
     expect(screen.queryByText(A_STEP_BODY)).toBeNull();
+  });
+
+  it("shows token validation failures inline", () => {
+    mocks.createOrUpdateTokenError = "This service account token is invalid.";
+    render(<OnePasswordTokenForm />);
+
+    expect(
+      screen.getByText("This service account token is invalid."),
+    ).toBeTruthy();
   });
 });

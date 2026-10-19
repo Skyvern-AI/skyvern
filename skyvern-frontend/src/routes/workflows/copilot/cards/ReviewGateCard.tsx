@@ -616,14 +616,7 @@ export function ReviewGateCard({
         turn !== undefined &&
         everyTestBlockExecuted(turn) &&
         !testFailed));
-  // The caller already withholds actionsEnabled in these states; this keeps the row locked if it
-  // ever does not.
-  const actionsLocked =
-    !actionsEnabled ||
-    accepting ||
-    failure === "reload" ||
-    failure === "recover" ||
-    failure === "saved";
+  const actionsLocked = !actionsEnabled || accepting;
   // A lock that lands mid-confirmation would strand it behind the disabled fieldset.
   if (confirmingTest && actionsLocked) {
     restoreFocusRef.current = true;

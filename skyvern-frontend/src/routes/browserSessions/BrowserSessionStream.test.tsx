@@ -7,6 +7,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSettingsStore } from "@/store/SettingsStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
   STREAM_MAX_RECONNECT_DELAY_MS,
   isTerminalStreamStatus,
@@ -33,6 +34,12 @@ const cdpInputState = vi.hoisted(() => ({
 
 const telemetry = vi.hoisted(() => ({
   captureRecordBrowser: vi.fn(),
+}));
+
+const interactiveStreamState = vi.hoisted(() => ({
+  onNavigate: undefined as ((url: string) => void) | undefined,
+  onHistoryNavigate: undefined as ((action: unknown) => void) | undefined,
+  showControlButtons: false,
 }));
 
 const api = vi.hoisted(() => ({
@@ -91,23 +98,32 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
     currentUrl,
     showControlButtons,
     userIsControlling,
+    onNavigate,
+    onHistoryNavigate,
   }: {
     streamImgSrc: string;
     currentUrl?: string;
     showControlButtons: boolean;
     userIsControlling: boolean;
-  }) => (
-    <>
-      <div
-        data-frame={streamImgSrc}
-        data-url={currentUrl}
-        data-testid="stream-frame"
-      />
-      {showControlButtons && userIsControlling && (
-        <button type="button">stop controlling</button>
-      )}
-    </>
-  ),
+    onNavigate?: (url: string) => void;
+    onHistoryNavigate?: (action: unknown) => void;
+  }) => {
+    interactiveStreamState.onNavigate = onNavigate;
+    interactiveStreamState.onHistoryNavigate = onHistoryNavigate;
+    interactiveStreamState.showControlButtons = showControlButtons;
+    return (
+      <>
+        <div
+          data-frame={streamImgSrc}
+          data-url={currentUrl}
+          data-testid="stream-frame"
+        />
+        {showControlButtons && userIsControlling && (
+          <button type="button">stop controlling</button>
+        )}
+      </>
+    );
+  },
 }));
 
 class FakeStreamSocket {
@@ -317,6 +333,12 @@ describe("BrowserSessionStream terminal statuses", () => {
   beforeEach(() => {
     stubAnimationFrame();
     cdpInputState.setUserIsControlling = undefined;
+    useRecordingLauncherStore.setState(
+      useRecordingLauncherStore.getInitialState(),
+    );
+    interactiveStreamState.onNavigate = undefined;
+    interactiveStreamState.onHistoryNavigate = undefined;
+    interactiveStreamState.showControlButtons = false;
     Object.defineProperty(window, "WebSocket", {
       configurable: true,
       value: FakeStreamSocket,
@@ -646,6 +668,105 @@ describe("BrowserSessionStream terminal statuses", () => {
       expect(
         screen.queryByRole("button", { name: "stop controlling" }),
       ).toBeNull(),
+    );
+    view.unmount();
+  });
+
+  it("holds control only while recording and retakes it after the stream is hidden", async () => {
+    const navigateDemonstration = vi.fn();
+    useRecordingLauncherStore.setState({
+      demonstrationBrowserSessionId: "pbs_test",
+      demonstrationRecordingBrowserSessionId: "pbs_test",
+      navigateDemonstration,
+    });
+    const view = render(
+      <BrowserSessionStream
+        browserSessionId="pbs_test"
+        showControlButtons={true}
+        enableUrlInput={true}
+      />,
+    );
+    await waitFor(() =>
+      expect(FakeStreamSocket.instances.length).toBeGreaterThan(0),
+    );
+    const streamSocket = FakeStreamSocket.instances.find((socket) =>
+      socket.url.includes("/stream/browser_sessions/pbs_test"),
+    );
+    act(() => {
+      streamSocket?.emitStreamMessage({
+        status: "running",
+        screenshot: "frame",
+        url: "https://current.example/",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("stream-frame")).toBeTruthy(),
+    );
+
+    expect(interactiveStreamState.showControlButtons).toBe(false);
+    expect(interactiveStreamState.onHistoryNavigate).toBeUndefined();
+    act(() => interactiveStreamState.onNavigate?.("next.example"));
+    expect(navigateDemonstration).toHaveBeenCalledWith("next.example");
+    const inputSocket = FakeStreamSocket.instances.find((socket) =>
+      socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+    );
+    act(() => {
+      inputSocket?.emit("message", {
+        data: JSON.stringify({ kind: "ready" }),
+      });
+    });
+    await waitFor(() =>
+      expect(inputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "take-control" }),
+      ),
+    );
+
+    view.rerender(
+      <BrowserSessionStream
+        browserSessionId="pbs_test"
+        showControlButtons={false}
+        enableUrlInput={true}
+      />,
+    );
+    await waitFor(() => expect(inputSocket?.close).toHaveBeenCalled());
+
+    view.rerender(
+      <BrowserSessionStream
+        browserSessionId="pbs_test"
+        showControlButtons={true}
+        enableUrlInput={true}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        FakeStreamSocket.instances.filter((socket) =>
+          socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+        ),
+      ).toHaveLength(2),
+    );
+    const reconnectedInputSocket = FakeStreamSocket.instances.filter((socket) =>
+      socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+    )[1];
+    act(() => {
+      reconnectedInputSocket?.emit("message", {
+        data: JSON.stringify({ kind: "ready" }),
+      });
+    });
+    await waitFor(() =>
+      expect(reconnectedInputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "take-control" }),
+      ),
+    );
+
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstrationRecordingBrowserSessionId: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(reconnectedInputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "cede-control" }),
+      ),
     );
     view.unmount();
   });

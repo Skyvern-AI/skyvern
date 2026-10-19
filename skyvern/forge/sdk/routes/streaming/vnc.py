@@ -87,7 +87,18 @@ async def stream(
         workflow_run_id=workflow_run_id,
     )
 
-    organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
+    # VNC carries input as well as the picture, so it needs the right to act on the run.
+    organization_id = await auth(
+        apikey=apikey,
+        token=token,
+        websocket=websocket,
+        folder_action="workflow_run.execute",
+        folder_resource={
+            "browser_session_id": browser_session_id,
+            "task_id": task_id,
+            "workflow_run_id": workflow_run_id,
+        },
+    )
 
     if not organization_id:
         LOG.info("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)

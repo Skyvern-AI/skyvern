@@ -22,6 +22,8 @@ from PIL import Image
 
 COPILOT_SCREENSHOT_MAX_WIDTH = 1024
 COPILOT_SCREENSHOT_MAX_HEIGHT = 768
+COPILOT_SHARP_MAX_WIDTH = 1600
+COPILOT_SHARP_MAX_HEIGHT = 1200
 COPILOT_JPEG_QUALITY = 60
 _BROWSER_ABLATION_MAX_SCREENSHOT_FRAMES = 24
 
@@ -53,6 +55,7 @@ class ScreenshotProvenance:
     dispatch_browser_session_id: str | None = None
     producer_browser_session_id: str | None = None
     session_binding: ProvenanceBinding = ProvenanceBinding.UNAVAILABLE
+    viewport_css_px: tuple[int, int] | None = None
 
     @classmethod
     def unknown(cls, *, source_tool: str) -> ScreenshotProvenance:
@@ -74,6 +77,10 @@ class ScreenshotEntry:
     provenance: ScreenshotProvenance
     captured_at: float = field(default_factory=time.monotonic)
     capture_event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    image_px: tuple[int, int] | None = None
+    # Sent on every model call that carries this frame while it fits the budget; session history keeps b64.
+    sharp_b64: str | None = None
+    sharp_px: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,7 @@ class CapturedFrame:
     dispatch_browser_session_id: str | None = None
     producer_browser_session_id: str | None = None
     session_binding: ProvenanceBinding = ProvenanceBinding.UNAVAILABLE
+    viewport_css_px: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -116,10 +124,23 @@ def capturing_tool_call(tool_call_id: str | None) -> Iterator[None]:
         _capturing_tool_call_id.reset(token)
 
 
+def capturing_tool_call_id() -> str | None:
+    return _capturing_tool_call_id.get()
+
+
 @runtime_checkable
 class CarriesChatScreenshots(Protocol):
     pending_chat_screenshots: list[ChatScreenshotFrame]
     chat_screenshot_capture_ids: set[str]
+
+
+@runtime_checkable
+class CarriesPendingScreenshots(Protocol):
+    pending_screenshots: list[ScreenshotEntry]
+
+
+class CarriesPendingFrames(CarriesPendingScreenshots, Protocol):
+    pending_frame_lease: PendingFrameLease | None
 
 
 def screenshot_result_facts(
@@ -153,6 +174,17 @@ def screenshot_result_facts(
     return producer_url, producer_session_id, binding
 
 
+def screenshot_viewport_css_px(result: dict[str, Any]) -> tuple[int, int] | None:
+    data = result.get("data")
+    viewport = data.get("viewport") if isinstance(data, dict) else None
+    if not isinstance(viewport, dict):
+        return None
+    width, height = viewport.get("width"), viewport.get("height")
+    if type(width) is int and type(height) is int and width > 0 and height > 0:
+        return width, height
+    return None
+
+
 def _fingerprint_projection(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")
@@ -182,34 +214,40 @@ def model_input_fingerprint(items: list[Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _fitted_jpeg_b64(img: Image.Image, box: tuple[int, int]) -> tuple[str, tuple[int, int]]:
+    fitted = img.copy()
+    fitted.thumbnail(box, Image.Resampling.LANCZOS)
+    if fitted.mode != "RGB":
+        fitted = fitted.convert("RGB")
+    buf = io.BytesIO()
+    fitted.save(buf, format="JPEG", quality=COPILOT_JPEG_QUALITY)
+    return base64.b64encode(buf.getvalue()).decode("ascii"), fitted.size
+
+
 def resize_screenshot_b64(
     b64_png: str,
     *,
     provenance: ScreenshotProvenance,
     captured_at: float | None = None,
 ) -> ScreenshotEntry:
-    """Resize a base64 PNG to 1024x768 max and compress to JPEG.
+    """Encode a frame as two JPEGs: a sharp copy fitted to 1600x1200 and a small copy fitted to 1024x768.
 
-    Uses thumbnail() to preserve aspect ratio — only shrinks, never enlarges.
-    Converts RGBA/P modes to RGB for JPEG compatibility.
+    thumbnail() preserves aspect ratio and never enlarges.
     """
     raw = base64.b64decode(b64_png)
     capture_id = f"sha256:{hashlib.sha256(raw).hexdigest()}"
-    img = Image.open(io.BytesIO(raw))
-    img.thumbnail(
-        (COPILOT_SCREENSHOT_MAX_WIDTH, COPILOT_SCREENSHOT_MAX_HEIGHT),
-        Image.Resampling.LANCZOS,
-    )
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=COPILOT_JPEG_QUALITY)
+    with Image.open(io.BytesIO(raw)) as img:
+        small_b64, small_px = _fitted_jpeg_b64(img, (COPILOT_SCREENSHOT_MAX_WIDTH, COPILOT_SCREENSHOT_MAX_HEIGHT))
+        sharp_b64, sharp_px = _fitted_jpeg_b64(img, (COPILOT_SHARP_MAX_WIDTH, COPILOT_SHARP_MAX_HEIGHT))
     return ScreenshotEntry(
-        b64=base64.b64encode(buf.getvalue()).decode("ascii"),
+        b64=small_b64,
         mime="image/jpeg",
         capture_id=capture_id,
         provenance=provenance,
         captured_at=captured_at if captured_at is not None else time.monotonic(),
+        image_px=small_px,
+        sharp_b64=sharp_b64,
+        sharp_px=sharp_px,
     )
 
 
@@ -283,6 +321,17 @@ def enqueue_screenshot(
     return True
 
 
+def withdraw_frame_captured_before(ctx: CarriesPendingFrames, cutoff: float) -> ScreenshotEntry | None:
+    """Drop the pending frame if it was captured before `cutoff`, releasing a lease on it, and return it."""
+    pending = ctx.pending_screenshots
+    if not pending or pending[0].captured_at >= cutoff:
+        return None
+    entry = pending.pop(0)
+    if ctx.pending_frame_lease is not None and ctx.pending_frame_lease.capture_event_id == entry.capture_event_id:
+        ctx.pending_frame_lease = None
+    return entry
+
+
 def consume_screenshot_artifact(result: dict[str, Any]) -> bytes | None:
     data = result.get("data")
     path = data.get("path") if isinstance(data, dict) else None
@@ -310,6 +359,7 @@ class ViewportFrame:
     producer_session_id: str | None
     session_binding: ProvenanceBinding
     started_at: float
+    viewport_css_px: tuple[int, int] | None = None
 
 
 def viewport_visible_effect(pre: ViewportFrame | None, post: ViewportFrame | None) -> VisibleEffect:

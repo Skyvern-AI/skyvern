@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +20,7 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionExtensionUnconfirmed,
     BrowserSessionNotExtendable,
+    BrowserSessionStartupTimeout,
     ExternalBrowserUnavailable,
 )
 from skyvern.forge import app as forge_app
@@ -285,6 +287,37 @@ async def test_create_browser_session_observes_before_creating_the_session() -> 
     assert calls == ["observe", "create"]
 
 
+@pytest.mark.asyncio
+async def test_create_browser_session_holds_the_admission_scope_until_the_create_ends() -> None:
+    """A deployment's per-organization create slot must stay held while the browser starts and come back on failure."""
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def admission(organization_id: str) -> AsyncIterator[None]:
+        calls.append(f"admit {organization_id}")
+        try:
+            yield
+        finally:
+            calls.append("release")
+
+    async def create_session(**_: object) -> MagicMock:
+        calls.append("create")
+        raise BrowserSessionStartupTimeout("pbs_1")
+
+    app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
+    app_mock.AGENT_FUNCTION.browser_session_create_admission = admission
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = create_session
+
+    with patch.object(browser_sessions_mod, "app", app_mock), pytest.raises(BrowserSessionStartupTimeout):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert calls == ["admit org_1", "create", "release"]
+
+
 def test_a_session_request_is_unwatched_unless_it_says_otherwise() -> None:
     """The public default. True would route every API-created session to first-party and make the
     provider rollout unreachable."""
@@ -323,10 +356,17 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
 async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(endpoint: str) -> None:
     """These endpoints already gather across sessions, so overlapping a session's two listings would
     only raise the request's peak pool checkouts from N to 2N."""
-    sessions = [MagicMock(), MagicMock()]
+    sessions = [MagicMock(browser_profile_id=None, persistent_browser_session_id=f"pbs_{index}") for index in range(2)]
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
+    app_mock.AGENT_FUNCTION.accessible_browser_session_ids = AsyncMock(
+        return_value={session.persistent_browser_session_id for session in sessions}
+    )
     app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=sessions)
     app_mock.PERSISTENT_SESSIONS_MANAGER.get_active_sessions = AsyncMock(return_value=sessions)
+    app_mock.DATABASE.browser_sessions.get_folder_visible_browser_session_ids = AsyncMock(
+        return_value={session.persistent_browser_session_id for session in sessions}
+    )
     from_browser_session = AsyncMock(return_value=MagicMock())
 
     with (

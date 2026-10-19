@@ -36,6 +36,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepo
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+from skyvern.forge.sdk.db.repositories.run_execution_leases import RunExecutionLeasesRepository
 from skyvern.forge.sdk.db.repositories.run_feedback import RunFeedbackRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
@@ -398,6 +399,7 @@ class AgentDB(BaseAlchemyDB):
         )
 
         # -- Zero-dependency repositories --
+        self.run_execution_leases = RunExecutionLeasesRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.tasks = TasksRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflows = WorkflowsRepository(
             self.Session,

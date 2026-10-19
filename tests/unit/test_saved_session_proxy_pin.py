@@ -863,6 +863,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
         created_by=None,
+        requested_by=None,
         workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
         browser_settings=None,
     )

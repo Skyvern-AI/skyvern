@@ -33,7 +33,7 @@ from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
-from skyvern.errors.errors import CredentialCheckEvidence, LoginUnconfirmedError, UserDefinedError
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     IllegitCompleteScriptTermination,
     NoTOTPSecretFound,
@@ -103,7 +103,7 @@ def _selected_engine():
 
 class _ScrapedPageStub:
     def __init__(self) -> None:
-        self._browser_state = SimpleNamespace()
+        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +156,24 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
     await page.goto("https://93.184.216.34/path")
 
     raw_page.goto.assert_awaited_once()
+    if page_type is ScriptSkyvernPage:
+        mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(
+            None,
+            url="https://93.184.216.34/path",
+        )
+
+
+@pytest.mark.asyncio
+async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
+    raw_page.goto = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match="ERR_INVALID_AUTH_CREDENTIALS"):
+        await page.goto("https://93.184.216.34/path", max_retries=1)
+
+    mock_scraped_page._browser_state.begin_navigation.assert_called_once_with()
+    mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(error)
 
 
 @pytest.mark.asyncio
@@ -631,7 +649,7 @@ async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scr
 
 
 @pytest.mark.asyncio
-async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
+async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
     """
     When context, task, and step are available, terminate() should call
     handle_terminate_action and then raise ScriptTerminationException.
@@ -660,14 +678,9 @@ async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
         mapped_error = UserDefinedError(
             error_code="unavailable", reasoning="The requested item is unavailable", confidence_float=1.0
         )
-        gate_error = (
-            LoginUnconfirmedError()
-            .to_user_defined_error()
-            .with_credential_check(CredentialCheckEvidence(confirmed=False))
-        )
 
         async def classify(action, *_args):
-            action.errors = [mapped_error, gate_error]
+            action.errors = [mapped_error]
             return [MagicMock(success=True)]
 
         mock_step = MagicMock()
@@ -697,7 +710,7 @@ async def test_terminate_keeps_skyvern_gate_errors(mock_scraped_page, mock_ai):
             with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2") as raised:
                 await script_page.terminate(errors=["error1", "error2"])
 
-            assert raised.value.user_defined_errors == [mapped_error, gate_error]
+            assert raised.value.user_defined_errors == [mapped_error]
 
             # Verify handler was called with correct arguments
             mock_handler.assert_called_once()
@@ -3961,7 +3974,6 @@ async def test_library_page_reads_response_snapshot_with_trusted_organization(
     transport: httpx.AsyncBaseTransport = httpx.MockTransport(authenticate)
     if organization_source == "embedded":
         monkeypatch.setattr(settings, "OTEL_ENABLED", False)
-        monkeypatch.delenv("LMNR_PROJECT_API_KEY", raising=False)
         monkeypatch.setattr(api_app_module, "start_forge_app", lambda: SimpleNamespace(setup_api_app=None))
         api = api_app_module.create_api_app()
 

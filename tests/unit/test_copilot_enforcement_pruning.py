@@ -9,7 +9,6 @@ These cover three regressions observed in trace 019d7b5c884dff0ff648680b9f31f715
 from __future__ import annotations
 
 import json
-import time
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -33,7 +32,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
     TOTAL_TIMEOUT_SECONDS,
     _mark_copilot_total_timeout,
-    _mark_copilot_total_timeout_if_elapsed,
     _prune_input_list,
     _recover_from_context_overflow,
     _summarize_tool_output,
@@ -826,7 +824,7 @@ def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(settings, "ENV", "local")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -842,7 +840,7 @@ def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(settings, "ENV", "production")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 @pytest.mark.asyncio
@@ -1399,30 +1397,6 @@ def test_deadline_flag_still_written_when_fingerprint_is_suppressed() -> None:
 
     assert _deadline_events(logs) == []
     assert ctx.copilot_total_timeout_exceeded is True
-
-
-@pytest.mark.parametrize("iteration", [0, 5, 11])
-def test_cancel_site_helper_threads_iteration_into_the_fingerprint(iteration: int) -> None:
-    ctx = _deadline_ctx()
-    start_time = time.monotonic() - (TOTAL_TIMEOUT_SECONDS + 5.0)
-
-    with capture_logs() as logs:
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
-
-    events = _deadline_events(logs)
-    assert len(events) == 1
-    assert events[0]["iteration"] == iteration
-    assert events[0]["elapsed_seconds"] >= TOTAL_TIMEOUT_SECONDS
-
-
-def test_cancel_site_helper_is_silent_before_the_deadline() -> None:
-    ctx = _deadline_ctx()
-
-    with capture_logs() as logs:
-        _mark_copilot_total_timeout_if_elapsed(ctx, time.monotonic(), 2)
-
-    assert _deadline_events(logs) == []
-    assert ctx.copilot_total_timeout_exceeded is False
 
 
 def test_total_timeout_override_binds_on_settings_and_defaults_unset() -> None:

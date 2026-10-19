@@ -1,5 +1,6 @@
 """Fixtures shared by every suite."""
 
+import functools
 import gc
 import inspect
 import io
@@ -13,6 +14,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from _pytest.monkeypatch import NOTSET, derive_importpath
+from structlog._config import BoundLoggerLazyProxy
 
 from skyvern.config import settings
 from skyvern.forge import app, forge_app_initializer, request_logging
@@ -21,7 +24,40 @@ from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.services import organization_log_scope
+
+_monkeypatch_setattr = pytest.MonkeyPatch.setattr
+_monkeypatch_undo = pytest.MonkeyPatch.undo
+
+
+def _setattr_tracking_resolved_logger_methods(
+    self: pytest.MonkeyPatch,
+    target: str | object,
+    name: object | str,
+    value: object = NOTSET,
+    raising: bool = True,
+) -> None:
+    if isinstance(target, str) and value is NOTSET:
+        attr, obj = derive_importpath(target, raising)
+    else:
+        attr, obj = name, target
+    # A lazy proxy resolves log methods on every access, so a name missing from its instance dict means undo would
+    # pin the method it resolved now to the processors of this moment.
+    if isinstance(obj, BoundLoggerLazyProxy) and isinstance(attr, str) and attr not in vars(obj):
+        self.__dict__.setdefault("_resolved_logger_methods", []).append((obj, attr))
+    _monkeypatch_setattr(self, target, name, value, raising)
+
+
+def _undo_without_stranding_logger_methods(self: pytest.MonkeyPatch) -> None:
+    resolved: list[tuple[BoundLoggerLazyProxy, str]] = self.__dict__.pop("_resolved_logger_methods", [])
+    _monkeypatch_undo(self)
+    for proxy, attr in resolved:
+        vars(proxy).pop(attr, None)
+
+
+pytest.MonkeyPatch.setattr = _setattr_tracking_resolved_logger_methods  # type: ignore[method-assign,assignment]
+pytest.MonkeyPatch.undo = _undo_without_stranding_logger_methods  # type: ignore[method-assign]
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -52,6 +88,41 @@ def _configure_logging_once_per_process() -> None:
 def _url_validation_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """URL validation is off by default; tests assert the validated behavior unless they opt out."""
     monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", True)
+
+
+LOOP_OWNER = ("skyvern/forge/agent.py", "_execute_task_v3")
+# The loop's own contract tests call it directly by design.
+LOOP_OWNER_EXEMPT_TEST_FILES = frozenset({"test_taskv3_engine.py"})
+
+
+def loop_entered_through_executor() -> bool:
+    frame = sys._getframe(1)
+    while frame is not None:
+        code = frame.f_code
+        if code.co_name == LOOP_OWNER[1] and code.co_filename.endswith(LOOP_OWNER[0]):
+            return True
+        frame = frame.f_back
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _loop_runs_only_inside_the_executor(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runtime half of tests/cloud/test_taskv3_single_loop_call_site.py: it sees calls the static scan cannot,
+    such as a name computed at runtime."""
+    if request.node.path.name in LOOP_OWNER_EXEMPT_TEST_FILES:
+        return
+    loop = taskv3_engine.run_task_v3_agent_loop
+
+    @functools.wraps(loop)
+    async def guarded(*args: Any, **kwargs: Any) -> taskv3_engine.LoopOutcome:
+        if not loop_entered_through_executor():
+            raise AssertionError(
+                "run_task_v3_agent_loop ran outside ForgeAgent._execute_task_v3; run the task through the executor "
+                "(tests/browser_e2e/taskv3_fixture_helpers.run_production_task_v3)"
+            )
+        return await loop(*args, **kwargs)
+
+    monkeypatch.setattr(taskv3_engine, "run_task_v3_agent_loop", guarded)
 
 
 @pytest.fixture(autouse=True)
@@ -165,7 +236,12 @@ def ai_fallback_flag(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | None], 
         app.DATABASE.workflow_runs,
         "get_workflow_run",
         AsyncMock(
-            return_value=SimpleNamespace(copilot_session_id=None, is_debug_session=False, parent_workflow_run_id=None)
+            return_value=SimpleNamespace(
+                ai_fallback=None,
+                copilot_session_id=None,
+                is_debug_session=False,
+                parent_workflow_run_id=None,
+            )
         ),
     )
 
@@ -186,6 +262,7 @@ def ai_fallback_on_in_an_ordinary_run(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def copilot_workflow_toggle_off() -> SimpleNamespace:
     return SimpleNamespace(
+        ai_fallback=True,
         enable_self_healing=False,
         created_by="copilot",
         edited_by=None,

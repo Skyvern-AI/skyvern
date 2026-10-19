@@ -4016,6 +4016,31 @@
           "404": {
             "description": "Browser profile not found"
           },
+          "429": {
+            "description": "Too many browser sessions are starting for this organization at once. Retry after the number of seconds in the Retry-After header.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail",
+                    "error_code"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "error_code": {
+                      "type": "string",
+                      "enum": [
+                        "too_many_starting_browser_sessions"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -11197,6 +11222,17 @@
             ],
             "title": "Last Verified Login At"
           },
+          "linked_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Id"
+          },
           "linked_credential_name": {
             "anyOf": [
               {
@@ -13129,74 +13165,6 @@
         ],
         "title": "CreateScriptResponse"
       },
-      "CredentialCheck": {
-        "type": "string",
-        "enum": [
-          "site_rejected_credentials",
-          "no_recent_login_with_same_credential",
-          "login_request_not_5xx_or_429"
-        ],
-        "title": "CredentialCheck",
-        "description": "The confirmations a credential-rejection verdict has to clear before it is returned as one."
-      },
-      "CredentialCheckEvidence": {
-        "properties": {
-          "confirmed": {
-            "type": "boolean",
-            "title": "Confirmed",
-            "description": "True only when every credential confirmation check passed. The login-request status check is not available yet, so the organization-scoped confirmation flag must remain disabled until that check is implemented."
-          },
-          "checks_passed": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Passed"
-          },
-          "checks_failed": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Failed"
-          },
-          "checks_skipped": {
-            "items": {
-              "$ref": "#/components/schemas/CredentialCheck"
-            },
-            "type": "array",
-            "title": "Checks Skipped"
-          },
-          "site_message": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Site Message"
-          },
-          "login_request_status": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Login Request Status"
-          }
-        },
-        "type": "object",
-        "required": [
-          "confirmed"
-        ],
-        "title": "CredentialCheckEvidence",
-        "description": "Why a credential-rejection verdict was or was not confirmed. Reaches the caller on the run\nresponse and the webhook, so a customer can tell a confirmed rejection from an unconfirmed one\nbefore blocking the credential."
-      },
       "CredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -13449,6 +13417,43 @@
             ],
             "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
+          "vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault Id",
+            "description": "1Password vault ID for linked credentials"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id",
+            "description": "1Password item ID for linked credentials"
+          },
+          "upstream_missing_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Missing At",
+            "description": "When the linked 1Password item was last found missing upstream"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -13606,7 +13611,8 @@
           "bitwarden",
           "azure_vault",
           "gcp",
-          "custom"
+          "custom",
+          "onepassword"
         ],
         "title": "CredentialVaultType"
       },
@@ -28730,17 +28736,6 @@
             "const": "USER_DEFINED_ERROR",
             "title": "Error Type",
             "default": "USER_DEFINED_ERROR"
-          },
-          "credential_check": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CredentialCheckEvidence"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Confirmation evidence set by Skyvern; request input is ignored. This field remains unconfirmed until all required checks, including login-request status, are available."
           }
         },
         "type": "object",
@@ -30607,6 +30602,17 @@
             ],
             "title": "Edited By"
           },
+          "build_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowBuildSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+          },
           "copilot_authored": {
             "type": "boolean",
             "title": "Copilot Authored",
@@ -30691,6 +30697,19 @@
           "agent_id"
         ],
         "title": "Workflow"
+      },
+      "WorkflowBuildSource": {
+        "type": "string",
+        "enum": [
+          "ui",
+          "copilot",
+          "mcp",
+          "cli",
+          "api",
+          "internal"
+        ],
+        "title": "WorkflowBuildSource",
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -34122,11 +34141,12 @@
           "api",
           "scheduled",
           "webhook",
+          "event",
           "job_recipe_extract",
           "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -34261,6 +34281,18 @@
               }
             ],
             "title": "Description"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "Who the schedule runs as; null for schedules created before owners were recorded."
           },
           "created_at": {
             "type": "string",

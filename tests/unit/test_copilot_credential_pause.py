@@ -44,6 +44,7 @@ from skyvern.exceptions import HttpException as VaultHttpException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import credential_resolution
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _turn_credential_prompt_reason
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -98,7 +99,10 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _seed_prior_approved_credentials,
     _seed_proposed_credential,
 )
-from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery, CredentialOriginRecoveryState
+from skyvern.forge.sdk.copilot.runtime import (
+    CredentialOriginRecovery,
+    CredentialOriginRecoveryState,
+)
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.credential_fill import _request_credential
@@ -1210,6 +1214,36 @@ async def test_route_404_when_credential_unknown_or_foreign_org(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+async def test_route_404_when_connected_credential_is_in_a_hidden_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = _FakeCache()
+    _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
+    monkeypatch.setattr(app, "CACHE", cache, raising=False)
+    credential_lookup = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        app, "DATABASE", SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=credential_lookup))
+    )
+    monkeypatch.setattr(
+        credential_resolution, "credential_folder_ids_for_current_request", AsyncMock(return_value={"folder_visible"})
+    )
+    organization = SimpleNamespace(organization_id="org-1")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await workflow_copilot_credential_response(
+            _response_request(action="connected", credential_id="cred_hidden"),
+            organization=organization,
+        )
+
+    assert excinfo.value.status_code == status.HTTP_404_NOT_FOUND
+    credential_lookup.assert_awaited_once_with(
+        ["cred_hidden"],
+        organization_id="org-1",
+        allowed_folder_ids={"folder_visible"},
+        include_deleted=False,
+    )
+    assert cache.set_calls == []
+
+
+@pytest.mark.asyncio
 async def test_route_writes_flag_for_connected_with_valid_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()
     _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
@@ -1706,7 +1740,7 @@ async def _ask(ctx: CopilotContext, login_page_url: str = "https://portal.exampl
 def test_connected_resume_stamps_the_single_ask_origin() -> None:
     policy = _ask_origin_policy("https://portal.example.com/login")
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.live_page_admitted_urls == {"cred_1": "https://portal.example.com/login"}
 
@@ -1714,7 +1748,7 @@ def test_connected_resume_stamps_the_single_ask_origin() -> None:
 def test_connected_resume_stamps_nothing_when_the_ask_spans_several_origins() -> None:
     policy = _ask_origin_policy("https://portal.example.com/login", "https://other.example.com/login")
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.live_page_admitted_urls == {}
 
@@ -1728,7 +1762,7 @@ async def test_generated_credential_connected_from_a_multi_origin_ask_gets_no_fi
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.org_credentials_for_turn = []
 
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential("cred_new"))
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential("cred_new"))
     grant, error = await tools_module.credential_fill._credential_fill_origin_grant(ctx, "cred_new")
 
     assert ctx.request_policy.live_page_admitted_urls == {}
@@ -1741,7 +1775,7 @@ def test_connected_resume_names_the_picked_credential_superseding_an_earlier_men
     policy = _ask_origin_policy("https://portal.example.com/login")
     policy.current_turn_named_credential_ids = {"cred_earlier"}
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, _make_credential())
 
     assert policy.current_turn_named_credential_ids == {"cred_1"}
 
@@ -1751,7 +1785,7 @@ def test_connected_resume_does_not_duplicate_an_already_resolved_credential() ->
     credential = _make_credential()
     policy.resolved_credentials = [credential]
 
-    credential_pause_module._apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
+    credential_pause_module.apply_connected_credential_to_policy(make_copilot_context(), policy, credential)
 
     assert [resolved.credential_id for resolved in policy.resolved_credentials] == ["cred_1"]
 
@@ -1765,7 +1799,7 @@ def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval(login
     policy = _ask_origin_policy(*login_urls)
     ctx.request_policy = policy
 
-    credential_pause_module._apply_connected_credential_to_policy(ctx, policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
 
     assert [record.credential_id for record in StructuredContext.from_json_str(carried).approved_credentials] == [
@@ -1791,7 +1825,7 @@ async def test_card_selection_keeps_its_origin_on_the_next_turn(
     previous = StructuredContext()
     if previous_origin is not None:
         previous.approved_credentials = [ApprovedCredential(credential_id="cred_1", admitted_url=previous_origin)]
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, previous.to_json_str())
     assert carried is not None
     records = StructuredContext.from_json_str(carried).approved_credentials
@@ -1831,7 +1865,7 @@ async def test_invalid_card_origin_cannot_create_cross_turn_approval(
 
     # Retained state must also fail closed if it predates validation at the card boundary.
     ctx.request_policy = _ask_origin_policy(login_url)
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
     assert StructuredContext.from_json_str(carried).approved_credentials == []
 
@@ -1860,7 +1894,7 @@ async def test_saved_workflow_resolution_requires_user_selection_for_chat_approv
 async def test_card_approval_preserves_explicit_port_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = make_copilot_context()
     ctx.request_policy = _ask_origin_policy("https://portal.example.com:0/login?code=synthetic-code")
-    credential_pause_module._apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
+    credential_pause_module.apply_connected_credential_to_policy(ctx, ctx.request_policy, _make_credential())
     carried = record_approved_credentials_in_global_llm_context(ctx, None)
     next_policy = RequestPolicy()
     _stub_credential_lookup(monkeypatch, _make_credential())
@@ -2506,6 +2540,21 @@ async def test_a_named_login_known_for_another_site_is_left_to_the_picker(
 
 
 @pytest.mark.asyncio
+async def test_denied_vault_site_read_leaves_a_named_login_to_the_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _tool_ctx(monkeypatch, _answered_cache("skip"))
+    ctx.request_policy.current_turn_named_credential_ids = {"cred_1"}
+    monkeypatch.setattr(
+        credential_fill_module,
+        "_read_vault_named_sites",
+        AsyncMock(side_effect=PermissionError("credential not accessible")),
+    )
+
+    await _ask(ctx, "https://portal.example.com/login")
+
+    assert [card.named_credential_id for card in _sent_cards(ctx)] == [None]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("carried_as", ["approval", "proposal"])
 async def test_a_login_carried_in_for_another_site_is_left_to_the_picker_when_named_again(
     monkeypatch: pytest.MonkeyPatch, carried_as: str
@@ -2761,6 +2810,28 @@ async def test_origin_recovery_admits_no_credential_it_cannot_place_on_the_provi
 
 
 @pytest.mark.asyncio
+async def test_denied_vault_site_read_does_not_abort_origin_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _recovery_ctx(monkeypatch, _answered_cache("connected", "cred_idp"))
+    monkeypatch.setattr(
+        credential_fill_module,
+        "_read_vault_named_sites",
+        AsyncMock(side_effect=PermissionError("credential not accessible")),
+    )
+    _stub_credential_lookup(monkeypatch, _idp_credential())
+    monkeypatch.setattr(
+        credential_pause_module.app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(record_pending_copilot_turn_credential_resume=AsyncMock()),
+        raising=False,
+    )
+
+    result = await _ask(ctx, f"{_IDP_ORIGIN}/login")
+
+    assert ctx.credential_pause_outcome == "not_admitted"
+    _assert_declined(ctx, result, "connected_other_site")
+
+
+@pytest.mark.asyncio
 async def test_a_recovery_connect_keeps_the_named_service_login_approved_beside_the_provider_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2999,6 +3070,9 @@ def test_the_raw_secret_card_sees_only_the_origin(user_url: str, origin: str) ->
     assert credential_pause_module.raw_secret_card_origin(user_url) == origin
 
 
+_SIGNED_IN_SCOPE_PHRASES = ("this turn's tests only", "start signed out")
+
+
 @pytest.mark.asyncio
 async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_does_not_fire_again(
     monkeypatch: pytest.MonkeyPatch,
@@ -3029,7 +3103,9 @@ async def test_a_run_derived_card_answered_by_signing_in_resumes_with_facts_and_
     resume_msgs = await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config)
 
     assert resume_msgs is not None
-    assert credential_pause_module.signed_in_facts(signed_in) in json.dumps(resume_msgs)
+    resume_text = json.dumps(resume_msgs)
+    assert credential_pause_module.signed_in_facts(signed_in) in resume_text
+    assert all(phrase in resume_text for phrase in _SIGNED_IN_SCOPE_PHRASES)
     assert ctx.credential_pause_outcome == "signed_in"
     assert _turn_credential_prompt_reason(ctx) is None
     assert await maybe_credential_pause(ctx, _fake_result(), _make_stream(), config) is None
@@ -3052,7 +3128,7 @@ async def test_a_card_answered_by_signing_in_tells_the_tool_what_happened(monkey
     result = await _call_ask_tool(ctx)
 
     assert (result["status"], result["browser_profile_id"]) == ("signed_in", "bp_signed_in")
-    assert result["detail"]
+    assert all(phrase in result["detail"] for phrase in _SIGNED_IN_SCOPE_PHRASES)
 
 
 _REGISTRATION = {
