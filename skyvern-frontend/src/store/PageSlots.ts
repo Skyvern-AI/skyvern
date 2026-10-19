@@ -47,6 +47,9 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  workflowCuratorSettings?: React.ComponentType<
+    Readonly<{ workflowPermanentId: string; readOnly: boolean }>
+  >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
   workflowRunsFilterControls?: React.ComponentType;
