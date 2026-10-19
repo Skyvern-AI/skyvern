@@ -301,7 +301,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       insertion: { after_label: "open_form", before_label: "finish" },
     });
     const status = screen
-      .getByText("Recording · 0 actions")
+      .getByText("Demonstrating · 0 actions")
       .closest('[role="status"]');
     expect(status?.querySelector(".bg-red-500")).toBeTruthy();
     expect(status?.querySelector("svg")).toBeNull();
@@ -441,7 +441,7 @@ describe("WorkflowCopilotChat demonstration", () => {
     ).not.toHaveProperty("demonstration_insertion");
 
     expect(
-      await screen.findByText("Recording paused · 2 actions"),
+      await screen.findByText("Demonstration paused · 2 actions"),
     ).toBeTruthy();
     expect(
       useRecordingLauncherStore.getState()
@@ -477,7 +477,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       ).toHaveLength(2),
     );
     await waitFor(() =>
-      expect(screen.queryByText("Recording paused · 2 actions")).toBeNull(),
+      expect(screen.queryByText("Demonstration paused · 2 actions")).toBeNull(),
     );
 
     const sentGroup = screen.getByRole("group", {
@@ -554,7 +554,7 @@ describe("WorkflowCopilotChat demonstration", () => {
     sansApiPost.mockRejectedValueOnce(new Error("network down"));
     fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
     await waitFor(() => expect(sansApiPost).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText("Recording · 1 action")).toBeTruthy();
+    expect(await screen.findByText("Demonstrating · 1 action")).toBeTruthy();
     expect(
       screen.getByRole("group", { name: "Your demonstration" }),
     ).toBeTruthy();
@@ -574,7 +574,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       ),
     );
     await waitFor(() => {
-      expect(screen.queryByText("Recording · 1 action")).toBeNull();
+      expect(screen.queryByText("Demonstrating · 1 action")).toBeNull();
       expect(
         screen.queryByRole("group", { name: "Your demonstration" }),
       ).toBeNull();
@@ -817,7 +817,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       }
 
       const pausedText = await screen.findByText(
-        "Recording paused · 3 actions",
+        "Demonstration paused · 3 actions",
       );
       const pausedStatus = pausedText.closest('[role="status"]');
       expect(pausedStatus).toBeTruthy();
@@ -864,7 +864,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       );
       if (status === "stopping") {
         expect(
-          await screen.findByText("Recording paused · 3 actions"),
+          await screen.findByText("Demonstration paused · 3 actions"),
         ).toBeTruthy();
         await waitFor(() =>
           expect(
@@ -884,7 +884,9 @@ describe("WorkflowCopilotChat demonstration", () => {
           ).toHaveLength(2),
         );
         await waitFor(() =>
-          expect(screen.queryByText("Recording paused · 3 actions")).toBeNull(),
+          expect(
+            screen.queryByText("Demonstration paused · 3 actions"),
+          ).toBeNull(),
         );
       }
       expect(

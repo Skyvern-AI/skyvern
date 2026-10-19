@@ -1916,7 +1916,7 @@ function Workspace({
     },
     [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
   );
-  // `/discover`'s "Record task" lands here with ?record=1; start once the browser is ready.
+  // `/discover`'s "Demonstrate task" lands here with ?record=1; start once the browser is ready.
   useEffect(() => {
     if (
       !autoRecordRequested ||

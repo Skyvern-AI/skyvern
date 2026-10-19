@@ -572,7 +572,7 @@ function RecordingPanelImpl(
   const showInterpretationFallbackNote =
     !interpretationEnabled && exposedEventCount > 0;
   const headerTitle = isFinishing
-    ? "Finishing recording…"
+    ? "Finishing demonstration…"
     : "Copilot is following along";
 
   // Focusing and filling one field both carry its credential kind, so group by
@@ -657,7 +657,7 @@ function RecordingPanelImpl(
     </div>
   ) : null;
 
-  const stopLabel = mutationIsError ? "Try again" : "Stop recording";
+  const stopLabel = mutationIsError ? "Try again" : "Finish demonstration";
   const renderStopButton = (className: string, iconOnly = false) => (
     <Button
       size={iconOnly ? "icon" : "sm"}
@@ -724,7 +724,7 @@ function RecordingPanelImpl(
           </div>
           <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
             {isFinishing
-              ? "Saving the last recorded actions"
+              ? "Saving the last actions"
               : `${actionCount} captured action${actionCount === 1 ? "" : "s"}`}
           </div>
         </div>
@@ -732,7 +732,7 @@ function RecordingPanelImpl(
           <button
             type="button"
             aria-label={
-              collapsed ? "Show recorded actions" : "Hide recorded actions"
+              collapsed ? "Show captured actions" : "Hide captured actions"
             }
             onClick={() => onCollapsedChange?.(!collapsed)}
             className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -747,7 +747,7 @@ function RecordingPanelImpl(
         <button
           type="button"
           aria-label={
-            expanded ? "Return recording to chat" : "Expand recording"
+            expanded ? "Return demonstration to chat" : "Expand demonstration"
           }
           onClick={() => onExpandedChange?.(!expanded)}
           className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -762,7 +762,7 @@ function RecordingPanelImpl(
           <DropdownMenuTrigger asChild>
             <button
               type="button"
-              aria-label="Recording options"
+              aria-label="Demonstration options"
               disabled={isFinishing && !mutationIsError}
               className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
             >
@@ -775,7 +775,7 @@ function RecordingPanelImpl(
               onSelect={onDiscardClick}
             >
               <TrashIcon className="mr-2 size-4" />
-              Discard recording
+              Discard demonstration
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -847,7 +847,7 @@ function RecordingPanelImpl(
               <div className="px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
                 {exposedEventCount} interaction
                 {exposedEventCount === 1 ? "" : "s"} captured — workflow steps
-                will be generated when you stop recording.
+                will be generated when you finish the demonstration.
               </div>
             )}
           </div>
@@ -879,7 +879,7 @@ function RecordingPanelImpl(
       {insertionPointMissing && (
         <div className="flex-none border-t px-3.5 py-2 text-[11px] leading-relaxed text-red-700 dark:text-red-400">
           Could not determine where to insert workflow steps. Discard and choose
-          Record task from the workflow editor again.
+          Demonstrate task from the workflow editor again.
         </div>
       )}
 
@@ -892,8 +892,8 @@ function RecordingPanelImpl(
           )}
           <span className="truncate">
             {isFinishing
-              ? "Finishing recording…"
-              : `Recording · ${formatRecordingClock(elapsedSeconds)}`}
+              ? "Finishing demonstration…"
+              : `Demonstrating · ${formatRecordingClock(elapsedSeconds)}`}
           </span>
         </div>
         {isFinishing && !mutationIsError ? (
@@ -909,14 +909,14 @@ function RecordingPanelImpl(
         <Dialog open onOpenChange={setConfirmDiscardOpen}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Discard task recording?</DialogTitle>
+              <DialogTitle>Discard demonstration?</DialogTitle>
               <DialogDescription>
                 {visibleSteps.length > 0
                   ? `You have ${visibleSteps.length} captured workflow step${
                       visibleSteps.length === 1 ? "" : "s"
                     } that will be lost if you discard.`
                   : "Your captured browser interactions will be lost if you discard."}{" "}
-                Are you sure you want to discard this task recording?
+                Are you sure you want to discard this demonstration?
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -924,7 +924,7 @@ function RecordingPanelImpl(
                 variant="outline"
                 onClick={() => setConfirmDiscardOpen(false)}
               >
-                Keep recording task
+                Keep demonstrating
               </Button>
               <Button variant="destructive" onClick={discard}>
                 Discard

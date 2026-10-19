@@ -57,15 +57,15 @@ describe("formatDropBlockedToast (SKY-9062)", () => {
   });
 
   describe("drag-mode", () => {
-    test("recording reason tells the user to stop recording", () => {
+    test("demonstration reason tells the user to finish", () => {
       // Matches the tooltip text surfaced on the grip handle so both
       // affordances converge on the same fix (`getDragGateReason`).
       const content = formatDropBlockedToast({
         kind: "drag-mode",
       });
-      expect(content.title).toContain("recording");
+      expect(content.title).toContain("demonstration");
       expect(content.description).toBe(
-        "Finish recording the task to reorder blocks.",
+        "Finish the demonstration to reorder blocks.",
       );
       expect(content.details).toEqual([]);
     });

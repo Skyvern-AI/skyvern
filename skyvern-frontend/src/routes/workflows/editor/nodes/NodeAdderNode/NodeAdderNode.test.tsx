@@ -209,13 +209,17 @@ describe("NodeAdderNode", () => {
       const token = lock === "copilot" ? beginCopilotAcceptance() : null;
       if (lock === "yaml") expect(beginYamlCommit(owner)).toBe(true);
       renderNodeAdder({}, { debug: true });
-      await act(async () => fireEvent.click(screen.getByText("Record Task")));
+      await act(async () =>
+        fireEvent.click(screen.getByText("Demonstrate task")),
+      );
       expect(useRecordingStore.getState().isRecording).toBe(false);
       act(() => {
         if (token) finishCopilotAcceptance(token);
         else finishYamlCommit(owner);
       });
-      await act(async () => fireEvent.click(screen.getByText("Record Task")));
+      await act(async () =>
+        fireEvent.click(screen.getByText("Demonstrate task")),
+      );
       expect(useRecordingStore.getState().isRecording).toBe(true);
       expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
         true,
@@ -244,7 +248,9 @@ describe("NodeAdderNode", () => {
       .getState()
       .setPendingRecording("br-pending", "wpid_test");
     const { unmount } = renderNodeAdder({}, { debug: true });
-    await act(async () => fireEvent.click(screen.getByText("Record Task")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Demonstrate task")),
+    );
     expect(useRecordingStore.getState().isRecording).toBe(false);
     const blockedStart = usePendingRecordingStartGate.getState().blockedStart;
     expect(blockedStart).not.toBeNull();

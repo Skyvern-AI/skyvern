@@ -361,9 +361,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
         "I have the demonstration. I’m turning it into workflow steps now.",
       ),
     ).toBeTruthy();
-    expect(screen.getByText("Recorded 2 actions")).toBeTruthy();
+    expect(screen.getByText("Captured 2 actions")).toBeTruthy();
     expect(screen.getByText("Task demonstration captured")).toBeTruthy();
-    expect(screen.getByText("Reviewing 2 recorded actions")).toBeTruthy();
+    expect(screen.getByText("Reviewing 2 captured actions")).toBeTruthy();
 
     await act(async () => {
       streamCalls[0]?.onMessage({
@@ -454,7 +454,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     ).toBeTruthy();
     expect(
       screen.queryByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeNull();
 
@@ -588,7 +588,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     ).toBeTruthy();
     expect(
       screen.queryByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeNull();
 
@@ -620,7 +620,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     expect(
       screen.getByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeTruthy();
     expect(
@@ -1063,7 +1063,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     expect(
       screen.getByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeTruthy();
     expect(
@@ -1168,7 +1168,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     ).toBeTruthy();
     expect(
       screen.queryByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeNull();
     expect(
@@ -1292,7 +1292,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     expect(screen.getByText("Draft ready to test")).toBeTruthy();
     expect(
       screen.getByText(
-        "I drafted a workflow from the recording without running it. Run it to check it works.",
+        "I drafted a workflow from your demonstration without running it. Run it to check it works.",
       ),
     ).toBeTruthy();
     expect(
@@ -1348,7 +1348,9 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     await renderChat();
 
-    expect(screen.getByText("I stopped refining this recording.")).toBeTruthy();
+    expect(
+      screen.getByText("I stopped refining this demonstration."),
+    ).toBeTruthy();
     expect(screen.getByText("Refinement cancelled")).toBeTruthy();
   });
 
@@ -1383,7 +1385,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     });
     expect(
       screen.getByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeTruthy();
 
@@ -1427,7 +1429,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
     expect(screen.getByText("Draft ready to test")).toBeTruthy();
     expect(
       screen.getByText(
-        "I drafted a workflow from the recording without running it. Run it to check it works.",
+        "I drafted a workflow from your demonstration without running it. Run it to check it works.",
       ),
     ).toBeTruthy();
   });
@@ -1633,7 +1635,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     expect(
       screen.getByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
@@ -1684,7 +1686,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     expect(
       screen.getByText(
-        "I couldn’t finish refining this recording. Your recorded steps are still in the editor, so you can edit them there or ask me to try again.",
+        "I couldn’t finish refining this demonstration. The captured steps are still in the editor, so you can edit them there or ask me to try again.",
       ),
     ).toBeTruthy();
     expect(screen.getByText("Refinement needs attention")).toBeTruthy();
@@ -1743,7 +1745,7 @@ describe("WorkflowCopilotChat — run grounding bridge", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText("I stopped refining this recording."),
+        screen.getByText("I stopped refining this demonstration."),
       ).toBeTruthy(),
     );
     expect(screen.getByText("Refinement cancelled")).toBeTruthy();

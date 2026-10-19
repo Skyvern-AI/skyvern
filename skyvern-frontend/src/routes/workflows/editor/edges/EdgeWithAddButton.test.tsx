@@ -209,13 +209,17 @@ describe("EdgeWithAddButton", () => {
       const token = lock === "copilot" ? beginCopilotAcceptance() : null;
       if (lock === "yaml") expect(beginYamlCommit(owner)).toBe(true);
       renderEdge({}, { debug: true });
-      await act(async () => fireEvent.click(screen.getByText("Record Task")));
+      await act(async () =>
+        fireEvent.click(screen.getByText("Demonstrate task")),
+      );
       expect(useRecordingStore.getState().isRecording).toBe(false);
       act(() => {
         if (token) finishCopilotAcceptance(token);
         else finishYamlCommit(owner);
       });
-      await act(async () => fireEvent.click(screen.getByText("Record Task")));
+      await act(async () =>
+        fireEvent.click(screen.getByText("Demonstrate task")),
+      );
       expect(useRecordingStore.getState().isRecording).toBe(true);
       expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
         true,
@@ -241,7 +245,9 @@ describe("EdgeWithAddButton", () => {
       .getState()
       .setPendingRecording("br-pending", "wpid_test");
     const { unmount } = renderEdge({}, { debug: true });
-    await act(async () => fireEvent.click(screen.getByText("Record Task")));
+    await act(async () =>
+      fireEvent.click(screen.getByText("Demonstrate task")),
+    );
     expect(useRecordingStore.getState().isRecording).toBe(false);
     const blockedStart = usePendingRecordingStartGate.getState().blockedStart;
     expect(blockedStart).not.toBeNull();
