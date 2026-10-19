@@ -36,7 +36,10 @@ import {
   SaveStaleError,
   useWorkflowHasChangesStore,
 } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { cn } from "@/util/utils";
 
 import { SaveFailedError, useSaveWorkflow } from "../hooks/useSaveWorkflow";
@@ -64,6 +67,8 @@ export function EditorOverflowMenu({
   const saveBlockedReason = useWorkflowHasChangesStore(
     (s) => s.saveBlockedReason,
   );
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const templateSaveReason = saveBlockedReason ?? saveLockReason;
   const templateReasonId = useId();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const requestTour = useProductTourStore((s) => s.requestTour);
@@ -112,7 +117,7 @@ export function EditorOverflowMenu({
   const disabled = isRecording || templateMutation.isPending || saving;
   // Only adding a template saves first. Radix skips a `disabled` item in keyboard navigation,
   // so the held item stays focusable and carries aria-disabled to keep its reason reachable.
-  const templateSaveHeld = !isTemplate && Boolean(saveBlockedReason);
+  const templateSaveHeld = !isTemplate && Boolean(templateSaveReason);
 
   const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
@@ -204,7 +209,7 @@ export function EditorOverflowMenu({
                 id={templateReasonId}
                 className="max-w-xs whitespace-normal text-xs text-muted-foreground"
               >
-                {saveBlockedReason}
+                {templateSaveReason}
               </span>
             </>
           ) : (
