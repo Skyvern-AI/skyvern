@@ -54,7 +54,7 @@ export function RecordingPill() {
           "opacity-50": finishRequested,
         })}
       />
-      {finishRequested ? "CREATING STEPS" : "RECORDING TASK"}{" "}
+      {finishRequested ? "CREATING STEPS" : "DEMONSTRATING TASK"}{" "}
       {formatRecordingClock(elapsedSeconds)}
       <span className="text-red-400/80">·</span>
       {count}

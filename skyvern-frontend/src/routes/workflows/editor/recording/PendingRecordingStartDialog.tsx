@@ -23,8 +23,8 @@ import { usePendingRecordingStartGate } from "./pendingRecordingStartGate";
 function startOrExplain(start: (() => boolean) | null) {
   if (start && !start())
     toast({
-      title: "Recording didn't start",
-      description: "Where you chose to record changed. Click Record again.",
+      title: "Demonstration didn't start",
+      description: "The starting point changed. Choose Demonstrate task again.",
     });
 }
 
@@ -148,7 +148,9 @@ export function PendingRecordingStartDialog({
         }}
       >
         <DialogHeader>
-          <DialogTitle>Save or discard changes before recording</DialogTitle>
+          <DialogTitle>
+            Save or discard changes before demonstrating
+          </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-2">
               <p>
@@ -157,7 +159,7 @@ export function PendingRecordingStartDialog({
                     ? editorLocked
                       ? `${getWorkflowLockMessage()}.`
                       : "Finish the current authoring action first."
-                    : "Blocks from your last recording aren't saved yet.")}
+                    : "Blocks from your last demonstration aren't saved yet.")}
               </p>
               <p>
                 Discarding reloads the last saved version and removes these
@@ -180,11 +182,11 @@ export function PendingRecordingStartDialog({
             disabled={saving || locked}
             onClick={discard}
           >
-            {discardRecords ? "Discard and record" : "Discard changes"}
+            {discardRecords ? "Discard and demonstrate" : "Discard changes"}
           </Button>
           <Button ref={saveRef} disabled={saving || locked} onClick={save}>
             {saving && <ReloadIcon className="mr-2 size-4 animate-spin" />}
-            Save and record
+            Save and demonstrate
           </Button>
         </DialogFooter>
       </DialogContent>

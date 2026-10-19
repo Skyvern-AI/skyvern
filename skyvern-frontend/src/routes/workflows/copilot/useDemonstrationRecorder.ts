@@ -156,9 +156,9 @@ export function useDemonstrationRecorder({
           if (frame.reason === "event_limit") {
             setLimitReached(true);
             toast({
-              title: "This recording reached its size limit",
+              title: "This demonstration reached its size limit",
               description:
-                "Build the workflow from what was recorded, or discard it.",
+                "Build the workflow from the captured actions, or discard the demonstration.",
             });
           }
           updatePhase("stopped");
@@ -337,7 +337,7 @@ export function useDemonstrationRecorder({
         setHasSkippedSensitiveField(false);
         if (stopped?.action_count === 0) {
           setActionCount(0);
-          toast({ title: "Nothing was recorded yet" });
+          toast({ title: "No actions captured yet" });
           updateBusy(false);
           return;
         }

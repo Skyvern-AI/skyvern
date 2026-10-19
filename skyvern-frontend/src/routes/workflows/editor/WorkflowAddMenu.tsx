@@ -53,7 +53,7 @@ function WorkflowAddMenu({
       },
     ];
 
-    // Show Record Task whenever a browser session exists (ready or still
+    // Show Demonstrate task whenever a browser session exists (ready or still
     // connecting). Disable it until the browser is actually ready so users
     // can see the action will be available without it popping in mid-load.
     if (settingsStore.isUsingABrowser || settingsStore.isLoadingABrowser) {
@@ -64,7 +64,7 @@ function WorkflowAddMenu({
           canRecordTask &&
           settingsStore.isUsingABrowser &&
           !recordingStore.isRecording,
-        text: "Record Task",
+        text: "Demonstrate task",
         onClick: () => {
           onRecord();
         },

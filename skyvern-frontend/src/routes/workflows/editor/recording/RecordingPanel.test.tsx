@@ -208,7 +208,7 @@ describe("RecordingPanel", () => {
     render(<RecordingPanel browserSessionId={null} />);
 
     const stopButton = screen.getByRole("button", {
-      name: /stop recording/i,
+      name: /finish demonstration/i,
     }) as HTMLButtonElement;
     expect(stopButton.disabled).toBe(true);
 
@@ -223,7 +223,7 @@ describe("RecordingPanel", () => {
     expect(
       (
         screen.getByRole("button", {
-          name: /stop recording/i,
+          name: /finish demonstration/i,
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);
@@ -231,7 +231,7 @@ describe("RecordingPanel", () => {
     rerender(<RecordingPanel browserSessionId="pbs_123" />);
 
     const stopButton = screen.getByRole("button", {
-      name: /stop recording/i,
+      name: /finish demonstration/i,
     }) as HTMLButtonElement;
     expect(stopButton.disabled).toBe(false);
 
@@ -251,7 +251,9 @@ describe("RecordingPanel", () => {
         <RecordingPanel browserSessionId="pbs_123" />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: /stop recording/i }));
+      fireEvent.click(
+        screen.getByRole("button", { name: /finish demonstration/i }),
+      );
 
       // The debug session's browser_session_id blips to null while the
       // finalize timeout is pending.
@@ -260,7 +262,7 @@ describe("RecordingPanel", () => {
       expect(mutateMock).not.toHaveBeenCalled();
 
       // It resolves again; the finalize wait should retry rather than
-      // leaving the panel stuck on "Finishing recording".
+      // leaving the panel stuck on "Finishing demonstration".
       rerender(<RecordingPanel browserSessionId="pbs_123" />);
       vi.advanceTimersByTime(5000);
 
@@ -280,7 +282,9 @@ describe("RecordingPanel", () => {
         <RecordingPanel browserSessionId="pbs_123" />,
       );
 
-      fireEvent.click(screen.getByRole("button", { name: /stop recording/i }));
+      fireEvent.click(
+        screen.getByRole("button", { name: /finish demonstration/i }),
+      );
       rerender(
         <RecordingPanel
           browserSessionId="pbs_123"

@@ -2910,7 +2910,7 @@ describe("Discover recording handoff", () => {
   );
 });
 
-describe("Record Browser pending-change prompt", () => {
+describe("Demonstration pending-change prompt", () => {
   const del = vi.fn();
 
   beforeEach(() => {
@@ -3008,11 +3008,11 @@ describe("Record Browser pending-change prompt", () => {
     act(() => useRecordingLauncherStore.getState().startRecordingAtEnd!());
   }
 
-  test("the Browser pane Record button asks first, and Save and record saves before recording", async () => {
+  test("the demonstration action asks first, and Save and demonstrate saves before recording", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     expect(
-      screen.getByText("Save or discard changes before recording"),
+      screen.getByText("Save or discard changes before demonstrating"),
     ).toBeTruthy();
     expect(useRecordingStore.getState().isRecording).toBe(false);
 
@@ -3020,7 +3020,9 @@ describe("Record Browser pending-change prompt", () => {
       data: { ...(liveWorkflow as object), version: 2 },
     });
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+      fireEvent.click(
+        screen.getByRole("button", { name: "Save and demonstrate" }),
+      ),
     );
     await waitFor(() =>
       expect(useRecordingStore.getState().isRecording).toBe(true),
@@ -3029,7 +3031,7 @@ describe("Record Browser pending-change prompt", () => {
     expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(null);
   });
 
-  test("Save and record does not record if the browser stopped being ready during the save", async () => {
+  test("Save and demonstrate does not record if the browser stopped being ready during the save", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     put.mockImplementation(async () => {
@@ -3037,7 +3039,9 @@ describe("Record Browser pending-change prompt", () => {
       return { data: { ...(liveWorkflow as object), version: 2 } };
     });
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+      fireEvent.click(
+        screen.getByRole("button", { name: "Save and demonstrate" }),
+      ),
     );
     await waitFor(() =>
       expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
@@ -3048,12 +3052,12 @@ describe("Record Browser pending-change prompt", () => {
     expect(useRecordingStore.getState().isRecording).toBe(false);
   });
 
-  test("Discard and record reloads the saved workflow, deletes the old recording, then records", async () => {
+  test("Discard and demonstrate reloads the saved workflow, deletes the old recording, then records", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     await act(async () =>
       fireEvent.click(
-        screen.getByRole("button", { name: "Discard and record" }),
+        screen.getByRole("button", { name: "Discard and demonstrate" }),
       ),
     );
     await waitFor(() =>
@@ -3074,7 +3078,9 @@ describe("Record Browser pending-change prompt", () => {
       }),
     );
     await clickBrowserPaneRecord();
-    const discard = screen.getByRole("button", { name: "Discard and record" });
+    const discard = screen.getByRole("button", {
+      name: "Discard and demonstrate",
+    });
     expect((discard as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(discard);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3093,7 +3099,7 @@ describe("Record Browser pending-change prompt", () => {
     });
     await waitFor(() =>
       expect(
-        screen.getByText("Save or discard changes before recording"),
+        screen.getByText("Save or discard changes before demonstrating"),
       ).toBeTruthy(),
     );
     expect(
@@ -3102,7 +3108,7 @@ describe("Record Browser pending-change prompt", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() =>
       expect(
-        screen.queryByText("Save or discard changes before recording"),
+        screen.queryByText("Save or discard changes before demonstrating"),
       ).toBeNull(),
     );
     expect(useRecordingStore.getState().isRecording).toBe(false);

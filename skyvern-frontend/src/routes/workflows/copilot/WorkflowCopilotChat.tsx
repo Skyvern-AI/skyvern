@@ -1370,12 +1370,12 @@ function RecordingChapterProxy({
         >
           <span className="block truncate text-xs font-semibold text-foreground">
             {isFinishing
-              ? "Finishing recording…"
+              ? "Finishing demonstration…"
               : "Copilot is following along"}
           </span>
           <span className="block truncate text-[10.5px] text-muted-foreground">
             {isFinishing ? (
-              "Saving the last recorded actions"
+              "Saving the last actions"
             ) : (
               <>
                 {actionCount} captured action{actionCount === 1 ? "" : "s"}
@@ -1387,8 +1387,8 @@ function RecordingChapterProxy({
         <div ref={stopSlotRef} className="flex shrink-0" />
         <button
           type="button"
-          aria-label="Expand recording"
-          title="Expand recording"
+          aria-label="Expand demonstration"
+          title="Expand demonstration"
           onClick={onExpand}
           className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -11119,7 +11119,7 @@ export function WorkflowCopilotChat({
                         content={
                           recordTaskDisabled
                             ? (authoringUnavailableReason ??
-                              "Record Task is available when the browser is ready")
+                              "Demonstrate task is available when the browser is ready")
                             : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
                         }
                         blocked={recordTaskDisabled}
@@ -11128,7 +11128,7 @@ export function WorkflowCopilotChat({
                       >
                         <button
                           type="button"
-                          aria-label="Record task"
+                          aria-label="Demonstrate task"
                           className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={recordTaskDisabled}
                           onClick={() => {
@@ -11141,7 +11141,7 @@ export function WorkflowCopilotChat({
                           </span>
                           <span className="min-w-0">
                             <span className="block font-medium text-foreground">
-                              Record task
+                              Demonstrate task
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
                               Do it once in the browser
@@ -12192,8 +12192,8 @@ export function WorkflowCopilotChat({
                 )}
                 <span>
                   {demonstrationRecorder.phase === "recording"
-                    ? "Recording"
-                    : "Recording paused"}
+                    ? "Demonstrating"
+                    : "Demonstration paused"}
                   {` · ${demonstrationRecorder.actionCount} ${
                     demonstrationRecorder.actionCount === 1
                       ? "action"

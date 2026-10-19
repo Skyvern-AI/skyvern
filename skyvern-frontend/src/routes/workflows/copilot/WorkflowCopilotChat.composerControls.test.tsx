@@ -182,7 +182,7 @@ vi.mock("@/routes/workflows/editor/recording/RecordingPanel", async () => {
               </button>
             ) : (
               <button type="button" onClick={() => onExpandedChange?.(true)}>
-                Expand recording
+                Expand demonstration
               </button>
             )}
           </div>
@@ -614,7 +614,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(ta.closest("[class*='focus-within']")).not.toBeNull();
   });
 
-  it("starts SOP upload and task recording from the empty state", async () => {
+  it("starts SOP upload and task demonstration from the empty state", async () => {
     const onUploadSOP = vi.fn();
     const onRecordTask = vi.fn();
 
@@ -632,7 +632,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("What should this agent do?")).toBeTruthy(),
     );
     expect(screen.getByText("Upload an SOP")).toBeTruthy();
-    expect(screen.getByText("Record task")).toBeTruthy();
+    expect(screen.getByText("Demonstrate task")).toBeTruthy();
     const actionLayout = screen.getByRole("button", {
       name: "Upload an SOP",
     }).parentElement?.parentElement;
@@ -648,11 +648,11 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     });
     expect(onUploadSOP).toHaveBeenCalledWith(file);
 
-    fireEvent.click(screen.getByRole("button", { name: "Record task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
-  it("does not allow SOP upload and task recording at the same time", async () => {
+  it("does not allow SOP upload and task demonstration at the same time", async () => {
     const onUploadSOP = vi.fn();
     const onRecordTask = vi.fn();
     const { rerender } = render(
@@ -671,7 +671,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("Uploading SOP…")).toBeTruthy(),
     );
     const recordTaskButton = screen.getByRole("button", {
-      name: "Record task",
+      name: "Demonstrate task",
     });
     expect(recordTaskButton.hasAttribute("disabled")).toBe(true);
     expect(recordTaskButton.parentElement?.getAttribute("tabindex")).toBe("0");
@@ -735,7 +735,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
           ],
         },
       });
-      fireEvent.click(screen.getByRole("button", { name: "Record task" }));
+      fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
       expect(onUploadSOP).not.toHaveBeenCalled();
       expect(onRecordTask).not.toHaveBeenCalled();
     },
@@ -837,7 +837,9 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       .getByTestId("recording-inline")
       .getAttribute("data-mount-id");
 
-    fireEvent.click(screen.getByRole("button", { name: "Expand recording" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Expand demonstration" }),
+    );
     expect(screen.getByTestId("recording-focus")).toBeTruthy();
     expect(
       document.querySelectorAll('[data-recording-controller="true"]'),

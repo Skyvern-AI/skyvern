@@ -1075,7 +1075,7 @@ function BrowserStream({
               <div className="relative h-full w-full">
                 <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2">
                   <RecordingPill />
-                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Stop when you are ready, or discard from the recording menu.">
+                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Finish when you are ready, or discard from the demonstration menu.">
                     <div className="cursor-pointer text-red-500">
                       <InfoCircledIcon />
                     </div>

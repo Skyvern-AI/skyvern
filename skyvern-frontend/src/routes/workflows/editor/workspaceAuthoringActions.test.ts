@@ -43,7 +43,7 @@ describe("workspace authoring actions", () => {
     });
   });
 
-  it("makes SOP upload and task recording mutually exclusive", () => {
+  it("makes SOP upload and task demonstration mutually exclusive", () => {
     expect(
       resolveWorkspaceAuthoringActionAvailability({
         browserReady: true,

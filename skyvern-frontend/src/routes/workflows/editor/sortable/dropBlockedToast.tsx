@@ -85,8 +85,8 @@ export function formatDropBlockedToast(
     }
     case "drag-mode": {
       return {
-        title: "Can't reorder: task recording is active",
-        description: "Finish recording the task to reorder blocks.",
+        title: "Can't reorder: demonstration is active",
+        description: "Finish the demonstration to reorder blocks.",
         details: [],
       };
     }
