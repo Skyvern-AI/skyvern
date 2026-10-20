@@ -583,9 +583,11 @@ async def test_recorder_persists_tap_actions_controls_and_stops(monkeypatch: pyt
     action_frames = [frame for frame in stream.frames if frame.get("type") == "demonstration_action"]
     assert [(frame["seq"], frame["tool_name"]) for frame in action_frames] == [
         (1, "click"),
+        (2, "type_text"),
         (3, "gap"),
         (4, "navigate_browser"),
     ]
+    assert action_frames[1]["label"] == second["label"] == "Fill password (value not recorded)"
     sensitive_frame = next(frame for frame in stream.frames if frame.get("type") == "demonstration_sensitive_field")
     assert sensitive_frame == {
         "type": "demonstration_sensitive_field",

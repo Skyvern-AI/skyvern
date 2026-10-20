@@ -681,7 +681,7 @@ describe("WorkflowCopilotChat demonstration", () => {
     act(() => {
       call.onMessage({
         type: "demonstration_action",
-        seq: 2,
+        seq: 1,
         label: 'Fill password from "Saved login"',
         tool_name: "fill_credential_field",
       });
@@ -699,8 +699,15 @@ describe("WorkflowCopilotChat demonstration", () => {
     await waitFor(() =>
       expect(screen.queryByLabelText("Sign-in request")).toBeNull(),
     );
+    expect(screen.queryByText(/value not recorded/)).toBeNull();
 
     act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 2,
+        label: 'Type "Test Applicant"',
+        tool_name: "type_text",
+      });
       call.onMessage({
         type: "demonstration_sensitive_field",
         field: "other",
@@ -718,7 +725,13 @@ describe("WorkflowCopilotChat demonstration", () => {
     act(() => {
       call.onMessage({
         type: "demonstration_action",
-        seq: 5,
+        seq: 3,
+        label: "Fill sensitive field (value not recorded)",
+        tool_name: "type_text",
+      });
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 4,
         label: "Submit form",
         tool_name: "click",
       });
@@ -729,10 +742,56 @@ describe("WorkflowCopilotChat demonstration", () => {
     const demonstration = screen.getByRole("group", {
       name: "Your demonstration",
     });
-    expect(within(demonstration).getAllByRole("listitem")).toHaveLength(5);
+    expect(within(demonstration).getAllByRole("listitem")).toHaveLength(4);
     expect(within(demonstration).getByText(/Fill password from/)).toBeTruthy();
     expect(
+      within(demonstration).getByText('Type "Test Applicant"'),
+    ).toBeTruthy();
+    expect(
       within(demonstration).getByText(/Fill sensitive field/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a sensitive step the stop flush streams after Done", async () => {
+    await renderChat({ liveBrowserSessionId: "browser-1" });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+    sansApiPost.mockResolvedValueOnce({ data: { seq: 1, action_count: 2 } });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Done, build the workflow" }),
+    );
+    await waitFor(() =>
+      expect(sansApiPost).toHaveBeenCalledWith(
+        "/workflow/copilot/demonstration/control",
+        { demonstration_id: "demonstration-1", action: "stop" },
+      ),
+    );
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 2,
+        label: "Fill password (value not recorded)",
+        tool_name: "type_text",
+      });
+    });
+
+    await waitFor(() =>
+      expect(streamCalls.some((item) => item.path.endsWith("/chat-post"))).toBe(
+        true,
+      ),
+    );
+    const card = screen.getByRole("group", { name: "Your demonstration" });
+    fireEvent.click(within(card).getByRole("button", { expanded: false }));
+    expect(
+      within(card).getByText("Fill password (value not recorded)"),
     ).toBeTruthy();
   });
 

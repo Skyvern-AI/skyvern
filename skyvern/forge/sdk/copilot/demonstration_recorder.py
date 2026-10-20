@@ -744,10 +744,20 @@ class DemonstrationRecorder:
             if kind == "secret_select":
                 stored["control"] = "select"
                 stored["label"] = "Select a sensitive option"
+            else:
+                field_name = {"password": "password", "totp": "one-time code"}.get(
+                    str(stored.get("field")), "sensitive field"
+                )
+                stored["label"] = f"Fill {field_name} (value not recorded)"
             seq = await self._append_event(stored)
-            if seq is not None and kind == "secret_select":
+            if seq is not None:
                 await self.stream.send(
-                    {"type": "demonstration_action", "seq": seq, "label": stored["label"], "tool_name": "select_option"}
+                    {
+                        "type": "demonstration_action",
+                        "seq": seq,
+                        "label": stored["label"],
+                        "tool_name": "select_option" if kind == "secret_select" else "type_text",
+                    }
                 )
             return
         label = _event_label(stored)
