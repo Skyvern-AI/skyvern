@@ -50,6 +50,25 @@ export const CREDENTIAL_REQUIRED_FRAME_BY_REASON = {
     reason: "credential_deferred_draft",
     message: "Picking back up on the credential you held off on earlier.",
   }),
+  credential_missing_totp: buildCredentialRequiredFrame({
+    reason: "credential_missing_totp",
+    message: "The sign-in reached a 2-Step Verification page.",
+    credential_refs: ["cred_hn"],
+  }),
+  credential_rejected_by_site: buildCredentialRequiredFrame({
+    reason: "credential_rejected_by_site",
+    message: "The site rejected the saved one-time code.",
+    credential_refs: ["cred_hn"],
+  }),
+  credential_registration: buildCredentialRequiredFrame({
+    reason: "credential_registration",
+    message: "Create the test account you asked for.",
+    login_page_urls: ["https://portal.example.com/signup"],
+    registration: {
+      username: "tester@example.com",
+      credential_name: "Portal test account",
+    },
+  }),
 } as const;
 
 // No dynamic ask text; only a richer, timed pause signal supplies one.
@@ -65,6 +84,15 @@ export const CREDENTIAL_REQUIRED_FRAME_MINIMAL: CredentialRequiredFrame = {
   type: "credential_required",
   reason: "workflow_credential_inputs_unbound",
 };
+
+// The shape a raw-secret ask actually reaches the card with: the supplied name was replaced by
+// the redaction upstream, so no ask text and no candidate ids survive to pin a suggestion.
+export const CREDENTIAL_REQUIRED_FRAME_REDACTED_ASK: CredentialRequiredFrame =
+  buildCredentialRequiredFrame({
+    reason: "raw_secret",
+    message: undefined,
+    credential_refs: undefined,
+  });
 
 export const RESOLVED_OUTCOME_CONNECTED: CredentialPauseHistorical = {
   outcome: "connected",

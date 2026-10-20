@@ -28,6 +28,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
+from skyvern.forge.sdk.workflow.context_manager import register_secret_derived_output
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
@@ -157,12 +158,14 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     template_data = data.copy() if data else {}
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
+    run_secrets: dict[str, Any] | None = None
     if context and context.workflow_run_id:
         workflow_run_id = context.workflow_run_id
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         template_data.update(workflow_run_context.values)
         if template in template_data:
             return template_data[template]
+        run_secrets = workflow_run_context.secrets
 
     # Inject loop metadata from script `skyvern.loop()` / `skyvern.while_loop()`
     # (current_value, current_index, current_item) so cached function bodies inside
@@ -172,7 +175,10 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             if key in context.loop_metadata:
                 template_data[key] = context.loop_metadata[key]
 
-    return jinja_template.render(template_data)
+    rendered = jinja_template.render(template_data)
+    if run_secrets is not None:
+        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+    return rendered
 
 
 class RealSkyvernPageAi(SkyvernPageAi):

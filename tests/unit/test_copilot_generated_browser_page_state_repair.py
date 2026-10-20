@@ -23,24 +23,29 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composition_evidence, parse_composition_html
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.output_utils import (
     _compact_packet_for_aggregate_limit,
     project_build_test_packet_for_llm,
     project_direct_test_handoff_packet_for_llm,
+    sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     REPAIR_INSTRUCTION_MAX_CHARS,
     WRAPPER_SCOPE_FAILURE_CLASS,
     WRAPPER_SCOPE_REPAIR_INSTRUCTION,
+    _runtime_action_summaries,
     finalize_runtime_authoring_repair_context_from_page_observation,
     record_pending_runtime_authoring_repair_context,
     repair_page_evidence_is_admissible,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     CopilotExecutionSnapshot,
+    _attach_run_session_facts,
     _build_recorded_build_test_outcome,
     _ExecutionResult,
     _failure_action_trace_summary,
@@ -48,6 +53,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _record_run_blocks_result,
     _RunExecution,
     build_test_evidence_packet,
+    finalize_build_test_result,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import CODE_BLOCK_FILENAME, user_code_line_from_exception
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -879,3 +885,238 @@ def test_a_completed_sibling_row_keeps_its_page_facts_beside_a_failed_rows_page_
         ),
         "- label=read_visitors; status=failed; recorded_output=(none recorded)",
     ]
+
+
+_HIDDEN_CONTROL_URL = "https://registry.fixture.test/search"
+_HIDDEN_CONTROL_RUN_ID = "wr_hidden_control"
+_HIDDEN_CONTROL_LABEL = "lookup_credentials"
+_HIDDEN_CONTROL_EXPANDERS = {
+    "focusable_span": ('<span class="dtr-control" tabindex="0"></span>', "span.dtr-control"),
+    "icon_button": ('<button class="row-toggle"><svg></svg></button>', "button.row-toggle"),
+}
+
+
+def _hidden_control_rows(*expanders: str) -> str:
+    return "".join(
+        f'<div class="result-row"><span class="name">{name}</span>{"".join(expanders)}</div>'
+        for name in ("Dana Rivera", "Luis Rivera")
+    )
+
+
+def _hidden_control_controls(body: str) -> list[dict[str, Any]]:
+    html = f"<html><body>{body}</body></html>"
+    parsed = parse_composition_html(html, inspected_url=_HIDDEN_CONTROL_URL, current_url=_HIDDEN_CONTROL_URL)
+    return parsed["clickable_controls"]
+
+
+def _hidden_control_evidence(expander: str) -> dict[str, Any]:
+    html = f'<html><body><h1>Search results</h1><div id="results">{_hidden_control_rows(expander)}</div></body></html>'
+    parsed = parse_composition_html(html, inspected_url=_HIDDEN_CONTROL_URL, current_url=_HIDDEN_CONTROL_URL)
+    return model_visible_composition_evidence(
+        {
+            **parsed,
+            "workflow_run_id": _HIDDEN_CONTROL_RUN_ID,
+            "source_browser_session_id": _RUN_BROWSER_SESSION_ID,
+            "source_tool": "inspect_page_for_composition",
+            "observed_after_workflow_run": True,
+        }
+    )
+
+
+def _hidden_control_result(evidence: dict[str, Any], *, completed: bool) -> dict[str, Any]:
+    outcome = (
+        {"status": "completed", "output": {"records": [], "no_results": True}}
+        if completed
+        else {
+            "status": "failed",
+            "failure_reason": "Locator.click: Timeout 30000ms exceeded. Element is not visible.",
+            "error_codes": ["user_code_error"],
+        }
+    )
+    return {
+        "ok": completed,
+        "data": {
+            "workflow_run_id": _HIDDEN_CONTROL_RUN_ID,
+            "browser_session_id": _RUN_BROWSER_SESSION_ID,
+            "overall_status": "completed" if completed else "failed",
+            "requested_block_labels": [_HIDDEN_CONTROL_LABEL],
+            "executed_block_labels": [_HIDDEN_CONTROL_LABEL],
+            "blocks": [
+                {
+                    "workflow_run_block_id": "wrb_hidden_control",
+                    "label": _HIDDEN_CONTROL_LABEL,
+                    "block_type": "code",
+                    **outcome,
+                }
+            ],
+            "post_run_page_evidence": evidence,
+        },
+    }
+
+
+def _hidden_control_expander_candidates(evidence: dict[str, Any]) -> list[str]:
+    [expander] = [control for control in evidence["clickable_controls"] if not control.get("text")]
+    return [candidate["selector"] for candidate in expander["selector_candidates"]]
+
+
+def _assert_whole_candidates(summary: str, candidates: list[str]) -> None:
+    assert len(summary) <= 120
+    assert summary.split(" | ") == candidates[: len(summary.split(" | "))]
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["failed_run", "completed_run"])
+@pytest.mark.parametrize("shape", list(_HIDDEN_CONTROL_EXPANDERS))
+def test_hidden_control_textless_expander_survives_into_the_model_visible_packet(shape: str, completed: bool) -> None:
+    markup, selector = _HIDDEN_CONTROL_EXPANDERS[shape]
+    evidence = _hidden_control_evidence(markup)
+    candidates = _hidden_control_expander_candidates(evidence)
+    result = _hidden_control_result(evidence, completed=completed)
+    packet = project_build_test_packet_for_llm(build_test_evidence_packet(_copilot_context(), result))
+    compacted = _compact_packet_for_aggregate_limit(packet, [])
+
+    assert candidates[0] == selector
+    for projected in (packet, compacted):
+        page_state = projected.failure.page_state if projected.failure else projected.page_state
+        assert page_state is not None
+        [summary] = page_state.action_summaries
+        _assert_whole_candidates(summary, candidates)
+
+
+def test_hidden_control_textless_expander_reaches_the_runtime_repair_context() -> None:
+    evidence = _hidden_control_evidence(_HIDDEN_CONTROL_EXPANDERS["icon_button"][0])
+    ctx = _copilot_context()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
+        block_label=_HIDDEN_CONTROL_LABEL,
+        reason_code="runtime_block_failure",
+        workflow_run_id=_HIDDEN_CONTROL_RUN_ID,
+    )
+    ctx.composition_page_evidence = evidence
+
+    finalized = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert finalized is not None
+    [summary] = finalized.page_action_summaries
+    _assert_whole_candidates(summary, _hidden_control_expander_candidates(evidence))
+    assert summary in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_hidden_control_textless_summary_keeps_only_whole_candidates_under_the_cap() -> None:
+    row_toggle = "div.result-list > div.result-row:nth-of-type(1) > span.toggle"
+    long_only = {"text": "", "selector_candidates": [{"selector": "span." + "x" * 120, "source": "class"}]}
+    stateful = {
+        "text": "",
+        "disabled": True,
+        "expanded": False,
+        "selector_candidates": [{"selector": row_toggle, "source": "structural"}],
+    }
+    texted = {"text": "View details", "selector_candidates": [{"selector": "button.details", "source": "class"}]}
+
+    assert _runtime_action_summaries(None, [texted]) == ["View details"]
+    assert _runtime_action_summaries(None, [long_only]) == []
+    two = {"text": "", "selector_candidates": [{"selector": row_toggle, "source": "class"}] * 2}
+    assert _runtime_action_summaries(None, [two]) == [row_toggle]
+    assert _runtime_action_summaries(None, [stateful]) == [f"{row_toggle} disabled collapsed"]
+    spaced = 'a[href="/report?label=Q1  summary"]'
+    spaced_control = {"text": "", "expanded": True, "selector_candidates": [{"selector": spaced, "source": "attr"}]}
+    assert _runtime_action_summaries(None, [spaced_control]) == [f"{spaced} expanded"]
+
+
+@pytest.mark.parametrize("shape", list(_HIDDEN_CONTROL_EXPANDERS))
+def test_hidden_control_row_expanders_append_without_changing_other_controls(shape: str) -> None:
+    markup, selector = _HIDDEN_CONTROL_EXPANDERS[shape]
+    export = '<button id="export">Export</button>'
+
+    controls = _hidden_control_controls(f'{export}<div id="results">{_hidden_control_rows(markup)}</div>')
+    baseline = _hidden_control_controls(f'{export}<div id="results"></div>')
+
+    assert controls[: len(baseline)] == baseline
+    [expander] = controls[len(baseline) :]
+    assert expander["text"] == ""
+    assert expander["selector_candidates"][0]["selector"] == selector
+
+
+def test_hidden_control_crowded_page_keeps_text_labeled_summaries_first() -> None:
+    expanders = [markup for markup, _ in _HIDDEN_CONTROL_EXPANDERS.values()]
+    controls = _hidden_control_controls(
+        '<button id="menu"></button><button id="close"></button><button id="export">Export CSV</button>'
+        '<table><tr><th tabindex="0">Name</th><th tabindex="0">Type</th></tr></table>'
+        f'<div id="results">{_hidden_control_rows(*expanders)}</div>'
+    )
+    summaries = _runtime_action_summaries(None, controls)
+
+    assert not {"Name", "Type"} & {control["text"] for control in controls}
+    assert summaries[0] == "Export CSV"
+    for _, selector in _HIDDEN_CONTROL_EXPANDERS.values():
+        assert any(summary.startswith(selector) for summary in summaries[1:]), summaries
+
+
+_SIGNED_OUT_READ_LABEL = "read_visitors"
+_SIGNED_OUT_WRITE_LABEL = "write_report_cell"
+_SIGNED_OUT_TITLE = "Sign in"
+
+
+def _signed_out_focused_result() -> dict[str, Any]:
+    """A read and a native write that completed on the sign-in page, in the chat's browser."""
+    data: dict[str, Any] = {
+        "workflow_run_id": "wr_signed_out_focused",
+        "browser_session_id": "pbs_chat",
+        "overall_status": "completed",
+        "requested_block_labels": [_SIGNED_OUT_READ_LABEL, _SIGNED_OUT_WRITE_LABEL],
+        "executed_block_labels": [_SIGNED_OUT_READ_LABEL, _SIGNED_OUT_WRITE_LABEL],
+        "current_url": "https://metrics.fixture.test/dashboard",
+        "page_title": _SIGNED_OUT_TITLE,
+        "blocks": [
+            {
+                "workflow_run_block_id": "wrb_read_visitors",
+                "label": _SIGNED_OUT_READ_LABEL,
+                "block_type": "EXTRACTION",
+                "status": "completed",
+                "output": {"status": "completed", "extracted_information": {"visitors": None}},
+            },
+            {
+                "workflow_run_block_id": "wrb_write_report_cell",
+                "label": _SIGNED_OUT_WRITE_LABEL,
+                "block_type": "HTTP_REQUEST",
+                "status": "completed",
+                "output": {"status_code": 200, "request_body": {"cell": "A1", "value": "None"}},
+            },
+        ],
+    }
+    _attach_run_session_facts(
+        data,
+        used_fresh_run_session=False,
+        run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
+        run_ok=True,
+        page_evidence=None,
+    )
+    return {"ok": True, "data": data}
+
+
+def test_a_signed_out_focused_run_reaches_the_model_as_facts_and_keeps_its_browser_as_an_older_result() -> None:
+    ctx = _copilot_context()
+    result = _signed_out_focused_result()
+    _record_run_blocks_result(ctx, copy.deepcopy(result))
+
+    model_facing = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        finalize_build_test_result(ctx, source_tool="run_blocks_and_collect_debug", result=result),
+    )
+
+    assert model_facing["ok"] is True and "error" not in model_facing
+    packet = model_facing["data"]["build_test_packet"]
+    assert packet["page_state"]["title"] == _SIGNED_OUT_TITLE
+    outputs = {entry["label"]: entry["output"] for entry in packet["registered_outputs"]}
+    assert outputs[_SIGNED_OUT_READ_LABEL]["extracted_information"] == {"visitors": None}
+    assert outputs[_SIGNED_OUT_WRITE_LABEL]["request_body"] == {"cell": "A1", "value": "None"}
+    assert packet["run"]["browser_start"]["kind"] == "chat_browser_context"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None and outcome.verdict == "not_authoritative"
+
+    older = _summarize_tool_output(json.dumps(model_facing))
+    kept = json.loads(older)["build_test_packet"]["run"]
+    for key in ("workflow_run_id", "status", "browser", "browser_start"):
+        assert kept[key] == packet["run"][key], key
+    assert _summarize_tool_output(older) == older

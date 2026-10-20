@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import type { IntervalDraft } from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 import { ScheduleConfigFields } from "./ScheduleConfigFields";
 
 function Harness({ initialCron }: { initialCron: string }) {
@@ -75,5 +76,55 @@ describe("ScheduleConfigFields", () => {
     const input = screen.getByPlaceholderText("* * * * *");
     fireEvent.change(input, { target: { value: "0 14 * * *" } });
     expect(cronOut()).toBe("0 14 * * *");
+  });
+
+  it("interval mode without an anchor describes the first run instead of guessing times", () => {
+    render(
+      <ScheduleConfigFields
+        cronExpression="0 9 * * *"
+        timezone="UTC"
+        onCronChange={() => {}}
+        onTimezoneChange={() => {}}
+        interval={{ every: "72", unit: "hours", firstFireAt: "" }}
+        onIntervalChange={() => {}}
+      />,
+    );
+    expect(
+      screen.getByText("Every 3 days. First run 3 days after saving."),
+    ).toBeTruthy();
+    expect(screen.queryByText("Next Scheduled Runs")).toBeNull();
+    expect(screen.queryByText("Advanced (cron expression)")).toBeNull();
+  });
+
+  it("keeps an emptied interval length empty and flags only that field", () => {
+    function IntervalHarness() {
+      const [interval, setInterval] = useState<IntervalDraft | null>({
+        every: "72",
+        unit: "hours",
+        firstFireAt: "",
+      });
+      return (
+        <ScheduleConfigFields
+          cronExpression="0 9 * * *"
+          timezone="UTC"
+          onCronChange={() => {}}
+          onTimezoneChange={() => {}}
+          interval={interval}
+          onIntervalChange={setInterval}
+        />
+      );
+    }
+    render(<IntervalHarness />);
+    const length = screen.getByLabelText("Every");
+    fireEvent.change(length, { target: { value: "" } });
+
+    expect((length as HTMLInputElement).value).toBe("");
+    expect(length.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByText("Enter how often the schedule runs.")).toBeTruthy();
+    expect(
+      screen
+        .getByLabelText("First run (optional)")
+        .getAttribute("aria-invalid"),
+    ).toBe(null);
   });
 });

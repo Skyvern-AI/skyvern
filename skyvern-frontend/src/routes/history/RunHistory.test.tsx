@@ -369,3 +369,12 @@ describe("RunHistory inputs during filtering", () => {
     );
   });
 });
+
+describe("RunHistory refetch policy", () => {
+  it("leaves filtered list refreshes to the existing query policy", () => {
+    renderRunHistory();
+    expect(runsQueryCalls.length).toBeGreaterThan(0);
+    for (const options of runsQueryCalls)
+      expect(options.refetchInterval).toBeUndefined();
+  });
+});

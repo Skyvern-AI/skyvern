@@ -1,3 +1,8 @@
+import {
+  useWorkflowScopeId,
+  useWorkflowScopeReadOnly,
+} from "@/routes/workflows/editor/WorkflowScopeContext";
+import { useDeferredLockedEdit } from "@/hooks/useDeferredLockedEdit";
 import CodeMirror, { EditorView, type Extension } from "@uiw/react-codemirror";
 import type { ViewUpdate } from "@codemirror/view";
 import { json } from "@codemirror/lang-json";
@@ -9,7 +14,6 @@ import { tokyoNightDay } from "@uiw/codemirror-theme-tokyo-night-day";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/util/utils";
 import { useThemeAsDarkOrLight } from "@/components/useThemeAsDarkOrLight";
-import { useDebouncedCallback } from "use-debounce";
 
 import {
   isDeeplyNestedDocument,
@@ -35,6 +39,7 @@ function getLanguageExtension(
 type Props = {
   value: string;
   onChange?: (value: string) => void;
+  deferKey?: string;
   // Invoked once with the CodeMirror view when it is created (e.g. to drive
   // the search panel from a toolbar button).
   onEditorView?: (view: EditorView) => void;
@@ -72,6 +77,7 @@ const VIEWPORT_PREMOUNT_MARGIN = "200px";
 function CodeEditorImpl({
   value,
   onChange,
+  deferKey,
   onEditorView,
   minHeight,
   maxHeight,
@@ -91,10 +97,24 @@ function CodeEditorImpl({
   // the editor and the oversized-document guard never read `.length` of
   // undefined.
   const safeValue = value ?? "";
+  const workflowId = useWorkflowScopeId();
+  const scopeReadOnly = useWorkflowScopeReadOnly();
+  const {
+    value: internalValue,
+    onChange: handleChange,
+    onBlur: handleBlur,
+    mutationLocked,
+  } = useDeferredLockedEdit({
+    value: safeValue,
+    onChange,
+    mutationLockEnabled: workflowId !== null,
+    deferKey:
+      deferKey !== undefined && !readOnly && !scopeReadOnly
+        ? JSON.stringify([workflowId, deferKey])
+        : undefined,
+  });
   const themeMode = useThemeAsDarkOrLight();
   const viewRef = useRef<EditorView | null>(null);
-  const [internalValue, setInternalValue] = useState(safeValue);
-  const latestValueRef = useRef(safeValue);
 
   // Defer EditorView creation until the container is in (or near) the
   // viewport. Block editors mount many CodeEditors at once (script-mode
@@ -128,45 +148,10 @@ function CodeEditorImpl({
     return () => observer.disconnect();
   }, [shouldMount]);
 
-  useEffect(() => {
-    setInternalValue(safeValue);
-    latestValueRef.current = safeValue;
-  }, [safeValue]);
-
-  // Capture the latest onChange in a ref so the debounced callback below
-  // (and the React.memo wrapper export) stay referentially stable across
-  // re-renders. Without this, an inline `onChange={...}` prop from a
-  // re-rendering parent would invalidate memoization and keep CodeMirror
-  // re-dispatching even when the editor's own state hasn't changed —
-  // amplifying axe-core measurement passes into a multi-second freeze (see
-  // SKY-9051 trace: ~25k readSelectionRange samples in a 3.9 s freeze).
-  const latestOnChangeRef = useRef(onChange);
-  useEffect(() => {
-    latestOnChangeRef.current = onChange;
-  }, [onChange]);
-
   const latestOnEditorViewRef = useRef(onEditorView);
   useEffect(() => {
     latestOnEditorViewRef.current = onEditorView;
   }, [onEditorView]);
-
-  const debouncedOnChange = useDebouncedCallback((newValue: string) => {
-    latestOnChangeRef.current?.(newValue);
-  }, 300);
-
-  const handleChange = useCallback(
-    (newValue: string) => {
-      setInternalValue(newValue);
-      latestValueRef.current = newValue;
-      debouncedOnChange(newValue);
-    },
-    [debouncedOnChange],
-  );
-
-  const handleBlur = useCallback(() => {
-    debouncedOnChange.cancel();
-    latestOnChangeRef.current?.(latestValueRef.current);
-  }, [debouncedOnChange]);
 
   const handleCreateEditor = useCallback((view: EditorView) => {
     viewRef.current = view;
@@ -293,7 +278,8 @@ function CodeEditorImpl({
       theme={themeMode === "dark" ? tokyoNightStorm : tokyoNightDay}
       minHeight={minHeight}
       maxHeight={maxHeight}
-      readOnly={readOnly}
+      readOnly={readOnly || mutationLocked}
+      editable={!mutationLocked}
       autoFocus={autoFocus}
       className={cn("cursor-auto", className)}
       style={style}

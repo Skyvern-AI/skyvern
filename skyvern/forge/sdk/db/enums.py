@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Literal, TypeAlias
 
 
 class OrganizationAuthTokenType(StrEnum):
@@ -10,6 +11,7 @@ class OrganizationAuthTokenType(StrEnum):
     bitwarden_credential = "bitwarden_credential"
     custom_llm = "custom_llm"
     google_oauth_client_config = "google_oauth_client_config"
+    twilio_credential = "twilio_credential"
 
 
 class TaskType(StrEnum):
@@ -43,10 +45,11 @@ class WorkflowRunTriggerType(StrEnum):
     """How a workflow run was initiated.
 
     - manual: User clicked "Run" in the UI
-    - mcp: First-party MCP client request
+    - mcp: First-party MCP client or Skyvern CLI request
     - api: Direct API call to the run endpoint
     - scheduled: Triggered by a cron schedule
     - webhook: Triggered by an external system via the webhook endpoint
+    - event: Triggered by an external event source
     - job_recipe_extract: Launched by a job recipe extract request
     - job_recipe_apply: Launched by a job recipe apply request
     """
@@ -56,8 +59,28 @@ class WorkflowRunTriggerType(StrEnum):
     api = "api"
     scheduled = "scheduled"
     webhook = "webhook"
+    event = "event"
     job_recipe_extract = "job_recipe_extract"
     job_recipe_apply = "job_recipe_apply"
+
+
+class WorkflowBuildSource(StrEnum):
+    """Which surface wrote a workflow version.
+
+    - ui: the Skyvern app
+    - copilot: the workflow copilot
+    - mcp: a first-party MCP client
+    - cli: the Skyvern CLI
+    - api: any other API or SDK caller
+    - internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)
+    """
+
+    ui = "ui"
+    copilot = "copilot"
+    mcp = "mcp"
+    cli = "cli"
+    api = "api"
+    internal = "internal"
 
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
@@ -82,3 +105,40 @@ JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
 
 def is_job_recipe_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
     return trigger_type in JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES
+
+
+class WorkflowRunStatus(StrEnum):
+    created = "created"
+    queued = "queued"
+    running = "running"
+    failed = "failed"
+    terminated = "terminated"
+    canceled = "canceled"
+    timed_out = "timed_out"
+    completed = "completed"
+    paused = "paused"
+
+    def is_final(self) -> bool:
+        return self in [
+            WorkflowRunStatus.failed,
+            WorkflowRunStatus.terminated,
+            WorkflowRunStatus.canceled,
+            WorkflowRunStatus.timed_out,
+            WorkflowRunStatus.completed,
+        ]
+
+    def is_final_excluding_canceled(self) -> bool:
+        """Like :meth:`is_final` but excludes ``canceled``.
+
+        For callers that can't distinguish a legitimate user/block cancel from
+        a synthetic ``canceled`` written as a last-resort fallback — e.g. the
+        copilot tool reading the row AFTER ``mark_workflow_run_as_canceled_if_not_final``
+        has run. Callers that want to trust a legitimate ``canceled`` must read
+        the row BEFORE invoking any cancel helper.
+        """
+        return self.is_final() and self is not WorkflowRunStatus.canceled
+
+
+# An alias, not an inline Literal at each use: the per-file pre-commit mypy run (follow_imports = skip) sees an
+# imported WorkflowRunStatus as Any, and Literal[Any] is a valid-type error there.
+DispatchFinalizationStatus: TypeAlias = Literal[WorkflowRunStatus.failed, WorkflowRunStatus.timed_out]

@@ -53,6 +53,16 @@ async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_
 
 
 @pytest.mark.asyncio
+async def test_workflow_knowledge_captcha_solver_topic_carries_the_image_form() -> None:
+    result = await skyvern_workflow_knowledge(topics=["captcha_solver"])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"]["captcha_solver"]["content"]
+    assert "solve_captcha(page, image=" in content
+    assert "input=" in content
+
+
+@pytest.mark.asyncio
 async def test_workflow_knowledge_returns_only_the_requested_authoritative_sections() -> None:
     result = await skyvern_workflow_knowledge(topics=["workflow_parameters", "error_handling_and_retries"])
 
@@ -125,6 +135,28 @@ async def test_block_schema_task_redirects_to_navigation() -> None:
     assert "navigation_goal" in result["data"]["schema"].get("properties", {})
     assert len(result["warnings"]) > 0
     assert any("deprecated" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_block_schema_google_sheets_write_carries_its_knowledge_section() -> None:
+    result = await skyvern_block_schema(block_type="google_sheets_write")
+
+    assert result["ok"] is True
+    description = result["data"]["description"]
+    assert result["data"]["use_cases"]
+    for shape_token in ("[[", "column_mapping", "cells", "| tojson"):
+        assert shape_token in description
+
+
+@pytest.mark.asyncio
+async def test_block_schema_terminate_lists_the_optional_error_code_and_its_example_validates() -> None:
+    result = await skyvern_block_schema(block_type="terminate")
+
+    assert result["ok"] is True
+    assert "error_code" in result["data"]["schema"]["properties"]
+    assert "error_code" in result["data"]["example"]
+    validated = await skyvern_block_validate(block_json=json.dumps(result["data"]["example"]))
+    assert validated["ok"] is True, validated
 
 
 @pytest.mark.asyncio
@@ -283,12 +315,19 @@ _DIRECT_FILE_DOWNLOAD_OUTPUT = {
     "downloaded_files": [{"url": "https://files.example.test/report.pdf", "filename": "report.pdf"}],
     "downloaded_file_urls": ["https://files.example.test/report.pdf"],
 }
+_HTTP_REQUEST_OUTPUT = {
+    "status_code": 200,
+    "headers": {"Content-Type": "application/json"},
+    "body": {"metric": "30 %"},
+    "response_body": {"metric": "30 %"},
+}
 _TEMPLATING_FAMILY_OUTPUTS = {
     "label": _BROWSER_TASK_OUTPUT,
     "extract_items": _BROWSER_TASK_OUTPUT,
     "get_data": _BROWSER_TASK_OUTPUT,
     "summarize_notes": _NON_TASK_OUTPUT,
     "fetch_report": _DIRECT_FILE_DOWNLOAD_OUTPUT,
+    "fetch_metric": _HTTP_REQUEST_OUTPUT,
 }
 
 

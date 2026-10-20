@@ -1,11 +1,13 @@
 import hashlib
 import hmac
+import ipaddress
 
 from skyvern.config import settings
 
 # Domain separator so this fingerprint can never collide with any other use of SECRET_KEY (e.g. auth
 # token signing). Bump the version suffix if the construction ever changes.
 _FP_DOMAIN = b"skyvern.download_suffix.diagnostic_fingerprint.v1"
+_EXIT_ID_DOMAIN = b"skyvern.browser_session.exit_identity.v1"
 
 
 def generate_url_hash(url: str) -> str:
@@ -44,3 +46,20 @@ def diagnostic_fingerprint(value: str | None) -> str:
         return "unkeyed"
     digest = hmac.new(key, _FP_DOMAIN + b"\x00" + value.encode("utf-8", "surrogatepass"), hashlib.sha256)
     return f"{digest.hexdigest()[:12]}:{len(value)}"
+
+
+def exit_identity_digest(ip: str | None) -> str | None:
+    """Keyed ``<key id>:<digest>`` of an egress IP, or None when it cannot be keyed or parsed. The key id tells a
+    different exit apart from a different key, since equal IPs digest differently under two keys."""
+    key = _fingerprint_key()
+    if key is None or not ip:
+        return None
+    try:
+        address = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    key_id = hmac.new(key, _EXIT_ID_DOMAIN + b"\x00key_id", hashlib.sha256).hexdigest()[:8]
+    digest = hmac.new(key, _EXIT_ID_DOMAIN + b"\x00" + str(address).encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{key_id}:{digest}"

@@ -15,6 +15,7 @@ from playwright.async_api import Browser, Playwright
 from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
 from skyvern.utils.url_validators import validate_browser_host
+from skyvern.webeye.browser_acquisition_sample import note_cdp_connect_attempts
 from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_SEGMENT, marked_credential_segment
 
 LOG = structlog.get_logger()
@@ -338,6 +339,12 @@ async def connect_over_cdp_with_diagnostics(
         host = urlparse(remote_browser_url).hostname
         if host:
             await asyncio.to_thread(validate_browser_host, host, resolve_dns=True)
+    # Each dial (the first URL and every resolved-address fallback) is a CDP-connect attempt, recorded
+    # before the dial so a first-try acquisition sample counts the retries this helper makes — the
+    # retry loop in connect_over_cdp_with_retry never runs on this path, so without this a
+    # resolved-IPv4 fallback after a failed first dial would report zero retries and a false first try.
+    dial = 1
+    note_cdp_connect_attempts(dial)
     try:
         return await playwright.chromium.connect_over_cdp(
             remote_browser_url,
@@ -358,6 +365,8 @@ async def connect_over_cdp_with_diagnostics(
                 remote_browser_url=redact_cdp_url(remote_browser_url),
                 fallback_url=redact_cdp_url(candidate.url),
             )
+            dial += 1
+            note_cdp_connect_attempts(dial)
             try:
                 return await playwright.chromium.connect_over_cdp(
                     candidate.url,

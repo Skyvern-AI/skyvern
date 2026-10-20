@@ -11,11 +11,11 @@ from skyvern.config import CodeBlockMode, settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.config import (
-    BlockAuthoringPolicy,
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
     CopilotConfig,
-    block_authoring_policy_for_request,
-    block_authoring_policy_from_code_only_mode,
-    download_scout_act_required_for_policy,
+    authoring_capability_for_request,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     derive_copilot_code_mode_diagnostics,
@@ -73,7 +73,7 @@ def _outcome(
         ("build", True, False, "code"),
         (None, True, False, "code"),
         (None, False, True, "build"),
-        (None, None, False, "build"),
+        (None, None, False, None),
         (None, None, True, "code"),
     ],
 )
@@ -240,11 +240,8 @@ def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> Non
 
 @pytest.mark.asyncio
 async def test_resolve_copilot_request_config_uses_single_resolved_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = CopilotConfig(
-        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
-        code_block_available=True,
-        effective_code_block_mode=True,
-    )
+    config = CopilotConfig(code_block_available=True, effective_code_block_mode=True)
+    config.authoring_capability = CODE_BLOCKS_ONLY
     agent_function = SimpleNamespace(get_copilot_config_for_request=AsyncMock(return_value=config))
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
 
@@ -305,72 +302,81 @@ def test_derive_copilot_code_mode_diagnostics_on_a_clean_turn() -> None:
     }
 
 
-def test_copilot_config_defaults_to_standard_policy() -> None:
-    assert CopilotConfig().block_authoring_policy == BlockAuthoringPolicy.STANDARD
+def test_copilot_config_defaults_to_agent_blocks_only() -> None:
+    assert CopilotConfig().authoring_capability == AGENT_BLOCKS_ONLY
 
 
-def test_code_block_settings_helper_selects_policy() -> None:
-    assert block_authoring_policy_from_code_only_mode(True) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    assert block_authoring_policy_from_code_only_mode(False) == BlockAuthoringPolicy.STANDARD
+@pytest.mark.parametrize(
+    ("code_block_mode", "has_code_block_access", "expected"),
+    [
+        (None, True, ALL_BLOCK_FAMILIES),
+        (True, True, CODE_BLOCKS_ONLY),
+        (False, True, AGENT_BLOCKS_ONLY),
+        (None, False, AGENT_BLOCKS_ONLY),
+        (True, False, AGENT_BLOCKS_ONLY),
+        (False, False, AGENT_BLOCKS_ONLY),
+    ],
+)
+def test_authoring_capability_for_request(
+    code_block_mode: bool | None,
+    has_code_block_access: bool,
+    expected: object,
+) -> None:
+    assert authoring_capability_for_request(code_block_mode, has_code_block_access) == expected
 
 
-def test_build_with_unspecified_code_mode_is_non_code() -> None:
-    assert block_authoring_policy_for_request(None) == BlockAuthoringPolicy.TASK_V3_PURE
-
-
-def test_build_with_explicit_code_opt_out_is_non_code() -> None:
-    assert block_authoring_policy_for_request(False) == BlockAuthoringPolicy.TASK_V3_PURE
-
-
-def test_build_with_explicit_code_selection_is_code_first() -> None:
-    assert block_authoring_policy_for_request(True) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-
-
-def test_download_scout_act_requirement_follows_code_only_policy() -> None:
-    assert download_scout_act_required_for_policy(BlockAuthoringPolicy.CODE_ONLY_BROWSER) is True
-    assert download_scout_act_required_for_policy("code_only_browser") is True
-    assert download_scout_act_required_for_policy(None) is False
-    assert download_scout_act_required_for_policy(BlockAuthoringPolicy.STANDARD) is False
-
-
-def test_base_agent_function_honors_code_block_mode_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_base_agent_function_default_config_authors_agent_blocks_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
 
     config = AgentFunction().get_copilot_config()
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
 
 
 @pytest.mark.asyncio
-async def test_base_agent_function_request_config_requires_explicit_code_selection(
+@pytest.mark.parametrize(
+    ("code_block_mode", "has_code_block_access", "expected_capability", "expected_effective_code_mode"),
+    [
+        (None, True, ALL_BLOCK_FAMILIES, False),
+        (True, True, CODE_BLOCKS_ONLY, True),
+        (False, True, AGENT_BLOCKS_ONLY, False),
+        (None, False, AGENT_BLOCKS_ONLY, False),
+        (True, False, AGENT_BLOCKS_ONLY, False),
+    ],
+)
+async def test_request_config_resolver_matrix(
     monkeypatch: pytest.MonkeyPatch,
+    code_block_mode: bool | None,
+    has_code_block_access: bool,
+    expected_capability: object,
+    expected_effective_code_mode: bool,
 ) -> None:
+    # The rows read the request against an org's access, so the dial is held on; that it drops an
+    # unstated mode to agent blocks when off is the rollback, covered by the code-block flag suite.
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    agent_function = AgentFunction()
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=has_code_block_access))
 
-    config = await AgentFunction().get_copilot_config_for_request("o_test")
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=code_block_mode)
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
-    assert config.code_block_available is False
-    assert config.effective_code_block_mode is False
+    assert config.authoring_capability == expected_capability
+    assert config.code_block_available is has_code_block_access
+    assert config.effective_code_block_mode is expected_effective_code_mode
 
 
 @pytest.mark.asyncio
-async def test_request_config_snapshots_entitlement_once_for_explicit_opt_out(
+async def test_request_config_authors_agent_blocks_only_when_access_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent_function = AgentFunction()
-    access = AsyncMock(return_value=True)
-    monkeypatch.setattr(agent_function, "has_code_block_access", access)
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(side_effect=RuntimeError("boom")))
 
-    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
+    config = await agent_function.get_copilot_config_for_request("o_test")
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
-    assert config.code_block_available is True
-    assert config.effective_code_block_mode is False
-    access.assert_awaited_once_with("o_test")
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
 
 
 @pytest.mark.asyncio
@@ -380,44 +386,10 @@ async def test_base_agent_function_request_config_honors_code_block_kill_switch(
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
     monkeypatch.setattr(settings, "CODE_BLOCK_MODE", CodeBlockMode.disabled)
 
-    config = await AgentFunction().get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=True,
-    )
+    config = await AgentFunction().get_copilot_config_for_request("o_test", code_block_mode=True)
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
-
-
-@pytest.mark.asyncio
-async def test_base_agent_function_explicit_code_mode_uses_available_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", False)
-    monkeypatch.setattr(settings, "CODE_BLOCK_MODE", CodeBlockMode.enabled)
-
-    config = await AgentFunction().get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=True,
-    )
-
-    assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-
-
-@pytest.mark.asyncio
-async def test_base_agent_function_build_without_code_access_selects_task_v3_pure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", False)
-
-    config = await AgentFunction().get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=None,
-    )
-
-    assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
 
 
 @pytest.mark.asyncio
@@ -426,11 +398,8 @@ async def test_base_request_config_preserves_get_copilot_config_override() -> No
     delegated_config = CopilotConfig()
     agent_function.get_copilot_config = MagicMock(return_value=delegated_config)  # type: ignore[method-assign]
 
-    config = await agent_function.get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=False,
-    )
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
 
     assert config is delegated_config
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
     agent_function.get_copilot_config.assert_called_once_with(False)

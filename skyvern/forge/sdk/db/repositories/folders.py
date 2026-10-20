@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge import app
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import BrowserRecordingModel, FolderModel, WorkflowModel
+from skyvern.forge.sdk.db.models import BrowserRecordingModel, FolderModel, WorkflowModel, WorkflowScheduleModel
 from skyvern.forge.sdk.db.protocols import WorkflowReader
 from skyvern.forge.sdk.db.utils import convert_to_workflow
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
+
+
+class SoftDeletedFolder(NamedTuple):
+    """What a folder delete removed; each schedule is a (schedule id, backend schedule id) pair."""
+
+    workflow_permanent_ids: list[str]
+    deleted_schedules: list[tuple[str, str | None]]
 
 
 class FoldersRepository(BaseRepository):
@@ -45,6 +54,8 @@ class FoldersRepository(BaseRepository):
                 description=description,
             )
             session.add(folder)
+            await session.flush()
+            await app.AGENT_FUNCTION.on_folder_created(session, folder, get_request_principal())
             await session.commit()
             await session.refresh(folder)
             return folder
@@ -58,10 +69,13 @@ class FoldersRepository(BaseRepository):
         search_query: str | None = None,
     ) -> list[FolderModel]:
         """Get all folders for an organization with pagination and optional search."""
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
         async with self.Session() as session:
             stmt = (
                 select(FolderModel).filter_by(organization_id=organization_id).filter(FolderModel.deleted_at.is_(None))
             )
+            if accessible_folder_ids is not None:
+                stmt = stmt.where(FolderModel.folder_id.in_(accessible_folder_ids))
 
             if search_query:
                 search_pattern = f"%{search_query}%"
@@ -168,8 +182,8 @@ class FoldersRepository(BaseRepository):
         folder_id: str,
         organization_id: str,
         delete_workflows: bool = False,
-    ) -> bool:
-        """Soft delete a folder. Optionally delete all workflows in the folder."""
+    ) -> SoftDeletedFolder | None:
+        """Soft delete a folder, its workflows and their schedules in one transaction; None when there is no folder."""
         async with self.Session() as session:
             # Check if folder exists
             folder_stmt = (
@@ -180,8 +194,10 @@ class FoldersRepository(BaseRepository):
             folder_result = await session.execute(folder_stmt)
             folder = folder_result.scalar_one_or_none()
             if not folder:
-                return False
+                return None
 
+            workflow_permanent_ids: list[str] = []
+            deleted_schedules: list[tuple[str, str | None]] = []
             # If delete_workflows is True, delete all workflows in the folder
             if delete_workflows:
                 # Get workflow permanent IDs in the folder (inline logic)
@@ -230,6 +246,17 @@ class FoldersRepository(BaseRepository):
                         .values(deleted_at=datetime.now(timezone.utc))
                     )
                     await session.execute(update_workflows_query)
+                    schedules_result = await session.execute(
+                        update(WorkflowScheduleModel)
+                        .where(WorkflowScheduleModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                        .where(WorkflowScheduleModel.organization_id == organization_id)
+                        .where(WorkflowScheduleModel.deleted_at.is_(None))
+                        .values(deleted_at=datetime.now(timezone.utc))
+                        .returning(
+                            WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id
+                        )
+                    )
+                    deleted_schedules = [(row[0], row[1]) for row in schedules_result.all()]
             else:
                 # Just remove folder_id from all workflows in this folder
                 update_workflows_query = (
@@ -243,7 +270,7 @@ class FoldersRepository(BaseRepository):
             # Soft delete the folder
             folder.deleted_at = datetime.now(timezone.utc)
             await session.commit()
-            return True
+            return SoftDeletedFolder(workflow_permanent_ids, deleted_schedules)
 
     @db_operation("get_folder_workflow_count")
     async def get_folder_workflow_count(

@@ -1,15 +1,24 @@
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import quote
 
 import pyotp
 import pytest
+import structlog.testing
 from fastapi import HTTPException, Response
 
+from skyvern.exceptions import (
+    CredentialSourceNotConfiguredError,
+    OnePasswordGetItemError,
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+)
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
+    CredentialVaultType,
     NonEmptyPasswordCredential,
     PasswordCredential,
     TotpType,
@@ -28,12 +37,13 @@ def _mock_totp_preview_dependencies(
     secret: str | None,
     credential_id: str = "cred_test",
     organization_id: str = "org_test",
+    vault_type: CredentialVaultType | None = None,
 ) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     db_credential = SimpleNamespace(
         credential_id=credential_id,
         organization_id=organization_id,
         name="Example",
-        vault_type=None,
+        vault_type=vault_type,
         item_id="item_test",
         credential_type=CredentialType.PASSWORD,
         totp_type=TotpType.AUTHENTICATOR,
@@ -426,3 +436,87 @@ async def test_get_credential_totp_code_sets_no_store_headers(monkeypatch: pytes
 
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Pragma"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "status_code", "detail"),
+    [
+        pytest.param(
+            lambda: CredentialSourceNotConfiguredError(
+                "1Password is not configured for this organization. Add a 1Password service account token in Settings."
+            ),
+            400,
+            "1Password is not configured for this organization. Add a 1Password service account token in Settings.",
+            id="missing-configuration",
+        ),
+        pytest.param(
+            lambda: OnePasswordRateLimitError("429"),
+            429,
+            "1Password rate limit exceeded. Please retry in a few minutes.",
+            id="rate-limited",
+        ),
+        pytest.param(
+            lambda: OnePasswordServiceUnavailableError(status_code=503),
+            502,
+            "1Password is temporarily unavailable. Please retry in a few minutes.",
+            id="unavailable",
+        ),
+        pytest.param(
+            lambda: OnePasswordGetItemError("service account token is invalid"),
+            400,
+            "Your 1Password service account token appears to be invalid or expired. Please update it in Settings and try again.",
+            id="invalid-token",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_onepassword_totp_preview_maps_item_list_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    error_factory: Callable[[], Exception],
+    status_code: int,
+    detail: str,
+) -> None:
+    _db_credential, vault_service, _mock_credentials = _mock_totp_preview_dependencies(
+        monkeypatch,
+        secret="JBSWY3DPEHPK3PXP",
+        vault_type=CredentialVaultType.ONEPASSWORD,
+    )
+    vault_service.get_credential_item.side_effect = error_factory()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await credentials.get_credential_totp_code(
+            response=Response(),
+            credential_id="cred_test",
+            current_org=SimpleNamespace(organization_id="org_test"),
+        )
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.detail == detail
+
+
+@pytest.mark.asyncio
+async def test_onepassword_totp_preview_logs_unmapped_failure_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _db_credential, vault_service, _mock_credentials = _mock_totp_preview_dependencies(
+        monkeypatch,
+        secret="JBSWY3DPEHPK3PXP",
+        vault_type=CredentialVaultType.ONEPASSWORD,
+    )
+    vault_service.get_credential_item.side_effect = RuntimeError("unexpected provider failure")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(HTTPException) as exc_info:
+        await credentials.get_credential_totp_code(
+            response=Response(),
+            credential_id="cred_test",
+            current_org=SimpleNamespace(organization_id="org_test"),
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Unable to retrieve credential from vault"
+    error_logs = [record for record in logs if record.get("log_level") == "error"]
+    assert len(error_logs) == 1
+    assert error_logs[0]["event"] == "Failed to retrieve credential item for TOTP code preview"
+    assert error_logs[0]["organization_id"] == "org_test"
+    assert error_logs[0]["credential_id"] == "cred_test"
+    assert "JBSWY3DPEHPK3PXP" not in repr(error_logs[0])

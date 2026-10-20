@@ -12,9 +12,9 @@ export interface HumanInteractionBlockYaml {
     instructions?: string;
     positive_descriptor?: string;
     negative_descriptor?: string;
-    timeout_seconds: number;
-    sender: string;
+    timeout_seconds?: number;
+    sender?: string;
     recipients: string[];
-    subject: string;
-    body: string;
+    subject?: string;
+    body?: string;
 }

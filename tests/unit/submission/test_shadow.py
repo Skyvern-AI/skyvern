@@ -630,6 +630,54 @@ async def test_cua_run_and_coordinate_click_overrides_are_applied_end_to_end(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("last_step_task_id", "expected_task_id"),
+    [("task-b", "task-b"), ("task-a", "task-a"), ("task-missing", "task-b")],
+)
+async def test_workflow_context_only_loads_current_attempt(
+    monkeypatch: pytest.MonkeyPatch, last_step_task_id: str, expected_task_id: str
+) -> None:
+    first_task = _task("task-a", workflow_run_id="workflow-run-1")
+    first_task.attempt_number = None
+    retry_task = _task("task-b", workflow_run_id="workflow-run-1")
+    retry_task.attempt_number = 2
+    tasks = {item.task_id: item for item in [first_task, retry_task]}
+    actions = {task_id: _submit_action(task_id=task_id, step_id=f"step-{task_id}") for task_id in tasks}
+    steps = {task_id: _step(f"step-{task_id}", 1, task_id=task_id, action=actions[task_id]) for task_id in tasks}
+
+    async def get_steps(task_id: str, organization_id: str) -> list[Step]:
+        assert organization_id == "org-1"
+        return [steps[task_id]]
+
+    async def get_actions(task_id: str, organization_id: str | None = None) -> list[ClickAction]:
+        assert organization_id == "org-1"
+        return [actions[task_id]]
+
+    tasks_repo = SimpleNamespace(
+        get_tasks_by_workflow_run_id=AsyncMock(return_value=[retry_task, first_task]),
+        get_task_steps=AsyncMock(side_effect=get_steps),
+        get_task_actions_hydrated=AsyncMock(side_effect=get_actions),
+    )
+    monkeypatch.setattr(
+        shadow.app,
+        "DATABASE",
+        SimpleNamespace(
+            tasks=tasks_repo,
+            workflow_runs=SimpleNamespace(get_workflow_run_output_parameters=AsyncMock(return_value=[])),
+        ),
+    )
+    last_step = steps.get(last_step_task_id) or _step("step-missing", 2, task_id=last_step_task_id)
+
+    context = await shadow._load_context(task=None, workflow_run=_workflow_run(), last_step=last_step)
+
+    assert context.tasks == [tasks[expected_task_id]]
+    assert context.steps == [steps[expected_task_id]]
+    assert context.actions == [actions[expected_task_id]]
+    tasks_repo.get_task_steps.assert_awaited_once_with(expected_task_id, "org-1")
+    tasks_repo.get_task_actions_hydrated.assert_awaited_once_with(expected_task_id, organization_id="org-1")
+
+
+@pytest.mark.asyncio
 async def test_workflow_uses_all_tasks_and_block_engine_for_cua_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     first_task = _task("task-a", workflow_run_id="workflow-run-1")
     candidate_task = _task("task-1", workflow_run_id="workflow-run-1")

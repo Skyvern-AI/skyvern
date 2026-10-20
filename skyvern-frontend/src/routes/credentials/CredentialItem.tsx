@@ -6,6 +6,8 @@ import {
   type CredentialTotpCodeResponse,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
+import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { SelectionCheckbox } from "@/components/SelectionCheckbox";
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
@@ -31,6 +33,7 @@ import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
 import { SaveIcon } from "@/components/icons/SaveIcon";
+import { OnePasswordIcon } from "@/components/icons/OnePasswordIcon";
 import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
@@ -262,6 +265,7 @@ function CredentialItem({
   const { additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const [editModalOpen, setEditModalOpen] = useState(false);
+  const showCreator = useCreatorColumnEnabled();
   const activeTest = useCredentialTestStore((s) =>
     s.activeTest?.credentialId === credential.credential_id
       ? s.activeTest
@@ -406,9 +410,23 @@ function CredentialItem({
         </div>
       )}
       <div className="w-48 space-y-2">
-        <p className="w-full truncate" title={credential.name}>
-          {credential.name}
-        </p>
+        <div className="flex min-w-0 items-center gap-2">
+          <p className="min-w-0 flex-1 truncate" title={credential.name}>
+            {credential.name}
+          </p>
+          {credential.vault_type === "onepassword" && (
+            <span className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
+              <OnePasswordIcon className="size-3" />
+              1Password
+            </span>
+          )}
+        </div>
+        {credential.vault_type === "onepassword" &&
+          credential.upstream_missing_at && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              missing in 1Password
+            </p>
+          )}
         <p className="text-sm text-neutral-600 dark:text-slate-400">
           {credential.credential_id}
         </p>
@@ -450,14 +468,24 @@ function CredentialItem({
                 </span>
               )}
             </div>
-            {/* Deep-links to the profile and auto-opens its Refresh dialog (the
-                fix-by-hand mechanism), so the user lands and sees what to do. */}
-            <Link
-              to={`/browser-profiles/${credential.browser_profile_id}?refresh=1`}
-              className="block text-blue-400 hover:text-blue-300"
-            >
-              Fix the saved login by hand
-            </Link>
+            {/* Deep-links to the profile and auto-opens its Refresh dialog, so
+                the user lands and sees what to do. */}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Link
+                    to={`/browser-profiles/${credential.browser_profile_id}?refresh=1`}
+                    className="block w-fit text-blue-400 hover:text-blue-300"
+                  >
+                    Sign in again to refresh
+                  </Link>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[250px]">
+                  Opens a live browser with this saved session. Sign in again,
+                  then close it to save the new session.
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         )}
         {canResaveSession && !credential.browser_profile_id && !activeTest && (
@@ -477,6 +505,16 @@ function CredentialItem({
         )}
       </div>
       {credentialDetails}
+      {showCreator && (
+        <div className="w-40 space-y-2 border-l pl-5">
+          <p className="text-sm text-neutral-600 dark:text-slate-400">
+            Created By
+          </p>
+          <p className="text-sm">
+            <WorkflowCreatorLabel createdBy={credential.created_by} />
+          </p>
+        </div>
+      )}
       <div className="ml-auto flex gap-1">
         <TooltipProvider>
           <Tooltip>
@@ -518,22 +556,24 @@ function CredentialItem({
             </Tooltip>
           </TooltipProvider>
         )}
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                size="icon"
-                variant="tertiary"
-                className="h-8 w-9"
-                onClick={() => setEditModalOpen(true)}
-                aria-label="Edit credential"
-              >
-                <Pencil1Icon className="size-5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Edit Credential</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+        {credential.vault_type !== "onepassword" && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="tertiary"
+                  className="h-8 w-9"
+                  onClick={() => setEditModalOpen(true)}
+                  aria-label="Edit credential"
+                >
+                  <Pencil1Icon className="size-5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Edit Credential</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
         <DeleteCredentialButton credential={credential} />
       </div>
       <CredentialsModal

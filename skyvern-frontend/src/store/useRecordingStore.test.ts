@@ -14,6 +14,7 @@ import {
 
 vi.mock("@/util/recordBrowserTelemetry", () => ({
   captureRecordBrowser: vi.fn(),
+  setRecordBrowserContext: vi.fn(),
 }));
 
 let seq = 0;
@@ -89,7 +90,7 @@ describe("addOptimisticStep", () => {
 
   it("no-ops when capture is paused", () => {
     store().setIsRecording(true);
-    store().setManualCapturePaused(true);
+    store().beginDraftEdit();
     store().addOptimisticStep(opt());
     expect(store().optimisticSteps).toHaveLength(0);
   });
@@ -172,6 +173,23 @@ describe("commit safety and resets", () => {
     expect(final).toHaveLength(1);
     expect(final?.every((s) => s.step_id === "s1-0")).toBe(true);
     expect(store().optimisticSteps).toHaveLength(1);
+  });
+
+  it("falls back to raw events when interpretation produced no draft steps", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(update("s1", 1, [], { finalized: true }));
+
+    expect(store().getFinalDraftSteps()).toBeNull();
+  });
+
+  it("preserves an intentionally empty draft after the user deletes every step", () => {
+    store().setIsRecording(true);
+    store().applyInterpretationUpdate(
+      update("s1", 1, [draft("s1-0", "click")], { finalized: true }),
+    );
+    store().deleteDraftStep("s1-0");
+
+    expect(store().getFinalDraftSteps()).toEqual([]);
   });
 
   it("reset() and starting a new recording zero optimistic state", () => {

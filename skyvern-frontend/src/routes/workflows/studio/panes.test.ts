@@ -7,50 +7,23 @@ import {
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
   WORKFLOW_AUTHORING_PANES,
-  copilotContextForSearch,
   fitPanesToWidth,
   isAuthoringLayout,
-  layoutClassForSearch,
   panesFitWidth,
   panesFromDeepLink,
   panesListEqual,
   panesWithoutDeletedBlocked,
   parsePanesParam,
+  rememberPaneSlots,
   resolveOpenPanes,
-  searchWithPanes,
   searchWithRunReference,
   toReadableSearch,
   togglePane,
-  withCopilotSelection,
   withPaneClosed,
   withPaneOpen,
   withPanesOpen,
+  type StudioPaneId,
 } from "./panes";
-
-describe("Copilot pane context and selection", () => {
-  test("uses one edit context and one run context", () => {
-    expect(copilotContextForSearch("?panes=copilot")).toBe("edit");
-    expect(copilotContextForSearch("?bl=block_1")).toBe("edit");
-    expect(copilotContextForSearch("?wr=wr_1")).toBe("run");
-    expect(copilotContextForSearch("?active=act_1")).toBe("run");
-    expect(copilotContextForSearch("?wr=wr_1&bl=block_1")).toBe("run");
-  });
-
-  test("applies runtime membership and preserves a remembered position", () => {
-    expect(
-      withCopilotSelection(["copilot", "editor", "browser"], {
-        open: false,
-        index: 0,
-      }),
-    ).toEqual(["editor", "browser"]);
-    expect(
-      withCopilotSelection(["editor", "browser"], {
-        open: true,
-        index: 1,
-      }),
-    ).toEqual(["editor", "copilot", "browser"]);
-  });
-});
 
 describe("parsePanesParam", () => {
   test("returns null when the param is absent", () => {
@@ -105,26 +78,26 @@ describe("parsePanesParam", () => {
 });
 
 describe("panesFromDeepLink", () => {
-  test("a run deep link opens watch-and-review: Browser, Overview", () => {
+  test("a run deep link opens Timeline on the left, Browser on the right", () => {
     expect(
       panesFromDeepLink({ runId: "wr_123", active: null, blockLabel: null }),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("an ?active= deep link opens the same run layout", () => {
     expect(
       panesFromDeepLink({ runId: null, active: "act_1", blockLabel: null }),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
-  test("a block run opens iterate: Editor, Browser, Overview", () => {
+  test("a cold block run opens Overview and Browser", () => {
     expect(
       panesFromDeepLink({
         runId: "wr_123",
         active: null,
         blockLabel: "block_1",
       }),
-    ).toEqual(["editor", "browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("a block label without a run does not force the run layout", () => {
@@ -133,83 +106,31 @@ describe("panesFromDeepLink", () => {
     ).toEqual([...DEFAULT_STUDIO_PANES]);
   });
 
-  test("no deep link falls back to the default panes", () => {
+  test("no deep link (Edit) opens only Copilot and Editor", () => {
     expect(
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
-    ).toEqual(["editor", "browser"]);
-  });
-
-  test("a learned run layout restores on a bare ?wr= entry", () => {
-    const learned = ["copilot", "browser", "editor", "overview"] as const;
-    expect(
-      panesFromDeepLink(
-        { runId: "wr_123", active: null, blockLabel: null },
-        DEFAULT_STUDIO_PANES,
-        learned,
-      ),
-    ).toEqual(["copilot", "browser", "editor", "overview"]);
-  });
-
-  test("learned run layout including editor is restored as-is", () => {
-    expect(
-      panesFromDeepLink(
-        { runId: "wr_123", active: null, blockLabel: null },
-        DEFAULT_STUDIO_PANES,
-        ["editor", "overview"],
-      ),
-    ).toEqual(["editor", "overview"]);
-  });
-
-  test("block-iterate (?wr= + ?bl=) ignores the learned run layout", () => {
-    expect(
-      panesFromDeepLink(
-        { runId: "wr_123", active: null, blockLabel: "block_1" },
-        DEFAULT_STUDIO_PANES,
-        ["copilot", "editor"],
-      ),
-    ).toEqual(["editor", "browser", "overview"]);
-  });
-
-  test("?active= alone ignores the learned run layout", () => {
-    expect(
-      panesFromDeepLink(
-        { runId: null, active: "act_1", blockLabel: null },
-        DEFAULT_STUDIO_PANES,
-        ["editor", "overview"],
-      ),
-    ).toEqual(["browser", "overview"]);
-  });
-
-  test("null learned layout falls back to factory run panes", () => {
-    expect(
-      panesFromDeepLink(
-        { runId: "wr_123", active: null, blockLabel: null },
-        DEFAULT_STUDIO_PANES,
-        null,
-      ),
-    ).toEqual(["browser", "overview"]);
+    ).toEqual(["copilot", "editor"]);
   });
 });
 
 describe("resolveOpenPanes", () => {
   test("no params resolves to the default panes", () => {
-    expect(resolveOpenPanes("")).toEqual(["editor", "browser"]);
+    expect(resolveOpenPanes("")).toEqual(["copilot", "editor"]);
   });
 
-  test("?wr= resolves to Browser and Overview", () => {
-    expect(resolveOpenPanes("?wr=wr_123")).toEqual(["browser", "overview"]);
+  test("?wr= resolves to Overview and Browser", () => {
+    expect(resolveOpenPanes("?wr=wr_123")).toEqual(["overview", "browser"]);
   });
 
-  test("?wr= plus ?bl= resolves to Editor, Browser and Overview", () => {
+  test("?wr= plus ?bl= resolves to Overview and Browser", () => {
     expect(resolveOpenPanes("?wr=wr_123&bl=block_1")).toEqual([
-      "editor",
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 
   test("?active= resolves like a run deep link", () => {
-    expect(resolveOpenPanes("?active=act_1")).toEqual(["browser", "overview"]);
+    expect(resolveOpenPanes("?active=act_1")).toEqual(["overview", "browser"]);
   });
 
   test("an explicit ?panes= wins over the deep-link params", () => {
@@ -231,38 +152,10 @@ describe("resolveOpenPanes", () => {
   });
 
   test("unrelated params do not affect the default", () => {
-    expect(resolveOpenPanes("?embed=true&cache-key-value=x")).toEqual([
+    expect(resolveOpenPanes("?cache-key-value=x")).toEqual([
+      "copilot",
       "editor",
-      "browser",
     ]);
-  });
-
-  test("?wr= with a learned run layout restores it", () => {
-    expect(
-      resolveOpenPanes("?wr=wr_123", DEFAULT_STUDIO_PANES, [
-        "browser",
-        "overview",
-        "editor",
-      ]),
-    ).toEqual(["browser", "overview", "editor"]);
-  });
-
-  test("explicit ?panes= wins over the learned run layout", () => {
-    expect(
-      resolveOpenPanes("?wr=wr_123&panes=copilot", DEFAULT_STUDIO_PANES, [
-        "browser",
-        "overview",
-      ]),
-    ).toEqual(["copilot"]);
-  });
-
-  test("?wr= + ?bl= ignores the learned run layout", () => {
-    expect(
-      resolveOpenPanes("?wr=wr_123&bl=block_1", DEFAULT_STUDIO_PANES, [
-        "copilot",
-        "editor",
-      ]),
-    ).toEqual(["editor", "browser", "overview"]);
   });
 });
 
@@ -276,12 +169,12 @@ describe("resolveOpenPanes with custom defaults", () => {
 
   test("deep links are unaffected by custom defaults", () => {
     expect(resolveOpenPanes("?wr=wr_123", ["copilot", "editor"])).toEqual([
-      "browser",
       "overview",
+      "browser",
     ]);
     expect(
       resolveOpenPanes("?wr=wr_123&bl=block_1", ["copilot", "editor"]),
-    ).toEqual(["editor", "browser", "overview"]);
+    ).toEqual(["overview", "browser"]);
   });
 
   test("an explicit ?panes= is never overridden by custom defaults", () => {
@@ -369,6 +262,27 @@ describe("pane list operations", () => {
     ]);
   });
 
+  test("closed panes keep their slots through later closes and reopen in any order", () => {
+    let panes: StudioPaneId[] = ["copilot", "editor", "browser"];
+    let slots: StudioPaneId[] = [...panes];
+    const apply = (next: StudioPaneId[]) => {
+      panes = next;
+      slots = rememberPaneSlots(slots, next);
+    };
+
+    apply(withPaneClosed(panes, "editor"));
+    apply(withPaneClosed(panes, "browser"));
+    apply(withPaneOpen(panes, "browser", slots));
+    apply(withPaneOpen(panes, "editor", slots));
+    expect(panes).toEqual(["copilot", "editor", "browser"]);
+
+    apply(withPaneClosed(panes, "copilot"));
+    apply(withPaneClosed(panes, "editor"));
+    apply(withPaneOpen(panes, "editor", slots));
+    apply(withPaneOpen(panes, "copilot", slots));
+    expect(panes).toEqual(["copilot", "editor", "browser"]);
+  });
+
   test("withPaneOpen is a no-op re-order-wise when already open", () => {
     expect(withPaneOpen(["overview", "copilot"], "copilot")).toEqual([
       "overview",
@@ -417,12 +331,12 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
     ).toEqual(["copilot", "browser", "editor", "overview"]);
   });
 
-  test("a block ▶ from a Browser-less layout appends Browser then Overview", () => {
+  test("a block ▶ from a Browser-less layout appends Overview then Browser", () => {
     expect(withPanesOpen(["copilot", "editor"], RUN_APPEND_PANES)).toEqual([
       "copilot",
       "editor",
-      "browser",
       "overview",
+      "browser",
     ]);
   });
 
@@ -434,46 +348,9 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
 
   test("a block ▶ from an empty stage opens just the run surfaces", () => {
     expect(withPanesOpen([], RUN_APPEND_PANES)).toEqual([
+      "overview",
       "browser",
-      "overview",
     ]);
-  });
-});
-
-describe("searchWithPanes", () => {
-  test("adds ?panes= to an empty search, with readable commas", () => {
-    expect(searchWithPanes("", ["copilot", "browser"])).toBe(
-      "?panes=copilot,browser",
-    );
-  });
-
-  test("preserves unrelated params and replaces an existing ?panes=", () => {
-    const next = searchWithPanes("?wr=wr_1&panes=timeline", [
-      "overview",
-      "editor",
-    ]);
-    const params = new URLSearchParams(next);
-    expect(params.get("wr")).toBe("wr_1");
-    expect(params.get("panes")).toBe("overview,editor");
-  });
-
-  test("serializes an empty list as an explicit empty value", () => {
-    const params = new URLSearchParams(searchWithPanes("?wr=wr_1", []));
-    expect(params.get("panes")).toBe("");
-    expect(params.get("wr")).toBe("wr_1");
-  });
-
-  test("round-trips through resolveOpenPanes", () => {
-    const next = searchWithPanes("?wr=wr_1", ["browser", "copilot"]);
-    expect(resolveOpenPanes(next)).toEqual(["browser", "copilot"]);
-  });
-
-  test("an aliased ?panes=run re-serializes canonically after a write", () => {
-    const parsed = parsePanesParam("run");
-    expect(parsed).toEqual(["overview"]);
-    expect(
-      searchWithPanes("?panes=run", withPaneOpen(parsed!, "copilot")),
-    ).toBe("?panes=overview,copilot");
   });
 });
 
@@ -510,58 +387,15 @@ describe("isAuthoringLayout", () => {
   });
 });
 
-describe("layoutClassForSearch", () => {
-  test("no params → edit class", () => {
-    expect(layoutClassForSearch("")).toBe("edit");
-  });
-
-  test("?panes= only → edit class (URL params other than wr/bl don't matter)", () => {
-    expect(layoutClassForSearch("?panes=copilot,browser")).toBe("edit");
-  });
-
-  test("?wr= without ?bl= → run class", () => {
-    expect(layoutClassForSearch("?wr=wr_123")).toBe("run");
-  });
-
-  test("?wr= with ?bl= → null (block-iterate, never learned)", () => {
-    expect(layoutClassForSearch("?wr=wr_123&bl=block_1")).toBeNull();
-  });
-
-  test("?bl= alone (no wr) → null", () => {
-    expect(layoutClassForSearch("?bl=block_1")).toBeNull();
-  });
-
-  test("?wr= with unrelated params → run class", () => {
-    expect(layoutClassForSearch("?wr=wr_123&panes=copilot")).toBe("run");
-  });
-
-  test("?active= without ?wr= → run class (same run test as panesFromDeepLink)", () => {
-    expect(layoutClassForSearch("?active=act_1")).toBe("run");
-  });
-
-  test("?active= with ?bl= → null", () => {
-    expect(layoutClassForSearch("?active=act_1&bl=block_1")).toBeNull();
-  });
-});
-
 describe("system run focus (?wrs=)", () => {
-  test("keeps the edit layout class while the run stays inspectable", () => {
-    expect(copilotContextForSearch("?wr=wr_1&wrs=copilot")).toBe("edit");
-    expect(layoutClassForSearch("?wr=wr_1&wrs=copilot")).toBe("edit");
-  });
-
   test("does not remap deep-link panes to the run layout", () => {
-    const learnedRun = ["overview", "browser"] as const;
     expect(
-      resolveOpenPanes(
-        "?wr=wr_1&wrs=copilot",
-        ["editor", "browser"],
-        [...learnedRun],
-      ),
+      resolveOpenPanes("?wr=wr_1&wrs=copilot", ["editor", "browser"]),
     ).toEqual(["editor", "browser"]);
-    expect(
-      resolveOpenPanes("?wr=wr_1", ["editor", "browser"], [...learnedRun]),
-    ).toEqual([...learnedRun]);
+    expect(resolveOpenPanes("?wr=wr_1", ["editor", "browser"])).toEqual([
+      "overview",
+      "browser",
+    ]);
   });
 });
 
@@ -571,18 +405,12 @@ describe("searchWithRunReference", () => {
     expect(resolveOpenPanes(searchWithRunReference("", "wr_123"))).toEqual(
       RUN_APPEND_PANES,
     );
-    expect(layoutClassForSearch(searchWithRunReference("", "wr_123"))).toBe(
-      "run",
-    );
   });
 
   test("drops a stale marker so a path run keeps its run class", () => {
     // The marker belongs to a copilot focus that is gone; leaving it would pin
     // a run the user opened to the edit layout.
     expect(searchWithRunReference("?wrs=copilot", "wr_123")).toBe("?wr=wr_123");
-    expect(
-      layoutClassForSearch(searchWithRunReference("?wrs=copilot", "wr_123")),
-    ).toBe("run");
     expect(
       resolveOpenPanes(searchWithRunReference("?wrs=copilot", "wr_123")),
     ).toEqual(RUN_APPEND_PANES);

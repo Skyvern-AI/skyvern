@@ -1,7 +1,8 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import { getClient } from "@/api/AxiosClient";
 import { Status } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
+
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { WorkflowRunTimelineItem } from "../types/workflowRunTypes";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
@@ -31,7 +32,7 @@ function useWorkflowRunTimelineQuery(options?: {
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(options);
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
-  const runIsLive = !!workflowRun && statusIsNotFinalized(workflowRun);
+  const runIsLive = !!workflowRun && runIsLogicallyActive(workflowRun);
   // Only a running run writes timeline rows. Created, queued and paused are live but idle, and a
   // paused run waits on a human for as long as that takes.
   const runIsWriting = workflowRun?.status === Status.Running;
@@ -49,6 +50,8 @@ function useWorkflowRunTimelineQuery(options?: {
         workflowPermanentId,
         workflowRunId,
         workflowRun?.status,
+        workflowRun?.attempt,
+        workflowRun?.retry_pending,
       ],
       activeOrgQueryKeyScope,
     ),
@@ -81,7 +84,7 @@ function useWorkflowRunTimelineQuery(options?: {
       if (query.state.status === "error") {
         return false;
       }
-      return runIsLive ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
+      return runIsWriting ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
     },
     // The interval otherwise pauses while the window is unfocused, and a run watched from another
     // window keeps writing blocks the whole time. Scoped to a running run so a backgrounded tab

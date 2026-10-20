@@ -10,6 +10,9 @@ import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot.context import (
+    OBSERVED_CONTEXT_FIELDS,
+    TOOL_ACTIVITY_CONTEXT_FIELDS,
+    TRUSTED_CONTEXT_FIELDS,
     ApprovedCredential,
     ObservedPage,
     StructuredContext,
@@ -63,6 +66,44 @@ def test_blank_browser_run_survives_context_roundtrip() -> None:
     )
     restored = StructuredContext.from_json_str(ctx.to_json_str())
     assert restored.decisions_made == ["test_workflow_from_blank_browser: Login failed", "  output: Missing login"]
+
+
+def test_browser_code_summary_records_the_page_and_the_decision() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [
+            {"tool": "run_browser_code", "summary": "Ran browser code (3 operation(s)) at https://example.com/a"},
+            {"tool": "run_browser_code", "summary": "Failed: locator timed out at line 2"},
+        ]
+    )
+
+    assert [v.url for v in ctx.urls_visited] == ["https://example.com/a"]
+    assert ctx.decisions_made == [
+        "run_browser_code: Ran browser code (3 operation(s)) at https://example.com/a",
+        "run_browser_code: Failed: locator timed out at line 2",
+    ]
+
+
+def test_tool_activity_fields_are_the_ones_the_turn_summary_writes() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [
+            {"tool": "navigate_browser", "summary": "Navigated to https://site.test"},
+            {"tool": "list_credentials", "summary": "Found 1 credential(s)"},
+            {"tool": "type_text", "summary": "Typed into '#name'"},
+            {"tool": "update_workflow", "summary": "2 blocks"},
+            {"tool": "click", "summary": "Clicked #go"},
+        ]
+    )
+
+    untouched = StructuredContext().model_dump()
+    written = {name for name, value in ctx.model_dump().items() if value != untouched[name]}
+    assert written == set(TOOL_ACTIVITY_CONTEXT_FIELDS)
+
+
+def test_user_goal_is_the_only_field_no_turn_end_writer_sets() -> None:
+    server_written = {*TRUSTED_CONTEXT_FIELDS, *OBSERVED_CONTEXT_FIELDS, *TOOL_ACTIVITY_CONTEXT_FIELDS}
+    assert set(StructuredContext.model_fields) - server_written == {"user_goal"}
 
 
 def test_merge_turn_summary_records_resolved_credential_ids() -> None:
@@ -329,6 +370,7 @@ def _policy_ctx(
             seeded_proposal_credential_ids=set(),
             carry_cited_credential_ids=set(),
             current_turn_named_credential_ids=set(),
+            origin_recovery_kept_named_credential_ids=set(),
             persisted_workflow_credential_ids=set(),
             selected_connected_account_id=selected_connected_account_id,
         ),
@@ -437,6 +479,18 @@ def test_malformed_structured_context_fallback_logs_a_fingerprint() -> None:
     assert len(events) == 1
     assert events[0]["raw_length"] == len(broken)
     assert broken not in str(events[0].values())
+
+
+def test_a_rejected_model_context_update_logs_the_field_that_failed() -> None:
+    trusted = StructuredContext(user_goal="kept").to_json_str()
+
+    with structlog.testing.capture_logs() as logs:
+        adopted = adopt_model_authored_context(trusted, {"user_goal": "new", "urls_visited": ["https://a.test"]})
+
+    assert adopted.user_goal == "kept"
+    events = [entry for entry in logs if entry.get("event") == "structured_context_model_update_rejected"]
+    assert [event["rejected_fields"] for event in events] == [["urls_visited"]]
+    assert "a.test" not in str(events[0].values())
 
 
 def test_a_live_page_grant_does_not_carry_into_a_later_turn() -> None:
@@ -588,6 +642,24 @@ def test_finalize_context_persists_carried_trajectory() -> None:
             "input_id": "inp_sku",
         }
     ]
+
+
+def test_carried_trajectory_keeps_the_challenge_a_click_raised() -> None:
+    carry = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "click",
+                "selector": "#submit-search",
+                "source_url": "https://records.example.test/search",
+                "result_url": "https://records.example.test/search",
+                "observed_effects": {"url_changed": False, "challenge_raised": True},
+                "challenge_vendor": "turnstile",
+            }
+        ]
+    )
+
+    assert carry[0]["observed_effects"] == {"url_changed": False, "challenge_raised": True}
+    assert carry[0]["challenge_vendor"] == "turnstile"
 
 
 def test_carried_trajectory_records_credential_field_inventory() -> None:

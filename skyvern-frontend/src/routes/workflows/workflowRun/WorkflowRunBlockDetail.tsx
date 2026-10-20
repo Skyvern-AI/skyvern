@@ -2,7 +2,7 @@ import type { ActionsApiResponse } from "@/api/types";
 import { useMemo } from "react";
 import { FileIcon } from "@radix-ui/react-icons";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
@@ -255,8 +255,7 @@ function WorkflowRunBlockDetail({
               block={resolvedBlock}
               iterationOverride={effectiveIteration}
               runFinalized={
-                Boolean(workflowRun) &&
-                statusIsFinalized({ status: workflowRun!.status })
+                Boolean(workflowRun) && runIsLogicallyFinal(workflowRun!)
               }
             />
           </>

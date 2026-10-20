@@ -19,6 +19,18 @@ import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksM
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
+import {
+  requestRecordingStart,
+  useIsMountedRef,
+} from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
+import {
+  runWorkflowAuthoringAction,
+  refuseMutationDuringYamlCommit,
+  refuseMutationDuringAuthoring,
+} from "@/store/WorkflowYamlEditorStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -31,6 +43,7 @@ import { SELECTED_RING_CLASSES } from "../selection/selectedRingClasses";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 import { findBranchContextForInsertion } from "../workflowInsertion";
+import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
 
 function EdgeWithAddButton({
   source,
@@ -57,6 +70,11 @@ function EdgeWithAddButton({
   });
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowStatePanel = useWorkflowPanelStore();
   const setRecordedBlocks = useRecordedBlocksStore(
@@ -72,25 +90,32 @@ function EdgeWithAddButton({
 
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result) => {
-      setRecordedBlocks(result, {
-        previous: source,
-        next: target,
-        parent: sourceNode?.parentId,
-        connectingEdgeType: "edgeWithAddButton",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: source,
+          next: target,
+          parent: sourceNode?.parentId,
+          connectingEdgeType: "edgeWithAddButton",
+        },
+        owner,
+      );
     },
   });
 
   const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result) => {
-      // Reuse existing block insertion pattern
-      setRecordedBlocks(result, {
-        previous: source,
-        next: target,
-        parent: sourceNode?.parentId,
-        connectingEdgeType: "edgeWithAddButton",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: source,
+          next: target,
+          parent: sourceNode?.parentId,
+          connectingEdgeType: "edgeWithAddButton",
+        },
+        owner,
+      );
     },
   });
 
@@ -98,7 +123,9 @@ function EdgeWithAddButton({
   const isUploadingSOP = sopToBlocksMutation.isPending;
 
   const isProcessing =
-    processRecordingMutation.isPending || recordingStore.isCommitting;
+    processRecordingMutation.isPending ||
+    recordingStore.finishRequested ||
+    recordingStore.isCommitting;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -139,19 +166,46 @@ function EdgeWithAddButton({
     updateWorkflowPanelState(true, branchContext);
   };
 
+  const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      recordingStore.setIsRecording(true, {
-        workflowPermanentId: workflowPermanentId ?? null,
-        browserSessionId: settingsStore.browserSessionId,
-      });
-      updateWorkflowPanelState(false);
+      requestRecordingStart(
+        () =>
+          void runWorkflowAuthoringAction(() => {
+            recordingStore.setIsRecording(true, {
+              workflowPermanentId: workflowPermanentId ?? null,
+              browserSessionId: settingsStore.browserSessionId,
+            });
+            updateWorkflowPanelState(false);
+          }),
+        "edge",
+        { isStillValid: () => mountedRef.current, recordsAfterDiscard: false },
+      );
     }
   };
 
   const onEndRecord = () => {
+    if (isProcessing) {
+      return;
+    }
+
     // With live interpretation, the recording panel owns the commit so user
     // edits/deletes to draft steps are honored.
     if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
@@ -163,10 +217,14 @@ function EdgeWithAddButton({
       recordingStore.setIsRecording(false);
     }
 
-    processRecordingMutation.mutate();
+    void runWorkflowAuthoringAction(() =>
+      processRecordingMutation.mutateAsync(),
+    );
   };
 
   const onUploadSOP = () => {
+    if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
+      return;
     fileInputRef.current?.click();
   };
 
@@ -184,7 +242,9 @@ function EdgeWithAddButton({
       e.target.value = "";
       return;
     }
-    sopToBlocksMutation.mutate(file);
+    void runWorkflowAuthoringAction(() =>
+      sopToBlocksMutation.mutateAsync(file),
+    );
     e.target.value = "";
   };
 
@@ -232,6 +292,7 @@ function EdgeWithAddButton({
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       isUploadingSOP={isUploadingSOP}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
     >
       {adder}
     </WorkflowAddMenu>

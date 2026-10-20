@@ -10,7 +10,7 @@ class TokenDecryptionError(Exception):
     """No configured key decrypts this ciphertext.
 
     Terminal by construction: the candidate key set is fixed for the life of the
-    process, so a retry re-derives the same keys and fails identically. Callers that
+    process, so a retry uses the same keys and fails identically. Callers that
     poll must stop rather than re-dial.
     """
 

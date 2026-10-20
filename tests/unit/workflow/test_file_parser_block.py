@@ -9,26 +9,37 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import tempfile
 import time
+import zipfile
 from collections.abc import Awaitable
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import docx
+import libcst as cst
 import pandas as pd
 import pytest
 import structlog
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
+from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
+from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.workflows import BlockResult, BlockStatus, FileParserBlockYAML, FileType
+from skyvern.services import script_service
 
 
 def _make_output_parameter(key: str) -> OutputParameter:
@@ -38,8 +49,8 @@ def _make_output_parameter(key: str) -> OutputParameter:
         description="test",
         output_parameter_id="test-output-id",
         workflow_id="test-workflow-id",
-        created_at=datetime.now(timezone.utc),
-        modified_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
     )
 
 
@@ -71,9 +82,12 @@ def _mock_workflow_run_context() -> MagicMock:
 
 
 async def _execute_with_downloaded_file(
-    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+    block: FileParserBlock,
+    file_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_run_context: WorkflowRunContext | MagicMock | None = None,
 ) -> BlockResult:
-    workflow_run_context = _mock_workflow_run_context()
+    workflow_run_context = workflow_run_context or _mock_workflow_run_context()
     monkeypatch.setattr(
         FileParserBlock,
         "get_workflow_run_context",
@@ -765,6 +779,25 @@ class TestPDFParserSchemaValidation:
         assert "expected type object, got array" in prompts[1]
         record_output_parameter_value.assert_awaited_once()
 
+    async def test_stalled_model_fails_the_block_at_the_deadline(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/resume.pdf")
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_execute_dependencies(mp, block, AsyncMock(side_effect=stalled_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute("workflow-run", "workflow-run-block", organization_id="org-1"), timeout=10
+            )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "did not answer within" in (result.failure_reason or "")
+
 
 @pytest.mark.asyncio
 class TestOcrPdfPages:
@@ -890,6 +923,31 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError, match="vision model outage"):
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
 
+    @pytest.mark.parametrize(
+        ("call_timeout", "pass_timeout", "expected_reason"),
+        [(0.05, 10, "did not answer within"), (10, 0.05, "did not transcribe")],
+        ids=["page_deadline", "whole_pass_deadline"],
+    )
+    async def test_stalled_page_fails_the_pass_instead_of_being_skipped(
+        self, call_timeout: float, pass_timeout: float, expected_reason: str
+    ) -> None:
+        """Skipping a page the model never answered would hand extraction a document with that page missing."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"stalled":
+                await asyncio.Event().wait()
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", call_timeout)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.PDF_OCR_TOTAL_TIMEOUT_SECONDS", pass_timeout)
+
+            with pytest.raises(TimeoutError, match=expected_reason):
+                await asyncio.wait_for(block._ocr_pdf_pages([b"good-1", b"stalled", b"good-3"]), timeout=5)
+
     async def test_empty_pages_contribute_nothing(self) -> None:
         """Pages that OCR to empty text add neither a marker nor content."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -994,6 +1052,240 @@ class TestOcrPdfPages:
         assert "page A" in result and "page B" in result
 
 
+# digit d -> U+0111 + d, ':' -> U+0146, '.' -> U+0144
+_DIGIT_REMAP = {ord(str(digit)): 0x0111 + digit for digit in range(10)} | {ord(":"): 0x0146, ord("."): 0x0144}
+
+_INVOICE_LINES = (
+    "Mobile Manager Invoice",
+    "Account Number: 7249163085",
+    "Date: 17 Aug 26",
+    "Invoice Total: 1234.56 GBP",
+    "Billing Period: 01 Jul 26 to 31 Jul 26",
+    "Please remit payment using the reference above.",
+)
+
+# An itemised page is mostly digits, so the scrambled glyphs outnumber the English labels.
+_ITEMISED_INVOICE_LINES = _INVOICE_LINES + tuple(
+    f"07700 9000{index % 10:02d}  17 Aug 26  09:1{index % 10}  00:0{index % 6}:12  0.0{index % 9} GBP"
+    for index in range(40)
+)
+
+
+def _build_pdf(lines: tuple[str, ...], remap: dict[int, int] | None = None) -> bytes:
+    """Build a one-page PDF, optionally giving its font a ToUnicode map that lies.
+
+    The page always draws ordinary ASCII character codes, so with ``remap`` set only the
+    ToUnicode map is wrong — which is what makes a subset font's text layer extract as
+    plausible-looking garbage instead of failing outright.
+    """
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
+    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        font + (b" /ToUnicode 6 0 R >>" if remap else b" >>"),
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    if remap:
+        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+        cmap = (
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Broken def\n"
+            "/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+            f"{len(remap)} beginbfchar\n{entries}\nendbfchar\nendcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\nend"
+        ).encode()
+        objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+class TestScrambledTextLayerFallback:
+    """A text layer the embedded font has scrambled must reach OCR, not the extraction LLM.
+
+    Without this, every digit in the document arrives as an unrelated glyph and the
+    extraction LLM invents plausible values for dates and account numbers.
+    """
+
+    @staticmethod
+    def _patch_ocr(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+            lambda *a, **kw: [b"page-1"],
+        )
+
+    async def test_remapped_digits_route_to_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES, remap=_DIGIT_REMAP))
+        # The real extractors run against the real broken font: no digit survives them.
+        text_layer = extract_pdf_file(str(pdf_path))
+        assert "17 Aug 26" not in text_layer and "7249163085" not in text_layer
+
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        assert handler.await_count == 1
+        assert "17 Aug 26" in result
+
+    async def test_readable_text_layer_is_returned_without_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "transcribed"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        handler.assert_not_awaited()
+        assert "17 Aug 26" in result
+
+    async def test_force_ocr_skips_the_text_layer(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        block.force_ocr = True
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+        extract = MagicMock(return_value="text layer that must not be read")
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", extract)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        extract.assert_not_called()
+        assert result == "--- Page 1 ---\nDate: 17 Aug 26"
+
+
+class TestScrambledTextLayerDetection:
+    """Text layers that must stay trusted, so a real document is never re-read by OCR."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param(
+                "Dear Sir or Madam,\nThank you for your continued business. Please find enclosed the "
+                "statement for your account.\nShould you have any questions, contact our support team.",
+                id="english_prose_without_digits",
+            ),
+            pytest.param(
+                "Faktura VAT nr 12/2026\nNabywca: Zakład Usług Łącznościowych\nKwota brutto: 1234,56 zł\n"
+                "Termin płatności: 17 sierpnia 2026\nDziękujemy za współpracę. Życzymy miłego dnia.",
+                id="polish_invoice",
+            ),
+            pytest.param(
+                "Zakład Usług Łącznościowych\nDziękujemy za współpracę i życzymy miłego dnia.\n"
+                "Prosimy o zapłatę należności w terminie wskazanym w umowie.\nPozdrawiamy serdecznie.",
+                id="polish_prose_without_digits",
+            ),
+            pytest.param(
+                "Děkujeme za vaši důvěru. Přejeme příjemný den.\nVáš účet byl úspěšně aktivován.\n"
+                "V případě dotazů se obraťte na naši zákaznickou linku.",
+                id="czech_prose_without_digits",
+            ),
+            pytest.param(
+                "Sayın müşterimiz, faturanız hazırlanmıştır. İlginiz için teşekkür ederiz.\n"
+                "Sorularınız için müşteri hizmetlerimize başvurabilirsiniz.",
+                id="turkish_prose_without_digits",
+            ),
+            pytest.param(
+                "Kính gửi quý khách hàng, hóa đơn của quý khách đã được lập và đã gửi tới địa chỉ đăng ký.\n"
+                "Để thanh toán, quý khách vui lòng chuyển khoản tới số tài khoản được ghi ở dưới.\n"
+                "Nếu quý khách đã thanh toán rồi thì xin vui lòng bỏ qua thông báo này.",
+                id="vietnamese_prose",
+            ),
+            pytest.param(
+                "Application for Service\n I confirm the details above are correct\n"
+                " I agree to the terms and conditions of supply\n"
+                " Please send my statements by email\n I am over 18 years of age\n"
+                " I would like marketing updates\n I have read the privacy notice\n"
+                " Direct debit\n Card payment\nSignature: ______  Date: 17 Aug 26",
+                id="icon_font_checkboxes",
+            ),
+            pytest.param("尊敬的客户，您的账单已经生成。请在到期日前付款。感谢您的支持。", id="chinese_prose"),
+            pytest.param("Уважаемый клиент, ваш счет сформирован. Оплатите до указанной даты.", id="russian_prose"),
+            pytest.param("Date: 17 Aug 26", id="too_short_to_judge"),
+        ],
+    )
+    def test_trustworthy_text_layers_are_not_flagged(self, text: str) -> None:
+        assert scrambled_text_layer_reason(text) is None
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            pytest.param(_INVOICE_LINES, id="label_heavy_header"),
+            # The real document is an itemised invoice. Its scrambled digits are Latin letters
+            # to str.isalpha, so counting them as the document's own script sank the ASCII share
+            # below the Latin-script floor and the page escaped every check.
+            pytest.param(_ITEMISED_INVOICE_LINES, id="page_of_call_rows"),
+        ],
+    )
+    def test_remapped_digits_are_flagged(self, lines: tuple[str, ...]) -> None:
+        scrambled = "\n".join(line.translate(_DIGIT_REMAP) for line in lines)
+        assert scrambled_text_layer_reason(scrambled) is not None
+
+
+class TestForceOcrOnTheCachedScriptPath:
+    """A cached run must honor force OCR, or the fix only holds while the block runs via the agent."""
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_force_ocr(self) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/invoice.pdf",
+                file_type=FileType.PDF,
+                label="parse_invoice",
+                force_ocr=True,
+            )
+
+        (block,) = built
+        assert block.force_ocr is True
+
+    def test_generated_script_carries_force_ocr(self) -> None:
+        base = {"file_url": "https://example.com/invoice.pdf", "file_type": "pdf", "label": "parse_invoice"}
+        module = cst.Module([])
+
+        with_force_ocr = module.code_for_node(_build_file_url_parser_statement({**base, "force_ocr": True}))
+        without_force_ocr = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "force_ocr = True" in with_force_ocr
+        assert "force_ocr" not in without_force_ocr
+
+
 BLOCKING_PARSE_SECONDS = 0.3
 TICK_INTERVAL_SECONDS = 0.01
 
@@ -1084,6 +1376,20 @@ class TestParsingDoesNotBlockEventLoop:
             text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
 
         assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_text_layer_scramble_check_yields_to_event_loop(self) -> None:
+        """The check walks every character of a text layer that can reach a million of them."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+        text_layer = "Account Number: 7249163085 Date: 17 Aug 26 Please remit payment.\n" * 20_000
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                lambda *a, **kw: text_layer,
+            )
+            _, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
         assert ticks > 0
 
     async def test_docx_parse_yields_to_event_loop(self) -> None:
@@ -1240,6 +1546,62 @@ class TestParseStepTimeout:
         assert result.success is False
         assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
         assert "timed out" in captured["failure_reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("handler_error", "expected_reason"),
+        [
+            (None, "did not answer within"),
+            (TimeoutError("gateway gave up on the request"), "gateway gave up on the request"),
+        ],
+        ids=["stalled_model_hits_the_deadline", "handler_timeout_keeps_its_own_cause"],
+    )
+    async def test_stalled_extraction_model_fails_the_block_at_the_deadline(
+        self, handler_error: Exception | None, expected_reason: str
+    ) -> None:
+        """A provider that never answers fails the block at the deadline instead of holding the run's slot."""
+        block = _make_file_parser_block("https://example.com/resume.pdf", FileType.PDF)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        mock_ctx = _mock_workflow_run_context()
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            if handler_error is not None:
+                raise handler_error
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/resume.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "Jane Doe, engineer"
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: stalled_handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"),
+                timeout=10,
+            )
+
+        assert result.success is False
+        assert expected_reason in captured["failure_reason"]
 
     async def test_validation_timeout_fails_the_block(self) -> None:
         block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)
@@ -1599,9 +1961,8 @@ class TestFileParserTelemetryLogs:
         block.json_schema = schema
         with pytest.MonkeyPatch.context() as mp:
             self._patch_extraction(mp, AsyncMock(return_value=response))
-            with structlog.testing.capture_logs() as logs:
-                with pytest.raises(ValueError):
-                    await block._extract_with_ai("name\nAlice", MagicMock())
+            with structlog.testing.capture_logs() as logs, pytest.raises(ValueError):
+                await block._extract_with_ai("name\nAlice", MagicMock())
         warnings = _events(logs, SCHEMA_FAILED_EVENT)
         assert warnings
         return warnings[0]
@@ -2153,3 +2514,485 @@ class TestCsvFallbackWarning:
 
         assert detected == FileType.CSV
         assert events == []
+
+
+SUMMARY_ROWS = [{"metric": "total_spend", "amount": 4210}]
+QUERY_LOG_ROWS = [{"query_id": "q-8817", "duration_ms": 942}]
+
+
+def _create_two_sheet_workbook(path: Path) -> Path:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+        pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name="Query Log", index=False)
+    return path
+
+
+def _workflow_run_context_with(**values: str) -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    ctx.values.update(values)
+    return ctx
+
+
+def _script_output() -> MagicMock:
+    output = MagicMock()
+    output.label = "parse_workbook"
+    output.output_parameter = _make_output_parameter("parse_workbook_output")
+    output.input_parameters = []
+    return output
+
+
+def _block_from_yaml(**overrides: str) -> FileParserBlock:
+    block_yaml = FileParserBlockYAML(
+        label="parse_workbook",
+        file_url="https://example.com/workbook.xlsx",
+        file_type=FileType.EXCEL,
+        **overrides,
+    )
+    block = block_yaml_to_block(block_yaml, {"parse_workbook_output": _make_output_parameter("parse_workbook_output")})
+    assert isinstance(block, FileParserBlock)
+    return block
+
+
+class TestFileParserWorksheetSelector:
+    @pytest.mark.asyncio
+    async def test_absent_selector_reads_first_worksheet(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml()
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == SUMMARY_ROWS
+
+    @pytest.mark.asyncio
+    async def test_named_worksheet_returns_only_that_sheet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Query Log")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_missing_worksheet_names_only_the_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Nope")
+
+        with pytest.raises(WorksheetNotFound) as raised:
+            block._parse_excel_file_sync(str(path))
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        for message in (str(raised.value), str(result.failure_reason)):
+            assert "Nope" in message
+            assert "Query Log" not in message
+            assert "Summary" not in message
+            assert "total_spend" not in message
+            assert "q-8817" not in message
+
+    def test_literal_persists_and_template_renders(self) -> None:
+        assert _block_from_yaml(worksheet="Query Log").worksheet == "Query Log"
+
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param="Query Log"))
+
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_selector_rendering_to_blank_fails_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        result = await _execute_with_downloaded_file(
+            block, path, monkeypatch, workflow_run_context=_workflow_run_context_with(sheet_param="")
+        )
+
+        assert result.success is False
+        assert result.output_parameter_value != SUMMARY_ROWS
+        assert "sheet_param" in str(result.failure_reason)
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_the_selector(self, tmp_path: Path) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param=""))
+
+        with pytest.raises(WorksheetNotFound):
+            block._parse_excel_file_sync(str(_create_two_sheet_workbook(tmp_path / "workbook.xlsx")))
+
+    @pytest.mark.asyncio
+    async def test_selector_keeps_the_spaces_the_author_typed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """openpyxl writes and calamine reads a padded sheet name verbatim, so normalizing the
+        selector would make that sheet permanently unreachable."""
+        path = tmp_path / "workbook.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+            pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name=" Query Log ", index=False)
+        block = _block_from_yaml(worksheet=" Query Log ")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_renders_a_templated_selector(self) -> None:
+        """The script path resolves worksheet the same way it resolves its file_url sibling."""
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(
+                script_service,
+                "_render_template_with_label",
+                lambda template, label=None: "Query Log" if template == "{{ sheet_param }}" else template,
+            ),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_a_selector_on_a_zip_is_reported_as_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ZIP never reaches the per-type parser, so the warning has to sit above that fork."""
+        path = tmp_path / "archive.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("readme.txt", "hello")
+        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
+        block.worksheet = "Query Log"
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert [log for log in logs if log["event"] == "FileParserBlock ignoring worksheet on a non-Excel file"]
+
+    def test_generated_script_carries_the_selector(self) -> None:
+        base = {"file_url": "https://example.com/workbook.xlsx", "file_type": "excel", "label": "parse_workbook"}
+        module = cst.Module([])
+
+        with_selector = module.code_for_node(_build_file_url_parser_statement({**base, "worksheet": "Query Log"}))
+        without_selector = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "worksheet = 'Query Log'" in with_selector
+        assert "worksheet" not in without_selector
+
+
+@pytest.fixture(scope="module")
+def forge_app() -> None:
+    start_forge_app()
+
+
+@pytest.mark.usefixtures("forge_app")
+class TestFileParserBlock:
+    @pytest.fixture
+    def file_parser_block(self):
+        """Create a basic FileParserBlock instance for testing."""
+        # Create a mock OutputParameter with all required fields
+        mock_output_parameter = MagicMock(spec=OutputParameter)
+        mock_output_parameter.parameter_type = "output"
+        mock_output_parameter.key = "test_output"
+        mock_output_parameter.output_parameter_id = "test_id"
+        mock_output_parameter.workflow_id = "test_workflow_id"
+        mock_output_parameter.created_at = datetime.now()
+        mock_output_parameter.modified_at = datetime.now()
+        mock_output_parameter.deleted_at = None
+
+        return FileParserBlock(
+            label="test_parser", output_parameter=mock_output_parameter, file_url="test.csv", file_type=FileType.CSV
+        )
+
+    @pytest.fixture
+    def csv_file(self):
+        """Create a temporary CSV file for testing."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("name,age,city\nJohn,30,New York\nJane,25,Boston")
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    @pytest.fixture
+    def excel_file(self):
+        """Create a temporary Excel file for testing."""
+        df = pd.DataFrame({"name": ["John", "Jane"], "age": [30, 25], "city": ["New York", "Boston"]})
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            df.to_excel(f.name, index=False)
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    @pytest.fixture
+    def tsv_file(self):
+        """Create a temporary TSV file for testing."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False) as f:
+            f.write("name\tage\tcity\nJohn\t30\tNew York\nJane\t25\tBoston")
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    def test_file_type_enum_values(self):
+        """Test that FileType enum has the expected values."""
+        assert FileType.CSV == "csv"
+        assert FileType.EXCEL == "excel"
+        assert FileType.PDF == "pdf"
+
+    def test_file_parser_block_initialization(self, file_parser_block):
+        """Test that FileParserBlock initializes correctly."""
+        assert file_parser_block.label == "test_parser"
+        assert file_parser_block.file_url == "test.csv"
+        assert file_parser_block.file_type == FileType.CSV
+        assert file_parser_block.json_schema is None
+
+    def test_file_parser_block_with_schema(self):
+        """Test that FileParserBlock can be initialized with a schema."""
+        schema = {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}}
+
+        # Create a mock OutputParameter
+        mock_output_parameter = MagicMock(spec=OutputParameter)
+        mock_output_parameter.parameter_type = "output"
+        mock_output_parameter.key = "test_output"
+        mock_output_parameter.output_parameter_id = "test_id"
+        mock_output_parameter.workflow_id = "test_workflow_id"
+        mock_output_parameter.created_at = datetime.now()
+        mock_output_parameter.modified_at = datetime.now()
+        mock_output_parameter.deleted_at = None
+
+        block = FileParserBlock(
+            label="test_parser",
+            output_parameter=mock_output_parameter,
+            file_url="test.csv",
+            file_type=FileType.CSV,
+            json_schema=schema,
+        )
+
+        assert block.json_schema == schema
+
+    @pytest.mark.asyncio
+    async def test_parse_csv_file(self, file_parser_block, csv_file):
+        """Test CSV file parsing."""
+        result = await file_parser_block._parse_csv_file(csv_file)
+
+        expected = [{"name": "John", "age": "30", "city": "New York"}, {"name": "Jane", "age": "25", "city": "Boston"}]
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_parse_excel_file(self, file_parser_block, excel_file):
+        """Test Excel file parsing."""
+        result = await file_parser_block._parse_excel_file(excel_file)
+
+        expected = [{"name": "John", "age": 30, "city": "New York"}, {"name": "Jane", "age": 25, "city": "Boston"}]
+
+        assert result == expected
+
+    def test_parse_excel_keeps_literal_na_text(self, file_parser_block, tmp_path: Path):
+        path = tmp_path / "status.xlsx"
+        pd.DataFrame(
+            {
+                "status": ["N/A", "NULL", None, "ok"],
+                "reading": ["NaN", "NaT", None, "ok"],
+                "count": [12, None, 7, 3],
+                "due": [datetime(2024, 1, 2), None, datetime(2024, 1, 4), datetime(2024, 1, 5)],
+            }
+        ).to_excel(path, index=False)
+
+        result = file_parser_block._parse_excel_file_sync(str(path))
+
+        assert [row["status"] for row in result] == ["N/A", "NULL", "nan", "ok"]
+        assert [row["reading"] for row in result] == ["NaN", "NaT", "nan", "ok"]
+        assert [str(row["count"]) for row in result] == ["12", "nan", "7", "3"]
+        assert [row["due"] for row in result] == [
+            "2024-01-02T00:00:00",
+            "nan",
+            "2024-01-04T00:00:00",
+            "2024-01-05T00:00:00",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parse_tsv_file(self, file_parser_block, tsv_file):
+        """Test TSV file parsing."""
+        result = await file_parser_block._parse_csv_file(tsv_file)
+
+        expected = [{"name": "John", "age": "30", "city": "New York"}, {"name": "Jane", "age": "25", "city": "Boston"}]
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_validate_csv_file_type(self, file_parser_block, csv_file):
+        """Test CSV file type validation."""
+        # Should not raise an exception
+        file_parser_block.validate_file_type("test.csv", csv_file)
+
+    @pytest.mark.asyncio
+    async def test_validate_excel_file_type(self, file_parser_block, excel_file):
+        """Test Excel file type validation."""
+        file_parser_block.file_type = FileType.EXCEL
+        # Should not raise an exception
+        file_parser_block.validate_file_type("test.xlsx", excel_file)
+
+    @pytest.mark.asyncio
+    async def test_validate_invalid_csv_file(self, file_parser_block):
+        """Test validation of invalid CSV file."""
+        # Create a binary file that's definitely not CSV
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv", delete=False) as f:
+            f.write(b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f")
+            temp_file = f.name
+
+        try:
+            with pytest.raises(Exception):
+                file_parser_block.validate_file_type("test.csv", temp_file)
+        finally:
+            os.unlink(temp_file)
+
+    @pytest.mark.asyncio
+    async def test_extract_with_ai_with_schema(self, file_parser_block):
+        """Test AI extraction with a provided schema."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "object",
+                    "properties": {
+                        "names": {"type": "array", "items": {"type": "string"}},
+                        "total_count": {"type": "integer"},
+                    },
+                }
+            },
+        }
+
+        file_parser_block.json_schema = schema
+
+        # Mock the LLM response
+        mock_response = {"extracted_data": {"names": ["John", "Jane"], "total_count": 2}}
+
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
+            mock_llm.return_value = mock_response
+
+            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+                mock_prompt.return_value = "mocked prompt"
+
+                result = await file_parser_block._extract_with_ai([{"name": "John"}, {"name": "Jane"}], MagicMock())
+
+                assert result == mock_response
+                mock_llm.assert_called_once()
+                mock_prompt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_with_ai_without_schema(self, file_parser_block):
+        """Test AI extraction without a provided schema (should use default)."""
+        # Mock the LLM response
+        mock_response = {"output": {"summary": "Extracted data from file"}}
+
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
+            mock_llm.return_value = mock_response
+
+            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+                mock_prompt.return_value = "mocked prompt"
+
+                result = await file_parser_block._extract_with_ai("Some text content", MagicMock())
+
+                assert result == mock_response
+                # Should NOT mutate the instance - json_schema should remain None
+                assert file_parser_block.json_schema is None
+                mock_llm.assert_called_once()
+                mock_prompt.assert_called_once()
+
+    def test_detect_file_type_from_url(self, file_parser_block):
+        """Test file type detection based on URL extension."""
+        # Test Excel files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsx") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xls") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsm") == FileType.EXCEL
+
+        # Test PDF files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/document.pdf") == FileType.PDF
+
+        # Test CSV files (default)
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.csv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.tsv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.txt") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data") == FileType.CSV
+
+    def test_clean_dataframe_for_json(self, file_parser_block):
+        """Test DataFrame cleaning for JSON serialization."""
+        # Create a DataFrame with NaN, NaT, and timestamp values
+        df = pd.DataFrame(
+            {
+                "OrderDate": ["2018-01-01", pd.NaT, "2018-01-03"],
+                "Region": ["North", "South", pd.NA],
+                "Sales": [1000.0, pd.NA, 3000.0],
+                "Timestamp": [pd.Timestamp("2018-01-01"), pd.NaT, pd.Timestamp("2018-01-03")],
+            }
+        )
+
+        # Clean the DataFrame
+        result = file_parser_block._clean_dataframe_for_json(df)
+
+        # Check that NaN and NaT values are converted to "nan" string
+        assert result[0]["OrderDate"] == "2018-01-01"
+        assert result[0]["Region"] == "North"
+        assert result[0]["Sales"] == 1000.0
+        assert result[0]["Timestamp"] == "2018-01-01T00:00:00"
+
+        assert result[1]["OrderDate"] == "nan"
+        assert result[1]["Region"] == "South"
+        assert result[1]["Sales"] == "nan"
+        assert result[1]["Timestamp"] == "nan"
+
+        assert result[2]["OrderDate"] == "2018-01-03"
+        assert result[2]["Region"] == "nan"
+        assert result[2]["Sales"] == 3000.0
+        assert result[2]["Timestamp"] == "2018-01-03T00:00:00"

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
 
 from skyvern.cli.core.result import BrowserContext
-from skyvern.cli.core.session_manager import SessionState
+from skyvern.cli.core.session_manager import RequestFailureLog, SessionState
 from skyvern.cli.mcp_tools.inspection import (
     _redact_url,
     _register_hooks_on_page,
@@ -13,8 +14,11 @@ from skyvern.cli.mcp_tools.inspection import (
     skyvern_handle_dialog,
     skyvern_network_requests,
 )
+from tests.unit._mcp_browser_fakes import logged_request_failures
 from tests.unit._mcp_browser_fakes import make_page as _make_page
 from tests.unit._mcp_browser_fakes import make_session_state as _make_state
+from tests.unit._socket_closing_fixture import BODY_SENTINEL, socket_closing_fixture_page
+from tests.unit.copilot_test_helpers import skip_no_browser
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> None:
@@ -43,13 +47,14 @@ def _network_entry(url: str = "https://a.com", method: str = "GET", status: int 
 
 
 class TestEnsureHooks:
-    def test_registers_four_listeners(self) -> None:
+    def test_registers_six_listeners(self) -> None:
         state = _make_state()
         raw = MagicMock()
         raw.on = MagicMock()
         _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 4
-        assert {c.args[0] for c in raw.on.call_args_list} == {"console", "response", "dialog", "pageerror"}
+        assert raw.on.call_count == 6
+        events = {c.args[0] for c in raw.on.call_args_list}
+        assert events == {"console", "response", "requestfailed", "close", "dialog", "pageerror"}
 
     def test_idempotent(self) -> None:
         state = _make_state()
@@ -57,7 +62,7 @@ class TestEnsureHooks:
         raw.on = MagicMock()
         _register_hooks_on_page(state, raw)
         _register_hooks_on_page(state, raw)
-        assert raw.on.call_count == 4
+        assert raw.on.call_count == 6
 
     def test_keeps_hooks_on_both_pages(self) -> None:
         """Multi-page: hooks are registered on ALL pages, not removed on switch."""
@@ -71,8 +76,56 @@ class TestEnsureHooks:
         _register_hooks_on_page(state, raw2)
         # Both pages should have hooks registered — no removal
         assert raw1.remove_listener.call_count == 0
-        assert raw1.on.call_count == 4
-        assert raw2.on.call_count == 4
+        assert raw1.on.call_count == 6
+        assert raw2.on.call_count == 6
+
+
+class TestRequestFailed:
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_real_chromium_records_a_socket_closed_xhr_once_ignores_successes_and_forgets_a_closed_tab(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = RequestFailureLog()
+        states = [_make_state(request_failures=log) for _ in range(3)]
+        async with socket_closing_fixture_page() as (page, origin):
+            tab_id = str(id(page))
+            for state in states:
+                state._codeblock_redactor = lambda value: json.loads(json.dumps(value).replace(tab_id, "[REDACTED]"))
+                _register_hooks_on_page(state, page)
+            await page.goto(f"{origin}/?token=page-secret")
+
+            async with page.expect_response(f"{origin}/ok"):
+                await page.click("#fast")
+            async with page.expect_response(f"{origin}/slow", timeout=30_000):
+                await page.click("#slow")
+            assert log.entries == {}
+
+            async with page.expect_event("requestfailed"):
+                await page.click("#view")
+            recorded = logged_request_failures(log)
+            await page.close()
+            assert log.entries == {}
+
+        (entry,) = recorded
+        assert set(entry) == {"url", "method", "resource_type", "failure_text", "page_url", "tab_id", "timestamp"}
+        assert entry["method"] == "POST" and entry["resource_type"] == "xhr"
+        assert entry["failure_text"] == "net::ERR_EMPTY_RESPONSE"
+        assert entry["url"].startswith(f"{origin}/report?")
+        assert "token=REDACTED" in entry["url"] and "request-secret" not in entry["url"]
+        assert entry["page_url"] == f"{origin}/?token=REDACTED"
+        assert entry["tab_id"] == tab_id
+        assert BODY_SENTINEL not in json.dumps(entry)
+
+        _patch(monkeypatch, states[0])
+        network = await skyvern_network_requests(verbosity="full")
+        requests = network["data"]["requests"]
+        assert sorted((r["method"], r["url"], r["status"]) for r in requests) == [
+            ("GET", f"{origin}/?token=REDACTED", 200),
+            ("GET", f"{origin}/ok", 200),
+            ("GET", f"{origin}/slow", 200),
+        ]
+        assert BODY_SENTINEL not in json.dumps(network)
 
 
 # --- Console messages ---

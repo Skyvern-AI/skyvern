@@ -6,6 +6,10 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
+)
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_transcript_context,
@@ -58,6 +62,11 @@ class WorkflowChangeContext(BaseModel):
 
 
 class RunnableDraftContext(BaseModel):
+    rendered_summary: str
+    block_labels: list[str] = Field(default_factory=list)
+
+
+class UserGoalContext(BaseModel):
     rendered_summary: str
     block_labels: list[str] = Field(default_factory=list)
 
@@ -115,6 +124,7 @@ class TurnContextPacket(BaseModel):
     proposal_context: ProposalContext | None = None
     workflow_change_context: WorkflowChangeContext | None = None
     runnable_draft_context: RunnableDraftContext | None = None
+    user_goal_context: UserGoalContext | None = None
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
@@ -127,6 +137,7 @@ class TurnContextPacket(BaseModel):
             "proposal_context",
             "workflow_change_context",
             "runnable_draft_context",
+            "user_goal_context",
             "run_context",
             "credential_context",
             "attached_file_context",
@@ -288,6 +299,7 @@ class TurnContextAssembler:
                 )
 
         runnable_draft_context = self._runnable_draft_context(inputs)
+        user_goal_context = self._user_goal_context(inputs)
 
         if inputs.prior_run_packet:
             run_context = RunContext(packet=inputs.prior_run_packet)
@@ -305,6 +317,7 @@ class TurnContextAssembler:
             proposal_context=proposal_context,
             workflow_change_context=workflow_change_context,
             runnable_draft_context=runnable_draft_context,
+            user_goal_context=user_goal_context,
             transcript_context=transcript_context,
             run_context=run_context,
             credential_context=credential_context,
@@ -317,6 +330,20 @@ class TurnContextAssembler:
             **{f"turn_context_{key}": value for key, value in packet.to_trace_data().items()},
         )
         return packet
+
+    def _user_goal_context(self, inputs: TurnContextInputs) -> UserGoalContext | None:
+        labels = code_block_labels_awaiting_goal_rebuild(inputs.workflow_yaml)
+        if not labels:
+            return None
+        owned_labels = code_block_labels_with_user_owned_goal(inputs.workflow_yaml)
+        summary = (
+            "The user changed the Goal on these code blocks and has not applied it yet: "
+            f"{', '.join(labels)}. Their Goal text is what the block is for; the saved code still does what the "
+            "previous Goal said. The user applies a new Goal from the block, which sends its own request. "
+            f"A Goal you submit for any user-owned block ({', '.join(owned_labels)}) is discarded; the Goal "
+            "field on the block is where the user edits it."
+        )
+        return UserGoalContext(rendered_summary=summary, block_labels=labels)
 
     def _runnable_draft_context(self, inputs: TurnContextInputs) -> RunnableDraftContext | None:
         if not inputs.request_policy.allow_run_blocks:

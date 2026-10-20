@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import textwrap
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +15,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.cli.mcp_tools.blocks import WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
+from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime_authoring_repair
 from skyvern.forge.sdk.copilot.agent import (
@@ -22,14 +25,21 @@ from skyvern.forge.sdk.copilot.agent import (
     _prior_run_debug_text,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    ACTION_TRACE_PER_TASK_LIMIT,
     SOLVER_ATTEMPT_KEY,
     BuildTestEvidencePacket,
+    ChallengeEffects,
     RecordedBuildTestOutcome,
+    challenge_notices,
     recorded_outcome_from_run_blocks_result,
+    solver_receipt,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    _RECORDABLE_CHALLENGE_FRAME_HOSTS,
     CHALLENGE_KIND_KEY,
     ChallengeKind,
+    composition_challenge_carrier,
+    stamp_challenge_frame_fact,
 )
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -39,17 +49,28 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     model_visible_composition_evidence,
     parse_composition_html,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.config import (
+    AGENT_BLOCKS_ONLY,
+    CODE_BLOCKS_ONLY,
+    BlockAuthoringPolicy,
+    CopilotConfig,
+)
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     _MAX_ITEMS,
     DiagnosisFailureType,
+    DiagnosisRepairContract,
     RepairNextAction,
+    _levers,
     author_time_levers,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
-from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY
+from skyvern.forge.sdk.copilot.enforcement import _PACKET_NOTICE_CAP, latest_diagnosis_contract_satisfies_goal
+from skyvern.forge.sdk.copilot.output_utils import (
+    BUILD_TEST_PACKET_KEY,
+    project_direct_test_handoff_packet_for_llm,
+    sanitize_tool_result_for_llm,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -66,15 +87,25 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    clear_session_scrub_values,
+    register_secret_scrub_values_from_structure,
+)
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
-from skyvern.forge.sdk.copilot.tools.run_execution import finalize_build_test_result
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    finalize_build_test_result,
+    settle_terminal_challenge_after_enrichment,
+)
 from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.copilot_test_helpers import make_stub_html_artifact
 
 
@@ -315,7 +346,7 @@ def test_non_paused_watchdog_exit_still_classifies_as_a_failed_run() -> None:
         source_tool="run_blocks_and_collect_debug",
         result={
             "ok": False,
-            "error": "The run exceeded the 600s absolute ceiling while still showing progress.",
+            "error": "The run did not reach a terminal status within the 600s absolute ceiling.",
             "data": {
                 "workflow_run_id": "wr_ceiling",
                 "overall_status": "running",
@@ -878,6 +909,57 @@ def test_failed_run_injects_pending_runtime_authoring_context_before_page_observ
     assert contract.repair_decision.target_blocks == ["search_registry"]
 
 
+@pytest.mark.parametrize(
+    ("codes", "repairs"),
+    [
+        pytest.param(["net::ERR_SSL_PROTOCOL_ERROR"], True, id="ssl_protocol_error_names_no_owner_and_repairs"),
+        pytest.param(
+            ["net::ERR_TUNNEL_CONNECTION_FAILED", "net::ERR_SSL_PROTOCOL_ERROR"],
+            True,
+            id="ssl_beside_a_tunnel_code_is_not_proxy_owned_and_repairs",
+        ),
+        pytest.param(["net::ERR_CERT_DATE_INVALID"], False, id="certificate_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN"], False, id="pinned_key_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_SERVER_CERT_CHANGED"], False, id="server_cert_changed_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_SERVER_CERT_BAD_FORMAT"], False, id="bad_server_cert_names_the_target_and_stops"),
+        pytest.param(["net::ERR_SSL_KEY_USAGE_INCOMPATIBLE"], False, id="key_usage_names_the_target_and_stops"),
+    ],
+)
+def test_a_driver_tls_failure_reaches_repair_only_when_it_names_no_owner(codes: list[str], repairs: bool) -> None:
+    code = codes[-1]
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "open_report",
+                    "status": "failed",
+                    "failure_reason": f"Failed to navigate to url https://localhost:8900/tls_repair/. Error message: "
+                    f"Page.goto: {code} at https://localhost:8900/tls_repair/",
+                    "error_codes": codes,
+                }
+            ],
+        },
+    }
+
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    inject_runtime_authoring_repair_context(ctx, run_result)
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=run_result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert ("authoring_repair_context" in run_result["data"]) is repairs
+    assert contract.repair_decision.next_action == (RepairNextAction.REPAIR if repairs else RepairNextAction.STOP)
+
+
 def test_runtime_repair_context_keeps_a_runner_denials_named_replacement_whole() -> None:
     # The secure runner's listener denial names its replacement after ~500 characters; the recorder
     # must carry the block's failure reason far enough for the repair prompt to see that route.
@@ -890,7 +972,9 @@ def test_runtime_repair_context_keeps_a_runner_denials_named_replacement_whole()
         "`await click_and_claim_download(page, selector)` for a download, "
         "`await page.wait_for_url(url, timeout=...)` for navigation, or "
         "`await page.wait_for_selector(selector, timeout=...)` for whatever the event renders on the page. "
-        "There is no brokered way to wait on a network response; wait on what the response renders instead."
+        "Network responses can be recorded, with page.on('response', handler) whose handler only appends "
+        "response fields to a list defined in the block, but there is still no brokered way to wait on one; "
+        "wait on what the response renders instead."
     )
     result = {
         "ok": False,
@@ -1274,7 +1358,14 @@ def test_runtime_authoring_repair_context_ignores_policy_verdict_but_respects_st
             "data": {
                 "workflow_run_id": "wr_stop",
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
     )
@@ -2301,7 +2392,14 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
             "ok": False,
             "data": {
                 "overall_status": "failed",
-                "blocks": [{"label": "open", "status": "failed", "failure_reason": "net::ERR_NAME_NOT_RESOLVED"}],
+                "blocks": [
+                    {
+                        "label": "open",
+                        "status": "failed",
+                        "failure_reason": "net::ERR_NAME_NOT_RESOLVED",
+                        "error_codes": ["net::ERR_NAME_NOT_RESOLVED"],
+                    }
+                ],
             },
         },
         ctx=stop_ctx,
@@ -2772,6 +2870,7 @@ async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_stru
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
 
     async def fake_read(
         _ctx: CopilotContext, *, run_session_id: str, current_url: str
@@ -2797,33 +2896,6 @@ async def test_sensitive_post_run_capture_redacts_registry_values_and_keeps_stru
     assert "private-pass" not in json.dumps(stored)
     assert "654321" not in json.dumps(stored)
     assert "[REDACTED_SECRET]" in json.dumps(stored)
-
-
-@pytest.mark.asyncio
-async def test_sensitive_post_run_capture_stays_withheld_when_registry_is_incomplete(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _ctx()
-    ctx.composition_page_evidence = _bounded_failure_page_evidence()
-    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-        "wr_sensitive",
-        {"credential": {"username": "private-user"}},
-        contains_sensitive_values=True,
-        contains_all_sensitive_values=False,
-    )
-    read = AsyncMock()
-    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
-
-    capture = await run_execution_module._capture_and_store_post_run_page(
-        ctx,
-        run_session_id="run_session",
-        run_id="wr_sensitive",
-        current_url="https://example.test/otp",
-    )
-
-    assert capture.status == "unavailable"
-    assert ctx.composition_page_evidence is None
-    read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3032,11 +3104,14 @@ async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
-    ctx.sensitive_origin_browser_session_ids = {"run_session"}
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
     evidence = _bounded_failure_page_evidence()
     evidence["forms"] = [{"fields": [{"label": "Verification code", "selector": "#totp", "value": "654321"}]}]
 
-    result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence, browser_session_id="run_session")
+    try:
+        result = await _drive_inspect_page(monkeypatch, ctx, captured=evidence, browser_session_id="run_session")
+    finally:
+        clear_session_scrub_values("run_session")
 
     assert result["ok"] is True
     assert result["data"]["forms"][0]["fields"][0]["label"] == "Verification code"
@@ -3044,33 +3119,6 @@ async def test_sensitive_current_page_inspect_redacts_registry_values_and_keeps_
     assert "private-pass" not in json.dumps(result)
     assert "654321" not in json.dumps(result)
     assert "[REDACTED_SECRET]" in json.dumps(result)
-
-
-@pytest.mark.asyncio
-async def test_sensitive_current_page_inspect_stays_withheld_while_origin_run_is_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _post_run_inspect_ctx()
-    ctx.browser_session_id = "run_session"
-    ctx.last_run_blocks_browser_session_id = "run_session"
-    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-        "wr_failed",
-        {"credential": {"username": "private-user", "password": "private-pass"}},
-        contains_sensitive_values=True,
-        contains_all_sensitive_values=True,
-    )
-    ctx.sensitive_origin_browser_session_ids = {"run_session"}
-    ctx.active_sensitive_origin_browser_session_ids = {"run_session"}
-
-    result = await _drive_inspect_page(
-        monkeypatch,
-        ctx,
-        captured=_bounded_failure_page_evidence(),
-        browser_session_id="run_session",
-    )
-
-    assert result["ok"] is False
-    assert "specific named URL" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -3379,17 +3427,27 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         modified_at=now,
     )
     run_workflow = SimpleNamespace(
+        workflow_id="wf_run_snapshot",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
         organization_id=ctx.organization_id,
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
         workflow_definition=SimpleNamespace(
             parameters=[output_parameter],
             blocks=[SimpleNamespace(label="open_result", block_type="CODE", output_parameter=output_parameter)],
         ),
     )
     run = SimpleNamespace(
+        workflow_run_id="wr_completed_missing_output",
+        workflow_id="wf_run_snapshot",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_completed_missing_output",
         status="completed",
         failure_reason=None,
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
+        workflow_definition_sha256=None,
     )
     block = WorkflowRunBlock(
         workflow_run_block_id="wrb_completed_missing_output",
@@ -3571,6 +3629,8 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -3586,6 +3646,8 @@ def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=False,
         page_evidence=None,
     )
@@ -3601,6 +3663,8 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
         data,
         used_fresh_run_session=True,
         run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
         run_ok=True,
         page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
@@ -4024,11 +4088,6 @@ def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_fai
     assert "#terms-overlay" not in obstruction_line
     assert "#btn-continue" not in obstruction_line
 
-    ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
-    selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
-    assert "selector: #btn-continue" in selector_prompt_lines
-    assert obstruction_line in selector_prompt_lines
-
 
 def test_overlay_selectors_do_not_reach_the_repair_prompt() -> None:
     ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
@@ -4216,15 +4275,15 @@ async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("complete", [False, True])
-async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces_context(monkeypatch, complete):
+async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces_context(monkeypatch):
     ctx = _ctx()
     registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_secret",
         parameters={"password": "inline-secret-sentinel"},
         contains_sensitive_values=True,
-        contains_all_sensitive_values=complete,
+        contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, registry.parameters)
     ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_sibling",
         parameters={},
@@ -4233,23 +4292,16 @@ async def test_inline_capture_uses_own_sensitive_registry_after_sibling_replaces
     )
     packet = _obstruction_only_page_evidence()
     packet["title"] = "inline-secret-sentinel"
-    read = AsyncMock(return_value=(packet, "pbs_run", None, SimpleNamespace(b64="secret-pixels")))
-    enqueue = MagicMock()
+    read = AsyncMock(return_value=(packet, "pbs_run", None, None))
     monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", read)
-    monkeypatch.setattr(run_execution_module, "enqueue_screenshot", enqueue)
     await run_execution_module._capture_and_store_post_run_page(
         ctx,
         run_session_id="pbs_run",
         run_id="wr_secret",
         current_url="https://example.test/statements",
-        origin_redaction_registry=registry,
     )
-    enqueue.assert_not_called()
-    if complete:
-        assert ctx.composition_page_evidence is not None
-        assert "inline-secret-sentinel" not in str(ctx.composition_page_evidence)
-    else:
-        read.assert_not_called()
+    assert ctx.composition_page_evidence is not None
+    assert "inline-secret-sentinel" not in str(ctx.composition_page_evidence)
     assert ctx.origin_run_redaction_registry.workflow_run_id == "wr_sibling"
 
 
@@ -5087,8 +5139,6 @@ def test_finalized_packet_carries_the_contract_challenge_and_levers() -> None:
 
 def test_the_production_capture_reads_the_traces_it_then_strips() -> None:
     """Drives the production unit: reordering the capture after the pop fails this."""
-    from skyvern.forge.sdk.copilot.tools import run_execution
-
     results = [
         {
             "label": "search",
@@ -5098,28 +5148,25 @@ def test_the_production_capture_reads_the_traces_it_then_strips() -> None:
         }
     ]
 
-    captured = run_execution._capture_solver_facts_and_strip_traces(results)
+    captured = run_execution_module._capture_solver_facts_and_strip_traces(results)
 
-    assert captured == {"attempted": True, "result": "failed", "failure": "not solved in time"}
+    facts = {"attempted": True, "result": "failed", "failure": "not solved in time"}
+    assert captured == {**facts, "code_block": facts}
     assert "action_trace" not in results[0]
 
 
 @pytest.mark.asyncio
 async def test_a_failed_availability_lookup_leaves_the_solver_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restoring `available = False` on the exception path must fail this."""
-    from unittest.mock import AsyncMock
-
-    from skyvern.forge.sdk.copilot.tools import run_execution
-
     ctx = _ctx()
     ctx.composition_page_evidence = {"current_url": "https://records.example.com/search"}
     monkeypatch.setattr(
-        run_execution.app.AGENT_FUNCTION,
+        run_execution_module.app.AGENT_FUNCTION,
         "captcha_solving_available",
         AsyncMock(side_effect=RuntimeError("provider down")),
     )
 
-    await run_execution._resolve_captcha_solver_availability(ctx)
+    await run_execution_module._resolve_captcha_solver_availability(ctx)
 
     assert ctx.captcha_solver_available is None
 
@@ -5174,7 +5221,7 @@ def test_solver_facts_survive_the_packet_dropping_per_block_action_traces() -> N
     result["data"][SOLVER_ATTEMPT_KEY] = {
         "attempted": True,
         "result": "failed",
-        "failure": "Captcha not solved in time",
+        "failure": "Captcha not solved in time at https://captcha.example.test/solve?token=abc " + "x" * 400,
     }
 
     contract = build_diagnosis_repair_contract(
@@ -5187,7 +5234,456 @@ def test_solver_facts_survive_the_packet_dropping_per_block_action_traces() -> N
     assert contract.challenge is not None
     assert contract.challenge.solver_attempted is True
     assert contract.challenge.solver_result == "failed"
-    assert contract.challenge.solver_failure == "Captcha not solved in time"
+    failure = contract.challenge.solver_failure or ""
+    assert failure.startswith("Captcha not solved in time at https://captcha.example.test")
+    assert "token=abc" not in failure
+    assert len(failure) <= 200
+
+
+def _solver_contract(ctx: CopilotContext, result: dict[str, Any]) -> DiagnosisRepairContract:
+    return build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+
+def _traced_block(shape: str) -> dict[str, Any]:
+    block = _solve_captcha_block("failed" if shape == "failed" else "completed")
+    if shape == "completed-false":
+        block["action_trace"][1]["solver_cleared"] = False
+    elif shape == "completed-true":
+        block["action_trace"][1]["solver_cleared"] = True
+    elif shape == "no-solve-row":
+        block["action_trace"] = block["action_trace"][:1]
+    elif shape == "no-history":
+        block.pop("action_trace")
+    return block
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected", "attempted"),
+    [
+        ("completed-false", "not_solved", True),
+        ("completed-true", "attempted", True),
+        ("completed-bare", "attempted", True),
+        ("failed", "failed", True),
+        ("no-solve-row", "not_attempted", False),
+        ("no-history", "unresolved", None),
+    ],
+)
+def test_every_solver_result_is_derivable_from_the_trace_fallback(
+    shape: str, expected: str, attempted: bool | None
+) -> None:
+    """A completed row that reported ``false`` is the solver giving up, not a cleared challenge, and
+    the trace fallback must reach every other member of the Literal too."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    result = _challenge_run_result()
+    result["data"]["blocks"] = [_traced_block(shape)]
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_result == expected
+    assert contract.challenge.solver_attempted is attempted
+
+
+@pytest.mark.parametrize("carried", ["failed", "not_solved", "attempted", "not_attempted", "unresolved"])
+def test_every_solver_result_survives_the_carried_record_whitelist(carried: str) -> None:
+    """The whitelist downgrades an unlisted value to ``unresolved`` with no error, so every member
+    of the Literal has to be listed in it."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    result = _challenge_run_result()
+    stripped = _solve_captcha_block("completed")
+    stripped.pop("action_trace")
+    result["data"]["blocks"] = [stripped]
+    result["data"][SOLVER_ATTEMPT_KEY] = {"attempted": True, "result": carried, "failure": None}
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.solver_result == carried
+    assert contract.to_trace_data()["challenge_solver_result"] == carried
+
+
+def test_the_not_solved_notice_reads_as_a_returned_refusal_not_an_unresolved_or_raised_solver() -> None:
+    """A Literal member with no notice branch falls into the unresolved else and the packet then
+    states the opposite of what the run recorded."""
+    ctx = _ctx()
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    _resolve_solver_for(ctx, True)
+    result = _challenge_run_result()
+    block = _solve_captcha_block("completed")
+    block["action_trace"][1]["solver_cleared"] = False
+    result["data"]["blocks"] = [block]
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    notice = next(text for text in challenge_notices(contract.challenge, contract.levers) if "challenge:" in text)
+    assert "the call returned `false`, the solver's own report that it cleared nothing" in notice
+    assert "the call may have run before that challenge appeared" in notice
+    assert "is unresolved, so do not state either way" not in notice
+    assert "the solver did not clear it" not in notice
+    assert "does not by itself mean the challenge cleared" not in notice
+
+
+def _unwalled_run_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_recourse",
+            "overall_status": "failed",
+            "failure_reason": "Could not confirm the submission landed",
+            "failure_categories": [],
+            "blocks": [],
+        },
+    }
+
+
+def _same_run_challenge_evidence(
+    *,
+    run_id: str = "wr_recourse",
+    url: str = "https://records.example.com/search",
+    challenge_kind: str | None = None,
+    frame_urls: list[str] | None = None,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "workflow_run_id": run_id,
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": url,
+        "challenge_state": {"detected": True, "kind": "captcha"},
+    }
+    if challenge_kind is not None:
+        evidence["challenge_state"][CHALLENGE_KIND_KEY] = challenge_kind
+    if frame_urls is not None:
+        evidence = stamp_challenge_frame_fact(evidence, frame_urls)
+    return evidence
+
+
+def _not_solved_result_and_ctx(evidence: dict[str, Any] | None) -> tuple[CopilotContext, dict[str, Any]]:
+    ctx = _ctx()
+    ctx.captcha_solver_available = True
+    ctx.captcha_solver_available_for_url = "https://records.example.com/search"
+    if evidence is not None:
+        ctx.composition_page_evidence = evidence
+    result = _unwalled_run_result()
+    block = _solve_captcha_block("completed")
+    block["action_trace"][1]["solver_cleared"] = False
+    result["data"]["blocks"] = [block]
+    return ctx, result
+
+
+@pytest.mark.parametrize(
+    "evidence_kwargs",
+    [
+        {"challenge_kind": "captcha"},
+        {"frame_urls": ["https://challenges.cloudflare.com/turnstile/v0/api.html"]},
+    ],
+)
+def test_a_not_solved_solver_plus_this_runs_challenge_evidence_is_a_wall(
+    evidence_kwargs: dict[str, Any],
+) -> None:
+    """Nothing else marks this run as walled, so without the solver's own refusal the packet would
+    carry no challenge record and no recourse inventory at all."""
+    ctx, result = _not_solved_result_and_ctx(_same_run_challenge_evidence(**evidence_kwargs))
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "run_wall"
+    assert contract.challenge.solver_result == "not_solved"
+    assert {"captcha_solver", "human_interaction"} <= {lever.mechanism for lever in contract.levers}
+
+
+def test_a_not_solved_run_hands_the_model_the_recovery_levers_and_no_submission_claim() -> None:
+    """Nothing but the solver's refusal and this run's challenge evidence marks the run walled, the
+    form never confirmed, so the packet must name the recourse instead of a bare confirmation failure."""
+    ctx, result = _not_solved_result_and_ctx(_same_run_challenge_evidence(challenge_kind="captcha"))
+
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result, workflow_updated=True)
+
+    packet = result["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"]["solver_result"] == "not_solved"
+    assert packet["challenge"]["solver_attempted"] is True
+    assert {"captcha_solver", "human_interaction"} <= {lever["mechanism"] for lever in packet["levers"]}
+    assert any("the solver's own report that it cleared nothing" in notice for notice in packet["challenge_notices"])
+    assert packet["run"]["status"] == "failed"
+    assert packet["failure"]["block_status"] == "failed"
+    assert packet["registered_outputs"] == []
+    assert packet["downloads"] == []
+
+
+def test_a_not_solved_solver_with_no_challenge_evidence_stays_unwalled() -> None:
+    """A solve call made before any challenge mounted also returns false, and that run must still
+    reach the ordinary submission-state inspection."""
+    ctx, result = _not_solved_result_and_ctx(None)
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "solver_call"
+    assert contract.levers == []
+
+
+@pytest.mark.parametrize("shape", ["failed", "completed-bare", "completed-false"])
+def test_a_failed_unwalled_captcha_call_is_reported_as_an_attempt_without_levers(shape: str) -> None:
+    """An image-text CAPTCHA form mounts no vendor frame, so without this record a failed or typed-but-rejected
+    solve never reaches the model at all."""
+    ctx = _ctx()
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = [_traced_block(shape)]
+
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result, workflow_updated=True)
+
+    contract = ctx.latest_diagnosis_repair_contract
+    assert contract is not None and contract.challenge is not None
+    assert contract.challenge.basis == "solver_call"
+    assert contract.challenge.solver_attempted is True
+    assert contract.challenge.solver_available is None
+    assert contract.levers == []
+    packet = result["data"][BUILD_TEST_PACKET_KEY]
+    assert not packet.get("levers")
+    notice = " ".join(packet["challenge_notices"]).replace(contract.challenge.solver_failure or "", "")
+    assert "solved" not in notice.lower()
+    assert "cleared" not in notice.lower()
+
+
+@pytest.mark.parametrize(
+    ("run_ok", "shape"),
+    [(True, "failed"), (True, "completed-bare"), (False, "no-solve-row"), (False, "no-history")],
+)
+def test_a_passing_run_or_a_run_without_a_captcha_call_gets_no_solver_record(run_ok: bool, shape: str) -> None:
+    result = _unwalled_run_result()
+    result["ok"] = run_ok
+    result["data"]["blocks"] = [_traced_block(shape)]
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is None
+    assert contract.levers == []
+
+
+def test_a_suspicious_success_with_a_captcha_call_gets_a_solver_record() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    result = _unwalled_run_result()
+    result["ok"] = True
+    result["data"]["blocks"] = [_traced_block("completed-bare")]
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "solver_call"
+    assert contract.levers == []
+
+
+@pytest.mark.parametrize("source", ["trace", "carried"])
+@pytest.mark.parametrize(
+    ("block_type", "expected_basis"), [("CODE", "solver_call"), ("NAVIGATION", None), ("TASK", None)]
+)
+def test_only_a_code_block_captcha_row_gets_a_solver_record(
+    source: str, block_type: str, expected_basis: str | None
+) -> None:
+    result = _unwalled_run_result()
+    block = _traced_block("failed")
+    block["block_type"] = block_type
+    for entry in block["action_trace"]:
+        entry.pop("code_line")
+    result["data"]["blocks"] = [block]
+    if source == "carried":
+        result["data"][SOLVER_ATTEMPT_KEY] = run_execution_module._capture_solver_facts_and_strip_traces([block])
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert (contract.challenge.basis if contract.challenge else None) == expected_basis
+    assert contract.levers == []
+
+
+def _recovered_raise_then_unrelated_failure() -> list[dict[str, Any]]:
+    return [
+        {
+            "label": "solve",
+            "block_type": "CODE",
+            "status": "completed",
+            "action_trace": [
+                {"action": "solve_captcha", "status": "completed"},
+                {"action": "click", "status": "completed"},
+                {"action": "solve_captcha", "status": "failed", "code_line": 3, "response": "no text in image"},
+            ],
+        },
+        {
+            "label": "submit",
+            "block_type": "CODE",
+            "status": "failed",
+            "action_trace": [{"action": "click", "status": "failed", "code_line": 2, "response": "Timeout"}],
+        },
+    ]
+
+
+def _code_solve_then_navigation_raise() -> list[dict[str, Any]]:
+    return [
+        {
+            "label": "solve",
+            "block_type": "CODE",
+            "status": "completed",
+            "action_trace": [{"action": "solve_captcha", "status": "completed"}],
+        },
+        {
+            "label": "next",
+            "block_type": "NAVIGATION",
+            "status": "failed",
+            "action_trace": [{"action": "solve_captcha", "status": "failed", "response": "Captcha not solved in time"}],
+        },
+    ]
+
+
+@pytest.mark.parametrize("source", ["trace", "carried"])
+@pytest.mark.parametrize(
+    "build_blocks",
+    [_recovered_raise_then_unrelated_failure, _code_solve_then_navigation_raise],
+    ids=["recovered_raise", "navigation_raise"],
+)
+def test_the_newest_code_block_solver_row_decides_a_solver_call_record(
+    source: str, build_blocks: Callable[[], list[dict[str, Any]]]
+) -> None:
+    """Traces are newest-first: a raise the retry loop recovered from, or one outside the code blocks, is not
+    the code's failed call."""
+    blocks = build_blocks()
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = blocks
+    if source == "carried":
+        result["data"][SOLVER_ATTEMPT_KEY] = run_execution_module._capture_solver_facts_and_strip_traces(blocks)
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "solver_call"
+    assert contract.challenge.solver_result == "attempted"
+
+
+@pytest.mark.parametrize("source", ["trace", "carried"])
+@pytest.mark.parametrize(
+    ("later_trace_length", "expected_basis"),
+    [(ACTION_TRACE_PER_TASK_LIMIT, None), (ACTION_TRACE_PER_TASK_LIMIT - 1, "solver_call")],
+)
+def test_a_later_code_block_with_a_full_trace_does_not_inherit_an_earlier_solver_row(
+    source: str, later_trace_length: int, expected_basis: str | None
+) -> None:
+    """A trace at the per-task cap may have dropped the later block's own call, so the earlier failure is stale."""
+    blocks = [
+        {
+            "label": "solve",
+            "block_type": "CODE",
+            "status": "completed",
+            "action_trace": [{"action": "solve_captcha", "status": "failed", "response": "no text in image"}],
+        },
+        {
+            "label": "retry",
+            "block_type": "CODE",
+            "status": "failed",
+            "action_trace": [{"action": "click", "status": "completed"}] * later_trace_length,
+        },
+    ]
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = blocks
+    if source == "carried":
+        result["data"][SOLVER_ATTEMPT_KEY] = run_execution_module._capture_solver_facts_and_strip_traces(blocks)
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert (contract.challenge.basis if contract.challenge else None) == expected_basis
+    assert contract.levers == []
+
+
+@pytest.mark.parametrize("solver_result", ["failed", "not_solved", "attempted"])
+def test_a_solver_call_notice_with_every_frame_host_fits_the_retained_notice_cap(solver_result: str) -> None:
+    """The retained packet cuts each notice at the cap, which would drop the frame hosts at its tail."""
+    challenge = ChallengeEffects(
+        basis="solver_call",
+        solver_attempted=True,
+        solver_result=solver_result,
+        solver_failure="x" * 200,
+        frame_hosts=sorted(_RECORDABLE_CHALLENGE_FRAME_HOSTS),
+    )
+
+    (notice,) = challenge_notices(challenge, [])
+
+    assert len(notice) <= _PACKET_NOTICE_CAP
+
+
+def test_a_solver_call_notice_names_the_frame_hosts_and_never_claims_a_solve() -> None:
+    ctx, result = _not_solved_result_and_ctx(
+        _same_run_challenge_evidence(frame_urls=["https://challenges.cloudflare.com/turnstile/v0/api.html"])
+    )
+    result["data"]["blocks"] = [_traced_block("failed")]
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None and contract.challenge.basis == "solver_call"
+    notice = " ".join(challenge_notices(contract.challenge, contract.levers))
+    assert contract.challenge.frame_hosts
+    assert all(host in notice for host in contract.challenge.frame_hosts)
+    stripped = notice.replace(contract.challenge.solver_failure or "", "").lower()
+    assert "solved" not in stripped and "cleared" not in stripped
+
+
+@pytest.mark.parametrize(
+    "evidence_kwargs",
+    [
+        {"challenge_kind": "captcha"},
+        {"frame_urls": ["https://challenges.cloudflare.com/turnstile/v0/api.html"]},
+    ],
+)
+def test_a_not_solved_solver_does_not_wall_on_another_runs_challenge_evidence(
+    evidence_kwargs: dict[str, Any],
+) -> None:
+    ctx, result = _not_solved_result_and_ctx(_same_run_challenge_evidence(run_id="wr_other", **evidence_kwargs))
+
+    contract = _solver_contract(ctx, result)
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "solver_call"
+    assert contract.levers == []
+
+
+_KIND_EVIDENCE: dict[str, Any] = {"challenge_kind": "captcha"}
+_FRAME_EVIDENCE: dict[str, Any] = {"frame_urls": ["https://challenges.cloudflare.com/turnstile/v0/api.html"]}
+
+
+@pytest.mark.parametrize(
+    ("carried", "evidence_kwargs", "expected_basis"),
+    [
+        ("failed", _KIND_EVIDENCE, "solver_call"),
+        ("failed", _FRAME_EVIDENCE, "solver_call"),
+        ("attempted", _KIND_EVIDENCE, "solver_call"),
+        ("attempted", _FRAME_EVIDENCE, "solver_call"),
+        ("not_attempted", _KIND_EVIDENCE, None),
+        ("not_attempted", _FRAME_EVIDENCE, "page_frames"),
+        ("unresolved", _KIND_EVIDENCE, None),
+        ("unresolved", _FRAME_EVIDENCE, "page_frames"),
+    ],
+)
+def test_only_not_solved_widens_the_wall(
+    carried: str, evidence_kwargs: dict[str, Any], expected_basis: str | None
+) -> None:
+    """The same challenge evidence mints a wall only next to the solver's own refusal: a code block's
+    raised or returned call is a solver_call record, and a run with no call keeps only its page frames."""
+    ctx, result = _not_solved_result_and_ctx(_same_run_challenge_evidence(**evidence_kwargs))
+    result["data"]["blocks"][0].pop("action_trace")
+    facts = {"attempted": True, "result": carried, "failure": None}
+    result["data"][SOLVER_ATTEMPT_KEY] = {**facts, "code_block": facts}
+
+    contract = _solver_contract(ctx, result)
+
+    assert (contract.challenge.basis if contract.challenge is not None else None) == expected_basis
+    assert contract.levers == []
 
 
 def test_a_no_proxy_run_never_reports_the_solver_as_available() -> None:
@@ -5246,6 +5742,22 @@ def test_author_time_levers_carry_the_same_inventory_without_a_run() -> None:
         "proxy_location",
     ]
     assert next(lever for lever in levers if lever.mechanism == "captcha_solver").availability == "unresolved"
+
+
+def test_author_time_levers_are_attached_only_to_a_detected_challenge() -> None:
+    """The other path to the full inventory is bought by a challenge the page itself declares, never
+    by a solver row, so a state that detected nothing must buy nothing."""
+    ctx = _ctx()
+    undetected: dict[str, Any] = {"challenge_state": {"detected": False}}
+    detected: dict[str, Any] = {"challenge_state": {"detected": True}}
+
+    composition_capture_module._attach_author_time_levers(ctx, undetected)
+    composition_capture_module._attach_author_time_levers(ctx, detected)
+
+    assert "levers" not in undetected["challenge_state"]
+    assert {"captcha_solver", "human_interaction"} <= {
+        lever["mechanism"] for lever in detected["challenge_state"]["levers"]
+    }
 
 
 def test_shadow_ineligible_finalize_carries_no_challenge_or_levers() -> None:
@@ -5309,3 +5821,519 @@ def test_a_run_that_fails_many_blocks_cannot_grow_the_contract_row_list() -> Non
     )
     assert len(contract.diagnosis_input.failed_block_labels) <= _MAX_ITEMS
     assert contract.diagnosis_input.failed_block_labels
+
+
+def _completed_run_result() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_challenge",
+            "overall_status": "completed",
+            "blocks": [{"label": "submit_form", "block_type": "code", "status": "completed"}],
+        },
+    }
+
+
+def _frame_stamped_evidence(run_id: str) -> dict[str, Any]:
+    evidence = {
+        "workflow_run_id": run_id,
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://forms.example.test/apply",
+        "forms": [
+            {
+                "fields": [{"label": "Last name", "selector": "#lastName"}],
+                "submit_controls": [{"text": "Search", "selector": "button.search"}],
+            }
+        ],
+    }
+    return stamp_challenge_frame_fact(evidence, ["https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x"])
+
+
+def test_a_vendor_frame_on_a_completed_run_is_reported_without_failing_the_run() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    result = _completed_run_result()
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert contract.challenge.kind is None
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.NO_CHANGE
+    assert contract.verification_result.run_status == "completed"
+    assert contract.verification_result.user_goal_satisfied is True
+    assert composition_challenge_carrier(ctx.composition_page_evidence) is None
+    assert ctx.last_test_anti_bot is None
+    assert settle_terminal_challenge_after_enrichment(ctx, result) is False
+    assert ctx.last_run_outcome is None
+
+
+def test_a_frame_host_alone_buys_no_recourse_inventory() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "page_frames"
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert list(contract.levers) == []
+    assert len(challenge_notices(contract.challenge, list(contract.levers))) == 1
+
+
+def test_a_frame_only_record_ships_no_solver_facts_even_when_the_run_called_solve_captcha() -> None:
+    """``basis`` is excluded from the packet, so a solver key there would read as a wall with its only
+    disqualifier missing, including after the direct-test handoff revalidates the packet."""
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    result = _completed_run_result()
+    result["data"]["blocks"][0]["action_trace"] = [
+        {"action": ActionType.SOLVE_CAPTCHA.value, "status": "failed", "response": "solver did not clear it"}
+    ]
+
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result, workflow_updated=True)
+
+    packet = result["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
+    assert packet["run"]["status"] == "completed"
+    handoff = project_direct_test_handoff_packet_for_llm(BuildTestEvidencePacket.model_validate(packet)).model_dump(
+        mode="json", exclude_none=True
+    )
+    assert handoff["challenge"] == {"frame_hosts": ["challenges.cloudflare.com"]}
+
+
+def test_trace_data_distinguishes_a_frame_only_record_from_a_wall() -> None:
+    """``challenge_basis`` says which trigger built the record and ``challenge_solver_result`` is
+    null on a frame-only one, so neither field alone counts a mounted frame as a wall."""
+    frame_ctx = _ctx()
+    frame_ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    walled_ctx = _ctx()
+    walled_ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    walled_ctx.last_test_anti_bot = "Verify you are human"
+
+    traces = [
+        build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_completed_run_result(),
+            ctx=ctx,
+            workflow_updated=True,
+        ).to_trace_data()
+        for ctx in (frame_ctx, walled_ctx, _ctx())
+    ]
+
+    assert [trace["challenge_basis"] for trace in traces] == ["page_frames", "run_wall", None]
+    assert [trace["challenge_solver_result"] for trace in traces] == [None, "unresolved", None]
+
+
+def test_a_failed_run_whose_only_challenge_signal_is_a_frame_host_still_gets_no_levers() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    failed_result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_challenge",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "submit_form",
+                    "block_type": "code",
+                    "status": "failed",
+                    "failure_reason": "Timed out waiting for #lastName",
+                }
+            ],
+        },
+    }
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=failed_result,
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "page_frames"
+    assert list(contract.levers) == []
+
+
+def test_an_anti_bot_category_restores_the_wall_presentation_beside_the_frame_hosts() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_challenge")
+    ctx.last_test_anti_bot = "Verify you are human"
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is not None
+    assert contract.challenge.basis == "run_wall"
+    assert contract.challenge.frame_hosts == ["challenges.cloudflare.com"]
+    assert "captcha_solver" in [lever.mechanism for lever in contract.levers]
+
+
+def test_a_frame_fact_from_another_run_does_not_report_a_wall_on_this_one() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _frame_stamped_evidence("wr_other")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.challenge is None
+
+
+def test_a_partial_frame_read_that_found_no_host_reports_nothing_about_the_page() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = stamp_challenge_frame_fact(
+        _frame_stamped_evidence("wr_challenge"), [], complete=False
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_completed_run_result(),
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert ctx.composition_page_evidence["challenge_frames"]["read"] == "partial"
+    assert contract.challenge is None
+
+
+def test_runtime_authoring_repair_needs_a_stated_code_capability() -> None:
+    """Both callers hand this predicate an untyped carrier, so an absent or unparseable capability has
+    to read as "no code authoring" instead of raising."""
+    allows = runtime_authoring_repair._policy_allows_runtime_authoring_repair
+
+    assert allows(None) is False
+    assert allows(SimpleNamespace()) is False
+    assert allows(SimpleNamespace(authoring_capability="code_only_browser")) is False
+    assert allows(SimpleNamespace(authoring_capability=AGENT_BLOCKS_ONLY)) is False
+    assert allows(SimpleNamespace(authoring_capability=CODE_BLOCKS_ONLY)) is True
+
+
+_SIGN_IN_CODE = """await page.fill("#code", await login_credentials.otp())
+if await page.locator("#code").is_visible():
+    raise RuntimeError("still on the code form")
+"""
+
+
+def _sign_in_workflow_yaml(*, binds_credential: bool) -> str:
+    parameter_keys = "[login_credentials]" if binds_credential else "[]"
+    return f"""
+workflow_definition:
+  parameters:
+  - key: login_credentials
+    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: cred_bound
+  blocks:
+  - block_type: code
+    label: sign_in
+    parameter_keys: {parameter_keys}
+    code: |
+{textwrap.indent(_SIGN_IN_CODE, "      ")}"""
+
+
+def _failed_sign_in_result(**extra_data: object) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_rejected",
+            "overall_status": "failed",
+            "failure_reason": "code block failed",
+            "failing_code_line": 3,
+            "blocks": [{"label": "sign_in", "block_type": "CODE", "status": "failed"}],
+            **extra_data,
+        },
+    }
+
+
+def _update_lever_ids(contract: Any) -> list[str | None]:
+    return [lever.credential_id for lever in contract.levers if lever.mechanism == "credential_update"]
+
+
+@pytest.mark.parametrize(("binds_credential", "update_levers"), [(True, ["cred_bound"]), (False, [])])
+def test_a_failed_sign_in_block_names_its_bound_credential_without_changing_the_repair_route(
+    binds_credential: bool, update_levers: list[str]
+) -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=binds_credential)
+    repair_context = CodeAuthoringRepairContext(block_label="sign_in", reason_code="runtime_block_failure")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_failed_sign_in_result(authoring_repair_context=repair_context.model_dump(mode="json")),
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert _update_lever_ids(contract) == update_levers
+
+
+def test_a_failed_sign_in_on_a_bound_credential_keeps_the_code_repair_context() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True)
+    run_execution_module._record_run_blocks_result(ctx, _failed_sign_in_result())
+    result = _failed_sign_in_result()
+
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    assert "authoring_repair_context" in result["data"]
+
+
+def test_a_bound_credential_keeps_its_update_lever_behind_a_challenge_wall() -> None:
+    levers = _levers(
+        _ctx(),
+        ChallengeEffects(basis="run_wall", kind=None, solver_available=True),
+        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+        {},
+        [],
+        bound_credential_ids={"cred_bound"},
+    )
+
+    assert [lever.credential_id for lever in levers if lever.mechanism == "credential_update"] == ["cred_bound"]
+    assert any(lever.mechanism == "captcha_solver" for lever in levers)
+
+
+def test_a_credential_with_fallbacks_names_no_credential_for_update() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True).replace(
+        "    default_value: cred_bound\n", "    default_value: cred_bound\n    fallback_credential_ids: [cred_backup]\n"
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks", result=_failed_sign_in_result(), ctx=ctx
+    )
+
+    assert _update_lever_ids(contract) == []
+
+
+def test_a_rotating_credential_pool_names_no_member_for_update() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = f"""
+workflow_definition:
+  parameters:
+  - key: login_credentials
+    parameter_type: credential
+    credential_ids: [cred_a, cred_b]
+  blocks:
+  - block_type: code
+    label: sign_in
+    parameter_keys: [login_credentials]
+    code: |
+{textwrap.indent(_SIGN_IN_CODE, "      ")}"""
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks", result=_failed_sign_in_result(), ctx=ctx
+    )
+
+    assert _update_lever_ids(contract) == []
+
+
+@pytest.mark.parametrize("with_default", [True, False], ids=["over-default", "no-default"])
+def test_the_update_lever_names_the_credential_the_run_was_given(with_default: bool) -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True)
+    if not with_default:
+        ctx.workflow_yaml = ctx.workflow_yaml.replace("    default_value: cred_bound\n", "")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_failed_sign_in_result(),
+        ctx=ctx,
+        executed_parameter_values={"login_credentials": "cred_given"},
+    )
+
+    assert _update_lever_ids(contract) == ["cred_given"]
+
+
+def test_the_update_lever_is_read_from_the_workflow_the_run_executed_not_a_later_draft() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=False)
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_failed_sign_in_result(),
+        ctx=ctx,
+        executed_workflow_yaml=_sign_in_workflow_yaml(binds_credential=True),
+    )
+
+    assert _update_lever_ids(contract) == ["cred_bound"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("vendor", "status"), [("datadome", "unsolved"), ("perimeterx", "unsupported")])
+async def test_a_build_test_that_met_a_hard_block_hands_the_model_the_solver_receipt(
+    monkeypatch: pytest.MonkeyPatch, vendor: str, status: str
+) -> None:
+    receipt = {"status": status, "vendor": vendor, "arm": "vendor_handler", "page_state": "challenged"}
+    rows = [
+        Action(
+            action_type=ActionType.SOLVE_CAPTCHA,
+            status=ActionStatus.failed,
+            task_id="tsk_probe",
+            step_id="stp_probe",
+            response="CodeBlockCaptchaError",
+            output={"code_line": 3, "challenge": receipt},
+        ),
+        Action(
+            action_type=ActionType.GOTO_URL,
+            status=ActionStatus.completed,
+            task_id="tsk_probe",
+            step_id="stp_probe",
+            output={"code_line": 1},
+        ),
+    ]
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(tasks=SimpleNamespace(get_recent_actions_for_tasks=AsyncMock(return_value=rows))),
+    )
+    now = datetime.now(UTC)
+    block = WorkflowRunBlock(
+        workflow_run_block_id="wrb_probe",
+        workflow_run_id="wr_probe",
+        organization_id="o_probe",
+        task_id="tsk_probe",
+        label="search",
+        block_type=BlockType.CODE,
+        status="failed",
+        created_at=now,
+        modified_at=now,
+    )
+    results: list[dict[str, Any]] = [
+        {"label": "search", "block_type": "CODE", "status": "failed", "task_id": "tsk_probe"}
+    ]
+    await run_execution_module._attach_action_traces([block], results, "o_probe", include_completed=True)
+    result: dict[str, Any] = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_probe",
+            "overall_status": "failed",
+            "blocks": results,
+            SOLVER_ATTEMPT_KEY: run_execution_module._capture_solver_facts_and_strip_traces(results),
+        },
+    }
+    ctx = _ctx()
+
+    finalize_build_test_result(
+        ctx,
+        source_tool="run_blocks_and_collect_debug",
+        result=result,
+        recorded_outcome=recorded_outcome_from_run_blocks_result(result),
+    )
+
+    packet = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)["data"][BUILD_TEST_PACKET_KEY]
+    assert packet["challenge"]["solver_receipt"] == receipt
+    notices = " ".join(packet["challenge_notices"])
+    assert vendor in notices
+    assert status in notices
+
+
+_PX_UNSOLVED = {"status": "unsolved", "vendor": "perimeterx", "arm": "vendor_handler", "page_state": "challenged"}
+_PX_SOLVED = {"status": "solved", "vendor": "perimeterx", "arm": "vendor_handler", "page_state": "clear"}
+
+
+def _receipt_block(label: str, status: str, receipt: dict[str, str] | None = None) -> dict[str, Any]:
+    row = {"action": "solve_captcha", "status": "completed", "challenge": receipt} if receipt else None
+    return {
+        "label": label,
+        "block_type": "CODE",
+        "status": status,
+        "action_trace": [row] if row else [{"action": "goto_url", "status": "completed"}],
+    }
+
+
+@pytest.mark.parametrize("source", ["trace", "carried"])
+@pytest.mark.parametrize(
+    ("blocks", "expected"),
+    [
+        (
+            [_receipt_block("search", "failed", _PX_UNSOLVED), _receipt_block("cleanup", "completed", _PX_SOLVED)],
+            _PX_UNSOLVED,
+        ),
+        (
+            [_receipt_block("search", "failed", _PX_UNSOLVED), _receipt_block("cleanup", "failed", _PX_SOLVED)],
+            _PX_SOLVED,
+        ),
+        ([_receipt_block("search", "completed", _PX_UNSOLVED), _receipt_block("submit", "failed")], None),
+    ],
+    ids=["completed_finally_skipped", "failing_finally_governs", "last_failed_block_has_no_call"],
+)
+def test_the_packet_and_the_notice_read_the_same_governing_receipt(
+    source: str, blocks: list[dict[str, Any]], expected: dict[str, str] | None
+) -> None:
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = copy.deepcopy(blocks)
+    attempt = run_execution_module._capture_solver_facts_and_strip_traces(copy.deepcopy(blocks))
+    if source == "carried":
+        result["data"][SOLVER_ATTEMPT_KEY] = attempt
+
+    contract = _solver_contract(_ctx(), result)
+
+    packet_receipt = contract.challenge.solver_receipt if contract.challenge is not None else None
+    assert (packet_receipt.model_dump(mode="json") if packet_receipt else None) == expected
+    assert attempt.get("receipt") == expected
+
+
+def test_a_passed_run_reports_no_receipt_even_when_a_tolerated_block_met_a_hard_block() -> None:
+    result = _unwalled_run_result()
+    result["ok"] = True
+    result["data"]["overall_status"] = "completed"
+    result["data"]["blocks"] = [_receipt_block("optional", "failed", _PX_UNSOLVED)]
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is None
+    assert contract.levers == []
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        _PX_UNSOLVED,
+        {**_PX_UNSOLVED, "page_state": "not_rechecked"},
+        {"status": "unsolved", "vendor": None, "arm": None, "page_state": "not_rechecked"},
+    ],
+    ids=["vendor_challenged", "vendor_not_rechecked", "ladder_timeout"],
+)
+def test_a_solver_receipt_is_reported_but_never_asserts_a_wall_by_itself(receipt: dict[str, str | None]) -> None:
+    result = _unwalled_run_result()
+    result["data"]["blocks"] = [_receipt_block("search", "failed", receipt)]
+
+    contract = _solver_contract(_ctx(), result)
+
+    assert contract.challenge is None or contract.challenge.basis != "run_wall"
+    if contract.challenge is not None:
+        assert contract.challenge.solver_receipt is not None
+
+
+@pytest.mark.parametrize("status", list(ChallengeStatus))
+def test_a_shared_solver_receipt_reads_back_whole_when_the_writer_adds_a_key(status: ChallengeStatus) -> None:
+    written = ChallengeOutcome(status, "perimeterx", "vendor_handler", "challenged").receipt()
+
+    receipt = solver_receipt({**written, "added_by_a_later_writer": "x"})
+
+    assert receipt is not None
+    assert receipt.model_dump(mode="json") == written

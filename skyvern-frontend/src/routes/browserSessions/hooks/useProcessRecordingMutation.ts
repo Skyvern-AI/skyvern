@@ -1,12 +1,10 @@
 import { useMutation } from "@tanstack/react-query";
 import { useRef } from "react";
-import { useFeatureFlagEnabled } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { RECORD_BROWSER_CODE_FIRST_FLAG } from "@/util/featureFlags";
 import {
   useRecordingStore,
   type RecordingDraftStep,
@@ -18,22 +16,49 @@ import type { RecordingEvidencePacket } from "@/routes/workflows/copilot/workflo
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
+  useWorkflowYamlEditorStore,
+  type YamlCommitOwner,
+} from "@/store/WorkflowYamlEditorStore";
+import { useRecordingFeedbackStore } from "@/store/RecordingFeedbackStore";
+import {
   captureRecordBrowser,
+  getRecordBrowserContext,
   markRecordBrowserProcessed,
 } from "@/util/recordBrowserTelemetry";
 
 const FAIL_QUIET_NO_EVENTS = "FAIL-QUIET:NO-EVENTS" as const;
+
+type ProcessRecordingInput = {
+  /** Live-interpreted steps, including user edits and deletes. */
+  draftSteps?: Array<RecordingDraftStep> | null;
+};
+
+type ProcessRecordingVariables = ProcessRecordingInput & {
+  owner: YamlCommitOwner | null;
+};
+
+function isRecordingOwnerCurrent(
+  owner: YamlCommitOwner | null,
+): owner is YamlCommitOwner {
+  return Boolean(
+    owner?.active &&
+    useWorkflowYamlEditorStore.getState().editorOwner === owner,
+  );
+}
 
 const useProcessRecordingMutation = ({
   browserSessionId,
   onSuccess,
 }: {
   browserSessionId: string | null;
-  onSuccess?: (args: {
-    recordingId: string | null;
-    blocks: Array<WorkflowBlock>;
-    parameters: Array<RecordedParameter>;
-  }) => void;
+  onSuccess?: (
+    args: {
+      recordingId: string | null;
+      blocks: Array<WorkflowBlock>;
+      parameters: Array<RecordedParameter>;
+    },
+    owner: YamlCommitOwner,
+  ) => void;
 }) => {
   const credentialGetter = useCredentialGetter();
   const { openPane } = useStudioPanes();
@@ -46,22 +71,24 @@ const useProcessRecordingMutation = ({
     eventCount: number;
     optimisticStepCount: number;
   } | null>(null);
-  // Per-user opt-in preview; not enrolled reads as false (agent blocks).
-  const codeFirst =
-    useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
-
   const processRecordingMutation = useMutation({
-    mutationFn: async (
-      variables: {
-        /**
-         * Live-interpreted draft steps (with user edits/deletes applied).
-         * When provided the backend converts them deterministically instead
-         * of re-processing the raw event stream.
-         */
-        draftSteps?: Array<RecordingDraftStep> | null;
-      } | void,
-    ) => {
-      const draftSteps = variables?.draftSteps ?? null;
+    onMutate: ({ owner }: ProcessRecordingVariables) => {
+      if (isRecordingOwnerCurrent(owner)) {
+        const currentRecording = useRecordingStore.getState();
+        return {
+          commitToken: currentRecording.setIsCommitting(true),
+          workflowPermanentId: currentRecording.workflowPermanentId,
+          recordingAttemptId: currentRecording.recordingAttemptId,
+        };
+      }
+    },
+    mutationFn: async ({
+      owner,
+      draftSteps = null,
+    }: ProcessRecordingVariables) => {
+      if (!isRecordingOwnerCurrent(owner)) {
+        throw new Error("The workflow editor is no longer available");
+      }
 
       if (!browserSessionId) {
         throw new Error(
@@ -111,6 +138,9 @@ const useProcessRecordingMutation = ({
       });
 
       const client = await getClient(credentialGetter, "sans-api-v1");
+      if (!isRecordingOwnerCurrent(owner)) {
+        throw new Error("The workflow editor is no longer available");
+      }
       return client
         .post<
           {
@@ -132,7 +162,8 @@ const useProcessRecordingMutation = ({
         >(`/browser_sessions/${browserSessionId}/process_recording`, {
           compressed_chunks: compressedChunks,
           workflow_permanent_id: workflowPermanentId,
-          code_first: codeFirst,
+          // Keep opting in explicitly while older backends still honor this field.
+          code_first: true,
           // This build substitutes credential tokens in a code block's code; a build that
           // does not must not be handed blocks whose code reads a token it cannot rename.
           supports_credential_tokens: true,
@@ -151,7 +182,8 @@ const useProcessRecordingMutation = ({
           evidence: response.data.evidence ?? null,
         }));
     },
-    onSuccess: ({ recordingId, blocks, parameters, evidence }) => {
+    onSuccess: ({ recordingId, blocks, parameters, evidence }, { owner }) => {
+      if (!isRecordingOwnerCurrent(owner)) return;
       const latencyMs =
         mutationStartedAtRef.current !== null
           ? Date.now() - mutationStartedAtRef.current
@@ -177,34 +209,47 @@ const useProcessRecordingMutation = ({
       });
 
       captureRecordBrowser("record_browser.processed", {
+        recording_id: recordingId ?? undefined,
         block_count: blocks?.length ?? 0,
         parameter_count: parameters?.length ?? 0,
         latency_ms: latencyMs,
       });
 
+      if (!isRecordingOwnerCurrent(owner)) return;
       recordingStore.clear();
 
       if (blocks && blocks.length > 0) {
-        if (recordingId && workflowPermanentId) {
+        if (!isRecordingOwnerCurrent(owner)) return;
+        useRecordingFeedbackStore.getState().show({
+          ...getRecordBrowserContext(),
+          workflow_permanent_id: owner.workflowPermanentId,
+          recording_id: recordingId ?? undefined,
+        });
+        if (recordingId) {
           useWorkflowHasChangesStore
             .getState()
-            .setPendingRecording(recordingId, workflowPermanentId);
+            .setPendingRecording(recordingId, owner.workflowPermanentId);
         }
         toast({
-          variant: "success",
-          title: "Recording Processed",
-          description: "The recording has been successfully processed.",
+          // Refinement has not produced a workflow yet, so this is progress, not success.
+          variant: evidence ? "default" : "success",
+          title: evidence ? "Workflow steps captured" : "Workflow steps added",
+          description: evidence
+            ? "Copilot is refining the workflow now. Follow its progress in the Copilot pane."
+            : "Skyvern turned your browser demonstration into workflow steps.",
         });
 
-        onSuccess?.({ recordingId, blocks, parameters: parameters });
+        if (!isRecordingOwnerCurrent(owner)) return;
+        onSuccess?.({ recordingId, blocks, parameters }, owner);
 
-        if (codeFirst && evidence) {
+        if (evidence && isRecordingOwnerCurrent(owner)) {
           // One replace-navigation stores the packet and arms the copilot turn that
           // reads it, the same handoff RunTab makes for diagnose_run.
           const nonce = crypto.randomUUID();
           useRecordingRefinementEvidenceStore
             .getState()
             .set({ nonce, evidence });
+          if (!isRecordingOwnerCurrent(owner)) return;
           openPane("copilot", {
             state: { copilotAction: { kind: "refine_recording", nonce } },
           });
@@ -216,15 +261,18 @@ const useProcessRecordingMutation = ({
       // A zero-block commit still ends the session: the caller's onSuccess (which
       // normally exits recording after landing blocks) is skipped, and without
       // this the user is stranded in the recording panel with a dead Done button.
+      if (!isRecordingOwnerCurrent(owner)) return;
       recordingStore.setIsRecording(false);
 
       toast({
         variant: "warning",
-        title: "Recording Processed (No Blocks)",
-        description: "No blocks could be created from the recording.",
+        title: "No workflow steps created",
+        description:
+          "Skyvern couldn't turn your demonstration into workflow steps.",
       });
     },
-    onError: (error) => {
+    onError: (error, { owner }) => {
+      if (!isRecordingOwnerCurrent(owner)) return;
       const latencyMs =
         mutationStartedAtRef.current !== null
           ? Date.now() - mutationStartedAtRef.current
@@ -236,9 +284,9 @@ const useProcessRecordingMutation = ({
         recordingStore.reset();
         toast({
           variant: "warning",
-          title: "Nothing was recorded",
+          title: "No task captured",
           description:
-            "Interact with the live browser (clicks, typing, navigation), then stop recording again to generate blocks.",
+            "Complete the task in the browser. Skyvern captures your clicks, typing, and navigation, then turns them into workflow steps.",
         });
         return;
       }
@@ -248,17 +296,46 @@ const useProcessRecordingMutation = ({
         latency_ms: latencyMs,
       });
 
-      useRecordingStore.setState({ finishRequested: false });
-
       toast({
         variant: "destructive",
-        title: "Error Processing Recording",
+        title: "Couldn't create workflow steps",
         description: error instanceof Error ? error.message : String(error),
       });
     },
+    onSettled: (_data, _error, { owner }, context) => {
+      const currentRecording = useRecordingStore.getState();
+      if (
+        context &&
+        currentRecording.commitToken === context.commitToken &&
+        currentRecording.workflowPermanentId === context.workflowPermanentId &&
+        currentRecording.recordingAttemptId === context.recordingAttemptId
+      ) {
+        if (isRecordingOwnerCurrent(owner)) {
+          currentRecording.setIsCommitting(false);
+        } else {
+          currentRecording.reset();
+        }
+      }
+    },
   });
 
-  return processRecordingMutation;
+  const captureRecording = (
+    input?: ProcessRecordingInput,
+  ): ProcessRecordingVariables => {
+    const owner = useWorkflowYamlEditorStore.getState().editorOwner;
+    return {
+      ...input,
+      owner: owner?.workflowPermanentId === workflowPermanentId ? owner : null,
+    };
+  };
+
+  return {
+    ...processRecordingMutation,
+    mutate: (input?: ProcessRecordingInput) =>
+      processRecordingMutation.mutate(captureRecording(input)),
+    mutateAsync: (input?: ProcessRecordingInput) =>
+      processRecordingMutation.mutateAsync(captureRecording(input)),
+  };
 };
 
 export { useProcessRecordingMutation };

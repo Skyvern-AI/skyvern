@@ -118,6 +118,7 @@ function renderMenu(props?: {
         onNavigate={() => {}}
         selectedCount={props?.selectedCount ?? 1}
         onDeleted={props?.onDeleted}
+        taggingEnabled
       >
         {() => <div>row</div>}
       </WorkflowRowActions>

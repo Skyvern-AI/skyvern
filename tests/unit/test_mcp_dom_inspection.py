@@ -203,3 +203,36 @@ async def test_get_styles_empty_properties(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert result["ok"] is True
     assert result["data"]["count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message, attempts",
+    [
+        ("Execution context was destroyed, most likely because of a navigation.", 2),
+        ("The page changed while the extension operation was running.", 2),
+        ("The page changed before the extension operation started.", 2),
+        ("Element not found", 1),
+    ],
+)
+async def test_get_html_page_change_retry(monkeypatch: pytest.MonkeyPatch, message: str, attempts: int) -> None:
+    from skyvern.cli.core.session_manager import scoped_session
+    from tests.unit._mcp_browser_fakes import make_session_state
+
+    page = _make_mock_page()
+    page.is_closed.return_value = False
+    ctx = BrowserContext(mode="local")
+    state = make_session_state(context=ctx)
+    state._implicit_page = page
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
+    page.locator.return_value.evaluate = AsyncMock(
+        side_effect=[RuntimeError(message), RuntimeError(message), "<p>new</p>"]
+    )
+
+    async with scoped_session(state):
+        result = await mcp_inspection.skyvern_get_html(selector="body")
+
+    assert page.locator.return_value.evaluate.await_count == (3 if attempts == 2 else 1)
+    assert result["ok"] is (attempts == 2)
+    if attempts == 2:
+        assert result["data"]["html"] == "<p>new</p>"

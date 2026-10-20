@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
 def _credential_parameter(
@@ -64,6 +65,7 @@ def _workflow_run(
     extra_http_headers: dict[str, str] | None = None,
     workflow_schedule_id: str | None = None,
     copilot_session_id: str | None = None,
+    start_fresh_browser: bool | None = None,
 ) -> WorkflowRun:
     now = datetime.now(timezone.utc)
     return WorkflowRun(
@@ -85,6 +87,7 @@ def _workflow_run(
         extra_http_headers=extra_http_headers,
         workflow_schedule_id=workflow_schedule_id,
         copilot_session_id=copilot_session_id,
+        start_fresh_browser=start_fresh_browser,
         trigger_type=WorkflowRunTriggerType.api,
         created_at=now,
         modified_at=now,
@@ -106,6 +109,7 @@ async def _validate_parameter(parameter: CredentialParameter, existing_ids: list
     organization = SimpleNamespace(organization_id="org_test")
     existing = [SimpleNamespace(credential_id=credential_id) for credential_id in existing_ids or []]
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=existing)
         await service._validate_and_normalize_credential_rotation_parameters([parameter], organization)
 
@@ -116,7 +120,7 @@ async def test_workflow_save_validation_dedupes_fallback_credentials_preserving_
         fallback_credential_ids=["cred_b", "cred_c", "cred_b", "cred_d", "cred_c"],
     )
 
-    await _validate_parameter(parameter, ["cred_b", "cred_c", "cred_d"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b", "cred_c", "cred_d"])
 
     assert parameter.fallback_credential_ids == ["cred_b", "cred_c", "cred_d"]
     assert parameter.credential_id == "cred_primary"
@@ -127,7 +131,7 @@ async def test_workflow_save_validation_rejects_unknown_fallback_credential_id()
     parameter = _credential_parameter(fallback_credential_ids=["cred_missing"])
 
     with pytest.raises(InvalidCredentialId):
-        await _validate_parameter(parameter, [])
+        await _validate_parameter(parameter, ["cred_primary"])
 
 
 @pytest.mark.asyncio
@@ -135,7 +139,7 @@ async def test_workflow_save_validation_rejects_bad_fallback_trigger() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_b"], fallback_trigger="later")
 
     with pytest.raises(SkyvernHTTPException, match="fallback_trigger"):
-        await _validate_parameter(parameter, ["cred_b"])
+        await _validate_parameter(parameter, ["cred_primary", "cred_b"])
 
 
 @pytest.mark.asyncio
@@ -150,7 +154,7 @@ async def test_workflow_save_validation_rejects_trigger_without_fallback_list() 
 async def test_workflow_save_validation_normalizes_empty_fallback_list_to_none() -> None:
     parameter = _credential_parameter(fallback_credential_ids=[])
 
-    await _validate_parameter(parameter)
+    await _validate_parameter(parameter, ["cred_primary"])
 
     assert parameter.fallback_credential_ids is None
 
@@ -159,7 +163,7 @@ async def test_workflow_save_validation_normalizes_empty_fallback_list_to_none()
 async def test_workflow_save_validation_drops_primary_credential_from_fallbacks() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_primary", "cred_b"])
 
-    await _validate_parameter(parameter, ["cred_b"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b"])
 
     assert parameter.fallback_credential_ids == ["cred_b"]
 
@@ -203,7 +207,7 @@ async def test_workflow_save_validation_allows_rotation_without_fallback_credent
 async def test_workflow_save_validation_allows_fallback_credentials_without_rotation() -> None:
     parameter = _credential_parameter(fallback_credential_ids=["cred_b", "cred_c"])
 
-    await _validate_parameter(parameter, ["cred_b", "cred_c"])
+    await _validate_parameter(parameter, ["cred_primary", "cred_b", "cred_c"])
 
     assert parameter.credential_ids is None
     assert parameter.fallback_credential_ids == ["cred_b", "cred_c"]
@@ -268,6 +272,7 @@ async def _run_fallback_retry(
     flag_enabled: bool = True,
     flag_error: Exception | None = None,
     run_tags: dict[str, str] | None = None,
+    run_group_item: object | None = None,
 ) -> tuple[str | None, AsyncMock, MagicMock]:
     captured: dict[str, object] = {}
 
@@ -296,6 +301,7 @@ async def _run_fallback_retry(
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=block_scoped)
         mock_app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers = _strip_marker_header
         mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=run_group_item)
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=_workflow(parameters))
         if retried_by_results is not None:
             mock_app.DATABASE.workflow_runs.get_workflow_run_retried_by = AsyncMock(side_effect=retried_by_results)
@@ -408,6 +414,24 @@ async def test_mixed_triggers_advance_each_parameter_from_its_own_prior_selectio
     assert kwargs["fallback_attempt"] == 2
     assert kwargs["workflow_request"].data["login_cred"] == "cred_a_fb2"
     assert kwargs["workflow_request"].data["backup_cred"] == "cred_b_fb1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_group_item", [False, True])
+async def test_a_run_group_child_never_starts_a_fallback_run(is_group_item: bool) -> None:
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}], start_fresh_browser=True)
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run,
+        parameters=[_credential_parameter(fallback_credential_ids=["cred_fb1"])],
+        run_group_item=SimpleNamespace(workflow_run_group_id="wrg_1") if is_group_item else None,
+    )
+
+    if is_group_item:
+        assert result is None
+        run_workflow_mock.assert_not_awaited()
+    else:
+        assert result == "wr_retry"
 
 
 @pytest.mark.asyncio
@@ -903,6 +927,7 @@ async def test_clean_up_workflow_schedules_credential_fallback_retry() -> None:
         mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -942,6 +967,7 @@ async def test_clean_up_workflow_preserves_body_success_without_retrying_finally
         mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         await service.clean_up_workflow(
             workflow=workflow,
@@ -986,6 +1012,7 @@ async def test_clean_up_workflow_schedules_retry_even_when_webhook_raises() -> N
         mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(
@@ -1025,6 +1052,7 @@ async def test_clean_up_workflow_schedules_retry_when_earlier_cleanup_step_raise
         mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
         mock_app.AGENT_FUNCTION.on_workflow_run_terminal = AsyncMock()
+        mock_app.DATABASE.workflow_run_attempts = make_workflow_run_attempts_fake()
 
         with pytest.raises(RuntimeError):
             await service.clean_up_workflow(

@@ -385,22 +385,18 @@ def test_code_block_steps_not_derived_without_prompt() -> None:
         assert result == definition
 
 
-def test_code_block_explicit_steps_preserved() -> None:
-    explicit = [{"description": "Author step", "action_type": "click", "line_start": 1, "line_end": 1}]
+@pytest.mark.parametrize(
+    "submitted",
+    [[{"description": "Author step", "action_type": "click", "line_start": 9, "line_end": 9}], []],
+    ids=["stale_outline", "empty_outline"],
+)
+def test_code_block_submitted_steps_are_rebuilt_from_code(submitted: list[dict[str, object]]) -> None:
     definition = _code_workflow_json(
-        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": explicit}]
+        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": submitted}]
     )
     result = _inject_code_block_derived_steps(definition, "json")
-    assert json.loads(result)["workflow_definition"]["blocks"][0]["steps"] == explicit
-
-
-def test_code_block_explicit_empty_steps_preserved() -> None:
-    """An explicitly-supplied `steps: []` is an authored empty outline, not absence."""
-    definition = _code_workflow_json(
-        [{"block_type": "code", "label": "step1", "code": _ACTION_CODE, "prompt": "", "steps": []}]
-    )
-    result = _inject_code_block_derived_steps(definition, "json")
-    assert json.loads(result)["workflow_definition"]["blocks"][0]["steps"] == []
+    steps = json.loads(result)["workflow_definition"]["blocks"][0]["steps"]
+    assert [step["action_type"] for step in steps] == ["goto_url", "click"]
 
 
 def test_code_block_null_steps_derived() -> None:

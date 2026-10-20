@@ -37,7 +37,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, Literal
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
 from urllib.parse import unquote, urlparse
 
 import aiohttp
@@ -49,7 +49,7 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
@@ -58,7 +58,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     is_unenrolled_redirect_hop_authorizer,
 )
 from skyvern.settings_manager import SettingsManager
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import BlobTooLargeError, SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.api.files import GuardedFileFetchHopResult
@@ -270,6 +270,15 @@ DOWNLOAD_EXTENSION_BY_MIME_TYPE = {
 _FILENAME_PATH_SEPARATOR_RE = re.compile(r"[\\/]+")
 _FILENAME_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+# The variable a download filename template uses to keep the site's own name, e.g.
+# "{{ fund }}_{{ original_filename }}". It renders to a marker rather than to the name itself,
+# because the name only exists once the download lands; the marker is substituted at rename time.
+# Built from unreserved characters so the percent-encoding the renderer applies leaves it intact.
+ORIGINAL_FILENAME_TEMPLATE_VARIABLE = "original_filename"
+ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
+_ORIGINAL_FILENAME_JINJA_RE = re.compile(r"\{\{\s*" + ORIGINAL_FILENAME_TEMPLATE_VARIABLE + r"\s*\}\}")
+_MAX_DOWNLOAD_FILENAME_BYTES = 255
 _DATA_URL_TOKEN = r"[!#$%&'*+.^_`|~A-Za-z0-9-]+"
 _DATA_URL_MEDIA_TYPE_RE = re.compile(rf"^{_DATA_URL_TOKEN}/{_DATA_URL_TOKEN}$")
 _DATA_URL_PARAMETER_NAME_RE = re.compile(rf"^{_DATA_URL_TOKEN}$")
@@ -308,6 +317,21 @@ def redacted_exception_origin(error: BaseException) -> str:
     code = traceback.tb_frame.f_code
     module = traceback.tb_frame.f_globals.get("__name__")
     return f"{module if isinstance(module, str) else code.co_filename}:{code.co_name}:{traceback.tb_lineno}"
+
+
+# A CDP protocol error names the rejected method and the state that rejected it well inside this
+# bound; past it the text is a traceback tail rather than the diagnosis.
+_CDP_ERROR_DETAIL_MAX_CHARS = 300
+
+
+def _redacted_cdp_error_detail(error: BaseException) -> str:
+    """``error``'s message with every URL replaced and the length bounded.
+
+    Every playwright protocol error is class ``Error``, so the class name alone does not say which
+    CDP call was rejected or why; the message does. Messages on this path can embed the
+    credential-bearing download URL or the remote-browser endpoint, so no URL survives.
+    """
+    return redact_cdp_endpoint_urls(str(error))[:_CDP_ERROR_DETAIL_MAX_CHARS]
 
 
 def _redacted_request_origin(url: str) -> str:
@@ -610,6 +634,17 @@ def normalize_download_filename(filename: str, content_type: str = "") -> str:
     return filename
 
 
+def monitor_saved_download_name(filename: str, content_type: str = "") -> str:
+    """The basename this monitor would save ``filename`` under, or "" when it is not a usable basename.
+
+    It percent-decodes, so names that differ only by escaping land on one file.
+    """
+    try:
+        return _validated_download_basename(filename, content_type)
+    except ValueError:
+        return ""
+
+
 def _validated_download_basename(filename: str, content_type: str = "") -> str:
     decoded_filename = filename.strip()
     while True:
@@ -631,22 +666,101 @@ def _validated_download_basename(filename: str, content_type: str = "") -> str:
     return normalize_download_filename(decoded_filename, content_type)
 
 
-def download_filename_from_suffix(download_suffix: str, source_extension: str, existing_names: set[str]) -> str:
-    """Filename for a download whose block configured ``download_suffix``"""
-    existing_names = {Path(n).name for n in existing_names}  # contract: dedup on basenames, never full paths
-    name = Path(download_suffix).name  # defensive: never let a suffix escape the dir
+def _marked_download_suffix(download_suffix: str) -> str:
+    """``download_suffix`` with every ``original_filename`` reference reduced to the marker.
+
+    The renderer normally produces the marker, but the cached-script path bakes the author's
+    filename template into generated code as a literal and never renders it, so the raw
+    ``{{ original_filename }}`` spelling has to resolve here too.
+    """
+    return _ORIGINAL_FILENAME_JINJA_RE.sub(ORIGINAL_FILENAME_MARKER, download_suffix)
+
+
+def _download_suffix_stem_and_extension(download_suffix: str, source_extension: str) -> tuple[str, str]:
+    name = Path(_marked_download_suffix(download_suffix)).name  # defensive: never let a suffix escape the dir
+    if ORIGINAL_FILENAME_MARKER in name:
+        suffix_after_marker = name.rsplit(ORIGINAL_FILENAME_MARKER, 1)[1]
+        suffix_ext = Path(suffix_after_marker).suffix
+        if suffix_ext:
+            return name[: -len(suffix_ext)], suffix_ext
+        return name, source_extension or ""
     suffix_ext = Path(name).suffix
     if suffix_ext:
-        stem, ext = name[: -len(suffix_ext)], suffix_ext
-    else:
-        stem, ext = name, source_extension or ""
-    stem = stem or "download"
-    candidate = f"{stem}{ext}"
+        return name[: -len(suffix_ext)], suffix_ext
+    return name, source_extension or ""
+
+
+def _basename_stem(filename: str) -> str:
+    name = Path(filename).name
+    extension = Path(name).suffix
+    return name[: -len(extension)] if extension else name
+
+
+def original_filename_stem(original_filename: str | None) -> str:
+    """``original_filename`` reduced to a stem safe to substitute into a download name.
+
+    The site chooses this name, so it goes through the same sanitization as a server-provided
+    filename; its extension is dropped because the final name's extension is resolved separately.
+    Truncated because a site-controlled basename can exceed the filesystem's 255-byte component limit.
+    """
+    stem = _basename_stem(normalize_download_filename(Path(original_filename or "").name))
+    return _truncate_utf8_to_bytes(stem, _MAX_DOWNLOAD_FILENAME_BYTES).strip(" .")
+
+
+def _truncate_utf8_to_bytes(value: str, max_bytes: int) -> str:
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def append_download_extension_if_missing(filename: str, extension: str) -> str:
+    """Preserve a recovered source extension when a download-time name has none."""
+    if not extension or Path(filename).suffix.lower() == extension.lower():
+        return filename
+    return f"{filename}{extension}"
+
+
+def _unique_download_filename(stem: str, extension: str, existing_names: set[str]) -> str:
+    existing_names = {file_api.sanitize_filename(Path(name).name) for name in existing_names}
+    stem = file_api.sanitize_filename(stem).strip(" .") or "download"
+    extension = file_api.sanitize_filename(extension)
     counter = 1
-    while candidate in existing_names:
-        candidate = f"{stem}_{counter}{ext}"
+    while True:
+        counter_suffix = "" if counter == 1 else f"_{counter - 1}"
+        bounded_extension = _truncate_utf8_to_bytes(
+            extension, _MAX_DOWNLOAD_FILENAME_BYTES - len(counter_suffix.encode("utf-8"))
+        )
+        bounded_stem = _truncate_utf8_to_bytes(
+            stem,
+            _MAX_DOWNLOAD_FILENAME_BYTES - len(counter_suffix.encode("utf-8")) - len(bounded_extension.encode("utf-8")),
+        ).strip(" .")
+        candidate = file_api.sanitize_filename(f"{bounded_stem}{counter_suffix}{bounded_extension}")
+        if candidate not in existing_names:
+            return candidate
         counter += 1
-    return candidate
+
+
+def unique_download_filename(filename: str, source_extension: str, existing_names: set[str]) -> str:
+    """Ensure a final download-time name and recovered extension do not overwrite a file."""
+    candidate = append_download_extension_if_missing(Path(filename).name, source_extension)
+    extension = (
+        candidate[-len(source_extension) :]
+        if source_extension and candidate.lower().endswith(source_extension.lower())
+        else ""
+    )
+    stem = candidate[: -len(extension)] if extension else candidate
+    return _unique_download_filename(stem, extension, existing_names)
+
+
+def download_filename_from_suffix(
+    download_suffix: str,
+    source_extension: str,
+    existing_names: set[str],
+    original_filename: str | None = None,
+) -> str:
+    """Filename for a download whose block configured ``download_suffix``"""
+    stem, ext = _download_suffix_stem_and_extension(download_suffix, source_extension)
+    if ORIGINAL_FILENAME_MARKER in stem:
+        stem = stem.replace(ORIGINAL_FILENAME_MARKER, original_filename_stem(original_filename))
+    return _unique_download_filename(stem, ext, existing_names)
 
 
 def is_download_response(headers: dict[str, str], status_code: int, resource_type: str = "") -> bool:
@@ -654,7 +768,7 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     Determine if a response is a file download.
 
     Checks:
-    0. Skip error responses (status >= 400)
+    0. Skip anything that is not a final 2xx body (errors, redirects, 304)
     1. Skip sub-resource types (Font, Stylesheet, Script, Image, etc.)
     2. Skip API content types (application/json, etc.)
     3. For XHR/Fetch: require BOTH attachment header AND download MIME type
@@ -665,7 +779,10 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     4. Content-Disposition contains "attachment"
     5. Content-Type is a known download MIME type
     """
-    if status_code >= 400:
+    # A 3xx/304 carries no body to take, and Chromium refuses takeResponseBodyAsStream while an
+    # interception sits in its redirect stage. Claiming a redirect as a download therefore fails the
+    # request and the browser never follows it; passing it through captures the final response instead.
+    if status_code >= 300:
         return False
 
     if resource_type in NON_DOWNLOAD_RESOURCE_TYPES:
@@ -738,6 +855,24 @@ def extract_filename(headers: dict[str, str], url: str) -> str:
     return ""
 
 
+class DownloadTally(NamedTuple):
+    """Counts since the last accounting reset; a different generation means the counts restarted."""
+
+    generation: str
+    saved: int
+    unsolicited_failures: dict[str, int]
+    pending: bool
+
+
+def download_limits() -> dict[str, int]:
+    """The enforced limit behind each limit rejection reason."""
+    return {
+        "file_count_limit": MAX_DOWNLOAD_FILES_PER_RUN,
+        "run_size_limit": MAX_RUN_DOWNLOAD_BYTES,
+        "file_size_limit": min(MAX_FILE_SIZE_BYTES, MAX_STREAMED_FILE_SIZE_BYTES),
+    }
+
+
 class CDPDownloadInterceptor:
     """
     Intercepts download responses via the CDP Fetch domain and optionally handles
@@ -790,6 +925,8 @@ class CDPDownloadInterceptor:
         # Track auth attempts per requestId to prevent infinite retry loops
         # when proxy credentials are rejected (407 → ProvideCredentials → 407 → …)
         self._auth_attempts: dict[str, int] = {}
+        self._auth_challenge_seen = False
+        self._proxy_auth_rejection_seen = False
         # Track URLs already downloaded (dedup between Fetch interception and browser download monitor)
         self._downloaded_urls: set[str] = set()
         self._artifact_scope_lock = threading.Lock()
@@ -824,6 +961,8 @@ class CDPDownloadInterceptor:
         self._reset_download_accounting()
 
     def _reset_download_accounting(self) -> None:
+        self._download_accounting_generation = uuid.uuid4().hex
+        self._unsolicited_download_failure_totals: dict[str, int] = {}
         self._download_attempt_counter = 0
         self._download_request_counter = 0
         self._run_download_file_count = 0
@@ -873,6 +1012,14 @@ class CDPDownloadInterceptor:
             "error_type": "SYSTEM_DEFINED_ERROR",
             "details": {"failed_download_count": failed_count, "reasons": reasons},
         }
+
+    def download_tally(self) -> DownloadTally:
+        return DownloadTally(
+            generation=self._download_accounting_generation,
+            saved=self._captured_download_count,
+            unsolicited_failures=dict(self._unsolicited_download_failure_totals),
+            pending=self.has_pending_download_activity(),
+        )
 
     def record_artifact_outcome(
         self,
@@ -1047,6 +1194,9 @@ class CDPDownloadInterceptor:
                     failures.add(reason)
         else:
             self._unsolicited_download_failures[reason] = self._unsolicited_download_failures.get(reason, 0) + 1
+            self._unsolicited_download_failure_totals[reason] = (
+                self._unsolicited_download_failure_totals.get(reason, 0) + 1
+            )
         self._log_download_attempt(
             attempt,
             capture_outcome="failed",
@@ -1104,6 +1254,12 @@ class CDPDownloadInterceptor:
         if self._proxy_username and self._proxy_password:
             return self._proxy_username, self._proxy_password
         return None
+
+    def consume_navigation_auth_challenges(self) -> tuple[bool, bool]:
+        challenges = (self._proxy_auth_rejection_seen, self._auth_challenge_seen)
+        self._proxy_auth_rejection_seen = False
+        self._auth_challenge_seen = False
+        return challenges
 
     def rebind_download_scope(
         self,
@@ -1384,6 +1540,10 @@ class CDPDownloadInterceptor:
             self._browser_download_listener = download_listener
             self._accepting_browser_downloads = True
             LOG.info("Browser download monitor enabled")
+
+    @property
+    def browser_download_event_count(self) -> int:
+        return self._browser_download_generation
 
     async def bind_to_context(
         self,
@@ -2122,9 +2282,13 @@ class CDPDownloadInterceptor:
         # shared reader must not emit ERROR logs for pages that don't own the blob's origin.
         data: bytes | None = None
         for page in list(self._browser_context.pages):
-            data = await SkyvernFrame.read_blob_url_bytes(
-                page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True
-            )
+            try:
+                data = await SkyvernFrame.read_blob_url_bytes(
+                    page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True, raise_too_large=True
+                )
+            except BlobTooLargeError:
+                self._record_download_failure(attempt, "file_size_limit")
+                return
             if data is not None:
                 break
 
@@ -2369,6 +2533,7 @@ class CDPDownloadInterceptor:
         request_id = event.get("requestId")
         source = ""
         request_origin = "<unknown>"
+        self._auth_challenge_seen = True
 
         try:
             # Reduce a present request URL to its origin first: a malformed ``authChallenge`` (null) raises
@@ -2405,6 +2570,8 @@ class CDPDownloadInterceptor:
             else:
                 # Clean up attempt tracking for this request
                 self._auth_attempts.pop(request_id, None)
+                if source == "Proxy" and self._proxy_username and self._proxy_password and attempts >= 1:
+                    self._proxy_auth_rejection_seen = True
                 if attempts >= 1:
                     LOG.warning(
                         "CDP proxy auth credentials rejected, cancelling to prevent retry loop",
@@ -2707,10 +2874,13 @@ class CDPDownloadInterceptor:
                     # decoded body in one shot, so a lying/understated Content-Length could materialize an
                     # unbounded payload and OOM the process — the exact failure this streaming path removes.
                     # Fail the request instead so nothing is ever materialized.
+                    cause = e.__cause__ or e
                     LOG.error(
                         "takeResponseBodyAsStream failed, failing request (no whole-body fallback)",
                         filename=filename,
-                        error_type=type(e.__cause__ or e).__name__,
+                        error_type=type(cause).__name__,
+                        error_detail=_redacted_cdp_error_detail(cause),
+                        status_code=response_status,
                     )
                     self._record_download_failure(attempt, "capture_failed")
                     await self._fail_request(cdp_session, request_id, filename=filename, url=url)
@@ -3075,6 +3245,13 @@ async def false_click_download_attribution_is_quiescent(browser_context: Browser
     return await interceptor.prove_pre_action_download_quiescence()
 
 
+def is_monitoring_browser_downloads_for_context(browser_context: BrowserContext | None) -> bool:
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    return isinstance(interceptor, CDPDownloadInterceptor) and interceptor.is_monitoring_browser_downloads()
+
+
 def has_download_interceptor_for_context(browser_context: BrowserContext | None) -> bool:
     interceptor = (
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
@@ -3118,6 +3295,13 @@ def consume_unsolicited_download_error_for_context(browser_context: BrowserConte
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     return interceptor.consume_unsolicited_download_error() if isinstance(interceptor, CDPDownloadInterceptor) else None
+
+
+def download_tally_for_context(browser_context: BrowserContext | None) -> DownloadTally | None:
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    return interceptor.download_tally() if isinstance(interceptor, CDPDownloadInterceptor) else None
 
 
 def record_download_artifact_outcome_for_context(

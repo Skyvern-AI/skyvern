@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -15,17 +16,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 import typer
 from playwright.async_api import Error as PlaywrightError
 from typer.testing import CliRunner
 
+from skyvern import _cli_bootstrap, config
+from skyvern.cli.commands import _output as cli_output
 from skyvern.cli.commands import browser as cli_browser
 from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.core import client as cli_client
 from skyvern.cli.core.guards import STALE_FRAME_HINT
 from skyvern.cli.status import _status_data
 from skyvern.exceptions import StaleFrameSelectionError
+from skyvern.library.skyvern import Skyvern
 from tests.unit._mcp_browser_fakes import StaleScopePage
 
 # ---------------------------------------------------------------------------
@@ -1121,7 +1127,7 @@ class TestSharedFactoryBaseUrlGuard:
         monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
         monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
         client_constructor = MagicMock(return_value=object())
-        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(client_module, "_LoopbackSkyvern", client_constructor)
 
         client_module._build_cloud_client("test-api-key")
 
@@ -1160,6 +1166,56 @@ class TestBrowserGroupBaseUrlGuard:
         assert "Set SKYVERN_BASE_URL" in parsed["error"]["message"]
 
 
+class TestCliUserAgent:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            pytest.param(["workflow", "list", "--json"], id="mcp_parity_command"),
+            pytest.param(["browser", "session", "create", "--json"], id="browser_command"),
+        ],
+    )
+    def test_cli_command_labels_its_api_calls_as_the_cli(
+        self, args: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The CLI drives the MCP's own client and tools; only the header lets the server tell the two apart."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[])
+
+        real_build_cloud_client = cli_client._build_cloud_client
+
+        def build_cloud_client_offline(api_key: str) -> Skyvern:
+            instance = real_build_cloud_client(api_key)
+            instance._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+            return instance
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_COMMAND_RUNNING", False)
+        monkeypatch.setattr("skyvern.utils.env_paths.load_backend_env_files", lambda intent: tmp_path / ".env")
+        monkeypatch.setattr(_cli_bootstrap, "configure_cli_runtime_logging", lambda: None)
+        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: False)
+        monkeypatch.setattr(
+            cli_client, "settings", config.Settings(_env_file=None, SKYVERN_BASE_URL="http://skyvern.test")
+        )
+        monkeypatch.setattr(cli_client, "_resolve_api_key", lambda: "test-api-key")
+        monkeypatch.setattr(cli_client, "_global_skyvern_instance", None)
+        monkeypatch.setattr(cli_client, "_build_cloud_client", build_cloud_client_offline)
+        monkeypatch.setattr(cli_output, "capture_cli_tool_call", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", lambda *_args, **_kwargs: None)
+
+        token = cli_client._skyvern_instance.set(None)
+        try:
+            CliRunner().invoke(cli_app, args)
+        finally:
+            cli_client._skyvern_instance.reset(token)
+
+        assert requests
+        assert {request.headers.get("x-user-agent") for request in requests} == {"skyvern-cli"}
+
+
 class TestCliRuntimeFlag:
     def test_prepare_cli_runtime_marks_cli_process(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from skyvern import _cli_bootstrap
@@ -1178,6 +1234,45 @@ class TestCliRuntimeFlag:
         code = "import sys; import skyvern.cli; raise SystemExit(1 if 'skyvern.config' in sys.modules else 0)"
         completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
         assert completed.returncode == 0, completed.stderr
+
+
+class TestCliRuntimeResetFixture:
+    def test_reset_cli_runtime_entry_restores_process_and_env_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The autouse conftest fixture must undo everything a CLI entry leaves in the process.
+
+        prepare_cli_runtime flips _CLI_RUNTIME_PREPARED, and load_backend_env_files writes
+        SKYVERN_ENV_INTENT unconditionally plus SKYVERN_API_KEY / SKYVERN_BASE_URL when a .env
+        supplies them. config._settings_env_intent reads SKYVERN_ENV_INTENT for env precedence,
+        so leaking it past teardown steers a later cloud-client test in the same shard.
+        """
+        from skyvern import _cli_bootstrap
+        from tests.unit.conftest import reset_cli_runtime_entry
+
+        run_reset = reset_cli_runtime_entry.__wrapped__
+
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_COMMAND_RUNNING", False)
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        monkeypatch.setenv("SKYVERN_ENV_INTENT", "auto")
+
+        teardown = run_reset()
+        next(teardown)
+
+        _cli_bootstrap._CLI_RUNTIME_PREPARED = True
+        _cli_bootstrap.mark_cli_command()
+        os.environ["SKYVERN_API_KEY"] = "leaked-key"
+        os.environ["SKYVERN_BASE_URL"] = "https://leaked.example"
+        os.environ["SKYVERN_ENV_INTENT"] = "cloud"
+
+        with pytest.raises(StopIteration):
+            next(teardown)
+
+        assert _cli_bootstrap._CLI_RUNTIME_PREPARED is False
+        assert _cli_bootstrap.is_cli_command() is False
+        assert "SKYVERN_API_KEY" not in os.environ
+        assert "SKYVERN_BASE_URL" not in os.environ
+        assert os.environ["SKYVERN_ENV_INTENT"] == "auto"
 
 
 class TestCredentialsCommands:

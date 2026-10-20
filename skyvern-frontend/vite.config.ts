@@ -83,38 +83,14 @@ function hasSourceMapPruningStep() {
   return packageJson.scripts?.build?.includes("npm run datadog:sourcemaps");
 }
 
-async function createSentryPlugin() {
-  try {
-    const { sentryVitePlugin } = await import("@sentry/vite-plugin");
-    return sentryVitePlugin({
-      org: "skyvern",
-      project: "javascript-react",
-    });
-  } catch (error) {
-    const missingDependency =
-      error instanceof Error &&
-      "code" in error &&
-      ["ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"].includes(error.code) &&
-      error.message.includes("@sentry/vite-plugin");
-    if (!missingDependency) {
-      throw error;
-    }
-    return { name: "optional-sentry-noop" };
-  }
-}
-
-export default defineConfig(async ({ mode }) => {
+export default defineConfig(({ mode }) => {
   const env = {
     ...loadEnv(mode, process.cwd(), ""),
     ...process.env,
   };
 
   return {
-    plugins: [
-      react(),
-      createUiSessionDevPlugin({ env }),
-      await createSentryPlugin(),
-    ],
+    plugins: [react(), createUiSessionDevPlugin({ env })],
 
     server: {
       port: devPort,

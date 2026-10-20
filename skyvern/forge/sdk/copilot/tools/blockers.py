@@ -12,7 +12,11 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     artifact_challenge_flag_key,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    generated_file_artifact_ids,
+    registered_download_proof_view,
+)
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
@@ -534,8 +538,9 @@ def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]
     return _iter_goal_value_path_values(next_value, remaining)
 
 
-def _unmet_code_output_goal_paths(value: Any, goal_value_paths: list[str]) -> list[str]:
+def _unmet_code_output_goal_paths(value: Any, goal_value_paths: list[str], generated: frozenset[str]) -> list[str]:
     """The declared goal-value paths this output retained no content for, in declared order."""
+    value = registered_download_proof_view(value, generated)
     unmet: list[str] = []
     for path in goal_value_paths:
         path_parts = _normalize_goal_value_path(path)
@@ -610,6 +615,9 @@ def _analyze_run_blocks(
 
     blocks = data.get("blocks")
     if isinstance(blocks, list):
+        generated = generated_file_artifact_ids(
+            block.get("extracted_data") for block in blocks if isinstance(block, dict)
+        )
         for block in blocks:
             if not isinstance(block, dict):
                 continue
@@ -643,7 +651,7 @@ def _analyze_run_blocks(
                     extracted = validate_and_fill_extraction_result(extracted, extraction_schema)
                 if goal_value_paths:
                     has_data_blocks = True
-                    unmet_paths = _unmet_code_output_goal_paths(extracted, goal_value_paths)
+                    unmet_paths = _unmet_code_output_goal_paths(extracted, goal_value_paths, generated)
                     if _is_meaningful_extracted_data(extracted):
                         any_data_output = True
                     if unmet_paths:

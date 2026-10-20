@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import typer
@@ -97,6 +98,15 @@ def _parse_parameters(value: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def _parse_first_fire_at(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as e:
+        raise typer.BadParameter(f"--first-fire-at must be an ISO 8601 date-time: {e}") from e
+
+
 @schedule_app.command("list")
 def schedule_list(
     ctx: typer.Context,
@@ -180,7 +190,15 @@ def schedule_get(
 @schedule_app.command("create")
 def schedule_create(
     workflow_id: str = typer.Option(..., "--workflow-id", help="Workflow ID (wpid_…)."),
-    cron: str = typer.Option(..., "--cron", help="Cron expression, e.g. '0 9 * * *'."),
+    cron: str | None = typer.Option(
+        None, "--cron", help="Cron expression, e.g. '0 9 * * *'. Set this or --interval-seconds."
+    ),
+    interval_seconds: int | None = typer.Option(
+        None, "--interval-seconds", help="Run every N seconds (minimum 300), e.g. 259200 for every 72 hours."
+    ),
+    first_fire_at: str | None = typer.Option(
+        None, "--first-fire-at", help="First run of an interval schedule, ISO 8601 with offset."
+    ),
     timezone: str = typer.Option("UTC", "--timezone", help="IANA timezone name."),
     enabled: bool = typer.Option(True, "--enabled/--disabled", help="Whether the schedule fires immediately."),
     parameters: str | None = typer.Option(None, "--parameters", help="Workflow input parameters as JSON object."),
@@ -188,13 +206,16 @@ def schedule_create(
     description: str | None = typer.Option(None, "--description", help="Schedule description."),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
-    """Create a schedule for a workflow."""
+    """Create a schedule for a workflow, on a cron or a fixed interval."""
     params_dict = _parse_parameters(parameters)
+    first_fire_at_dt = _parse_first_fire_at(first_fire_at)
 
     async def _run() -> dict[str, Any]:
         return await tool_schedule_create(
             workflow_permanent_id=workflow_id,
             cron_expression=cron,
+            interval_seconds=interval_seconds,
+            first_fire_at=first_fire_at_dt,
             timezone=timezone,
             enabled=enabled,
             parameters=params_dict,
@@ -205,7 +226,7 @@ def schedule_create(
     run_tool(
         _run,
         json_output=json_output,
-        hint_on_exception="Check cron, timezone, and parameter shape.",
+        hint_on_exception="Check the cron or interval, timezone, and parameter shape.",
         action="skyvern_schedule_create",
     )
 
@@ -215,6 +236,12 @@ def schedule_update(
     workflow_id: str = typer.Option(..., "--workflow-id", help="Workflow ID (wpid_…)."),
     schedule_id: str = typer.Option(..., "--id", "--schedule-id", help="Schedule ID (wfs_…)."),
     cron: str | None = typer.Option(None, "--cron", help="New cron expression."),
+    interval_seconds: int | None = typer.Option(
+        None, "--interval-seconds", help="New fixed interval in seconds (minimum 300)."
+    ),
+    first_fire_at: str | None = typer.Option(
+        None, "--first-fire-at", help="New future first run for an interval schedule, ISO 8601 with offset."
+    ),
     timezone: str | None = typer.Option(None, "--timezone", help="New IANA timezone."),
     enabled: bool | None = typer.Option(
         None,
@@ -248,12 +275,15 @@ def schedule_update(
         raise typer.BadParameter("Cannot pass both --parameters and --clear-parameters.")
 
     params_dict = _parse_parameters(parameters)
+    first_fire_at_dt = _parse_first_fire_at(first_fire_at)
 
     async def _run() -> dict[str, Any]:
         return await tool_schedule_update(
             workflow_permanent_id=workflow_id,
             workflow_schedule_id=schedule_id,
             cron_expression=cron,
+            interval_seconds=interval_seconds,
+            first_fire_at=first_fire_at_dt,
             timezone=timezone,
             enabled=enabled,
             parameters=params_dict,
@@ -268,7 +298,7 @@ def schedule_update(
     run_tool(
         _run,
         json_output=json_output,
-        hint_on_exception="Check cron, timezone, and parameter shape.",
+        hint_on_exception="Check the cron or interval, timezone, and parameter shape.",
         action="skyvern_schedule_update",
     )
 

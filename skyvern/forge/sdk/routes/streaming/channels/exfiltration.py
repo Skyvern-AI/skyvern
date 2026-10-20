@@ -108,6 +108,10 @@ class ExfiltrationChannel(CdpChannel):
         self._decoration_init_script_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._decoration_page_locks: weakref.WeakKeyDictionary[Page, asyncio.Lock] = weakref.WeakKeyDictionary()
         self._pending_nav_tasks: weakref.WeakKeyDictionary[Page, asyncio.Task] = weakref.WeakKeyDictionary()
+        self._pending_dialogs: weakref.WeakKeyDictionary[Page, tuple[dict[str, t.Any], float]] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._pending_dialog_tasks: weakref.WeakKeyDictionary[Page, asyncio.Task[None]] = weakref.WeakKeyDictionary()
         self._network_activity_count = 0
         self._last_network_activity_emit = 0.0
         self._network_activity_flush_task: asyncio.Task[None] | None = None
@@ -283,14 +287,47 @@ class ExfiltrationChannel(CdpChannel):
 
         self._emit_console_event(event_data, capture_seq)
 
+    def _handle_dialog_opening(self, page: Page, params: dict[str, t.Any]) -> None:
+        self._pending_dialogs[page] = (params, time.time())
+
+    def _schedule_dialog_closed(self, page: Page, params: dict[str, t.Any]) -> None:
+        pending = self._pending_dialogs.pop(page, None)
+        previous = self._pending_dialog_tasks.get(page)
+        task = self._track_event_task(self._handle_dialog_closed(page, params, pending, previous))
+        self._pending_dialog_tasks[page] = task
+
+    async def _handle_dialog_closed(
+        self,
+        page: Page,
+        params: dict[str, t.Any],
+        pending: tuple[dict[str, t.Any], float] | None,
+        previous: asyncio.Task[None] | None,
+    ) -> None:
+        if previous is not None:
+            with contextlib.suppress(Exception):
+                await previous
+        await self._drain_page_queue(page)
+        if pending is not None:
+            opening_params, opening_timestamp = pending
+            self._emit_cdp_event("dialog:opening", opening_params, timestamp=opening_timestamp)
+        self._emit_cdp_event("dialog:closed", params)
+
     async def _attach_page_cdp_console_capture(self, page: Page) -> CDPSession | None:
         cdp_session = await page.context.new_cdp_session(page)
-        await cdp_session.send("Runtime.enable")
+        await asyncio.gather(cdp_session.send("Runtime.enable"), cdp_session.send("Page.enable"))
         cdp_session.on(
             "Runtime.consoleAPICalled",
             lambda params: self._track_event_task(
                 self._handle_runtime_console_event_async(params, self._next_capture_seq())
             ),
+        )
+        cdp_session.on(
+            "Page.javascriptDialogOpening",
+            lambda params: self._handle_dialog_opening(page, params),
+        )
+        cdp_session.on(
+            "Page.javascriptDialogClosed",
+            lambda params: self._schedule_dialog_closed(page, params),
         )
         return cdp_session
 
@@ -426,7 +463,7 @@ class ExfiltrationChannel(CdpChannel):
         self._network_activity_count = 0
         self._handle_cdp_event("net:activity", {"count": count})
 
-    def _emit_cdp_event(self, event_name: str, params: dict) -> None:
+    def _emit_cdp_event(self, event_name: str, params: dict, *, timestamp: float | None = None) -> None:
         self._emit_events(
             [
                 ExfiltratedEvent(
@@ -434,7 +471,7 @@ class ExfiltrationChannel(CdpChannel):
                     event_name=event_name,
                     params=params,
                     source=ExfiltratedEventSource.CDP,
-                    timestamp=time.time(),
+                    timestamp=timestamp if timestamp is not None else time.time(),
                     capture_seq=self._next_capture_seq(),
                 ),
             ]
@@ -805,6 +842,8 @@ class ExfiltrationChannel(CdpChannel):
 
             # Final flush so events since the last drain tick reach the recording before teardown.
             await self._drain_all_pages()
+            # Dialog events emit only after their own page drain; cancelling them would drop the recorded dialog.
+            await asyncio.gather(*list(self._pending_dialog_tasks.values()), return_exceptions=True)
 
             if self._network_activity_flush_task and not self._network_activity_flush_task.done():
                 self._network_activity_flush_task.cancel()

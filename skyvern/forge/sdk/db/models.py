@@ -9,6 +9,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -20,9 +21,10 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, deferred
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
@@ -40,6 +42,7 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_parameter_id,
     generate_debug_session_id,
     generate_folder_id,
+    generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
@@ -50,12 +53,15 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_phone_number_id,
+    generate_run_feedback_id,
     generate_run_tag_event_id,
     generate_script_block_id,
     generate_script_fallback_episode_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
+    generate_sms_config_id,
     generate_step_id,
     generate_tag_event_id,
     generate_tag_key_id,
@@ -75,6 +81,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_credential_selection_id,
+    generate_workflow_run_group_id,
     generate_workflow_run_id,
     generate_workflow_schedule_id,
     generate_workflow_script_id,
@@ -88,6 +95,16 @@ class Base(AsyncAttrs, DeclarativeBase):
     pass
 
 
+class RunExecutionLeaseModel(Base):
+    __tablename__ = "run_execution_leases"
+
+    run_id = Column(String, primary_key=True)
+    run_type = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    attempt_number = Column(Integer, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=False)
+
+
 class TaskModel(Base):
     __tablename__ = "tasks"
     __table_args__ = (
@@ -98,6 +115,14 @@ class TaskModel(Base):
             "modified_at",
             "created_at",
             postgresql_where=text("status IN ('created', 'queued', 'running')"),
+        ),
+        Index(
+            "ix_tasks_org_standalone_status_created",
+            "organization_id",
+            "status",
+            "created_at",
+            postgresql_where=text("workflow_run_id IS NULL"),
+            sqlite_where=text("workflow_run_id IS NULL"),
         ),
     )
 
@@ -152,6 +177,8 @@ class TaskModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
+    task_queue = Column(String, nullable=True)
 
 
 class StepModel(Base):
@@ -241,6 +268,99 @@ class OrganizationAuthTokenModel(Base):
     encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationSMSConfigModel(Base):
+    __tablename__ = "organization_sms_configs"
+    __table_args__ = (
+        Index(
+            "uq_org_sms_configs_one_connected",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("mode = 'connected' AND deleted_at IS NULL"),
+            sqlite_where=text("mode = 'connected' AND deleted_at IS NULL"),
+        ),
+        Index(
+            "uq_org_sms_configs_one_managed",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("mode = 'managed' AND deleted_at IS NULL"),
+            sqlite_where=text("mode = 'managed' AND deleted_at IS NULL"),
+        ),
+        UniqueConstraint(
+            "sms_config_id",
+            "organization_id",
+            name="uq_organization_sms_configs_id_org",
+        ),
+    )
+
+    sms_config_id = Column(String, primary_key=True, default=generate_sms_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    mode = Column(String, nullable=False)
+    encrypted_webhook_secret = Column(String, nullable=False)
+    webhook_secret_encrypted_method = Column(String, nullable=False, default="aes", server_default="aes")
+    encrypted_signing_token = Column(String, nullable=True)
+    signing_token_encrypted_method = Column(String, nullable=True)
+    daily_ingest_cap = Column(Integer, nullable=False, default=100, server_default="100")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationPhoneNumberModel(Base):
+    __tablename__ = "organization_phone_numbers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["sms_config_id", "organization_id"],
+            [
+                "organization_sms_configs.sms_config_id",
+                "organization_sms_configs.organization_id",
+            ],
+            name="fk_organization_phone_numbers_sms_config_org",
+        ),
+        ForeignKeyConstraint(
+            ["credential_id", "organization_id"],
+            ["credentials.credential_id", "credentials.organization_id"],
+            name="fk_organization_phone_numbers_credential_org",
+        ),
+        Index(
+            "uq_org_phone_numbers_org_number",
+            "organization_id",
+            "phone_number",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+            sqlite_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+        ),
+    )
+
+    phone_number_id = Column(String, primary_key=True, default=generate_phone_number_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    sms_config_id = Column(String, nullable=False, index=True)
+    phone_number = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default="twilio", server_default="twilio")
+    provider_number_sid = Column(String, nullable=True)
+    previous_sms_url = Column(String, nullable=True)
+    previous_sms_method = Column(String, nullable=True)
+    previous_sms_application_sid = Column(String, nullable=True)
+    credential_id = Column(String, nullable=True)
+    provider_cost_cents = Column(Integer, nullable=True)
+    price_cents = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, default="active", server_default="active")
+    quarantined_until = Column(DateTime, nullable=True)
+    provisioning_claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -617,6 +737,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
     ai_fallback = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     cache_key = Column(String, nullable=True)
     adaptive_caching = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -629,6 +750,9 @@ class WorkflowModel(SoftDeleteMixin, Base):
     import_error = Column(String, nullable=True)  # Error message if import failed
     created_by = Column(String, nullable=True)
     edited_by = Column(String, nullable=True)
+    # The person a Copilot save was made for; run start holds them accountable for the version's Trigger targets.
+    edited_for = Column(String, nullable=True)
+    build_source = Column(String, nullable=True)  # WorkflowBuildSource
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -685,18 +809,31 @@ class WorkflowScheduleModel(Base):
             postgresql_where=text("deleted_at IS NULL"),
         ),
         Index("idx_workflow_schedules_org_enabled", "organization_id", "enabled"),
+        CheckConstraint(
+            "(CASE WHEN cron_expression IS NULL THEN 0 ELSE 1 END + CASE WHEN interval_seconds IS NULL THEN 0 ELSE 1 END "
+            "+ CASE WHEN run_at IS NULL THEN 0 ELSE 1 END) = 1 "
+            "AND (interval_seconds IS NULL) = (first_fire_at IS NULL) "
+            "AND (run_at IS NULL) = (dispatch_status IS NULL)",
+            name="ck_workflow_schedules_one_cadence",
+        ),
     )
 
     workflow_schedule_id = Column(String, primary_key=True, default=generate_workflow_schedule_id)
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
-    cron_expression = Column(String, nullable=False)
+    cron_expression = Column(String, nullable=True)
+    interval_seconds = Column(Integer, nullable=True)
+    first_fire_at = Column(DateTime, nullable=True)
+    run_at = Column(DateTime, nullable=True)
+    dispatch_status = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
     timezone = Column(String, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     parameters = Column(JSON, nullable=True)
     backend_schedule_id = Column("temporal_schedule_id", String, nullable=True)
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -706,6 +843,63 @@ class WorkflowScheduleModel(Base):
         nullable=False,
     )
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunGroupModel(Base):
+    __tablename__ = "workflow_run_groups"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "submission_key", name="uq_workflow_run_groups_org_submission_key"),
+        Index(
+            "idx_workflow_run_groups_unfinished_modified_at",
+            "modified_at",
+            postgresql_where=text("status IN ('active', 'cancel_requested')"),
+        ),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True, default=generate_workflow_run_group_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    requested_version = Column(Integer, nullable=True)
+    workflow_id = Column(String, nullable=False)
+    submission_key = Column(String, nullable=False)
+    input_fingerprint = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    finished_at = Column(DateTime, nullable=True)
+
+
+class WorkflowRunGroupItemModel(Base):
+    __tablename__ = "workflow_run_group_items"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_group_id", "item_key", name="uq_workflow_run_group_items_group_item_key"),
+        UniqueConstraint("workflow_run_id", name="uq_workflow_run_group_items_workflow_run_id"),
+        Index("ix_workflow_run_group_items_item_key_created_at", "item_key", "created_at"),
+    )
+
+    workflow_run_group_id = Column(String, primary_key=True)
+    position = Column(Integer, primary_key=True)
+    item_key = Column(String, nullable=False)
+    parameters = Column(JSON, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="pending")
+    dispatch_token = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    dispatch_attempts = Column(Integer, nullable=False, default=0)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
 
 
 class WorkflowTemplateModel(Base):
@@ -763,6 +957,13 @@ class WorkflowRunModel(Base):
             postgresql_where=text("status IN ('queued', 'running', 'paused')"),
         ),
         Index(
+            "ix_workflow_runs_job_recipe_listing",
+            "organization_id",
+            text("created_at DESC"),
+            text("workflow_run_id DESC"),
+            postgresql_where=text("trigger_type IN ('job_recipe_apply', 'job_recipe_extract')"),
+        ),
+        Index(
             "ix_workflow_runs_retried_from_workflow_run_id",
             "retried_from_workflow_run_id",
             unique=True,
@@ -784,11 +985,14 @@ class WorkflowRunModel(Base):
     start_fresh_browser = Column(Boolean, nullable=True)
     reuse_browser_session = Column(Boolean, nullable=True)
     reuse_bound_key = Column(String, nullable=True)
+    workflow_definition_sha256 = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
     webhook_callback_url = Column(String)
     webhook_failure_reason = Column(String, nullable=True)
+    webhook_delivery_status = Column(String, nullable=True)
+    webhook_delivery_finalized_at = Column(DateTime, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
@@ -799,10 +1003,16 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
+    setup_completed = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    task_queue = Column(String, nullable=True)
+    target_cluster = Column(String, nullable=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     sequential_credential_id = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    browser_type = Column(String, nullable=True)  # BrowserType value; None means system default
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
     debug_session_id: Column = Column(String, nullable=True)
     trigger_type = Column(String, nullable=True)
     workflow_schedule_id = Column(String, nullable=True, index=True)
@@ -814,6 +1024,14 @@ class WorkflowRunModel(Base):
     verification_code_identifier = Column(String, nullable=True)
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
+    # Internal-only infra-failure attribution document (SKY-16588). Bounded codes only,
+    # written on the first non-success terminal write; never exposed to customers. NULL
+    # means pre-classifier / not evaluated; an explicit "unattributed" component means the
+    # classifier ran and abstained. none_as_null=True so clearing it (ORM `= None` or Core
+    # `.values(...=None)`) stores SQL NULL, not the JSON token `null`: reopen/reset/timeout
+    # clears must be SQL NULL for the COALESCE repair and the completed-run NULL invariant to
+    # hold at SQL/CDC/Redshift grain, not just when deserialized back to Python None.
+    failure_attribution = Column(JSON(none_as_null=True), nullable=True)
     # When True, this run was spawned by a WorkflowTriggerBlock whose
     # ignore_workflow_system_prompt flag was set, and the child must not
     # inherit the parent chain's workflow_system_prompt. Set at spawn time so
@@ -829,7 +1047,13 @@ class WorkflowRunModel(Base):
     # the pin, and the gates resolve the flag as before.
     secure_runner_pinned = Column(Boolean, nullable=True)
     copilot_session_id = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
+    # The actor that authorized the start when it is not created_by: the person Copilot started the run for, or the
+    # org's synthetic user for an API key. Run start and its Trigger children are judged as them.
+    requested_by = Column(String, nullable=True)
 
+    # Internal Apply admission decision; NULL retains legacy pricing lookup behavior.
+    billing_exempt_at_admission = Column(Boolean, nullable=True)
     credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     cached_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
     topup_credits_used = Column(Integer, nullable=True, default=0, server_default="0")
@@ -845,6 +1069,73 @@ class WorkflowRunModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
         index=True,
+    )
+
+
+class WorkflowRunAttemptModel(Base):
+    __tablename__ = "workflow_run_attempts"
+    __table_args__ = (
+        Index("ix_workflow_run_attempts_organization_created_at", "organization_id", "created_at"),
+        Index(
+            "ix_workflow_run_attempts_profile_run_lookup",
+            "browser_profile_id",
+            "workflow_run_id",
+            postgresql_where=text("browser_profile_id IS NOT NULL"),
+        ),
+        # Folder access resolves a browser session to the runs whose attempts pinned it.
+        Index(
+            "ix_workflow_run_attempts_pinned_session_run_lookup",
+            "pinned_browser_session_id",
+            "workflow_run_id",
+            postgresql_where=text("pinned_browser_session_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_workflow_run_attempts_pending_retries",
+            "next_attempt_at",
+            "workflow_run_id",
+            "attempt_number",
+            postgresql_where=text(
+                "retry_decision = 'retry' AND next_attempt_prepared_at IS NULL AND next_attempt_at IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_workflow_run_attempts_terminal_releases",
+            "side_effects_released_at",
+            postgresql_where=text("retry_decision IN ('final', 'revoked', 'abandoned') AND webhook_sent_at IS NULL"),
+        ),
+        Index(
+            "ix_workflow_run_attempts_prepared_not_started",
+            "modified_at",
+            postgresql_where=text("retry_decision IS NULL AND status = 'queued' AND started_at IS NULL"),
+        ),
+    )
+
+    workflow_run_id = Column(String, primary_key=True)
+    attempt_number = Column(Integer, primary_key=True)
+    organization_id = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    failure_reason = Column(Text, nullable=True)
+    failure_category = Column(JSON, nullable=True)
+    error_codes = Column(JSON, nullable=True)
+    retry_decision = Column(String, nullable=True)
+    decision_reason = Column(String, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True)
+    next_attempt_prepared_at = Column(DateTime, nullable=True)
+    webhook_sent_at = Column(DateTime, nullable=True)
+    interim_webhook_sent_at = Column(DateTime, nullable=True)
+    side_effects_released_at = Column(DateTime, nullable=True)
+    interim_side_effects_progress = Column(JSON, nullable=True)
+    final_side_effects_progress = Column(JSON, nullable=True)
+    pinned_browser_session_id = Column(String, nullable=True)
+    browser_profile_id = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=naive_utc_now, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=naive_utc_now,
+        onupdate=naive_utc_now,
+        nullable=False,
     )
 
 
@@ -920,6 +1211,7 @@ class BitwardenLoginCredentialParameterModel(Base):
     bitwarden_collection_id = Column(String, nullable=True, default=None)
     bitwarden_item_id = Column(String, nullable=True, default=None)
     url_parameter_key = Column(String, nullable=True, default=None)
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -983,6 +1275,7 @@ class BitwardenCreditCardDataParameterModel(Base):
 
 class CredentialParameterModel(Base):
     __tablename__ = "credential_parameters"
+    __table_args__ = (Index("ix_credential_parameters_credential_workflow_lookup", "credential_id", "workflow_id"),)
 
     credential_parameter_id = Column(String, primary_key=True, default=generate_credential_parameter_id)
     workflow_id = Column(String, index=True, nullable=False)
@@ -1004,6 +1297,7 @@ class WorkflowRunCredentialSelectionModel(Base):
     __tablename__ = "workflow_run_credential_selections"
     __table_args__ = (
         UniqueConstraint("workflow_run_id", "parameter_key", name="uq_wrcs_workflow_run_parameter_key"),
+        Index("ix_wrcs_credential_run_lookup", "credential_id", "workflow_run_id"),
         Index(
             "idx_wrcs_lru_lookup",
             "organization_id",
@@ -1034,7 +1328,7 @@ class OnePasswordCredentialParameterModel(Base):
     description = Column(String, nullable=True)
     vault_id = Column(String, nullable=False)
     item_id = Column(String, nullable=False)
-
+    totp_identifier = Column(String, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1101,6 +1395,9 @@ class WorkflowRunOutputParameterModel(Base):
         index=True,
     )
     value = Column(JSON, nullable=False)
+    # SQL NULL marks an absent cache so COALESCE falls through to the authoritative value.
+    capped_value = deferred(Column(JSON(none_as_null=True), nullable=True))
+    capped_extracted_information = deferred(Column(JSON(none_as_null=True), nullable=True))
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
@@ -1147,6 +1444,14 @@ class TOTPCodeModel(Base):
     __table_args__ = (
         Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
         Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+        Index(
+            "uq_totp_codes_org_external_message_id",
+            "organization_id",
+            "external_message_id",
+            unique=True,
+            postgresql_where=text("external_message_id IS NOT NULL"),
+            sqlite_where=text("external_message_id IS NOT NULL"),
+        ),
     )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
@@ -1158,6 +1463,7 @@ class TOTPCodeModel(Base):
     content = Column(String, nullable=False)
     code = Column(String)
     source = Column(String)
+    external_message_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
@@ -1219,6 +1525,7 @@ class WorkflowRunBlockModel(Base):
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)
+    capped_output = deferred(Column(JSON(none_as_null=True), nullable=True))
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
     # Page URL at the moment the block failed. Distinct from the task's target url, which is
@@ -1281,6 +1588,7 @@ class WorkflowRunBlockModel(Base):
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
     # not CDC-mirrored, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1380,7 +1688,7 @@ class PersistentBrowserSessionModel(Base):
             "status",
             desc("created_at"),
         ),
-        # The orphan sweep (SKY-13158) is deliberately cross-organization, so it matches neither
+        # The orphan sweep is deliberately cross-organization, so it matches neither
         # index above. The partial predicate is what does the work: it restricts the index to live
         # rows of the shape the sweep can identify from this table alone, a small subset, which is
         # why plain column keys are enough even though the sweep orders by
@@ -1439,8 +1747,15 @@ class PersistentBrowserSessionModel(Base):
     browser_profile_id = Column(String, nullable=True, index=True)
     bound_workflow_permanent_id = Column(String, nullable=True)
     bound_key = Column(String, nullable=True)
+    browser_settings = Column(JSON, nullable=True)
+    browser_settings_receipt = Column(JSON, nullable=True)
+    created_for_workflow_run_id = Column(String, nullable=True)
+    # The workflow a Copilot chat provisioned this browser for; folder access follows it. Not a reuse binding.
+    created_for_workflow_permanent_id = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
+    profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    exit_identity_digest = Column(String, nullable=True)
     instance_type = Column(String, nullable=True)
     # Retained, unwritten columns: the pod-share estimator that filled them was replaced by the
     # pool rate card, which prices whole run-hours and has no per-pod share to record.
@@ -1466,6 +1781,7 @@ class PersistentBrowserSessionModel(Base):
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
     # and dropping it would rewrite a hot table for no gain. Keep it in sync with `alembic check`.
     provisioning_deadline_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -1568,8 +1884,8 @@ class TaskRunModel(Base):
     parent_workflow_run_id = Column(String, nullable=True)
     debug_session_id = Column(String, nullable=True)
     searchable_text = Column(Text, nullable=True)
-    # Compute cost tracking fields. instance_type names the provider that ran the compute since
-    # SKY-14848, not the machine shape; vcpu_millicores and memory_mb are retained but unwritten.
+    # Compute cost tracking fields. instance_type names the provider that ran the compute rather than
+    # the machine shape; vcpu_millicores and memory_mb are retained but unwritten.
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
@@ -1625,6 +1941,7 @@ class CredentialModel(Base):
     __tablename__ = "credentials"
     __table_args__ = (
         Index("credential_folder_id_idx", "folder_id"),
+        UniqueConstraint("credential_id", "organization_id", name="uq_credentials_id_org"),
         Index(
             "uq_credentials_browser_profile_id",
             "browser_profile_id",
@@ -1632,11 +1949,21 @@ class CredentialModel(Base):
             postgresql_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
             sqlite_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
         ),
+        Index(
+            "uq_credentials_org_vault_item",
+            "organization_id",
+            "vault_id",
+            "item_id",
+            unique=True,
+            postgresql_where=text("vault_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("vault_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
     )
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
     vault_type = Column(String, nullable=True)
+    vault_id = Column(String, nullable=True)
     item_id = Column(String, nullable=True)
 
     name = Column(String, nullable=False)
@@ -1644,6 +1971,7 @@ class CredentialModel(Base):
     username = Column(String, nullable=True)
     totp_type = Column(String, nullable=False, default="none")
     totp_identifier = Column(String, nullable=True, default=None)
+    has_totp_seed = Column(Boolean, nullable=True)
     card_last4 = Column(String, nullable=True)
     card_brand = Column(String, nullable=True)
     secret_label = Column(String, nullable=True)
@@ -1657,14 +1985,25 @@ class CredentialModel(Base):
     proxy_location = Column(String, nullable=True)
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
+    created_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    upstream_missing_at = Column(DateTime, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
 
 
 class DebugSessionModel(Base):
     __tablename__ = "debug_sessions"
+    __table_args__ = (
+        Index(
+            "ix_debug_sessions_org_wpid_user_created_at",
+            "organization_id",
+            "workflow_permanent_id",
+            "user_id",
+            "created_at",
+        ),
+    )
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)
@@ -1728,6 +2067,12 @@ class ScriptFileModel(Base):
     __table_args__ = (
         Index("file_script_path_index", "script_revision_id", "file_path"),
         Index("ix_script_files_dedup", "script_id", "organization_id", "content_hash"),
+        Index(
+            "ix_script_files_artifact_id",
+            "artifact_id",
+            postgresql_where=text("artifact_id IS NOT NULL"),
+            sqlite_where=text("artifact_id IS NOT NULL"),
+        ),
         UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
     )
 
@@ -1823,6 +2168,7 @@ class WorkflowCopilotChatModel(Base):
     organization_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     proposed_workflow = Column(JSON, nullable=True)
+    accepted_turn_ids = Column(JSON, nullable=True)
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
     work_plan = Column(JSON, nullable=True)
@@ -1852,6 +2198,9 @@ class WorkflowCopilotChatMessageModel(Base):
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)
+    feedback_rating = Column(String, nullable=True)
+    feedback_reason = Column(UnicodeText, nullable=True)
+    feedback_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -2039,6 +2388,7 @@ class GoogleOAuthCredentialModel(Base):
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     credential_name = Column(String, nullable=False, default="Default")
     email_address = Column(String, nullable=True)
+    google_subject = Column(String, nullable=True)
     provider = Column(String, nullable=False, default="google")
     state = Column(String, nullable=False, default="pending_consent", index=True)
     scopes_requested = Column(JSON, nullable=False, default=list)
@@ -2051,6 +2401,38 @@ class GoogleOAuthCredentialModel(Base):
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
     client_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class GmailSendDispatchModel(Base):
+    """One row per logical send_email execution that reached the Gmail send call."""
+
+    __tablename__ = "gmail_send_dispatches"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "execution_key", name="uq_gmail_send_dispatches_execution"),
+        CheckConstraint(
+            "status IN ('dispatching', 'accepted', 'failed', 'unknown')",
+            name="ck_gmail_send_dispatches_status",
+        ),
+    )
+
+    gmail_send_dispatch_id = Column(String, primary_key=True, default=generate_gmail_send_dispatch_id)
+    organization_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, nullable=False)
+    execution_key = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    credential_id = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="dispatching")
+    provider_message_id = Column(String, nullable=True)
+    error_code = Column(String, nullable=True)
+    provider_status = Column(Integer, nullable=True)
+    provider_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -2084,6 +2466,11 @@ class MicrosoftOAuthCredentialModel(Base):
     scopes_granted = Column(JSON, nullable=False, default=list)
     encrypted_refresh_token = Column(String, nullable=True)
     encrypted_method = Column(String, nullable=True)
+    tenant_id = Column(String, nullable=True)
+    object_id = Column(String, nullable=True)
+    initiating_user_id = Column(String, nullable=True)
+    connection_id = Column(String, nullable=True)
+    custody_mode = Column(String, nullable=True)
     consent_nonce = Column(String, nullable=True)
     consent_redirect_uri = Column(String, nullable=True)
     consent_code_verifier = Column(String, nullable=True)
@@ -2139,6 +2526,30 @@ class UploadedFileModel(Base):
     # engine, so there is no single table to point at.
     run_id = Column(String, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class RunFeedbackModel(Base):
+    __tablename__ = "run_feedback"
+    __table_args__ = (Index("ux_run_feedback_org_target", "organization_id", "target_type", "target_id", unique=True),)
+
+    run_feedback_id = Column(String, primary_key=True, default=generate_run_feedback_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False, index=True)
+    target_type = Column(String, nullable=False)
+    # No foreign key: a workflow run id and a task id live in different tables.
+    target_id = Column(String, nullable=False)
+    context_id = Column(String, nullable=True)
+    rating = Column(String, nullable=False)
+    reason = Column(UnicodeText, nullable=True)
+    needs_support = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
+    submitted_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

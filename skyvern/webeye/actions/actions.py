@@ -315,6 +315,10 @@ class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
     # When set, close the open tab at this index in the open-tabs list instead of the current tab.
     tab_index: int | None = None
+    # Set only when the agent synthesized this close to recover from a dead blank working page.
+    # Persists into action_json via model_dump; gates the recovery recheck, the completed-step
+    # guards, and the cached-script marker filter.
+    is_internal_recovery: bool = False
 
 
 class NewTabAction(Action):

@@ -4,20 +4,24 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 from sqlalchemy import exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import aliased
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
+from skyvern.exceptions import WorkflowPinnedByRunGroup
+from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db._soft_delete import exclude_deleted
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     AWSSecretParameterModel,
@@ -32,6 +36,7 @@ from skyvern.forge.sdk.db.models import (
     OutputParameterModel,
     WorkflowModel,
     WorkflowParameterModel,
+    WorkflowRunGroupModel,
     WorkflowRunModel,
     WorkflowScheduleModel,
     WorkflowTemplateModel,
@@ -39,6 +44,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.tag_filters import workflow_tag_wpid_subqueries
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
+from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
     carried_policy,
     read_policy,
@@ -51,6 +57,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.workflow_run_groups import WorkflowRunGroupStatus
 from skyvern.schemas.workflows import WorkflowStatus
 
 if TYPE_CHECKING:
@@ -58,6 +65,11 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS = 10
+
+
+def _copilot_edited_for(organization_id: str | None, edited_by: str | None) -> str | None:
+    # Copilot saves inside the live request of the person it works for; a background save records nobody.
+    return requesting_user_id(organization_id) if organization_id and edited_by == "copilot" else None
 
 
 class WorkflowCreationLockTimeout(Exception):
@@ -106,6 +118,31 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
     _visit(workflow_definition.blocks)
 
 
+async def _refuse_if_pinned_by_run_group(session: AsyncSession, workflow_id: str) -> None:
+    pinned = await session.scalar(
+        select(WorkflowRunGroupModel.workflow_run_group_id)
+        .where(WorkflowRunGroupModel.workflow_id == workflow_id)
+        .where(
+            WorkflowRunGroupModel.status.in_(
+                [WorkflowRunGroupStatus.active.value, WorkflowRunGroupStatus.cancel_requested.value]
+            )
+        )
+        .limit(1)
+    )
+    if pinned is not None:
+        raise WorkflowPinnedByRunGroup(workflow_id)
+
+
+def with_carried_browser_settings(definition: dict[str, Any], previous_definition: object) -> dict[str, Any]:
+    """An absent key keeps the previous definition's settings and an explicit null clears them, because the
+    editor rebuilds definitions from a fixed key list and would otherwise drop the setting on every save."""
+    if "browser_settings" in definition or not isinstance(previous_definition, dict):
+        return definition
+    if "browser_settings" not in previous_definition:
+        return definition
+    return {**definition, "browser_settings": previous_definition["browser_settings"]}
+
+
 class WorkflowsRepository(BaseRepository):
     """Database operations for workflow management."""
 
@@ -149,24 +186,34 @@ class WorkflowsRepository(BaseRepository):
             raise RuntimeError("Workflow creation locking requires a database engine")
         if lock_key is not None:
             while True:
-                async with self._db_engine.connect() as connection:
-                    async with connection.begin():
-                        acquired = await connection.scalar(
-                            text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
-                            {"key": lock_key},
-                        )
-                        if acquired:
-                            async with self.Session.bind_connection(connection):
-                                yield
-                            return
+                async with self._db_engine.connect() as connection, connection.begin():
+                    acquired = await connection.scalar(
+                        text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                        {"key": lock_key},
+                    )
+                    if acquired:
+                        async with self.Session.bind_connection(connection):
+                            yield
+                        return
                 # ponytail: Polling frees the SQL pool; use a lock service if this key becomes hot.
                 await asyncio.sleep(0.1)
-        async with self._db_engine.connect() as connection:
-            async with connection.begin():
-                async with self.Session.bind_connection(connection):
-                    yield
+        async with self._db_engine.connect() as connection, connection.begin():
+            async with self.Session.bind_connection(connection):
+                yield
 
-    async def _policy_of_latest_version(
+    @asynccontextmanager
+    async def version_write_transaction(self) -> AsyncIterator[None]:
+        """Bind every write in the block to one transaction.
+
+        A save allocates its version row before it can build the definition that fills it (the
+        definition is keyed by the new ``workflow_id``). Committing the row first publishes an
+        empty workflow as the latest version, so every write between entering and leaving this
+        block becomes visible at once instead.
+        """
+        async with self._workflow_creation_transaction():
+            yield
+
+    async def _latest_version_definition(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None
     ) -> object | None:
         """Deliberately does NOT exclude soft-deleted rows, unlike the read used at bind time.
@@ -184,7 +231,7 @@ class WorkflowsRepository(BaseRepository):
         )
         if organization_id:
             query = query.filter_by(organization_id=organization_id)
-        return carried_policy(await session.scalar(query))
+        return await session.scalar(query)
 
     @db_operation("rename_workflow_if_still_default")
     async def rename_workflow_if_still_default(
@@ -252,6 +299,7 @@ class WorkflowsRepository(BaseRepository):
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         run_with: str | None = None,
+        browser_type: str | None = None,
         ai_fallback: bool = True,
         cache_key: str | None = None,
         adaptive_caching: bool = False,
@@ -263,13 +311,14 @@ class WorkflowsRepository(BaseRepository):
         folder_id: str | None = None,
         created_by: str | None = None,
         edited_by: str | None = None,
+        build_source: WorkflowBuildSource | None = None,
         workflow_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             # Policy is never taken from the caller's definition: a new version inherits exactly what
             # the previous one stored, so no save path can add, widen or clear an enrollment.
-            carried = (
-                await self._policy_of_latest_version(session, workflow_permanent_id, organization_id)
+            previous_definition = (
+                await self._latest_version_definition(session, workflow_permanent_id, organization_id)
                 if workflow_permanent_id and version != 1
                 else None
             )
@@ -277,7 +326,10 @@ class WorkflowsRepository(BaseRepository):
                 organization_id=organization_id,
                 title=title,
                 description=description,
-                workflow_definition=with_policy(workflow_definition, carried),
+                workflow_definition=with_policy(
+                    with_carried_browser_settings(workflow_definition, previous_definition),
+                    carried_policy(previous_definition),
+                ),
                 proxy_location=serialize_proxy_location(proxy_location),
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
@@ -296,6 +348,7 @@ class WorkflowsRepository(BaseRepository):
                 is_saved_task=is_saved_task,
                 status=status,
                 run_with=run_with,
+                browser_type=browser_type,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 adaptive_caching=adaptive_caching,
@@ -307,6 +360,8 @@ class WorkflowsRepository(BaseRepository):
                 folder_id=folder_id,
                 created_by=created_by,
                 edited_by=edited_by,
+                edited_for=_copilot_edited_for(organization_id, edited_by),
+                build_source=build_source,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -330,7 +385,7 @@ class WorkflowsRepository(BaseRepository):
                     raise ValueError(
                         f"Folder {folder_id} not found or does not belong to organization {organization_id}"
                     )
-                folder_model.modified_at = datetime.now(timezone.utc)
+                folder_model.modified_at = datetime.now(UTC)
 
             await session.commit()
             await session.refresh(workflow)
@@ -397,7 +452,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.workflow_id == workflow_id)
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=datetime.now(UTC))
             )
             await session.execute(update_deleted_at_query)
             await session.commit()
@@ -648,6 +703,7 @@ class WorkflowsRepository(BaseRepository):
         non-deleted workflows in the org, filtering out soft-deleted workflows."""
         if not workflow_permanent_ids:
             return set()
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
         async with self.Session() as session:
             stmt = (
                 select(WorkflowModel.workflow_permanent_id)
@@ -656,6 +712,22 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.deleted_at.is_(None))
                 .distinct()
             )
+            if accessible_folder_ids is not None:
+                # Folder moves only touch the latest live version, so judge each workflow by that version.
+                latest = aliased(WorkflowModel)
+                current_folder_id = (
+                    select(latest.folder_id)
+                    .where(
+                        latest.organization_id == organization_id,
+                        latest.workflow_permanent_id == WorkflowModel.workflow_permanent_id,
+                        latest.deleted_at.is_(None),
+                    )
+                    .order_by(latest.version.desc())
+                    .limit(1)
+                    .correlate_except(latest)
+                    .scalar_subquery()
+                )
+                stmt = stmt.where(or_(current_folder_id.is_(None), current_folder_id.in_(accessible_folder_ids)))
             return set((await session.execute(stmt)).scalars().all())
 
     @db_operation("get_workflows_by_organization_id")
@@ -697,6 +769,7 @@ class WorkflowsRepository(BaseRepository):
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
         db_page = page - 1
         async with self.Session() as session:
             subquery = (
@@ -704,6 +777,7 @@ class WorkflowsRepository(BaseRepository):
                     WorkflowModel.organization_id,
                     WorkflowModel.workflow_permanent_id,
                     func.max(WorkflowModel.version).label("max_version"),
+                    func.min(WorkflowModel.version).label("min_version"),
                 )
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
@@ -716,13 +790,32 @@ class WorkflowsRepository(BaseRepository):
                 )
                 .subquery()
             )
+            # Saves re-stamp created_by on each new version, so the true creator is the earliest version's row.
+            origin = aliased(WorkflowModel)
+            # Deleted versions still count toward when the agent was born, as in get_workflow_permanent_id_created_at.
+            lineage = aliased(WorkflowModel)
+            first_created_at = (
+                select(func.min(lineage.created_at))
+                .where(
+                    lineage.organization_id == WorkflowModel.organization_id,
+                    lineage.workflow_permanent_id == WorkflowModel.workflow_permanent_id,
+                )
+                .correlate(WorkflowModel)
+                .scalar_subquery()
+            )
             main_query = (
-                select(WorkflowModel)
+                select(WorkflowModel, origin.created_by, first_created_at)
                 .join(
                     subquery,
                     (WorkflowModel.organization_id == subquery.c.organization_id)
                     & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
                     & (WorkflowModel.version == subquery.c.max_version),
+                )
+                .join(
+                    origin,
+                    (origin.organization_id == subquery.c.organization_id)
+                    & (origin.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                    & (origin.version == subquery.c.min_version),
                 )
                 .outerjoin(
                     FolderModel,
@@ -745,6 +838,10 @@ class WorkflowsRepository(BaseRepository):
                 main_query = main_query.where(WorkflowModel.status.in_(statuses))
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
+            if accessible_folder_ids is not None:
+                main_query = main_query.where(
+                    or_(WorkflowModel.folder_id.is_(None), WorkflowModel.folder_id.in_(accessible_folder_ids))
+                )
             if workflow_tags:
                 for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
                     main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))
@@ -880,19 +977,22 @@ class WorkflowsRepository(BaseRepository):
             main_query = (
                 main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             )
-            workflows = (await session.scalars(main_query)).all()
+            rows = (await session.execute(main_query)).all()
             template_permanent_ids: set[str] = set()
-            if workflows and organization_id:
+            if rows and organization_id:
                 template_permanent_ids = await self.get_org_template_permanent_ids(organization_id)
 
-            return [
-                convert_to_workflow(
-                    workflow,
+            workflows: list[Workflow] = []
+            for workflow_model, original_created_by, original_created_at in rows:
+                workflow = convert_to_workflow(
+                    workflow_model,
                     self.debug_enabled,
-                    is_template=workflow.workflow_permanent_id in template_permanent_ids,
+                    is_template=workflow_model.workflow_permanent_id in template_permanent_ids,
                 )
-                for workflow in workflows
-            ]
+                workflow.original_created_by = original_created_by
+                workflow.original_created_at = original_created_at
+                workflows.append(workflow)
+            return workflows
 
     @db_operation("link_workflow_browser_profile_if_unset")
     async def link_workflow_browser_profile_if_unset(
@@ -915,7 +1015,7 @@ class WorkflowsRepository(BaseRepository):
             await session.commit()
             return result.rowcount > 0
 
-    @db_operation("update_workflow")
+    @db_operation("update_workflow", expected_errors=(WorkflowPinnedByRunGroup,))
     async def update_workflow(
         self,
         workflow_id: str,
@@ -951,6 +1051,9 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        edited_for: str | None | object = _UNSET,
+        build_source: WorkflowBuildSource | None | object = _UNSET,
+        refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -958,14 +1061,19 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+            if refuse_if_pinned_by_run_group:
+                get_workflow_query = get_workflow_query.with_for_update()
             if workflow := (await session.scalars(get_workflow_query)).first():
+                if refuse_if_pinned_by_run_group:
+                    await _refuse_if_pinned_by_run_group(session, workflow_id)
                 if title is not None:
                     workflow.title = title
                 if description is not None:
                     workflow.description = description
                 if workflow_definition is not None:
                     workflow.workflow_definition = with_policy(
-                        workflow_definition, carried_policy(workflow.workflow_definition)
+                        with_carried_browser_settings(workflow_definition, workflow.workflow_definition),
+                        carried_policy(workflow.workflow_definition),
                     )
                 if version is not None:
                     workflow.version = version
@@ -1023,6 +1131,14 @@ class WorkflowsRepository(BaseRepository):
                     workflow.created_by = cast(str | None, created_by)
                 if edited_by is not _UNSET:
                     workflow.edited_by = cast(str | None, edited_by)
+                    # A restore passes the original row's value back; a new save is stamped from the live request.
+                    workflow.edited_for = (
+                        _copilot_edited_for(workflow.organization_id, workflow.edited_by)
+                        if edited_for is _UNSET
+                        else cast(str | None, edited_for)
+                    )
+                if build_source is not _UNSET:
+                    workflow.build_source = cast(WorkflowBuildSource | None, build_source)
                 await session.commit()
                 await session.refresh(workflow)
                 is_template = (
@@ -1248,7 +1364,7 @@ class WorkflowsRepository(BaseRepository):
                 is_template=is_template,
             )
 
-    @db_operation("update_workflow_and_reconcile_definition_params")
+    @db_operation("update_workflow_and_reconcile_definition_params", expected_errors=(WorkflowPinnedByRunGroup,))
     async def update_workflow_and_reconcile_definition_params(
         self,
         workflow_id: str,
@@ -1284,7 +1400,10 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        edited_for: str | None | object = _UNSET,
+        build_source: WorkflowBuildSource | None | object = _UNSET,
         preserve_completion_contract: bool = True,
+        refuse_if_pinned_by_run_group: bool = False,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -1306,6 +1425,10 @@ class WorkflowsRepository(BaseRepository):
         round-trip.  That trade-off is deliberate — the alternative (sync
         every credential subclass's columns on every write) pulls a
         significant amount of orthogonal logic into this path.
+
+        The one exception is which ``credential_id`` each ``CredentialParameter``
+        key is bound to: run search dates those bindings by their
+        ``credential_parameters`` rows, so they are kept current here.
         """
         async with self.Session() as session:
             get_workflow_query = exclude_deleted(
@@ -1313,9 +1436,13 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+            if refuse_if_pinned_by_run_group:
+                get_workflow_query = get_workflow_query.with_for_update()
             workflow = (await session.scalars(get_workflow_query)).first()
             if not workflow:
                 raise NotFoundError("Workflow not found")
+            if refuse_if_pinned_by_run_group:
+                await _refuse_if_pinned_by_run_group(session, workflow_id)
 
             if title is not None:
                 workflow.title = title
@@ -1342,7 +1469,8 @@ class WorkflowsRepository(BaseRepository):
                     # default above because their models omit this field without intending a clear.
                     definition_json.pop("completion_contract", None)
                 workflow.workflow_definition = with_policy(
-                    definition_json, carried_policy(workflow.workflow_definition)
+                    with_carried_browser_settings(definition_json, workflow.workflow_definition),
+                    carried_policy(workflow.workflow_definition),
                 )
             if version is not None:
                 workflow.version = version
@@ -1400,6 +1528,14 @@ class WorkflowsRepository(BaseRepository):
                 workflow.created_by = cast(str | None, created_by)
             if edited_by is not _UNSET:
                 workflow.edited_by = cast(str | None, edited_by)
+                # A restore passes the original row's value back; a new save is stamped from the live request.
+                workflow.edited_for = (
+                    _copilot_edited_for(workflow.organization_id, workflow.edited_by)
+                    if edited_for is _UNSET
+                    else cast(str | None, edited_for)
+                )
+            if build_source is not _UNSET:
+                workflow.build_source = cast(WorkflowBuildSource | None, build_source)
 
             await session.commit()
             await session.refresh(workflow)
@@ -1422,20 +1558,21 @@ class WorkflowsRepository(BaseRepository):
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
-    ) -> list[str]:
-        """Soft-delete a workflow and its active schedules in a single DB transaction."""
+    ) -> tuple[list[tuple[str, str | None]], str | None]:
+        """Soft-delete a workflow and its active schedules in one transaction; returns (schedule id, backend id)."""
         async with self.Session() as session:
             select_query = (
-                select(WorkflowScheduleModel.workflow_schedule_id)
+                select(WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id)
                 .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
                 .where(WorkflowScheduleModel.deleted_at.is_(None))
             )
             if organization_id is not None:
                 select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
             result = await session.execute(select_query)
-            schedule_ids = list(result.scalars().all())
+            deleted_schedules = [(row[0], row[1]) for row in result.all()]
+            schedule_ids = [schedule_id for schedule_id, _ in deleted_schedules]
 
-            deleted_at = datetime.now(timezone.utc)
+            deleted_at = datetime.now(UTC)
             if schedule_ids:
                 update_schedules_query = (
                     update(WorkflowScheduleModel)
@@ -1451,7 +1588,10 @@ class WorkflowsRepository(BaseRepository):
             )
             if organization_id is not None:
                 update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            await session.execute(update_workflow_query.values(deleted_at=deleted_at))
+            workflow_result = await session.execute(
+                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
+            )
+            deleted_workflow_id = workflow_result.scalars().first()
             recording_delete_query = update(BrowserRecordingModel).where(
                 BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
                 BrowserRecordingModel.deleted_at.is_(None),
@@ -1462,7 +1602,7 @@ class WorkflowsRepository(BaseRepository):
                 )
             await session.execute(recording_delete_query.values(deleted_at=deleted_at))
             await session.commit()
-            return schedule_ids
+            return deleted_schedules, deleted_workflow_id
 
     @db_operation("add_workflow_template")
     async def add_workflow_template(
@@ -1504,7 +1644,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowTemplateModel.workflow_permanent_id == workflow_permanent_id)
                 .where(WorkflowTemplateModel.organization_id == organization_id)
                 .where(WorkflowTemplateModel.deleted_at.is_(None))
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=datetime.now(UTC))
             )
             await session.execute(update_deleted_at_query)
             await session.commit()

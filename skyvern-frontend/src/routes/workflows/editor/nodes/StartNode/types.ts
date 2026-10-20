@@ -1,12 +1,21 @@
 import { ProxyLocation } from "@/api/types";
 import type { Node } from "@xyflow/react";
 import { AppNode } from "..";
-import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
+import {
+  WorkflowModel,
+  WorkflowRetryPolicy,
+} from "@/routes/workflows/types/workflowTypes";
+import type { StartReviewAnnotation } from "../../review/reviewAnnotation";
 
 export type WorkflowStartNodeData = {
   withWorkflowSettings: true;
+  retryPolicy: WorkflowRetryPolicy | null;
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
+  adaptiveCaching: boolean;
+  generateScriptOnTerminal: boolean;
   persistBrowserSession: boolean;
   reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
@@ -19,10 +28,10 @@ export type WorkflowStartNodeData = {
   cdpConnectHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string;
+  browserType?: string | null;
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean;
-  enableSelfHealing: boolean;
   maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
@@ -31,6 +40,7 @@ export type WorkflowStartNodeData = {
   errorCodeMapping: Record<string, string> | null;
   label: "__start_block__";
   showCode: boolean;
+  review?: StartReviewAnnotation;
 };
 
 export type OtherStartNodeData = {

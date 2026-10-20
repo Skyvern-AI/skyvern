@@ -17,7 +17,8 @@ type WorkflowPanelState = {
     | "nodeLibrary"
     | "history"
     | "comparison"
-    | "schedules";
+    | "schedules"
+    | "triggers";
   data?: {
     previous?: string | null;
     next?: string | null;
@@ -30,7 +31,9 @@ type WorkflowPanelState = {
     version2?: WorkflowVersion;
     showComparison?: boolean;
     mode?: "history" | "copilot";
-    onCopilotReviewClose?: (status: CopilotReviewStatus) => void;
+    onCopilotReviewClose?: (
+      status: CopilotReviewStatus,
+    ) => void | Promise<void>;
   };
 };
 

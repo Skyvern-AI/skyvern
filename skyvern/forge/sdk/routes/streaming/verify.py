@@ -23,7 +23,11 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    AddressablePersistentBrowserSession,
+    is_external_cdp_session,
+    is_final_status,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.browser_session_timeouts import MAX_LIFETIME_SECONDS, session_is_active
@@ -56,7 +60,8 @@ async def verify_browser_session(
         )
         return None
 
-    if is_final_status(browser_session.status):
+    # A registered external browser has no live view; the fallback below would stream Skyvern's own browser.
+    if is_final_status(browser_session.status) or is_external_cdp_session(browser_session):
         return None
 
     started_at = browser_session.started_at
@@ -275,7 +280,10 @@ async def verify_workflow_run(
     return workflow_run, addressable_browser_session
 
 
-async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -> None:
+async def loop_verify_browser_session(
+    verifiable: MessageChannel | VncChannel,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], None] | None = None,
+) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
     """
@@ -287,6 +295,8 @@ async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -
         )
 
         verifiable.browser_session = browser_session
+        if on_session is not None:
+            on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 

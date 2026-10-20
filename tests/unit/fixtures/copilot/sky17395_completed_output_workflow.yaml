@@ -1,0 +1,40 @@
+title: Completed output repair baseline
+proxy_location: NONE
+ai_fallback: false
+enable_self_healing: false
+code_version: 2
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+    - block_type: code
+      label: read_rows
+      next_block_label: extract_fixture_value
+      prompt: Return the input rows for the report.
+      code: |
+        return {"rows": [{"week": "2026-09-28", "count": 7}]}
+    - block_type: extraction
+      engine: skyvern-1.0
+      label: extract_fixture_value
+      next_block_label: locate_week_and_prepare_values
+      url: http://localhost:8908/frontier_state_dependency/
+      data_extraction_goal: Extract the name of the first replacement part in the catalog as part_name.
+      data_schema:
+        type: object
+        properties:
+          part_name:
+            type: string
+        required: [part_name]
+    - block_type: code
+      label: locate_week_and_prepare_values
+      next_block_label: return_prepared_values
+      prompt: Combine the rows and extracted catalog part into a report with week, count and part_name.
+      code: |
+        rows = {{ read_rows_output.rows }}
+        part_name = "{{ extract_fixture_value_output.extracted_information.part_name }}"
+        return {"week": rows[0]["week"], "count": rows[0]["count"] + missing_adjustment, "part_name": part_name}
+    - block_type: code
+      label: return_prepared_values
+      prompt: Return the prepared report unchanged.
+      code: |
+        return {{ locate_week_and_prepare_values_output }}

@@ -108,6 +108,9 @@ export default {
         sidebar: "cubic-bezier(0.32, 0.72, 0, 1)",
       },
       keyframes: {
+        marquee: {
+          to: { transform: "translateX(-50%)" },
+        },
         "accordion-down": {
           from: { height: "0" },
           to: { height: "var(--radix-accordion-content-height)" },
@@ -138,12 +141,9 @@ export default {
           },
           to: { height: "0", opacity: "0" },
         },
-        "copilot-stop-orbit": {
-          to: { transform: "rotate(1turn)" },
-        },
-        "copilot-verb-shimmer": {
-          from: { backgroundPosition: "180% 0" },
-          to: { backgroundPosition: "-80% 0" },
+        "copilot-sparkle-breathe": {
+          "0%, 100%": { transform: "scale(0.8) rotate(0deg)", opacity: "0.6" },
+          "50%": { transform: "scale(1) rotate(90deg)", opacity: "1" },
         },
         glow: {
           "0%, 100%": { boxShadow: "0 0 8px 2px rgba(234, 179, 8, 0.3)" },
@@ -163,6 +163,7 @@ export default {
         },
       },
       animation: {
+        marquee: "marquee 30s linear infinite",
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
         "collapsible-down":
@@ -172,9 +173,10 @@ export default {
           "collapsible-down-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         "collapsible-up-fade":
           "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
-        "copilot-stop-orbit": "copilot-stop-orbit 3s linear infinite",
-        "copilot-verb-shimmer": "copilot-verb-shimmer 2.4s linear infinite",
+        "copilot-sparkle-breathe":
+          "copilot-sparkle-breathe 2.8s ease-in-out infinite",
         glow: "glow 2.5s ease-in-out infinite",
+        "run-blocking-locate": "glow 0.85s ease-in-out 3",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
         "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
         "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",

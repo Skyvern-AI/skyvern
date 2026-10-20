@@ -1,12 +1,30 @@
-import { renderHook } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+} from "@testing-library/react";
+import { type ChangeEvent, createElement, useState } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CredentialApiResponse } from "@/api/types";
+import {
+  clearDeferredEdits,
+  useDeferredLockedEdit,
+} from "@/hooks/useDeferredLockedEdit";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
+import {
+  useWorkflowScopeId,
+  WorkflowScopeContext,
+} from "../../WorkflowScopeContext";
 import { loginNodeDefaultData } from "./types";
 import { useLoginGoalAutoFill } from "./useLoginGoalAutoFill";
 
 const DEFAULT_GOAL = loginNodeDefaultData.navigationGoal;
+const NODE_ID = "login-node";
 
 const CRED_WITH_CONTEXT: CredentialApiResponse = {
   credential_id: "cred-a",
@@ -34,6 +52,7 @@ function setup(props: {
   const rendered = renderHook(
     (p: typeof props) =>
       useLoginGoalAutoFill({
+        nodeId: NODE_ID,
         editable: p.editable ?? true,
         selectedCredentialId: p.selectedCredentialId,
         credentials: p.credentials,
@@ -45,7 +64,161 @@ function setup(props: {
   return { ...rendered, onAutoFill };
 }
 
+type GoalProps = {
+  goal: string;
+  onChange: (value: string) => void;
+};
+
+function DeferredGoalInput({ goal, onChange }: GoalProps) {
+  const workflowId = useWorkflowScopeId();
+  const input = useDeferredLockedEdit({
+    value: goal,
+    onChange,
+    deferKey: JSON.stringify([workflowId, NODE_ID, "navigationGoal"]),
+  });
+  return createElement("textarea", {
+    value: input.value,
+    disabled: input.mutationLocked,
+    onChange: (event: ChangeEvent<HTMLTextAreaElement>) =>
+      input.onChange(event.target.value),
+  });
+}
+
+function GoalAutoFill({
+  goal,
+  onChange,
+  credentials,
+}: GoalProps & { credentials: Array<CredentialApiResponse> }) {
+  useLoginGoalAutoFill({
+    nodeId: NODE_ID,
+    editable: true,
+    selectedCredentialId: "cred-a",
+    credentials,
+    currentGoal: goal,
+    onAutoFill: onChange,
+  });
+  return null;
+}
+
+function LoginGoalHarness({
+  credentials,
+  autoFillFirst,
+  onAutoFill,
+}: {
+  credentials: Array<CredentialApiResponse>;
+  autoFillFirst: boolean;
+  onAutoFill?: (value: string) => void;
+}) {
+  const [goal, setGoal] = useState(DEFAULT_GOAL);
+  const input = createElement(DeferredGoalInput, {
+    key: "input",
+    goal,
+    onChange: setGoal,
+  });
+  const autoFill = createElement(GoalAutoFill, {
+    key: "auto-fill",
+    goal,
+    onChange: (value) => {
+      onAutoFill?.(value);
+      setGoal(value);
+    },
+    credentials,
+  });
+  return createElement(
+    WorkflowScopeContext.Provider,
+    { value: { workflowId: "workflow-a", readOnly: false } },
+    ...(autoFillFirst ? [autoFill, input] : [input, autoFill]),
+    createElement("output", { "data-testid": "saved-goal" }, goal),
+  );
+}
+
 describe("useLoginGoalAutoFill", () => {
+  afterEach(() => {
+    cleanup();
+    clearDeferredEdits();
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+      true,
+    );
+    vi.useRealTimers();
+  });
+
+  it.each([false, true])(
+    "preserves a deferred goal when credentials resolve under lock (auto-fill first: %s)",
+    (autoFillFirst) => {
+      vi.useFakeTimers();
+      const onAutoFill = vi.fn();
+      const { rerender } = render(
+        createElement(LoginGoalHarness, {
+          credentials: [],
+          autoFillFirst,
+          onAutoFill,
+        }),
+      );
+      const userGoal = "Use the account picker before entering the password";
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: userGoal },
+      });
+      act(() => {
+        useWorkflowYamlEditorStore.setState({
+          copilotAcceptance: Symbol("turn"),
+        });
+      });
+      rerender(
+        createElement(LoginGoalHarness, {
+          credentials: [CRED_WITH_CONTEXT],
+          autoFillFirst,
+          onAutoFill,
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.getByTestId("saved-goal").textContent).toBe(DEFAULT_GOAL);
+
+      act(() => {
+        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null });
+      });
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(screen.getByTestId("saved-goal").textContent).toBe(userGoal);
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        userGoal,
+      );
+      expect(onAutoFill).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fills an untouched goal when credentials resolve under lock", () => {
+    const { rerender } = render(
+      createElement(LoginGoalHarness, {
+        credentials: [],
+        autoFillFirst: false,
+      }),
+    );
+    act(() => {
+      useWorkflowYamlEditorStore.setState({
+        copilotAcceptance: Symbol("turn"),
+      });
+    });
+    rerender(
+      createElement(LoginGoalHarness, {
+        credentials: [CRED_WITH_CONTEXT],
+        autoFillFirst: false,
+      }),
+    );
+    expect(screen.getByTestId("saved-goal").textContent).toBe(DEFAULT_GOAL);
+
+    act(() => {
+      useWorkflowYamlEditorStore.setState({ copilotAcceptance: null });
+    });
+
+    expect(screen.getByTestId("saved-goal").textContent).toContain(
+      CRED_WITH_CONTEXT.user_context,
+    );
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      screen.getByTestId("saved-goal").textContent,
+    );
+  });
+
   it("does not fire before the credentials list resolves", () => {
     const { onAutoFill } = setup({
       selectedCredentialId: "cred-a",
@@ -74,6 +247,48 @@ describe("useLoginGoalAutoFill", () => {
       "Click the SSO button first",
     );
   });
+
+  it.each(["save", "yaml"] as const)(
+    "defers credentials resolved during a %s until the lock releases, then fills once",
+    (lock) => {
+      const { rerender, onAutoFill } = setup({
+        selectedCredentialId: "cred-a",
+        credentials: [],
+        currentGoal: DEFAULT_GOAL,
+      });
+
+      act(() => {
+        useWorkflowYamlEditorStore.setState({
+          commitInProgress: true,
+          lockKind: lock,
+        });
+      });
+      rerender({
+        selectedCredentialId: "cred-a",
+        credentials: [CRED_WITH_CONTEXT],
+        currentGoal: DEFAULT_GOAL,
+      });
+      expect(onAutoFill).not.toHaveBeenCalled();
+
+      act(() => {
+        useWorkflowYamlEditorStore.setState({
+          commitInProgress: false,
+          lockKind: null,
+        });
+      });
+      expect(onAutoFill).toHaveBeenCalledTimes(1);
+      expect(onAutoFill).toHaveBeenCalledWith(
+        expect.stringContaining(CRED_WITH_CONTEXT.user_context!),
+      );
+
+      rerender({
+        selectedCredentialId: "cred-a",
+        credentials: [CRED_WITH_CONTEXT],
+        currentGoal: onAutoFill.mock.calls[0]![0] as string,
+      });
+      expect(onAutoFill).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("never clobbers a user-authored goal once the credential resolves", () => {
     const { rerender, onAutoFill } = setup({

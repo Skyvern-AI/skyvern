@@ -39,7 +39,7 @@ export const loginNodeDefaultData: LoginNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   includeActionHistoryInVerification: false,
-  engine: RunEngine.SkyvernV1,
+  engine: null,
   model: null,
   ignoreWorkflowSystemPrompt: false,
 } as const;

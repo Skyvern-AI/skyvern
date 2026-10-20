@@ -7,7 +7,7 @@ import re
 import textwrap
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypedDict, TypeVar, get_args
 from urllib.parse import urlsplit
 
 import structlog
@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    MAX_CHALLENGE_FRAME_HOSTS,
     carrier_backed_anti_bot_categories,
     interactive_challenge_controls,
 )
@@ -29,16 +30,18 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import page_evidence_source_matches_run, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
-from skyvern.forge.sdk.copilot.failure_tracking import (
-    selector_identities_in_text,
-    selector_identity_from_failure,
-    selector_identity_from_literal,
-)
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import UnresolvedRuntimeFailure
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_param_ids,
+    parse_workflow_yaml,
+    workflow_blocks,
+)
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
 
 LOG = structlog.get_logger()
 
@@ -105,6 +108,8 @@ TerminalCause = Literal[
     "cdp_connect_failed",
     "occupied",
     "billing_credit_admission_refusal",
+    "saved_profile_unresolved",
+    "saved_profile_not_applied",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -194,6 +199,43 @@ class BuildTestPacketRunBrowser(BaseModel):
     note: str
 
 
+LoopSelectedInput = Literal["loop_variable_reference", "loop_over_parameter_key", "none"]
+
+
+class LoopInputFact(BaseModel):
+    """One for_loop's declared input in the executed definition, and the loop_values its run rows recorded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str
+    enclosing_loop_label: str | None = None
+    loop_over_parameter_key: str | None = None
+    producer_block_label: str | None = None
+    producer_output_parameter_id: str | None = None
+    loop_variable_reference: str | None = None
+    selected_input: LoopSelectedInput
+    run_rows: int | None = None
+    loop_values_counts: list[int | Literal["not_recorded"]] | None = None
+    loop_values_counts_omitted: int | None = None
+
+
+class LoopInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str | None = None
+    workflow_id: str
+    workflow_permanent_id: str
+    version: int
+    loops: list[LoopInputFact]
+    loops_omitted: int | None = None
+
+
+class LoopInputsUnavailable(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    executed_definition: Literal["unavailable"] = "unavailable"
+
+
 class BuildTestPacketRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -203,6 +245,7 @@ class BuildTestPacketRun(BaseModel):
     browser: BuildTestPacketRunBrowser | None = None
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
+    loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -306,6 +349,8 @@ class BuildTestPacketFailure(BaseModel):
     block_status: str | None = None
     reason: str | None = None
     final_url: str | None = None
+    # The opened page a failure ran on when that is not the block's own page (final_url).
+    receiver_url: str | None = None
     page_title: str | None = None
     covering_element: str | None = None
     error_codes: list[str] = Field(default_factory=list)
@@ -315,6 +360,19 @@ class BuildTestPacketFailure(BaseModel):
     action_trace: list[str] = Field(default_factory=list)
     page_state: BuildTestPacketPageState | None = None
     locator_observations: list[BuildTestPacketLocatorObservation] = Field(default_factory=list)
+
+
+class BuildTestPacketAiFallbackBlock(BaseModel):
+    """A block whose code failed and that the AI fallback then handled; ``failure_text`` is the code's own error."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str | None = None
+    status: str
+    task_id: str | None = None
+    failing_line: int | None = None
+    failure_text: str | None = None
+    recovery_failure_text: str | None = None
 
 
 class BuildTestPacketRegisteredOutput(BaseModel):
@@ -353,6 +411,8 @@ class BuildTestPacketDownload(BaseModel):
 
     artifact_id: str
     file_name: str | None = None
+    # Rendered by the run's own code, so it is not evidence that a site delivered a file.
+    generated: Literal[True] | None = None
 
 
 class BuildTestPacketScreenshot(BaseModel):
@@ -372,6 +432,61 @@ class BuildTestPacketUnfinishedItem(BaseModel):
 
 
 SOLVER_ATTEMPT_KEY = "solver_attempt"
+ACTION_TRACE_PER_TASK_LIMIT = 15
+
+SolverResult = Literal["failed", "not_solved", "attempted", "not_attempted", "unresolved"]
+SOLVER_RESULTS: frozenset[str] = frozenset(get_args(SolverResult))
+
+
+class SolverReceipt(BaseModel):
+    """The shared solver's own typed receipt for one ``solve_captcha`` call; ``vendor`` is never page text."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    status: ChallengeStatus
+    vendor: str | None = None
+    arm: ChallengeArm | None = None
+    page_state: ChallengePageState = "not_rechecked"
+
+
+def solver_receipt(value: object) -> SolverReceipt | None:
+    try:
+        return SolverReceipt.model_validate(value)
+    except ValidationError:
+        return None
+
+
+_UNFINISHED_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed.value, BlockStatus.terminated.value, BlockStatus.timed_out.value, BlockStatus.canceled.value}
+)
+
+
+def governing_solver_receipt(block_rows: Sequence[Mapping[str, object]]) -> SolverReceipt | None:
+    """The newest ``solve_captcha`` receipt in the last block that did not finish, so a completed finally block
+    after it never hides it; blocks are chronological and each trace is newest-first."""
+    stopped = next(
+        (row for row in reversed(block_rows) if str(row.get("status") or "").lower() in _UNFINISHED_BLOCK_STATUSES),
+        None,
+    )
+    trace = stopped.get("action_trace") if stopped is not None else None
+    if not isinstance(trace, list):
+        return None
+    solver_row = next(
+        (entry for entry in trace if isinstance(entry, Mapping) and entry.get("action") == ActionType.SOLVE_CAPTCHA),
+        None,
+    )
+    return solver_receipt(solver_row.get("challenge")) if solver_row is not None else None
+
+
+class SolverFacts(TypedDict):
+    attempted: bool
+    result: SolverResult
+    failure: str | None
+
+
+class SolverAttempt(SolverFacts, total=False):
+    code_block: SolverFacts
+    receipt: dict[str, str | None]
 
 
 class ChallengeEffects(BaseModel):
@@ -380,16 +495,41 @@ class ChallengeEffects(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: str | None = None
+    # ``page_frames`` means only a vendor frame the page mounted or declared built this record; it is
+    # the default because the dump excludes the field, so a revalidated record cannot mint a wall.
+    basis: Literal["run_wall", "page_frames", "solver_call"] = Field(default="page_frames", exclude=True, repr=False)
     solver_available: bool | None = None
     solver_attempted: bool | None = None
-    solver_result: Literal["failed", "attempted", "not_attempted", "unresolved"] = "unresolved"
+    solver_result: SolverResult | None = None
     solver_failure: str | None = None
+    solver_receipt: SolverReceipt | None = None
+    frame_hosts: list[str] | None = Field(default=None, max_length=MAX_CHALLENGE_FRAME_HOSTS)
 
 
 def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -> list[str]:
     """Prose facts for the typed record, so a reader that skips the keys still meets them; no ranking."""
     notices: list[str] = []
-    if challenge is not None:
+    if challenge is not None and challenge.basis == "page_frames":
+        hosts = ", ".join(challenge.frame_hosts or [])
+        notices.append(
+            "challenge frames: the final page mounted or declared a frame served by a challenge vendor; that is "
+            f"what the page holds, not a finding that this run was blocked. Frame hosts: {hosts}."
+        )
+    elif challenge is not None and challenge.basis == "solver_call":
+        if challenge.solver_result == "failed":
+            outcome = "raised (see `solver_failure`)"
+        elif challenge.solver_result == "not_solved":
+            outcome = "returned `false`, the solver's own report that it did nothing"
+        else:
+            outcome = "returned without error, which for either form only means it ran"
+        frames = ""
+        if challenge.frame_hosts:
+            frames = f" Vendor frames on the final page: {', '.join(challenge.frame_hosts)}."
+        notices.append(
+            f"solver call: the last `solve_captcha` call in this run's code {outcome}; a call is an attempt, not "
+            f"page advancement, so the final page and block status say whether the form moved on.{frames}"
+        )
+    elif challenge is not None:
         kind = challenge.kind or "unclassified"
         if challenge.solver_available is True:
             availability = "the managed captcha solver is available for this run"
@@ -402,21 +542,34 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
             availability = "the managed captcha solver's availability was not resolved"
         if challenge.solver_result == "attempted":
             outcome = (
-                "this run called `solve_captcha(page)` and the call returned without an error, which does not by "
+                "this run called `solve_captcha` and the call returned without an error, which does not by "
                 "itself mean the challenge cleared: the no-solver fallback also returns success"
             )
+        elif challenge.solver_result == "not_solved":
+            outcome = (
+                "this run called `solve_captcha` and the call returned `false`, the solver's own report that "
+                "it cleared nothing; separately, a challenge was recorded for this run, and the call may have run "
+                "before that challenge appeared"
+            )
         elif challenge.solver_result == "failed":
-            outcome = "this run called `solve_captcha(page)` and the solver did not clear it"
+            outcome = "this run called `solve_captcha` and the solver did not clear it"
             if challenge.solver_failure:
                 outcome += f" ({challenge.solver_failure})"
         elif challenge.solver_result == "not_attempted":
             outcome = (
-                "no `solve_captcha(page)` call appears in this run's recorded actions; a code block reaches the "
+                "no `solve_captcha` call appears in this run's recorded actions; a code block reaches the "
                 "solver only when its code calls that builtin"
             )
         else:
-            outcome = "whether this run called `solve_captcha(page)` is unresolved, so do not state either way"
+            outcome = "whether this run called `solve_captcha` is unresolved, so do not state either way"
         notices.append(f"challenge: {kind}; {availability}; {outcome}.")
+    receipt = challenge.solver_receipt if challenge is not None else None
+    if receipt is not None:
+        notices.append(
+            f"solver receipt: the newest `solve_captcha` call reported status `{receipt.status.value}`, vendor "
+            f"`{receipt.vendor or 'not identified'}`, arm `{receipt.arm or 'none'}`, and page state "
+            f"`{receipt.page_state}` after its last arm."
+        )
     if levers:
         names = ", ".join(lever.mechanism for lever in levers)
         notices.append(
@@ -427,7 +580,12 @@ def challenge_notices(challenge: ChallengeEffects | None, levers: list[Lever]) -
 
 
 LeverMechanism = Literal[
-    "captcha_solver", "proxy_location", "browser_profile", "credential_totp_or_inbox", "human_interaction"
+    "captcha_solver",
+    "proxy_location",
+    "browser_profile",
+    "credential_totp_or_inbox",
+    "credential_update",
+    "human_interaction",
 ]
 LeverTopic = Literal["captcha_solver", "proxy_location", "login_block", "human_interaction_block"]
 
@@ -440,6 +598,7 @@ class Lever(BaseModel):
     mechanism: LeverMechanism
     knowledge_topic: LeverTopic
     availability: str | None = None
+    credential_id: str | None = None
 
 
 _ValueT = TypeVar("_ValueT")
@@ -592,6 +751,7 @@ class BuildTestEvidencePacket(BaseModel):
     challenge: ChallengeEffects | None = None
     levers: list[Lever] = Field(default_factory=list)
     challenge_notices: list[str] = Field(default_factory=list)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
 
 class CodeSafetyRejectionFact(BaseModel):
@@ -637,7 +797,6 @@ class RecordedBuildTestOutcome(BaseModel):
     attempted_tool: str = ""
     attempted_target: str = ""
     attempted_block_label: str = ""
-    attempted_call_ref: str = ""
     verdict: BuildTestOutcomeVerdict
     reason_code: BuildTestOutcomeReasonCode
     observed_evidence_summary: str = ""
@@ -670,6 +829,7 @@ class RecordedBuildTestOutcome(BaseModel):
     display_text: str = ""
     observed_page_value_excerpt: str = ""
     key_provenance: dict[str, str] = Field(default_factory=dict)
+    ai_fallback_blocks: list[BuildTestPacketAiFallbackBlock] | None = None
 
     @property
     def structural_key_payload(self) -> dict[str, object] | None:
@@ -723,7 +883,7 @@ def _recorded_outcome_degrade_eligible(
 
 
 class _RecordedBuildTestOutcomeContext(Protocol):
-    workflow_yaml: str
+    workflow_yaml: str | None
     persisted_workflow_yaml: str | None
     staged_workflow_yaml: str | None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None
@@ -745,7 +905,6 @@ def _history_entry(ctx: _RecordedBuildTestOutcomeContext, outcome: RecordedBuild
         "attempted_block_label": outcome.attempted_block_label,
         "attempted_block_signature": _attempted_block_signature(ctx, outcome),
         "attempted_block_code_hash": _attempted_block_code_hash(ctx, outcome),
-        "attempted_call_ref": outcome.attempted_call_ref,
         "code_safety_rejection_facts": [fact.model_dump(mode="json") for fact in outcome.code_safety_rejection_facts],
         "failed_operation": (
             outcome.failed_operation.model_dump(mode="json") if outcome.failed_operation is not None else None
@@ -841,7 +1000,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
     history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
     # A merged record adds no block outcome -- the prior entry already holds this failure, snapshotted
     # against the code the run executed. Appending would re-snapshot it against the current draft,
-    # so a later clearance check would compare the failure to code it never ran.
+    # so a later comparison would read the failure against code it never ran.
     if not merged_into_prior_failure:
         history.append(_history_entry(ctx, outcome))
     del history[:-_HISTORY_LIMIT]
@@ -857,10 +1016,7 @@ def record_build_test_outcome(ctx: _RecordedBuildTestOutcomeContext, outcome: Re
         is_authoritative=outcome.is_authoritative,
         workflow_run_id=outcome.workflow_run_id,
         authored_structure_signature=outcome.authored_structure_signature,
-        # The three fields `unresolved_runtime_block_failure` branches on. Without them a suppressed
-        # honesty note cannot be attributed to a branch from the logs alone.
         attempted_block_label=outcome.attempted_block_label,
-        attempted_call_ref=outcome.attempted_call_ref,
         attempted_block_signature=_attempted_block_signature(ctx, outcome),
     )
 
@@ -880,11 +1036,8 @@ def _attempted_block_code_hash(ctx: _RecordedBuildTestOutcomeContext, outcome: R
     return authored_block_code_hashes_from_workflow(_executed_workflow_yaml(ctx)).get(outcome.attempted_block_label, "")
 
 
-def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str:
+def _executed_workflow_yaml(ctx: _RecordedBuildTestOutcomeContext) -> str | None:
     return ctx.staged_workflow_yaml or ctx.workflow_yaml
-
-
-_EXECUTED_CALL_REF_LIMIT = 64
 
 
 class ExecutedBlockEvidence(BaseModel):
@@ -892,15 +1045,10 @@ class ExecutedBlockEvidence(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    signature: str = ""
-    call_refs: list[str] = Field(default_factory=list)
-    call_refs_truncated: bool = False
-    removal_provable: bool = False
     yaml_digest: str = "absent"
 
 
 def _failed_block_labels(blocks: Sequence[Mapping[str, object]]) -> list[str]:
-    """Every failed block, not just the first: the block being judged may be a later one."""
     return [
         label
         for block in blocks
@@ -918,41 +1066,8 @@ def _executed_block_evidence(
     executed_yaml = _executed_workflow_yaml(ctx)
     if not executed_yaml:
         return {}
-    yaml_digest = _yaml_digest(executed_yaml)
-    signatures = authored_block_signatures_from_workflow(executed_yaml)
-    code_by_label = _code_blocks_by_label(executed_yaml)
-    failed = set(outcome.failed_block_labels)
-    evidence: dict[str, dict[str, object]] = {}
-    for label in outcome.executed_block_labels:
-        # A block that failed in this run proves nothing about its own repair.
-        if label in failed:
-            continue
-        code = code_by_label.get(label)
-        call_refs = sorted(selector_identities_in_text(code)) if code else []
-        truncated = len(call_refs) > _EXECUTED_CALL_REF_LIMIT
-        evidence[label] = ExecutedBlockEvidence(
-            signature=signatures.get(label, ""),
-            # Stored whole rather than shortened: absence is what clears a failure, and a shortened
-            # ref would read as absent while the call it names is still there.
-            call_refs=call_refs[:_EXECUTED_CALL_REF_LIMIT],
-            call_refs_truncated=truncated,
-            removal_provable=(not truncated and _selector_removal_is_provable(code)) if code else False,
-            yaml_digest=yaml_digest,
-        ).model_dump(mode="json")
-    return evidence
-
-
-def _executed_block_evidence_for_label(entry: Mapping[str, object], label: str) -> ExecutedBlockEvidence | None:
-    raw = entry.get("executed_block_evidence")
-    if not isinstance(raw, Mapping):
-        return None
-    value = raw.get(label)
-    if not isinstance(value, Mapping):
-        return None
-    try:
-        return ExecutedBlockEvidence.model_validate(dict(value))
-    except ValidationError:
-        return None
+    evidence = ExecutedBlockEvidence(yaml_digest=_yaml_digest(executed_yaml)).model_dump(mode="json")
+    return {label: dict(evidence) for label in outcome.executed_block_labels}
 
 
 def _code_for_runner_association(
@@ -1023,12 +1138,6 @@ def _failed_operation_call_signature(code: str | None, failing_line: int | None)
     return _stable_hash(ast.dump(outermost, include_attributes=False))
 
 
-# Every construct that can reach the end of a block without running something inside it, including
-# expression-level ones: a zero-length comprehension skips its body exactly as an unentered loop does.
-# Over-detection only costs a redundant note; a miss silently drops a real failure.
-_SELECTOR_CALL_ATTRS = frozenset({"locator", "get_by_role", "get_by_text", "get_by_label", "get_by_placeholder"})
-
-
 def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
     """Block code is an async body, so it only parses inside a wrapper; None means unparseable."""
     try:
@@ -1040,175 +1149,9 @@ def _parse_block_code(code: str) -> ast.AsyncFunctionDef | None:
     return wrapper if isinstance(wrapper, ast.AsyncFunctionDef) else None
 
 
-def _selector_removal_is_provable(code: str) -> bool:
-    """Whether every selector in the block is a literal, so a scan that misses one proves removal.
-
-    A selector built at runtime (an f-string, a variable, a concatenation) is invisible to the
-    literal scan, so its absence would otherwise read as the failing call having been edited away.
-    """
-    wrapper = _parse_block_code(code)
-    if wrapper is None:
-        return False
-    scanned = selector_identities_in_text(code)
-    for node in ast.walk(wrapper):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr not in _SELECTOR_CALL_ATTRS:
-            continue
-        selector_args = [*node.args, *(kw.value for kw in node.keywords if kw.arg == "name")]
-        literals = [arg.value for arg in selector_args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
-        if len(literals) != len(selector_args):
-            return False
-        # The scan and this proof must read the same selector. Adjacent literals ("#a" "#b") and
-        # triple quotes parse to one constant the text scan spells differently, so a selector the
-        # scan never recorded would read as one the edit removed.
-        identity = selector_identity_from_literal(
-            node.func.attr,
-            literals[0] if literals else "",
-            literals[1] if len(literals) > 1 else "",
-        )
-        if identity and identity not in scanned:
-            return False
-    return True
-
-
 def _yaml_digest(text: str | None) -> str:
     """Identity of a workflow's bytes, so sources can be compared without logging their content."""
     return hashlib.sha256((text or "").encode()).hexdigest()[:16] if text else "absent"
-
-
-def _executed_snapshot_clearance(
-    later_runs: Sequence[object],
-    *,
-    label: str,
-    signature: str,
-    call_ref: str,
-    source_digest: str,
-) -> str | None:
-    """Clearance from a run's own receipts: the run executed this block, and the snapshot it ran
-    carries the same proof of change the delivered workflow would have to carry."""
-    for entry_after in later_runs:
-        if not isinstance(entry_after, Mapping):
-            continue
-        # A run that completed without evaluating its outputs still carries a failed_operation when one
-        # of its blocks re-failed; admitting that would clear the failure and record no new one.
-        completed_unevaluated = (
-            entry_after.get("verdict") == "not_authoritative"
-            and entry_after.get("reason_code") == "run_completed_unevaluated"
-            and entry_after.get("failed_operation") is None
-        )
-        if not (entry_after.get("verdict") == "progress_observed" or completed_unevaluated):
-            continue
-        evidence = _executed_block_evidence_for_label(entry_after, label)
-        if evidence is None:
-            continue
-        # The snapshot that ran has to still be the source being judged. Any edit after that run --
-        # a revert to the code that failed included -- leaves the run proving nothing about it.
-        if evidence.yaml_digest != source_digest:
-            continue
-        run_id = _safe_str(entry_after.get("workflow_run_id"))
-        if call_ref:
-            if call_ref not in evidence.call_refs and evidence.removal_provable:
-                return f"executed_snapshot_call_removed:{run_id}:{label}"
-        elif signature and evidence.signature and evidence.signature != signature:
-            return f"executed_snapshot_signature_changed:{run_id}:{label}"
-    return None
-
-
-def unresolved_runtime_block_failure(
-    ctx: _RecordedBuildTestOutcomeContext,
-    *,
-    reported_workflow_yaml: str | None = None,
-    pending_later_run_id: str | None = None,
-) -> UnresolvedRuntimeFailure | None:
-    return unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=reported_workflow_yaml, pending_later_run_id=pending_later_run_id
-    )[0]
-
-
-def unresolved_runtime_block_failure_with_disposition(
-    ctx: _RecordedBuildTestOutcomeContext,
-    *,
-    reported_workflow_yaml: str | None = None,
-    pending_later_run_id: str | None = None,
-    reported_workflow_is_persisted: bool = False,
-) -> tuple[UnresolvedRuntimeFailure | None, str]:
-    """The newest runtime block failure the retained evidence does not show was resolved.
-
-    A later run of the same block is not clearance. It proves the code executed again, not that it met
-    the condition that failed: a login step can fail against an already-authenticated page and pass
-    against a signed-out one, same lines, opposite precondition. Only evidence that the code itself
-    changed -- the failing call removed, or the block's signature changed -- clears the failure.
-
-    ``reported_workflow_is_persisted`` says what an absent ``reported_workflow_yaml`` means. Callers
-    reading persistence pass it, so absence means nothing is saved and the run's own receipts may
-    stand in; a caller judging a proposal leaves it false, where absence only means it has none.
-    """
-    raw_history = getattr(ctx, "recorded_build_test_outcome_history", None)
-    history: list[dict[str, object]] = raw_history if isinstance(raw_history, list) else []
-    for index in range(len(history) - 1, -1, -1):
-        entry = history[index]
-        if entry.get("reason_code") != "runtime_block_failure":
-            continue
-        label = _safe_str(entry.get("attempted_block_label"))
-        signature = _safe_str(entry.get("attempted_block_signature"))
-        run_id = _safe_str(entry.get("workflow_run_id"))
-        call_ref = _safe_str(entry.get("attempted_call_ref"))
-        # Scout evaluations and author-time rejects share this history, so a later *run* has to be
-        # identified by phase and a different run id -- otherwise author-time work after the failure
-        # would read as a later run that skipped the block.
-        later_runs: list[object] = [
-            entry_after
-            for entry_after in history[index + 1 :]
-            if entry_after.get("phase") == "persisted_block_run"
-            and _safe_str(entry_after.get("workflow_run_id")) not in ("", run_id)
-        ]
-        # A run asking mid-flight is its own later run: its outcome reaches the history only after the
-        # result it is about has been handed back, so without this it would see nothing after the
-        # failure and decline.
-        if pending_later_run_id and pending_later_run_id != run_id:
-            later_runs.append({"workflow_run_id": pending_later_run_id})
-        if label and run_id and later_runs and (reported_workflow_yaml or reported_workflow_is_persisted):
-            executed_snapshot_disposition = _executed_snapshot_clearance(
-                later_runs,
-                label=label,
-                signature=signature,
-                call_ref=call_ref,
-                source_digest=_yaml_digest(reported_workflow_yaml or _executed_workflow_yaml(ctx)),
-            )
-            if executed_snapshot_disposition is not None:
-                return None, executed_snapshot_disposition
-        # Absence answers a different question per caller: the run-level carrier reads the snapshot
-        # the run executed, the terminal reads what is saved. reported_workflow_is_persisted says which.
-        delivered_yaml = reported_workflow_yaml
-        code = _code_blocks_by_label(delivered_yaml).get(label) if delivered_yaml else None
-        if not (label and run_id and later_runs and code):
-            if not (label and run_id):
-                return None, "incomplete_failure_record"
-            # `no_later_run` is not a suppression: with nothing after it, the failure is the turn's
-            # own headline and needs no separate qualification.
-            if not later_runs:
-                return None, "no_later_run"
-            # Nothing to read the failing block from: either no delivered candidate at all, or the
-            # block is absent from the one we have because it was authored after the snapshot was
-            # taken. Absence is not proof of repair, so the failure stands.
-            return (
-                UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label),
-                "no_reported_candidate" if not delivered_yaml else "block_absent_from_delivered",
-            )
-        if call_ref:
-            if call_ref not in selector_identities_in_text(code) and _selector_removal_is_provable(code):
-                LOG.info(
-                    "copilot unresolved runtime failure cleared by call removal",
-                    delivered_digest=_yaml_digest(delivered_yaml),
-                    draft_digest=_yaml_digest(ctx.workflow_yaml),
-                    delivered_is_the_draft=delivered_yaml == ctx.workflow_yaml,
-                )
-                return None, f"failing_call_removed:{run_id}:{label}"
-        elif signature and authored_block_signatures_from_workflow(delivered_yaml).get(label) != signature:
-            return None, f"block_signature_changed:{run_id}:{label}"
-        return UnresolvedRuntimeFailure(workflow_run_id=run_id, block_label=label), "unresolved"
-    return None, "no_runtime_failure"
 
 
 class PriorAttemptChangeIdentity(BaseModel):
@@ -2046,7 +1989,6 @@ def _recorded_outcome_from_run_blocks_result(
         attempted_block_label=_redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
         if failed_block is not None
         else "",
-        attempted_call_ref=_attempted_call_ref(failed_block),
         verdict=verdict,
         reason_code=reason_code,
         workflow_run_id=workflow_run_id or None,
@@ -2109,6 +2051,56 @@ def failed_operation_from_run_blocks_result(
         failing_line=failing_line if type(failing_line) is int else None,
         block_association=(block_associations_by_label or {}).get(_safe_str(failed_block.get("label"))),
     )
+
+
+def failed_block_bound_credential_ids(
+    workflow_yaml: str | None,
+    run_data: Mapping[str, object],
+    run_parameter_values: Mapping[str, object] | None = None,
+) -> set[str]:
+    """The one saved credential bound to the run's failed code block, or nothing when it is not exactly one."""
+    failed_block = _newest_failed_block(_block_dicts(run_data.get("blocks")))
+    if failed_block is None:
+        return set()
+    parsed = parse_workflow_yaml(workflow_yaml or "")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("workflow_definition"), dict):
+        return set()
+    parameters = parsed["workflow_definition"].get("parameters") or []
+    credential_params_by_key = credential_param_ids(parameters)
+    declared_credential_keys = {
+        parameter.get("key")
+        for parameter in parameters
+        if isinstance(parameter, dict)
+        and (
+            _safe_str(parameter.get("parameter_type")).lower() == "credential"
+            or _safe_str(parameter.get("workflow_parameter_type")).lower() == "credential_id"
+        )
+    }
+    # A value the run was given for a credential parameter is the credential it bound, not the default,
+    # and the only one when the parameter declares no default.
+    credential_params_by_key.update(
+        {
+            key: {value}
+            for key, value in (run_parameter_values or {}).items()
+            if key in declared_credential_keys and isinstance(value, str) and value
+        }
+    )
+    for parameter in parameters:
+        fallbacks = parameter.get("fallback_credential_ids") if isinstance(parameter, dict) else None
+        if isinstance(fallbacks, list) and parameter.get("key") in credential_params_by_key:
+            credential_params_by_key[parameter["key"]] |= {item for item in fallbacks if isinstance(item, str)}
+    label = _safe_str(failed_block.get("label"))
+    code_blocks = [
+        block
+        for block in workflow_blocks(parsed, {label})
+        if block.get("label") == label and _safe_str(block.get("block_type")).lower() == BlockType.CODE.value
+    ]
+    if not code_blocks:
+        return set()
+    credential_ids = block_credential_ids(code_blocks[0], credential_params_by_key)
+    # A rotation pool or a fallback list picks its credential per run, out of reach here, so naming any
+    # member could send the user to edit a credential the site never saw.
+    return credential_ids if len(credential_ids) == 1 else set()
 
 
 def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:
@@ -2448,24 +2440,8 @@ def _runtime_failure_identity(
     )
 
 
-def _attempted_call_ref(failed_block: Mapping[str, object] | None) -> str:
-    """The selector whose removal clears this failure, and only when the failure is about it.
-
-    Clearance treats a call ref as the one thing that must change, so a reason that merely mentions
-    a locator must not carry one: a code-execution failure is repaired by rewriting the block, which
-    the block signature already witnesses, and demanding the selector be dropped strands a repair
-    that correctly kept it.
-    """
-    if failed_block is None:
-        return ""
-    if not _locator_wait_failure_identity(failed_block) and _code_execution_failure_identity(failed_block):
-        return ""
-    return selector_identity_from_failure(_safe_str(failed_block.get("failure_reason")))
-
-
 def _is_code_block_failure(failed_block: Mapping[str, object] | None) -> bool:
-    """A native block's failure is the agent's run, not authored code, and has no code signature to
-    change, so it has no route out of an unresolved-failure note."""
+    """A native block's failure is the agent's run, not authored code, and has no code signature."""
     return failed_block is not None and _safe_str(failed_block.get("block_type")).upper() == BlockType.CODE.name
 
 
@@ -3369,11 +3345,3 @@ def _value_shape(value: object, *, depth: int = 0) -> object:
     if value is None:
         return "none"
     return type(value).__name__
-
-
-def history_has_runtime_block_failure(ctx: _RecordedBuildTestOutcomeContext) -> bool:
-    """Whether this turn recorded any runtime block failure, resolved or not."""
-    history = getattr(ctx, "recorded_build_test_outcome_history", [])
-    return isinstance(history, list) and any(
-        isinstance(entry, dict) and entry.get("reason_code") == "runtime_block_failure" for entry in history
-    )

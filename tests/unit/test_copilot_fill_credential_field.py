@@ -9,21 +9,31 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 from agents import RunContextWrapper
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page, Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
+from skyvern.cli.mcp_tools.browser import skyvern_evaluate
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import mcp_adapter
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.blocker_signal import CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _build_request_policy_bootstrap,
@@ -32,14 +42,16 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
 )
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_PAGE_ERROR,
+    AgentContext,
+    CredentialOriginRecovery,
     OriginRunRedactionRegistry,
-    browser_page_custody_lock,
+    browser_session_recovery,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
     register_secret_scrub_value,
+    register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
@@ -48,11 +60,14 @@ from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirementReason
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import (
-    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
-    remove_sensitive_disclosure_prerequisite,
-    taint_by_terminal_run,
+    make_copilot_ctx,
+    wire_credential_vault,
 )
 
 _FAKE_PASSWORD = "fake-test-password-7x9"
@@ -82,6 +97,11 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         request_policy=_policy(),
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         browser_session_id="pbs_1",
+        credential_pause_used=False,
+        browser_session_recovery_lock=asyncio.Lock(),
+        browser_session_recovery_owner=None,
+        browser_session_recovery_depth=0,
+        browser_session_locks_by_session_id={},
         last_run_blocks_workflow_run_id=None,
         scouted_interactions=[],
         scout_trajectory=[],
@@ -94,6 +114,12 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         pending_scout_download_detachers=[],
         pending_scout_popup=None,
         pending_scout_popup_content_type=None,
+        pending_scout_challenge_frames=[],
+        pending_scout_challenge_detachers=[],
+        pending_scout_challenge_prior_frames=[],
+        last_scout_act_observe_recapture_attempted=False,
+        pending_scout_challenge_armed_at=None,
+        pending_scout_click_pre_frame=None,
         authoring_parameter_binding_snapshot=None,
         pending_browser_interaction_observation=None,
         discovery_mcp_server=None,
@@ -103,6 +129,10 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         vault_login_uris_by_credential_id={},
         signed_out_page_observations=[],
         signed_out_page_observation_attempts=[],
+        credential_origin_recovery=None,
+        blocker_signal=None,
+        codeblock_redaction_parameters={},
+        supports_vision=False,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -128,8 +158,8 @@ class TestCredentialFillPolicyGate:
             "https://example.com/login",
         )
 
-    def test_rejects_outside_code_only_mode(self) -> None:
-        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+    def test_rejects_when_code_blocks_cannot_be_authored(self) -> None:
+        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
         error = tools_module._credential_fill_prerequisite_error(ctx, "cred_123")
         assert error is not None
         assert "login" in error
@@ -168,30 +198,18 @@ class TestResolveCredentialFillValue:
     def _wire_vault(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        credential: Any,
+        credential: PasswordCredential,
         *,
         name: str = "authtest simple",
     ) -> None:
-        db_credential = SimpleNamespace(vault_type=CredentialVaultType.BITWARDEN)
+        wire_credential_vault(monkeypatch, credential, credential_id="cred_123", name=name)
         monkeypatch.setattr(
-            app.DATABASE,
-            "credentials",
-            SimpleNamespace(get_credential=AsyncMock(return_value=db_credential)),
-            raising=False,
-        )
-        vault = SimpleNamespace(
-            get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=credential))
-        )
-        # `app` is an AppHolder proxy without __delattr__; patch the underlying instance
-        # so monkeypatch teardown can delete the attribute it set.
-        app_instance = object.__getattribute__(app, "_inst")
-        monkeypatch.setattr(
-            app_instance, "CREDENTIAL_VAULT_SERVICES", {CredentialVaultType.BITWARDEN: vault}, raising=False
-        )
-        monkeypatch.setattr(
-            app_instance,
+            object.__getattribute__(app, "_inst"),
             "AGENT_FUNCTION",
-            SimpleNamespace(parse_enterprise_totp_secret=AsyncMock(return_value=None)),
+            SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
+                parse_enterprise_totp_secret=AsyncMock(return_value=None),
+            ),
             raising=False,
         )
 
@@ -308,9 +326,7 @@ class TestResolveCredentialFillValue:
     async def test_totp_without_seed_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._wire_vault(monkeypatch, PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None))
         value, _, error = await tools_module._resolve_credential_fill_value(_ctx(), "cred_123", "totp")
-        assert value is None
-        assert error is not None
-        assert "TOTP" in error
+        assert value is None and isinstance(error, credential_fill_module.MissingAuthenticator)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -456,7 +472,7 @@ async def test_the_readback_comes_from_the_page_not_the_tool_layer(
     ctx = _ctx()
 
     selector = f"#{field}"
-    result = await tools_module._fill_credential_field_impl(ctx, selector, "cred_123", field)
+    result = await tools_module.fill_credential_field(ctx, selector, "cred_123", field)
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "exact_match"
@@ -464,6 +480,20 @@ async def test_the_readback_comes_from_the_page_not_the_tool_layer(
     # read taken on the page handle that filled the field sees what was actually typed.
     assert page.read_calls == [selector]
     assert ctx.scout_trajectory[-1]["credential_field"] == field
+
+
+def _fake_probe_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    packet: dict[str, Any],
+    *,
+    events: list[tuple[str, str]] | None = None,
+) -> None:
+    async def probe(_ctx: AgentContext, selector: str, *, fingerprint: bool) -> tuple[dict[str, Any], dict[str, str]]:
+        if events is not None:
+            events.append(("probe", selector))
+        return packet, {}
+
+    monkeypatch.setattr(credential_fill_module, "_probe_target_facts", probe)
 
 
 def _wire_impl(
@@ -480,7 +510,7 @@ def _wire_impl(
         return None
 
     @asynccontextmanager
-    async def fake_browser_context(_ctx: Any) -> AsyncIterator[None]:
+    async def fake_browser_context(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
         yield
 
     async def fake_get_page(session_id: str | None = None) -> tuple[_FakePage, None]:
@@ -489,16 +519,13 @@ def _wire_impl(
     async def fake_url(_ctx: Any) -> str:
         return "https://authenticationtest.com/simpleFormAuth/"
 
-    async def fake_role_name(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
-        return "textbox", "Password"
-
     monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", fake_resolve)
     monkeypatch.setattr(credential_fill_module, "ensure_browser_session", fake_ensure)
     monkeypatch.setattr(credential_fill_module, "mcp_browser_context", fake_browser_context)
     monkeypatch.setattr(credential_fill_module, "get_page", fake_get_page)
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
-    monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
+    _fake_probe_facts(monkeypatch, {"role_name": {"role": "textbox", "accessible_name": "Password"}})
     monkeypatch.setattr(credential_fill_module, "_authority_tool_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "record_tool_step_result_for_ctx", lambda *a, **k: None)
 
@@ -524,23 +551,18 @@ async def test_target_identity_is_captured_before_fill_and_effect_afterward(monk
     page = OrderedPage()
     _wire_impl(monkeypatch, page)
 
-    async def pre_fact(*_args: Any, **_kwargs: Any) -> int:
-        events.append("pre_fact")
-        return 1
+    async def probe(_ctx: AgentContext, _selector: str, *, fingerprint: bool) -> tuple[dict[str, Any], dict[str, str]]:
+        events.append("probe")
+        candidates = [{"selector": 'input[name="password"]', "source": "name"}]
+        return {"selector_match_count": 1, "selector_candidates": candidates}, {}
 
-    async def selector_candidates(ctx: Any, _selector: str) -> None:
-        events.append("selector_candidates")
-        ctx.pending_scout_selector_candidates = [{"selector": 'input[name="password"]', "source": "name"}]
-
-    monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", pre_fact)
-    monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", selector_candidates)
+    monkeypatch.setattr(credential_fill_module, "_probe_target_facts", probe)
 
     ctx = _ctx()
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is True
-    assert events.index("selector_candidates") < events.index("fill")
-    assert events.index("pre_fact") < events.index("fill") < events.index("post_effect")
+    assert events.index("probe") < events.index("fill") < events.index("post_effect")
     assert ctx.scout_trajectory[-1]["selector_match_count"] == 1
     assert ctx.scout_trajectory[-1]["observed_effects"]["value_landed"] is True
     assert ctx.scout_trajectory[-1]["selector_candidates"] == [
@@ -570,7 +592,7 @@ async def test_multi_match_selector_still_reaches_an_outcome(monkeypatch: pytest
     _wire_impl(monkeypatch, page, secret_value="123456")
     ctx = _ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "input.otp", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(ctx, "input.otp", "cred_123", "totp")
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "different"
@@ -592,7 +614,7 @@ async def test_a_field_not_holding_what_was_typed_is_reported_without_failing_or
     _wire_impl(monkeypatch, page, secret_value=secret_value)
     ctx = _ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(ctx, "#totp", "cred_123", "totp")
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "different"
@@ -615,7 +637,7 @@ async def test_unreadable_field_records_the_fill_and_says_so(monkeypatch: pytest
     ctx = _ctx()
 
     with capture_logs() as logs:
-        result = await tools_module._fill_credential_field_impl(ctx, "#totp", "cred_123", "totp")
+        result = await tools_module.fill_credential_field(ctx, "#totp", "cred_123", "totp")
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "unavailable"
@@ -634,7 +656,7 @@ async def test_happy_path_fills_and_records_value_free(monkeypatch: pytest.Monke
     _wire_impl(monkeypatch, page)
     ctx = _ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is True
     assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
@@ -673,7 +695,7 @@ async def test_email_otp_scout_failure_returns_only_factual_credential_identity(
 
     monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", runtime_only_otp)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "#otp", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(_ctx(), "#otp", "cred_123", "totp")
 
     assert result["ok"] is False
     assert result["data"] == {
@@ -689,7 +711,7 @@ async def test_fill_error_text_is_scrubbed(monkeypatch: pytest.MonkeyPatch) -> N
     page = _FakePage(fill_error=RuntimeError(f"could not type {_FAKE_PASSWORD} into element"))
     _wire_impl(monkeypatch, page)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+    result = await tools_module.fill_credential_field(_ctx(), "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is False
     assert _FAKE_PASSWORD not in result["error"]
@@ -701,7 +723,7 @@ async def test_rejects_unknown_field(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _FakePage()
     _wire_impl(monkeypatch, page)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "#cvv", "cred_123", "cvv")
+    result = await tools_module.fill_credential_field(_ctx(), "#cvv", "cred_123", "cvv")
 
     assert result["ok"] is False
     assert "username, password, totp" in result["error"]
@@ -713,7 +735,7 @@ async def test_rejects_empty_selector(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _FakePage()
     _wire_impl(monkeypatch, page)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "   ", "cred_123", "password")
+    result = await tools_module.fill_credential_field(_ctx(), "   ", "cred_123", "password")
 
     assert result["ok"] is False
     assert page.fill_calls == []
@@ -726,7 +748,7 @@ async def test_unresolved_credential_never_reaches_vault_or_page(monkeypatch: py
     resolver = AsyncMock()
     monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolver)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_999", "password")
+    result = await tools_module.fill_credential_field(_ctx(), "#passwordInput", "cred_999", "password")
 
     assert result["ok"] is False
     assert "cred_999" in result["error"]
@@ -735,12 +757,12 @@ async def test_unresolved_credential_never_reaches_vault_or_page(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_standard_mode_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_agent_blocks_only_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _FakePage()
     _wire_impl(monkeypatch, page)
-    ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD)
+    ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is False
     assert page.fill_calls == []
@@ -753,7 +775,7 @@ async def test_readback_failure_surfaces_and_skips_recording(monkeypatch: pytest
     ctx = _ctx()
 
     with capture_logs() as logs:
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
     assert result["ok"] is False
     assert "still empty" in result["error"]
@@ -781,7 +803,7 @@ async def test_a_field_cleared_by_its_own_submit_is_not_reported_as_a_lost_fill(
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
     ctx = _ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp")
 
     # The form committed on the last digit and cleared its own field. Calling that a lost fill
     # sends the model back to re-type a code into a page the sign-in has already left.
@@ -810,7 +832,7 @@ async def test_a_navigation_cannot_stand_in_for_a_readback_nobody_took(monkeypat
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
     ctx = _ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp")
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "unavailable"
@@ -828,7 +850,7 @@ async def test_a_rejected_code_re_rendering_the_same_page_is_still_a_lost_fill(m
 
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", same_page_with_error)
 
-    result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp")
+    result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp")
 
     # A rejected code re-renders the same page with an error param. That is not the form having
     # carried the code away, so the empty field still means the fill did not land.
@@ -841,7 +863,7 @@ async def test_a_verified_fill_is_still_reported_as_observed(monkeypatch: pytest
     _wire_impl(monkeypatch, page)
     ctx = _ctx()
 
-    await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
     assert "landing_inferred_from_navigation" not in ctx.scouted_interactions[0]["observed_effects"]
 
@@ -851,30 +873,24 @@ class TestCredentialFillInCallSubmit:
     probe and the submit click happens in the same call."""
 
     def _log_probes(self, monkeypatch: pytest.MonkeyPatch, events: list[tuple[str, str]]) -> None:
-        async def candidates(ctx: Any, selector: str) -> None:
-            events.append(("selector_candidates", selector))
-            ctx.pending_scout_selector_candidates = None
-
-        async def role_name(_ctx: Any, selector: str, **_kwargs: Any) -> tuple[str, str]:
-            events.append(("role_name", selector))
-            return "button", "Verify"
-
         async def selector_matches(_ctx: Any, selector: str) -> int:
             events.append(("selector_match_count", selector))
-            return 1
-
-        async def role_name_matches(_ctx: Any, role: str, name: str) -> int:
-            events.append(("role_name_match_count", f"{role}/{name}"))
             return 1
 
         async def mint(_ctx: Any, _credential_id: str, _field: str) -> tuple[str, str, None]:
             events.append(("mint", "totp"))
             return "123456", "authtest simple", None
 
-        monkeypatch.setattr(credential_fill_module, "_capture_scout_selector_candidates", candidates)
-        monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", role_name)
+        _fake_probe_facts(
+            monkeypatch,
+            {
+                "role_name": {"role": "button", "accessible_name": "Verify"},
+                "selector_match_count": 1,
+                "role_name_match_count": 1,
+            },
+            events=events,
+        )
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", selector_matches)
-        monkeypatch.setattr(credential_fill_module, "_role_name_match_count", role_name_matches)
         monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", mint)
 
     @pytest.mark.asyncio
@@ -894,15 +910,12 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page)
         self._log_probes(monkeypatch, events)
 
-        result = await tools_module._fill_credential_field_impl(
-            _ctx(), "#totpCode", "cred_123", "totp", "#verifyButton"
-        )
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         names = [name for name, _ in events]
         mint_at = names.index("mint")
-        assert [target for _, target in events[:mint_at]].count("#totpCode") == 3
-        assert [target for _, target in events[:mint_at]].count("#verifyButton") == 3
+        assert events[:mint_at] == [("probe", "#totpCode"), ("probe", "#verifyButton")]
         assert names[mint_at:] == ["mint", "fill", "selector_match_count", "click"]
         assert events[-2] == ("selector_match_count", "#verifyButton")
 
@@ -914,7 +927,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         assert page.click_calls == [("#verifyButton",)]
@@ -933,7 +946,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="marker-value-one")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         assert result["data"]["readback_outcome"] == "different"
@@ -953,7 +966,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="marker-value-two")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#password", "cred_123", "password", "#signIn")
+        result = await tools_module.fill_credential_field(ctx, "#password", "cred_123", "password", "#signIn")
 
         assert result["ok"] is True
         assert result["data"]["readback_outcome"] == "different"
@@ -966,7 +979,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp")
 
         assert result["ok"] is True
         assert page.click_calls == []
@@ -988,7 +1001,7 @@ class TestCredentialFillInCallSubmit:
 
         monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated_away)
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         assert page.click_calls == []
@@ -1006,17 +1019,15 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        # The pre-fill probe reads come back unreadable here: an explicit zero at dispatch still
-        # means the control is gone, whatever the earlier reads could or could not see.
-        async def unreadable_then_gone(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return 0 if counts["n"] > 2 else None
+        # The pre-fill probe comes back unreadable here: an explicit zero at dispatch still
+        # means the control is gone, whatever the earlier read could or could not see.
+        async def gone(_ctx: AgentContext, _selector: str) -> int:
+            return 0
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable_then_gone)
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", gone)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
 
         assert result["ok"] is True
         assert page.click_calls == []
@@ -1033,9 +1044,10 @@ class TestCredentialFillInCallSubmit:
         async def never_matched(_ctx: Any, _selector: str) -> int:
             return 0
 
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 0})
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", never_matched)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
 
         # Zero before the fill AND after it is a wrong selector. Reporting a login that never
         # happened sends the model away while the code it just minted ages out.
@@ -1060,23 +1072,59 @@ class TestCredentialFillInCallSubmit:
 
         monkeypatch.setattr(credential_fill_module, "_register_scout_interaction_observation", record_observation)
 
-        await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verifyButton")
+        await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert observed == [("fill_credential_field", "#totpCode"), ("click", "#verifyButton")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("submit_selector", "submit_role_name"),
+        [("#verifyButton", ("", "")), ('role=button[name="Verify"]', ("button", "Verify"))],
+    )
+    async def test_a_hung_probe_read_drops_every_fact_and_still_submits(
+        self, monkeypatch: pytest.MonkeyPatch, submit_selector: str, submit_role_name: tuple[str, str]
+    ) -> None:
+        page = _FakePage()
+        _wire_impl(monkeypatch, page, secret_value="123456")
+        monkeypatch.setattr(credential_fill_module, "_probe_target_facts", scouting_module._probe_target_facts)
+        monkeypatch.setattr(scouting_module, "_DISCOVERY_PER_CALL_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(scouting_module, "_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS", 0.05)
+
+        async def hang(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await asyncio.Event().wait()
+            return {}
+
+        stale = [{"selector": "#stale", "source": "id", "match_count": 1}]
+        ctx = _ctx(
+            discovery_mcp_server=SimpleNamespace(call_internal_tool=hang), pending_scout_selector_candidates=stale
+        )
+
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", submit_selector)
+
+        assert result["data"]["submitted"] is True
+        assert page.click_calls == [(submit_selector,)]
+        assert ctx.pending_scout_selector_candidates is None
+        fill_record, submit_record = ctx.scout_trajectory
+        assert not any(key.startswith("element_fingerprint") for key in fill_record)
+        assert not fill_record.get("role")
+        assert (submit_record.get("role", ""), submit_record.get("accessible_name", "")) == submit_role_name
+        for record, selector in ((fill_record, "#totpCode"), (submit_record, submit_selector)):
+            assert record.get("selector_match_count") is None
+            assert record.get("role_name_match_count") is None
+            assert record["selector_candidates"] == [{"selector": selector, "source": "requested", "match_count": None}]
 
     @pytest.mark.asyncio
     async def test_an_unreadable_match_count_still_submits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 1
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 1})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
 
         # None means the page could not be read, not that the control is gone. Treating it as gone
         # would strand a fresh code and hand the expiry problem back to the next turn.
@@ -1091,9 +1139,10 @@ class TestCredentialFillInCallSubmit:
         async def two_matches(_ctx: Any, _selector: str) -> int:
             return 2
 
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 2})
         monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", two_matches)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
 
         # A direct click takes .first, and next to a submit control that is often "Resend code",
         # which would void the code just typed. Guessing is worse than declining.
@@ -1107,15 +1156,14 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def never_matched_then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 0
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", never_matched_then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 0})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#nope")
 
         # The probe already saw the selector match nothing; an unreadable dispatch read is not a
         # reason to spend the click timeout on it and report a failure.
@@ -1128,15 +1176,14 @@ class TestCredentialFillInCallSubmit:
     ) -> None:
         page = _FakePage()
         _wire_impl(monkeypatch, page, secret_value="123456")
-        counts = {"n": 0}
 
-        async def ambiguous_then_unreadable(_ctx: Any, _selector: str) -> int | None:
-            counts["n"] += 1
-            return None if counts["n"] > 2 else 2
+        async def unreadable(_ctx: AgentContext, _selector: str) -> None:
+            return None
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", ambiguous_then_unreadable)
+        _fake_probe_facts(monkeypatch, {"selector_match_count": 2})
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", unreadable)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "button.x")
 
         # An unreadable count at dispatch does not unsee what the pre-fill probe already counted, and
         # "Resend code" is just as adjacent whichever read spotted the second control.
@@ -1144,21 +1191,26 @@ class TestCredentialFillInCallSubmit:
         assert "matches 2 controls" in result["data"]["submit_skipped"]
 
     @pytest.mark.asyncio
-    async def test_a_failed_submit_click_never_costs_the_fill(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = _FakePage(click_error=RuntimeError("no element matched #verifyButton for 123456"))
-        _wire_impl(monkeypatch, page, secret_value="123456")
+    @pytest.mark.parametrize(("field", "secret"), [("totp", "123456"), ("password", "Generated-Pa55word!xyz")])
+    async def test_a_failed_submit_click_never_costs_the_fill(
+        self, monkeypatch: pytest.MonkeyPatch, field: str, secret: str
+    ) -> None:
+        page = _FakePage(click_error=RuntimeError(f"no element matched #verifyButton for {secret}"))
+        _wire_impl(monkeypatch, page, secret_value=secret)
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, f"#{field}", "cred_123", field, "#verifyButton")
 
         assert result["ok"] is True
-        assert result["data"]["typed_length"] == 6
-        assert "123456" not in json.dumps(result)
+        assert result["data"]["typed_length"] == len(secret)
+        assert secret not in json.dumps(result)
         assert "[REDACTED_SECRET]" in result["data"]["submit_error"]
         # The click raised, so whether it reached the page is unknown. Saying only "not submitted"
         # would read as safe to retry, and a retry spends a second code.
         assert result["data"]["submitted"] is False
         assert result["data"]["submit_uncertain"] is True
+        assert "may already have been submitted" in result["data"]["submit_error"]
+        assert page.click_calls == [("#verifyButton",)]
         assert [entry["tool_name"] for entry in ctx.scout_trajectory] == ["fill_credential_field"]
 
     @pytest.mark.asyncio
@@ -1171,7 +1223,7 @@ class TestCredentialFillInCallSubmit:
 
         monkeypatch.setattr(credential_fill_module, "_live_working_page_url", navigated)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
+        result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verify")
 
         # The probed control belongs to the page the fill left, so clicking now acts on a different one.
         assert page.click_calls == []
@@ -1186,7 +1238,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         assert "submit_error" not in result["data"]
@@ -1206,7 +1258,7 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         ctx = _ctx()
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         assert page.click_calls == [("#verifyButton",)]
@@ -1234,7 +1286,11 @@ class TestCredentialFillInCallSubmit:
         _wire_impl(monkeypatch, page, secret_value="123456")
         monkeypatch.setattr(credential_fill_module, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
 
-        async def slow_probe(_ctx: Any, _selector: str) -> int:
+        async def slow_probe(*_args: Any, **_kwargs: Any) -> tuple[dict[str, Any], dict[str, str]]:
+            advance(10.0)
+            return {"selector_match_count": 1}, {}
+
+        async def slow_live_count(_ctx: AgentContext, _selector: str) -> int:
             advance(10.0)
             return 1
 
@@ -1249,14 +1305,13 @@ class TestCredentialFillInCallSubmit:
             advance(0.1 if url_reads["count"] == 1 else 100.0)
             return _FIXTURE_LOGIN_URL
 
-        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", slow_probe)
+        monkeypatch.setattr(credential_fill_module, "_probe_target_facts", slow_probe)
+        monkeypatch.setattr(credential_fill_module, "_selector_live_match_count", slow_live_count)
         monkeypatch.setattr(credential_fill_module, "_read_filled_field_value", slow_readback)
         monkeypatch.setattr(credential_fill_module, "_live_working_page_url", counted_url)
 
         with capture_logs() as logs:
-            result = await tools_module._fill_credential_field_impl(
-                _ctx(), "#totpCode", "cred_123", "totp", "#verifyButton"
-            )
+            result = await tools_module.fill_credential_field(_ctx(), "#totpCode", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is True
         filled = next(entry for entry in logs if "filled a saved credential field" in entry["event"])
@@ -1276,7 +1331,7 @@ class TestCredentialFillInCallSubmit:
 
         monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", runtime_only_otp)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#otp", "cred_123", "totp", "#verifyButton")
+        result = await tools_module.fill_credential_field(_ctx(), "#otp", "cred_123", "totp", "#verifyButton")
 
         assert result["ok"] is False
         assert result["data"] == {
@@ -1286,61 +1341,6 @@ class TestCredentialFillInCallSubmit:
         }
         assert page.fill_calls == []
         assert page.click_calls == []
-
-
-@pytest.mark.asyncio
-async def test_in_flight_sensitive_taint_suppresses_fill_result_screenshot_and_recorded_page_facts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    page = _FakePage()
-    _wire_impl(monkeypatch, page)
-    ctx = _ctx()
-    existing_interaction = {"tool_name": "click", "selector": "#existing"}
-    existing_trajectory = {**existing_interaction, "trajectory_index": 0}
-    existing_flow = {"step": 1, "evidence": {"source_tool": "existing"}}
-    ctx.scouted_interactions = [existing_interaction]
-    ctx.scout_trajectory = [existing_trajectory]
-    ctx.flow_evidence = [existing_flow]
-    ctx.scouted_output_covered_paths = {"output.existing"}
-    ctx.scout_observation_contract = {"existing": True}
-    ctx.pending_browser_interaction_observation = SimpleNamespace(tool_name="click", url="https://existing.test")
-    unrelated_commit: asyncio.Task[None] | None = None
-
-    async def append_unrelated_evidence() -> None:
-        async with browser_page_custody_lock(ctx):
-            ctx.scouted_interactions.append({"tool_name": "click", "selector": "#parallel"})
-            ctx.scout_trajectory.append({"tool_name": "click", "selector": "#parallel", "trajectory_index": 1})
-            ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "parallel"}})
-
-    async def taint_before_screenshot(*_args: Any, **_kwargs: Any) -> bool:
-        nonlocal unrelated_commit
-        unrelated_commit = asyncio.create_task(append_unrelated_evidence())
-        await asyncio.sleep(0)
-        assert not unrelated_commit.done()
-        ctx.sensitive_origin_browser_session_ids = {"pbs_1"}
-        return False
-
-    screenshot = AsyncMock(side_effect=taint_before_screenshot)
-    monkeypatch.setattr(credential_fill_module, "_capture_post_interaction_screenshot", screenshot)
-
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
-    assert unrelated_commit is not None
-    await unrelated_commit
-
-    assert result["ok"] is False
-    assert "specific named URL" in result["error"]
-    screenshot.assert_awaited_once()
-    assert ctx.scouted_interactions == [existing_interaction, {"tool_name": "click", "selector": "#parallel"}]
-    assert ctx.scout_trajectory == [
-        existing_trajectory,
-        {"tool_name": "click", "selector": "#parallel", "trajectory_index": 1},
-    ]
-    assert ctx.flow_evidence == [existing_flow, {"step": 2, "evidence": {"source_tool": "parallel"}}]
-    assert ctx.scouted_output_covered_paths == {"output.existing"}
-    assert ctx.scout_observation_contract == {"existing": True}
-    assert ctx.pending_browser_interaction_observation == SimpleNamespace(
-        tool_name="click", url="https://existing.test"
-    )
 
 
 class TestPublicToolCall:
@@ -1375,6 +1375,95 @@ class TestPublicToolCall:
         assert result["data"]["submitted"] is True
         assert result["data"]["submit_selector"] == "#verifyButton"
         assert "123456" not in payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("target", "acting_session"), [("debug", "pbs_debug"), ("last_run", "pbs_run")])
+    async def test_the_fill_and_its_submit_land_in_the_browser_the_call_named(
+        self, monkeypatch: pytest.MonkeyPatch, target: str, acting_session: str
+    ) -> None:
+        """A run that minted its own browser leaves two pages on the same login form. A `last_run`
+        cell followed by a fill that silently acts on the chat's browser submits a credential there."""
+        pages = {"pbs_debug": _FakePage(), "pbs_run": _FakePage()}
+        _wire_impl(monkeypatch, pages["pbs_debug"], secret_value="123456")
+        provisioned: list[bool] = []
+
+        async def get_page_for(session_id: str | None = None) -> tuple[_FakePage, None]:
+            return pages[session_id or ""], None
+
+        async def ensure(_ctx: object) -> None:
+            provisioned.append(True)
+
+        monkeypatch.setattr(credential_fill_module, "get_page", get_page_for)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", ensure)
+        ctx = RunContextWrapper(_ctx(browser_session_id="pbs_debug", last_run_blocks_browser_session_id="pbs_run"))
+        ctx.tool_name = "fill_credential_field"
+
+        tool = next(t for t in tools_module.NATIVE_TOOLS if t.name == "fill_credential_field")
+        payload = await tool.on_invoke_tool(
+            ctx,
+            json.dumps(
+                {
+                    "selector": "#totpCode",
+                    "credential_id": "cred_123",
+                    "field": "totp",
+                    "submit_selector": "#verifyButton",
+                    "target": target,
+                }
+            ),
+        )
+
+        result = json.loads(payload)
+        idle_session = next(s for s in pages if s != acting_session)
+        assert result["ok"] is True and result["browser_target"] == target
+        assert pages[acting_session].fill_calls and pages[acting_session].click_calls == [("#verifyButton",)]
+        assert not pages[idle_session].fill_calls and not pages[idle_session].click_calls
+        assert provisioned == ([True] if target == "debug" else [])
+
+    @pytest.mark.asyncio
+    async def test_missing_authenticator_points_to_the_update_ask_in_the_browser_the_call_named(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_resolve = credential_fill_module._resolve_credential_fill_value
+        page = _FakePage()
+        _wire_impl(monkeypatch, page)
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", real_resolve)
+        wire_credential_vault(
+            monkeypatch,
+            PasswordCredential(username=_FAKE_USERNAME, password=_FAKE_PASSWORD, totp=None),
+            credential_id="cred_123",
+            name="authtest simple",
+        )
+        ctx = RunContextWrapper(_ctx(browser_session_id="pbs_debug", last_run_blocks_browser_session_id="pbs_run"))
+        ctx.tool_name = "fill_credential_field"
+
+        tool = next(t for t in tools_module.NATIVE_TOOLS if t.name == "fill_credential_field")
+        payload = await tool.on_invoke_tool(
+            ctx,
+            json.dumps({"selector": "#totpCode", "credential_id": "cred_123", "field": "totp", "target": "last_run"}),
+        )
+
+        result = json.loads(payload)
+        assert (result["ok"], result["status"], result["browser_target"]) == (
+            False,
+            credential_fill_module.MISSING_AUTHENTICATOR,
+            "last_run",
+        )
+        assert result["data"] == {
+            "credential_id": "cred_123",
+            "credential_name": "authtest simple",
+            "credential_field": "totp",
+        }
+        assert result["update_ask"] == "available"
+        assert not page.fill_calls
+
+    @pytest.mark.parametrize("already_asked", [False, True])
+    def test_missing_authenticator_steers_to_the_update_ask_only_once(self, already_asked: bool) -> None:
+        ctx = make_copilot_context()
+        ctx.credential_totp_update_asked = already_asked
+
+        result = credential_fill_module._missing_authenticator_fill_error(ctx, "cred_123", "authtest simple")
+
+        assert result["update_ask"] == ("already_asked" if already_asked else "available")
 
     @pytest.mark.asyncio
     async def test_a_credential_short_enough_to_sit_inside_an_outcome_word_cannot_forge_another_outcome(
@@ -1413,7 +1502,7 @@ class TestToolRegistration:
         description = tool.description or ""
         assert "server-side" in description
         assert "never" in description
-        assert "type_text" in description
+        assert "rather than typing the value yourself" in description
         assert "code_artifact_metadata.input_bindings" in description
         assert "credential_parameter.key" not in description
         assert "credential_parameter.otp_accessor" not in description
@@ -1503,7 +1592,7 @@ class TestCredentialFillLivePageAdmission:
             credential_id="cred_analytics",
             page_url="https://analytics.example.com/login",
             org_credentials=[_org_credential("cred_analytics", "analytics", "https://analytics.example.com/login")],
-            block_authoring_policy=BlockAuthoringPolicy.STANDARD,
+            block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE,
         )
 
         assert error is not None
@@ -1550,7 +1639,7 @@ class TestCredentialFillLivePageAdmission:
         page = _FakePage(url="https://elsewhere.example.com/collect")
         _wire_impl(monkeypatch, page)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(_ctx(), "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
@@ -1568,7 +1657,7 @@ class TestCredentialFillLivePageAdmission:
 
         monkeypatch.setattr(credential_fill_module, "_capture_scout_source_url", redirect_after_approval)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(_ctx(), "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
@@ -1584,10 +1673,74 @@ class TestCredentialFillLivePageAdmission:
         )
         _wire_impl(monkeypatch, page)
 
-        result = await tools_module._fill_credential_field_impl(_ctx(), "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(_ctx(), "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_fill_refused_on_another_origin_opens_recovery_carrying_only_that_origin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(
+            url=_FIXTURE_LOGIN_URL,
+            release_url="https://idp.example.test/oauth/authorize?state=opaque-state#login_hint=someone",
+        )
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert result["recovery"] == {
+            "observed_origin": "https://idp.example.test",
+            "next_action": "request_credential",
+        }
+        assert page.fill_calls == []
+        assert ctx.credential_origin_recovery == CredentialOriginRecovery(
+            "https://idp.example.test", "pending", refused_credential_id="cred_123"
+        )
+        signal = ctx.blocker_signal
+        assert signal.internal_reason_code == CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
+        assert signal.recovery_hint == "ask_user_clarifying"
+        assert signal.renders_final_reply is False
+        assert dict(signal.extra) == {"observed_origin": "https://idp.example.test"}
+        serialized = json.dumps([signal.model_dump(mode="json"), result])
+        assert "opaque-state" not in serialized
+        assert "login_hint" not in serialized
+        assert "/oauth/authorize" not in serialized
+        assert _FAKE_PASSWORD not in serialized
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_on_a_second_origin_keeps_the_pending_recovery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url="https://idp.example.test/login")
+        _wire_impl(monkeypatch, page)
+        first = CredentialOriginRecovery("https://first-idp.example.test", "pending", refused_credential_id="cred_123")
+        ctx = _ctx(credential_origin_recovery=first)
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is False
+        assert result["error"] == credential_fill_module._credential_origin_recovery_error(first)
+        assert ctx.credential_origin_recovery == first
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("release_url", ["about:blank", "https://sso.authenticationtest.com/login"])
+    async def test_a_refusal_off_another_site_keeps_the_retry_hint_and_opens_no_recovery(
+        self, monkeypatch: pytest.MonkeyPatch, release_url: str
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url=release_url)
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result == {"ok": False, "error": credential_fill_module._credential_fill_origin_mismatch_error()}
+        assert ctx.credential_origin_recovery is None
+        assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
     async def test_resolved_credential_without_a_user_provided_site_fails_closed(
@@ -1598,10 +1751,11 @@ class TestCredentialFillLivePageAdmission:
         _wire_impl(monkeypatch, page)
         ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[_resolved_credential(tested_url=None)]))
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
         assert "request_credential" in result["error"]
+        assert "already named" not in result["error"]
         assert page.fill_calls == []
 
     async def _unbound_grant(
@@ -1666,6 +1820,9 @@ class TestCredentialFillLivePageAdmission:
         assert grant is None
         assert error is not None
         assert "request_credential" in error
+        assert "already named" in error
+        # Passing the id opens the add-2FA update card instead of the confirm ask.
+        assert "without `credential_id`" in error
 
     @pytest.mark.asyncio
     async def test_a_lookalike_domain_does_not_match_the_user_site(self) -> None:
@@ -1840,7 +1997,7 @@ class TestCredentialFillLivePageAdmission:
             "skyvern.forge.app.DATABASE.credentials.get_credentials",
             new=AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)]),
         ):
-            result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_analytics", "password")
+            result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_analytics", "password")
 
         assert result["ok"] is True
         assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
@@ -1861,7 +2018,7 @@ class TestCredentialFillLivePageAdmission:
             "skyvern.forge.app.DATABASE.credentials.get_credentials",
             new=AsyncMock(side_effect=AssertionError("a stamped credential needs no org scan")),
         ):
-            result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+            result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is True
         assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
@@ -1883,7 +2040,7 @@ class TestCredentialFillLivePageAdmission:
 
         monkeypatch.setattr(credential_fill_module, "_capture_scout_source_url", redirect_then_capture)
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
@@ -1907,7 +2064,7 @@ class TestCredentialFillLivePageAdmission:
             "skyvern.forge.app.DATABASE.credentials.get_credentials",
             new=AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)]),
         ):
-            result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_analytics", "password")
+            result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_analytics", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
@@ -1925,9 +2082,9 @@ class TestCredentialFillLivePageAdmission:
             "skyvern.forge.app.DATABASE.credentials.get_credentials",
             new=AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)]),
         ):
-            first = await tools_module._fill_credential_field_impl(ctx, "#user", "cred_analytics", "username")
+            first = await tools_module.fill_credential_field(ctx, "#user", "cred_analytics", "username")
             page.url = "https://evil.example.com/harvest"
-            second = await tools_module._fill_credential_field_impl(ctx, "#pass", "cred_analytics", "password")
+            second = await tools_module.fill_credential_field(ctx, "#pass", "cred_analytics", "password")
 
         assert first["ok"] is True
         assert second["ok"] is False
@@ -1954,13 +2111,40 @@ class TestCredentialFillLivePageAdmission:
         monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolve)
 
         username, password = await asyncio.gather(
-            tools_module._fill_credential_field_impl(ctx, "#user", "cred_123", "username"),
-            tools_module._fill_credential_field_impl(ctx, "#pass", "cred_123", "password"),
+            tools_module.fill_credential_field(ctx, "#user", "cred_123", "username"),
+            tools_module.fill_credential_field(ctx, "#pass", "cred_123", "password"),
         )
 
         assert username["ok"] is True
         assert password["ok"] is True
         assert maximum_active_resolutions == 1
+
+    @pytest.mark.asyncio
+    async def test_direct_credential_fill_waits_for_source_promotion_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = _ctx(browser_session_recovery_lock=asyncio.Lock())
+        provisioning_started = asyncio.Event()
+
+        async def grant(*_args: object, **_kwargs: object) -> tuple[SimpleNamespace, None]:
+            return SimpleNamespace(), None
+
+        async def provision(provision_ctx: object, **_kwargs: object) -> dict[str, object]:
+            async with browser_session_recovery(provision_ctx):
+                provisioning_started.set()
+                return {"ok": False, "error": "stop after provisioning"}
+
+        monkeypatch.setattr(credential_fill_module, "_credential_fill_origin_grant", grant)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", provision)
+
+        async with ctx.browser_session_recovery_lock:
+            fill = asyncio.create_task(tools_module.fill_credential_field(ctx, "#password", "cred_123", "password"))
+            await asyncio.sleep(0)
+            assert provisioning_started.is_set() is False
+            assert fill.done() is False
+
+        assert await fill == {"ok": False, "error": "stop after provisioning"}
+        assert provisioning_started.is_set() is True
 
     @pytest.mark.asyncio
     async def test_a_second_step_on_the_same_site_still_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1974,9 +2158,9 @@ class TestCredentialFillLivePageAdmission:
             "skyvern.forge.app.DATABASE.credentials.get_credentials",
             new=AsyncMock(return_value=[_org_credential("cred_analytics", "analytics", _FIXTURE_LOGIN_URL)]),
         ):
-            first = await tools_module._fill_credential_field_impl(ctx, "#user", "cred_analytics", "username")
+            first = await tools_module.fill_credential_field(ctx, "#user", "cred_analytics", "username")
             page.url = "https://authenticationtest.com/simpleFormAuth/verify?step=2fa"
-            second = await tools_module._fill_credential_field_impl(ctx, "#code", "cred_analytics", "totp")
+            second = await tools_module.fill_credential_field(ctx, "#code", "cred_analytics", "totp")
 
         assert first["ok"] is True
         assert second["ok"] is True
@@ -2085,7 +2269,7 @@ class TestObservationSeamCredentialBinding:
         )
         page.url = "https://elsewhere.example.com/collect"
 
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_analytics", "password")
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_analytics", "password")
 
         assert result["ok"] is False
         assert page.fill_calls == []
@@ -2418,24 +2602,24 @@ def _terminal_credential_run_ctx(**overrides: Any) -> SimpleNamespace:
     clear_session_scrub_values(ctx.browser_session_id)
     ctx.last_run_blocks_workflow_run_id = "wr_credential"
     ctx.last_run_blocks_browser_session_id = ctx.browser_session_id
-    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id=ctx.browser_session_id)
     ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_credential",
         parameters={"password": _RUN_PASSWORD, "totp": _RUN_OTP},
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
     return ctx
 
 
 def _echo_run_secret_in_probe_facts(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_role_name(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
-        return "textbox", f"One-time code {_RUN_OTP} for {_RUN_PASSWORD}"
-
     async def fake_url(_ctx: Any) -> str:
         return _LANDED_URL_WITH_OTP
 
-    monkeypatch.setattr(credential_fill_module, "_resolve_scout_role_name", fake_role_name)
+    _fake_probe_facts(
+        monkeypatch,
+        {"role_name": {"role": "textbox", "accessible_name": f"One-time code {_RUN_OTP} for {_RUN_PASSWORD}"}},
+    )
     monkeypatch.setattr(credential_fill_module, "_live_working_page_url", fake_url)
     monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
 
@@ -2449,7 +2633,7 @@ async def test_the_authorized_fill_and_submit_run_on_the_page_a_terminal_credent
     _echo_run_secret_in_probe_facts(monkeypatch)
     ctx = _terminal_credential_run_ctx()
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_123", "totp", "#verifyButton")
+    result = await tools_module.fill_credential_field(ctx, "#token", "cred_123", "totp", "#verifyButton")
 
     assert result["ok"] is True
     assert result["data"]["readback_outcome"] == "exact_match"
@@ -2469,24 +2653,6 @@ async def test_the_authorized_fill_and_submit_run_on_the_page_a_terminal_credent
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
-async def test_the_fill_is_refused_on_the_same_page_when_a_prerequisite_is_absent(
-    monkeypatch: pytest.MonkeyPatch, arm: str
-) -> None:
-    page = _FakePage()
-    _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
-    ctx = _terminal_credential_run_ctx()
-    remove_sensitive_disclosure_prerequisite(ctx, arm)
-
-    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_123", "totp", "#verifyButton")
-
-    assert result["ok"] is False
-    assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
-    assert page.fill_calls == []
-    assert page.click_calls == []
-
-
-@pytest.mark.asyncio
 async def test_a_terminal_credential_run_does_not_authorize_a_credential_without_an_origin_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2494,10 +2660,9 @@ async def test_a_terminal_credential_run_does_not_authorize_a_credential_without
     _wire_impl(monkeypatch, page, secret_value=_RUN_OTP)
     ctx = _terminal_credential_run_ctx(request_policy=RequestPolicy(resolved_credentials=[]))
 
-    result = await tools_module._fill_credential_field_impl(ctx, "#token", "cred_unbound", "totp", "#verifyButton")
+    result = await tools_module.fill_credential_field(ctx, "#token", "cred_unbound", "totp", "#verifyButton")
 
     assert result["ok"] is False
-    assert result["error"] != SENSITIVE_ORIGIN_PAGE_ERROR
     assert page.fill_calls == []
 
 
@@ -2565,7 +2730,7 @@ workflow_definition:
             policy.current_turn_named_credential_ids = {"cred_123"}
         if origin_arm == "saved_other_approved":
             with patch(
-                "skyvern.forge.sdk.copilot.request_policy.app.DATABASE.credentials.get_credentials_by_ids",
+                "skyvern.forge.sdk.copilot.credential_resolution.app.DATABASE.credentials.get_credentials_by_ids",
                 AsyncMock(return_value=[credential]),
             ):
                 await _seed_prior_approved_credentials(
@@ -2574,7 +2739,7 @@ workflow_definition:
                     global_llm_context=json.dumps({"approved_credentials": [{"credential_id": "cred_123"}]}),
                 )
     with patch.object(credential_fill_module, "load_credentials", AsyncMock(return_value=candidates)):
-        result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
     allowed = origin_arm in {"saved_login", "vault", "tested", "saved_other_named", "saved_other_approved"}
     assert result["ok"] is allowed
     assert bool(page.fill_calls) is allowed
@@ -2586,7 +2751,7 @@ async def test_unresolved_fill_names_the_in_chat_selection_recovery(monkeypatch:
     page = _FakePage()
     _wire_impl(monkeypatch, page)
     ctx = _ctx(request_policy=RequestPolicy(), org_credentials_for_turn=[])
-    result = await tools_module._fill_credential_field_impl(ctx, "#passwordInput", "cred_123", "password")
+    result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
     assert result["ok"] is False
     assert "request_credential" in result["error"]
     assert page.fill_calls == []
@@ -2609,3 +2774,350 @@ async def test_live_admission_exposes_the_existing_selection_path(ambiguous: boo
     assert admission.steer is not None
     assert "request_credential" in admission.steer if ambiguous else "cred_site" in admission.steer
     assert "Ask the user which" not in admission.steer
+
+
+_ACQUISITION_DELAY_SECONDS = 0.2
+_ARM_TOTP = "246810"
+_ARM_LOGIN_ORIGIN = "https://authenticationtest.com"
+_ARM_SSO_ORIGIN = "https://sso.example.com"
+_ARM_SECRETS = (_FAKE_USERNAME, _FAKE_PASSWORD, _ARM_TOTP)
+
+_ARM_LOGIN_HTML = """<!DOCTYPE html><html><head><title>Sign in</title></head><body>
+<form id="login" method="post" action="/totp/">
+  <label for="email">Email</label><input id="email" name="email" type="email" />
+  <label for="password">Password</label><input id="password" name="password" type="password" />
+  <button id="signIn" type="submit">Sign in</button>
+</form></body></html>"""
+
+_ARM_TOTP_HTML = """<!DOCTYPE html><html><head><title>Two-factor</title></head><body>
+<form id="otp" method="post" action="/welcome/">
+  <label for="totpCode">Authenticator code</label><input id="totpCode" name="code" inputmode="numeric" />
+  <button id="verifyButton" type="submit">Verify</button>
+</form>{script}</body></html>"""
+
+_ARM_AUTO_SUBMIT_SCRIPT = """<script>
+document.getElementById('totpCode').addEventListener('input', (event) => {
+  if (event.target.value.length === 6) event.target.form.submit();
+});
+</script>"""
+
+_ARM_WELCOME_HTML = (
+    '<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1 id="welcome">Welcome</h1></body></html>'
+)
+
+_ARM_SSO_HTML = """<!DOCTYPE html><html><head><title>Single sign-on</title></head><body>
+<form method="post" action="/collect/">
+  <label for="password">Password</label><input id="password" name="password" type="password" />
+  <button id="signIn" type="submit">Sign in</button>
+</form></body></html>"""
+
+
+class _AcquisitionArm:
+    """A real Chromium page behind the real overlay server and runtime browser context, with a
+    fixed delay and a trace at the persistent-session `browser_operation` seam every read enters."""
+
+    def __init__(self, page: Page, *, auto_submit_totp: bool) -> None:
+        self.page = page
+        self.auto_submit_totp = auto_submit_totp
+        self.trace: list[dict[str, Any]] = []
+        self.requests: list[tuple[str, str, str]] = []
+        self.rejected = False
+        self.on_acquire: Callable[[], Awaitable[None]] | None = None
+        self.after_mint: Callable[[], Awaitable[None]] | None = None
+
+    def event(self, name: str, **facts: str | int) -> None:
+        self.trace.append({"event": name, **facts})
+
+    @asynccontextmanager
+    async def browser_operation(
+        self, _session_id: str, resolved_state: BrowserState
+    ) -> AsyncIterator[BrowserOperation | BrowserOperationRejected]:
+        await asyncio.sleep(_ACQUISITION_DELAY_SECONDS)
+        self.event("acquire")
+        if self.on_acquire is not None:
+            hook, self.on_acquire = self.on_acquire, None
+            await hook()
+        if self.rejected:
+            yield BrowserOperationRejected(BrowserRetirementReason.replacement)
+            return
+        yield BrowserOperation(resolved_state, BrowserRetirement())
+
+    async def route(self, route: Route) -> None:
+        request = route.request
+        self.requests.append((request.method, request.url, request.post_data or ""))
+        parts = urlsplit(request.url)
+        if f"{parts.scheme}://{parts.netloc}" == _ARM_SSO_ORIGIN:
+            body = _ARM_SSO_HTML
+        elif f"{parts.scheme}://{parts.netloc}" != _ARM_LOGIN_ORIGIN:
+            await route.abort()
+            return
+        elif parts.path == "/totp/":
+            body = _ARM_TOTP_HTML.format(script=_ARM_AUTO_SUBMIT_SCRIPT if self.auto_submit_totp else "")
+        elif parts.path == "/welcome/":
+            body = _ARM_WELCOME_HTML
+        else:
+            body = _ARM_LOGIN_HTML
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    def posts_to(self, path: str) -> int:
+        return sum(1 for method, url, _ in self.requests if method == "POST" and urlsplit(url).path == path)
+
+
+class _LocalEvaluateClient:
+    def __init__(self, arm: _AcquisitionArm) -> None:
+        self._arm = arm
+
+    async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> SimpleNamespace:
+        self._arm.event("dispatch", tool=name)
+        payload = (
+            await skyvern_evaluate(**args)
+            if name == "skyvern_evaluate"
+            else {"ok": False, "error": f"{name} is not served by this arm"}
+        )
+        return SimpleNamespace(structured_content=payload, is_error=payload.get("ok", True) is not True, content=[])
+
+
+@asynccontextmanager
+async def _acquisition_arm(
+    monkeypatch: pytest.MonkeyPatch, *, auto_submit_totp: bool = False
+) -> AsyncIterator[tuple[_AcquisitionArm, CopilotContext]]:
+    async with async_playwright() as playwright:
+        try:
+            browser = await playwright.chromium.launch(headless=True)
+        except PlaywrightError:
+            pytest.skip("Requires Playwright Chromium (run: playwright install chromium)")
+        context = await browser.new_context()
+        page = await context.new_page()
+        arm = _AcquisitionArm(page, auto_submit_totp=auto_submit_totp)
+        await context.route("**/*", arm.route)
+        await page.goto(f"{_ARM_LOGIN_ORIGIN}/login/")
+
+        browser_state = MagicMock(browser_context=context)
+        browser_state.get_working_page = AsyncMock(return_value=page)
+        browser_state.get_or_create_page = AsyncMock(return_value=page)
+        manager = MagicMock()
+        manager.get_browser_state = AsyncMock(return_value=browser_state)
+        manager.browser_operation = arm.browser_operation
+        monkeypatch.setattr(copilot_runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
+        monkeypatch.setattr(copilot_runtime, "get_skyvern", MagicMock(return_value=MagicMock()))
+
+        async def prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
+            return None, None, None
+
+        async def session_ready(_ctx: AgentContext) -> None:
+            return None
+
+        async def grant(
+            _ctx: AgentContext, _credential_id: str
+        ) -> tuple[credential_fill_module._CredentialFillOriginGrant, None]:
+            return credential_fill_module._CredentialFillOriginGrant(f"{_ARM_LOGIN_ORIGIN}/login/"), None
+
+        async def resolve(ctx: AgentContext, _credential_id: str, field: str) -> tuple[str, str, None]:
+            value = {"username": _FAKE_USERNAME, "password": _FAKE_PASSWORD, "totp": _ARM_TOTP}[field]
+            if field != "username":
+                register_secret_scrub_value(ctx, value)
+            if arm.after_mint is not None:
+                arm.on_acquire, arm.after_mint = arm.after_mint, None
+            return value, "authtest simple", None
+
+        original_fill = SkyvernBrowserPage.fill
+        original_click = SkyvernBrowserPage.click
+
+        async def traced_fill(self: SkyvernBrowserPage, selector: str, *args: Any, **kwargs: Any) -> str:
+            arm.event("fill", selector=selector)
+            return await original_fill(self, selector, *args, **kwargs)
+
+        async def traced_click(self: SkyvernBrowserPage, selector: str, *args: Any, **kwargs: Any) -> str | None:
+            arm.event("click", selector=selector)
+            return await original_click(self, selector, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", prepared)
+        monkeypatch.setattr(credential_fill_module, "ensure_browser_session", session_ready)
+        monkeypatch.setattr(credential_fill_module, "_credential_fill_origin_grant", grant)
+        monkeypatch.setattr(credential_fill_module, "_resolve_credential_fill_value", resolve)
+        monkeypatch.setattr(SkyvernBrowserPage, "fill", traced_fill)
+        monkeypatch.setattr(SkyvernBrowserPage, "click", traced_click)
+
+        ctx = make_copilot_ctx(browser_session_id="pbs_acquisition_arm")
+        ctx.api_key = "test-api-key"
+        ctx.supports_vision = False
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.request_policy = _policy()
+        server = SkyvernOverlayMCPServer(
+            transport=object(),
+            overlays={},
+            alias_map={"evaluate": "skyvern_evaluate"},
+            allowlist=frozenset({"skyvern_evaluate"}),
+            context_provider=lambda: ctx,
+        )
+        server._client = _LocalEvaluateClient(arm)  # type: ignore[assignment]
+        ctx.discovery_mcp_server = server
+        try:
+            yield arm, ctx
+        finally:
+            clear_session_scrub_values(ctx.browser_session_id)
+            await context.close()
+            await browser.close()
+
+
+async def _arm_step(
+    arm: _AcquisitionArm, ctx: CopilotContext, selector: str, field: str, submit_selector: str | None = None
+) -> dict[str, Any]:
+    arm.event("step", field=field)
+    return await tools_module.fill_credential_field(ctx, selector, "cred_123", field, submit_selector)
+
+
+def _arm_steps(trace: list[dict[str, Any]]) -> dict[str, list[str]]:
+    steps: dict[str, list[str]] = {}
+    for entry in trace:
+        if entry["event"] == "step":
+            current = steps.setdefault(str(entry["field"]), [])
+        else:
+            current.append(str(entry["event"]))
+    return steps
+
+
+def _acquisitions_before_fill(events: list[str]) -> int:
+    return events[: events.index("fill")].count("acquire")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auto_submit_totp",
+    [pytest.param(False, id="submit-button"), pytest.param(True, id="auto-submitting-authenticator")],
+)
+async def test_acquisition_arm_pays_one_acquisition_per_target_read(
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None], auto_submit_totp: bool
+) -> None:
+    async with _acquisition_arm(monkeypatch, auto_submit_totp=auto_submit_totp) as (arm, ctx):
+        with capture_logs() as logs:
+            username = await _arm_step(arm, ctx, "#email", "username")
+            password = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+            totp = await _arm_step(arm, ctx, "#totpCode", "totp", "#verifyButton")
+        landed_url = arm.page.url
+        totp_posts = arm.posts_to("/totp/")
+        welcome_posts = arm.posts_to("/welcome/")
+
+    steps = _arm_steps(arm.trace)
+    trace = json.dumps(steps)
+    record_property("acquisition_trace", trace)
+    record_property(
+        "acquisitions_before_fill", json.dumps({field: _acquisitions_before_fill(steps[field]) for field in steps})
+    )
+
+    # One read per probed target (the email field alone; the password field and its submit), and one
+    # more for the fill's own browser scope.
+    assert _acquisitions_before_fill(steps["username"]) == 2, trace
+    assert _acquisitions_before_fill(steps["password"]) == 3, trace
+    assert _acquisitions_before_fill(steps["totp"]) == 3, trace
+    assert steps["password"][: steps["password"].index("fill")] == ["acquire", "dispatch"] * 2 + ["acquire"], trace
+    fill_at, click_at = steps["password"].index("fill"), steps["password"].index("click")
+    assert steps["password"][fill_at + 1 : click_at] == ["acquire", "dispatch", "acquire"], trace
+
+    assert [username["ok"], password["ok"], totp["ok"]] == [True, True, True]
+    assert username["data"]["readback_outcome"] == "exact_match"
+    assert password["data"]["readback_outcome"] == "exact_match"
+    assert password["data"]["submitted"] is True
+    assert totp_posts == 1
+    assert welcome_posts == 1
+    assert urlsplit(landed_url).path == "/welcome/"
+    if auto_submit_totp:
+        assert totp["data"]["submitted"] is False
+        assert "click" not in steps["totp"]
+    else:
+        assert totp["data"]["readback_outcome"] == "exact_match"
+        assert totp["data"]["submitted"] is True
+
+    records = {(entry["tool_name"], entry["selector"]): entry for entry in ctx.scouted_interactions}
+    password_record = records[("fill_credential_field", "#password")]
+    assert password_record["selector_match_count"] == 1
+    assert (password_record["role"], password_record["accessible_name"]) == ("textbox", "Password")
+    assert password_record["role_name_match_count"] == 1
+    assert (password_record["element_fingerprint_id"], password_record["element_fingerprint_type"]) == (
+        "password",
+        "password",
+    )
+    assert password_record["element_fingerprint_probed"]
+    assert records[("click", "#signIn")]["selector_match_count"] == 1
+    assert records[("click", "#signIn")]["accessible_name"] == "Sign in"
+
+    retained = json.dumps(
+        [arm.trace, username, password, totp, ctx.scouted_interactions, ctx.scout_trajectory, logs], default=str
+    )
+    for secret in _ARM_SECRETS:
+        assert secret not in retained
+
+
+@pytest.mark.asyncio
+async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (_arm, ctx):
+        probe = await credential_fill_module._probe_scout_target(
+            ctx, 'role=button[name=" Sign in "]', fingerprint=False
+        )
+
+    assert (probe.role, probe.accessible_name, probe.role_name_match_count) == ("button", "Sign in", 1)
+
+
+@pytest.mark.asyncio
+async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing_to_the_new_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (arm, ctx):
+        prior_step = {"tool_name": "click", "selector": "#earlier", "trajectory_index": 0}
+        ctx.scout_trajectory = [dict(prior_step)]
+
+        async def depart() -> None:
+            await arm.page.goto(f"{_ARM_SSO_ORIGIN}/login/")
+
+        arm.after_mint = depart
+        result = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+        sso_field = await arm.page.evaluate("document.querySelector('#password').value")
+        later = await ctx.discovery_mcp_server.call_internal_tool("skyvern_evaluate", {"expression": "location.host"})
+        sso_traffic = [entry for entry in arm.requests if urlsplit(entry[1]).hostname == "sso.example.com"]
+
+    assert result["ok"] is False
+    assert sso_field == ""
+    assert sso_traffic
+    assert all(_FAKE_PASSWORD not in url and _FAKE_PASSWORD not in body for _, url, body in sso_traffic)
+    assert not any(method == "POST" for method, _, _ in arm.requests)
+    assert "fill" in _arm_steps(arm.trace)["password"]
+    assert ctx.scouted_interactions == []
+    assert ctx.scout_trajectory == [prior_step]
+    assert later["ok"] is True
+    assert later["data"]["result"] == "sso.example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retired_at", ["probe", "after_mint"])
+async def test_acquisition_arm_retired_generation_types_nothing_and_leaves_later_reads_working(
+    monkeypatch: pytest.MonkeyPatch, retired_at: str
+) -> None:
+    async with _acquisition_arm(monkeypatch) as (arm, ctx):
+        prior_record = {"tool_name": "click", "selector": "#earlier", "url": f"{_ARM_LOGIN_ORIGIN}/login/"}
+        ctx.scouted_interactions = [dict(prior_record)]
+        prior_step = {"tool_name": "click", "selector": "#earlier", "trajectory_index": 0}
+        ctx.scout_trajectory = [dict(prior_step)]
+
+        async def retire() -> None:
+            arm.rejected = True
+
+        if retired_at == "probe":
+            arm.on_acquire = retire
+        else:
+            arm.after_mint = retire
+        result = await _arm_step(arm, ctx, "#password", "password", "#signIn")
+        field_value = await arm.page.evaluate("document.querySelector('#password').value")
+        arm.rejected = False
+        later = await ctx.discovery_mcp_server.call_internal_tool("skyvern_evaluate", {"expression": "document.title"})
+
+    assert result["ok"] is False
+    assert _FAKE_PASSWORD not in json.dumps(result)
+    assert field_value == ""
+    assert "fill" not in _arm_steps(arm.trace)["password"]
+    assert not any(method == "POST" for method, _, _ in arm.requests)
+    assert ctx.scouted_interactions == [prior_record]
+    assert ctx.scout_trajectory == [prior_step]
+    assert later["ok"] is True
+    assert later["data"]["result"] == "Sign in"

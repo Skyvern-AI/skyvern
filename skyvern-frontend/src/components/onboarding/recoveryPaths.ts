@@ -4,6 +4,7 @@ type RecoveryPathId =
   | "retry"
   | "edit_workflow"
   | "update_credentials"
+  | "create_browser_session"
   | "view_docs"
   | "contact_support";
 
@@ -24,6 +25,11 @@ const UPDATE_CREDENTIALS: RecoveryPath = {
   label: "Update credentials",
   kind: "navigate",
 };
+const CREATE_BROWSER_SESSION: RecoveryPath = {
+  id: "create_browser_session",
+  label: "Create browser session",
+  kind: "navigate",
+};
 const VIEW_DOCS: RecoveryPath = {
   id: "view_docs",
   label: "View troubleshooting docs",
@@ -39,6 +45,10 @@ const CONTACT_SUPPORT: RecoveryPath = {
 // Always returns at least two paths so the failure state offers real choices.
 function getRecoveryPaths(failureCategory: string | null): RecoveryPath[] {
   const category = failureCategory?.toLowerCase() ?? "";
+  // Retrying against the same timed-out session fails identically, so Retry is not offered.
+  if (category === "browser_session_expired") {
+    return [CREATE_BROWSER_SESSION, VIEW_DOCS];
+  }
   if (/credential|auth|login|password|2fa|verification/.test(category)) {
     return [UPDATE_CREDENTIALS, RETRY];
   }

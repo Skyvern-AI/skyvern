@@ -5,11 +5,15 @@ preventing runtime errors like "'State_' is undefined" when using keys like "Sta
 """
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
 
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.constants import SCRUBBED_VALUE
+from skyvern.exceptions import InvalidWorkflowParameter
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import (
     TaskBlockYAML,
     WorkflowParameterYAML,
@@ -484,3 +488,26 @@ class TestSanitizeWorkflowYamlWithReferences:
         result = sanitize_workflow_yaml_with_references(workflow_yaml)
         assert result["workflow_definition"]["parameters"][0]["key"] == "user_input"
         assert "{{ user_input }}" in result["workflow_definition"]["workflow_system_prompt"]
+
+
+@pytest.mark.parametrize(
+    ("parameter_type", "value"),
+    [
+        (WorkflowParameterType.INTEGER, "3.9"),
+        (WorkflowParameterType.INTEGER, "true"),
+        (WorkflowParameterType.FLOAT, "true"),
+        (WorkflowParameterType.INTEGER, SCRUBBED_VALUE),
+    ],
+)
+def test_run_input_of_the_wrong_shape_is_rejected_at_submit(parameter_type: WorkflowParameterType, value: str) -> None:
+    now = datetime.now(timezone.utc)
+    parameter = WorkflowParameter(
+        workflow_parameter_id="wp_count",
+        workflow_parameter_type=parameter_type,
+        key="count",
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+    with pytest.raises(InvalidWorkflowParameter):
+        WorkflowService._serialize_workflow_run_parameter_value(parameter, value)

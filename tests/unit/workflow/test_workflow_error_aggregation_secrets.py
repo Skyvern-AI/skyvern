@@ -1,12 +1,34 @@
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
+import structlog
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.workflow import service
 from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
 
 SHORT_SECRET = "587"
 MASK = "[redacted]"
+
+
+@contextmanager
+def captured_drop_warnings() -> Iterator[list[dict[str, Any]]]:
+    # capture_logs misses a logger bound before another test reconfigured structlog, and a level-filtering
+    # wrapper_class drops the warning first; so this uses an unfiltered wrapper and rebinds the service logger.
+    config = structlog.get_config()
+    previous_wrapper = config["wrapper_class"]
+    previous_cache = config["cache_logger_on_first_use"]
+    with capture_logs() as logs:
+        structlog.configure(wrapper_class=structlog.BoundLogger, cache_logger_on_first_use=False)
+        previous_logger = service.LOG
+        service.LOG = structlog.get_logger()
+        try:
+            yield logs
+        finally:
+            service.LOG = previous_logger
+            structlog.configure(wrapper_class=previous_wrapper, cache_logger_on_first_use=previous_cache)
 
 
 def _typed_error(code: str, reasoning: str) -> dict[str, Any]:
@@ -84,7 +106,7 @@ def test_aggregation_scrubs_short_card_secrets_from_all_reasoning_sinks() -> Non
 
 
 def test_aggregation_skips_code_containing_short_secret_and_warns() -> None:
-    with capture_logs() as logs:
+    with captured_drop_warnings() as logs:
         errors = _merge_workflow_run_errors(
             [],
             [
@@ -106,7 +128,7 @@ def test_aggregation_skips_code_containing_short_secret_and_warns() -> None:
 
 
 def test_aggregation_normalizes_then_drops_code_containing_short_secret_and_warns() -> None:
-    with capture_logs() as logs:
+    with captured_drop_warnings() as logs:
         errors = _merge_workflow_run_errors(
             [],
             [("legacy", ["ERR_5\u200b87"], "failure", None, "code")],

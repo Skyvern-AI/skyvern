@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { useQuery } from "@tanstack/react-query";
 import {
   getActiveOrgQueryKeyScope,
@@ -25,6 +26,7 @@ function useRunTagSuggestionsQuery({
   enabled = true,
 }: { enabled?: boolean } = {}) {
   const credentialGetter = useCredentialGetter();
+  const taggingEnabled = useWorkflowTaggingEnabled();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
 
@@ -33,7 +35,7 @@ function useRunTagSuggestionsQuery({
       ["run-tag-suggestions"],
       activeOrgQueryKeyScope,
     ),
-    enabled,
+    enabled: enabled && taggingEnabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client

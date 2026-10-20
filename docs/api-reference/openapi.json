@@ -94,7 +94,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    body: {\n        prompt: \"Find the top 3 posts on Hacker News.\"\n    }\n})\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    prompt: \"Find the top 3 posts on Hacker News.\"\n})\n"
               }
             ]
           }
@@ -193,6 +193,17 @@
           "400": {
             "description": "Invalid agent run request"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -214,7 +225,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    body: {\n        workflow_id: \"wpid_123\",\n        parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n    }\n});\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    agent_id: \"wpid_123\",\n    parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n});\n"
               }
             ]
           }
@@ -579,15 +590,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -900,15 +911,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: []\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: []\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -1388,6 +1399,63 @@
           }
         },
         "x-fern-sdk-method-name": "delete_folder"
+      }
+    },
+    "/v1/browser_types": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "List selectable browser types",
+        "description": "List the selectable browser engines for the workflow/run browser_type setting. The list is runtime-capability aware: a runtime that can honor an explicit engine (the cloud dynamic-browser capability) returns all supported engines, while a runtime without it (OSS/self-host) returns an empty list rather than advertising selections the server would reject.",
+        "operationId": "get_browser_types_v1_browser_types_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully listed selectable browser types",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserTypeOption"
+                  },
+                  "title": "Response Get Browser Types V1 Browser Types Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_browser_types"
       }
     },
     "/v1/runs/{workflow_run_id}/tags": {
@@ -3066,14 +3134,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search (min 3 chars for trigram index).",
+              "description": "Case-insensitive substring search (min 3 chars for trigram index) across the run's title, URL, run ID, agent (workflow) ID and inputs, plus a workflow run's webhook callback URL. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. Browser profile and credential IDs apply to workflow runs; a browser session ID also matches a standalone task that used it.",
               "examples": [
                 "login_url",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search (min 3 chars for trigram index)."
+            "description": "Case-insensitive substring search (min 3 chars for trigram index) across the run's title, URL, run ID, agent (workflow) ID and inputs, plus a workflow run's webhook callback URL. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. Browser profile and credential IDs apply to workflow runs; a browser session ID also matches a standalone task that used it."
           },
           {
             "name": "run_type",
@@ -3946,6 +4016,31 @@
           "404": {
             "description": "Browser profile not found"
           },
+          "429": {
+            "description": "Too many browser sessions are starting for this organization at once. Retry after the number of seconds in the Retry-After header.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail",
+                    "error_code"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "error_code": {
+                      "type": "string",
+                      "enum": [
+                        "too_many_starting_browser_sessions"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -4713,10 +4808,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -6569,6 +6664,17 @@
           "404": {
             "description": "Workflow run not found"
           },
+          "503": {
+            "description": "The server is busy dispatching other runs. No run was created; retry after Retry-After seconds.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -6589,7 +6695,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\nA complete browser profile or browser session id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -6653,15 +6759,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
               "examples": [
                 "login_url",
-                "credential_value",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
           },
           {
             "name": "error_code",
@@ -6741,7 +6848,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -6814,15 +6921,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
               "examples": [
                 "login_url",
-                "credential_value",
-                "wr_abc123"
+                "wr_abc123",
+                "bp_123456789",
+                "cred_123456789"
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
           },
           {
             "name": "error_code",
@@ -7210,7 +7318,7 @@
           "Schedules"
         ],
         "summary": "Create a schedule for an agent",
-        "description": "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. Returns the stored schedule and its next upcoming run times.",
+        "description": "Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -7340,7 +7448,7 @@
           "Schedules"
         ],
         "summary": "Get an agent schedule by id",
-        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, parameters, enabled state, and next upcoming run times.",
+        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times.",
         "operationId": "schedules_get",
         "parameters": [
           {
@@ -7408,7 +7516,7 @@
           "Schedules"
         ],
         "summary": "Update an agent schedule",
-        "description": "Replace a schedule's cron expression, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times.",
+        "description": "Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -7533,6 +7641,76 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DeleteScheduleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel": {
+      "post": {
+        "tags": [
+          "Schedules"
+        ],
+        "summary": "Cancel a one-time agent schedule",
+        "description": "Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.",
+        "operationId": "schedules_cancel",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "workflow_schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Schedule Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowScheduleResponse"
                 }
               }
             }
@@ -7703,6 +7881,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7768,6 +7981,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7784,6 +8032,37 @@
                   },
                   "other_information": {
                     "title": "Other Information"
+                  },
+                  "terminate_criterion": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Terminate Criterion",
+                    "description": "Condition that stops Apply. Omit to use the recipe default; null or empty text disables it.",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                  },
+                  "error_code_mapping": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Error Code Mapping",
+                    "description": "Error codes and descriptions. Omit for the recipe default; null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "default": {
+                      "job_expired": "The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications."
+                    }
                   },
                   "username": {
                     "anyOf": [
@@ -7858,6 +8137,31 @@
                     "format": "binary",
                     "title": "Resume File"
                   },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "other_information": {
                     "anyOf": [
                       {
@@ -7868,6 +8172,32 @@
                       }
                     ],
                     "title": "Other Information"
+                  },
+                  "terminate_criterion": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Terminate Criterion",
+                    "description": "Condition that stops Apply. Omit for the recipe default; empty text disables it.",
+                    "default": "Terminate when the requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications. A missing Apply button or redirect alone is insufficient."
+                  },
+                  "error_code_mapping": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Error Code Mapping",
+                    "description": "JSON text containing an object of error codes and descriptions. Omit for the recipe default; JSON null or {} disables mapping. A supplied mapping replaces the default independently of terminate_criterion.",
+                    "default": "{\"job_expired\": \"The requested job posting explicitly states that it is expired, closed, filled, or no longer accepting applications.\"}"
                   },
                   "username": {
                     "anyOf": [
@@ -8035,6 +8365,149 @@
           }
         },
         "x-fern-sdk-method-name": "list_job_recipe_runs"
+      }
+    },
+    "/v1/audit-events/export": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Export organization audit events",
+        "description": "Export audit events for the authenticated organization as JSON or CSV. Only organization admins and full API keys may export. The default window is the last 90 days, with timezone-aware since/until bounds, newest-first keyset pagination, and a maximum page size of 500. CSV output uses fixed columns and is protected from spreadsheet formula execution.",
+        "operationId": "export_audit_events_v1_audit_events_export_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of audit events as JSON, or a CSV download when format=csv.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditEventExportResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller must be an organization admin or use a full API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDenialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "export_audit_events"
       }
     }
   },
@@ -8758,8 +9231,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -9073,8 +9557,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -9478,6 +9974,192 @@
           "unknown"
         ],
         "title": "ArtifactType"
+      },
+      "AuditEventExportResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventExportRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "next": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "next"
+        ],
+        "title": "AuditEventExportResponse"
+      },
+      "AuditEventExportRow": {
+        "properties": {
+          "audit_event_id": {
+            "type": "string",
+            "title": "Audit Event Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "actor_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor User Id"
+          },
+          "auth_kind": {
+            "type": "string",
+            "title": "Auth Kind"
+          },
+          "org_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Role"
+          },
+          "action": {
+            "type": "string",
+            "title": "Action"
+          },
+          "resource_type": {
+            "type": "string",
+            "title": "Resource Type"
+          },
+          "resource_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource Id"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audit_event_id",
+          "created_at",
+          "organization_id",
+          "actor_user_id",
+          "auth_kind",
+          "org_role",
+          "action",
+          "resource_type",
+          "resource_id",
+          "request_id",
+          "details"
+        ],
+        "title": "AuditEventExportRow"
+      },
+      "AuditExportDenialDetail": {
+        "properties": {
+          "error_code": {
+            "type": "string",
+            "const": "organization_admin_required",
+            "title": "Error Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "reason_kind": {
+            "type": "string",
+            "const": "role",
+            "title": "Reason Kind"
+          },
+          "required": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Required"
+          },
+          "caller_has": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Caller Has"
+          },
+          "next_action": {
+            "type": "string",
+            "title": "Next Action"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error_code",
+          "message",
+          "reason_kind",
+          "required",
+          "caller_has",
+          "next_action"
+        ],
+        "title": "AuditExportDenialDetail"
+      },
+      "AuditExportDenialResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/AuditExportDenialDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "AuditExportDenialResponse"
       },
       "AzureSecretParameter": {
         "properties": {
@@ -9914,6 +10596,17 @@
             ],
             "title": "Bitwarden Item Id"
           },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10017,6 +10710,17 @@
               }
             ],
             "title": "Bitwarden Item Id"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
           }
         },
         "type": "object",
@@ -10213,6 +10917,7 @@
           "goto_url",
           "pdf_parser",
           "http_request",
+          "web_search",
           "human_interaction",
           "print_page",
           "workflow_trigger",
@@ -10221,7 +10926,8 @@
           "pdf_fill",
           "split_pdf",
           "email_inbox",
-          "data_export"
+          "data_export",
+          "terminate"
         ],
         "title": "BlockType"
       },
@@ -10516,6 +11222,17 @@
             ],
             "title": "Last Verified Login At"
           },
+          "linked_credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Credential Id"
+          },
           "linked_credential_name": {
             "anyOf": [
               {
@@ -10776,6 +11493,28 @@
             "description": "Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
             "default": false
           },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings requested when the session was created."
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the browser reported after launch for the requested settings. Null until it is measured, and always null when no settings were requested."
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -10866,6 +11605,18 @@
             "title": "Completed At",
             "description": "Timestamp when the session was completed"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who created the session"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10902,6 +11653,28 @@
             ],
             "title": "Warning",
             "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "managed",
+              "external"
+            ],
+            "title": "Source",
+            "description": "\"external\" for a browser the caller registered and runs itself; \"managed\" for one Skyvern runs.",
+            "default": "managed"
+          },
+          "remaining_lifetime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Lifetime Seconds",
+            "description": "Seconds left before a registered external browser's fixed deadline. Null for managed sessions and once the session has ended."
           }
         },
         "type": "object",
@@ -10913,6 +11686,111 @@
         ],
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
+      },
+      "BrowserSettings": {
+        "properties": {
+          "timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone Id",
+            "description": "IANA timezone the browser reports to pages, for example `America/New_York`. Applied when a browser is created and takes precedence over any timezone implied by the proxy location. Offsets such as `+03:00` are rejected. Omit or set to null to keep the default behavior.",
+            "examples": [
+              "America/New_York"
+            ]
+          }
+        },
+        "type": "object",
+        "title": "BrowserSettings"
+      },
+      "BrowserSettingsReceipt": {
+        "properties": {
+          "requested_timezone_id": {
+            "type": "string",
+            "title": "Requested Timezone Id",
+            "description": "The timezone that was requested."
+          },
+          "actual_timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Timezone Id",
+            "description": "The timezone the browser reported when measured, or null when it could not be measured."
+          },
+          "source": {
+            "$ref": "#/components/schemas/BrowserSettingsSource",
+            "description": "Where the requested setting came from."
+          },
+          "status": {
+            "$ref": "#/components/schemas/BrowserSettingsStatus",
+            "description": "`verified` when the browser reported the requested timezone or an IANA alias of it (Chromium reports `Asia/Calcutta` for `Asia/Kolkata`), `mismatch` when it reported another zone, `unapplied` when the browser already existed and was left unchanged, `unknown` when it could not be measured."
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "type": "object",
+        "required": [
+          "requested_timezone_id",
+          "source",
+          "status"
+        ],
+        "title": "BrowserSettingsReceipt"
+      },
+      "BrowserSettingsSource": {
+        "type": "string",
+        "enum": [
+          "workflow_version",
+          "session_request",
+          "existing_session"
+        ],
+        "title": "BrowserSettingsSource"
+      },
+      "BrowserSettingsStatus": {
+        "type": "string",
+        "enum": [
+          "verified",
+          "mismatch",
+          "unapplied",
+          "unknown"
+        ],
+        "title": "BrowserSettingsStatus"
+      },
+      "BrowserTypeOption": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "BrowserTypeOption"
       },
       "BulkCancelRunsRequest": {
         "properties": {
@@ -11226,6 +12104,58 @@
               }
             ],
             "title": "Steps"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "user_owned_goal": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Owned Goal"
+          },
+          "goal_needs_regeneration": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Needs Regeneration"
+          },
+          "code_edited_by_hand": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Edited By Hand"
           }
         },
         "type": "object",
@@ -11238,17 +12168,6 @@
       },
       "CodeBlockStep": {
         "properties": {
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
           "description": {
             "anyOf": [
               {
@@ -11292,17 +12211,6 @@
       },
       "CodeBlockStepYAML": {
         "properties": {
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
           "description": {
             "anyOf": [
               {
@@ -11454,7 +12362,63 @@
               }
             ],
             "title": "Steps",
-            "description": "Plain-language step outline mapped to code line ranges; derived from the code when omitted"
+            "description": "Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema",
+            "description": "JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing"
+          },
+          "user_owned_goal": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Owned Goal",
+            "description": "True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one"
+          },
+          "goal_needs_regeneration": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Goal Needs Regeneration",
+            "description": "True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one"
+          },
+          "code_edited_by_hand": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Edited By Hand",
+            "description": "True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one"
           }
         },
         "type": "object",
@@ -11925,6 +12889,17 @@
             "title": "Generate Browser Profile",
             "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
             "default": false
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied when the session's browser is created. A timezone_id here takes precedence over the timezone implied by proxy_location."
           },
           "needs_live_view": {
             "type": "boolean",
@@ -12442,6 +13417,43 @@
             ],
             "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
+          "vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault Id",
+            "description": "1Password vault ID for linked credentials"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id",
+            "description": "1Password item ID for linked credentials"
+          },
+          "upstream_missing_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Missing At",
+            "description": "When the linked 1Password item was last found missing upstream"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -12558,6 +13570,18 @@
             ],
             "title": "Proxy Session Id",
             "description": "Opaque Skyvern-managed proxy sticky-session id."
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who created the credential"
           }
         },
         "type": "object",
@@ -12587,7 +13611,8 @@
           "bitwarden",
           "azure_vault",
           "gcp",
-          "custom"
+          "custom",
+          "onepassword"
         ],
         "title": "CredentialVaultType"
       },
@@ -13408,7 +14433,7 @@
               }
             ],
             "title": "Download Suffix",
-            "description": "Suffix or complete filename for the downloaded file"
+            "description": "Complete filename for the downloaded file. Supports {{ original_filename }}, which keeps the name the site gave the file, so {{ original_filename }} alone preserves it and prefix_{{ original_filename }} prefixes it. The source extension is used unless the configured filename includes an extension, which overrides it. {{ original_filename }} must be a standalone interpolation without filters or other transformations."
           },
           "download_timeout": {
             "anyOf": [
@@ -13730,6 +14755,11 @@
             "title": "Include Body",
             "default": true
           },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "default": false
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -13933,6 +14963,12 @@
             "title": "Include Body",
             "default": true
           },
+          "download_attachments": {
+            "type": "boolean",
+            "title": "Download Attachments",
+            "description": "Download non-inline attachments from matched emails for downstream blocks.",
+            "default": false
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -13954,6 +14990,14 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -14142,8 +15186,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -14479,8 +15534,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "data_schema": {
             "anyOf": [
@@ -14892,8 +15959,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -15429,8 +16507,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -15781,6 +16871,23 @@
               }
             ],
             "title": "Json Schema"
+          },
+          "worksheet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -15862,6 +16969,23 @@
               }
             ],
             "title": "Json Schema"
+          },
+          "worksheet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -16740,6 +17864,9 @@
                   "$ref": "#/components/schemas/HttpRequestBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/WebSearchBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PrintPageBlock"
                 },
                 {
@@ -16762,6 +17889,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DataExportBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TerminateBlock"
                 }
               ],
               "discriminator": {
@@ -16792,10 +17922,12 @@
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
+                  "terminate": "#/components/schemas/TerminateBlock",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
                   "wait": "#/components/schemas/WaitBlock",
+                  "web_search": "#/components/schemas/WebSearchBlock",
                   "while_loop": "#/components/schemas/WhileLoopBlock",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
@@ -17018,6 +18150,9 @@
                   "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/TerminateBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -17028,6 +18163,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WebSearchBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
@@ -17154,6 +18292,12 @@
               "London",
               "Berlin"
             ]
+          },
+          "isISP": {
+            "type": "boolean",
+            "title": "Isisp",
+            "description": "Whether this geo target is marked as an ISP proxy location.",
+            "default": false
           }
         },
         "type": "object",
@@ -18275,8 +19419,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "skyvern-1.0"
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -18876,6 +20032,22 @@
         "title": "JinjaBranchCriteria",
         "description": "Jinja2-templated branch criteria (only supported criteria type for now)."
       },
+      "JobRecipeOutcome": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "canceled",
+          "job_unavailable",
+          "login_required",
+          "application_refused",
+          "blocked_by_site",
+          "invalid_input",
+          "insufficient_credits",
+          "incomplete",
+          "failed"
+        ],
+        "title": "JobRecipeOutcome"
+      },
       "JobRecipeRunListResponse": {
         "properties": {
           "runs": {
@@ -18972,6 +20144,29 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobRecipeOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed result of a finished run; null while it is still running. Apply failures name their cause (job_unavailable, login_required, application_refused, blocked_by_site, invalid_input, insufficient_credits, incomplete); a cause Skyvern cannot classify is failed, and so is every Extract failure except one Skyvern itself reports, such as running out of credits."
+          },
+          "next_step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Step",
+            "description": "What to do about an unsuccessful outcome; null for completed, canceled, and running runs."
           }
         },
         "additionalProperties": false,
@@ -18983,7 +20178,9 @@
           "status",
           "created_at",
           "job_url",
-          "failure_reason"
+          "failure_reason",
+          "outcome",
+          "next_step"
         ],
         "title": "JobRecipeRunSummary"
       },
@@ -19088,8 +20285,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -19393,8 +20601,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -19902,8 +21122,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -20200,8 +21431,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "error_code_mapping": {
             "anyOf": [
@@ -20594,6 +21837,17 @@
             ],
             "title": "Totp Field Name"
           },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -20670,6 +21924,17 @@
               }
             ],
             "title": "Totp Field Name"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
           }
         },
         "type": "object",
@@ -20679,6 +21944,16 @@
           "item_id"
         ],
         "title": "OnePasswordCredentialParameterYAML"
+      },
+      "OneTimeDispatchStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "fired",
+          "canceled",
+          "failed"
+        ],
+        "title": "OneTimeDispatchStatus"
       },
       "OrganizationScheduleItem": {
         "properties": {
@@ -20699,8 +21974,71 @@
             "title": "Workflow Title"
           },
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds"
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "dispatch_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OneTimeDispatchStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
           },
           "timezone": {
             "type": "string",
@@ -20773,7 +22111,6 @@
           "organization_id",
           "workflow_permanent_id",
           "workflow_title",
-          "cron_expression",
           "timezone",
           "enabled",
           "created_at",
@@ -21112,6 +22449,12 @@
               "user@example.com",
               "+14155550123"
             ]
+          },
+          "has_totp": {
+            "type": "boolean",
+            "title": "Has Totp",
+            "description": "Whether the stored password credential includes a non-empty TOTP seed. Legacy rows with an unknown value report false until the credential is updated.",
+            "default": false
           }
         },
         "type": "object",
@@ -22633,6 +23976,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -22794,7 +24174,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -22828,12 +24210,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
@@ -23987,8 +25407,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -24287,8 +25718,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "navigation_goal": {
             "anyOf": [
@@ -24545,6 +25988,18 @@
                 "type": "null"
               }
             ]
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
           }
         },
         "type": "object",
@@ -24709,7 +26164,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -24726,7 +26181,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -25050,7 +26505,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -25067,7 +26522,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -25834,6 +27289,168 @@
           "atomic_e164"
         ],
         "title": "TelInputStrategy"
+      },
+      "TerminateBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "terminate",
+            "title": "Block Type",
+            "default": "terminate"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "reason"
+        ],
+        "title": "TerminateBlock"
+      },
+      "TerminateBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "terminate",
+            "title": "Block Type",
+            "default": "terminate"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason",
+            "description": "Why the run ends here; supports Jinja templating."
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code",
+            "description": "Optional error code added to the run's error codes; supports Jinja templating. A literal code must be at most 128 characters. The rendered code must be at most 128 characters and may contain only ASCII letters, digits, underscores, periods, colons, and hyphens."
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "reason"
+        ],
+        "title": "TerminateBlockYAML"
       },
       "TextPromptBlock": {
         "properties": {
@@ -26790,8 +28407,20 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "default": "skyvern-1.0"
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -27233,8 +28862,19 @@
             "default": ""
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -27522,8 +29162,20 @@
             "default": false
           },
           "engine": {
-            "$ref": "#/components/schemas/RunEngine",
-            "default": "skyvern-1.0"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "engine_pinned": {
+            "type": "boolean",
+            "title": "Engine Pinned",
+            "description": "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise.",
+            "default": false
           },
           "complete_criterion": {
             "anyOf": [
@@ -27838,6 +29490,385 @@
         ],
         "title": "WaitBlockYAML"
       },
+      "WebSearchBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "web_search",
+            "title": "Block Type",
+            "default": "web_search"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Query"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "google",
+              "exa"
+            ],
+            "title": "Provider",
+            "default": "auto"
+          },
+          "num_results": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Num Results",
+            "default": 10
+          },
+          "no_results_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "no_match_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "query"
+        ],
+        "title": "WebSearchBlock"
+      },
+      "WebSearchBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "web_search",
+            "title": "Block Type",
+            "default": "web_search"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Query"
+          },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "google",
+              "exa"
+            ],
+            "title": "Provider",
+            "default": "auto"
+          },
+          "num_results": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Num Results",
+            "default": 10
+          },
+          "no_results_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Results Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "no_match_error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Match Error Code",
+            "description": "Deprecated. Use error_code_mapping.",
+            "deprecated": true
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "query"
+        ],
+        "title": "WebSearchBlockYAML"
+      },
       "WhileLoopBlock": {
         "properties": {
           "label": {
@@ -27971,6 +30002,9 @@
                   "$ref": "#/components/schemas/HttpRequestBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/WebSearchBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PrintPageBlock"
                 },
                 {
@@ -27993,6 +30027,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DataExportBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TerminateBlock"
                 }
               ],
               "discriminator": {
@@ -28023,10 +30060,12 @@
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
+                  "terminate": "#/components/schemas/TerminateBlock",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
                   "wait": "#/components/schemas/WaitBlock",
+                  "web_search": "#/components/schemas/WebSearchBlock",
                   "while_loop": "#/components/schemas/WhileLoopBlock",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
@@ -28177,6 +30216,9 @@
                   "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/TerminateBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -28187,6 +30229,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WebSearchBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
@@ -28438,6 +30483,17 @@
             "title": "Run With",
             "default": "agent"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
           "ai_fallback": {
             "type": "boolean",
             "title": "Ai Fallback",
@@ -28546,10 +30602,57 @@
             ],
             "title": "Edited By"
           },
+          "build_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowBuildSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+          },
           "copilot_authored": {
             "type": "boolean",
             "title": "Copilot Authored",
             "default": false
+          },
+          "effective_default_engine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The engine a task block with no `engine` set runs on in this agent, or null when engine routing decides it. Populated by the detail endpoint only."
+          },
+          "original_created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Original Created By",
+            "description": "Who created the agent's first version. Populated by the list endpoint only."
+          },
+          "original_created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Original Created At",
+            "description": "When the agent's first version was created. Populated by the list endpoint only."
           },
           "created_at": {
             "type": "string",
@@ -28594,6 +30697,19 @@
           "agent_id"
         ],
         "title": "Workflow"
+      },
+      "WorkflowBuildSource": {
+        "type": "string",
+        "enum": [
+          "ui",
+          "copilot",
+          "mcp",
+          "cli",
+          "api",
+          "internal"
+        ],
+        "title": "WorkflowBuildSource",
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -28640,7 +30756,8 @@
                 "type": "null"
               }
             ],
-            "title": "Proxy Location"
+            "title": "Proxy Location",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
           },
           "webhook_callback_url": {
             "anyOf": [
@@ -28651,7 +30768,8 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Callback Url"
+            "title": "Webhook Callback Url",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. URL validation errors identify the field and failure class without returning the URL or host."
           },
           "totp_verification_url": {
             "anyOf": [
@@ -28662,7 +30780,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Verification Url"
+            "title": "Totp Verification Url",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. URL validation errors identify the field and failure class without returning the URL or host."
           },
           "totp_identifier": {
             "anyOf": [
@@ -28673,7 +30792,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Identifier"
+            "title": "Totp Identifier",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
           },
           "persist_browser_session": {
             "type": "boolean",
@@ -28780,7 +30900,8 @@
                 "type": "null"
               }
             ],
-            "title": "Extra Http Headers"
+            "title": "Extra Http Headers",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. An empty object ({}) clears the header map. Values, including ***, are literal."
           },
           "cdp_connect_headers": {
             "anyOf": [
@@ -28794,7 +30915,8 @@
                 "type": "null"
               }
             ],
-            "title": "Cdp Connect Headers"
+            "title": "Cdp Connect Headers",
+            "description": "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. An empty object ({}) clears the header map; each masked *** entry keeps the stored value for that key."
           },
           "status": {
             "$ref": "#/components/schemas/WorkflowStatus",
@@ -28804,6 +30926,18 @@
             "type": "string",
             "title": "Run With",
             "default": "agent"
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for runs of this workflow, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. Null means the system default."
           },
           "ai_fallback": {
             "type": "boolean",
@@ -29028,6 +31162,9 @@
                   "$ref": "#/components/schemas/HttpRequestBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/WebSearchBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PrintPageBlock"
                 },
                 {
@@ -29050,6 +31187,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DataExportBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/TerminateBlock"
                 }
               ],
               "discriminator": {
@@ -29080,10 +31220,12 @@
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
                   "task": "#/components/schemas/TaskBlock",
                   "task_v2": "#/components/schemas/TaskV2Block",
+                  "terminate": "#/components/schemas/TerminateBlock",
                   "text_prompt": "#/components/schemas/TextPromptBlock",
                   "upload_to_s3": "#/components/schemas/UploadToS3Block",
                   "validation": "#/components/schemas/ValidationBlock",
                   "wait": "#/components/schemas/WaitBlock",
+                  "web_search": "#/components/schemas/WebSearchBlock",
                   "while_loop": "#/components/schemas/WhileLoopBlock",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlock"
                 }
@@ -29117,6 +31259,17 @@
             ],
             "title": "Error Code Mapping"
           },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
+          },
           "workflow_system_prompt": {
             "anyOf": [
               {
@@ -29140,6 +31293,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates."
           }
         },
         "type": "object",
@@ -29276,6 +31440,9 @@
                   "$ref": "#/components/schemas/DataExportBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/TerminateBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -29286,6 +31453,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/HttpRequestBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/WebSearchBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/ConditionalBlockYAML"
@@ -29340,10 +31510,12 @@
                   "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
                   "task": "#/components/schemas/TaskBlockYAML",
                   "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "terminate": "#/components/schemas/TerminateBlockYAML",
                   "text_prompt": "#/components/schemas/TextPromptBlockYAML",
                   "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
                   "validation": "#/components/schemas/ValidationBlockYAML",
                   "wait": "#/components/schemas/WaitBlockYAML",
+                  "web_search": "#/components/schemas/WebSearchBlockYAML",
                   "while_loop": "#/components/schemas/WhileLoopBlockYAML",
                   "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
                 }
@@ -29377,6 +31549,17 @@
             ],
             "title": "Error Code Mapping"
           },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional policy for retrying eligible terminal workflow runs"
+          },
           "workflow_system_prompt": {
             "anyOf": [
               {
@@ -29400,6 +31583,17 @@
             ],
             "title": "Completion Contract",
             "description": "Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand."
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Settings applied to every browser this workflow version creates. Omit to keep the previous version's settings; set to null to clear them."
           }
         },
         "type": "object",
@@ -29609,6 +31803,87 @@
         "type": "object",
         "title": "WorkflowRequest"
       },
+      "WorkflowRetryPolicy": {
+        "properties": {
+          "max_retries": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Max Retries",
+            "description": "Maximum number of retries after the initial attempt",
+            "default": 1
+          },
+          "delay_seconds": {
+            "type": "integer",
+            "maximum": 3600.0,
+            "minimum": 0.0,
+            "title": "Delay Seconds",
+            "description": "Fixed delay before the next attempt, in seconds",
+            "default": 0
+          },
+          "webhook_on_retry": {
+            "type": "string",
+            "enum": [
+              "final_only",
+              "every_attempt"
+            ],
+            "title": "Webhook On Retry",
+            "description": "Whether to send a webhook for every attempt or only the final attempt",
+            "default": "final_only"
+          },
+          "retry_on": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRetryRule"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Retry On",
+            "description": "Terminal status rules that enable retries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "retry_on"
+        ],
+        "title": "WorkflowRetryPolicy"
+      },
+      "WorkflowRetryRule": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "terminated",
+              "canceled",
+              "timed_out"
+            ],
+            "title": "Status",
+            "description": "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+          },
+          "error_codes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Codes",
+            "description": "Optional error codes. The rule matches when any listed code is present."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "WorkflowRetryRule"
+      },
       "WorkflowRun": {
         "properties": {
           "workflow_run_id": {
@@ -29705,6 +31980,39 @@
           },
           "status": {
             "$ref": "#/components/schemas/WorkflowRunStatus"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -29910,6 +32218,38 @@
             ],
             "title": "Run With"
           },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type"
+          },
+          "browser_settings": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Browser settings copied from the workflow version when the run was created"
+          },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "script_run": {
             "anyOf": [
               {
@@ -30023,6 +32363,18 @@
             ],
             "title": "Copilot Session Id"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "ID of the user who started the run"
+          },
           "credits_used": {
             "type": "integer",
             "title": "Credits Used",
@@ -30092,6 +32444,121 @@
         ],
         "title": "WorkflowRun"
       },
+      "WorkflowRunAttempt": {
+        "properties": {
+          "attempt_number": {
+            "type": "integer",
+            "title": "Attempt Number",
+            "description": "One-based number of this workflow run attempt"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus",
+            "description": "Status of this workflow run attempt"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason",
+            "description": "Reason for failure, if the attempt failed"
+          },
+          "error_codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Error Codes",
+            "description": "Error codes reported by this attempt"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At",
+            "description": "Timestamp when this attempt started"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At",
+            "description": "Timestamp when this attempt finished"
+          },
+          "retry_decision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Decision",
+            "description": "Retry decision recorded for this attempt"
+          },
+          "decision_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Reason",
+            "description": "Reason recorded for the retry decision"
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next attempt is scheduled"
+          },
+          "webhook_sent_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Sent At",
+            "description": "Timestamp when the webhook for this attempt was sent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "attempt_number",
+          "status"
+        ],
+        "title": "WorkflowRunAttempt"
+      },
       "WorkflowRunBlock": {
         "properties": {
           "workflow_run_block_id": {
@@ -30112,6 +32579,17 @@
           "workflow_run_id": {
             "type": "string",
             "title": "Workflow Run Id"
+          },
+          "attempt_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Number"
           },
           "organization_id": {
             "type": "string",
@@ -30671,7 +33149,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -30686,7 +33164,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -30833,6 +33311,21 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
             ]
           },
           "run_metadata": {
@@ -30955,7 +33448,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -30970,7 +33463,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -31117,6 +33610,21 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "browser_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Type",
+            "description": "Browser engine for this run, one of the supported browser types (e.g. msedge, chrome, stealth-chromium). Overrides the workflow-level setting. Null inherits from the workflow.",
+            "examples": [
+              "chrome"
             ]
           },
           "run_metadata": {
@@ -31429,6 +33937,39 @@
             "title": "Run Type",
             "description": "Type of run - always workflow_run for workflow runs"
           },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "description": "One-based number of the current workflow run attempt",
+            "default": 1
+          },
+          "retry_pending": {
+            "type": "boolean",
+            "title": "Retry Pending",
+            "description": "Whether another attempt is scheduled for this workflow run",
+            "default": false
+          },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At",
+            "description": "Timestamp when the next workflow run attempt is scheduled"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunAttempt"
+            },
+            "type": "array",
+            "title": "Attempts",
+            "description": "Attempts recorded for this workflow run"
+          },
           "run_with": {
             "type": "string",
             "title": "Run With",
@@ -31479,6 +34020,17 @@
               "fresh"
             ]
           },
+          "browser_settings_receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BrowserSettingsReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The timezone the run's browser reported against the one its workflow version requested. Null when the version requests no browser settings or the browser has not been measured yet."
+          },
           "run_request": {
             "anyOf": [
               {
@@ -31520,6 +34072,11 @@
         "properties": {
           "type": {
             "$ref": "#/components/schemas/WorkflowRunTimelineType"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
           },
           "block": {
             "anyOf": [
@@ -31584,11 +34141,12 @@
           "api",
           "scheduled",
           "webhook",
+          "event",
           "job_recipe_extract",
           "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -31605,8 +34163,71 @@
             "title": "Workflow Permanent Id"
           },
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds"
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "dispatch_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OneTimeDispatchStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
           },
           "timezone": {
             "type": "string",
@@ -31661,6 +34282,18 @@
             ],
             "title": "Description"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "Who the schedule runs as; null for schedules created before owners were recorded."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -31689,7 +34322,6 @@
           "workflow_schedule_id",
           "organization_id",
           "workflow_permanent_id",
-          "cron_expression",
           "timezone",
           "enabled",
           "created_at",
@@ -31736,8 +34368,55 @@
       "WorkflowScheduleUpsertRequest": {
         "properties": {
           "cron_expression": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Cron Expression"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "minimum": 300.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds",
+            "description": "Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression."
+          },
+          "first_fire_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Fire At",
+            "description": "First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation."
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At",
+            "description": "Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires."
           },
           "timezone": {
             "type": "string",
@@ -31792,7 +34471,6 @@
         },
         "type": "object",
         "required": [
-          "cron_expression",
           "timezone"
         ],
         "title": "WorkflowScheduleUpsertRequest"

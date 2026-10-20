@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import TypeAdapter
 
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockType
-from skyvern.webeye.actions.actions import ExtractAction
+from skyvern.webeye.actions.actions import Action, ExtractAction
+from tests.unit.helpers import (
+    ONE_TIME_CODE,
+    assert_one_time_code_withheld,
+    make_one_time_code_action_rows,
+    make_session_factory_yielding,
+)
 
 
 def _block(
@@ -150,6 +161,37 @@ async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cap_output_values", [True, False])
+async def test_timeline_serves_the_typed_value_and_withholds_the_one_time_code(
+    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch, cap_output_values: bool
+) -> None:
+    """Driven through the real repository read, because the typed value is resolved in hydration."""
+    base = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    mock_db.return_value = [_block("wrb_task", created_at=base, task_id="tsk_test")]
+    repo = TasksRepository.__new__(TasksRepository)
+    monkeypatch.setattr(
+        TasksRepository, "Session", make_session_factory_yielding(make_one_time_code_action_rows()), raising=False
+    )
+    hydrated: list[Action] = []
+    read = repo.get_tasks_actions
+
+    async def read_and_keep(**kwargs: Any) -> list[Action]:
+        hydrated.extend(await read(**kwargs))
+        return hydrated
+
+    monkeypatch.setattr(repo, "get_tasks_actions", read_and_keep)
+    monkeypatch.setattr(app.DATABASE, "tasks", repo)
+
+    timeline = await WorkflowService().get_workflow_run_timeline(
+        workflow_run_id="wr_test", organization_id="o_test", cap_output_values=cap_output_values
+    )
+
+    body = TypeAdapter(list[WorkflowRunTimeline]).dump_json(timeline).decode()
+    assert_one_time_code_withheld(body, json.loads(body)[0]["block"]["actions"], hydrated)
+    assert hydrated[0].text == ONE_TIME_CODE
+
+
+@pytest.mark.asyncio
 async def test_timeline_empty_run_returns_empty_list(mock_db: AsyncMock) -> None:
     """No blocks → empty timeline."""
     service = WorkflowService()
@@ -171,3 +213,45 @@ async def test_timeline_duplicate_block_ids_keep_last(mock_db: AsyncMock, caplog
 
     assert len(timeline) == 1
     assert any("Duplicate workflow_run_block_id" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_flatten_task_v2_timeline_inherits_enclosing_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    parent_block = _block("wrb_parent", created_at=base, block_type=BlockType.TaskV2).model_copy(
+        update={"block_workflow_run_id": "wr_child"}
+    )
+    parent = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        attempt=2,
+        block=parent_block,
+        created_at=base,
+        modified_at=base,
+    )
+    leaf = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        attempt=1,
+        block=_block("wrb_leaf", created_at=base),
+        created_at=base,
+        modified_at=base,
+    )
+    conditional = leaf.model_copy(
+        update={"block": _block("wrb_cond", created_at=base, block_type=BlockType.CONDITIONAL), "children": [leaf]}
+    )
+    loop = leaf.model_copy(
+        update={"block": _block("wrb_loop", created_at=base, block_type=BlockType.FOR_LOOP), "children": [conditional]}
+    )
+    thought = leaf.model_copy(update={"type": WorkflowRunTimelineType.thought, "block": None})
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", AsyncMock(return_value=[loop, thought]))
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(parent, organization_id="o_test")
+
+    assert len(result) == 2
+    assert len(result[0].children) == 1
+    assert len(result[0].children[0].children) == 1
+    flattened_items = [*result, result[0].children[0], result[0].children[0].children[0]]
+    assert [item.attempt for item in flattened_items] == [2, 2, 2, 2]
+    assert result[0].block == loop.block
+    assert result[1].type == WorkflowRunTimelineType.thought
+    assert result[0].children[0].children[0].block == leaf.block
+    assert [item.attempt for item in [loop, thought, conditional, leaf]] == [1, 1, 1, 1]

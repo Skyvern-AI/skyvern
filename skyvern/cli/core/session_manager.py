@@ -7,16 +7,16 @@ import secrets
 import time
 import weakref
 from collections import deque
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, TypedDict
 
 import httpx
 import structlog
 
 from skyvern.config import settings
-from skyvern.exceptions import get_user_facing_exception_message
+from skyvern.exceptions import get_user_facing_exception_message, is_stalled_attach_handshake
 from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
 from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
@@ -31,7 +31,7 @@ LOG = structlog.get_logger(__name__)
 _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page
+    from playwright.async_api import Frame, Page, Request
 
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -56,6 +56,55 @@ class ObserveV2State:
         self.refs = {}
 
 
+class RequestFailure(TypedDict):
+    url: str
+    method: str
+    resource_type: str
+    failure_text: str
+    page_url: str
+    tab_id: str
+    timestamp: float
+
+
+_MAX_REQUEST_FAILURES_PER_TAB = 20
+
+
+def newest_per_failure_text_first(entries: list[RequestFailure], limit: int) -> list[RequestFailure]:
+    """Up to ``limit`` entries in time order: the newest of each failure text first, then the newest of the rest,
+    so a burst of one kind of failure cannot displace a different one."""
+    seen: set[str] = set()
+    firsts: list[RequestFailure] = []
+    rest: list[RequestFailure] = []
+    for entry in reversed(entries):
+        (rest if entry["failure_text"] in seen else firsts).append(entry)
+        seen.add(entry["failure_text"])
+    kept = {id(entry) for entry in (firsts + rest)[:limit]}
+    return [entry for entry in entries if id(entry) in kept]
+
+
+@dataclass
+class RequestFailureLog:
+    # Keyed by tab so a noisy background tab cannot evict the working tab's failures.
+    entries: dict[str, list[RequestFailure]] = field(default_factory=dict)
+    # Several SessionStates can hook the same page, so each failed request is recorded once.
+    seen: weakref.WeakSet[Request] = field(default_factory=weakref.WeakSet)
+
+    def append(self, entry: RequestFailure) -> None:
+        tab = self.entries.setdefault(entry["tab_id"], [])
+        tab.append(entry)
+        if len(tab) > _MAX_REQUEST_FAILURES_PER_TAB:
+            tab[:] = newest_per_failure_text_first(tab, _MAX_REQUEST_FAILURES_PER_TAB)
+
+    def take_tab(self, tab_id: str) -> list[RequestFailure]:
+        return self.entries.pop(tab_id, [])
+
+    def restore(self, taken: list[RequestFailure]) -> None:
+        if taken:
+            tab_id = taken[0]["tab_id"]
+            merged = [*taken, *self.entries.get(tab_id, [])]
+            self.entries[tab_id] = newest_per_failure_text_first(merged, _MAX_REQUEST_FAILURES_PER_TAB)
+
+
 @dataclass
 class SessionState:
     browser: SkyvernBrowser | None = None
@@ -66,6 +115,7 @@ class SessionState:
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     page_errors: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
+    request_failures: RequestFailureLog = field(default_factory=RequestFailureLog)
     tracing_active: bool = False
     har_enabled: bool = False
     _har_entries: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=5000))
@@ -108,6 +158,9 @@ class SessionState:
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _current_organization_id: ContextVar[str | None] = ContextVar("mcp_session_organization_id", default=None)
+_call_connections: ContextVar[list[SkyvernBrowser] | None] = ContextVar("mcp_call_connections", default=None)
+_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS = 5
+_CALL_CONNECTION_DISCONNECTS: set[asyncio.Task[None]] = set()
 _global_session: SessionState | None = None
 _organization_sessions: dict[str, SessionState] = {}
 _stateless_http_mode = False
@@ -189,8 +242,6 @@ def _session_ref_key(
     context = state.context
     resolved_session_id = session_id or (context.session_id if context else None)
     resolved_cdp_url = cdp_url or (context.cdp_url if context else None)
-    # Prefer the hash stored at resolve_browser time — recomputing runs a
-    # deliberately slow PBKDF2 per call, and this sits on the per-ref hot path.
     api_key_hash = state.api_key_hash or _api_key_hash(get_active_api_key())
     organization_id = _current_organization_id.get() or state.organization_id
 
@@ -496,6 +547,52 @@ async def scoped_session(state: SessionState) -> AsyncIterator[None]:
         _current_session.reset(token)
 
 
+@asynccontextmanager
+async def stateless_call_connection_scope() -> AsyncIterator[None]:
+    """Disconnect the CDP connections a stateless tool call opened when the call ends."""
+    # The call's SessionState lives only in its own ContextVar, so nothing else can close them; an open
+    # connection keeps receiving and buffering the remote browser's events until that cloud session ends.
+    if not _stateless_http_mode:
+        yield
+        return
+    connections: list[SkyvernBrowser] = []
+    token = _call_connections.set(connections)
+    try:
+        yield
+    finally:
+        _call_connections.reset(token)
+        if connections:
+            # Shielded so a cancelled call still disconnects; the timeout only stops a hung close
+            # handshake from holding the response, and the close itself finishes in the background.
+            disconnect = asyncio.create_task(_disconnect_call_connections(connections))
+            _CALL_CONNECTION_DISCONNECTS.add(disconnect)
+            disconnect.add_done_callback(_CALL_CONNECTION_DISCONNECTS.discard)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(disconnect), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+
+
+def _own_call_connection(browser: SkyvernBrowser) -> None:
+    connections = _call_connections.get()
+    if connections is not None:
+        connections.append(browser)
+
+
+async def _disconnect_browser(browser: SkyvernBrowser) -> None:
+    # On a connect_over_cdp browser this drops only our connection; the remote browser and its
+    # cloud session keep running. SkyvernBrowser.close() would end the cloud session.
+    playwright_browser = browser.browser
+    if playwright_browser is not None:
+        await playwright_browser.close()
+
+
+async def _disconnect_call_connections(connections: list[SkyvernBrowser]) -> None:
+    for browser in connections:
+        try:
+            await _disconnect_browser(browser)
+        except Exception:
+            LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+
+
 def set_stateless_http_mode(enabled: bool) -> None:
     global _stateless_http_mode
     _stateless_http_mode = enabled
@@ -636,6 +733,7 @@ async def resolve_browser(
         and _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key()))
     ):
         connected_browser = await skyvern.connect_to_cloud_browser_session(current.context.session_id)
+        _own_call_connection(connected_browser)
         current.browser = connected_browser
         return connected_browser, current.context
 
@@ -657,9 +755,13 @@ async def resolve_browser(
             return registered.browser, registered.context
 
     browser: SkyvernBrowser | None = None
+    # Rollback may only end a browser session this call created. On the attach paths the session
+    # belongs to the caller, so a failure there must drop our CDP connection and nothing else.
+    browser_created_here = False
     try:
         if session_id:
             browser = await skyvern.connect_to_cloud_browser_session(session_id)
+            _own_call_connection(browser)
             ctx = BrowserContext(
                 mode="cloud_session",
                 session_id=session_id,
@@ -670,24 +772,29 @@ async def resolve_browser(
 
         if extension_runtime is not None:
             browser = await skyvern.connect_to_browser_extension(extension_runtime)
+            _own_call_connection(browser)
             ctx = BrowserContext(mode="extension", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if cdp_url:
             browser = await skyvern.connect_to_browser_over_cdp(cdp_url)
+            _own_call_connection(browser)
             ctx = BrowserContext(mode="cdp", cdp_url=cdp_url)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if local:
             browser = await skyvern.launch_local_browser(headless=headless)
+            browser_created_here = True
             ctx = BrowserContext(mode="local", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if create_session:
             browser = await skyvern.launch_cloud_browser(timeout=timeout)
+            browser_created_here = True
+            _own_call_connection(browser)
             ctx = BrowserContext(
                 mode="cloud_session",
                 session_id=browser.browser_session_id,
@@ -698,7 +805,10 @@ async def resolve_browser(
     except Exception as exc:
         if browser is not None:
             try:
-                await browser.close()
+                if browser_created_here:
+                    await browser.close()
+                else:
+                    await _disconnect_browser(browser)
             except Exception:
                 pass
         set_current_session(SessionState())
@@ -1058,6 +1168,7 @@ class BrowserSessionConnectionError(BrowserNotAvailableError):
         self.session_gone = is_target_closed_message(raw_detail) or (
             "code=4408" in lowered and "reason=session expired" in lowered
         )
+        self.attach_handshake_stalled = is_stalled_attach_handshake(raw_detail)
         super().__init__("Browser session connection failed")
 
 
@@ -1124,14 +1235,25 @@ def no_browser_error(exc: BrowserNotAvailableError | None = None) -> dict[str, A
                 "Browser session expired or closed.",
                 "Create a new browser session and retry this operation.",
             )
+        # A stalled attach leaves a CDP client attached to the browser, so retrying the same
+        # session makes the next attach slower; every other shape here is safe to retry.
+        if exc.attach_handshake_stalled:
+            recovery = (
+                "Create a new browser session; a browser profile carries login state over. "
+                "Retrying the same session_id/cdp_url will likely fail again."
+            )
+        else:
+            recovery = (
+                "This is often transient. Retry with the same session_id/cdp_url; "
+                "if it keeps failing, create a new browser session."
+            )
         return make_error(
             ErrorCode.SDK_ERROR,
             # get_user_facing_exception_message already strips CDP/session-router hostnames,
             # raw proxy response bodies, and driver call logs for anything connect_over_cdp-
             # shaped; anything else degrades to a generic "Unexpected error: <text>", also safe.
             get_user_facing_exception_message(Exception(exc.raw_detail)),
-            "This is often transient. Retry with the same session_id/cdp_url; "
-            "if it keeps failing, create a new browser session.",
+            recovery,
         )
     return make_error(
         ErrorCode.NO_ACTIVE_BROWSER,

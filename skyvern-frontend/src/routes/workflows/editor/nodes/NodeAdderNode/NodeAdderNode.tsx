@@ -13,6 +13,18 @@ import {
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
+import {
+  requestRecordingStart,
+  useIsMountedRef,
+} from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
+import {
+  runWorkflowAuthoringAction,
+  refuseMutationDuringYamlCommit,
+  refuseMutationDuringAuthoring,
+} from "@/store/WorkflowYamlEditorStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import {
@@ -29,6 +41,7 @@ import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
+import { demonstrationInsertionFromNodes } from "../../workspaceAuthoringActions";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const workflowPermanentId = useWorkflowPermanentId();
@@ -36,6 +49,11 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const nodes = useNodes();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
@@ -88,25 +106,32 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const processRecordingMutation = useProcessRecordingMutation({
     browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result) => {
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+          connectingEdgeType: "default",
+        },
+        owner,
+      );
     },
   });
 
   const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result) => {
-      // Reuse existing block insertion pattern
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
+    onSuccess: (result, owner) => {
+      setRecordedBlocks(
+        result,
+        {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+          connectingEdgeType: "default",
+        },
+        owner,
+      );
     },
   });
 
@@ -114,7 +139,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const isUploadingSOP = sopToBlocksMutation.isPending;
 
   const isProcessing =
-    processRecordingMutation.isPending || recordingStore.isCommitting;
+    processRecordingMutation.isPending ||
+    recordingStore.finishRequested ||
+    recordingStore.isCommitting;
 
   const isBusy =
     (isProcessing || recordingStore.isRecording) &&
@@ -140,7 +167,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     : isBlockedByFinally
       ? "Finally block must run last - choose a position above it"
       : !isBusy && recordingStore.isRecording
-        ? "Stop recording to add a block"
+        ? "Finish recording the task to add a block"
         : null;
 
   const updateWorkflowPanelState = (
@@ -168,19 +195,46 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     updateWorkflowPanelState(true, branchContext);
   };
 
+  const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: previous ?? null,
+        next: id,
+        parent: parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
-      recordingStore.setIsRecording(true, {
-        workflowPermanentId: workflowPermanentId ?? null,
-        browserSessionId: settingsStore.browserSessionId,
-      });
-      updateWorkflowPanelState(false);
+      requestRecordingStart(
+        () =>
+          void runWorkflowAuthoringAction(() => {
+            recordingStore.setIsRecording(true, {
+              workflowPermanentId: workflowPermanentId ?? null,
+              browserSessionId: settingsStore.browserSessionId,
+            });
+            updateWorkflowPanelState(false);
+          }),
+        "node_adder",
+        { isStillValid: () => mountedRef.current, recordsAfterDiscard: false },
+      );
     }
   };
 
   const onEndRecord = () => {
+    if (isProcessing) {
+      return;
+    }
+
     // With live interpretation, the recording panel owns the commit so user
     // edits/deletes to draft steps are honored.
     if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
@@ -192,10 +246,14 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       recordingStore.setIsRecording(false);
     }
 
-    processRecordingMutation.mutate();
+    void runWorkflowAuthoringAction(() =>
+      processRecordingMutation.mutateAsync(),
+    );
   };
 
   const onUploadSOP = () => {
+    if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
+      return;
     fileInputRef.current?.click();
   };
 
@@ -213,7 +271,9 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       e.target.value = "";
       return;
     }
-    sopToBlocksMutation.mutate(file);
+    void runWorkflowAuthoringAction(() =>
+      sopToBlocksMutation.mutateAsync(file),
+    );
     e.target.value = "";
   };
 
@@ -292,6 +352,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       isUploadingSOP={isUploadingSOP}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
       onPinnedChange={setMenuPinned}
     >
       {adder}

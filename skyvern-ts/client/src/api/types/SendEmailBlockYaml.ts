@@ -9,10 +9,14 @@ export interface SendEmailBlockYaml {
     model?: Record<string, unknown>;
     ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
-    smtp_host_secret_parameter_key: string;
-    smtp_port_secret_parameter_key: string;
-    smtp_username_secret_parameter_key: string;
-    smtp_password_secret_parameter_key: string;
+    smtp_host_secret_parameter_key?: string;
+    smtp_port_secret_parameter_key?: string;
+    smtp_username_secret_parameter_key?: string;
+    smtp_password_secret_parameter_key?: string;
+    custom_smtp_host?: string;
+    custom_smtp_port?: number;
+    custom_smtp_username?: string;
+    custom_smtp_password?: string;
     sender: string;
     recipients: string[];
     subject: string;

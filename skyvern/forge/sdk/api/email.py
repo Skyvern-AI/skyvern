@@ -242,6 +242,7 @@ async def build_message(
     subject: str,
     body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
     html_footer: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> EmailMessage:
     to = ", ".join(recipients)
     msg = EmailMessage()
@@ -249,6 +250,8 @@ async def build_message(
     msg["From"] = sender
     msg["Subject"] = subject
     msg["To"] = to
+    for name, value in (headers or {}).items():
+        msg[name] = value
     set_body(msg, body, body_format, html_footer)
 
     return msg
@@ -262,6 +265,7 @@ async def send(
     body: str | None = None,
     body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
     html_footer: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> bool:
     recipients = normalize_recipients(recipients)
     validate_recipients(recipients)
@@ -273,6 +277,7 @@ async def send(
         subject=subject,
         body_format=body_format,
         html_footer=html_footer,
+        headers=headers,
     )
 
     return await _send(message=message)

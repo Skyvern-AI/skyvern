@@ -3,7 +3,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from skyvern import analytics
+
+
+@pytest.fixture(autouse=True)
+def _telemetry_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise capture(), so turn telemetry on rather than inherit it from the environment.
+
+    CI sets SKYVERN_TELEMETRY=false so the test suite never sends events to PostHog.
+    """
+    monkeypatch.setattr(analytics.settings, "SKYVERN_TELEMETRY", True)
 
 
 class FakePosthog:
@@ -73,3 +84,26 @@ def test_capture_can_use_custom_posthog_client() -> None:
         event="mcp_tool_call",
         properties={"ok": True},
     )
+
+
+@pytest.mark.parametrize("gate_allows", [None, True, False])
+def test_capture_gate_can_veto_an_event_and_never_adds_the_organization_id(
+    monkeypatch: pytest.MonkeyPatch, gate_allows: bool | None
+) -> None:
+    seen: list[str | None] = []
+
+    def gate(_: object, organization_id: str | None) -> bool:
+        seen.append(organization_id)
+        return bool(gate_allows)
+
+    monkeypatch.setattr(analytics, "_capture_gate", None if gate_allows is None else gate)
+    fake_capture = Mock()
+
+    with patch.object(analytics, "_resolve_posthog_client", return_value=SimpleNamespace(capture=fake_capture)):
+        analytics.capture("skyvern-oss-run-task", data={"url": "https://example.com"}, organization_id="org_1")
+
+    if gate_allows is False:
+        fake_capture.assert_not_called()
+    else:
+        assert "org_1" not in str(fake_capture.call_args)
+    assert seen == ([] if gate_allows is None else ["org_1"])

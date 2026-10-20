@@ -32,9 +32,6 @@ vi.mock("../hooks/useRunHealEpisodesQuery", () => ({
     },
   }),
 }));
-vi.mock("./WorkflowRunHumanInteraction", () => ({
-  WorkflowRunHumanInteraction: () => null,
-}));
 
 import {
   cleanup,
@@ -894,9 +891,6 @@ describe("WorkflowRunBlockDetail cold-start skeleton", () => {
         data: undefined,
         isLoading: false,
       }),
-    }));
-    vi.doMock("./WorkflowRunHumanInteraction", () => ({
-      WorkflowRunHumanInteraction: () => null,
     }));
     const { WorkflowRunBlockDetail: ReloadedBlockDetail } =
       await import("./WorkflowRunBlockDetail");

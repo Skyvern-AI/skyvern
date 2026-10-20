@@ -85,14 +85,17 @@ describe("WorkflowRow tagging gate", () => {
     cleanup();
   });
 
-  it("hides the tag chips when WORKFLOW_TAGGING is off", () => {
-    renderRow(false);
+  it.each([
+    ["off", false],
+    ["not known yet", undefined],
+  ])("hides the tag chips while WORKFLOW_TAGGING is %s", (_state, flag) => {
+    renderRow(flag);
 
     expect(screen.queryByTestId("tag-chip-list")).toBeNull();
   });
 
-  it("shows the tag chips when the flag is unresolved (default on)", () => {
-    renderRow(undefined);
+  it("shows the tag chips when WORKFLOW_TAGGING is on", () => {
+    renderRow(true);
 
     expect(screen.getByTestId("tag-chip-list")).toBeTruthy();
   });

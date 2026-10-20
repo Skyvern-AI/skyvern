@@ -152,6 +152,23 @@ def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
+def _locally_allowed_hosts() -> frozenset[str]:
+    """Hosts the operator named in ALLOWED_HOSTS, honoured only on a developer checkout.
+
+    The SSRF host guard already exempts these, and without the same exemption here brokered code
+    cannot reach a host-local fixture: the refusal surfaces to a code block as a bare
+    ERR_ADDRESS_UNREACHABLE. Empty for cloud and packaged deployments, and empty by default.
+    """
+    # Imported here rather than at module scope: this is a leaf policy module and agent_functions
+    # reaches back through it.
+    from skyvern.config import settings
+    from skyvern.forge.agent_functions import running_in_packaged_deployment
+
+    if settings.is_cloud_environment() or running_in_packaged_deployment():
+        return frozenset()
+    return frozenset(host.lower().rstrip(".") for host in settings.ALLOWED_HOSTS if host)
+
+
 def resolve_public_destination(url: str) -> ResolvedDestination | None:
     """Resolve one browser destination and reject every unusable or non-public peer."""
     # urlsplit matches the WHATWG parser's whitespace handling (strips C0/space,
@@ -173,7 +190,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
     except ValueError as exc:
         raise DestinationBlockedError("blocked egress: malformed host or port") from exc
     if not raw_host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
     if port is None:
         port = _DEFAULT_PORTS.get(scheme)
     if port is None or not 1 <= port <= 65535:
@@ -181,7 +198,9 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
 
     host = normalize_host(raw_host)
     if not host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
+
+    allowed_locally = host.lower().rstrip(".") in _locally_allowed_hosts()
 
     literal_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
@@ -189,12 +208,14 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
     except ValueError:
         literal_ip = _parse_whatwg_ipv4(host)
     if literal_ip is not None:
-        if not _ip_is_public(literal_ip):
+        if not allowed_locally and not _ip_is_public(literal_ip):
             raise DestinationBlockedError(f"blocked egress to internal address {raw_host}")
         return ResolvedDestination(host, port, (str(literal_ip),))
 
     normalized_host = to_ascii_host(host).lower()
-    if normalized_host in BLOCKED_HOST_NAMES or normalized_host.endswith(BLOCKED_HOST_SUFFIXES):
+    if not allowed_locally and (
+        normalized_host in BLOCKED_HOST_NAMES or normalized_host.endswith(BLOCKED_HOST_SUFFIXES)
+    ):
         raise DestinationBlockedError(f"blocked egress to internal hostname {raw_host}")
 
     try:
@@ -208,7 +229,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
             resolved_ip = ipaddress.ip_address(address)
         except ValueError:
             continue
-        if not _ip_is_public(resolved_ip):
+        if not allowed_locally and not _ip_is_public(resolved_ip):
             raise DestinationBlockedError(f"blocked egress to internal hostname {host} (resolved {address})")
         numeric_address = str(resolved_ip)
         if numeric_address not in addresses:

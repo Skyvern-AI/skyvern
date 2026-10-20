@@ -135,9 +135,14 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Real WorkflowCopilotHistory needs an infinite-query + debounced Popover;
 // a button standing in for "pick a different past chat" is enough here.

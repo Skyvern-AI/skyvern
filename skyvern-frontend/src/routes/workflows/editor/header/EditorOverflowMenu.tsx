@@ -1,3 +1,4 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import {
   CounterClockwiseClockIcon,
   DotsHorizontalIcon,
@@ -5,6 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
+import { useId } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
@@ -24,15 +26,23 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowHasChangesStore,
+} from "@/store/WorkflowHasChangesStore";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { cn } from "@/util/utils";
 
-import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
+import { SaveFailedError, useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
 import { CodeSubmenu } from "./CodeSubmenu";
 
@@ -54,6 +64,12 @@ export function EditorOverflowMenu({
   const { data: workflowRun } = useWorkflowRunQuery();
   const isTemplate = workflow?.is_template ?? false;
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (s) => s.saveBlockedReason,
+  );
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const templateSaveReason = saveBlockedReason ?? saveLockReason;
+  const templateReasonId = useId();
   const isRecording = useRecordingStore((s) => s.isRecording);
   const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
@@ -68,7 +84,7 @@ export function EditorOverflowMenu({
   const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
 
   const workflowRunIsRunningOrQueued = Boolean(
-    workflowRun && statusIsRunningOrQueued(workflowRun),
+    workflowRun && runIsLogicallyActive(workflowRun),
   );
 
   const templateMutation = useMutation({
@@ -99,11 +115,14 @@ export function EditorOverflowMenu({
   });
 
   const disabled = isRecording || templateMutation.isPending || saving;
+  // Only adding a template saves first. Radix skips a `disabled` item in keyboard navigation,
+  // so the held item stays focusable and carries aria-disabled to keep its reason reachable.
+  const templateSaveHeld = !isTemplate && Boolean(templateSaveReason);
 
-  const handleTemplateToggle = () => {
+  const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
-      void onSave().catch(() => {});
+      await onSave();
     }
     templateMutation.mutate(newIsTemplate);
   };
@@ -160,15 +179,42 @@ export function EditorOverflowMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem
           disabled={disabled}
+          aria-disabled={disabled || templateSaveHeld || undefined}
+          // The name stays the action; the visible reason line below is its description.
+          aria-label={templateSaveHeld ? "Save as Template" : undefined}
+          aria-describedby={templateSaveHeld ? templateReasonId : undefined}
+          className={cn(templateSaveHeld && "flex-col items-start gap-1")}
           onSelect={(event) => {
-            if (disabled) {
+            if (disabled || templateSaveHeld) {
               event.preventDefault();
               return;
             }
-            handleTemplateToggle();
+            void handleTemplateToggle().catch((error: unknown) => {
+              if (
+                error instanceof SaveRefusedError ||
+                error instanceof SaveStaleError ||
+                error instanceof SaveFailedError
+              )
+                return;
+              console.error("Failed to save workflow as template:", error);
+            });
           }}
         >
-          {isTemplate ? "Remove from Templates" : "Save as Template"}
+          {isTemplate ? (
+            "Remove from Templates"
+          ) : templateSaveHeld ? (
+            <>
+              <span className="text-muted-foreground">Save as Template</span>
+              <span
+                id={templateReasonId}
+                className="max-w-xs whitespace-normal text-xs text-muted-foreground"
+              >
+                {templateSaveReason}
+              </span>
+            </>
+          ) : (
+            "Save as Template"
+          )}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={requestTour}>

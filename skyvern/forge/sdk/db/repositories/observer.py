@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import structlog
 from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -22,11 +23,12 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
+    capped_jsonb_write,
     convert_to_task_v2,
     convert_to_workflow_run_block,
     downloaded_file_count_from_output,
+    prefer_capped_columns,
     serialize_proxy_location,
-    truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -346,6 +348,36 @@ class ObserverRepository(BaseRepository):
                 return Thought.model_validate(thought_obj)
             raise NotFoundError(f"Thought {thought_id}")
 
+    @db_operation("update_task_v2_status_if_not_final")
+    async def update_task_v2_status_if_not_final(
+        self,
+        task_v2_id: str,
+        organization_id: str,
+        status: TaskV2Status,
+        *,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        now = naive_utc_now()
+        values: dict[str, Any] = {"status": status.value, "modified_at": now}
+        if status.is_final():
+            values["finished_at"] = func.coalesce(TaskV2Model.finished_at, now)
+        if failure_category is not None:
+            values["failure_category"] = failure_category
+        async with self.Session() as session:
+            result = await session.execute(
+                update(TaskV2Model)
+                .where(
+                    TaskV2Model.observer_cruise_id == task_v2_id,
+                    TaskV2Model.organization_id == organization_id,
+                    TaskV2Model.status.in_([s.value for s in TaskV2Status if not s.is_final()]),
+                )
+                .values(**values)
+                .returning(TaskV2Model.observer_cruise_id)
+            )
+            won = result.scalar_one_or_none() is not None
+            await session.commit()
+            return won
+
     @db_operation("update_task_v2")
     async def update_task_v2(
         self,
@@ -361,16 +393,19 @@ class ObserverRepository(BaseRepository):
         organization_id: str | None = None,
         webhook_failure_reason: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> TaskV2:
         async with self.Session() as session:
-            task_v2 = (
-                await session.scalars(
-                    select(TaskV2Model)
-                    .filter_by(observer_cruise_id=task_v2_id)
-                    .filter_by(organization_id=organization_id)
-                )
-            ).first()
+            query = (
+                select(TaskV2Model).filter_by(observer_cruise_id=task_v2_id).filter_by(organization_id=organization_id)
+            )
+            if keep_final_status:
+                query = query.with_for_update()
+            task_v2 = (await session.scalars(query)).first()
             if task_v2:
+                if keep_final_status and TaskV2Status(task_v2.status).is_final():
+                    return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
                 if status:
                     task_v2.status = status
                     if status == TaskV2Status.queued and task_v2.queued_at is None:
@@ -418,12 +453,12 @@ class ObserverRepository(BaseRepository):
         current_value: str | None = None,
         current_index: int | None = None,
         ai_fallback_triggered: bool | None = None,
+        attempt_number: int | None = None,
     ) -> WorkflowRunBlock:
-        if output is not None:
-            output = truncate_oversized_jsonb_value(
-                output,
-                context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
-            )
+        output_write = capped_jsonb_write(
+            output,
+            context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
+        )
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
                 workflow_run_id=workflow_run_id,
@@ -433,11 +468,13 @@ class ObserverRepository(BaseRepository):
                 label=label,
                 block_type=block_type,
                 status=status,
-                output=output,
+                output=output_write.value,
+                capped_output=output_write.capped_value,
                 continue_on_failure=continue_on_failure,
                 engine=engine,
                 current_value=current_value,
                 current_index=current_index,
+                attempt_number=attempt_number,
                 script_run=ScriptRunResponse(ai_fallback_triggered=ai_fallback_triggered).model_dump(mode="json")
                 if ai_fallback_triggered is not None
                 else None,
@@ -509,14 +546,13 @@ class ObserverRepository(BaseRepository):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
-        # Read before truncation: truncate_oversized_jsonb_value strips downloaded_files
-        # from oversized payloads, which would zero out an otherwise-real count.
+        # Read before truncation: the jsonb storage guard strips downloaded_files from
+        # oversized payloads, which would zero out an otherwise-real count.
         derived_downloaded_file_count = downloaded_file_count_from_output(output)
-        if output is not None:
-            output = truncate_oversized_jsonb_value(
-                output,
-                context={"workflow_run_block_id": workflow_run_block_id},
-            )
+        output_write = capped_jsonb_write(
+            output,
+            context={"workflow_run_block_id": workflow_run_block_id},
+        )
         async with self.Session() as session:
             workflow_run_block = (
                 await session.scalars(
@@ -529,7 +565,8 @@ class ObserverRepository(BaseRepository):
                 if status:
                     workflow_run_block.status = status
                 if output:
-                    workflow_run_block.output = output
+                    workflow_run_block.output = output_write.value
+                    workflow_run_block.capped_output = output_write.capped_value
                 if task_id:
                     workflow_run_block.task_id = task_id
                 if failure_reason:
@@ -627,6 +664,7 @@ class ObserverRepository(BaseRepository):
         new_status: str,
         only_if_status_in: list[str],
         failure_reason: str | None = None,
+        organization_id: str | None = None,
     ) -> int:
         if not only_if_status_in:
             return 0
@@ -636,12 +674,13 @@ class ObserverRepository(BaseRepository):
             if failure_reason is not None:
                 update_values["failure_reason"] = failure_reason
 
-            stmt = (
-                update(WorkflowRunBlockModel)
-                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
-                .where(WorkflowRunBlockModel.status.in_(only_if_status_in))
-                .values(**update_values)
-            )
+            stmt = update(WorkflowRunBlockModel).where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+            # No index leads with workflow_run_id; the run lookup index is (organization_id, workflow_run_id).
+            # An unknown organization still has to match every block of the run, so None adds no predicate
+            # rather than the `IS NULL` a filter_by would generate.
+            if organization_id is not None:
+                stmt = stmt.where(WorkflowRunBlockModel.organization_id == organization_id)
+            stmt = stmt.where(WorkflowRunBlockModel.status.in_(only_if_status_in)).values(**update_values)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount or 0
@@ -709,21 +748,68 @@ class ObserverRepository(BaseRepository):
             ).first()
             return RunEngine(engine) if engine else None
 
+    @db_operation("set_workflow_run_block_engine_by_task_id")
+    async def set_workflow_run_block_engine_by_task_id(
+        self,
+        task_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.task_id == task_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(engine=engine.value)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("workflow_run_has_block_on_engine")
+    async def workflow_run_has_block_on_engine(
+        self,
+        workflow_run_id: str,
+        engine: RunEngine,
+        organization_id: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            found = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel.workflow_run_block_id)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(engine=engine.value)
+                    .limit(1)
+                )
+            ).first()
+            return found is not None
+
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(
         self,
         workflow_run_id: str,
         organization_id: str | None = None,
+        prefer_capped: bool = False,
     ) -> list[WorkflowRunBlock]:
         async with self.Session() as session:
-            workflow_run_blocks = (
-                await session.scalars(
+            if prefer_capped:
+                table = WorkflowRunBlockModel.__table__
+                capped = (
+                    select(*prefer_capped_columns(table, raw="output", capped="capped_output"))
+                    .where(table.c.workflow_run_id == workflow_run_id)
+                    .where(table.c.organization_id == organization_id)
+                    .subquery()
+                )
+                capped_block = aliased(WorkflowRunBlockModel, capped, adapt_on_names=True)
+                query = select(capped_block).order_by(capped_block.created_at.desc())
+            else:
+                query = (
                     select(WorkflowRunBlockModel)
                     .filter_by(workflow_run_id=workflow_run_id)
                     .filter_by(organization_id=organization_id)
                     .order_by(WorkflowRunBlockModel.created_at.desc())
                 )
-            ).all()
+            workflow_run_blocks = (await session.scalars(query)).all()
             if self._task_reader is None:
                 raise RuntimeError("task_reader dependency not set")
             tasks = await self._task_reader.get_tasks_by_workflow_run_id(workflow_run_id)

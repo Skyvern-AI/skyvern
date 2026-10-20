@@ -294,6 +294,8 @@ class EventContextManager:
 
 
 class Page:
+    _skyvern_brokerable_handle = True
+
     def __init__(self, context: BrowserContext, session: CdpSession) -> None:
         self._context = context
         self._session = session

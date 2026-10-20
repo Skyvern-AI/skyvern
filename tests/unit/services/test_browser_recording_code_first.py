@@ -10,6 +10,8 @@ from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.types import (
     Action,
     ActionClick,
+    ActionDialog,
+    ActionDragDrop,
     ActionHover,
     ActionInputText,
     ActionKind,
@@ -29,7 +31,7 @@ START_URL = "https://example.com/start"
 
 
 def make_target(**kwargs) -> ActionTarget:
-    return ActionTarget(mouse=Mouse(xp=0.5, yp=0.5), **kwargs)
+    return ActionTarget(**{"mouse": Mouse(xp=0.5, yp=0.5), **kwargs})
 
 
 def make_click(ts: float, url: str = START_URL, **target_kwargs) -> ActionClick:
@@ -95,6 +97,29 @@ def make_hover(ts: float, url: str = START_URL, **target_kwargs) -> ActionHover:
     )
 
 
+def make_dialog(ts: float, response: str = "accept", dialog_type: str = "confirm") -> ActionDialog:
+    return ActionDialog(
+        kind=ActionKind.DIALOG,
+        target=make_target(),
+        timestamp_start=ts,
+        timestamp_end=ts + 1,
+        url=START_URL,
+        dialog_type=dialog_type,
+        response=response,
+    )
+
+
+def make_drag(ts: float) -> ActionDragDrop:
+    return ActionDragDrop(
+        kind=ActionKind.DRAG_DROP,
+        source=make_target(selector="#card", accessible_name="Card"),
+        target=make_target(selector="#column", accessible_name="Column"),
+        timestamp_start=ts,
+        timestamp_end=ts + 100,
+        url=START_URL,
+    )
+
+
 def draft_for(action: Action, **overrides) -> RecordingDraftStep:
     block_type = {
         ActionKind.URL_CHANGE: "goto_url",
@@ -136,6 +161,57 @@ def test_click_and_type_synthesize_single_code_block() -> None:
     assert parameters[0].default_value == ""
     assert parameters[0].workflow_parameter_type == "string"
     assert "widgets" not in block.code
+
+
+def test_dialog_policy_is_armed_before_triggering_click() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#remove", accessible_name="Remove"),
+        make_dialog(1010),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    code = blocks[0].code
+    policy = 'await set_dialog_policy(page, "accept")'
+    click = 'await page.locator("#remove").click()'
+    assert policy in code
+    assert code.index(policy) < code.index(click)
+
+
+def test_drag_drop_synthesizes_drag_to() -> None:
+    result = actions_to_code_first_blocks([make_drag(1000)], None)
+
+    assert result is not None
+    blocks, _ = result
+    assert 'await page.locator("#card").drag_to(page.locator("#column"))' in blocks[0].code
+    assert [step.action_type for step in blocks[0].steps or []] == ["goto_url", "drag"]
+
+
+def test_incomplete_iframe_click_emits_repair_instead_of_false_replay() -> None:
+    result = actions_to_code_first_blocks([make_click(1000, tag_name="iframe", selector="#embedded")], None)
+
+    assert result is not None
+    blocks, _ = result
+    assert 'page.locator("#embedded").click()' not in blocks[0].code
+    assert "incomplete_capture_unattached_frame" in blocks[0].code
+
+
+def test_chained_dialog_emits_repair_before_triggering_click() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#open", accessible_name="Open"),
+        make_dialog(1010, response="accept"),
+        make_dialog(1020, response="dismiss"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    code = blocks[0].code
+    assert "chained_dialog" in code
+    assert code.index("chained_dialog") < code.index('page.locator("#open").click()')
 
 
 def test_recorded_code_blocks_use_the_code_first_editor_shape() -> None:
@@ -183,6 +259,22 @@ def test_password_input_becomes_parameter_without_default() -> None:
     assert parameters[0].default_value == ""
 
 
+def test_recorded_targets_get_extended_visibility_waits() -> None:
+    actions: list[Action] = [
+        make_click(1000, selector="#generate"),
+        make_click(40000, selector="#download"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    readiness = 'await page.locator("#download").wait_for(state="visible", timeout=120000)'
+    click = 'await page.locator("#download").click()'
+    assert readiness in blocks[0].code
+    assert blocks[0].code.index(readiness) < blocks[0].code.index(click)
+
+
 def test_select_element_maps_to_select_option() -> None:
     actions: list[Action] = [
         make_input(1000, "CA", selector="#state", tag_name="SELECT", accessible_name="State"),
@@ -193,6 +285,48 @@ def test_select_element_maps_to_select_option() -> None:
     assert result is not None
     blocks, _ = result
     assert 'await page.locator("#state").select_option("CA")' in blocks[0].code
+
+
+def test_file_input_maps_to_an_authorized_file_attachment() -> None:
+    actions: list[Action] = [
+        make_input(1000, "", selector="#fileInput", tag_name="INPUT", input_type="file"),
+        make_click(2000, selector="#submit", role="button", accessible_name="Submit checklist"),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, parameters = result
+    assert 'await attach_authorized_file(page, upload_file, "#fileInput")' in blocks[0].code
+    assert "set_input_files" not in blocks[0].code
+    assert blocks[0].parameter_keys == ["upload_file"]
+    assert len(parameters) == 1
+    assert parameters[0].key == "upload_file"
+    assert parameters[0].workflow_parameter_type == "file_url"
+    assert parameters[0].default_value == ""
+
+
+def test_file_inputs_in_separate_blocks_keep_distinct_parameter_references() -> None:
+    actions: list[Action] = [
+        make_input(1000, "", selector="#firstFile", tag_name="INPUT", input_type="file"),
+        make_url_change(5000, "https://example.com/second"),
+        make_input(
+            6000,
+            "",
+            url="https://example.com/second",
+            selector="#secondFile",
+            tag_name="INPUT",
+            input_type="file",
+        ),
+    ]
+
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, parameters = result
+    assert 'attach_authorized_file(page, upload_file, "#firstFile")' in blocks[0].code
+    assert 'attach_authorized_file(page, upload_file_2, "#secondFile")' in blocks[1].code
+    assert [parameter.key for parameter in parameters] == ["upload_file", "upload_file_2"]
 
 
 def test_wait_and_hover_emit_deterministic_lines() -> None:
@@ -254,10 +388,84 @@ def test_goto_only_recording_emits_goto_code_block() -> None:
     assert parameters == []
 
 
-def test_actions_without_locators_fall_back_to_none() -> None:
-    actions: list[Action] = [make_click(1000), make_click(2000)]
+def test_actions_without_locators_emit_repair_step() -> None:
+    actions: list[Action] = [make_click(1000), make_click(2000, selector="body")]
 
-    assert actions_to_code_first_blocks(actions, None) is None
+    result = actions_to_code_first_blocks(actions, None)
+
+    assert result is not None
+    blocks, _ = result
+    assert blocks[0].code.count("Recorded click needs repair:") == 2
+    assert [step.description for step in blocks[0].steps or []].count("Repair recorded click") == 2
+
+
+@pytest.mark.asyncio
+async def test_process_keeps_every_action_of_a_long_recording() -> None:
+    actions: list[Action] = [
+        make_click(float(index * 1000), **({} if index == 47 else {"selector": f"#button-{index}"}))
+        for index in range(96)
+    ]
+
+    blocks, _, _ = await Processor(PBS_ID, ORG_ID, WP_ID).process([], recorded_actions=actions)
+
+    assert blocks
+    code = "\n".join(block.code for block in blocks)
+    steps = [step.description for block in blocks for step in block.steps or []]
+    assert code.count(".click(") == 95
+    assert steps.count("Repair recorded click") == 1
+    assert code.index("#button-46") < code.index("Recorded click needs repair:") < code.index("#button-48")
+    assert "#button-0" in code
+    assert "#button-95" in code
+
+
+def test_select_of_empty_value_option_emits_repair_step() -> None:
+    result = actions_to_code_first_blocks(
+        [
+            make_input(1000, "", tag_name="SELECT", selector="#country"),
+            make_click(2000, selector="#next"),
+        ],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    assert "Recorded select_option needs repair: missing_value" in blocks[0].code
+    assert 'await page.locator("#next").click()' in blocks[0].code
+    repair = next(step for step in blocks[0].steps or [] if step.description == "Repair recorded select_option")
+    assert repair.action_type == "select_option"
+
+
+def test_canvas_click_replays_its_recorded_offset() -> None:
+    result = actions_to_code_first_blocks(
+        [
+            make_click(
+                1000, tag_name="CANVAS", selector="#board", mouse=Mouse(xp=0.5, yp=0.5, offset_x=12.5, offset_y=40)
+            ),
+            make_click(2000, tag_name="CANVAS", selector="#board"),
+        ],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    assert 'await page.locator("#board").click(position={"x": 12.5, "y": 40.0})' in blocks[0].code
+    assert "Recorded click needs repair: missing_canvas_offset" in blocks[0].code
+
+
+def test_repair_step_metadata_does_not_persist_url_secrets() -> None:
+    result = actions_to_code_first_blocks(
+        [make_click(1000, url="https://alice:supersecret@example.com/path?token=raw-token#secret=raw-fragment")],
+        None,
+    )
+
+    assert result is not None
+    blocks, _ = result
+    serialized = blocks[0].model_dump_json()
+    assert "alice" not in serialized
+    assert "supersecret" not in serialized
+    assert "raw-token" not in serialized
+    assert "raw-fragment" not in serialized
+    assert any(step.description == "Repair recorded click" for step in blocks[0].steps or [])
 
 
 def test_draft_overlay_deletion_drops_action() -> None:
@@ -428,19 +636,17 @@ async def test_process_binds_credentials_only_for_a_caller_that_substitutes_toke
     )
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
 
-    unsupported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts, code_first=True)
-    supported_blocks, _, _ = await processor.process(
-        ["chunk"], draft_steps=drafts, code_first=True, supports_credential_tokens=True
-    )
+    unsupported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts)
+    supported_blocks, _, _ = await processor.process(["chunk"], draft_steps=drafts, supports_credential_tokens=True)
 
-    # The route defaults to off, so an old frontend never receives code reading a token it
+    # Token substitution defaults to off, so an old frontend never receives code reading a token it
     # cannot rename - which would persist a block that fails at run time with a NameError.
     assert "cred_123" not in unsupported_blocks[0].code
     assert "cred_123.password" in supported_blocks[0].code
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_process_returns_code_blocks_and_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     typed_value = "hunter2-distinct"
     actions: list[Action] = [
         make_input(1000, typed_value, selector="#query", input_type="text"),
@@ -454,7 +660,7 @@ async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: 
     )
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID, recording_attempt_id="rra_test")
-    blocks, _, evidence = await processor.process(["chunk"], code_first=True)
+    blocks, _, evidence = await processor.process(["chunk"])
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"
@@ -468,20 +674,33 @@ async def test_process_code_first_returns_code_blocks_and_evidence(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_falls_back_to_legacy_when_synthesis_empty(
+async def test_process_keeps_code_blocks_when_a_recorded_action_needs_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(Processor, "compressed_chunks_to_events", lambda self, chunks: [])
+    action = make_click(1000)
+    monkeypatch.setattr(
+        Processor,
+        "events_to_actions",
+        lambda self, events, machines=None, initial_actions=None: [action],
+    )
+
+    async def fail_legacy_conversion(*args: object, **kwargs: object) -> object:
+        raise AssertionError("legacy draft conversion must not run")
+
+    monkeypatch.setattr(Processor, "create_action_block", fail_legacy_conversion)
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, parameters, _ = await processor.process(["chunk"], code_first=True)
+    blocks, parameters, evidence = await processor.process(["chunk"], draft_steps=[draft_for(action)])
 
-    assert blocks == []
+    assert len(blocks) == 1
+    assert "Recorded click needs repair:" in blocks[0].code
     assert parameters == []
+    assert evidence is not None
 
 
 @pytest.mark.asyncio
-async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
+async def test_process_applies_draft_overlay_before_code_synthesis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kept = make_click(1000, selector="#keep", accessible_name="Keep")
@@ -494,7 +713,7 @@ async def test_process_code_first_prefers_draft_overlay_over_drafts_to_blocks(
     )
 
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
-    blocks, _, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)], code_first=True)
+    blocks, _, _ = await processor.process(["chunk"], draft_steps=[draft_for(kept)])
 
     assert len(blocks) == 1
     assert blocks[0].block_type == "code"

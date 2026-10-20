@@ -4,17 +4,20 @@ import asyncio
 import copy
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.failure_classifier import with_sign_in_form_visible
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -22,13 +25,13 @@ from skyvern.forge.sdk.copilot.agent import (
     _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY,
     _build_dynamic_system_prompt,
     _build_user_context,
-    _make_agent_result,
+    _build_wip_exit_result,
     _prior_run_debug_text,
     _recorded_build_test_outcome_prompt,
+    _review_projection_for,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
-    _EXECUTED_CALL_REF_LIMIT,
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
     OBSERVED_BLOCK_END_URLS_EMPTY,
@@ -37,6 +40,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestConnectFailure,
     BuildTestEvidencePacket,
     BuildTestFailedOperation,
+    BuildTestPacketAiFallbackBlock,
     BuildTestPacketDownload,
     BuildTestPacketFailure,
     BuildTestPacketLocatorObservation,
@@ -44,6 +48,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRegisteredOutput,
     BuildTestPacketRequestedOutput,
     BuildTestPacketUnfinishedItem,
+    LoopInputFact,
+    LoopInputs,
+    LoopSelectedInput,
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
     authored_block_signatures_from_workflow,
@@ -56,16 +63,16 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_authoring_repair_context,
     recorded_outcome_from_run_blocks_result,
     recorded_outcome_from_scout_act_observe_hollow,
-    unresolved_runtime_block_failure,
-    unresolved_runtime_block_failure_with_disposition,
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
-from skyvern.forge.sdk.copilot.failure_tracking import selector_identity_from_failure
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
+    BUILD_TEST_PACKET_KEY,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
     labelled_url_screen_reasons,
@@ -73,6 +80,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     project_direct_test_handoff_packet_for_llm,
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     build_test_page_state_from_evidence,
@@ -80,10 +88,12 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR,
     _authored_literal_locator_selectors,
-    _carry_unresolved_failure_into_result,
+    _carry_prior_attempt_change_identity_into_result,
     _failed_block_code,
     _failing_code_line,
     _newest_failed_result,
@@ -92,27 +102,62 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _run_blocks_and_collect_debug,
     _verify_and_record_run_blocks_result,
     build_test_evidence_packet,
+    finalize_build_test_result,
+    loop_definition_facts,
+    loop_selected_input,
+    project_run_results_page,
+    with_loop_observations,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _update_workflow,
+    publish_workflow_candidate,
+    restore_pending_workflow_proposal,
+)
+from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations, workflow_to_copilot_yaml
+from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome, UnresolvedRuntimeFailure
+from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PRIVATE_SETTINGS_KEY,
+    CopilotProposalMetadata,
+    copilot_proposal_metadata,
+)
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunStatus,
+    workflow_definition_sha256,
+)
+from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from tests.unit.copilot_test_helpers import (
     HANDBACK_WORKFLOW_YAML,
+    HARNESS_RUN_CREATED_AT,
     SEARCH_THEN_SELECT_WORKFLOW_YAML,
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    historical_code_version,
+    inert_approval_workflow,
     install_get_run_results_harness,
+    install_historical_run,
     install_run_blocks_harness,
     make_copilot_ctx,
     make_stub_html_artifact,
@@ -121,7 +166,6 @@ from tests.unit.copilot_test_helpers import (
     run_result_action_row,
     run_result_block_row,
     same_run_page_evidence,
-    straight_line_login_yaml,
     terminal_extraction_block,
     two_page_login_yaml,
 )
@@ -620,17 +664,13 @@ def test_acquisition_failure_without_a_run_id_still_leaves_the_earlier_failure_f
     )
 
     # An acquisition failure that never reached a run names none, so it merges into the failure it
-    # follows and keeps that run's identity. The record must never carry runtime_block_failure under
-    # an empty run id: the scan reads that as an incomplete record and stops, reporting nothing.
+    # follows and keeps that run's identity.
     latest = ctx.latest_recorded_build_test_outcome
     assert latest is not None
     assert latest.workflow_run_id == "wr_1"
     assert latest.attempted_block_label == "collect_credentials"
     assert latest.connect_failure is not None
     assert ctx.recorded_build_test_outcome_history[-1]["workflow_run_id"] == "wr_1"
-    assert unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_is_persisted=True)[1] != (
-        "incomplete_failure_record"
-    )
 
 
 def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence() -> None:
@@ -814,8 +854,8 @@ def test_a_terminal_challenge_keeps_its_own_reason_over_an_earlier_block_failure
 
 
 def test_a_block_failure_with_no_run_id_is_never_merged_into_an_acquisition_failure() -> None:
-    """The merged record must carry a real run id. Stamped runtime_block_failure under an empty one,
-    the unresolved-failure scan reads it as an incomplete record and stops, reporting nothing."""
+    """The merged record must carry a real run id: the prior-attempt change identity names the
+    earlier attempt by it."""
     ctx = _run_history_ctx(two_page_login_yaml())
     ctx.runner_code_block_associations_by_label = {}
     record_build_test_outcome(
@@ -882,14 +922,12 @@ def test_a_different_runs_blocker_is_not_restated_as_the_earlier_runs_block_fail
     assert latest.reason_code == "terminal_challenge_blocker"
     assert latest.attempted_block_label == ""
     assert latest.failed_block_labels == []
-    # The earlier run's failure is still carried, and is still the one the unresolved-failure scan
-    # finds: wr_2's own entry must not be stamped as a runtime block failure under wr_2's id.
+    # The earlier run's failure is still carried: wr_2's own entry must not be stamped as a runtime
+    # block failure under wr_2's id.
     assert latest.failed_operation is not None
     assert latest.failed_operation.workflow_run_id == "wr_1"
     assert ctx.recorded_build_test_outcome_history[-1]["reason_code"] == "terminal_challenge_blocker"
-    unresolved = unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_is_persisted=True)[0]
-    assert unresolved is not None
-    assert unresolved.workflow_run_id == "wr_1"
+    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == ["wr_1", "wr_2"]
 
 
 def test_later_run_with_its_own_failed_block_replaces_the_earlier_attribution() -> None:
@@ -1618,7 +1656,6 @@ def test_recorded_failed_run_preserves_runtime_block_identity() -> None:
         assert outcome.reason_code == "runtime_block_failure"
         assert outcome.verdict == "repairable_failure"
         assert outcome.attempted_block_label == "collect_top_entry"
-        assert outcome.attempted_call_ref == "locator:#cta-stale-regression-probe"
 
 
 def test_failed_run_classification_preserved_for_failed_block() -> None:
@@ -2036,6 +2073,10 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
     )
     run_workflow = SimpleNamespace(
         workflow_id="wf_run_snapshot",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
         organization_id=ctx.organization_id,
         workflow_definition=SimpleNamespace(
             parameters=[output_parameter],
@@ -2049,13 +2090,19 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         ),
     )
     run = SimpleNamespace(
+        workflow_run_id="wr_failed_complete_packet",
+        workflow_id="wf_run_snapshot",
         workflow_permanent_id=ctx.workflow_permanent_id,
         browser_session_id="pbs_failed_complete_packet",
         status="failed",
         failure_reason="Code block failed.",
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
+        workflow_definition_sha256=None,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
+        parent_workflow_run_block_id=None,
         task_id=None,
         label="collect_records",
         block_type=SimpleNamespace(name="CODE"),
@@ -2178,7 +2225,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         workflow_run_id="wr_failed_complete_packet",
     )
     assert nonassociated is not None
-    assert "execution_source" not in nonassociated["run"]
+    assert nonassociated["run"]["execution_source"]["source_kind"] == "run_version"
+    assert nonassociated["run"]["execution_source"]["workflow_id"] == "wf_run_snapshot"
 
 
 def test_unavailable_registered_output_rows_do_not_become_false_missing_output_facts() -> None:
@@ -2377,12 +2425,9 @@ def _generated_code_exception_result(
     }
 
 
-def test_generated_code_exception_reaches_repair_and_needs_a_changed_submission() -> None:
+def test_generated_code_exception_reaches_repair() -> None:
     """A raised exception is the only evidence: no page state, no outputs, no failure categories."""
     raising_code = "total = passenger_count * fare\nawait page.locator('#pay-now').click()\n"
-    repaired_code = (
-        "total = int(await page.locator('#pax').input_value()) * fare\nawait page.locator('#pay-now').click()\n"
-    )
     failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
     other_line_reason = "CodeBlock failed with NameError at line 2: name 'passenger_count' is not defined."
 
@@ -2441,64 +2486,6 @@ def test_generated_code_exception_reaches_repair_and_needs_a_changed_submission(
     assert failure_reason in rendered
     assert "page_capture: status=unavailable; omission=page_capture_unavailable" in rendered
 
-    # Re-running the same code does not clear the failure; a changed submission does.
-    assert unresolved_runtime_block_failure(
-        ctx,
-        reported_workflow_yaml=_raising_code_workflow_yaml(raising_code),
-        pending_later_run_id="wr_trip_rerun",
-    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_trip", block_label="book_trip")
-    assert (
-        unresolved_runtime_block_failure(
-            ctx,
-            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_code),
-            pending_later_run_id="wr_trip_rerun",
-        )
-        is None
-    )
-
-
-def _looped_code_workflow_yaml(code: str) -> str:
-    return (
-        "workflow_definition:\n"
-        "  parameters: []\n"
-        "  blocks:\n"
-        "  - block_type: for_loop\n"
-        "    label: per_passenger\n"
-        "    loop_over: passengers\n"
-        "    loop_blocks:\n"
-        "    - block_type: code\n"
-        "      label: book_trip\n"
-        "      code: |\n" + "".join(f"        {line}\n" for line in code.splitlines())
-    )
-
-
-def test_a_repaired_code_block_inside_a_loop_clears_its_failure() -> None:
-    """A nested block is repaired by editing its code, so its signature has to be readable there."""
-    raising_code = "total = passenger_count * fare\n"
-    repaired_code = "total = int(await page.locator('#pax').input_value()) * fare\n"
-    failure_reason = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
-
-    ctx = _run_history_ctx(_looped_code_workflow_yaml(raising_code))
-    record_build_test_outcome(
-        ctx,
-        recorded_outcome_from_run_blocks_result(_generated_code_exception_result("wr_loop", failure_reason)),
-    )
-
-    assert ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"]
-    assert unresolved_runtime_block_failure(
-        ctx,
-        reported_workflow_yaml=_looped_code_workflow_yaml(raising_code),
-        pending_later_run_id="wr_loop_rerun",
-    ) == UnresolvedRuntimeFailure(workflow_run_id="wr_loop", block_label="book_trip")
-    assert (
-        unresolved_runtime_block_failure(
-            ctx,
-            reported_workflow_yaml=_looped_code_workflow_yaml(repaired_code),
-            pending_later_run_id="wr_loop_rerun",
-        )
-        is None
-    )
-
 
 def test_a_code_failure_with_no_typed_identity_is_not_admitted() -> None:
     """Nothing names the failure, so no later edit could ever be shown to have addressed it."""
@@ -2525,55 +2512,39 @@ def test_a_code_failure_with_no_typed_identity_is_not_admitted() -> None:
     )
 
 
-def test_a_recorded_code_failure_always_has_a_route_out_and_native_blocks_stay_out() -> None:
-    """Both edges of admitting a bare block failure.
-
-    A non-builtin exception inside a code block reaches persistence as the runner's generic phrase,
-    naming neither the exception nor a line, and that failure still has to clear when the block is
-    rewritten. A native block — which has no code signature to change — must not be admitted at
-    all, or its unresolved-failure note could never be cleared by any edit.
-    """
+def test_a_bare_code_failure_is_admitted_and_native_blocks_stay_out() -> None:
+    """A non-builtin exception in a code block reaches persistence as the runner's generic phrase and
+    is still recorded as an authored-code failure; a native block's failure is not."""
     # Byte-for-byte what the runner persists when the raised class is not a builtin, e.g. a
     # Playwright timeout: the exception's own words are stripped on the way out.
     generic_reason = "CodeBlock failed while running user code."
-    timed_out = 'await page.locator("#pay-now").click()\n'
-    repaired_same_selector = 'await page.locator("#pay-now").first.click(timeout=15000)\n'
 
-    ctx = _run_history_ctx(_raising_code_workflow_yaml(timed_out))
-    record_build_test_outcome(
-        ctx,
-        recorded_outcome_from_run_blocks_result(
-            {
-                "ok": False,
-                "data": {
-                    "workflow_run_id": "wr_browser_op",
-                    "overall_status": "failed",
-                    "requested_block_labels": ["book_trip"],
-                    "blocks": [
-                        {
-                            "label": "book_trip",
-                            "block_type": "CODE",
-                            "status": "failed",
-                            "failure_reason": generic_reason,
-                            "error_codes": ["user_code_error"],
-                        }
-                    ],
-                },
-            }
-        ),
+    admitted = recorded_outcome_from_run_blocks_result(
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_browser_op",
+                "overall_status": "failed",
+                "requested_block_labels": ["book_trip"],
+                "blocks": [
+                    {
+                        "label": "book_trip",
+                        "block_type": "CODE",
+                        "status": "failed",
+                        "failure_reason": generic_reason,
+                        "error_codes": ["user_code_error"],
+                    }
+                ],
+            },
+        }
     )
-    assert (
-        unresolved_runtime_block_failure(
-            ctx,
-            reported_workflow_yaml=_raising_code_workflow_yaml(repaired_same_selector),
-            pending_later_run_id="wr_browser_op_rerun",
-        )
-        is None
-    )
+    assert admitted is not None
+    assert admitted.reason_code == "runtime_block_failure"
+    assert admitted.attempted_block_label == "book_trip"
 
     # A failure no rewrite could have prevented is not recorded as an authored-code failure: the
     # same block can pass unchanged once the sandbox is back, the browser reconnects, or the run is
-    # not cancelled, and recording one would hold the block open until an unrelated edit.
+    # not cancelled.
     for code in ("runner_unavailable", "browser_disconnected", "cancelled"):
         assert (
             recorded_outcome_from_run_blocks_result(
@@ -2620,214 +2591,6 @@ def test_a_recorded_code_failure_always_has_a_route_out_and_native_blocks_stay_o
     assert native_outcome is None
 
 
-def test_failure_stays_open_when_a_later_run_passes_without_taking_the_failed_branch() -> None:
-    """The live shape: the block runs to completion while its internal branch skips the failing call."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.workflow_run_id == "wr_1"
-    assert open_failure.block_label == "sign_in_and_read"
-
-
-def test_a_later_run_of_a_straight_line_block_does_not_clear_the_failure() -> None:
-    """Executing the block again proves the call ran, not that it met the condition that failed.
-
-    A login step fails against an already-authenticated page and passes against a signed-out one on
-    the same lines, so a later success on unchanged code establishes nothing about the failure.
-    """
-    ctx = _run_history_ctx(straight_line_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-    assert open_failure is not None
-    assert open_failure.workflow_run_id == "wr_1"
-
-
-def test_a_later_run_of_a_branched_block_does_not_clear_the_failure() -> None:
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    assert unresolved_runtime_block_failure(ctx) is not None
-
-
-def test_a_delivered_candidate_that_removes_the_call_retires_the_failure() -> None:
-    """The legitimate repair: the candidate this turn delivers no longer carries the failing call."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    repaired = two_page_login_yaml(submit_selector="Continue")
-    ctx.workflow_yaml = repaired
-
-    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=repaired) is None
-
-
-def test_a_block_missing_from_the_delivered_workflow_does_not_clear_the_failure() -> None:
-    """The delivered snapshot is taken before the turn authors anything, so a block written during
-    the turn is absent from it. Absence is not proof of repair."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    snapshot_without_the_block = "title: t\nworkflow_definition:\n  blocks: []\n"
-
-    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=snapshot_without_the_block) is not None
-
-
-def test_an_unrelated_edit_to_the_block_does_not_retire_the_failing_call() -> None:
-    """The call-level check earns its place here: the block changed, the failing call did not."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    ctx.workflow_yaml = two_page_login_yaml().replace(
-        'return {"visitors": "9.42K"}', 'return {"visitors": "9.42K", "extra": 1}'
-    )
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.block_label == "sign_in_and_read"
-
-
-def test_a_failure_with_no_later_run_is_the_turns_own_headline_not_an_unresolved_note() -> None:
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-
-    assert unresolved_runtime_block_failure(ctx) is None
-
-
-def test_another_record_for_the_same_run_id_is_not_a_later_run() -> None:
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_1", ["sign_in_and_read"]))
-
-    assert unresolved_runtime_block_failure(ctx) is None
-
-
-def test_author_time_work_after_the_failure_is_not_a_later_run() -> None:
-    """Scout evaluations and author-time rejects share this history but execute nothing."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(
-        ctx,
-        RecordedBuildTestOutcome(
-            phase="author_time_reject",
-            attempted_tool="update_and_run_blocks",
-            verdict="repairable_failure",
-            reason_code="synthesized_parameter_binding_ambiguous",
-            structural_failure_identity="author-time-identity",
-        ),
-    )
-
-    assert unresolved_runtime_block_failure(ctx) is None
-
-
-def test_a_later_run_still_arms_the_note_when_author_time_work_follows_it() -> None:
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
-    record_build_test_outcome(
-        ctx,
-        RecordedBuildTestOutcome(
-            phase="scout_evaluate",
-            attempted_tool="evaluate",
-            verdict="progress_observed",
-            reason_code="run_completed_unevaluated",
-            structural_failure_identity="scout-identity",
-        ),
-    )
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.workflow_run_id == "wr_1"
-
-
-def test_a_code_block_nested_in_a_loop_is_still_found() -> None:
-    """A failure inside a loop body must stay reportable, not vanish because the walk missed it."""
-    ctx = _run_history_ctx(
-        """
-    title: Loop over rows
-    workflow_definition:
-      blocks:
-      - block_type: for_loop
-        label: each_row
-        loop_blocks:
-        - block_type: code
-          label: sign_in_and_read
-          code: |
-            if await page.locator("#token").count():
-                await page.get_by_role("button", name="Login", exact=True).click()
-    """
-    )
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["each_row"]))
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.block_label == "sign_in_and_read"
-
-
-def test_a_css_selector_failure_matches_the_locator_call_in_the_draft() -> None:
-    """A failure that spells it "selector:" must still match code that spells it locator()."""
-    ctx = _run_history_ctx(
-        """
-    title: Read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          if await page.locator("#token").count():
-              await page.locator("#submit-btn").click()
-    """
-    )
-    # Derived, not hardcoded: the point of the test is that the two spellings normalize together.
-    call_ref = selector_identity_from_failure('TimeoutError: resolved selector: "#submit-btn" never appeared')
-    assert call_ref == "locator:#submit-btn"
-    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": call_ref})
-    record_build_test_outcome(ctx, outcome)
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.block_label == "sign_in_and_read"
-
-
-def test_run_blocks_outcome_extracts_the_implicated_call_from_the_failure_text() -> None:
-    outcome = recorded_outcome_from_run_blocks_result(
-        {
-            "ok": False,
-            "data": {
-                "workflow_run_id": "wr_failed",
-                "overall_status": "failed",
-                "failure_type": "runtime_error",
-                "blocks": [
-                    {
-                        "label": "get_visitors",
-                        "block_type": "code",
-                        "status": "failed",
-                        "failure_reason": (
-                            "code block failed. failure reason: Failed to execute code block. Reason: "
-                            "TimeoutError: Locator.click: Timeout 30000ms exceeded. Call log: - waiting for "
-                            'get_by_role("button", name="Continue", exact=True)'
-                        ),
-                    },
-                ],
-            },
-        },
-    )
-
-    assert outcome is not None
-    assert outcome.attempted_call_ref == "role:button:Continue"
-
-
 def _templated_selector_yaml(*, templated: bool = True) -> str:
     call = 'f"#submit-{kind}"' if templated else '"#submit-btn"'
     return f"""
@@ -2842,28 +2605,12 @@ def _templated_selector_yaml(*, templated: bool = True) -> str:
     """
 
 
-def test_a_templated_selector_does_not_read_as_the_call_being_removed() -> None:
-    """A runtime-built selector is invisible to the literal scan, so it cannot prove removal."""
-    ctx = _run_history_ctx(_templated_selector_yaml())
-    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#submit-btn"})
-    record_build_test_outcome(ctx, outcome)
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    open_failure = unresolved_runtime_block_failure(ctx)
-
-    assert open_failure is not None
-    assert open_failure.block_label == "sign_in_and_read"
-
-
 def test_merging_an_acquisition_failure_does_not_resnapshot_the_failure_against_edited_code() -> None:
     """History snapshots are taken from the current draft, so re-appending the carried failure after
     an edit would record it against code the run never executed."""
     ctx = _run_history_ctx(_templated_selector_yaml())
     ctx.runner_code_block_associations_by_label = {}
-    record_build_test_outcome(
-        ctx,
-        failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": ""}),
-    )
+    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
     entries_before = len(ctx.recorded_build_test_outcome_history)
     signature_at_failure = ctx.recorded_build_test_outcome_history[-1]["attempted_block_signature"]
     assert signature_at_failure
@@ -2892,58 +2639,6 @@ def test_merging_an_acquisition_failure_does_not_resnapshot_the_failure_against_
     assert latest is not None
     assert latest.reason_code == "runtime_block_failure"
     assert latest.connect_failure is not None
-
-
-def test_a_carried_failure_keeps_the_call_reference_so_an_edit_alone_cannot_retire_it() -> None:
-    """Carrying the block label without its call reference would downgrade clearance to a
-    whole-block signature comparison, which any unrelated edit trips."""
-    delivered = _templated_selector_yaml()
-    ctx = _run_history_ctx(delivered)
-    ctx.runner_code_block_associations_by_label = {}
-    record_build_test_outcome(
-        ctx,
-        failed_second_factor_run("wr_1").model_copy(
-            update={
-                "attempted_call_ref": "locator:#submit-btn",
-                "failed_operation": BuildTestFailedOperation(
-                    kind="browser_operation_failed",
-                    workflow_run_id="wr_1",
-                    block_label="sign_in_and_read",
-                    failing_line=2,
-                ),
-            }
-        ),
-    )
-    record_build_test_outcome(
-        ctx,
-        RecordedBuildTestOutcome(
-            phase="persisted_block_run",
-            verdict="not_authoritative",
-            reason_code="unrecoverable_tool_error",
-            workflow_run_id="wr_1",
-            connect_failure=BuildTestConnectFailure(
-                state="cdp_connect_failed",
-                browser_session_id="pbs_stale",
-            ),
-        ),
-    )
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    assert ctx.recorded_build_test_outcome_history[-2]["attempted_call_ref"] == "locator:#submit-btn"
-    open_failure = unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered)
-    assert open_failure is not None
-    assert open_failure.block_label == "sign_in_and_read"
-
-
-def test_an_all_literal_block_still_retires_when_the_call_is_gone() -> None:
-    """The pass path: with every selector a literal, absence really is proof of removal."""
-    delivered = _templated_selector_yaml(templated=False)
-    ctx = _run_history_ctx(delivered)
-    outcome = failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#gone-btn"})
-    record_build_test_outcome(ctx, outcome)
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-
-    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered) is None
 
 
 def _secure_runner_failure_result(error_code: str, category: str | None) -> dict[str, object]:
@@ -3075,7 +2770,7 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
         ],
     }
 
-    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings")
+    from_evidence = build_test_page_state_from_evidence(evidence, workflow_run_id="wr_bindings", omission_notices=[])
 
     assert from_evidence is not None
     assert from_evidence.value_bindings == ["Sessions started=72.51k"]
@@ -3105,6 +2800,48 @@ def test_a_page_whose_only_fact_is_a_label_value_pair_still_yields_a_packet_page
     assert packet.failure.page_state.value_bindings == ["Sessions started=72.51k"]
     assert projected.failure is not None and projected.failure.page_state is not None
     assert projected.failure.page_state.value_bindings == ["Sessions started=72.51k"]
+
+
+_BLOCKING_LAYER = {
+    "kind": "interaction_blocking_layer",
+    "text": "We use cookies",
+    "intercepts_outside_control": True,
+    "visible_controls": [{"tag": "button", "text": "Accept all"}],
+    "visible_controls_omitted": 1,
+}
+
+
+def test_a_blocking_layer_reaches_the_model_and_a_malformed_one_is_announced() -> None:
+    ctx = _locator_packet_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    result: dict[str, object] = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {
+            "workflow_run_id": "wr_obstructed",
+            "overall_status": "failed",
+            "blocks": [{"label": "search", "status": "failed", "failure_reason": "RuntimeError"}],
+            "post_run_page_evidence": {
+                "workflow_run_id": "wr_obstructed",
+                "observed_after_workflow_run": True,
+                "page_obstructions": [_BLOCKING_LAYER, {**_BLOCKING_LAYER, "undeclared_field": "x"}],
+            },
+        },
+    }
+    _record_run_blocks_result(ctx, result)
+
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["build_test_packet"] = build_test_evidence_packet(ctx, result).model_dump(mode="json", exclude_none=True)
+    model_packet = json.loads(json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)))["data"][
+        "build_test_packet"
+    ]
+
+    assert "failure.page_state.obstructions omitted: 1 malformed item(s)." in model_packet["omission_notices"]
+    assert [
+        (item["text"], item["intercepts_outside_control"], item["visible_controls_omitted"])
+        for item in model_packet["failure"]["page_state"]["obstructions"]
+    ] == [("We use cookies", True, 1)]
 
 
 def test_a_standalone_clickable_control_reaches_the_packet_page_state_and_the_llm_projection() -> None:
@@ -4987,165 +4724,6 @@ def test_the_projection_hands_every_consumer_an_already_redacted_packet() -> Non
     assert projected.failure.error_codes == ["user_code_error"]
 
 
-def test_a_draft_that_drops_the_call_does_not_clear_it_in_the_delivered_workflow() -> None:
-    """Clearance must read the candidate the turn presents as saved, not whichever draft is current.
-
-    A draft the user never receives can remove the failing call while the delivered workflow still
-    contains it, which would clear a failure the customer still has.
-    """
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
-    # The draft under the cursor drops the failing call; the delivered workflow keeps it.
-    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-    delivered = two_page_login_yaml()
-    ctx.persisted_workflow_yaml = delivered
-
-    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=delivered) is not None
-
-
-def test_clearance_holds_when_the_delivered_workflow_dropped_the_call() -> None:
-    """The legitimate case: the saved workflow itself no longer carries the failing call."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["read_metric"]))
-    repaired = two_page_login_yaml(submit_selector="Continue")
-    ctx.workflow_yaml = repaired
-    ctx.persisted_workflow_yaml = repaired
-
-    assert unresolved_runtime_block_failure(ctx, reported_workflow_yaml=repaired) is None
-
-
-def _run_result_ok() -> dict:
-    return {"ok": True, "data": {"workflow_run_id": "wr_2", "overall_status": "completed"}}
-
-
-def test_a_passing_run_carries_an_earlier_unresolved_failure_to_the_model() -> None:
-    """The model decides whether to repair from this result, so the failure has to survive into it.
-
-    A later success otherwise displaces the failing run before that decision is made: the model sees a
-    pass, has no record of the failure, and reports done.
-    """
-    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
-
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    result = _run_result_ok()
-
-    _carry_unresolved_failure_into_result(ctx, result)
-
-    carried = result["data"]["unresolved_earlier_failure"]
-    assert carried["workflow_run_id"] == "wr_1"
-    assert carried["block_label"] == "sign_in_and_read"
-    assert carried["failure_kind"] == "runtime_block_failure"
-    assert "does not establish" in carried["note"]
-
-
-def test_a_delivered_repair_leaves_the_passing_result_untouched() -> None:
-    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
-
-    repaired = two_page_login_yaml(submit_selector="Continue")
-    ctx = _run_history_ctx(repaired)
-    ctx.persisted_workflow_yaml = repaired
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    result = _run_result_ok()
-
-    _carry_unresolved_failure_into_result(ctx, result)
-
-    assert "unresolved_earlier_failure" not in result["data"]
-
-
-def test_a_passing_run_with_no_earlier_failure_carries_no_extra_field() -> None:
-    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
-
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-    result = _run_result_ok()
-
-    _carry_unresolved_failure_into_result(ctx, result)
-
-    assert "unresolved_earlier_failure" not in result["data"]
-
-
-def test_the_carry_survives_compaction_of_an_older_tool_output() -> None:
-    """The model may decide to repair several turns later, after the output has been compacted.
-
-    Dropping the field there would reproduce the loss it exists to prevent.
-    """
-    import json
-
-    from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
-
-    carried = {
-        "workflow_run_id": "wr_1",
-        "block_label": "sign_in_and_read",
-        "failure_kind": "runtime_block_failure",
-        "note": "this run passing does not establish that the earlier failure was resolved",
-    }
-    output = json.dumps(
-        {
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr_2",
-                "overall_status": "completed",
-                "unresolved_earlier_failure": carried,
-                "padding": "x" * 400,
-            },
-        }
-    )
-
-    synopsis = json.loads(_summarize_tool_output(output))
-
-    assert synopsis["unresolved_earlier_failure"] == carried
-
-
-def test_every_run_surface_attaches_through_the_same_helper() -> None:
-    """One attachment helper covers every run surface; attaching at a single tool left it inert.
-
-    Successful runs reach it from `run_blocks` and from the shared edit/update path, and some
-    unsuccessful early returns call it harmlessly. What matters is that no run surface returns a
-    result without passing through it.
-    """
-    from pathlib import Path as _Path
-
-    tools = _Path(__file__).resolve().parents[2] / "skyvern/forge/sdk/copilot/tools/__init__.py"
-    source = tools.read_text()
-
-    call = "_carry_unresolved_failure_into_result(copilot_ctx, run_result, tool_name)"
-    assert source.count(call) == 1
-    shared = source.index(call)
-    # The shared path records the run, then attaches, then hands the result to the model.
-    window = source[shared - 400 : shared + 200]
-    assert "_verify_and_record_run_blocks_result" in window
-    assert "record_tool_step_result_for_ctx" in window
-
-    # `run_workflow_end_to_end` is the third run surface and builds its own hand-back.
-    end_to_end = _Path(__file__).resolve().parents[2] / "skyvern/forge/sdk/copilot/tools/run_execution.py"
-    end_to_end_source = end_to_end.read_text()
-    body_start = end_to_end_source.index("async def run_workflow_end_to_end(")
-    body = end_to_end_source[body_start : end_to_end_source.index("async def _run_blocks_and_collect_debug(")]
-    assert "_carry_prior_attempt_change_identity_into_result(" in body
-
-
-def test_the_carried_field_claims_only_that_the_pass_proves_nothing() -> None:
-    """It reports a fact and prescribes no repair; the model still owns the branch."""
-    from skyvern.forge.sdk.copilot.tools.run_execution import _carry_unresolved_failure_into_result
-
-    ctx = _run_history_ctx(two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    result = {"ok": True, "data": {"workflow_run_id": "wr_2", "overall_status": "completed"}}
-
-    _carry_unresolved_failure_into_result(ctx, result)
-
-    carried = result["data"]["unresolved_earlier_failure"]
-    assert set(carried) == {"workflow_run_id", "block_label", "failure_kind", "note"}
-    assert carried["note"] == "this run passing does not establish that the earlier failure was resolved"
-    for forbidden in ("add", "guard", "should", "must", "conditional", "if "):
-        assert forbidden not in carried["note"].lower(), "the note prescribes a fix"
-
-
 _REPEAT_FAILURE_REASON = "CodeBlock failed with NameError at line 1: name 'passenger_count' is not defined."
 _REPEAT_RAISING_CODE = "total = passenger_count * fare\n"
 _REPEAT_CHANGED_CODE = "total = int(await page.locator('#pax').input_value()) * fare\n"
@@ -5183,11 +4761,11 @@ def test_a_repeat_failing_run_reports_whether_the_code_it_ran_changed() -> None:
     ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
 
     first = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
-    _carry_unresolved_failure_into_result(ctx, first, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, first, "edit_block_and_run")
     assert "prior_attempt_change_identity" not in first["data"]
 
     resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
-    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, resubmitted, "edit_block_and_run")
     assert resubmitted["data"]["prior_attempt_change_identity"] == {
         "prior_workflow_run_id": "wr_1",
         "block_label": "book_trip",
@@ -5196,7 +4774,7 @@ def test_a_repeat_failing_run_reports_whether_the_code_it_ran_changed() -> None:
     }
 
     repaired = _record_failing_attempt(ctx, _REPEAT_CHANGED_CODE, "wr_3")
-    _carry_unresolved_failure_into_result(ctx, repaired, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, repaired, "edit_block_and_run")
     assert repaired["data"]["prior_attempt_change_identity"] == {
         "prior_workflow_run_id": "wr_2",
         "block_label": "book_trip",
@@ -5207,19 +4785,19 @@ def test_a_repeat_failing_run_reports_whether_the_code_it_ran_changed() -> None:
 
 
 def test_legs_that_re_ran_no_code_carry_no_change_identity() -> None:
-    """The validation and update legs return before any run, and a passing run is the other seam's
-    question; a comparison reported on either would stand behind no execution."""
+    """The validation and update legs return before any run, and a passing run after two failures is
+    handed back exactly as the run produced it."""
     ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
     _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
     _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
 
     rejected = {"ok": False, "error": "block_labels must include the edited block 'book_trip'."}
-    _carry_unresolved_failure_into_result(ctx, rejected, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, rejected, "edit_block_and_run")
     assert rejected == {"ok": False, "error": "block_labels must include the edited block 'book_trip'."}
 
     passing = {"ok": True, "data": {"workflow_run_id": "wr_3", "overall_status": "completed"}}
-    _carry_unresolved_failure_into_result(ctx, passing, "edit_block_and_run")
-    assert "prior_attempt_change_identity" not in passing["data"]
+    _carry_prior_attempt_change_identity_into_result(ctx, passing, "edit_block_and_run")
+    assert passing == {"ok": True, "data": {"workflow_run_id": "wr_3", "overall_status": "completed"}}
 
 
 def test_the_change_identity_survives_sanitization_and_compaction() -> None:
@@ -5227,7 +4805,7 @@ def test_the_change_identity_survives_sanitization_and_compaction() -> None:
     ctx = _run_history_ctx(_raising_code_workflow_yaml(_REPEAT_RAISING_CODE))
     _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_1")
     resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
-    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, resubmitted, "edit_block_and_run")
     carried = resubmitted["data"]["prior_attempt_change_identity"]
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", resubmitted)
@@ -5235,6 +4813,9 @@ def test_the_change_identity_survives_sanitization_and_compaction() -> None:
 
     compacted = json.loads(_summarize_tool_output(json.dumps(resubmitted)))
     assert compacted["prior_attempt_change_identity"] == carried
+    assert compacted["workflow_run_id"] == "wr_2"
+    assert compacted["overall_status"] == "failed"
+    assert compacted["blocks"][0]["failure_reason"] == _REPEAT_FAILURE_REASON
 
 
 def test_an_attempt_recorded_before_this_field_existed_reports_unavailable_not_unchanged() -> None:
@@ -5245,7 +4826,7 @@ def test_an_attempt_recorded_before_this_field_existed_reports_unavailable_not_u
     ctx.recorded_build_test_outcome_history[0].pop("attempted_block_code_hash")
 
     resubmitted = _record_failing_attempt(ctx, _REPEAT_RAISING_CODE, "wr_2")
-    _carry_unresolved_failure_into_result(ctx, resubmitted, "edit_block_and_run")
+    _carry_prior_attempt_change_identity_into_result(ctx, resubmitted, "edit_block_and_run")
 
     assert resubmitted["data"]["prior_attempt_change_identity"] == {
         "prior_workflow_run_id": "wr_1",
@@ -5941,8 +5522,11 @@ async def test_the_repaired_block_executes_and_the_run_owns_the_outputs_it_was_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("token_moved", "source_moved"), [(True, True), (False, True), (True, False)])
 async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
     monkeypatch: pytest.MonkeyPatch,
+    token_moved: bool,
+    source_moved: bool,
 ) -> None:
     ctx = await handback_ctx(monkeypatch, polled_status="completed", block_status="completed")
     ctx.workflow_copilot_chat_id = "chat-1"
@@ -5953,12 +5537,15 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 
     async def bind_candidate_run(**kwargs: object) -> None:
         captured.update(kwargs)
-        raise CopilotProposalConflictError("candidate changed")
+        raise CopilotProposalConflictError("candidate changed", reason="token_changed")
 
     async def prepare_workflow(**_kwargs: object) -> SimpleNamespace:
-        ctx.proposal_owner_turn_id = "turn-newer"
-        ctx.proposal_revision = 1
-        ctx.staged_workflow = ctx.staged_workflow.model_copy(update={"title": "Newer candidate"})
+        if token_moved:
+            ctx.proposal_owner_turn_id = "turn-newer"
+            ctx.proposal_revision = 1
+        if source_moved:
+            ctx.staged_workflow = ctx.staged_workflow.model_copy(update={"title": "Newer candidate"})
+        captured["ctx_at_bind"] = (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow)
         return SimpleNamespace(
             workflow_run_id="wr_source",
             workflow_id="w_source",
@@ -5968,18 +5555,17 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 
     forge_app.DATABASE.workflow_params.bind_workflow_copilot_candidate_run = bind_candidate_run
     forge_app.DATABASE.workflows.soft_delete_workflow_by_id = AsyncMock()
-    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
     monkeypatch.setattr(workflow_service_module, "prepare_workflow", prepare_workflow)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
-    assert result == {
-        "ok": False,
-        "error": "The pending Copilot proposal changed before the test started; reload and try again.",
-    }
+    assert (result["ok"], result["conflict_reason"], result["adoption"]) == (False, "token_changed", "kept")
+    assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert captured["expected_owner_turn_id"] == "turn-source"
     assert captured["expected_revision"] == 3
     assert captured["expected_workflow_yaml"] == HANDBACK_WORKFLOW_YAML
+    assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == captured["ctx_at_bind"]
 
 
 @pytest.mark.asyncio
@@ -6010,9 +5596,451 @@ async def test_canonical_run_does_not_bind_a_stale_proposal_token(
     assert harness["executor_cancelled"] is False
 
 
+_NEWER_CANDIDATE_YAML = HANDBACK_WORKFLOW_YAML.replace("title: extraction example", "title: newer example")
+_STORED_CODE_ARTIFACT_METADATA = {"extract_heading": {"goal_value_paths": ["heading"]}}
+_OTHER_TURN_PRIVATE_SETTINGS = {
+    "totp_identifier": "otp@example.test",
+    "webhook_callback_url": "https://hooks.test/done",
+}
+
+
+async def _install_real_candidate_cas(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+    *,
+    blockless_saved_workflow: bool = False,
+) -> tuple[dict[str, Any], WorkflowParametersRepository, str]:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="completed",
+        terminal_blocks=[terminal_extraction_block("completed")],
+    )
+    saved = harness["workflow"]
+    if blockless_saved_workflow:
+        saved = saved.model_copy(update={"workflow_definition": WorkflowDefinition(parameters=[], blocks=[])})
+        forge_app.DATABASE.workflows.get_workflow = AsyncMock(return_value=saved)
+        forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=saved)
+    forge_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=saved)
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    forge_app.DATABASE.workflow_params = repo
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wfp-1")
+    turn_one = make_copilot_ctx(workflow_copilot_chat_id=chat.workflow_copilot_chat_id, turn_id="turn-one")
+    await publish_workflow_candidate(turn_one, workflow=harness["workflow"], workflow_yaml=HANDBACK_WORKFLOW_YAML)
+    return harness, repo, chat.workflow_copilot_chat_id
+
+
+async def _restored_turn(chat_id: str, turn_id: str, **overrides: object) -> CopilotContext:
+    ctx = make_copilot_ctx(
+        browser_session_id="pbs_chat", workflow_copilot_chat_id=chat_id, turn_id=turn_id, **overrides
+    )
+    await restore_pending_workflow_proposal(ctx)
+    return ctx
+
+
+async def _run_extract_heading(ctx: CopilotContext) -> dict[str, Any]:
+    ctx.frontier_resume_session_id = "pbs_run"
+    return await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+
+async def _publish_from_another_turn(chat_id: str, code_artifact_metadata: dict[str, Any] | None = None) -> None:
+    turn_b = await _restored_turn(chat_id, "turn-b")
+    turn_b.code_artifact_metadata = code_artifact_metadata
+    turn_b.authored_private_workflow_settings = dict(_OTHER_TURN_PRIVATE_SETTINGS)
+    assert turn_b.staged_workflow is not None
+    newer = turn_b.staged_workflow.model_copy(update={"title": "newer example"})
+    await publish_workflow_candidate(turn_b, workflow=newer, workflow_yaml=_NEWER_CANDIDATE_YAML)
+
+
+async def _stored_candidate(
+    repo: WorkflowParametersRepository, chat_id: str
+) -> tuple[dict[str, Any], CopilotProposalMetadata]:
+    chat = await repo.get_workflow_copilot_chat_by_id(organization_id="org-1", workflow_copilot_chat_id=chat_id)
+    assert chat is not None and isinstance(chat.proposed_workflow, dict)
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    assert metadata is not None
+    return chat.proposed_workflow, metadata
+
+
+async def _next_model_response(ctx: CopilotContext) -> None:
+    await CopilotRunHooks(ctx).on_llm_end(MagicMock(), MagicMock(), MagicMock(output=[]))
+
+
+def _bind_lost_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry for entry in logs if entry["event"] == "copilot candidate run bind lost"]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["as_stored", "other_settings", "cleared", "saved_changed"])
+async def test_candidate_run_bind_after_a_rejected_restore_dispatches_only_the_stored_prior_draft(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, case: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(
+        monkeypatch, sqlite_engine, blockless_saved_workflow=True
+    )
+    stored, _ = await _stored_candidate(repo, chat_id)
+    if case == "saved_changed":
+        changed = forge_app.DATABASE.workflows.get_workflow_by_permanent_id.return_value.model_copy(
+            update={"description": "edited after the proposal"}
+        )
+        forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=changed)
+    ctx = await _restored_turn(
+        chat_id,
+        "turn-two",
+        workflow_yaml=HANDBACK_WORKFLOW_YAML.replace("extract_heading", "user_edited_block"),
+        prior_copilot_workflow_yaml=stored["_copilot_yaml"],
+        private_workflow_settings={"webhook_callback_url": "https://hooks.test/request"}
+        if case == "other_settings"
+        else {},
+    )
+    assert (ctx.staged_workflow, ctx.proposal_owner_turn_id, ctx.proposal_revision) == (None, "turn-one", 1)
+    if case == "cleared":
+        await repo.clear_workflow_copilot_candidate(
+            "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+        )
+    settings_before = copy.deepcopy(ctx.private_workflow_settings)
+
+    with capture_logs() as logs:
+        first = await _run_extract_heading(ctx)
+
+    assert first["ok"] is (case == "as_stored"), first
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == (1 if case == "as_stored" else 0)
+    if case == "saved_changed":
+        assert (first["conflict_reason"], first["adoption"]) == ("bytes_changed", "canonical_fingerprint_mismatch")
+    elif case == "cleared":
+        assert (first["conflict_reason"], first["adoption"]) == ("candidate_missing", "cleared")
+        assert [entry["reason"] for entry in _bind_lost_logs(logs)] == ["candidate_missing"]
+        await _next_model_response(ctx)
+        assert (await _run_extract_heading(ctx))["ok"] is False
+        assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    elif case == "other_settings":
+        second = await _run_extract_heading(ctx)
+        assert [first, second] == [{"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}] * 2
+        workflow_service_module.prepare_workflow.assert_not_awaited()
+        assert ctx.private_workflow_settings == settings_before
+        assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, None)
+        assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
+    else:
+        assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id == "wr_paused"
+
+
+@pytest.mark.asyncio
+async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim_is_live(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    ctx = await _restored_turn(chat_id, "turn-a")
+    passed = await _run_extract_heading(ctx)
+    assert passed["ok"] is True, passed
+    await repo.claim_workflow_copilot_candidate(
+        "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+    )
+    claimed_before, _ = await _stored_candidate(repo, chat_id)
+    staged_before, outcome_before, trace_before = ctx.staged_workflow, ctx.last_run_outcome, list(ctx.run_outcome_trace)
+    ctx.last_test_ok, ctx.frontier_resume_session_id = True, "pbs_run"
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(run_execution_module, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        tools_module, "_plan_frontier", lambda *_args: (["extract_heading"], {}, "extract_heading", "initial")
+    )
+    workflow_service_module.prepare_workflow.return_value = SimpleNamespace(
+        workflow_run_id="wr_refused",
+        workflow_id="w_source",
+        browser_session_id="pbs_run",
+        sequential_credential_id=None,
+    )
+    tool_context = SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug")
+    arguments = json.dumps({"block_labels": ["extract_heading"], "parameters": {}})
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+
+    with capture_logs() as logs:
+        runs = [json.loads(await tools_module.run_blocks_tool.on_invoke_tool(tool_context, arguments))]
+        runs.append(await _run_extract_heading(ctx))
+        edits = [await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True) for _ in "ab"]
+
+    assert [(result["ok"], result["conflict_reason"], result["adoption"]) for result in runs + edits] == [
+        (False, "being_accepted", "claimed")
+    ] * 4
+    assert BUILD_TEST_PACKET_KEY not in runs[0]["data"]
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 1
+    assert [(entry["reason"], entry["adoption"]) for entry in _bind_lost_logs(logs)] == [
+        ("being_accepted", "claimed")
+    ] * 2
+    assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, staged_before)
+    assert (ctx.last_test_ok, ctx.last_run_outcome, ctx.run_outcome_trace) == (True, outcome_before, trace_before)
+    assert (await _stored_candidate(repo, chat_id))[0] == claimed_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "event"),
+    [("bytes_changed", "copilot candidate run bind lost"), ("unexpected_error", "copilot candidate run bind failed")],
+)
+async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, reason: str, event: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    ctx = await _restored_turn(chat_id, "turn-a")
+    if reason == "bytes_changed":
+        ctx.staged_workflow_yaml = HANDBACK_WORKFLOW_YAML.replace("https://example.com", "https://example.org")
+    else:
+        monkeypatch.setattr(repo, "bind_workflow_copilot_candidate_run", AsyncMock(side_effect=RuntimeError("down")))
+
+    with capture_logs() as logs:
+        result = await _run_extract_heading(ctx)
+
+    assert (result["ok"], result.get("conflict_reason")) == (False, reason if reason == "bytes_changed" else None)
+    assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
+    assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
+    assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
+
+
+_ACCEPTED_WEBHOOK = "https://hooks.example.test/accepted"
+
+
+async def _accept_concurrently(harness: dict[str, Any], repo: WorkflowParametersRepository, chat_id: str) -> Workflow:
+    accepted = harness["workflow"].model_copy(
+        update={"workflow_id": "w_accepted", "webhook_callback_url": _ACCEPTED_WEBHOOK}
+    )
+    versions = {harness["workflow"].workflow_id: harness["workflow"], accepted.workflow_id: accepted}
+    forge_app.DATABASE.workflows.get_workflow = AsyncMock(
+        side_effect=lambda workflow_id, organization_id: versions.get(workflow_id)
+    )
+    forge_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=accepted)
+    forge_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=accepted)
+    await repo.clear_workflow_copilot_candidate(
+        "org-1", chat_id, expected_owner_turn_id="turn-one", expected_revision=1
+    )
+    return accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["test", "edit"])
+@pytest.mark.parametrize("concurrent", ["publish", "accept"])
+async def test_stale_proposal_token_conflict_recovers_so_the_next_call_succeeds(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, path: str, concurrent: str
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(
+        chat_id,
+        "turn-a",
+        workflow_id=harness["workflow"].workflow_id,
+        private_workflow_settings={"webhook_callback_url": "https://hooks.example.test/stale"}
+        if path == "edit"
+        else {},
+    )
+    ctx.executed_block_fingerprints = workflow_block_fingerprints(HANDBACK_WORKFLOW_YAML)
+    ctx.verified_prefix_labels = ["extract_heading"]
+    ctx.workflow_verification_evidence.full_workflow_verified = True
+    if concurrent == "publish":
+        await _publish_from_another_turn(chat_id, code_artifact_metadata=_STORED_CODE_ARTIFACT_METADATA)
+        expected = ("token_changed", "adopted")
+    else:
+        accepted = await _accept_concurrently(harness, repo, chat_id)
+        expected = ("candidate_missing", "cleared")
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+
+    async def test_or_edit() -> dict[str, Any]:
+        if path == "test":
+            return await _run_extract_heading(ctx)
+        return await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True)
+
+    with capture_logs() as logs:
+        first = await test_or_edit()
+
+    assert (first["ok"], first["conflict_reason"], first["adoption"]) == (False, *expected)
+    conflict_events = {"copilot candidate run bind lost", "copilot_candidate_publication_conflict"}
+    assert [(entry["reason"], entry["adoption"]) for entry in logs if entry["event"] in conflict_events] == [expected]
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    if concurrent == "publish":
+        assert first["adopted_workflow_yaml"] == _NEWER_CANDIDATE_YAML
+        assert (ctx.proposal_owner_turn_id, ctx.proposal_revision) == ("turn-b", 1)
+        assert ctx.code_artifact_metadata == _STORED_CODE_ARTIFACT_METADATA
+        assert (ctx.verified_prefix_labels, ctx.workflow_verification_evidence.full_workflow_verified) == ([], False)
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
+        assert review is not None and [block["neverTested"] for block in review["blocks"]] == [True]
+    else:
+        assert ctx.workflow_yaml == workflow_to_copilot_yaml(accepted)
+
+    await _next_model_response(ctx)
+    second = await test_or_edit()
+
+    assert second["ok"] is True, second
+    if path == "test":
+        assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 1
+        if concurrent == "accept":
+            resolved_workflow_id = workflow_service_module.prepare_workflow.await_args.kwargs["resolved_workflow_id"]
+            assert resolved_workflow_id == accepted.workflow_id
+            return
+        create_draft = forge_app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version
+        dispatched = create_draft.await_args.kwargs["runtime_workflow"]
+        assert [dispatched.totp_identifier, dispatched.webhook_callback_url] == [*_OTHER_TURN_PRIVATE_SETTINGS.values()]
+        return
+    stored, metadata = await _stored_candidate(repo, chat_id)
+    assert (metadata.owner_turn_id, metadata.revision) == ("turn-a", 1)
+    assert "Extract the page title." in stored["_copilot_yaml"]
+    if concurrent == "publish":
+        assert stored[COPILOT_PRIVATE_SETTINGS_KEY] == _OTHER_TURN_PRIVATE_SETTINGS
+    else:
+        assert ctx.staged_workflow is not None and ctx.staged_workflow.webhook_callback_url == _ACCEPTED_WEBHOOK
+        assert stored.get("webhook_callback_url") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_call", "second_call", "overlap"),
+    [
+        ("edit", "edit", True),
+        ("test", "edit", True),
+        ("edit", "edit", False),
+        ("edit", "test", False),
+        ("test", "test", False),
+    ],
+)
+async def test_stale_proposal_token_adoption_refuses_a_call_written_before_it(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, first_call: str, second_call: str, overlap: bool
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(chat_id, "turn-a", workflow_id=harness["workflow"].workflow_id)
+    await _publish_from_another_turn(chat_id)
+    stored_before, _ = await _stored_candidate(repo, chat_id)
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+    stale_metadata = {"extract_heading": {"goal_value_paths": ["stale"]}}
+
+    def call(kind: str, metadata: object = None) -> Coroutine[Any, Any, dict[str, Any]]:
+        if kind == "test":
+            return _run_extract_heading(ctx)
+        params = {"workflow_yaml": edit, "code_artifact_metadata": metadata}
+        return _update_workflow(params, ctx, allow_missing_credentials=True)
+
+    if overlap:
+        results = await asyncio.gather(call(first_call), call(second_call, stale_metadata))
+    else:
+        # The second call of the same model response starts after the first adopted, as when a wrapper waits on
+        # a lock or the credential gate before reaching the write.
+        results = [await call(first_call)]
+        submission_before = (ctx.raw_code_artifact_metadata, ctx.code_artifact_metadata)
+        results.append(await call(second_call, stale_metadata))
+        assert (ctx.raw_code_artifact_metadata, ctx.code_artifact_metadata) == submission_before
+
+    assert [(result["ok"], result["conflict_reason"], result["adoption"]) for result in results] == [
+        (False, "token_changed", "adopted")
+    ] * 2
+    assert (await _stored_candidate(repo, chat_id))[0] == stored_before
+    assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dropped_by", ["in_flight_edit", "earlier_edit"])
+async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, dropped_by: str
+) -> None:
+    harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    parameters = harness["workflow"].workflow_definition.parameters
+    outputs = [parameter for parameter in parameters if isinstance(parameter, OutputParameter)]
+    monkeypatch.setattr(repo, "get_workflow_output_parameters", AsyncMock(return_value=outputs))
+    ctx = await _restored_turn(chat_id, "turn-a", workflow_id=harness["workflow"].workflow_id)
+    ctx.code_artifact_metadata = {
+        "extract_heading": {"completion_criteria": [{"deliverable_kind": "generated_file", "id": "report"}]}
+    }
+    contract_dropping_edit = HANDBACK_WORKFLOW_YAML.replace(
+        "  parameters: []\n",
+        "  parameters: []\n  completion_contract:\n    schema_version: 1\n    criteria:\n"
+        "      - id: report\n        kind: generated_file\n        min_count: 1\n",
+    )
+    if dropped_by == "earlier_edit":
+        dropped = await _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True)
+        assert dropped["ok"] is True and ctx.clear_persisted_completion_contract is True
+        await _publish_from_another_turn(chat_id)
+        adopting = await _run_extract_heading(ctx)
+    else:
+        await _publish_from_another_turn(chat_id)
+        sibling_adopted = asyncio.Event()
+        real_canonicalize = workflow_update_module.canonicalize_named_google_sheet_bindings
+
+        async def canonicalize_after_the_sibling_adopts(workflow_yaml: str, call_ctx: object) -> object:
+            # Holds the contract-dropping edit past its entry check until its sibling has adopted.
+            if "completion_contract" in workflow_yaml:
+                await sibling_adopted.wait()
+            return await real_canonicalize(workflow_yaml, call_ctx)
+
+        monkeypatch.setattr(
+            workflow_update_module, "canonicalize_named_google_sheet_bindings", canonicalize_after_the_sibling_adopts
+        )
+
+        async def sibling_edit() -> dict[str, Any]:
+            try:
+                return await _update_workflow(
+                    {"workflow_yaml": HANDBACK_WORKFLOW_YAML}, ctx, allow_missing_credentials=True
+                )
+            finally:
+                sibling_adopted.set()
+
+        adopting, in_flight = await asyncio.gather(
+            sibling_edit(),
+            _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True),
+        )
+        assert (in_flight["ok"], in_flight["adoption"]) == (False, "adopted")
+    assert (adopting["ok"], adopting["adoption"]) == (False, "adopted")
+
+    await _next_model_response(ctx)
+    edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
+    assert (await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True))["ok"] is True
+
+    assert (ctx.has_staged_proposal, ctx.clear_persisted_completion_contract) == (True, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["auto_accept", "cancel"])
+async def test_stale_proposal_token_adoption_leaves_the_stored_candidate_untouched_at_turn_end(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, exit_path: str
+) -> None:
+    _harness, repo, chat_id = await _install_real_candidate_cas(monkeypatch, sqlite_engine)
+    turn_start_chat = await repo.update_workflow_copilot_chat(
+        organization_id="org-1", workflow_copilot_chat_id=chat_id, auto_accept=exit_path == "auto_accept"
+    )
+    assert turn_start_chat is not None
+    ctx = await _restored_turn(chat_id, "turn-a")
+    ctx.staged_workflow_yaml = HANDBACK_WORKFLOW_YAML.replace("https://example.com", "https://example.org")
+    conflict = await _run_extract_heading(ctx)
+    assert (conflict["conflict_reason"], conflict["adoption"]) == ("bytes_changed", "adopted")
+    await _next_model_response(ctx)
+    assert (await _run_extract_heading(ctx))["ok"] is True
+    stored_before, _ = await _stored_candidate(repo, chat_id)
+
+    if exit_path == "cancel":
+        await workflow_copilot_route._persist_cancel_turn(
+            stream=MagicMock(send=AsyncMock(return_value=True)),
+            chat=turn_start_chat,
+            organization_id="org-1",
+            original_workflow=None,
+            user_message="stop",
+            agent_result=_build_wip_exit_result(ctx, None, cancelled=True),
+            turn_id="turn-a",
+        )
+    else:
+        await workflow_copilot_route._persist_proposed_workflow_state(
+            turn_start_chat, _build_wip_exit_result(ctx, None), restored=False
+        )
+
+    assert (await _stored_candidate(repo, chat_id))[0] == stored_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withheld_yaml", [False, True])
 async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
     monkeypatch: pytest.MonkeyPatch,
+    withheld_yaml: bool,
 ) -> None:
     completed_block = terminal_extraction_block("completed").model_copy(update={"output": {"heading": "Done"}})
     ctx = await handback_ctx(
@@ -6021,6 +6049,8 @@ async def test_completed_run_is_recorded_before_the_browser_enrichment_await(
         block_status="completed",
         terminal_blocks=[completed_block],
     )
+    if withheld_yaml:
+        ctx.workflow_yaml = None
     order: list[str] = []
     projected_rows_at_commit: list[list[dict[str, object]]] = []
     real_record = run_execution_module.record_build_test_outcome
@@ -6251,571 +6281,6 @@ async def test_watchdog_paused_result_is_recorded_before_the_captcha_probe(
     ]
 
 
-def _signature_only_failure(run_id: str) -> RecordedBuildTestOutcome:
-    return RecordedBuildTestOutcome(
-        phase="persisted_block_run",
-        attempted_tool="update_and_run_blocks",
-        attempted_block_label="sign_in_and_read",
-        verdict="repairable_failure",
-        reason_code="runtime_block_failure",
-        workflow_run_id=run_id,
-        block_labels=["sign_in_and_read"],
-        structural_failure_identity="value-error-identity",
-    )
-
-
-def _executing_run(
-    run_id: str,
-    executed_block_labels: list[str],
-    *,
-    verdict: str = "progress_observed",
-    reason_code: str = "",
-    failed_operation: BuildTestFailedOperation | None = None,
-    failed_block_labels: list[str] | None = None,
-) -> RecordedBuildTestOutcome:
-    default_reason_code = "verified_success" if verdict == "progress_observed" else "run_completed_unevaluated"
-    return RecordedBuildTestOutcome(
-        phase="persisted_block_run",
-        attempted_tool="update_and_run_blocks",
-        verdict=verdict,  # type: ignore[arg-type]
-        reason_code=reason_code or default_reason_code,  # type: ignore[arg-type]
-        workflow_run_id=run_id,
-        block_labels=["sign_in_and_read"],
-        executed_block_labels=executed_block_labels,
-        failed_block_labels=failed_block_labels or [],
-        evidence_refs=["rows:1"],
-        failed_operation=failed_operation,
-    )
-
-
-def _executed_snapshot_history(
-    failure: RecordedBuildTestOutcome,
-    later_run: RecordedBuildTestOutcome,
-    *,
-    executed_yaml: str,
-    failing_yaml: str = "",
-) -> SimpleNamespace:
-    ctx = _run_history_ctx(failing_yaml or two_page_login_yaml())
-    ctx.persisted_workflow_yaml = None
-    record_build_test_outcome(ctx, failure)
-    ctx.workflow_yaml = executed_yaml
-    record_build_test_outcome(ctx, later_run)
-    return ctx
-
-
-def test_a_run_over_a_changed_snapshot_that_drops_the_failing_call_clears_the_failure() -> None:
-    """The snapshot a run executed is evidence the delivered workflow cannot supply when nothing is
-    persisted yet, and it is bound when that run is recorded rather than read back off the draft."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved is None
-    assert disposition == "executed_snapshot_call_removed:wr_2:sign_in_and_read"
-    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == ["wr_1", "wr_2"]
-    assert ctx.recorded_build_test_outcome_history[0]["reason_code"] == "runtime_block_failure"
-
-
-def test_a_run_over_a_changed_snapshot_clears_a_failure_that_named_no_call() -> None:
-    ctx = _executed_snapshot_history(
-        _signature_only_failure("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=straight_line_login_yaml(),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved is None
-    assert disposition == "executed_snapshot_signature_changed:wr_2:sign_in_and_read"
-
-
-def test_a_later_run_that_executed_no_block_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", []),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_run_covering_only_a_sibling_block_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["read_metric"]),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_run_over_the_same_source_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=two_page_login_yaml(),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_run_over_a_snapshot_of_runtime_built_selectors_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1").model_copy(update={"attempted_call_ref": "locator:#submit-btn"}),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=_templated_selector_yaml(),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_run_over_the_same_source_still_carries_a_failure_that_named_no_call() -> None:
-    ctx = _executed_snapshot_history(
-        _signature_only_failure("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=two_page_login_yaml(),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_run_whose_snapshot_carries_no_such_block_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        _signature_only_failure("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml="title: Sign in and read the metric\nworkflow_definition:\n  blocks: []\n",
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-@pytest.mark.parametrize(
-    "reason_code",
-    [
-        "unrecoverable_tool_error",
-        "terminal_challenge_blocker",
-        "no_meaningful_output",
-        "fallback_floor_turn_unsatisfiable",
-    ],
-)
-def test_a_later_run_that_reached_no_evaluated_completion_still_carries_the_failure(reason_code: str) -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"], verdict="not_authoritative", reason_code=reason_code),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_later_completed_run_whose_own_block_failed_still_carries_the_failure() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run(
-            "wr_2",
-            ["sign_in_and_read"],
-            verdict="not_authoritative",
-            failed_operation=BuildTestFailedOperation(
-                kind="browser_operation_failed",
-                workflow_run_id="wr_2",
-                block_label="sign_in_and_read",
-            ),
-        ),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_completed_run_that_evaluated_no_output_clears_over_a_changed_snapshot() -> None:
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"], verdict="not_authoritative"),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved is None
-    assert disposition == "executed_snapshot_call_removed:wr_2:sign_in_and_read"
-
-
-def test_the_tool_result_and_the_terminal_agree_once_the_executed_snapshot_cleared_the_failure() -> None:
-    ctx = make_copilot_ctx(workflow_yaml=two_page_login_yaml())
-    ctx.persisted_workflow_yaml = None
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    ctx.workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-    record_build_test_outcome(ctx, _executing_run("wr_2", ["sign_in_and_read"]))
-    ctx.last_run_blocks_workflow_run_id = "wr_2"
-    result = _run_result_ok()
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
-    terminal = _make_agent_result(
-        ctx,
-        user_response="Built it and tested it.",
-        updated_workflow=object(),
-        global_llm_context=None,
-        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
-        narrative_payload={"terminalMessage": "Built it and tested it.", "narrativeSummary": "Built it and tested it."},
-    )
-
-    assert "unresolved_earlier_failure" not in result["data"]
-    assert terminal.turn_outcome is not None
-    assert terminal.turn_outcome.unresolved_runtime_failure is None
-    assert terminal.narrative_payload is not None
-    assert terminal.narrative_payload["terminalMessage"] == "Built it and tested it."
-
-
-# Hand-backs whose logs carry the reported ordering: the run being reported has not reached the
-# history yet, and no workflow is saved.
-_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS = (
-    "wr_570538698832229610",
-    "wr_570540378164441128",
-    "wr_570559591083343744",
-    "wr_570559917500856932",
-    "wr_570560299752946268",
-)
-
-
-def _executed_run_result(
-    workflow_run_id: str, executed_workflow_yaml: str, snapshot_workflow_yaml: str | None = ""
-) -> dict[str, Any]:
-    """A hand-back shaped like the run path's: it carries the snapshot the run dispatched.
-
-    ``snapshot_workflow_yaml`` defaults to the executed text; pass None for the snapshots that
-    carry no authored bytes, where _RunExecution falls back to a re-serialized definition."""
-    now = datetime.now(UTC)
-    workflow = Workflow(
-        workflow_id="wf_test",
-        organization_id="org_test",
-        title="Test",
-        workflow_permanent_id="wpid_test",
-        version=1,
-        is_saved_task=False,
-        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-        created_at=now,
-        modified_at=now,
-    )
-    execution = run_execution_module._RunExecution(
-        snapshot=run_execution_module.CopilotExecutionSnapshot(
-            provenance="staged",
-            workflow=workflow,
-            workflow_parameters=(),
-            output_parameters=(),
-            workflow_yaml=executed_workflow_yaml if snapshot_workflow_yaml == "" else snapshot_workflow_yaml,
-        ),
-        workflow_yaml=executed_workflow_yaml,
-        metadata={},
-        associations={},
-        source_at_start=None,
-        unbound_keys=[],
-        explicit_blank=False,
-    )
-    return run_execution_module._ExecutionResult(
-        {"ok": True, "data": {"workflow_run_id": workflow_run_id, "overall_status": "completed"}},
-        execution,
-    )
-
-
-def _never_saved_draft_ctx() -> CopilotContext:
-    ctx = make_copilot_ctx(workflow_yaml=two_page_login_yaml())
-    ctx.persisted_workflow_yaml = None
-    ctx.staged_workflow_yaml = two_page_login_yaml()
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    return ctx
-
-
-def test_a_run_reports_the_snapshot_it_executed_when_nothing_is_saved() -> None:
-    """Nothing is saved, so the snapshot the run executed is the only candidate the failure can be
-    read against; reading persistence here reports a repaired run as having no candidate at all."""
-    ctx = _never_saved_draft_ctx()
-    result = _executed_run_result(
-        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[0], two_page_login_yaml(submit_selector="Continue")
-    )
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
-
-    assert "unresolved_earlier_failure" not in result["data"]
-    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == ["wr_1"]
-
-
-def test_a_run_that_executed_the_unrepaired_snapshot_carries_the_older_run_id() -> None:
-    ctx = _never_saved_draft_ctx()
-    result = _executed_run_result(_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[1], two_page_login_yaml())
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
-
-    carried = result["data"]["unresolved_earlier_failure"]
-    assert carried["workflow_run_id"] == "wr_1"
-    assert carried["workflow_run_id"] != result["data"]["workflow_run_id"]
-    assert carried["block_label"] == "sign_in_and_read"
-
-
-def test_a_repair_staged_after_the_run_cannot_clear_the_snapshot_that_ran() -> None:
-    """A proposal staged between the run and the hand-back was never executed, so crediting it
-    would clear a failure on the strength of code no run has tried."""
-    ctx = _never_saved_draft_ctx()
-    result = _executed_run_result(_SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[2], two_page_login_yaml())
-    ctx.staged_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
-
-    assert result["data"]["unresolved_earlier_failure"]["workflow_run_id"] == "wr_1"
-
-
-def test_a_snapshot_without_authored_bytes_is_not_compared_against_a_re_serialization() -> None:
-    """Signatures are taken from authored yaml. A re-serialized definition drops authoring-only
-    fields, so comparing it would read every block as changed and clear the failure."""
-    ctx = _never_saved_draft_ctx()
-    result = _executed_run_result(
-        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[0],
-        two_page_login_yaml(submit_selector="Continue"),
-        snapshot_workflow_yaml=None,
-    )
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "run_blocks_and_collect_debug")
-
-    assert result["data"]["unresolved_earlier_failure"]["workflow_run_id"] == "wr_1"
-
-
-def test_the_terminal_judges_the_saved_workflow_while_the_run_reports_the_snapshot_that_ran() -> None:
-    ctx = make_copilot_ctx(workflow_yaml=two_page_login_yaml())
-    ctx.persisted_workflow_yaml = two_page_login_yaml()
-    ctx.staged_workflow_yaml = two_page_login_yaml()
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, _executing_run("wr_2", ["sign_in_and_read"]))
-    result = _executed_run_result(
-        _SUCCESSFUL_DRAFT_HANDBACK_RUN_IDS[3], two_page_login_yaml(submit_selector="Continue")
-    )
-
-    run_execution_module._carry_unresolved_failure_into_result(ctx, result, "update_and_run_blocks")
-    terminal = _make_agent_result(
-        ctx,
-        user_response="Built it and tested it.",
-        updated_workflow=object(),
-        global_llm_context=None,
-        turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
-        narrative_payload={"terminalMessage": "Built it and tested it.", "narrativeSummary": "Built it and tested it."},
-    )
-
-    assert "unresolved_earlier_failure" not in result["data"]
-    assert terminal.turn_outcome is not None
-    assert terminal.turn_outcome.unresolved_runtime_failure == UnresolvedRuntimeFailure(
-        workflow_run_id="wr_1", block_label="sign_in_and_read"
-    )
-
-
-def _many_literal_selectors_yaml(selector_count: int) -> str:
-    calls = "".join(f'          await page.locator("#field-{index}").click()\n' for index in range(selector_count))
-    return (
-        "title: Sign in and read the metric\n"
-        "workflow_definition:\n"
-        "  blocks:\n"
-        "  - block_type: code\n"
-        "    label: sign_in_and_read\n"
-        "    code: |\n" + calls
-    )
-
-
-def test_reverting_the_draft_to_the_code_that_failed_carries_the_failure_again() -> None:
-    """A clean run proves nothing about source it no longer describes, so a revert re-carries."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-    ctx.workflow_yaml = two_page_login_yaml()
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_signature_change_on_a_snapshot_the_draft_no_longer_holds_carries_the_failure() -> None:
-    """The signature arm is bound to the source being judged the same way the call arm is."""
-    ctx = _executed_snapshot_history(
-        _signature_only_failure("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=straight_line_login_yaml(),
-    )
-    ctx.workflow_yaml = two_page_login_yaml()
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_snapshot_with_more_calls_than_the_evidence_holds_cannot_prove_removal() -> None:
-    """Past the cap the ref list is incomplete, and an incomplete list cannot show a call is gone."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=_many_literal_selectors_yaml(_EXECUTED_CALL_REF_LIMIT + 6),
-    )
-    evidence = ctx.recorded_build_test_outcome_history[-1]["executed_block_evidence"]["sign_in_and_read"]
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert len(evidence["call_refs"]) == _EXECUTED_CALL_REF_LIMIT
-    assert evidence["call_refs_truncated"] is True
-    assert evidence["removal_provable"] is False
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_staged_repair_does_not_clear_a_failure_the_saved_workflow_still_carries() -> None:
-    """A repair the user has not saved leaves the workflow they can run carrying the failure."""
-    saved = two_page_login_yaml()
-    ctx = _run_history_ctx(saved)
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    ctx.staged_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-    record_build_test_outcome(ctx, _executing_run("wr_2", ["sign_in_and_read"]))
-    ctx.staged_workflow_yaml = None
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_yaml=saved)
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "unresolved"
-
-
-def test_a_run_over_a_changed_staged_proposal_clears_when_nothing_is_persisted() -> None:
-    """The ticket's shape: the proposal that ran was never saved, so only its own receipts prove the repair."""
-    ctx = _run_history_ctx(two_page_login_yaml())
-    ctx.persisted_workflow_yaml = None
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    # Stays staged: the terminal is assembled before the route commits the proposal.
-    ctx.staged_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-    record_build_test_outcome(ctx, _executing_run("wr_2", ["sign_in_and_read"]))
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved is None
-    assert disposition == "executed_snapshot_call_removed:wr_2:sign_in_and_read"
-
-
-def test_a_caller_judging_a_proposal_does_not_read_the_draft_when_it_has_none() -> None:
-    """An absent proposal means the caller has nothing to show, not that nothing is saved."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(ctx, reported_workflow_yaml=None)
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def test_a_completed_run_whose_block_failed_without_a_browser_error_still_carries_the_failure() -> None:
-    """``failed_operation`` is only set for browser failures, so it cannot mean no block failed."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run(
-            "wr_2",
-            ["sign_in_and_read"],
-            verdict="not_authoritative",
-            failed_block_labels=["sign_in_and_read"],
-        ),
-        executed_yaml=two_page_login_yaml(submit_selector="Continue"),
-    )
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
-def _adjacent_literal_selector_yaml() -> str:
-    """Adjacent string literals parse to one constant, which the text scan reads as a shorter selector."""
-    return """
-    title: Sign in and read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          await page.locator("#sub" "mit").click()
-          return {"visitors": "9.42K"}
-    """
-
-
-def test_a_selector_the_text_scan_cannot_read_whole_cannot_prove_removal() -> None:
-    """The scan records ``#sub`` while the call runs ``#submit``; absence from the scan is not removal."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=_adjacent_literal_selector_yaml(),
-    )
-
-    evidence = ctx.recorded_build_test_outcome_history[-1]["executed_block_evidence"]["sign_in_and_read"]
-
-    assert evidence["call_refs"] == ["locator:#sub"]
-    assert evidence["removal_provable"] is False
-
-
 def test_not_evaluated_run_outcome_does_not_hide_failed_blocks() -> None:
     outcome = recorded_outcome_from_run_blocks_result(
         {
@@ -6849,49 +6314,14 @@ def test_not_evaluated_run_outcome_does_not_hide_failed_blocks() -> None:
     assert outcome.failed_block_labels == ["open_page", "sign_in_and_read"]
 
 
-def _runtime_built_role_name_yaml() -> str:
-    """A per-account accessible name built at runtime, which the literal scan cannot see."""
-    return """
-    title: Sign in and read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          account = "acct-42"
-          await page.get_by_role("button", name=account).click()
-          return {"visitors": "9.42K"}
-    """
-
-
-def test_a_selector_argument_built_at_runtime_cannot_prove_removal() -> None:
-    """The role alone resolves to an identity the scan did record, so only the literal count is left
-    to separate a dynamic argument from a call the scan read whole."""
-    ctx = _executed_snapshot_history(
-        failed_second_factor_run("wr_1"),
-        _executing_run("wr_2", ["sign_in_and_read"]),
-        executed_yaml=_runtime_built_role_name_yaml(),
-    )
-
-    evidence = ctx.recorded_build_test_outcome_history[-1]["executed_block_evidence"]["sign_in_and_read"]
-
-    assert evidence["removal_provable"] is False
-
-    unresolved, disposition = unresolved_runtime_block_failure_with_disposition(
-        ctx, reported_workflow_yaml=None, reported_workflow_is_persisted=True
-    )
-
-    assert unresolved == UnresolvedRuntimeFailure(workflow_run_id="wr_1", block_label="sign_in_and_read")
-    assert disposition == "no_reported_candidate"
-
-
 @pytest.mark.asyncio
 async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A mid-workflow block is the route that runs in the chat's browser; a head start mints its own.
     harness = await install_run_blocks_harness(
         monkeypatch,
-        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML,
         polled_status="running",
         dispatch_to_worker=True,
     )
@@ -6930,7 +6360,7 @@ async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_
     ctx.staged_workflow = harness["workflow"]
     ctx.workflow_copilot_chat_id = "wcc_mine"
 
-    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
 
     workflow_service_module.prepare_workflow.assert_not_awaited()
     harness["worker_execute"].assert_not_awaited()
@@ -6940,49 +6370,6 @@ async def test_a_foreign_occupier_stops_the_dispatch_before_any_workflow_run_is_
     assert result["data"]["build_test_connect_failure"]["state"] == "occupied"
     assert result["data"]["build_test_connect_failure"]["occupier_run_id"] == "wr_foreign"
     assert result["data"]["executed_block_labels"] == []
-
-
-@pytest.mark.asyncio
-async def test_budget_denied_dispatch_preserves_prior_run_through_public_tool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_ctx()
-    ctx.budget_expiry_state.source = "deadline"
-    ctx.budget_expiry_state.drain_active = True
-    ctx.last_run_blocks_workflow_run_id = "wr_prior"
-    ctx.last_successful_run_blocks_workflow_run_id = "wr_prior"
-    ctx.last_run_blocks_browser_session_id = "pbs_prior"
-    ctx.last_test_ok = True
-    ctx.last_full_workflow_test_ok = True
-    ctx.last_run_outcome = RecordedRunOutcome(
-        verdict="verified", reason_code="execution_completed", workflow_run_id="wr_prior", run_completed=True
-    )
-    previous_outcome = ctx.last_run_outcome
-    previous_history = list(ctx.run_outcome_trace)
-    previous_diagnosis = ctx.latest_diagnosis_repair_contract
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools_module, "_plan_frontier", lambda *_args: (["step"], {}, "step", "initial"))
-    dispatch = AsyncMock(side_effect=AssertionError("denied dispatch must not reach the database"))
-    monkeypatch.setattr(run_execution_module.app.DATABASE.workflows, "get_workflow_by_permanent_id", dispatch)
-
-    result = json.loads(
-        await tools_module.run_blocks_tool.on_invoke_tool(
-            SimpleNamespace(context=ctx, tool_name="run_blocks_and_collect_debug"),
-            json.dumps({"block_labels": ["step"], "parameters": {}}),
-        )
-    )
-
-    assert ctx.last_run_blocks_workflow_run_id == "wr_prior"
-    assert ctx.last_successful_run_blocks_workflow_run_id == "wr_prior"
-    assert ctx.last_run_blocks_browser_session_id == "pbs_prior"
-    assert ctx.last_test_ok is True
-    assert ctx.last_full_workflow_test_ok is True
-    assert ctx.last_run_outcome is previous_outcome
-    assert ctx.run_outcome_trace == previous_history
-    assert ctx.latest_diagnosis_repair_contract is previous_diagnosis
-    assert result == {"ok": False, "data": {"budget_expired": True, "run_dispatched": False, "source": "deadline"}}
-    dispatch.assert_not_awaited()
 
 
 def _two_block_search_failure_result() -> dict[str, Any]:
@@ -7160,45 +6547,32 @@ def test_the_direct_handoff_does_not_report_an_all_filtered_url_map_as_never_rec
     assert not any("no per-block end URL was recorded" in notice for notice in projected.omission_notices)
 
 
-SECRET_BEARING_EXTRACTION_YAML = """
-title: extraction example
-workflow_definition:
-  parameters:
-    - parameter_type: aws_secret
-      key: site_password
-      aws_key: SKYVERN_SITE_PASSWORD
-  blocks:
-    - block_type: extraction
-      label: extract_heading
-      url: https://example.com
-      data_extraction_goal: Extract the page heading.
-"""
+_ELEMENT_TIMEOUT_CATEGORY = {"category": "ELEMENT_STATE_TIMEOUT", "confidence_float": 0.85}
 
 
 @pytest.mark.asyncio
-async def test_a_credential_bearing_run_mints_no_per_block_end_url_for_the_model(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("run_category_before_label", "model_sees"),
+    [(None, "absent"), ([_ELEMENT_TIMEOUT_CATEGORY], [_ELEMENT_TIMEOUT_CATEGORY])],
+    ids=["label_only", "label_after_a_category"],
+)
+async def test_the_model_reads_a_run_category_as_it_was_before_the_sign_in_label(
+    monkeypatch: pytest.MonkeyPatch, run_category_before_label: list[dict[str, Any]] | None, model_sees: object
 ) -> None:
-    async def run_failed_block(*, workflow_yaml: str) -> dict[str, Any]:
-        harness = await install_run_blocks_harness(
-            monkeypatch,
-            workflow_yaml=workflow_yaml,
-            polled_status="failed",
-            terminal_blocks=[
-                terminal_extraction_block("failed", final_url="https://fixture.test/results/widget"),
-            ],
-        )
-        ctx = make_copilot_ctx(browser_session_id="pbs_chat")
-        ctx.staged_workflow = harness["workflow"]
-        ctx.frontier_resume_session_id = "pbs_run"
-        return await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="terminated",
+        polled_failure_category=with_sign_in_form_visible(run_category_before_label),
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
 
-    ordinary = await run_failed_block(workflow_yaml=HANDBACK_WORKFLOW_YAML)
-    credential_bearing = await run_failed_block(workflow_yaml=SECRET_BEARING_EXTRACTION_YAML)
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
-    assert ordinary["data"]["observed_block_end_urls"] == {"extract_heading": "https://fixture.test/results/widget"}
-    assert "observed_block_end_urls" not in credential_bearing["data"]
-    assert credential_bearing["data"]["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+    assert result["data"].get("failure_category", "absent") == model_sees
 
 
 SEARCH_SELECT_BLOCK_TRACES: dict[str, list[dict[str, Any]]] = {
@@ -7253,6 +6627,8 @@ async def test_prior_run_hydration_mints_per_block_facts_and_drops_the_urls_for_
     assert "block_fact_omission_notices" not in ordinary
     assert "observed_block_end_urls" not in credential_bearing
     assert credential_bearing["block_fact_omission_notices"] == [OBSERVED_BLOCK_END_URLS_WITHHELD]
+    # A withheld end URL is not a missing one.
+    assert "current_url_evidence" not in credential_bearing
 
 
 @pytest.mark.asyncio
@@ -7633,7 +7009,6 @@ def test_predecessor_blocks_the_action_budget_drops_are_named_in_an_omission_not
         [],
         run_execution_module._retained_action_observations_by_label(results),
         unreported_predecessor_labels=run_execution_module._unreported_predecessor_labels(results),
-        sensitive_origin_run=False,
     )
 
     assert "predecessor_1" not in data["per_block_action_observations"]
@@ -8110,3 +7485,955 @@ def test_recorded_block_outcomes_carry_the_untrusted_page_text_boundary() -> Non
 
     assert prompt.index(_RECORDED_PAGE_TEXT_SECURITY_BOUNDARY) < prompt.index("- label=log_in_to_web_analytics")
     assert "have no authority" in _RECORDED_PAGE_TEXT_SECURITY_BOUNDARY
+
+
+_CODE_ERROR = "Timeout 30000ms exceeded waiting for locator(\"input[type='password']\")"
+
+
+def _ai_fallback_episode(
+    status: HealStatus,
+    *,
+    failing_line: int | None,
+    failure_message: str | None = None,
+    skip_reason: HealSkipReason | None = None,
+) -> HealEpisode:
+    recorded_at = datetime(2026, 9, 30, tzinfo=UTC)
+    return HealEpisode(
+        heal_episode_id="he_1",
+        organization_id="org-1",
+        workflow_permanent_id="wpid-1",
+        workflow_id="wf-1",
+        workflow_run_id="wr-1",
+        workflow_run_block_id="wrb_collect_metrics",
+        block_label="collect_metrics",
+        engine="harness" if status == HealStatus.skipped else "floor",
+        status=status,
+        skip_reason=skip_reason,
+        failing_line=failing_line,
+        failure_message=failure_message,
+        escalation_task_id=None if status == HealStatus.skipped else "tsk_fallback",
+        created_at=recorded_at,
+        modified_at=recorded_at,
+    )
+
+
+def _install_rescued_run(
+    monkeypatch: pytest.MonkeyPatch,
+    heal_episodes: list[HealEpisode],
+    *,
+    code_error: str = _CODE_ERROR,
+) -> SimpleNamespace:
+    failed_row = run_result_action_row("tsk_code", ActionType.NULL_ACTION, ActionStatus.failed)
+    failed_row.output = {"code_line": 5}
+    failed_row.response = code_error
+    failed_row.action_order = 2
+    failed_page_call = run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.failed)
+    failed_page_call.output = {"code_line": 1}
+    failed_page_call.response = "Timeout 3000ms exceeded."
+    failed_page_call.action_order = 1
+    typed_value_row = run_result_action_row("tsk_code", ActionType.INPUT_TEXT, ActionStatus.failed)
+    typed_value_row.output = {"code_line": None}
+    typed_value_row.response = "typed-in field value"
+    typed_value_row.action_order = 3
+
+    async def register_rescued_output(*, data: dict[str, Any], **_: object) -> dict[str, Any]:
+        for block in data["blocks"]:
+            if block["label"] == "collect_metrics":
+                block["extracted_data"] = {"collect_metrics_output": {"impressions": 1180}}
+        return {}
+
+    code_row = run_result_block_row("collect_metrics", "completed", task_id="tsk_code")
+    code_row.block_type = BlockType.CODE
+    recovery_row = run_result_block_row("Self-heal recovery", "completed", task_id="tsk_fallback")
+    recovery_row.parent_workflow_run_block_id = code_row.workflow_run_block_id
+    fired = any(episode.status != HealStatus.skipped for episode in heal_episodes)
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[
+            code_row,
+            *([recovery_row] if fired else []),
+            run_result_block_row("write_sheet", "completed", task_id="tsk_write"),
+        ],
+        recent_actions=[
+            typed_value_row,
+            failed_row,
+            failed_page_call,
+            run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.completed),
+            run_result_action_row("tsk_write", ActionType.CLICK, ActionStatus.completed),
+        ],
+        heal_episodes=heal_episodes,
+    )
+    monkeypatch.setattr(run_execution_module, "_attach_registered_output_parameter_values", register_rescued_output)
+    return ctx
+
+
+async def _run_results_page(ctx: SimpleNamespace | CopilotContext) -> dict[str, Any]:
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    return sanitize_tool_result_for_llm("get_run_results", run_execution_module.project_run_results_page(result, {}))
+
+
+@pytest.mark.asyncio
+async def test_a_rescued_block_reads_as_an_ai_fallback_rescue_in_run_results_and_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+
+    page = await _run_results_page(ctx)
+
+    rows = {row["label"]: row for row in page["data"]["blocks"]}
+    assert rows["collect_metrics"]["status"] == "completed"
+    assert rows["collect_metrics"]["ai_fallback"] == {
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert rows["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert "ai_fallback" not in rows["write_sheet"]
+    compacted = {row["label"]: row for row in json.loads(_summarize_tool_output(json.dumps(page)))["blocks"]}
+    assert compacted["collect_metrics"]["ai_fallback"] == {"status": "fired_completed", "failure_text": _CODE_ERROR}
+    assert compacted["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_ai_fallback_reports_the_code_error_beside_the_recovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [
+            _ai_fallback_episode(
+                HealStatus.fired_failed, failing_line=5, failure_message="Password field never appeared"
+            )
+        ],
+    )
+
+    page = await _run_results_page(ctx)
+
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert ai_fallback["failure_text"] == _CODE_ERROR
+    assert ai_fallback["recovery_failure_text"] == "Password field never appeared"
+
+
+@pytest.mark.asyncio
+async def test_a_secret_shaped_token_in_the_code_error_never_reaches_the_run_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Joined at runtime so no source line holds a whole JWT for secret scanners to flag.
+    token = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJ0ZXN0LXVzZXIifQ", "c2lnbmF0dXJlLXZhbHVlLXg"))
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)],
+        code_error=f"Timeout 30000ms exceeded waiting for locator(\"#session[value='{token}']\")",
+    )
+
+    page = await _run_results_page(ctx)
+
+    assert token not in json.dumps(page)
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert "[REDACTED_SECRET]" in ai_fallback["failure_text"]
+
+
+def test_the_packet_keeps_the_newest_ai_fallback_records_and_says_how_many_it_left_out() -> None:
+    ctx = make_copilot_ctx()
+    ctx.registered_artifact_evidence = None
+    blocks = [
+        {
+            "label": f"loop_step_{index}",
+            "status": "completed",
+            "ai_fallback": {"status": "fired_completed", "task_id": f"tsk_{index}"},
+        }
+        for index in range(15)
+    ]
+
+    packet = build_test_evidence_packet(
+        ctx, {"ok": True, "data": {"workflow_run_id": "wr_1", "overall_status": "completed", "blocks": blocks}}
+    )
+
+    assert [block.block_label for block in packet.ai_fallback_blocks or []] == [
+        f"loop_step_{index}" for index in range(3, 15)
+    ]
+    assert any(notice.startswith("ai_fallback_blocks shortened: 3 oldest") for notice in packet.omission_notices)
+
+
+@pytest.mark.asyncio
+async def test_the_prior_run_packet_and_its_recorded_outcome_name_the_rescued_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+    ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+
+    rescued = {
+        "block_label": "collect_metrics",
+        "status": "fired_completed",
+        "task_id": "tsk_fallback",
+        "failing_line": 5,
+        "failure_text": _CODE_ERROR,
+    }
+    assert outcome is not None
+    assert [block.model_dump(mode="json", exclude_none=True) for block in outcome.ai_fallback_blocks or []] == [rescued]
+    assert hydrated is not None
+    assert hydrated["ai_fallback_blocks"] == [rescued]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_an_ai_fallback_reads_exactly_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[str] = []
+    for episodes in (
+        [],
+        [_ai_fallback_episode(HealStatus.skipped, failing_line=5, skip_reason=HealSkipReason.no_goal)],
+    ):
+        _install_rescued_run(monkeypatch, episodes)
+        ctx = make_copilot_ctx(workflow_permanent_id="wpid-1")
+        page = await _run_results_page(ctx)
+        hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
+        outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+        assert hydrated is not None
+        assert outcome is not None
+        reads.append(json.dumps([page, hydrated, outcome.model_dump(mode="json", exclude_none=True)], default=str))
+
+    assert reads[0] == reads[1]
+    for absent in ("ai_fallback", "parent_block_label"):
+        assert absent not in reads[0]
+
+
+_PARSE_THEN_LOOP_YAML = """
+title: parse then loop
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: file_url_parser
+      label: parse_rows
+      file_url: https://fixture.test/rows.csv
+      file_type: csv
+      next_block_label: visit_each_row
+    - block_type: for_loop
+      label: visit_each_row
+      loop_over_parameter_key: parse_rows_output
+      {reference}
+      loop_blocks:
+        - block_type: goto_url
+          label: open_row_url
+          url: "{{{{ current_value.url }}}}"
+"""
+
+_LoopFactRow = tuple[
+    str,
+    str | None,
+    str | None,
+    str | None,
+    LoopSelectedInput,
+    int | None,
+    list[int | Literal["not_recorded"]] | None,
+    int | None,
+]
+
+_NESTED_LOOP_YAML = """
+title: nested loop
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: groups
+      workflow_parameter_type: json
+      default_value: [{"urls": ["https://fixture.test/a"]}]
+  blocks:
+    - block_type: for_loop
+      label: each_group
+      loop_over_parameter_key: groups
+      loop_blocks:
+        - block_type: for_loop
+          label: each_url
+          loop_variable_reference: current_value.urls
+          loop_blocks:
+            - block_type: goto_url
+              label: open_url
+              url: "{{ current_value }}"
+"""
+
+_REFERENCE_NAMES_A_PARAMETER_YAML = """
+title: reference names a parameter
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: groups
+      workflow_parameter_type: json
+      default_value: [{}]
+    - parameter_type: workflow
+      key: other_groups
+      workflow_parameter_type: json
+      default_value: [{}]
+  blocks:
+    - block_type: for_loop
+      label: each_group
+      loop_over_parameter_key: other_groups
+      loop_variable_reference: "{{ groups }}"
+      loop_blocks:
+        - block_type: goto_url
+          label: open_url
+          url: https://fixture.test/a
+"""
+
+
+def _parse_then_loop_yaml(reference: str | None) -> str:
+    return _PARSE_THEN_LOOP_YAML.format(
+        reference=f"loop_variable_reference: {json.dumps(reference)}" if reference else ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_both_inputs_run_reports_the_dispatched_versions_selected_reference_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser_row = terminal_extraction_block("completed", label="parse_rows").model_copy(
+        update={"block_type": BlockType.FILE_URL_PARSER}
+    )
+    failed_loop_row = terminal_extraction_block(
+        "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+    ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_parse_then_loop_yaml("current_value"),
+        polled_status="failed",
+        dispatch_to_worker=True,
+        terminal_blocks=[parser_row, failed_loop_row],
+    )
+    dispatched = harness["workflow"].model_copy(deep=True, update={"workflow_id": "w_dispatch_v8", "version": 8})
+    forge_app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version = AsyncMock(return_value=dispatched)
+
+    async def execute_and_rewrite_reference(**_kwargs: object) -> None:
+        loop = dispatched.workflow_definition.blocks[1]
+        assert isinstance(loop, ForLoopBlock)
+        loop.loop_variable_reference = "extracted_loop_values_runtime"
+
+    harness["worker_execute"].side_effect = execute_and_rewrite_reference
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["parse_rows", "visit_each_row"], "parameters": {}}, ctx
+    )
+    finalize_build_test_result(ctx, source_tool="update_and_run_blocks", result=result)
+    model_facing = sanitize_tool_result_for_llm("update_and_run_blocks", result)["data"]
+
+    parser_output_id = dispatched.workflow_definition.blocks[0].output_parameter.output_parameter_id
+    assert "loop_inputs" not in model_facing
+    assert model_facing["build_test_packet"]["run"]["loop_inputs"] == {
+        "workflow_run_id": "wr_paused",
+        "workflow_id": "w_dispatch_v8",
+        "workflow_permanent_id": "wfp-1",
+        "version": 8,
+        "loops": [
+            {
+                "block_label": "visit_each_row",
+                "loop_over_parameter_key": "parse_rows_output",
+                "producer_block_label": "parse_rows",
+                "producer_output_parameter_id": parser_output_id,
+                "loop_variable_reference": "current_value",
+                "selected_input": "loop_variable_reference",
+                "run_rows": 1,
+                "loop_values_counts": ["not_recorded"],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "rows", "expected"),
+    [
+        pytest.param(
+            _parse_then_loop_yaml(None),
+            [
+                terminal_extraction_block("completed", label="visit_each_row").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": ["a", "b"]}
+                )
+            ],
+            [("visit_each_row", None, "parse_rows_output", None, "loop_over_parameter_key", 1, [2], None)],
+            id="typed-only",
+        ),
+        pytest.param(
+            _parse_then_loop_yaml("{{ parse_rows_output.rows }}"),
+            [],
+            [
+                (
+                    "visit_each_row",
+                    None,
+                    "parse_rows_output",
+                    "{{ parse_rows_output.rows }}",
+                    "loop_variable_reference",
+                    None,
+                    None,
+                    None,
+                )
+            ],
+            id="explicit-expression-never-reached",
+        ),
+        pytest.param(
+            _REFERENCE_NAMES_A_PARAMETER_YAML,
+            [
+                terminal_extraction_block("completed", label="each_group").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": [{}]}
+                )
+            ],
+            [("each_group", None, None, "{{ groups }}", "loop_variable_reference", 1, [1], None)],
+            id="reference-names-a-parameter",
+        ),
+        pytest.param(
+            _NESTED_LOOP_YAML,
+            [
+                terminal_extraction_block("completed", label="each_group").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": [{}]}
+                )
+            ]
+            + [
+                terminal_extraction_block("completed", label="each_url").model_copy(
+                    update={"block_type": BlockType.FOR_LOOP, "loop_values": list(range(minute)) or None}
+                )
+                for minute in range(12)
+            ],
+            [
+                ("each_group", None, "groups", None, "loop_over_parameter_key", 1, [1], None),
+                (
+                    "each_url",
+                    "each_group",
+                    None,
+                    "current_value.urls",
+                    "loop_variable_reference",
+                    12,
+                    list(range(2, 12)),
+                    2,
+                ),
+            ],
+            id="nested-keeps-newest-ten-rows",
+        ),
+    ],
+)
+async def test_loop_input_facts_report_each_loops_own_declared_and_recorded_input(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_yaml: str,
+    rows: list[WorkflowRunBlock],
+    expected: list[_LoopFactRow],
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    definitions = loop_definition_facts(await inert_approval_workflow(workflow_yaml, workflow_id="w_source"))
+    assert definitions is not None
+    facts = with_loop_observations(definitions, "wr_paused", rows)
+
+    assert [
+        (
+            loop.block_label,
+            loop.enclosing_loop_label,
+            loop.loop_over_parameter_key,
+            loop.loop_variable_reference,
+            loop.selected_input,
+            loop.run_rows,
+            loop.loop_values_counts,
+            loop.loop_values_counts_omitted,
+        )
+        for loop in facts.loops
+    ] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_loop_over_id_from_an_older_version_still_names_its_producer_by_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    parser, loop = workflow.workflow_definition.blocks
+    assert isinstance(loop, ForLoopBlock) and isinstance(loop.loop_over, OutputParameter)
+    loop.loop_over = loop.loop_over.model_copy(update={"output_parameter_id": "op_from_version_2"})
+
+    definitions = loop_definition_facts(workflow)
+
+    assert definitions is not None
+    [fact] = definitions.loops
+    assert (fact.producer_block_label, fact.producer_output_parameter_id) == (
+        "parse_rows",
+        parser.output_parameter.output_parameter_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "loop_over", "expected"),
+    [
+        ("current_value", True, "loop_variable_reference"),
+        ("", True, "loop_over_parameter_key"),
+        (None, False, "none"),
+    ],
+)
+async def test_selected_input_matches_the_branch_the_real_for_loop_getter_takes(
+    reference: str | None, loop_over: bool, expected: str
+) -> None:
+    now = datetime(2026, 4, 21, 12, 0, tzinfo=UTC)
+    block = ForLoopBlock(
+        label="visit_each_row",
+        output_parameter=OutputParameter(
+            output_parameter_id="op_loop",
+            key="visit_each_row_output",
+            workflow_id="w",
+            created_at=now,
+            modified_at=now,
+        ),
+        loop_blocks=[],
+        loop_over=(
+            WorkflowParameter(
+                workflow_parameter_id="wp_rows",
+                workflow_parameter_type=WorkflowParameterType.JSON,
+                key="rows",
+                workflow_id="w",
+                created_at=now,
+                modified_at=now,
+            )
+            if loop_over
+            else None
+        ),
+        loop_variable_reference=reference,
+        complete_if_empty=True,
+    )
+    branch_values = {"loop_variable_reference": ["from_reference"], "loop_over_parameter_key": ["from_key"], "none": []}
+    context = MagicMock()
+    context.get_value.return_value = branch_values["loop_over_parameter_key"]
+
+    with patch.object(
+        ForLoopBlock,
+        "get_values_from_loop_variable_reference",
+        AsyncMock(return_value=branch_values["loop_variable_reference"]),
+    ):
+        observed = await block.get_loop_over_parameter_values(context, "wr", "wrb")
+
+    assert loop_selected_input(block) == expected
+    assert observed == branch_values[expected]
+
+
+@pytest.mark.asyncio
+async def test_read_run_reports_the_executed_versions_loop_inputs_not_the_current_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="wf-1")).model_copy(
+        update={"workflow_permanent_id": "wpid-1", "modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)}
+    )
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block(
+                "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+            ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+    ctx.staged_workflow = await inert_approval_workflow(_parse_then_loop_yaml(None), workflow_id="w_source")
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    page = sanitize_tool_result_for_llm("get_run_results", project_run_results_page(result, {}))["data"]
+
+    assert page["loop_inputs"]["workflow_run_id"] == "wr-1"
+    assert page["loop_inputs"]["workflow_id"] == "wf-1"
+    [loop] = page["loop_inputs"]["loops"]
+    assert (loop["loop_variable_reference"], loop["selected_input"], loop["loop_values_counts"]) == (
+        "current_value",
+        "loop_variable_reference",
+        ["not_recorded"],
+    )
+    assert "Failed to get loop values" not in json.dumps(page["loop_inputs"])
+
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=None)
+    unresolved = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    assert unresolved["data"]["loop_inputs"] == {"executed_definition": "unavailable"}
+    packet = build_test_evidence_packet(_locator_packet_ctx(), unresolved)
+    assert packet.run.loop_inputs is not None
+    assert packet.run.loop_inputs.model_dump() == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "created_by", "expected_unavailable"),
+    [
+        (_parse_then_loop_yaml("current_value"), None, True),
+        (_parse_then_loop_yaml("current_value"), COPILOT_TEST_WORKFLOW_CREATOR, False),
+        (SEARCH_THEN_SELECT_WORKFLOW_YAML, None, True),
+    ],
+    ids=[
+        "saved-version-overwritten-after-run",
+        "test-version-soft-deleted-after-run",
+        "loop-removed-from-saved-version-after-run",
+    ],
+)
+async def test_read_run_withholds_loop_inputs_when_the_workflow_row_changed_after_the_run(
+    monkeypatch: pytest.MonkeyPatch, workflow_yaml: str, created_by: str | None, expected_unavailable: bool
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (await inert_approval_workflow(workflow_yaml, workflow_id="wf-1")).model_copy(
+        update={
+            "workflow_permanent_id": "wpid-1",
+            "created_by": created_by,
+            "modified_at": HARNESS_RUN_CREATED_AT + timedelta(minutes=5),
+        }
+    )
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block(
+                "failed", label="visit_each_row", failure_reason="Failed to get loop values."
+            ).model_copy(update={"block_type": BlockType.FOR_LOOP})
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert (result["data"]["loop_inputs"] == {"executed_definition": "unavailable"}) is expected_unavailable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["aware_modified_at", "loop_definition_facts", "with_loop_observations"])
+async def test_read_run_degrades_loop_inputs_to_unavailable_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    modified_at = (
+        HARNESS_RUN_CREATED_AT.replace(tzinfo=UTC) + timedelta(minutes=5)
+        if fault == "aware_modified_at"
+        else HARNESS_RUN_CREATED_AT - timedelta(minutes=1)
+    )
+    executed = (
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    ).model_copy(update={"modified_at": modified_at})
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block("failed", label="visit_each_row").model_copy(
+                update={"block_type": BlockType.FOR_LOOP}
+            )
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+    if fault != "aware_modified_at":
+        monkeypatch.setattr(run_execution_module, fault, MagicMock(side_effect=ValueError("projection failed")))
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert result["data"]["loop_inputs"] == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["loop_definition_facts", "with_loop_observations"])
+async def test_build_test_loop_inputs_degrade_to_unavailable_when_the_projection_raises(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(_parse_then_loop_yaml("current_value"), workflow_id="w_source")
+    monkeypatch.setattr(run_execution_module, fault, MagicMock(side_effect=ValueError("projection failed")))
+    execution = run_execution_module._RunExecution(
+        snapshot=run_execution_module.CopilotExecutionSnapshot(
+            provenance="staged",
+            workflow=workflow,
+            workflow_parameters=(),
+            output_parameters=(),
+            workflow_yaml="",
+        ),
+        workflow_yaml="",
+        metadata={},
+        associations={},
+        source_at_start=None,
+        unbound_keys=[],
+        explicit_blank=False,
+        loop_definitions=run_execution_module._loop_definitions_or_unavailable(workflow),
+    )
+    data: dict[str, Any] = {}
+
+    run_execution_module._attach_loop_inputs(data, execution, "wr-1", [])
+
+    assert data["loop_inputs"] == {"executed_definition": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_read_run_reports_no_loop_inputs_for_an_unresolved_workflow_that_ran_no_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = install_get_run_results_harness(
+        monkeypatch, blocks=[terminal_extraction_block("failed", label="open_result")]
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=None)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    assert "loop_inputs" not in result["data"]
+    assert build_test_evidence_packet(_locator_packet_ctx(), result).run.loop_inputs is None
+
+
+@pytest.mark.asyncio
+async def test_prior_run_packet_and_handoff_carry_the_notice_for_a_truncated_loop_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    executed = (
+        await inert_approval_workflow(_parse_then_loop_yaml("current_value." + "a" * 400), workflow_id="wf-1")
+    ).model_copy(
+        update={"workflow_permanent_id": "wpid-1", "modified_at": HARNESS_RUN_CREATED_AT - timedelta(minutes=1)}
+    )
+    ctx = install_get_run_results_harness(
+        monkeypatch,
+        blocks=[
+            terminal_extraction_block("failed", label="visit_each_row").model_copy(
+                update={"block_type": BlockType.FOR_LOOP}
+            )
+        ],
+    )
+    run_execution_module.app.DATABASE.workflows.get_workflow_for_workflow_run = AsyncMock(return_value=executed)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    packet = build_test_evidence_packet(_locator_packet_ctx(), result)
+
+    assert isinstance(packet.run.loop_inputs, LoopInputs)
+    assert len(packet.run.loop_inputs.loops[0].loop_variable_reference or "") <= 200
+    assert any("loop_variable_reference" in notice for notice in packet.omission_notices)
+    handoff = project_direct_test_handoff_packet_for_llm(packet)
+    assert any("loop_variable_reference" in notice for notice in handoff.omission_notices)
+
+
+@pytest.mark.parametrize("ai_fallback_rows", [0, 12])
+def test_many_long_loop_facts_stay_inside_the_packet_budget(ai_fallback_rows: int) -> None:
+    long_label = "l" * 400
+    loop_inputs = LoopInputs(
+        workflow_run_id="wr_1",
+        workflow_id="w_dispatch",
+        workflow_permanent_id="wpid",
+        version=3,
+        loops=[
+            LoopInputFact(
+                block_label=f"{long_label}{index}",
+                enclosing_loop_label=long_label,
+                loop_over_parameter_key=f"{long_label}_output",
+                producer_block_label=long_label,
+                loop_variable_reference="r" * 5_000,
+                selected_input="loop_variable_reference",
+                run_rows=12 + index,
+                loop_values_counts=[1_000_000] * 10,
+                loop_values_counts_omitted=2,
+            )
+            for index in range(20)
+        ],
+    )
+    packet = _oversized_packet(build_test_evidence_packet(_locator_packet_ctx(), _failed_run_result(None)))
+    ai_fallback_blocks = [
+        BuildTestPacketAiFallbackBlock(
+            block_label=f"{long_label}{index}",
+            status="fired_failed",
+            task_id=f"tsk_{index}",
+            failing_line=index,
+            failure_text="f" * 2_000,
+            recovery_failure_text="g" * 2_000,
+        )
+        for index in range(ai_fallback_rows)
+    ]
+    packet = packet.model_copy(
+        update={
+            "run": packet.run.model_copy(update={"loop_inputs": loop_inputs}),
+            "ai_fallback_blocks": ai_fallback_blocks or None,
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(packet)
+
+    serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    assert len(serialized) <= _BUILD_TEST_PACKET_MAX_CHARS
+    assert isinstance(projected.run.loop_inputs, LoopInputs)
+    # Loop facts give way before canonical_workflow_yaml is shortened.
+    assert [loop.run_rows for loop in projected.run.loop_inputs.loops] == [12 + index for index in range(6)]
+    assert projected.run.loop_inputs.loops_omitted == 14
+    assert all(len(loop.loop_variable_reference or "") <= 200 for loop in projected.run.loop_inputs.loops)
+    assert all(loop.selected_input == "loop_variable_reference" for loop in projected.run.loop_inputs.loops)
+    assert all(loop.loop_values_counts == [1_000_000] * 10 for loop in projected.run.loop_inputs.loops)
+
+
+_EXECUTED_A_CODE = 'greeting = "Hello " + legacy_applicant_name\nreturn {"greeting": greeting}\n'
+_EDITABLE_B_CODE = 'display = greeting_prefix + " " + applicant_display_name\nreturn {"greeting": display}\n'
+_EDITABLE_B_YAML = """title: Historical run source
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: full_name
+      workflow_parameter_type: string
+    - parameter_type: workflow
+      key: greeting_prefix
+      workflow_parameter_type: string
+  blocks:
+    - block_type: code
+      label: greet_applicant
+      parameter_keys: [full_name, greeting_prefix]
+      code: |
+        display = greeting_prefix + " " + applicant_display_name
+        return {"greeting": display}
+"""
+
+
+def _editable_b_ctx() -> CopilotContext:
+    return make_copilot_ctx(workflow_permanent_id="wpid-1", workflow_yaml=_EDITABLE_B_YAML)
+
+
+@pytest.mark.asyncio
+async def test_get_run_results_and_hydration_name_the_version_a_finished_run_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_historical_run(
+        monkeypatch, historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), failed_label="greet_applicant"
+    )
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args: None)
+    ctx = _editable_b_ctx()
+
+    raw = await tools_module.get_run_results_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="get_run_results"), json.dumps({"workflow_run_id": "wr-1"})
+    )
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+
+    tool_source = json.loads(raw)["data"]["execution_source"]
+    assert hydrated is not None
+    assert hydrated["run"]["execution_source"] == tool_source
+    assert tool_source == {
+        "source_kind": "run_version",
+        "disposition": "available",
+        "workflow_run_id": "wr-1",
+        "workflow_id": "wf-1",
+        "workflow_version": 3,
+        "failed_block_label": "greet_applicant",
+        "failed_statement": 'greeting = "Hello " + legacy_applicant_name',
+        "declared_parameter_keys": ["applicant_name"],
+        "block_code_sha256": {"greet_applicant": hashlib.sha256(_EXECUTED_A_CODE.encode()).hexdigest()},
+        "current_draft_code_matches": {"greet_applicant": False},
+        "failed_block_code": _EXECUTED_A_CODE,
+    }
+    executed_fields = json.dumps(tool_source)
+    assert "applicant_display_name" not in executed_fields
+    assert hashlib.sha256(_EDITABLE_B_CODE.encode()).hexdigest() not in executed_fields
+
+
+@pytest.mark.asyncio
+async def test_a_historical_read_takes_no_signature_or_unverified_label_from_the_current_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_historical_run(
+        monkeypatch, historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), failed_label="greet_applicant"
+    )
+    ctx = _editable_b_ctx()
+    ctx.last_unverified_block_labels = ["greet_applicant", "only_in_b"]
+    ctx.unbound_required_parameter_keys = ["full_name"]
+    ctx.runner_code_block_associations_by_label = {"greet_applicant": "assoc_b"}
+    history_before = copy.deepcopy(ctx.recorded_build_test_outcome_history)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+    hydrated = await run_execution_module.hydrate_prior_run_packet(ctx, workflow_run_id="wr-1")
+    draft_outcome = run_execution_module._build_recorded_build_test_outcome(
+        ctx,
+        {**result, "data": {key: value for key, value in result["data"].items() if key != "execution_source"}},
+        recorded_run_outcome=None,
+    )
+
+    assert draft_outcome is not None and draft_outcome.authored_structure_signature
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr-1"
+    assert outcome.authored_structure_signature is None
+    assert outcome.block_shape_hashes == {}
+    assert outcome.executed_block_associations == ()
+    assert hydrated is not None
+    assert [item for item in hydrated.get("unfinished_items", []) if item.get("kind") == "unverified_block"] == []
+    assert ctx.recorded_build_test_outcome_history == history_before
+    assert ctx.latest_recorded_build_test_outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("definition_matches", [True, False], ids=["metadata-only-edit", "definition-rewritten"])
+async def test_the_definition_recorded_at_dispatch_decides_whether_an_edited_row_is_what_ran(
+    monkeypatch: pytest.MonkeyPatch, definition_matches: bool
+) -> None:
+    # A folder or title edit bumps modified_at past the run; only a definition change may withhold its source.
+    version = historical_code_version(
+        {"greet_applicant": _EXECUTED_A_CODE}, modified_at=HARNESS_RUN_CREATED_AT + timedelta(minutes=5)
+    )
+    recorded = historical_code_version({"greet_applicant": _EXECUTED_A_CODE if definition_matches else "pass\n"})
+    install_historical_run(
+        monkeypatch,
+        version,
+        failed_label="greet_applicant",
+        run_definition_sha256=workflow_definition_sha256(recorded.workflow_definition),
+    )
+    observe_locators = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_observe_authored_locators", observe_locators)
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, _editable_b_ctx())
+
+    source = result["data"]["execution_source"]
+    if definition_matches:
+        assert source["disposition"] == "available"
+        assert source["failed_statement"] == 'greeting = "Hello " + legacy_applicant_name'
+        assert observe_locators.await_args.kwargs["failed_block_code"] == _EXECUTED_A_CODE
+        assert "requested_output_parameter_definitions" in result["data"]
+    else:
+        assert source == {
+            "source_kind": "run_version",
+            "disposition": "unavailable",
+            "workflow_run_id": "wr-1",
+            "workflow_id": "wf-1",
+            "reason": "overwritten_after_run_start",
+        }
+        assert "requested_output_parameter_definitions" not in result["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "reason"),
+    [
+        (None, "version_missing"),
+        (historical_code_version({"greet_applicant": _EXECUTED_A_CODE}, workflow_id="wf-other"), "identity_mismatch"),
+        (
+            historical_code_version(
+                {"greet_applicant": _EXECUTED_A_CODE}, modified_at=HARNESS_RUN_CREATED_AT + timedelta(seconds=1)
+            ),
+            "overwritten_after_run_start",
+        ),
+        (historical_code_version({"greet_applicant": _EXECUTED_A_CODE}), None),
+    ],
+)
+async def test_an_unprovable_executed_version_is_unavailable_and_never_falls_back_to_the_draft(
+    monkeypatch: pytest.MonkeyPatch, version: SimpleNamespace | None, reason: str | None
+) -> None:
+    install_historical_run(monkeypatch, version, failed_label="greet_applicant")
+    observe_locators = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_observe_authored_locators", observe_locators)
+    ctx = _editable_b_ctx()
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    outcome = run_execution_module._build_recorded_build_test_outcome(ctx, result, recorded_run_outcome=None)
+
+    source = result["data"]["execution_source"]
+    observed_code = observe_locators.await_args.kwargs["failed_block_code"] if observe_locators.await_args else None
+    assert outcome is not None and outcome.authored_structure_signature is None
+    assert "applicant_display_name" not in json.dumps(source)
+    fetched_terminal_page = run_execution_module._fetch_dispatched_terminal_page_evidence.await_count > 0
+    if reason is None:
+        assert source["disposition"] == "available"
+        assert source["failed_statement"] == 'greeting = "Hello " + legacy_applicant_name'
+        assert observed_code == _EXECUTED_A_CODE
+        assert "requested_output_parameter_definitions" in result["data"]
+        assert fetched_terminal_page
+        return
+    # An unproven row may have lost the sensitive parameters or outputs the run had, so nothing is read from it.
+    assert observed_code is None
+    assert "requested_output_parameter_definitions" not in result["data"]
+    assert not fetched_terminal_page
+    assert source == {
+        "source_kind": "run_version",
+        "disposition": "unavailable",
+        "workflow_run_id": "wr-1",
+        "workflow_id": "wf-1",
+        "reason": reason,
+    }

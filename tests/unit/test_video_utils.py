@@ -2,21 +2,41 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import struct
+import subprocess
 from datetime import UTC, datetime
+from io import BytesIO
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from PIL import Image
 
 from skyvern.config import settings
 from skyvern.webeye import video_utils
 from skyvern.webeye.video_utils import (
     cut_recording_segment,
+    extract_video_frames_jpeg,
     finalize_webm,
     plan_run_segment,
     prepare_recording_for_upload,
     probe_media_duration_seconds,
+    probe_video_packet_duration_seconds,
+    remux_mp4_faststart,
 )
+
+
+def _mvhd_duration(data: bytes) -> int | None:
+    """Read the movie duration from the first ``mvhd`` box (0 for an empty_moov init)."""
+    i = data.find(b"mvhd")
+    if i < 0:
+        return None
+    body = data[i + 4 :]
+    version = body[0]
+    if version == 1:
+        return struct.unpack(">Q", body[4 + 8 + 8 + 4 : 4 + 8 + 8 + 4 + 8])[0]
+    return struct.unpack(">I", body[4 + 4 + 4 + 4 : 4 + 4 + 4 + 4 + 4])[0]
 
 
 def _write_unfinalized_webm(path: str) -> bytes:
@@ -320,6 +340,88 @@ async def test_finalize_webm_end_to_end_sets_duration(tmp_path) -> None:
     assert b"\x44\x89" in output[:4096]
 
 
+@pytest.mark.asyncio
+async def test_remux_mp4_faststart_defragments_and_sets_duration(tmp_path) -> None:
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    frag = str(tmp_path / "frag.mp4")
+    subprocess.check_call(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=160x90:rate=15:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            frag,
+        ]
+    )
+    frag_bytes = open(frag, "rb").read()
+    # Precondition: input is a fragmented MP4 whose init moov carries no duration.
+    assert b"moof" in frag_bytes
+    assert _mvhd_duration(frag_bytes) == 0
+
+    out_path = await remux_mp4_faststart(frag)
+    assert out_path is not None
+    # Output is created beside the source (same mount) so the caller can swap it in atomically.
+    assert os.path.dirname(out_path) == os.path.dirname(frag)
+    try:
+        out_bytes = open(out_path, "rb").read()
+    finally:
+        os.unlink(out_path)
+
+    # Postcondition: de-fragmented (no movie-fragment boxes) with a real duration,
+    # so a native <video> can read the length and seek without a full-file scan.
+    assert b"moof" not in out_bytes
+    assert (_mvhd_duration(out_bytes) or 0) > 0
+    # Faststart layout specifically: the moov must sit ahead of the mdat, not just be de-fragmented
+    # (de-fragmentation alone already drops moof and sets duration even without +faststart).
+    moov_off = out_bytes.find(b"moov")
+    mdat_off = out_bytes.find(b"mdat")
+    assert moov_off != -1 and mdat_off != -1 and moov_off < mdat_off
+
+
+@pytest.mark.asyncio
+async def test_remux_mp4_faststart_writes_output_beside_source(tmp_path, monkeypatch) -> None:
+    # Deterministic (no ffmpeg): the helper must place its temp output on the source's own
+    # directory/mount so the caller's swap is an atomic same-filesystem os.replace.
+    src = tmp_path / "sub" / "rec.mp4"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"x")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_run(src_path, *, suffix, output_args, timeout_seconds, operation, input_args=None, output_dir=None):
+        captured["output_dir"] = output_dir
+        captured["output_args"] = output_args
+        out = tmp_path / "sub" / "out.mp4"
+        out.write_bytes(b"y")
+        return str(out)
+
+    monkeypatch.setattr(video_utils.shutil, "which", lambda _binary: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_utils, "_run_ffmpeg_to_temp", _fake_run)
+
+    out = await remux_mp4_faststart(str(src))
+    assert out is not None
+    assert captured["output_dir"] == str(src.parent)
+    assert captured["output_args"] == ["-c", "copy", "-movflags", "+faststart"]
+
+
 def test_plan_run_segment_clamps_leading_run_in_long_session() -> None:
     # The production incident: a 29-min run is the first slice of a ~3h session recording.
     video_start = datetime(2026, 6, 4, 15, 59, 0, tzinfo=UTC)
@@ -430,6 +532,95 @@ async def test_probe_media_duration_unparseable_returns_none(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_probe_media_duration_cancellation_kills_ffprobe(tmp_path) -> None:
+    src = tmp_path / "v.mp4"
+    src.write_bytes(b"x")
+    killed = False
+    waited = False
+
+    class FakeProcess:
+        returncode = None
+
+        async def communicate(self):
+            return b"", b""
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            nonlocal waited
+            waited = True
+            return self.returncode
+
+    async def immediate_cancel(coro, timeout):
+        coro.close()
+        raise asyncio.CancelledError()
+
+    with (
+        patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffprobe"),
+        patch.object(video_utils.asyncio, "create_subprocess_exec", return_value=FakeProcess()),
+        patch.object(video_utils.asyncio, "wait_for", side_effect=immediate_cancel),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await probe_media_duration_seconds(str(src))
+
+    assert killed
+    assert waited
+
+
+@pytest.mark.asyncio
+async def test_probe_video_packet_duration_uses_latest_packet_end(tmp_path) -> None:
+    src = tmp_path / "durationless.webm"
+    src.write_bytes(b"x")
+    proc = AsyncMock()
+    proc.returncode = 0
+    proc.communicate = AsyncMock(return_value=(b"0.000000,0.100000\n3.900000,0.100000\n", b""))
+
+    with (
+        patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffprobe"),
+        patch.object(video_utils.asyncio, "create_subprocess_exec", return_value=proc),
+    ):
+        duration = await probe_video_packet_duration_seconds(str(src))
+
+    assert duration == 4.0
+
+
+@pytest.mark.asyncio
+async def test_probe_video_packet_duration_reads_durationless_webm_end_to_end(tmp_path) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    src = str(tmp_path / "durationless.webm")
+    subprocess.check_call(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=320x180:rate=10:duration=4",
+            "-c:v",
+            "libvpx",
+            "-f",
+            "webm",
+            "-live",
+            "1",
+            src,
+        ]
+    )
+
+    assert await probe_media_duration_seconds(src) is None
+    packet_duration = await probe_video_packet_duration_seconds(src)
+    assert packet_duration is not None
+    assert packet_duration == pytest.approx(4.0, abs=0.2)
+
+
+@pytest.mark.asyncio
 async def test_cut_recording_segment_reencodes_with_accurate_seek(tmp_path) -> None:
     src = str(tmp_path / "session.mp4")
     with open(src, "wb") as f:
@@ -484,3 +675,52 @@ async def test_cut_recording_segment_nonpositive_duration_yields_none(tmp_path) 
     with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
         async with cut_recording_segment(src, start_seconds=0.0, duration_seconds=0.0) as clip_path:
             assert clip_path is None
+
+
+@pytest.mark.asyncio
+async def test_upload_probes_pin_the_demuxer_and_refuse_a_disguised_playlist(tmp_path) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    src = str(tmp_path / "demo.mp4")
+    Path(src).write_text("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nfile:///etc/hostname\n#EXT-X-ENDLIST\n")
+
+    assert await probe_media_duration_seconds(src, input_format="mov") is None
+    assert await probe_video_packet_duration_seconds(src, input_format="mov") is None
+    assert await extract_video_frames_jpeg(src, frames_per_second=2, max_duration_seconds=5, input_format="mov") == ()
+
+
+@pytest.mark.parametrize(("duration", "expected_frame_count"), [(2, 4), (0.1, 1)])
+@pytest.mark.asyncio
+async def test_extract_video_frames_jpeg_decodes_a_timeline_in_one_process(
+    tmp_path, duration: float, expected_frame_count: int
+) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+
+    src = str(tmp_path / "timeline.mp4")
+    subprocess.check_call(  # noqa: ASYNC221 - a local ffmpeg fixture must finish before extraction
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=size=640x360:rate=10:duration={duration}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            src,
+        ]
+    )
+
+    frames = await extract_video_frames_jpeg(src, frames_per_second=2, max_duration_seconds=300)
+
+    assert len(frames) == expected_frame_count
+    for frame in frames:
+        with Image.open(BytesIO(frame)) as image:
+            assert max(image.size) <= 768

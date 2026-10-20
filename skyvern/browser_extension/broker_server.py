@@ -106,7 +106,7 @@ MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
 TAB_REQUEST_EXACT_TIMEOUT_TOLERANCE_SECONDS = 0.25
 _LEASED_OPS = frozenset(
-    {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "tabs.activate", "tabs.remove"}
+    {"debugger.attach", "debugger.send", "debugger.detach", "dom.evaluate", "dom.fill", "tabs.activate", "tabs.remove"}
 )
 _WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
 _APPROVAL_SOURCE_INTERACTIVE = "interactive"
@@ -1654,8 +1654,9 @@ class BrowserExtensionBrokerServer:
         if event == "scope.tabRemoved":
             lease.draining = True
             await self._persist_leases()
-            cleanup = lease.origin == "created" and params.get("reason") != "closed"
-            self._schedule_lease_drain(lease, cleanup=cleanup)
+            # Scope loss revokes control; it does not authorize closing the tab.
+            # Keep the old-request fence even if the operator shares it again.
+            self._schedule_lease_drain(lease, cleanup=False)
         await self._forward_to_owner(lease.client_id, event, params)
 
     def _legacy_create_fence_active(self) -> bool:

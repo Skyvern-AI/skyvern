@@ -1,17 +1,24 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { Status } from "@/api/types";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
+import { StudioPaneDefaultsProvider } from "../workflows/studio/StudioPaneDefaults";
+import { useStudioPanes } from "../workflows/studio/useStudioPanes";
 import { RunRouter } from "./RunRouter";
 
 type RunQueryResult = {
   data:
-    | { workflow_run_id: string; workflow: { workflow_permanent_id: string } }
+    | {
+        workflow_run_id: string;
+        status: Status;
+        workflow: { workflow_permanent_id: string };
+      }
     | undefined;
   isLoading: boolean;
   isError?: boolean;
@@ -19,6 +26,7 @@ type RunQueryResult = {
 
 const resolvedRun = {
   workflow_run_id: "wr_1",
+  status: Status.Completed,
   workflow: { workflow_permanent_id: "wpid_123" },
 };
 
@@ -29,24 +37,28 @@ const { getClientMock, realRunQuery } = vi.hoisted(() => ({
   realRunQuery: { enabled: false },
 }));
 
+const { postHogCaptureMock } = vi.hoisted(() => ({
+  postHogCaptureMock: vi.fn(),
+}));
+
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: postHogCaptureMock }),
+}));
+
 const mocks = vi.hoisted(() => ({
-  studioFlagState: vi.fn<() => boolean | undefined>(() => true),
   taskV2: vi.fn(() => ({ data: undefined, isLoading: false })),
   runQuery: vi.fn<
     (options?: { workflowRunId?: string; enabled?: boolean }) => RunQueryResult
   >(() => ({
     data: {
       workflow_run_id: "wr_1",
+      status: "completed",
       workflow: { workflow_permanent_id: "wpid_123" },
     },
     isLoading: false,
   })),
 }));
 
-vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
-  useWorkflowStudioFlagState: () => mocks.studioFlagState(),
-  useWorkflowStudioEnabled: () => mocks.studioFlagState() ?? false,
-}));
 vi.mock("@/routes/runs/useTaskV2Query", () => ({
   useTaskV2Query: () => mocks.taskV2(),
 }));
@@ -76,12 +88,17 @@ vi.mock(
 // verify both the branch choice and that the provider fed the id through.
 vi.mock("@/routes/workflows/editor/WorkflowEditor", () => ({
   WorkflowEditor: () => (
-    <div data-testid="studio">studio:{useWorkflowPermanentId()}</div>
+    <StudioPaneDefaultsProvider hasBlocks={true}>
+      <div data-testid="studio">studio:{useWorkflowPermanentId()}</div>
+      <PanesProbe />
+    </StudioPaneDefaultsProvider>
   ),
 }));
-vi.mock("@/routes/workflows/WorkflowRun", () => ({
-  WorkflowRun: () => <div data-testid="legacy">legacy</div>,
-}));
+
+function PanesProbe() {
+  const { panes } = useStudioPanes();
+  return <output data-testid="panes">{panes.join(",")}</output>;
+}
 
 function LocationProbe() {
   const location = useLocation();
@@ -91,22 +108,24 @@ function LocationProbe() {
 }
 
 function renderAt(entry: string, client?: QueryClient) {
-  const tree = (
-    <MemoryRouter initialEntries={[entry]}>
-      <Routes>
-        <Route path="/runs/:runId/*" element={<RunRouter />} />
-        <Route path="/agents/*" element={<div data-testid="redirected" />} />
-      </Routes>
-      <LocationProbe />
-    </MemoryRouter>
+  const queryClient =
+    client ??
+    new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+  const renderPage = () => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route path="/runs/:runId/*" element={<RunRouter />} />
+          <Route path="/agents/*" element={<div data-testid="redirected" />} />
+        </Routes>
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
-  return render(
-    client ? (
-      <QueryClientProvider client={client}>{tree}</QueryClientProvider>
-    ) : (
-      tree
-    ),
-  );
+  const result = render(renderPage());
+  return { ...result, rerenderPage: () => result.rerender(renderPage()) };
 }
 
 function expectCenteredLoadingIndicator() {
@@ -125,7 +144,7 @@ function expectCenteredLoadingIndicator() {
 
 describe("RunRouter", () => {
   beforeEach(() => {
-    mocks.studioFlagState.mockReturnValue(true);
+    postHogCaptureMock.mockReset();
     mocks.taskV2.mockReturnValue({ data: undefined, isLoading: false });
     mocks.runQuery.mockReturnValue({ data: resolvedRun, isLoading: false });
   });
@@ -139,10 +158,87 @@ describe("RunRouter", () => {
     renderAt("/runs/wr_1");
     expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
     expect(screen.queryByTestId("redirected")).toBeNull();
-    expect(screen.queryByTestId("legacy")).toBeNull();
   });
 
-  test("studio on: shows the fetching treatment while the run resolves", () => {
+  test("captures one safe page-view event for a run id despite status rerenders", () => {
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status: Status.Failed },
+      isLoading: false,
+    });
+    const page = renderAt("/runs/wr_1");
+
+    expect(postHogCaptureMock.mock.calls).toEqual([
+      [
+        "run.page_viewed",
+        { run_id: "wr_1", run_status: Status.Failed, failed: true },
+      ],
+    ]);
+
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status: Status.Completed },
+      isLoading: false,
+    });
+    page.rerenderPage();
+
+    expect(postHogCaptureMock.mock.calls).toEqual([
+      [
+        "run.page_viewed",
+        { run_id: "wr_1", run_status: Status.Failed, failed: true },
+      ],
+    ]);
+  });
+
+  test.each([
+    [Status.Terminated, true],
+    [Status.TimedOut, true],
+    [Status.Canceled, false],
+    [Status.Completed, false],
+  ])("marks a %s run page view failed=%s", (status, failed) => {
+    mocks.runQuery.mockReturnValue({
+      data: { ...resolvedRun, status },
+      isLoading: false,
+    });
+    renderAt("/runs/wr_1");
+
+    expect(postHogCaptureMock).toHaveBeenCalledWith("run.page_viewed", {
+      run_id: "wr_1",
+      run_status: status,
+      failed,
+    });
+  });
+
+  test.each([
+    ["overview", "timeline", "overview,browser"],
+    ["blocks", "timeline", "overview,browser"],
+    ["output", "timeline", "overview,browser"],
+    ["parameters", "timeline", "overview,browser"],
+    ["recording", "recording", "browser,overview"],
+    ["code", "code", "overview,browser"],
+  ])("preserves the direct %s subview", (legacySubview, studioView, panes) => {
+    renderAt(`/runs/wr_1/${legacySubview}?active=act_1`);
+
+    expect(screen.getByTestId("location").textContent).toBe(
+      `/runs/wr_1?active=act_1&view=${studioView}`,
+    );
+    expect(screen.getByTestId("panes").textContent).toBe(panes);
+  });
+
+  test.each([
+    ["output", "outputs"],
+    ["parameters", "inputs"],
+  ])(
+    "preserves the run-level %s subview without an active block",
+    (legacySubview, studioView) => {
+      renderAt(`/runs/wr_1/${legacySubview}`);
+
+      expect(screen.getByTestId("location").textContent).toBe(
+        `/runs/wr_1?view=${studioView}`,
+      );
+      expect(screen.getByTestId("panes").textContent).toBe("overview,browser");
+    },
+  );
+
+  test("shows the fetching treatment while the workflow run resolves", () => {
     mocks.runQuery.mockReturnValue({ data: undefined, isLoading: true });
     renderAt("/runs/wr_1");
     expectCenteredLoadingIndicator();
@@ -173,43 +269,55 @@ describe("RunRouter", () => {
     expect(screen.queryByTestId("studio")).toBeNull();
   });
 
-  test("studio off: keeps the legacy run view", () => {
-    mocks.studioFlagState.mockReturnValue(false);
-    renderAt("/runs/wr_1");
-    expect(screen.getByTestId("legacy")).toBeTruthy();
-    expect(screen.queryByTestId("studio")).toBeNull();
-  });
-
-  test("studio on: enables the run-resolver query for the wr_ id", () => {
+  test("enables the run-resolver query for the wr_ id", () => {
     renderAt("/runs/wr_1");
     expect(mocks.runQuery).toHaveBeenCalledWith(
       expect.objectContaining({ workflowRunId: "wr_1", enabled: true }),
     );
   });
 
-  test("studio off: disables the run-resolver query so non-studio routes don't fetch a workflow run", () => {
-    mocks.studioFlagState.mockReturnValue(false);
-    renderAt("/runs/wr_1");
+  test("does not fetch a workflow run for task routes", () => {
+    renderAt("/runs/tsk_1");
     expect(mocks.runQuery).toHaveBeenCalledWith(
       expect.objectContaining({ enabled: false }),
     );
   });
 
-  test("embed=true keeps the chrome-free legacy view, not the studio shell", () => {
+  test("embed=true renders a chrome-free Overview-only studio run", async () => {
     renderAt("/runs/wr_1?embed=true");
-    expect(screen.getByTestId("legacy")).toBeTruthy();
-    expect(screen.queryByTestId("studio")).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?embed=true",
+    );
+    expect(screen.getByTestId("panes").textContent).toBe("overview");
+    await waitFor(() => {
+      expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
+    });
   });
 
-  test("embed=true honors ?wr= even while the studio flag is unresolved", () => {
-    // Embed never renders the studio shell, so there is no URL state to protect
-    // and the redirect need not wait for the flag.
-    mocks.studioFlagState.mockReturnValue(undefined);
-    renderAt("/runs/wr_1?embed=true&wr=wr_2&active=act_9");
+  test("embedded recording links focus only the Browser pane", () => {
+    renderAt("/runs/wr_1/recording?embed=true");
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_2/overview?embed=true&active=act_9",
+      "/runs/wr_1?embed=true&view=recording",
     );
-    expect(screen.getByTestId("legacy")).toBeTruthy();
+    expect(screen.getByTestId("panes").textContent).toBe("browser");
+  });
+
+  test("embedded in-app pane changes are not normalized away", () => {
+    renderAt("/runs/wr_1?embed=true&panes=browser&active=wrb_1");
+
+    expect(screen.getByTestId("studio").textContent).toBe("studio:wpid_123");
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?embed=true&panes=browser&active=wrb_1",
+    );
+  });
+
+  test("embedded URLs cannot open authoring panes", () => {
+    renderAt("/runs/wr_1?embed=true&panes=editor,browser");
+
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/runs/wr_1?embed=true&panes=editor,browser",
+    );
+    expect(screen.getByTestId("panes").textContent).toBe("overview");
   });
 
   test("a permanently failed run fetch lands on 404, not an endless spinner", () => {
@@ -221,74 +329,6 @@ describe("RunRouter", () => {
     renderAt("/runs/wr_1");
     expect(screen.queryByTestId("studio")).toBeNull();
     expect(screen.queryByAltText("Minimized Logo")).toBeNull();
-    expect(screen.queryByTestId("legacy")).toBeNull();
-  });
-
-  test("studio off: a studio-shared link resolves to the ?wr= run, selection intact", () => {
-    // The studio switches runs by rewriting ?wr= and leaving the path alone, so
-    // its URLs can carry a stale run id in the path. Flag-off must land on the
-    // ?wr= run — straight onto the sub-path so the index redirect can't drop
-    // ?active= (the shared selection).
-    mocks.studioFlagState.mockReturnValue(false);
-    renderAt(
-      "/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9&selected-block=Payment",
-    );
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_2/overview?panes=editor,overview&active=act_9&selected-block=Payment",
-    );
-    expect(screen.getByTestId("legacy")).toBeTruthy();
-    expect(screen.queryByTestId("studio")).toBeNull();
-  });
-
-  test("studio off: ?wr= naming the path run is not a redirect", () => {
-    mocks.studioFlagState.mockReturnValue(false);
-    renderAt("/runs/wr_1?wr=wr_1&active=act_9");
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?wr=wr_1&active=act_9",
-    );
-    expect(screen.getByTestId("legacy")).toBeTruthy();
-  });
-
-  test("flag unresolved: no rewrite — a studio user's URL state must survive cold load", () => {
-    mocks.studioFlagState.mockReturnValue(undefined);
-    renderAt("/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9");
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?wr=wr_2&panes=editor,overview&active=act_9",
-    );
-    expect(screen.getByTestId("legacy")).toBeTruthy();
-  });
-
-  test("studio off: /blocks maps to /overview and the studio-internal ?wrs=/?bl= are scrubbed", () => {
-    // /blocks immediately re-navigates to /overview without the search, and
-    // ?wrs=/?bl= are companions of the ?wr= being promoted into the path.
-    mocks.studioFlagState.mockReturnValue(false);
-    renderAt("/runs/wr_1/blocks?wr=wr_2&wrs=copilot&bl=Login&active=act_9");
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_2/overview?active=act_9",
-    );
-  });
-
-  test("studio off: the splat is whitelisted — known sub-paths forward, anything else lands on overview", () => {
-    mocks.studioFlagState.mockReturnValue(false);
-    const first = renderAt("/runs/wr_1/recording?wr=wr_2");
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_2/recording",
-    );
-    first.unmount();
-    renderAt("/runs/wr_1/%2E%2E%2Fagents?wr=wr_2&active=act_9");
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_2/overview?active=act_9",
-    );
-  });
-
-  test("studio off: a malformed ?wr= is ignored, not spliced into the path", () => {
-    mocks.studioFlagState.mockReturnValue(false);
-    const wr = encodeURIComponent("wr_2/../../agents/wpid_x/studio");
-    renderAt(`/runs/wr_1?wr=${wr}`);
-    expect(screen.getByTestId("location").textContent).toBe(
-      `/runs/wr_1?wr=${wr}`,
-    );
-    expect(screen.getByTestId("legacy")).toBeTruthy();
   });
 
   test("studio on: the studio owns ?wr= — the path is never rewritten under it", () => {

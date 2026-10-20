@@ -9,12 +9,15 @@ which sidesteps Chromium ``Cookies`` SQLite surgery (no encryption/schema/patchr
 import contextlib
 import json
 import os
+from urllib.parse import urlparse
 
 import structlog
 
 LOG = structlog.get_logger()
 
 BANKED_COOKIES_FILENAME = ".skyvern_banked_cookies.json"
+# A one-shot seed written by an explicit profile create; boot restores it regardless of the memory engine.
+SIGNIN_COOKIES_FILENAME = ".skyvern_signin_cookies.json"
 
 # Keys accepted by Playwright's add_cookies; drop anything else (e.g. partitionKey) so one
 # unexpected field can't reject the whole batch. Single source — session_cookies imports this.
@@ -92,6 +95,11 @@ def union_cookies_into_profile_dir(
             os.remove(path)
         return 0
 
+    _write_cookie_file(path, cookies)
+    return len(cookies)
+
+
+def _write_cookie_file(path: str, cookies: list[dict]) -> None:
     # 0o600: the sidecar holds auth cookies. Write to a temp file and atomically replace so a
     # failed write can't leave a partial file or destroy the previous good sidecar.
     tmp = f"{path}.tmp"
@@ -103,7 +111,38 @@ def union_cookies_into_profile_dir(
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.remove(tmp)
-    return len(cookies)
+
+
+def sanitize_cookies(cookies: list[dict]) -> list[dict]:
+    return [c for c in (_sanitize(cookie) for cookie in cookies) if c is not None]
+
+
+def write_signin_cookies(profile_dir: str, cookies: list[dict]) -> int:
+    """Write ``cookies`` as the profile's sign-in seed sidecar and return the count written."""
+    sanitized = sanitize_cookies(cookies)
+    if not sanitized:
+        return 0
+    _write_cookie_file(os.path.join(profile_dir, SIGNIN_COOKIES_FILENAME), sanitized)
+    return len(sanitized)
+
+
+def cookie_applies_to_host(cookie_domain: str | None, host: str) -> bool:
+    d = (cookie_domain or "").lstrip(".").lower()
+    return bool(d) and (host == d or host.endswith("." + d))
+
+
+def cookies_for_login_urls(cookies: list[dict], login_urls: list[str]) -> list[dict]:
+    """Keep only cookies that apply to a login URL's host or its parent domains.
+
+    Fails CLOSED: with no usable login host nothing is kept, rather than every origin's cookies.
+    """
+    # Sibling-subdomain and cross-domain-SSO cookies fall out in v1 (those logins re-auth).
+    hosts = {host for url in login_urls if (host := (urlparse(url).hostname or "").lower())}
+    return [c for c in cookies if any(cookie_applies_to_host(c.get("domain"), host) for host in hosts)]
+
+
+def cookies_for_login_host(cookies: list[dict], login_url: str | None) -> list[dict]:
+    return cookies_for_login_urls(cookies, [login_url] if login_url else [])
 
 
 def cookie_delta(end_state_cookies: list[dict], seed_cookies: list[dict]) -> list[dict]:

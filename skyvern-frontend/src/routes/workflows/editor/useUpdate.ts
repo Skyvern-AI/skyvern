@@ -1,3 +1,6 @@
+import { RunEngine } from "@/api/types";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
 import { useReactFlow } from "@xyflow/react";
 import { useCallback } from "react";
 
@@ -30,10 +33,19 @@ export function useUpdate<T extends Record<string, unknown>>({
   const readOnlyScope = useWorkflowScopeReadOnly();
 
   const update = useCallback(
-    (updates: Partial<T>) => {
-      if (!editable || readOnlyScope) return;
-
-      updateNodeData(id, updates);
+    (updates: Partial<T>, options?: { source: "workflow" }) => {
+      if (!editable || readOnlyScope || refuseMutationDuringYamlCommit())
+        return false;
+      if (options?.source !== "workflow")
+        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+      // Only a pick in the engine dropdown marks skyvern-1.0 as a pin; a load carries the stored marker.
+      updateNodeData(
+        id,
+        "engine" in updates
+          ? { ...updates, enginePinned: updates.engine === RunEngine.SkyvernV1 }
+          : updates,
+      );
+      return true;
     },
     [id, editable, readOnlyScope, updateNodeData],
   );

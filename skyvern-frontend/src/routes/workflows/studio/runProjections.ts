@@ -4,8 +4,9 @@ import {
   ReadableActionTypes,
   Status,
   WorkflowRunStatusApiResponseWithWorkflow,
+  WorkflowRunRetryFields,
 } from "@/api/types";
-import { statusIsAFailureType, statusIsFinalized } from "@/routes/tasks/types";
+import { statusIsAFailureType } from "@/routes/tasks/types";
 import {
   isBlockItem,
   WorkflowRunBlock,
@@ -13,6 +14,10 @@ import {
 } from "@/routes/workflows/types/workflowRunTypes";
 import { taskV3CallText } from "@/routes/workflows/workflowBlockUtils";
 import { flattenTimelineChronologically } from "@/routes/workflows/workflowRun/workflowTimelineUtils";
+import {
+  runIsLogicallyFinal,
+  runIsLogicallyActive,
+} from "../workflowRun/runRetryState";
 import { isRecord } from "@/util/utils";
 import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
 
@@ -54,16 +59,13 @@ export function formatElapsed(
   return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
 }
 
-// The elapsed value's hover tooltip: the full created/queued/started/finished
-// breakdown, one per line, omitting timestamps the run doesn't have yet.
+// The elapsed value's hover tooltip supplements the visible Created timestamp
+// with the run's queue/start/finish breakdown.
 export function formatRunTimesTooltip(
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
 ): string {
-  const finalized = statusIsFinalized(workflowRun);
+  const finalized = runIsLogicallyFinal(workflowRun);
   return [
-    workflowRun.created_at
-      ? `Created ${basicLocalTimeFormat(workflowRun.created_at)}`
-      : null,
     workflowRun.queued_at
       ? `Queued ${basicLocalTimeFormat(workflowRun.queued_at)}`
       : null,
@@ -79,15 +81,16 @@ export function formatRunTimesTooltip(
 }
 
 export function runOutcomeFromStatus(
-  status: Status | null | undefined,
+  run: ({ status: Status } & WorkflowRunRetryFields) | null | undefined,
 ): RunOutcome {
-  if (!status) {
+  if (!run) {
     return "idle";
   }
-  if (status === Status.Completed) {
+  if (runIsLogicallyActive(run)) return "running";
+  if (run.status === Status.Completed) {
     return "success";
   }
-  if (statusIsAFailureType({ status }) || status === Status.Canceled) {
+  if (statusIsAFailureType(run) || run.status === Status.Canceled) {
     return "failed";
   }
   return "running";
@@ -95,12 +98,12 @@ export function runOutcomeFromStatus(
 
 // Null while the run is in-flight; the tab shows only the terminal status.
 export function finalizedRunStatus(
-  status: Status | null | undefined,
+  run: ({ status: Status } & WorkflowRunRetryFields) | null | undefined,
 ): Status | null {
-  if (status == null) {
+  if (run == null) {
     return null;
   }
-  return statusIsFinalized({ status }) ? status : null;
+  return runIsLogicallyFinal(run) ? run.status : null;
 }
 
 type RunOutputSignals = Pick<
@@ -173,6 +176,24 @@ export function runErrorRows(
     rows.push({ code, message });
   }
   return rows;
+}
+
+export type RunErrorCode = { code: string; message: string | null };
+
+// The Overview's failure line names each code once, keeping the first message
+// that carried it as the hover. Built on runErrorRows so the line and
+// Outputs → Errors can't disagree on which codes a run has.
+export function runErrorCodes(
+  errors: Array<Record<string, unknown>>,
+): RunErrorCode[] {
+  const byCode = new Map<string, string | null>();
+  for (const row of runErrorRows(errors)) {
+    if (!row.code || byCode.has(row.code)) {
+      continue;
+    }
+    byCode.set(row.code, row.message);
+  }
+  return Array.from(byCode, ([code, message]) => ({ code, message }));
 }
 
 function nonEmptyString(value: unknown): boolean {

@@ -11,6 +11,7 @@ export type { CustomLlmUpdateRequest } from "./CustomLlmUpdateRequest.js";
 export type { DeleteFolderRequest } from "./DeleteFolderRequest.js";
 export type { DeployScriptRequest } from "./DeployScriptRequest.js";
 export type { DownloadFilesRequest } from "./DownloadFilesRequest.js";
+export type { ExtendBrowserSessionRequest } from "./ExtendBrowserSessionRequest.js";
 export type { FolderCreate } from "./FolderCreate.js";
 export type { FolderUpdate } from "./FolderUpdate.js";
 export type { GetCredentialsRequest } from "./GetCredentialsRequest.js";

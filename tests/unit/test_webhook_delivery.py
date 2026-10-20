@@ -27,6 +27,7 @@ async def test_scheme_less_url_rejected_before_delivery(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_valid_https_url_reaches_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
     resp = httpx.Response(200, request=httpx.Request("POST", "https://example.com/webhook"))
     deliver = AsyncMock(return_value=resp)

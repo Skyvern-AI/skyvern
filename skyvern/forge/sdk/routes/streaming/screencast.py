@@ -193,6 +193,7 @@ async def start_screencast_loop(
     check_finalized: Callable[[], Awaitable[bool]],
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
+    on_frame_sent: Callable[[], None] | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
     metric_attributes = {"entity_type": entity_type}
@@ -379,6 +380,8 @@ async def start_screencast_loop(
                 )
             except Exception:
                 break
+            if on_frame_sent is not None:
+                on_frame_sent()
             sent_at = time.monotonic()
             _frame_send_seconds.record(sent_at - dequeued_at, metric_attributes)
             _frame_forward_seconds.record(sent_at - received_at, metric_attributes)

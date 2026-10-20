@@ -17,6 +17,9 @@ import {
   DrawerHeader,
   DrawerTitle,
 } from "@/components/ui/drawer";
+import { CreatorDirectoryBoundary } from "@/components/CreatorDirectoryBoundary";
+import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Pill } from "@/components/StatusBadge";
 import { Input } from "@/components/ui/input";
@@ -95,10 +98,12 @@ const EXTENSION_OPTIONS: Array<{
   },
 ];
 
-function BrowserSessions() {
+function BrowserSessionsContent() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const showCreator = useCreatorColumnEnabled();
+  const columnCount = showCreator ? 7 : 6;
   const [sessionOptions, setSessionOptions] = useState<{
     proxyLocation: ProxyLocation;
     timeoutMinutes: number | null;
@@ -212,9 +217,9 @@ function BrowserSessions() {
           <Table className="w-full table-fixed">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[22%] truncate">ID</TableHead>
-                <TableHead className="w-[10%] truncate">Open</TableHead>
-                <TableHead className="w-[14%]">
+                <TableHead className="w-[20%] truncate">ID</TableHead>
+                <TableHead className="w-[8%] truncate">Open</TableHead>
+                <TableHead className="w-[12%]">
                   <span className="inline-flex items-center gap-1.5">
                     Occupied
                     <HelpTooltip
@@ -223,16 +228,28 @@ function BrowserSessions() {
                     />
                   </span>
                 </TableHead>
-                <TableHead className="w-[14%] truncate">Started</TableHead>
-                <TableHead className="w-[12%] truncate">Timeout</TableHead>
-                <TableHead className="w-[28%] truncate">CDP Url</TableHead>
+                {showCreator && (
+                  <TableHead className="w-[14%] truncate">Created By</TableHead>
+                )}
+                <TableHead className="w-[12%] truncate">Started</TableHead>
+                <TableHead className="w-[10%] truncate">Timeout</TableHead>
+                <TableHead
+                  className={cn(
+                    "truncate",
+                    showCreator ? "w-[24%]" : "w-[38%]",
+                  )}
+                >
+                  CDP Url
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
-                <TableMessageRow colSpan={6}>Loading browsers…</TableMessageRow>
+                <TableMessageRow colSpan={columnCount}>
+                  Loading browsers…
+                </TableMessageRow>
               ) : browserSessions?.length === 0 ? (
-                <TableMessageRow colSpan={6}>
+                <TableMessageRow colSpan={columnCount}>
                   No browser sessions found
                 </TableMessageRow>
               ) : (
@@ -272,6 +289,13 @@ function BrowserSessions() {
                       <TableCell>
                         {browserSession.runnable_id ? <Yes /> : <No />}
                       </TableCell>
+                      {showCreator && (
+                        <TableCell>
+                          <WorkflowCreatorLabel
+                            createdBy={browserSession.created_by}
+                          />
+                        </TableCell>
+                      )}
                       <TableCell
                         className="text-muted-foreground"
                         title={
@@ -522,6 +546,14 @@ function BrowserSessions() {
         </DrawerContent>
       </Drawer>
     </div>
+  );
+}
+
+function BrowserSessions() {
+  return (
+    <CreatorDirectoryBoundary>
+      <BrowserSessionsContent />
+    </CreatorDirectoryBoundary>
   );
 }
 

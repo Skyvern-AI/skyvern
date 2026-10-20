@@ -144,6 +144,14 @@ class InvalidFileType(BaseWorkflowHTTPException):
         )
 
 
+class WorksheetNotFound(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, worksheet: str) -> None:
+        super().__init__(
+            f"Worksheet {worksheet!r} was not found in the workbook at file URL {file_url}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class FileParseTimeout(BaseWorkflowHTTPException):
     def __init__(self, file_url: str, step: str, timeout_seconds: float) -> None:
         super().__init__(
@@ -184,11 +192,11 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
-class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
-    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
+class BlockEngineNotEnabledError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, engine: str) -> None:
         super().__init__(
-            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"Block '{block_label}' uses the {engine} engine, which is not enabled on this server",
+            status_code=status.HTTP_400_BAD_REQUEST,
         )
 
 
@@ -200,6 +208,14 @@ class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
         line_suffix = f" on line {self.line}" if self.line is not None else ""
         super().__init__(
             f"Invalid Jinja2 in code block '{block_label}'{line_suffix}: {original}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
+class CodeBlockInsecureCodeError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, reason: str) -> None:
+        super().__init__(
+            f"Code block '{block_label}' can't run: {reason}",
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 

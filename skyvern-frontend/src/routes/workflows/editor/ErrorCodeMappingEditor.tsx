@@ -27,11 +27,13 @@ const EXTRA_EXTENSIONS: Extension[] = [errorCodeMappingLinter, lintGutter()];
  */
 export function ErrorCodeMappingEditor({
   label,
+  deferKey,
   value,
   onChange,
   readOnly = false,
 }: {
   label: string;
+  deferKey?: string;
   value: string;
   onChange: (value: string) => void;
   readOnly?: boolean;
@@ -39,6 +41,7 @@ export function ErrorCodeMappingEditor({
   return (
     <div>
       <CodeEditor
+        deferKey={deferKey}
         language="json"
         value={value}
         onChange={readOnly ? undefined : onChange}

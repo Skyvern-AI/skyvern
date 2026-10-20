@@ -16,6 +16,7 @@ from skyvern.webeye.utils.page import (
     _wait_for_navigation_settle,
     with_dom_utils,
 )
+from tests.unit.conftest import DriverReplyProbe
 
 
 class TestIsNavigationContextLost:
@@ -135,6 +136,19 @@ class TestEvaluateWithNavigationRecovery:
 
         result = await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=30000)
         assert result == 42
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("message", ["Execution context was destroyed", "Frame has been detached."])
+    async def test_an_abandoned_evaluate_leaves_the_driver_no_unretrieved_reply(self, message: str) -> None:
+        """A navigation that destroys the context answers an evaluate the deadline already gave up on."""
+        probe = DriverReplyProbe(PlaywrightError(f"Page.evaluate: {message}"))
+        frame = AsyncMock()
+        frame.evaluate = probe
+
+        with pytest.raises(SkyvernPageAnalysisTimeout):
+            await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=25)
+
+        assert not await probe.orphaned_reply()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_type", [PlaywrightError, RuntimeError])
@@ -306,14 +320,15 @@ class TestGetElementVisible:
 async def test_large_helper_expression_is_bounded_in_timeout_logs(failures, monkeypatch):
     from skyvern.webeye.utils import page as page_utils
 
-    warning = MagicMock()
-    monkeypatch.setattr(page_utils.LOG, "warning", warning)
+    log = MagicMock()
+    # Patching the lazy structlog proxy's method would freeze LOG for later capture_logs tests.
+    monkeypatch.setattr(page_utils, "LOG", log)
     frame = AsyncMock()
     frame.evaluate.side_effect = failures
     expression = "x" * 135000
     with pytest.raises(SkyvernPageAnalysisTimeout):
         await SkyvernFrame.evaluate(frame=frame, expression=expression)
-    logged = [call.kwargs["expression"] for call in warning.call_args_list if "expression" in call.kwargs]
+    logged = [call.kwargs["expression"] for call in log.warning.call_args_list if "expression" in call.kwargs]
     assert logged
     assert all(value == expression[:200] for value in logged)
 

@@ -12,6 +12,7 @@ from playwright._impl._errors import TimeoutError as PWTimeoutError
 
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
+from skyvern.webeye import browser_acquisition_sample as sample_mod
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError, BrowserCdpConnectionError
 from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry, is_cdp_connection_error
@@ -384,3 +385,42 @@ class TestRetryBudget:
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 5
         assert [call.args[0] for call in mock_sleep.call_args_list] == [1, 2, 3, 4]
+
+
+class TestFirstTryAcquisitionRecording:
+    """connect_over_cdp_with_retry records CDP-connect attempts into an open acquisition sample so
+    a downstream first-try ratio distinguishes a clean connect from a retried one; no-op otherwise."""
+
+    @pytest.mark.asyncio
+    async def test_records_successful_attempt_number(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_budget(monkeypatch, attempts=6, backoff=[0.0])
+        monkeypatch.setattr(sample_mod, "_current_sample", sample_mod.contextvars.ContextVar("t", default=None))
+        monkeypatch.setattr("skyvern.webeye.cdp_retry._sleep", AsyncMock())
+        pw = _make_playwright([ConnectionRefusedError("refused"), ConnectionRefusedError("refused"), MagicMock()])
+        with sample_mod.browser_acquisition_scope("create"):
+            await connect_over_cdp_with_retry(pw, "wss://cdp.example.test", validate_browser_address=False)
+            sample = sample_mod.current_browser_acquisition_sample()
+            assert sample is not None and sample.cdp_connect_attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_cancellation_mid_retry_preserves_attempt_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_budget(monkeypatch, attempts=6, backoff=[0.0])
+        monkeypatch.setattr(sample_mod, "_current_sample", sample_mod.contextvars.ContextVar("t", default=None))
+        monkeypatch.setattr("skyvern.webeye.cdp_retry._sleep", AsyncMock())
+        pw = _make_playwright(
+            [ConnectionRefusedError("refused"), ConnectionRefusedError("refused"), asyncio.CancelledError()]
+        )
+        with sample_mod.browser_acquisition_scope("create"):
+            with pytest.raises(asyncio.CancelledError):
+                await connect_over_cdp_with_retry(pw, "wss://cdp.example.test", validate_browser_address=False)
+            sample = sample_mod.current_browser_acquisition_sample()
+            assert sample is not None and sample.cdp_connect_attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_no_scope_is_silent_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_budget(monkeypatch, attempts=2, backoff=[0.0])
+        monkeypatch.setattr(sample_mod, "_current_sample", sample_mod.contextvars.ContextVar("t", default=None))
+        await connect_over_cdp_with_retry(
+            _make_playwright(MagicMock()), "wss://cdp.example.test", validate_browser_address=False
+        )
+        assert sample_mod.current_browser_acquisition_sample() is None

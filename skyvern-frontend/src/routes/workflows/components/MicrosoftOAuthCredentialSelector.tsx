@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   CustomSelectItem,
   Select,
@@ -10,12 +10,14 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useHasCapability } from "@/store/PageSlots";
 import {
   getDefaultMicrosoftOAuthCredentialId,
   hasMicrosoftOAuthCredentialScopes,
   useMicrosoftOAuthCredentials,
 } from "@/hooks/useMicrosoftOAuthCredentials";
 import { MICROSOFT_MAIL_REQUIRED_SCOPES } from "@/util/microsoftScopes";
+import { useOAuthCredentialAutoFill } from "@/routes/workflows/editor/hooks/useOAuthCredentialAutoFill";
 import { PlusIcon } from "@radix-ui/react-icons";
 
 type Props = {
@@ -39,13 +41,11 @@ function MicrosoftOAuthCredentialSelector({
     isLoading,
     isFetching,
   } = useMicrosoftOAuthCredentials();
+  const canAuthorize = useHasCapability("microsoft_oauth.authorize");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentials = allCredentials.filter((credential) =>
     hasMicrosoftOAuthCredentialScopes(credential, requiredScopes),
   );
-
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
 
   const isTemplateValue = value.includes("{{") || value.includes("{%");
   const useAdvanced = showAdvanced || isTemplateValue;
@@ -55,18 +55,16 @@ function MicrosoftOAuthCredentialSelector({
   const firstValidId = getDefaultMicrosoftOAuthCredentialId(credentials);
   const needsAutoFill = !value;
 
-  useEffect(() => {
-    if (
-      isLoading ||
-      isFetching ||
-      !hasCredentials ||
-      !needsAutoFill ||
-      !firstValidId
-    ) {
-      return;
-    }
-    onChangeRef.current(firstValidId);
-  }, [isLoading, isFetching, hasCredentials, needsAutoFill, firstValidId]);
+  useOAuthCredentialAutoFill({
+    nodeId,
+    field: "credentialId:microsoft",
+    value,
+    firstValidId,
+    needsAutoFill,
+    isLoading,
+    isFetching,
+    onChange,
+  });
 
   const handlePickerValueChange = (selected: string) => {
     if (selected === ADVANCED_OPTION) {
@@ -99,6 +97,7 @@ function MicrosoftOAuthCredentialSelector({
       {useAdvanced ? (
         <>
           <WorkflowBlockInputTextarea
+            name="credentialId:microsoft"
             nodeId={nodeId}
             value={value}
             onChange={onChange}
@@ -138,10 +137,14 @@ function MicrosoftOAuthCredentialSelector({
                 </CustomSelectItem>
               ))}
 
-              <SelectItem value={SETTINGS_OPTION}>
+              <SelectItem value={SETTINGS_OPTION} disabled={!canAuthorize}>
                 <div className="flex items-center gap-2">
                   <PlusIcon className="size-4" />
-                  <span>Connect new account</span>
+                  <span>
+                    {canAuthorize
+                      ? "Connect new account"
+                      : "Connect new account (admin required)"}
+                  </span>
                 </div>
               </SelectItem>
 

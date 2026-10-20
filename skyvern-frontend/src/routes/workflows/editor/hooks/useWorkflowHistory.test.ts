@@ -59,7 +59,14 @@ describe("useWorkflowHistory hook", () => {
 
     const hook = renderHook(
       ({ n, e }: { n: AppNode[]; e: Edge[] }) =>
-        useWorkflowHistory({ nodes: n, edges: e, setNodes, setEdges }),
+        useWorkflowHistory({
+          nodes: n,
+          edges: e,
+          setNodes,
+          setEdges,
+          organizationId: "org_1",
+          workflowPermanentId: "wpid_1",
+        }),
       { initialProps: { n: nodes, e: edges } },
     );
 

@@ -145,8 +145,7 @@ def test_mcp_to_copilot_error() -> None:
     }
     result = mcp_to_copilot(mcp_result)
     assert result["ok"] is False
-    assert "No browser" in result["error"]
-    assert "Create one" in result["error"]
+    assert result["error"] == "No browser"
 
 
 class TestMcpBrowserContextBridge:
@@ -159,6 +158,7 @@ class TestMcpBrowserContextBridge:
 
         browser_state = MagicMock()
         browser_state.browser_context = MagicMock()
+        browser_state.get_working_page = AsyncMock(return_value=None)
         manager = MagicMock()
         manager.get_browser_state = AsyncMock(return_value=browser_state)
 

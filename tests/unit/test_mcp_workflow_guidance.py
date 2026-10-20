@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ from skyvern.cli.mcp_tools.workflow import (
     skyvern_workflow_run,
     skyvern_workflow_update,
 )
+from skyvern.forge.sdk.routes import code_samples
 
 
 def test_build_workflow_prompt_guides_text_prompt_defaults() -> None:
@@ -38,6 +40,28 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     assert "skyvern_extract" in mcp.instructions
     assert "skyvern_act" in mcp.instructions
     assert "skyvern_observe" in mcp.instructions
+
+
+def test_workflow_authoring_sources_leave_the_block_engine_unset() -> None:
+    # Past TASK_V3_CHOSEN_ENGINE_CUTOFF an omitted engine is not skyvern-1.0 and a written one is a pin.
+    prompts_dir = Path(code_samples.__file__).resolve().parents[2] / "prompts" / "skyvern"
+    sources = {
+        "mcp instructions": mcp.instructions,
+        "build_workflow prompt": BUILD_WORKFLOW_CONTENT,
+        "knowledge base": (prompts_dir / "workflow_knowledge_base.txt").read_text(),
+        "pdf import prompt": (prompts_dir / "build-workflow-from-pdf.j2").read_text(),
+        "code samples": Path(code_samples.__file__).read_text(),
+        "skyvern skill": (
+            Path(mcp_common.__file__).resolve().parents[1] / "skills" / "skyvern" / "SKILL.md"
+        ).read_text(),
+    }
+    for name, text in sources.items():
+        for line in text.splitlines():
+            if "skyvern-1.0" in line:
+                assert "asks for" in line and "default" not in line, (name, line)
+        assert "engine 1.0" not in text and "1.0 blocks" not in text and "1.0 (default" not in text, name
+    for name in ("mcp instructions", "build_workflow prompt", "skyvern skill"):
+        assert "`engine: skyvern-1.0`" in sources[name], name
 
 
 def test_workflow_create_guides_code_only_policy() -> None:

@@ -39,8 +39,8 @@ type Props = {
   onDeleted?: (workflowId: string) => void;
   // Single-row nav (Open in editor / Run) hides when a multi-selection is active.
   selectedCount?: number;
-  // Defaults to shown; only an explicit false (cloud flag off) hides tagging.
-  taggingEnabled?: boolean;
+  // From useWorkflowTaggingEnabled: true only once the WORKFLOW_TAGGING flag resolves on.
+  taggingEnabled: boolean;
   // The row renderer; place the provided kebab last in the actions cell. It is
   // null while a selection is active (row menus yield to the bulk bar).
   children: (kebab: React.ReactNode) => React.ReactElement;
@@ -55,7 +55,7 @@ function WorkflowRowActions({
   onNavigate,
   onDeleted,
   selectedCount = 0,
-  taggingEnabled = true,
+  taggingEnabled,
   children,
 }: Props) {
   const studioEnabled = useWorkflowStudioEnabled();

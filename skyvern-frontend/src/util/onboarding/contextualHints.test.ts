@@ -40,6 +40,7 @@ describe("HINT_REGISTRY", () => {
     const tmpl = HINT_REGISTRY.find((h) => h.id === "start-template")!;
     const base = {
       tour_completed_at: "2026-06-01T00:00:00Z",
+      studio_tour_completed_at: null,
       modal_dismissed_at: null,
       first_save_at: null,
       first_run_at: null,

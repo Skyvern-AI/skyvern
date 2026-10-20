@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import structlog
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import GoogleOAuthCredentialModel
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.models import GmailSendDispatchModel, GoogleOAuthCredentialModel
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.schemas.emails import GmailSendErrorCode
 
 LOG = structlog.get_logger()
 
@@ -23,6 +27,10 @@ STATE_ACTIVE = "active"
 STATE_REVOKED = "revoked"
 STATE_ERROR = "error"
 
+DISPATCH_DISPATCHING = "dispatching"
+DISPATCH_ACCEPTED = "accepted"
+DISPATCH_FAILED = "failed"
+
 
 class InvalidConsentNonceError(ValueError):
     """Raised when the OAuth callback nonce is unknown, expired, or already consumed.
@@ -33,6 +41,10 @@ class InvalidConsentNonceError(ValueError):
     """
 
 
+class GmailSendUpgradeUnavailableError(ValueError):
+    """Raised when send permission is requested for a connection that has no stored account identity."""
+
+
 @dataclass(frozen=True)
 class PendingConsentContext:
     credential_id: str
@@ -40,6 +52,32 @@ class PendingConsentContext:
     consent_code_verifier: str | None
     consent_app_origin: str | None = None
     client_id: str | None = None
+    scopes_requested: tuple[str, ...] = ()
+    email_address: str | None = None
+    google_subject: str | None = None
+
+
+@dataclass(frozen=True)
+class GmailSendDispatch:
+    gmail_send_dispatch_id: str
+    status: str
+    modified_at: datetime.datetime
+    provider_message_id: str | None = None
+    error_code: GmailSendErrorCode | None = None
+    provider_status: int | None = None
+    provider_reason: str | None = None
+
+
+def _to_gmail_send_dispatch(model: GmailSendDispatchModel) -> GmailSendDispatch:
+    return GmailSendDispatch(
+        gmail_send_dispatch_id=model.gmail_send_dispatch_id,
+        status=model.status,
+        modified_at=model.modified_at,
+        provider_message_id=model.provider_message_id,
+        error_code=GmailSendErrorCode(model.error_code) if model.error_code else None,
+        provider_status=model.provider_status,
+        provider_reason=model.provider_reason,
+    )
 
 
 @dataclass(frozen=True)
@@ -129,6 +167,9 @@ class GoogleOAuthRepository(BaseRepository):
                 GoogleOAuthCredentialModel.consent_code_verifier,
                 GoogleOAuthCredentialModel.consent_app_origin,
                 GoogleOAuthCredentialModel.client_id,
+                GoogleOAuthCredentialModel.scopes_requested,
+                GoogleOAuthCredentialModel.email_address,
+                GoogleOAuthCredentialModel.google_subject,
             ).where(
                 GoogleOAuthCredentialModel.consent_nonce == nonce,
                 GoogleOAuthCredentialModel.organization_id == organization_id,
@@ -144,9 +185,27 @@ class GoogleOAuthRepository(BaseRepository):
                 consent_code_verifier=row[2],
                 consent_app_origin=row[3],
                 client_id=row[4],
+                scopes_requested=tuple(row[5] or ()),
+                email_address=row[6],
+                google_subject=row[7],
             )
 
-    @db_operation("begin_reauthorization")
+    @db_operation("get_credential")
+    async def get_credential(self, organization_id: str, credential_id: str) -> GoogleOAuthCredentialBase | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(GoogleOAuthCredentialModel).where(
+                        GoogleOAuthCredentialModel.id == credential_id,
+                        GoogleOAuthCredentialModel.organization_id == organization_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return GoogleOAuthCredentialBase.model_validate(row, from_attributes=True)
+
+    @db_operation("begin_reauthorization", expected_errors=(GmailSendUpgradeUnavailableError,))
     async def begin_reauthorization(
         self,
         credential_id: str,
@@ -160,6 +219,7 @@ class GoogleOAuthRepository(BaseRepository):
         client_id: str | None = None,
         requested_scopes: list[str] | None = None,
         fallback_scopes: list[str] | None = None,
+        adjust_scopes: Callable[[GoogleOAuthCredentialBase, list[str]], list[str]] | None = None,
     ) -> GoogleOAuthCredentialBase | None:
         """Stamp a fresh consent challenge onto an existing connectable row so re-auth
         preserves the credential id.
@@ -181,11 +241,14 @@ class GoogleOAuthRepository(BaseRepository):
             row = (await session.execute(stmt)).scalar_one_or_none()
             if row is None:
                 return None
-            row.scopes_requested = list(
+            scopes = list(
                 requested_scopes
                 if requested_scopes is not None
                 else row.scopes_requested or row.scopes_granted or fallback_scopes or []
             )
+            if adjust_scopes is not None:
+                scopes = adjust_scopes(GoogleOAuthCredentialBase.model_validate(row, from_attributes=True), scopes)
+            row.scopes_requested = scopes
             row.consent_nonce = consent_nonce
             row.consent_redirect_uri = consent_redirect_uri
             row.consent_expires_at = consent_expires_at
@@ -264,6 +327,8 @@ class GoogleOAuthRepository(BaseRepository):
         encrypted_method: EncryptMethod,
         scopes_granted: list[str],
         now: datetime.datetime,
+        google_subject: str | None = None,
+        email_address: str | None = None,
     ) -> GoogleOAuthCredentialBase:
         async with self.Session() as session:
             # Promotes both a first-connect row (``pending_consent``) and an in-place re-auth of an
@@ -283,7 +348,8 @@ class GoogleOAuthRepository(BaseRepository):
                     encrypted_refresh_token=encrypted_refresh_token,
                     encrypted_method=encrypted_method.value,
                     scopes_granted=scopes_granted,
-                    email_address=None,
+                    email_address=email_address,
+                    google_subject=google_subject,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,
@@ -529,6 +595,7 @@ class GoogleOAuthRepository(BaseRepository):
                     encrypted_refresh_token=None,
                     encrypted_method=None,
                     email_address=None,
+                    google_subject=None,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,
@@ -541,3 +608,101 @@ class GoogleOAuthRepository(BaseRepository):
             revoked_id = (await session.execute(stmt)).scalar_one_or_none()
             await session.commit()
             return revoked_id
+
+    @db_operation("get_gmail_send_dispatch")
+    async def get_gmail_send_dispatch(self, workflow_run_id: str, execution_key: str) -> GmailSendDispatch | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(GmailSendDispatchModel).where(
+                        GmailSendDispatchModel.workflow_run_id == workflow_run_id,
+                        GmailSendDispatchModel.execution_key == execution_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            return _to_gmail_send_dispatch(row) if row is not None else None
+
+    @db_operation("claim_gmail_send_dispatch")
+    async def claim_gmail_send_dispatch(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        execution_key: str,
+        block_label: str,
+        credential_id: str,
+    ) -> GmailSendDispatch | None:
+        """Take the one send claim for this execution; None means another execution already holds it."""
+        async with self.Session() as session:
+            model = GmailSendDispatchModel(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                execution_key=execution_key,
+                block_label=block_label,
+                credential_id=credential_id,
+                status=DISPATCH_DISPATCHING,
+            )
+            session.add(model)
+            try:
+                await session.flush()
+                claimed = _to_gmail_send_dispatch(model)
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return None
+            return claimed
+
+    @db_operation("reclaim_failed_gmail_send_dispatch")
+    async def reclaim_failed_gmail_send_dispatch(
+        self, *, gmail_send_dispatch_id: str, observed_modified_at: datetime.datetime, credential_id: str
+    ) -> bool:
+        """Take back a rejected send for one more attempt; False when the row changed since it was read."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(GmailSendDispatchModel)
+                .where(
+                    GmailSendDispatchModel.gmail_send_dispatch_id == gmail_send_dispatch_id,
+                    GmailSendDispatchModel.status == DISPATCH_FAILED,
+                    GmailSendDispatchModel.modified_at == observed_modified_at,
+                )
+                .values(
+                    status=DISPATCH_DISPATCHING,
+                    credential_id=credential_id,
+                    provider_message_id=None,
+                    error_code=None,
+                    provider_status=None,
+                    provider_reason=None,
+                    modified_at=naive_utc_now(),
+                )
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    @db_operation("finalize_gmail_send_dispatch")
+    async def finalize_gmail_send_dispatch(
+        self,
+        *,
+        gmail_send_dispatch_id: str,
+        status: str,
+        provider_message_id: str | None = None,
+        error_code: GmailSendErrorCode | None = None,
+        provider_status: int | None = None,
+        provider_reason: str | None = None,
+    ) -> bool:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(GmailSendDispatchModel)
+                .where(
+                    GmailSendDispatchModel.gmail_send_dispatch_id == gmail_send_dispatch_id,
+                    GmailSendDispatchModel.status == DISPATCH_DISPATCHING,
+                )
+                .values(
+                    status=status,
+                    provider_message_id=provider_message_id,
+                    error_code=error_code.value if error_code else None,
+                    provider_status=provider_status,
+                    provider_reason=provider_reason,
+                )
+            )
+            await session.commit()
+            return result.rowcount > 0

@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { useQuery } from "@tanstack/react-query";
 import type { TagValue } from "../types/tagTypes";
 import { buildTagColorMap, type TagColorMap } from "../types/tagColors";
@@ -29,11 +30,12 @@ function useTagValuesQuery({
   key = null,
 }: TagValuesQueryOptions = {}) {
   const credentialGetter = useCredentialGetter();
+  const taggingEnabled = useWorkflowTaggingEnabled();
   const { queryKey, requestConfig } = tagValuesQueryOptions(key);
 
   return useQuery<Array<TagValue>, Error, TagColorMap>({
     queryKey,
-    enabled,
+    enabled: enabled && taggingEnabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const request = requestConfig
@@ -53,11 +55,12 @@ function useTagValuesListQuery({
   key = null,
 }: TagValuesQueryOptions = {}) {
   const credentialGetter = useCredentialGetter();
+  const taggingEnabled = useWorkflowTaggingEnabled();
   const { queryKey, requestConfig } = tagValuesQueryOptions(key);
 
   return useQuery<Array<TagValue>>({
     queryKey,
-    enabled,
+    enabled: enabled && taggingEnabled,
     // This queryFn intentionally duplicates useTagValuesQuery's so the shared
     // "tag-values" key still has a fetcher when only this hook is mounted (e.g.
     // direct nav to /settings/labels); removing it yields a Missing queryFn error.

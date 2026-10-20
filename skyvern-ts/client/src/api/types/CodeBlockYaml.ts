@@ -15,4 +15,13 @@ export interface CodeBlockYaml {
     parameter_keys?: string[];
     prompt?: string;
     steps?: Skyvern.CodeBlockStepYaml[];
+    /** JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing */
+    data_schema?: CodeBlockYaml.DataSchema;
+}
+
+export namespace CodeBlockYaml {
+    /**
+     * JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing
+     */
+    export type DataSchema = Record<string, unknown> | unknown[] | string;
 }

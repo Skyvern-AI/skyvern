@@ -19,11 +19,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
 import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
@@ -44,7 +43,7 @@ function TaskHistory() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const navigate = useNavigate();
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
 
   const {
     data: tasks,

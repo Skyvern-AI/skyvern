@@ -3,24 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import functools
+import io
 import json
+import math
 import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import structlog
-from agents.exceptions import MaxTurnsExceeded
+from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
+from agents.items import TResponseInputItem
 from agents.memory.session import Session
 from agents.run import Runner
+from agents.run_config import RunConfig
+from agents.run_context import RunContextWrapper
+from agents.tool import Tool
+from openai.types.responses import ResponseFunctionToolCall
+from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
+    BudgetExpiredReplyObservation,
     BudgetExpirySource,
+    BudgetExpiryState,
+    RecordedRunState,
     serialize_budget_expiry_observation,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
@@ -44,17 +58,20 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    has_bounded_page_schema,
+    model_visible_composition_evidence,
+)
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
-from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -62,11 +79,13 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     BUILD_TEST_PACKET_KEY,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
     parse_final_response,
+    screened_recorded_url,
 )
 from skyvern.forge.sdk.copilot.pending_operation import (
     install_pending_operation_slot,
@@ -90,7 +109,12 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    CarriesPendingScreenshots,
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+)
+from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -102,11 +126,16 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_FACT_KEYS,
+    PAGE_REQUEST_FAILURES_KEY,
+)
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     CopilotUnrecoverableToolError as CopilotUnrecoverableToolError,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -114,6 +143,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
     from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
     from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 
@@ -121,7 +151,12 @@ LOG = structlog.get_logger()
 
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
+ToolT = TypeVar("ToolT", bound=Tool)
+BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
+# A turn whose budget is already spent may have no backstop time left for its one final reply, so
+# that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.
+EXPIRED_TURN_REPLY_SECONDS = 60
 # Floor for the per-iteration ``wait_for`` deadline so an already-spent budget
 # never yields ``wait_for(timeout=0)`` (which raises immediately). Kept as a
 # constant so tests can shrink it instead of paying a full second per deadline.
@@ -130,6 +165,21 @@ SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
+FINAL_REPLY_OBSERVATION = (
+    NUDGE_SENTINEL + "Your last response was empty. Call `reply` now with your final response for this turn; "
+    "any other tool call will not run."
+)
+
+
+def raw_secret_reply_withheld_observation(label: str | None) -> str:
+    flagged = f" The flagged value was the one given for `{label}`." if label else ""
+    return (
+        NUDGE_SENTINEL + "Your last reply was not shown to the user. The output check withheld it because it read the "
+        f"reply as containing a raw secret value.{flagged} Call `reply` now with your final response for this turn; "
+        "any other tool call will not run."
+    )
+
+
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
 SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
@@ -141,19 +191,12 @@ _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
     {"independent_run_evidence", "registered_output_parameter", "registered_artifact_content"}
 )
-# OpenAI detail=high cost per resized image. If we support other providers,
-# pull from model config — this value will silently over/undercount otherwise.
-# See screenshot_utils.resize_screenshot_b64 for the dimension contract this
-# token count assumes.
+# Charged for an image whose pixel size cannot be read.
 TOKENS_PER_RESIZED_IMAGE = 765
 
 # Keep the last N function_call_output items at full (head-truncated) size.
 # Older outputs collapse to a compact synopsis so context doesn't grow linearly.
 KEEP_RECENT_TOOL_OUTPUTS = 3
-# A tripwire against pathological payloads, not a routine ration: code-bearing tool
-# results (synthesized blocks, edit re-anchor echoes) run 3-30KB plus JSON escaping
-# and must reach the model whole, so the cap sits above that class with headroom.
-_RECENT_TOOL_OUTPUT_CHAR_CAP = 50_000
 # Older tool-call arguments that fail to summarize keep only this much; that channel
 # exists to shrink replayed context and must not follow the recent-window cap.
 _SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
@@ -165,30 +208,21 @@ _TOOL_OUTPUT_TRUNCATION_SUFFIX = "\n... [older tool output truncated]"
 _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX = "\n... [truncated]"
 
 
-def _normalized_proxy_label(proxy_location: Any) -> str | None:
-    if proxy_location is None:
-        return None
-    raw_value = getattr(proxy_location, "value", proxy_location)
-    if isinstance(raw_value, dict):
-        country = raw_value.get("country")
-        subdivision = raw_value.get("subdivision")
-        city = raw_value.get("city")
-        parts = [str(part).strip() for part in (country, subdivision, city) if part]
-        return "-".join(parts) if parts else None
-    value = str(raw_value).strip()
-    if not value or value.upper() in {"NONE", "NULL", "NO_PROXY"}:
-        return None
-    return value
-
-
-def _effective_proxy_label(ctx: Any) -> str | None:
-    effective_raw = getattr(ctx, "effective_workflow_proxy_location", None)
-    if effective_raw is not None:
-        return _normalized_proxy_label(effective_raw)
-    workflow = getattr(ctx, "last_workflow", None)
-    if workflow is None:
-        return None
-    return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
+def proxy_hop_failure_reason(
+    ctx: AgentContext,
+    reason: str,
+    session_proxy_location: ProxyLocationInput = None,
+    session_made_hop: bool = False,
+) -> str:
+    # A session that made the hop is the authority on the proxy it used. Reading the workflow's
+    # declared proxy when that session named none would label a location the hop never went through.
+    label = (
+        None
+        if session_made_hop and session_proxy_location is None
+        else effective_proxy_label(ctx, session_proxy_location)
+    )
+    hop = "Skyvern proxy hop failed" if label is None else f"Skyvern proxy hop failed (proxy_location={label})"
+    return f"{hop}: {reason}"
 
 
 def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
@@ -330,21 +364,14 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
-    elapsed = _elapsed_run_seconds(ctx, start_time)
-    if elapsed >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-
-
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
-    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+    """Record a cancellation raised at a model-call boundary; the turn deadline never arrives as a cancellation.
 
     Synchronous and never raising, so the caller's ``raise`` re-raises the original
     cancellation neither masked nor delayed.
     """
     try:
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
         ctx.copilot_turn_cancelled_iteration = iteration
         LOG.warning(
             "copilot_turn_cancelled",
@@ -457,7 +484,13 @@ def _same_page(left: str | None, right: str | None) -> bool:
     return left_path == right_path
 
 
-def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
+def pending_screenshot_entry(ctx: object) -> ScreenshotEntry | None:
+    if not isinstance(ctx, CarriesPendingScreenshots) or not ctx.pending_screenshots:
+        return None
+    return ctx.pending_screenshots[0]
+
+
+def pending_screenshot_message(ctx: Any, *, sharp: bool = False) -> dict[str, Any] | None:
     """Build the synthetic user message for the staged frame without draining it.
 
     Tool results stay text-only because OpenAI rejects images in tool
@@ -471,8 +504,12 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
+    images = [
+        (entry.sharp_b64, entry.sharp_px) if sharp and entry.sharp_b64 else (entry.b64, entry.image_px)
+        for entry in screenshots
+    ]
     provenance_lines: list[str] = []
-    for entry in screenshots:
+    for entry, (_, image_px) in zip(screenshots, images):
         provenance = entry.provenance
         fields = {
             "capture_id": entry.capture_id,
@@ -488,6 +525,8 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "session_binding": provenance.session_binding.value,
             "workflow_run_id": provenance.workflow_run_id or "unavailable",
             "action_relation": provenance.action_relation.value,
+            "image_px": _px(image_px),
+            "viewport_css_px": _px(provenance.viewport_css_px),
         }
         rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
         relation = (
@@ -509,15 +548,19 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
             "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
-    for entry in screenshots:
+    for entry, (b64, _) in zip(screenshots, images):
         content.append(
             {
                 "type": "input_image",
-                "image_url": f"data:{entry.mime};base64,{entry.b64}",
+                "image_url": f"data:{entry.mime};base64,{b64}",
                 "detail": "high",
             }
         )
     return {"role": "user", "content": content}
+
+
+def _px(size: tuple[int, int] | None) -> str:
+    return f"{size[0]}x{size[1]}" if size else "unavailable"
 
 
 def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
@@ -629,6 +672,14 @@ def _bounded_error_codes(codes: Any) -> list[str]:
     return [str(c)[:64] for c in codes if isinstance(c, str)][:_PACKET_LIST_CAP]
 
 
+def _bounded_scalars(fact: dict[str, Any]) -> dict[str, bool | int | float | str]:
+    return {
+        str(key)[:64]: item if isinstance(item, (bool, int, float)) else item[:_PACKET_NOTICE_CAP]
+        for key, item in list(fact.items())[:_PACKET_LIST_CAP]
+        if isinstance(item, (bool, int, float, str))
+    }
+
+
 def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
     """The packet's identity and failure scalars, bounded. Lists are tails, so they yield first."""
     if not isinstance(packet, dict):
@@ -642,6 +693,12 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
         run_id = run.get("workflow_run_id")
         status = run.get("status")
         bounded_run = {k: v for k, v in (("workflow_run_id", run_id), ("status", status)) if v}
+        # A later test selection reads an older run by which browser ran it and how that browser
+        # started; reduced to an id and a status, the run reads as having left its page for the next.
+        for key in ("browser", "browser_start"):
+            browser_fact = run.get(key)
+            if isinstance(browser_fact, dict) and (scalars := _bounded_scalars(browser_fact)):
+                bounded_run[key] = scalars
         if bounded_run:
             kept["run"] = bounded_run
     challenge = packet.get("challenge")
@@ -726,6 +783,7 @@ def _bounded_evidence_entries(value: list[Any], budget: int) -> list[Any]:
 
 
 def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    data = model_visible_composition_evidence(data)
     kept: dict[str, Any] = {}
     for key in _PAGE_EVIDENCE_IDENTITY:
         value = data.get(key, parsed.get(key))
@@ -756,6 +814,23 @@ def _summarize_page_evidence(parsed: dict[str, Any], data: dict[str, Any]) -> di
     return kept
 
 
+def _summarize_page_state(page_state: dict[str, Any]) -> dict[str, Any]:
+    vendor = page_state.get("challenge_vendor")
+    kept: dict[str, Any] = {
+        "read": "ok" if page_state.get("read") == "ok" else "failed",
+        "challenge_vendor": vendor[:200] if isinstance(vendor, str) else None,
+    }
+    # A withheld location has no url or title key at all, and must not gain one here.
+    if "url" in page_state:
+        url = page_state["url"]
+        screened = screened_recorded_url(url)[0] if isinstance(url, str) else None
+        kept["url"] = screened[:200] if screened is not None else None
+    if "title" in page_state:
+        title = page_state["title"]
+        kept["title"] = title if isinstance(title, str) else None
+    return kept
+
+
 def _summarize_tool_output(output: str) -> str:
     """Compress an old function_call_output to a compact JSON synopsis that
     preserves only signal fields (ok/error/status/failure_reason/block labels).
@@ -771,6 +846,24 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
+    # Page facts ride on browser results; they must not be what pushes a short result into compaction.
+    if parsed.keys() & PAGE_FACT_KEYS:
+        without_page_facts = {key: value for key, value in parsed.items() if key not in PAGE_FACT_KEYS}
+        if len(json.dumps(without_page_facts)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+            return output
+
+    # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
+    # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
+    if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
+        return output
+    # An account group result is the only record of which runs exist and what each did.
+    if (
+        MCP_RESULT_PROVENANCE_KEY not in parsed
+        and "workflow_run_group_id" in parsed
+        and isinstance(parsed.get("rows"), list)
+    ):
+        return output
+
     synopsis: dict[str, Any] = {}
     # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
     # re-stamped rather than copied, so this is not where an attacker-chosen provenance survives.
@@ -780,6 +873,11 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["ok"] = parsed["ok"]
     if parsed.get("error"):
         synopsis["error"] = str(parsed["error"])[:200]
+    if isinstance(parsed.get("page_state"), dict):
+        synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
+    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
+    if isinstance(request_failures, list) and request_failures:
+        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the
@@ -794,6 +892,11 @@ def _summarize_tool_output(output: str) -> str:
         except (TypeError, ValueError):
             return _truncated_output_fallback(output)
 
+    # A synopsis is re-bound rather than returned so the same bounded retention rules run over
+    # its keys again; an MCP result spreading its own `_summarized` key must not freeze here.
+    if not isinstance(data, dict) and "_summarized" in parsed:
+        data = parsed
+
     if isinstance(data, dict):
         retained_packet = _retained_run_packet(data.get(BUILD_TEST_PACKET_KEY))
         if retained_packet is not None:
@@ -801,6 +904,9 @@ def _summarize_tool_output(output: str) -> str:
         failing_line = data.get("failing_code_line")
         if type(failing_line) is int:
             synopsis["failing_code_line"] = failing_line
+        code_chars_elided = data.get("code_chars_elided")
+        if type(code_chars_elided) is int:
+            synopsis["code_chars_elided"] = code_chars_elided
         code = data.get("code")
         if isinstance(code, str) and code:
             synopsis["code_chars_elided"] = len(code)
@@ -810,16 +916,16 @@ def _summarize_tool_output(output: str) -> str:
                 continue
             synopsis[key] = val if isinstance(val, (bool, int, float)) else str(val)[:200]
 
-        # An unresolved earlier failure survives compaction for the reason it is attached at all:
-        # the model may decide whether to repair several turns after the run that passed, and dropping
-        # it here would reproduce the loss it exists to prevent.
-        unresolved = data.get("unresolved_earlier_failure")
-        if isinstance(unresolved, dict) and unresolved:
-            synopsis["unresolved_earlier_failure"] = unresolved
-
         change_identity = data.get("prior_attempt_change_identity")
         if isinstance(change_identity, dict) and change_identity:
             synopsis["prior_attempt_change_identity"] = change_identity
+
+        dropped_prior_blocks = data.get("dropped_prior_blocks")
+        if isinstance(dropped_prior_blocks, list) and dropped_prior_blocks:
+            synopsis["dropped_prior_blocks"] = dropped_prior_blocks
+        block_type_changes = data.get("block_type_changes")
+        if isinstance(block_type_changes, dict) and block_type_changes:
+            synopsis["block_type_changes"] = block_type_changes
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
@@ -827,21 +933,34 @@ def _summarize_tool_output(output: str) -> str:
         if isinstance(categories, list) and categories:
             synopsis["failure_categories"] = categories
 
-        blocks = data.get("blocks")
-        if isinstance(blocks, list):
+        for list_key in ("blocks", "block_details"):
+            blocks = data.get(list_key)
+            if not isinstance(blocks, list):
+                continue
             block_summary: list[dict[str, Any]] = []
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
                 entry: dict[str, Any] = {"label": block.get("label"), "status": block.get("status")}
+                # A paged run-results row keeps its key and iteration, so the model can map it and read it again.
+                for key in ("row_key", "current_index"):
+                    if key in block:
+                        entry[key] = block[key]
                 if block.get("failure_reason"):
                     entry["failure_reason"] = str(block["failure_reason"])[:120]
                 codes = block.get("error_codes")
                 if isinstance(codes, list) and codes:
                     entry["error_codes"] = _bounded_error_codes(codes)
+                ai_fallback = block.get("ai_fallback")
+                if isinstance(ai_fallback, dict):
+                    entry["ai_fallback"] = {
+                        key: str(value)[:120] for key in ("status", "failure_text") if (value := ai_fallback.get(key))
+                    }
+                if block.get("parent_block_label"):
+                    entry["parent_block_label"] = str(block["parent_block_label"])[:120]
                 block_summary.append(entry)
             if block_summary:
-                synopsis["blocks"] = block_summary
+                synopsis[list_key] = block_summary
 
     synopsis["_summarized"] = "older tool output — only key fields retained"
     try:
@@ -905,13 +1024,54 @@ def _summarize_tool_arguments(args_json: str) -> str:
         return args_json[:_SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP] + _TOOL_OUTPUT_TRUNCATION_SUFFIX
 
 
-def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int) -> None:
+def log_recent_tool_output_truncation(truncated_count: int, largest_original_chars: int, tool_names: list[str]) -> None:
     LOG.warning(
         "copilot_recent_tool_output_truncated",
         truncated_count=truncated_count,
         cap=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         largest_original_chars=largest_original_chars,
+        tool_name=sorted(set(tool_names)),
     )
+
+
+def _is_model_authored(item: Any) -> bool:
+    return _item_field(item, "type") in ("reasoning", "function_call") or _item_field(item, "role") == "assistant"
+
+
+def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
+    """Indices of tool outputs no model call has seen yet: those after the last model-authored item. The SDK
+    appends a response's calls, then all of their outputs, so any later model item means the model read them.
+    User, synthetic and screenshot messages are not reads."""
+    unread: set[int] = set()
+    for index in range(len(items) - 1, -1, -1):
+        if _is_model_authored(items[index]):
+            break
+        if _item_field(items[index], "type") == "function_call_output":
+            unread.add(index)
+    return unread
+
+
+def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
+    """Return, oldest first, the index of every tool output or real user message that precedes both the compaction
+    window and every unpruned screenshot. Later model calls resend every item up to the last of them unchanged."""
+    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
+    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+    unstable = {
+        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+        *unread_tool_output_indices(items),
+        *(
+            i
+            for i, item in enumerate(items)
+            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+        ),
+    }
+    return [
+        index
+        for index, item in enumerate(items[: min(unstable, default=len(items))])
+        if _item_field(item, "type") == "function_call_output"
+        or (_item_field(item, "role") == "user" and not is_synthetic_user_message(item))
+    ]
 
 
 def _prune_input_list(items: list[Any]) -> list[Any]:
@@ -929,12 +1089,16 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
     recent_fco_set = set(fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
+    recent_fco_set |= unread_tool_output_indices(items)
+
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
+    tool_names = {_item_field(items[i], "call_id"): _item_field(items[i], "name") for i in fc_indices}
 
     result: list[Any] = []
     recent_truncated_count = 0
     recent_truncated_largest = 0
+    recent_truncated_names: list[str] = []
     for i, item in enumerate(items):
         if i in drop_indices:
             result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
@@ -950,6 +1114,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
                         if new_output != output:
                             recent_truncated_count += 1
                             recent_truncated_largest = max(recent_truncated_largest, len(output))
+                            recent_truncated_names.append(tool_names.get(_item_field(item, "call_id")) or "unknown")
                     else:
                         new_output = output
                 else:
@@ -965,36 +1130,53 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
 
         result.append(item)
     if recent_truncated_count:
-        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest)
+        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest, recent_truncated_names)
     return result
+
+
+@functools.lru_cache(maxsize=16)
+def _image_tokens(image_url: str) -> int:
+    """OpenAI's patch formula x 1.2, which matched terra's billing at 1024x576 (692) and 1600x900 (1,741).
+    `skyvern.utils.image_token_estimator` uses 1.0 for gpt-5.x and needs a model name, which this budget check lacks.
+    """
+    _, _, encoded = image_url.partition(";base64,")
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+            width, height = image.size
+    except Exception:
+        return TOKENS_PER_RESIZED_IMAGE
+    return math.floor(1.2 * math.ceil(width / 32) * math.ceil(height / 32)) + 1
 
 
 def _sanitize_for_token_estimation(value: Any) -> tuple[Any, int]:
     """Build a sanitized copy of *value*, replacing base64 image data with
     a short placeholder so blobs don't inflate the token count.
 
-    Returns ``(sanitized_value, image_count)``.
+    Returns ``(sanitized_value, image_tokens)``.
     """
     if isinstance(value, dict):
         is_image = value.get("type") == "input_image"
         sanitized: dict[str, Any] = {}
-        image_count = 1 if is_image else 0
+        image_tokens = 0
+        if is_image:
+            image_url = value.get("image_url")
+            image_tokens = _image_tokens(image_url) if isinstance(image_url, str) else TOKENS_PER_RESIZED_IMAGE
         for key, child in value.items():
             if is_image and key == "image_url":
                 sanitized[key] = "[image]"
                 continue
-            sanitized_child, child_images = _sanitize_for_token_estimation(child)
+            sanitized_child, child_tokens = _sanitize_for_token_estimation(child)
             sanitized[key] = sanitized_child
-            image_count += child_images
-        return sanitized, image_count
+            image_tokens += child_tokens
+        return sanitized, image_tokens
     if isinstance(value, list):
         sanitized_list: list[Any] = []
-        image_count = 0
+        image_tokens = 0
         for item in value:
-            sanitized_item, item_images = _sanitize_for_token_estimation(item)
+            sanitized_item, item_tokens = _sanitize_for_token_estimation(item)
             sanitized_list.append(sanitized_item)
-            image_count += item_images
-        return sanitized_list, image_count
+            image_tokens += item_tokens
+        return sanitized_list, image_tokens
     return value, 0
 
 
@@ -1002,9 +1184,9 @@ def estimate_tokens(items: list[Any]) -> int:
     """Token estimate for an input list using tiktoken."""
     if not items:
         return 0
-    sanitized, image_count = _sanitize_for_token_estimation(items)
+    sanitized, image_tokens = _sanitize_for_token_estimation(items)
     text = json.dumps(sanitized, separators=(",", ":"), ensure_ascii=False, default=str)
-    return count_tokens(text) + image_count * TOKENS_PER_RESIZED_IMAGE
+    return count_tokens(text) + image_tokens
 
 
 _AGGRESSIVE_PRUNE_TAIL = 7
@@ -1199,6 +1381,9 @@ async def _run_streamed_with_deadline(
     runner_kwargs: dict[str, Any],
     start_time: float,
     iteration: int,
+    *,
+    watch_steer: bool = False,
+    min_remaining_seconds: float | None = None,
 ) -> Any:
     """Run ``Runner.run_streamed`` + ``stream_to_sse`` under the hard watchdog.
 
@@ -1210,11 +1395,12 @@ async def _run_streamed_with_deadline(
     credential card) can suspend it for the length of that wait.
 
     ``MIN_DEADLINE_REMAINING_SECONDS`` floors ``remaining`` so a zero
-    timeout never panics on an already-spent budget.
+    timeout never panics on an already-spent budget; ``min_remaining_seconds``
+    raises that floor.
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(
-        MIN_DEADLINE_REMAINING_SECONDS,
+        MIN_DEADLINE_REMAINING_SECONDS if min_remaining_seconds is None else min_remaining_seconds,
         TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
     )
     with pending_operation("turn.stream", span=True):
@@ -1227,12 +1413,17 @@ async def _run_streamed_with_deadline(
                 result.cancel(mode="after_turn")
 
         ctx.check_model_work_deadline = None if ctx.budget_expiry_state.drain_active else check_model_work_deadline
+        steer_watcher = asyncio.create_task(watch_for_steer(result, ctx)) if watch_steer else None
         try:
             try:
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
             finally:
+                if steer_watcher is not None:
+                    steer_watcher.cancel()
+                    await asyncio.wait({steer_watcher})
+                ctx.model_call_in_flight = False
                 ctx.model_stream_deadline = None
                 ctx.check_model_work_deadline = None
                 # A request_credential call the SDK rejected before its handler ran leaves the gate
@@ -1247,6 +1438,116 @@ async def _run_streamed_with_deadline(
             _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
             raise CopilotTotalTimeoutError() from None
     return result
+
+
+def budget_drain_tools(tools: Sequence[ToolT]) -> list[ToolT]:
+    return [tool for tool in tools if tool.name not in BUDGET_DRAIN_EXCLUDED_TOOLS]
+
+
+def unrun_call_outputs(calls: Sequence[ResponseFunctionToolCall], offered: set[str]) -> dict[str, str] | None:
+    """Results by call id when a response names a tool the request did not offer, else None.
+    The SDK rejects such a response before running any of its calls, so every call gets a result."""
+    if all(call.name in offered for call in calls):
+        return None
+    return {
+        call.call_id: json.dumps(
+            {
+                "ok": False,
+                "error": (
+                    "Not run: this response also called a tool that does not exist, so none of its calls ran."
+                    if call.name in offered
+                    else f"No tool named {call.name[:64]} exists. Call only the tools provided in this request."
+                ),
+            }
+        )
+        for call in calls
+    }
+
+
+async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
+    response = ctx.last_model_response
+    if response is None:
+        return None
+    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
+    outputs = unrun_call_outputs(calls, offered)
+    if outputs is not None:
+        LOG.warning(
+            "copilot_unknown_tool_call",
+            tool_names=sorted({call.name for call in calls if call.name not in offered}),
+            call_count=len(calls),
+        )
+    return outputs
+
+
+async def _save_unrun_call_results(
+    agent: Agent, ctx: CopilotContext, session: Session | None, stream: EventSourceStream
+) -> bool:
+    """Save the response the SDK rejected, with a result per call. False when that response named no unoffered tool."""
+    response = ctx.last_model_response
+    outputs = await _unrun_call_outputs(agent, ctx) if session is not None else None
+    ctx.last_model_response = None
+    if response is None or outputs is None or session is None:
+        return False
+    # The rejected response never reached the session, and a drain sends only session history.
+    await session.add_items(
+        [
+            *response.to_input_items(),
+            *(
+                {"type": "function_call_output", "call_id": call_id, "output": output}
+                for call_id, output in outputs.items()
+            ),
+        ]
+    )
+    await streaming_adapter.close_unrun_tool_calls(stream, ctx, outputs)
+    return True
+
+
+async def _run_drain(
+    agent: Agent,
+    observation: str,
+    ctx: CopilotContext,
+    session: Session | None,
+    stream: EventSourceStream,
+    runner_kwargs: dict[str, Any],
+    start_time: float,
+    iteration: int,
+    *,
+    total_turns: int,
+    min_remaining_seconds: float | None = None,
+) -> RunResultStreaming:
+    """One drain run. A response naming a tool that was not offered gets its results and one more run, within
+    ``total_turns`` model calls across both runs."""
+    calls_before = ctx.model_calls_this_turn
+    try:
+        return await _run_streamed_with_deadline(
+            agent,
+            observation,
+            ctx,
+            session,
+            _SendTrackingStream(stream),
+            runner_kwargs,
+            start_time,
+            iteration,
+            min_remaining_seconds=min_remaining_seconds,
+        )
+    except ModelBehaviorError:
+        if not await _save_unrun_call_results(agent, ctx, session, stream):
+            raise
+    remaining_turns = total_turns - (ctx.model_calls_this_turn - calls_before)
+    if remaining_turns < 1:
+        raise MaxTurnsExceeded("Drain turns spent before a tool that was not offered")
+    return await _run_streamed_with_deadline(
+        agent,
+        [],
+        ctx,
+        session,
+        _SendTrackingStream(stream),
+        {**runner_kwargs, "max_turns": remaining_turns},
+        start_time,
+        iteration,
+        min_remaining_seconds=min_remaining_seconds,
+    )
 
 
 def _mark_budget_expiry(ctx: CopilotContext, source: BudgetExpirySource) -> None:
@@ -1290,19 +1591,67 @@ async def _run_budget_drain(
         staged_draft_id=state.staged_draft_id,
     )
     try:
-        result = await _run_streamed_with_deadline(
-            agent,
+        result = await _run_drain(
+            agent.clone(tools=budget_drain_tools(agent.tools)),
             observation,
             ctx,
             session,
-            _SendTrackingStream(stream),
+            stream,
             drain_kwargs,
             start_time,
             iteration,
+            total_turns=BUDGET_DRAIN_HEADROOM,
         )
     finally:
         state.drain_active = False
     return result
+
+
+def budget_expired_reply_observation(state: BudgetExpiryState, runs_not_in_history: list[RecordedRunState]) -> str:
+    return (
+        NUDGE_SENTINEL
+        + BudgetExpiredReplyObservation(
+            source=state.source,
+            staged_draft=state.staged_draft_id,
+            stopped_waiting=state.hard_backstop_reached,
+            runs_not_in_history=runs_not_in_history,
+        ).model_dump_json()
+    )
+
+
+async def run_final_reply_drain(
+    agent: Agent,
+    ctx: CopilotContext,
+    stream: EventSourceStream,
+    *,
+    session: Session | None,
+    hooks: FinalReplyRunHooks,
+    run_config: RunConfig,
+    observation: str = FINAL_REPLY_OBSERVATION,
+) -> RunResultStreaming:
+    state = ctx.budget_expiry_state
+    expiry_snapshot = (state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded)
+    LOG.info("copilot_final_reply_drain_started", budget_expiry_source=state.source)
+    # Only `reply` is offered: any other call is rejected before its input checks run, and gets a result.
+    reply_only = agent.clone(tools=[tool for tool in agent.tools if tool.name == REPLY_TOOL_NAME], mcp_servers=[])
+    try:
+        return await _run_drain(
+            reply_only,
+            observation,
+            ctx,
+            session,
+            stream,
+            {"max_turns": 1, "hooks": hooks, "run_config": run_config},
+            ctx.copilot_run_start_monotonic or time.monotonic(),
+            0,
+            total_turns=2,
+            min_remaining_seconds=EXPIRED_TURN_REPLY_SECONDS if state.source is not None else None,
+        )
+    except CopilotTotalTimeoutError:
+        # The hard backstop marks the turn budget-expired; this call is not a budget drain.
+        state.source, state.hard_backstop_reached, ctx.copilot_total_timeout_exceeded = expiry_snapshot
+        LOG.warning("copilot_final_reply_drain_turn_deadline_rolled_back")
+        raise
 
 
 # Intentionally distinct from request_policy._OUTPUT_GENERIC_WORDS: this list filters output-path leaf
@@ -1818,14 +2167,21 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
+    # A retry after a failed drain would otherwise restart the full tool set.
+    if ctx.budget_expiry_state.drain_attempted:
+        raise MaxTurnsExceeded("Budget drain already attempted")
     session = runner_kwargs.pop("session", None)
     copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
+    token_budget = runner_kwargs.pop("token_budget", None) or copilot_config.token_budget or TOKEN_BUDGET
     current_input: str | list = initial_input
-    start_time = time.monotonic()
+    # A fallback or model-lookup retry resumes the turn's clock, so the turn keeps one deadline and one backstop.
+    resumed = ctx.copilot_run_start_monotonic is not None
+    start_time = ctx.copilot_run_start_monotonic if resumed else time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
     install_pending_operation_slot(ctx)
     iteration = 0
     pending_recovery_nudge: str | None = None
+    remaining_turns: int | None = None
 
     while True:
         # Client disconnect is no longer treated as a stop signal. The
@@ -1833,7 +2189,7 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
+        if (iteration > 0 or resumed) and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             return await _run_budget_drain(
                 agent,
@@ -1852,11 +2208,11 @@ async def run_with_enforcement(
         if isinstance(current_input, list):
             est = estimate_tokens(current_input)
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
-            if est > copilot_config.token_budget:
+            if est > token_budget:
                 LOG.warning(
                     "Token estimate exceeds budget, aggressively pruning",
                     tokens=est,
-                    budget=copilot_config.token_budget,
+                    budget=token_budget,
                 )
                 current_input = aggressive_prune(current_input)
 
@@ -1865,7 +2221,11 @@ async def run_with_enforcement(
             "enforcement_iteration",
             data={"iteration": iteration, "elapsed_seconds": round(elapsed, 3)},
         ):
-            current_runner_kwargs = runner_kwargs
+            current_runner_kwargs = (
+                runner_kwargs if remaining_turns is None else {**runner_kwargs, "max_turns": remaining_turns}
+            )
+            remaining_turns = None
+            unknown_tool_error: ModelBehaviorError | None = None
             try:
                 result = await _run_streamed_with_deadline(
                     agent,
@@ -1876,6 +2236,7 @@ async def run_with_enforcement(
                     current_runner_kwargs,
                     start_time,
                     iteration,
+                    watch_steer=True,
                 )
             except asyncio.CancelledError:
                 _record_copilot_cancellation(ctx, start_time, iteration)
@@ -1891,6 +2252,8 @@ async def run_with_enforcement(
                     iteration,
                     "max_turns",
                 )
+            except ModelBehaviorError as e:
+                unknown_tool_error = e
             except Exception as e:
                 if not _is_context_window_error(e):
                     raise
@@ -1931,6 +2294,7 @@ async def run_with_enforcement(
                         current_runner_kwargs,
                         start_time,
                         iteration,
+                        watch_steer=True,
                     )
                 except asyncio.CancelledError:
                     _record_copilot_cancellation(ctx, start_time, iteration)
@@ -1946,6 +2310,8 @@ async def run_with_enforcement(
                         iteration,
                         "max_turns",
                     )
+                except ModelBehaviorError as retry_error:
+                    unknown_tool_error = retry_error
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
@@ -1955,6 +2321,26 @@ async def run_with_enforcement(
                         has_session=session is not None,
                     )
                     raise
+
+        if unknown_tool_error is not None:
+            if not await _save_unrun_call_results(agent, ctx, session, stream):
+                raise unknown_tool_error
+            # The counter spans the whole chat turn and the cap is per run, so this can only tighten the cap.
+            remaining_turns = runner_kwargs.get("max_turns", copilot_config.max_turns) - ctx.model_calls_this_turn
+            if remaining_turns < 1:
+                return await _run_budget_drain(
+                    agent,
+                    ctx,
+                    session,
+                    stream,
+                    runner_kwargs,
+                    start_time,
+                    iteration,
+                    "max_turns",
+                )
+            current_input = await take_steer_input(ctx)
+            iteration += 1
+            continue
 
         elapsed = _elapsed_run_seconds(ctx, start_time)
         if elapsed >= TOTAL_TIMEOUT_SECONDS:
@@ -1969,6 +2355,14 @@ async def run_with_enforcement(
                 iteration,
                 "deadline",
             )
+
+        steer_input = await take_steer_input(ctx)
+        if steer_input:
+            current_input = (
+                steer_input if session is not None else _prune_input_list(result.to_input_list()) + steer_input
+            )
+            iteration += 1
+            continue
 
         # The post-run screenshot drain must follow the enforcement check:
         # without a nudge, re-invoking with just the screenshot would replace
@@ -2013,21 +2407,20 @@ async def run_with_enforcement(
 
         # OpenAI rejects images in tool messages, so a queued post-run
         # screenshot rides as its own user message just before the nudge.
+        entry = pending_screenshot_entry(ctx)
         screenshot_msg = _consume_pending_screenshots(ctx)
         if screenshot_msg is not None:
-            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
+            LOG.info(
+                "Injecting screenshot user message",
+                count=len(screenshot_msg["content"]) - 1,
+                source_tool=entry.provenance.source_tool if entry else None,
+                capture_id=entry.capture_id if entry else None,
+                capture_event_id=entry.capture_event_id if entry else None,
+            )
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
             extra_msgs = _assemble_enforcement_messages(screenshot_msg, decision.message)
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )
-        # Signal the narrator that the agent is re-entering the loop after an
-        # enforcement correction. stream_to_sse creates the state on the first
-        # pass; on later passes we poke the transition latch directly so the
-        # next narration (produced after the next tool round-trip) can describe
-        # the course-correction.
-        narrator_state = getattr(ctx, "narrator_state", None)
-        if narrator_state is not None:
-            narrator_state.record_transition(TransitionKind.ENFORCEMENT_RETRY)
         iteration += 1

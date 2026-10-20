@@ -11,6 +11,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.workflow.models.workflow import (
+    MIXED_RUN_DEFINITION_DIGEST,
+    WorkflowRunStatus,
+    workflow_definition_sha256,
+)
 
 
 @pytest_asyncio.fixture
@@ -218,3 +223,104 @@ async def test_workflow_never_touched_by_copilot_is_not_copilot_authored(agent_d
         workflow_permanent_id=workflow.workflow_permanent_id,
         organization_id=org_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_run_definition_digest_survives_reload_and_metadata_edits_but_not_a_rewrite(
+    agent_db: AgentDB, org_id: str
+) -> None:
+    workflow = await agent_db.workflows.create_workflow(
+        title="wf",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org_id,
+    )
+    run = await agent_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+        workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
+    )
+    stored = await agent_db.workflow_runs.get_workflow_run(run.workflow_run_id, organization_id=org_id)
+    assert stored is not None and stored.workflow_definition_sha256 is not None
+
+    async def digest_of_row_the_run_reads() -> str:
+        row = await agent_db.workflows.get_workflow_for_workflow_run(run.workflow_run_id, organization_id=org_id)
+        assert row is not None
+        return workflow_definition_sha256(row.workflow_definition)
+
+    assert await digest_of_row_the_run_reads() == stored.workflow_definition_sha256
+    await agent_db.workflows.update_workflow(workflow_id=workflow.workflow_id, organization_id=org_id, title="renamed")
+    assert await digest_of_row_the_run_reads() == stored.workflow_definition_sha256
+    await agent_db.workflows.update_workflow(
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+        workflow_definition={"parameters": [], "blocks": [], "workflow_system_prompt": "rewritten in place"},
+    )
+    assert await digest_of_row_the_run_reads() != stored.workflow_definition_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_attempt_runs_original", [True, False], ids=["rewritten-between-retries", "rewritten-while-queued"]
+)
+async def test_a_run_whose_attempts_saw_different_definitions_never_matches_its_row(
+    agent_db: AgentDB, org_id: str, first_attempt_runs_original: bool
+) -> None:
+    original = {"parameters": [], "blocks": []}
+    workflow = await agent_db.workflows.create_workflow(
+        title="wf", workflow_definition=original, organization_id=org_id
+    )
+    original_digest = workflow_definition_sha256(workflow.workflow_definition)
+    run = await agent_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+        workflow_definition_sha256=original_digest,
+    )
+
+    async def start_attempt(digest: str) -> str | None:
+        started = await agent_db.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id=run.workflow_run_id, status=WorkflowRunStatus.running, workflow_definition_sha256=digest
+        )
+        assert started is not None
+        return started.workflow_definition_sha256
+
+    if first_attempt_runs_original:
+        assert await start_attempt(original_digest) == original_digest
+    rewritten = await agent_db.workflows.update_workflow(
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+        workflow_definition={**original, "workflow_system_prompt": "rewritten in place"},
+    )
+    stored = await start_attempt(workflow_definition_sha256(rewritten.workflow_definition))
+
+    row = await agent_db.workflows.get_workflow_for_workflow_run(run.workflow_run_id, organization_id=org_id)
+    assert row is not None
+    assert stored == MIXED_RUN_DEFINITION_DIGEST
+    assert workflow_definition_sha256(row.workflow_definition) != stored
+
+
+@pytest.mark.asyncio
+async def test_a_run_created_before_digests_is_never_stamped_by_a_later_attempt(agent_db: AgentDB, org_id: str) -> None:
+    # Its earlier attempts' block rows may describe a definition nobody recorded, so it stays on the modified_at rule.
+    workflow = await agent_db.workflows.create_workflow(
+        title="wf", workflow_definition={"parameters": [], "blocks": []}, organization_id=org_id
+    )
+    run = await agent_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+    )
+    rewritten = await agent_db.workflows.update_workflow(
+        workflow_id=workflow.workflow_id,
+        organization_id=org_id,
+        workflow_definition={"parameters": [], "blocks": [], "workflow_system_prompt": "rewritten before the retry"},
+    )
+
+    retried = await agent_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id=run.workflow_run_id,
+        status=WorkflowRunStatus.running,
+        workflow_definition_sha256=workflow_definition_sha256(rewritten.workflow_definition),
+    )
+
+    assert retried is not None and retried.workflow_definition_sha256 is None

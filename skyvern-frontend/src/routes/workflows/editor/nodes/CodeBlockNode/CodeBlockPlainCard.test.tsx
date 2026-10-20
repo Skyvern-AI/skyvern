@@ -29,7 +29,7 @@ describe("CodeBlockPlainCard", () => {
   it("uses a singular label for a single step", () => {
     render(
       <CodeBlockPlainCard
-        steps={[{ action_type: "extract", title: "Summarize the page" }]}
+        steps={[{ action_type: "extract", description: "Summarize the page" }]}
       />,
     );
 
@@ -79,7 +79,7 @@ describe("CodeBlockPlainCard", () => {
     expect(screen.getByText("Go Forward")).toBeDefined();
   });
 
-  it("falls back to the readable action type for the step text when title and description are absent", () => {
+  it("falls back to the readable action type for the step text when the description is absent", () => {
     const steps: Array<CodeBlockStep> = [
       { action_type: "extract", line_start: 1, line_end: 1 },
     ];

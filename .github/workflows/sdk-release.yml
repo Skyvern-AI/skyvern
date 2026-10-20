@@ -136,7 +136,7 @@ jobs:
           name: skyvern-dist
           path: dist/skyvern
       - name: Publish skyvern-ui to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/skyvern-ui/
           # Defense-in-depth: if check-version-change ever misses an edge case
@@ -144,7 +144,7 @@ jobs:
           # already on PyPI rather than failing the whole publish step.
           skip-existing: true
       - name: Publish skyvern to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/skyvern/
           skip-existing: true

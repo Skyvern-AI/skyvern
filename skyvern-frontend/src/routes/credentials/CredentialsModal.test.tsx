@@ -13,6 +13,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CredentialApiResponse } from "@/api/types";
+import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
 import {
   CredentialAuthenticatorSupportProvider,
@@ -31,6 +32,25 @@ const mockEmailCredentials = vi.hoisted(() => ({
   google: vi.fn(),
   microsoft: vi.fn(),
 }));
+
+function permissionsForCredentialDelete(allowed: boolean): PermissionsState {
+  return {
+    status: "ready",
+    data: {
+      organization_id: "org_1",
+      user_id: allowed ? "user_admin" : "user_member",
+      auth_kind: "bearer",
+      org_role: allowed ? "org:admin" : "org:member",
+      role: allowed ? "admin" : "member",
+      capabilities: [
+        { capability: "credential.delete", allowed, reason: "role" },
+      ],
+    },
+  };
+}
+
+const adminPermissions = permissionsForCredentialDelete(true);
+const memberPermissions = permissionsForCredentialDelete(false);
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn(async () => ({
@@ -106,11 +126,11 @@ function installEmailCredentialHooks() {
   });
 }
 
-function axiosErrorWithDetail(detail: unknown): AxiosError {
+function axiosErrorWithDetail(detail: unknown, status = 400): AxiosError {
   const error = new AxiosError("Request failed");
   error.response = {
     data: { detail },
-    status: 400,
+    status,
     statusText: "Bad Request",
     headers: {},
     config: { headers: new AxiosHeaders() },
@@ -122,6 +142,7 @@ function renderPasswordCredentialsModal(
   additionalTwoFactorMethods?: CredentialAdditionalTwoFactorMethod[],
   onOpenChange = vi.fn(),
   onCredentialCreated?: (id: string, name?: string) => void,
+  permissions: PermissionsState = adminPermissions,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -131,18 +152,20 @@ function renderPasswordCredentialsModal(
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <CredentialAuthenticatorSupportProvider
-        value={{ additionalTwoFactorMethods }}
-      >
-        <MemoryRouter>
-          <CredentialsModal
-            isOpen
-            onOpenChange={onOpenChange}
-            onCredentialCreated={onCredentialCreated}
-            overrideType={CredentialModalTypes.PASSWORD}
-          />
-        </MemoryRouter>
-      </CredentialAuthenticatorSupportProvider>
+      <PageSlotsProvider value={{ permissions }}>
+        <CredentialAuthenticatorSupportProvider
+          value={{ additionalTwoFactorMethods }}
+        >
+          <MemoryRouter>
+            <CredentialsModal
+              isOpen
+              onOpenChange={onOpenChange}
+              onCredentialCreated={onCredentialCreated}
+              overrideType={CredentialModalTypes.PASSWORD}
+            />
+          </MemoryRouter>
+        </CredentialAuthenticatorSupportProvider>
+      </PageSlotsProvider>
     </QueryClientProvider>,
   );
 }
@@ -169,6 +192,9 @@ const editingPasswordCredential: CredentialApiResponse = {
 function renderEditPasswordCredentialsModal(
   credential = editingPasswordCredential,
   additionalTwoFactorMethods?: CredentialAdditionalTwoFactorMethod[],
+  onCredentialCreated?: (id: string, name?: string) => void,
+  defaultTotpType?: "authenticator",
+  permissions: PermissionsState = adminPermissions,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -178,19 +204,23 @@ function renderEditPasswordCredentialsModal(
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <CredentialAuthenticatorSupportProvider
-        value={{ additionalTwoFactorMethods }}
-      >
-        <MemoryRouter>
-          <CredentialsModal
-            isOpen
-            onOpenChange={vi.fn()}
-            overrideType={CredentialModalTypes.PASSWORD}
-            editingCredential={credential}
-            onStartBackgroundTest={vi.fn()}
-          />
-        </MemoryRouter>
-      </CredentialAuthenticatorSupportProvider>
+      <PageSlotsProvider value={{ permissions }}>
+        <CredentialAuthenticatorSupportProvider
+          value={{ additionalTwoFactorMethods }}
+        >
+          <MemoryRouter>
+            <CredentialsModal
+              isOpen
+              onOpenChange={vi.fn()}
+              overrideType={CredentialModalTypes.PASSWORD}
+              editingCredential={credential}
+              defaultTotpType={defaultTotpType}
+              onStartBackgroundTest={vi.fn()}
+              onCredentialCreated={onCredentialCreated}
+            />
+          </MemoryRouter>
+        </CredentialAuthenticatorSupportProvider>
+      </PageSlotsProvider>
     </QueryClientProvider>,
   );
 }
@@ -198,6 +228,7 @@ function renderEditPasswordCredentialsModal(
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("getAuthenticatorKeyError", () => {
@@ -389,58 +420,89 @@ describe("CredentialsModal additional two-factor methods", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("rolls back the created credential when the passkey material attach fails", async () => {
-    const onSaved = vi
-      .fn()
-      .mockRejectedValue(axiosErrorWithDetail("Passkey setup failed."));
-    const onCredentialCreated = vi.fn();
-    const additionalMethod: CredentialAdditionalTwoFactorMethod = {
-      value: "passkey",
-      requestType: "passkey",
-      label: "Passkey",
-      renderFields: () => null,
-      validate: () => null,
-      onSaved,
-    };
-    postMock.mockResolvedValueOnce({
-      data: { credential_id: "cred-passkey", name: "credentials" },
-    });
-    deleteMock.mockResolvedValueOnce({ data: {} });
-    renderPasswordCredentialsModal(
-      [additionalMethod],
-      vi.fn(),
-      onCredentialCreated,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
-    });
-    const usernameInput = Array.from(
-      document.querySelectorAll<HTMLInputElement>("input"),
-    ).find(
-      (input) =>
-        input.type === "text" && input.value === "" && input.placeholder === "",
-    );
-    fireEvent.change(usernameInput as HTMLInputElement, {
-      target: { value: "user@example.com" },
-    });
-    fireEvent.change(document.querySelector('input[type="password"]')!, {
-      target: { value: "password" },
-    });
-    fireEvent.click(screen.getByText("Two-Factor Authentication"));
-    fireEvent.click(screen.getByText("Passkey"));
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => {
-      expect(onSaved).toHaveBeenCalledWith(
-        expect.objectContaining({ credentialId: "cred-passkey" }),
+  it.each([
+    { caller: "an Admin", permissions: adminPermissions, retry: false },
+    {
+      caller: "capabilities are loading",
+      permissions: { status: "loading" },
+      retry: true,
+    },
+    {
+      caller: "capabilities errored",
+      permissions: { status: "error" },
+      retry: true,
+    },
+  ] as const)(
+    "starts with general cleanup for $caller and retries only if forbidden",
+    async ({ permissions, retry }) => {
+      const onSaved = vi
+        .fn()
+        .mockRejectedValue(axiosErrorWithDetail("Passkey setup failed."));
+      const onCredentialCreated = vi.fn();
+      const additionalMethod: CredentialAdditionalTwoFactorMethod = {
+        value: "passkey",
+        requestType: "passkey",
+        label: "Passkey",
+        renderFields: () => null,
+        validate: () => null,
+        onSaved,
+      };
+      postMock.mockResolvedValueOnce({
+        data: { credential_id: "cred-passkey", name: "credentials" },
+      });
+      if (retry) {
+        deleteMock
+          .mockRejectedValueOnce(axiosErrorWithDetail("Forbidden", 403))
+          .mockResolvedValueOnce({ data: {} });
+      } else {
+        deleteMock.mockResolvedValueOnce({ data: {} });
+      }
+      renderPasswordCredentialsModal(
+        [additionalMethod],
+        vi.fn(),
+        onCredentialCreated,
+        permissions,
       );
-    });
-    await waitFor(() => {
-      expect(deleteMock).toHaveBeenCalledWith("/credentials/cred-passkey");
-    });
-    expect(onCredentialCreated).not.toHaveBeenCalled();
-  });
+
+      await waitFor(() => {
+        expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+      });
+      const usernameInput = Array.from(
+        document.querySelectorAll<HTMLInputElement>("input"),
+      ).find(
+        (input) =>
+          input.type === "text" &&
+          input.value === "" &&
+          input.placeholder === "",
+      );
+      fireEvent.change(usernameInput as HTMLInputElement, {
+        target: { value: "user@example.com" },
+      });
+      fireEvent.change(document.querySelector('input[type="password"]')!, {
+        target: { value: "password" },
+      });
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+      fireEvent.click(screen.getByText("Passkey"));
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(onSaved).toHaveBeenCalledWith(
+          expect.objectContaining({ credentialId: "cred-passkey" }),
+        );
+      });
+      await waitFor(() => {
+        expect(deleteMock.mock.calls.map(([path]) => path)).toEqual(
+          retry
+            ? [
+                "/credentials/cred-passkey",
+                "/credentials/cred-passkey/temporary",
+              ]
+            : ["/credentials/cred-passkey"],
+        );
+      });
+      expect(onCredentialCreated).not.toHaveBeenCalled();
+    },
+  );
 
   it("runs the configured method callback after turning two-factor off", async () => {
     const onSaved = vi.fn().mockResolvedValue(undefined);
@@ -472,8 +534,7 @@ describe("CredentialsModal additional two-factor methods", () => {
     fireEvent.change(screen.getByPlaceholderText("••••••••"), {
       target: { value: "password" },
     });
-    // Collapsing the Two-Factor Authentication section turns 2FA off (no None tile).
-    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Security Device" }));
     fireEvent.click(screen.getByRole("button", { name: "Update" }));
 
     // Removing a saved 2FA method now requires confirming an in-app dialog.
@@ -545,6 +606,7 @@ describe("CredentialsModal authenticator save errors", () => {
     });
 
     fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Authenticator App" }));
     const authenticatorInput = screen.getByPlaceholderText(
       "e.g. JBSWY3DPEHPK3PXP",
     );
@@ -615,77 +677,105 @@ describe("CredentialsModal authenticator save errors", () => {
 });
 
 describe("CredentialsModal edit-mode inline test", () => {
-  it("updates the real credential and deletes the temp one instead of renaming the temp credential in place, even if 'save browser session' gets unchecked before saving", async () => {
-    // 1st POST: startTest's /credentials/test-login. 2nd POST: the real
-    // credential's /credentials/{id}/update once Save is clicked.
-    postMock
-      .mockResolvedValueOnce({
-        data: { credential_id: "temp-cred-id", workflow_run_id: "wr-1" },
-      })
-      .mockResolvedValueOnce({
-        data: { credential_id: "real-cred-id", name: "Acme Login" },
+  it.each(["success", "404"] as const)(
+    "uses Member cleanup without interrupting save when cleanup returns %s",
+    async (cleanupResult) => {
+      // 1st POST: startTest's /credentials/test-login. 2nd POST: the real
+      // credential's /credentials/{id}/update once Save is clicked.
+      postMock
+        .mockResolvedValueOnce({
+          data: { credential_id: "temp-cred-id", workflow_run_id: "wr-1" },
+        })
+        .mockResolvedValueOnce({
+          data: { credential_id: "real-cred-id", name: "Acme Login" },
+        });
+      getMock.mockResolvedValueOnce({
+        data: {
+          status: "completed",
+          browser_profile_id: "new-profile-id",
+          tested_url: "https://example.com/login",
+        },
       });
-    getMock.mockResolvedValueOnce({
-      data: {
-        status: "completed",
-        browser_profile_id: "new-profile-id",
-        tested_url: "https://example.com/login",
-      },
-    });
-    patchMock.mockResolvedValue({ data: {} });
-    deleteMock.mockResolvedValue({ data: {} });
+      patchMock.mockResolvedValue({ data: {} });
+      if (cleanupResult === "404") {
+        deleteMock.mockRejectedValueOnce(
+          axiosErrorWithDetail("Credential not found", 404),
+        );
+      } else {
+        deleteMock.mockResolvedValue({ data: {} });
+      }
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    renderEditPasswordCredentialsModal();
-
-    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
-    const passwordInput = document.querySelector('input[type="password"]');
-    expect(passwordInput).toBeTruthy();
-    fireEvent.change(passwordInput as HTMLInputElement, {
-      target: { value: "rotated-password" },
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Test" }));
-
-    // Real 3s poll delay inside the component — wait for the button label
-    // to flip once testStatus reaches "completed".
-    await waitFor(
-      () => {
-        expect(screen.getByRole("button", { name: "Retest" })).toBeTruthy();
-      },
-      { timeout: 8000 },
-    );
-
-    // Uncheck "Save browser session" after the test completed — the checkbox
-    // has no side effect on testStatus/testCredentialId, so this must not be
-    // able to skip cleanup of the now-orphaned temp credential.
-    fireEvent.click(
-      screen.getByLabelText("Save browser session for future logins"),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Update" }));
-
-    await waitFor(() => {
-      expect(deleteMock).toHaveBeenCalledWith("/credentials/temp-cred-id");
-    });
-    await waitFor(() => {
-      expect(postMock).toHaveBeenCalledWith(
-        "/credentials/real-cred-id/update",
-        expect.objectContaining({
-          credential: expect.objectContaining({
-            password: "rotated-password",
-          }),
-        }),
+      renderEditPasswordCredentialsModal(
+        editingPasswordCredential,
+        undefined,
+        undefined,
+        undefined,
+        memberPermissions,
       );
-    });
 
-    // The bug this guards against: the old code renamed the throwaway temp
-    // credential in place of updating the real one. renameCredentialMutation
-    // is the only path that PATCHes a credential by the *temp* id — assert
-    // it never fired.
-    for (const call of patchMock.mock.calls) {
-      expect(call[0]).not.toBe("/credentials/temp-cred-id");
-    }
-  }, 15_000);
+      fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+      const passwordInput = document.querySelector('input[type="password"]');
+      expect(passwordInput).toBeTruthy();
+      fireEvent.change(passwordInput as HTMLInputElement, {
+        target: { value: "rotated-password" },
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Test" }));
+
+      // Real 3s poll delay inside the component — wait for the button label
+      // to flip once testStatus reaches "completed".
+      await waitFor(
+        () => {
+          expect(screen.getByRole("button", { name: "Retest" })).toBeTruthy();
+        },
+        { timeout: 8000 },
+      );
+
+      // Uncheck "Save browser session" after the test completed — the checkbox
+      // has no side effect on testStatus/testCredentialId, so this must not be
+      // able to skip cleanup of the now-orphaned temp credential.
+      fireEvent.click(
+        screen.getByLabelText("Save browser session for future logins"),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+      await waitFor(() => {
+        expect(deleteMock).toHaveBeenCalledWith(
+          "/credentials/temp-cred-id/temporary",
+        );
+      });
+      if (cleanupResult === "404") {
+        expect(warning).toHaveBeenCalledWith(
+          "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
+        );
+      } else {
+        expect(warning).not.toHaveBeenCalledWith(
+          "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
+        );
+      }
+      await waitFor(() => {
+        expect(postMock).toHaveBeenCalledWith(
+          "/credentials/real-cred-id/update",
+          expect.objectContaining({
+            credential: expect.objectContaining({
+              password: "rotated-password",
+            }),
+          }),
+        );
+      });
+
+      // The bug this guards against: the old code renamed the throwaway temp
+      // credential in place of updating the real one. renameCredentialMutation
+      // is the only path that PATCHes a credential by the *temp* id — assert
+      // it never fired.
+      for (const call of patchMock.mock.calls) {
+        expect(call[0]).not.toBe("/credentials/temp-cred-id");
+      }
+    },
+    15_000,
+  );
 
   it("shows only the partial-save toast, not a success toast, when the metadata PATCH fails", async () => {
     postMock.mockResolvedValueOnce({
@@ -721,6 +811,34 @@ describe("CredentialsModal edit-mode inline test", () => {
       expect.objectContaining({ title: "Credential updated" }),
     );
   }, 15_000);
+});
+
+describe("CredentialsModal edit-mode save callback", () => {
+  it("reports the edited credential to onCredentialCreated", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    const onCredentialCreated = vi.fn();
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      onCredentialCreated,
+    );
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(screen.getByDisplayValue("user@example.com"), {
+      target: { value: "renamed@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith(
+        "real-cred-id",
+        "Acme Login",
+      ),
+    );
+  }, 10_000);
 });
 
 describe("CredentialsModal edit-mode password preservation", () => {
@@ -1272,6 +1390,22 @@ describe("CredentialsModal copilot-context tested_url default", () => {
     expect(onCredentialCreated).toHaveBeenCalledWith("cred-z", "credentials");
   }, 10_000);
 
+  it("saves when Enter is pressed in the password field", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-e", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsernameAndPassword();
+    fireEvent.keyDown(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { key: "Enter" },
+    );
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith("cred-e", "credentials"),
+    );
+  }, 10_000);
+
   it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
     postMock.mockResolvedValueOnce({
       data: { credential_id: "cred-y", name: "credentials" },
@@ -1425,6 +1559,20 @@ describe("CredentialsModal record-browser defaults", () => {
     expect(authenticatorMethod.getAttribute("aria-pressed")).toBe("true");
     const emailMethod = await screen.findByRole("button", { name: /email/i });
     expect(emailMethod.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("editing a credential without 2FA opens on the default method", async () => {
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      undefined,
+      "authenticator",
+    );
+    const authenticatorMethod = await screen.findByRole("button", {
+      name: /authenticator app/i,
+    });
+    expect(authenticatorMethod.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryAllByDisplayValue("••••••••")).toHaveLength(0);
   });
 
   it("opens 2FA on the email method for a magic-link prompt", async () => {

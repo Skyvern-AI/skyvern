@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TypeVar, cast
 
 from email_validator import EmailNotValidError, validate_email
+
+from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 
 # The `token` keyword is guarded by negative lookbehinds so pagination cursors
 # (next_token, page_token, continuation_token, ...), which are not credentials,
@@ -34,6 +37,70 @@ RAW_SECRET_PATTERNS = (
 )
 _COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS = (",", ";", "|")
 _COLON_DELIMITED_SECRET_EDGE_CHARS = "\"'`()[]{}<>"
+
+
+_TOTP_DIAGNOSTIC = re.compile(r"\b(totp_identifier|totp_verification_url)(?:\s*=|[\"']?\s*:\s*(?=[\"']))")
+_TOTP_FIELDS = frozenset({"totp_identifier", "totp_verification_url"})
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "reason",
+        "reasoning",
+        "intention",
+        "error",
+        "errors",
+        "error_message",
+        "failure_reason",
+        "terminate_reason",
+        "terminated_reason",
+        "display_reason",
+        "workflow_error_message",
+        "traceback",
+        "exception",
+        "action_trace",
+        "action_trace_summary",
+        "reviewer_output",
+        "logs",
+    }
+)
+_T = TypeVar("_T")
+
+
+def redact_totp_runtime_values(node: _T, *, diagnostic: bool | None = None) -> _T:
+    if isinstance(node, str):
+        fields = sorted({match[1] for match in _TOTP_DIAGNOSTIC.finditer(node)}) if diagnostic is not False else []
+        if fields:
+            # Legacy diagnostics do not delimit values; retaining any free text can retain a value fragment.
+            failure = "TOTP verification failed"
+            if "No TOTP verification code found" in node or "produced no code" in node:
+                failure = "TOTP verification code unavailable"
+            return cast(_T, f"{failure} ({', '.join(fields)}): [WITHHELD]")
+        return node
+    if isinstance(node, dict):
+        return cast(
+            _T,
+            {
+                key: (
+                    "[WITHHELD]"
+                    if key in _TOTP_FIELDS and isinstance(value, (str, int, float)) and value != SECRET_HEADER_MASK
+                    else redact_totp_runtime_values(
+                        value,
+                        diagnostic=key in _DIAGNOSTIC_FIELDS or (diagnostic is True and key in {"message", "detail"}),
+                    )
+                )
+                for key, value in node.items()
+            },
+        )
+    if isinstance(node, list):
+        return cast(
+            _T,
+            [redact_totp_runtime_values(value, diagnostic=diagnostic) for value in node],
+        )
+    if isinstance(node, tuple):
+        return cast(
+            _T,
+            tuple(redact_totp_runtime_values(value, diagnostic=diagnostic) for value in node),
+        )
+    return node
 
 
 def _candidate_secret_segments(text: str) -> list[str]:
@@ -120,7 +187,7 @@ _WORDLIKE_RUN_CHARS = 4
 _WORDLIKE_RUNS_REQUIRED = 2
 
 
-def _is_secret_shaped(token: str) -> bool:
+def is_secret_shaped(token: str) -> bool:
     if any(not run.isdigit() for run in _HEX_BLOB_RE.findall(token)):
         return True
     wordlike_runs = sum(1 for run in _LOWERCASE_RUN_RE.findall(token) if len(run) >= _WORDLIKE_RUN_CHARS)
@@ -142,7 +209,7 @@ def redact_secretlike_filename(name: str) -> str:
     stem, dot, extension = redacted.rpartition(".")
     if not dot:
         stem, extension = redacted, ""
-    if _is_secret_shaped(stem.strip()):
+    if is_secret_shaped(stem.strip()):
         return f"[REDACTED_SECRET]{dot}{extension}"
     return redacted
 

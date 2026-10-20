@@ -26,11 +26,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright._impl._errors import Error as DriverError
 from playwright._impl._errors import TargetClosedError
 
 import skyvern.forge.agent as agent_mod
 import skyvern.services.task_v2_service as task_v2_mod
 import skyvern.webeye.actions.handler as handler_mod
+import skyvern.webeye.browser_driver_errors as driver_errors_mod
 import skyvern.webeye.scraper.scraper as scraper_mod
 from skyvern.exceptions import (
     BrowserStateDiagnostic,
@@ -45,6 +47,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.actions import ActionType, ClickAction, CompleteAction
+from skyvern.webeye.browser_runtime_events import AcquireMode, BrowserRuntimeLogContext
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.test_agent_step_characterization import make_agent_step_rig
@@ -134,6 +137,131 @@ class TestRecordArtifactsAfterActionTargetClosed:
 
         assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
 
+    @pytest.mark.asyncio
+    async def test_capture_deadline_timeout_warns_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        assert any(
+            "Timed out taking the post-action screenshot" in str(call.args[0]) for call in log.warning.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_timeout_still_logs_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+        kwargs["browser_state"].take_post_action_screenshot = AsyncMock(return_value=b"png")
+        agent_mod.SkyvernFrame.create_instance.return_value.safe_scroll_to_x_y = AsyncMock()
+        monkeypatch.setattr(
+            agent_mod.app.ARTIFACT_MANAGER,
+            "accumulate_screenshot_to_step_archive",
+            MagicMock(side_effect=TimeoutError()),
+        )
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
+
+
+_NAVIGATING_REFUSAL = "Page.content: Unable to retrieve content because the page is navigating and changing the content"
+
+
+class _SecondPackageDriverError(Exception):
+    """Stands in for the second Playwright-family package's ``Error``. The browser image repoints the
+    driver import but leaves persistent-session pages on the un-rewritten package, so one process
+    holds two unrelated classes for the same refusal -- and this environment installs only one of
+    them, hence a local stand-in registered the way the image resolves both.
+    """
+
+
+class TestRecordArtifactsAfterActionHtmlCapture:
+    """The post-action html read is best-effort too, and it hits the same expected page states: the
+    tab closed, or the document is being replaced mid-navigation. Those refusals must not be ERRORs
+    with tracebacks, while a genuine failure to read or to record the html still must be.
+    """
+
+    @pytest.mark.parametrize(
+        "html_error, register_second_package",
+        [
+            (DriverError(_NAVIGATING_REFUSAL), False),
+            (TargetClosedError("Target page, context or browser has been closed"), False),
+            (DriverError("Execution context was destroyed, most likely because of a navigation"), False),
+            (_SecondPackageDriverError(_NAVIGATING_REFUSAL), True),
+        ],
+        ids=["navigating", "closed_target", "context_lost", "navigating_from_second_driver_package"],
+    )
+    @pytest.mark.asyncio
+    async def test_transient_refusals_warn_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, html_error: Exception, register_second_package: bool
+    ) -> None:
+        if register_second_package:
+            monkeypatch.setattr(
+                driver_errors_mod,
+                "DRIVER_ERROR_TYPES",
+                driver_errors_mod.DRIVER_ERROR_TYPES + (_SecondPackageDriverError,),
+            )
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=html_error)
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        warning = next(
+            (call for call in log.warning.call_args_list if "Skipping the post-action html" in str(call.args[0])),
+            None,
+        )
+        assert warning is not None, f"refusal did not warn: {log.warning.call_args_list}"
+        assert not warning.kwargs.get("exc_info"), "the downgraded warning must carry no traceback"
+        # Keeps the downgraded lines splittable by driver class, which exc_info used to supply.
+        assert warning.kwargs["error_type"].endswith(type(html_error).__name__)
+
+    @pytest.mark.asyncio
+    async def test_read_deadline_timeout_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``get_content`` bounds the read with ``asyncio.timeout``, so expiry is the builtin
+        TimeoutError rather than a Skyvern one."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=TimeoutError())
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        log.error.assert_not_called()
+        log.exception.assert_not_called()
+        assert any("Timed out reading the post-action html" in str(call.args[0]) for call in log.warning.call_args_list)
+
+    @pytest.mark.parametrize(
+        "html_error",
+        [RuntimeError("page is navigating"), DriverError("Target crashed")],
+        ids=["same_text_without_driver_identity", "driver_error_with_unrecognized_message"],
+    )
+    @pytest.mark.asyncio
+    async def test_non_transient_read_failures_keep_their_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, html_error: Exception
+    ) -> None:
+        """Controls for both halves of the classification: the identity gate rejects an unrelated
+        exception carrying a refusal's text, and the message gate rejects a driver error that is a
+        real failure (a crash) rather than an expected page state."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError(), html_error=html_error)
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to read the post-action html" in str(call.args[0]) for call in log.exception.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_failure_still_logs_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The narrowed read guard must not cover the artifact write: recording a page Skyvern did
+        read is not a transient page state, whatever the write raises."""
+        log, kwargs = _agent_rig(monkeypatch, TimeoutError())
+        monkeypatch.setattr(
+            agent_mod.app.ARTIFACT_MANAGER,
+            "accumulate_action_html_to_archive",
+            MagicMock(side_effect=TargetClosedError("Target page, context or browser has been closed")),
+        )
+
+        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
+
+        assert any("Failed to record html after action" in str(call.args[0]) for call in log.exception.call_args_list)
+
 
 class TestScrapeWebsiteTargetClosed:
     @pytest.mark.asyncio
@@ -200,21 +328,32 @@ class TestScrapeRetryLoopTargetClosed:
     async def test_final_attempt_warns_on_closed_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
         error = ScreenshotTargetClosed(error_message="Page is closed")
         agent, log, kwargs = self._rig(monkeypatch, error)
+        kwargs["browser_state"].runtime_event_context = BrowserRuntimeLogContext(browser_runtime="pbs")
 
         with pytest.raises(ScreenshotTargetClosed):
             await agent.build_and_record_step_prompt(**kwargs)
 
         assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
-        assert any("browser target closed" in str(call.args[0]).lower() for call in log.warning.call_args_list)
+        closed = [
+            call
+            for call in log.warning.call_args_list
+            if call.args[0] == "All scrape attempts failed because the browser target closed"
+        ]
+        assert len(closed) == 1
+        assert closed[0].kwargs["browser_runtime"] == "pbs"
 
     @pytest.mark.asyncio
     async def test_final_attempt_warns_on_other_failures(self, monkeypatch: pytest.MonkeyPatch) -> None:
         agent, log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
+        kwargs["browser_state"].runtime_event_context = BrowserRuntimeLogContext(browser_runtime="vendor")
 
         with pytest.raises(FailedToTakeScreenshot):
             await agent.build_and_record_step_prompt(**kwargs)
 
-        assert any("All scrape attempts failed" in str(call.args[0]) for call in log.warning.call_args_list)
+        exhausted = [call for call in log.warning.call_args_list if call.args[0] == "All scrape attempts failed"]
+        assert len(exhausted) == 1
+        # The exhaustion line is the only terminal rendering-failure signal, so it must say which runtime failed.
+        assert exhausted[0].kwargs["browser_runtime"] == "vendor"
         assert not any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
 
 
@@ -438,6 +577,30 @@ class TestCleanUpTaskTargetClosed:
             for call in log.exception.call_args_list
         )
 
+    @pytest.mark.asyncio
+    async def test_capture_deadline_timeout_warns_without_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, TimeoutError())
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        log.exception.assert_not_called()
+        assert any("Timed out taking the final screenshot" in str(call.args[0]) for call in log.warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_artifact_write_timeout_still_logs_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, TimeoutError())
+        agent_mod.app.BROWSER_MANAGER.get_for_task.return_value.take_fullpage_screenshot = AsyncMock(
+            return_value=b"png"
+        )
+        agent_mod.app.ARTIFACT_MANAGER.create_artifact = AsyncMock(side_effect=TimeoutError())
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        assert any(
+            "Failed to take screenshot before sending task response" in str(call.args[0])
+            for call in log.exception.call_args_list
+        )
+
 
 class TestHandleActionTargetClosed:
     async def _run(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[MagicMock, list]:
@@ -534,6 +697,14 @@ class _CachedBrowserState:
         self._diagnostic: BrowserStateDiagnostic | None = None
         self.browser_context = None
         self.browser_artifacts = browser_artifacts
+
+    def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None:
+        self.runtime_event_context = context
+
+    def record_browser_acquisition(
+        self, acquire_mode: AcquireMode, requested_at_monotonic: float | None = None
+    ) -> None:
+        self.acquire_mode = acquire_mode
 
     def is_connected(self) -> bool:
         if not self._connected and self._diagnostic is None:

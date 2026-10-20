@@ -1,5 +1,16 @@
-import { render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { act, cleanup, render } from "@testing-library/react";
+import { useState } from "react";
+import { EditorView } from "@codemirror/view";
+import { WorkflowScopeContext } from "../editor/WorkflowScopeContext";
+import {
+  beginSaveTransaction,
+  createYamlCommitOwner,
+  finishSaveTransaction,
+  registerEditorOwner,
+  unregisterEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CodeEditor } from "./CodeEditor";
 import {
   isDeeplyNestedDocument,
@@ -150,4 +161,75 @@ describe("CodeEditor large-document guard", () => {
       ),
     ).not.toThrow();
   });
+});
+
+describe("CodeEditor workflow transaction scope", () => {
+  it.each([false, true])(
+    "keeps a code editor editable outside a pending workflow save (scoped=%s)",
+    (scoped) => {
+      useWorkflowYamlEditorStore.setState(
+        useWorkflowYamlEditorStore.getInitialState(),
+      );
+      const owner = createYamlCommitOwner("workflow-a");
+      registerEditorOwner(owner);
+      expect(beginSaveTransaction(owner)).toBe(true);
+      unregisterEditorOwner(owner);
+      const onChange = vi.fn();
+      function Field() {
+        const [value, setValue] = useState("{}");
+        return (
+          <CodeEditor
+            value={value}
+            language="json"
+            onChange={(next) => {
+              onChange(next);
+              setValue(next);
+            }}
+          />
+        );
+      }
+      vi.useFakeTimers();
+      const view = render(
+        scoped ? (
+          <WorkflowScopeContext.Provider
+            value={{ workflowId: "workflow-a", readOnly: false }}
+          >
+            <Field />
+          </WorkflowScopeContext.Provider>
+        ) : (
+          <Field />
+        ),
+      );
+      try {
+        const content =
+          view.container.querySelector<HTMLElement>(".cm-content")!;
+        const editor = EditorView.findFromDOM(content)!;
+        expect(editor.state.readOnly).toBe(scoped);
+        expect(content.getAttribute("contenteditable")).toBe(
+          scoped ? "false" : "true",
+        );
+        if (!scoped) {
+          act(() =>
+            editor.dispatch({
+              changes: {
+                from: 0,
+                to: editor.state.doc.length,
+                insert: '{"edited":true}',
+              },
+            }),
+          );
+          act(() => vi.advanceTimersByTime(300));
+          expect(onChange).toHaveBeenCalledExactlyOnceWith('{"edited":true}');
+          expect(editor.state.doc.toString()).toBe('{"edited":true}');
+        }
+      } finally {
+        cleanup();
+        finishSaveTransaction(owner);
+        useWorkflowYamlEditorStore.setState(
+          useWorkflowYamlEditorStore.getInitialState(),
+        );
+        vi.useRealTimers();
+      }
+    },
+  );
 });

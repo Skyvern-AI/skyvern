@@ -99,8 +99,8 @@ class StateMachineInputText(StateMachine):
             self.reset()
             return None
 
-        xp = (self.mouse.xp or -1) if self.mouse else None
-        yp = (self.mouse.yp or -1) if self.mouse else None
+        xp = self.mouse.xp if self.mouse and self.mouse.xp is not None else None
+        yp = self.mouse.yp if self.mouse and self.mouse.yp is not None else None
 
         LOG.debug("~ emitting input text action")
 
@@ -132,6 +132,7 @@ class StateMachineInputText(StateMachine):
             accessible_name=self.target.accessibleName,
             input_type=self.target.inputType,
             autocomplete=self.target.autocomplete,
+            in_child_frame=self.target.inChildFrame,
         )
 
         action = ActionInputText(

@@ -4,11 +4,18 @@ import {
   QueryClientProvider,
   QueryObserver,
 } from "@tanstack/react-query";
-import { cleanup, render, renderHook, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  renderHook,
+  waitFor,
+} from "@testing-library/react";
 import { type ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { toast } from "@/components/ui/use-toast";
 import { Status } from "@/api/types";
 import { retryTransientNetworkFailures } from "@/api/QueryClient";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -25,6 +32,8 @@ import {
 } from "./useWorkflowRunQuery";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
 
+vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
+
 const { getClientMock } = vi.hoisted(() => ({ getClientMock: vi.fn() }));
 
 vi.mock("@/api/AxiosClient", async (importOriginal) => ({
@@ -33,9 +42,6 @@ vi.mock("@/api/AxiosClient", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => undefined,
-}));
-vi.mock("./useGlobalWorkflowsQuery", () => ({
-  useGlobalWorkflowsQuery: () => ({ data: [] }),
 }));
 
 function httpError(status: number): AxiosError {
@@ -219,7 +225,6 @@ function harness(client: QueryClient, path: string) {
 // key of the run now being requested, which is what keepPreviousData hands over.
 function seedRetained(client: QueryClient, requestedId: string, run: unknown) {
   client.setQueryData(["workflowRun", requestedId], run);
-  client.setQueryData(["workflowRun", "wpid_1", requestedId], run);
 }
 
 beforeEach(() => {
@@ -240,6 +245,55 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("run read path", () => {
+  test("reads the run by id on the version-agnostic client, without waiting on global workflows", async () => {
+    const get = vi.fn((url: string) =>
+      url.includes(RUN_A_ID)
+        ? Promise.resolve({ data: buildRun(RUN_A_ID, Status.Completed) })
+        : new Promise(() => {}),
+    );
+    getClientMock.mockResolvedValue({ get, post: vi.fn() });
+    const client = makeClient();
+    const { result } = renderHook(
+      () => useWorkflowRunQuery({ workflowRunId: RUN_A_ID }),
+      { wrapper: harness(client, "/agents/wpid_1/studio") },
+    );
+
+    await waitFor(() =>
+      expect(result.current.data?.workflow_run_id).toBe(RUN_A_ID),
+    );
+    expect(getClientMock).toHaveBeenCalledWith(undefined, "sans-api-v1");
+    expect(get.mock.calls[0]?.[0]).toBe(`/workflows/runs/${RUN_A_ID}`);
+  });
+
+  // Both hooks read this route, and the run page mounts both. Separate keys made
+  // the server build the whole run response twice per view and poll it twice over.
+  test("both run hooks share one cache entry, so a run is read once", async () => {
+    const get = vi.fn((url: string) =>
+      url.includes(RUN_A_ID)
+        ? Promise.resolve({ data: buildRun(RUN_A_ID, Status.Completed) })
+        : new Promise(() => {}),
+    );
+    getClientMock.mockResolvedValue({ get, post: vi.fn() });
+    const client = makeClient();
+    const { result } = renderHook(
+      () => ({
+        plain: useWorkflowRunQuery({ workflowRunId: RUN_A_ID }),
+        withWorkflow: useWorkflowRunWithWorkflowQuery({
+          workflowRunId: RUN_A_ID,
+        }),
+      }),
+      { wrapper: harness(client, "/agents/wpid_1/studio") },
+    );
+
+    await waitFor(() => {
+      expect(result.current.plain.data?.workflow_run_id).toBe(RUN_A_ID);
+      expect(result.current.withWorkflow.data?.workflow_run_id).toBe(RUN_A_ID);
+    });
+    expect(get.mock.calls).toHaveLength(1);
+  });
 });
 
 describe("run identity withholding", () => {
@@ -361,4 +415,28 @@ describe("studio consumers of a retained run payload", () => {
 
     expect(container.textContent).toBe("");
   });
+});
+
+test("Studio completion toast waits for cancel to revoke a pending retry and fires once", async () => {
+  const client = makeClient();
+  const id = "wr_cancel_wait";
+  const run = {
+    ...buildRun(id, Status.Failed),
+    retry_pending: true,
+    next_attempt_at: "2026-09-09T12:00:00Z",
+  };
+  client.setQueryData(["workflowRun", id], run);
+  const { rerender } = renderHook(() => useStudioRunSignals(), {
+    wrapper: harness(client, `/agents/wpid_1/studio?wr=${id}`),
+  });
+  expect(toast).not.toHaveBeenCalled();
+  act(() => {
+    client.setQueryData(["workflowRun", id], { ...run, retry_pending: false });
+  });
+  await waitFor(() => expect(toast).toHaveBeenCalledTimes(1));
+  rerender();
+  expect(toast).toHaveBeenCalledWith(
+    expect.objectContaining({ title: "Run Failed" }),
+  );
+  expect(toast).toHaveBeenCalledTimes(1);
 });

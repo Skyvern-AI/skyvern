@@ -189,4 +189,14 @@ async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> No
     assert [WorkflowRunStatus.running.value] in statement_parameters.values()
     assert statement_parameters["finished_at"] is None
     assert statement_parameters["failure_reason"] is None
-    assert statement_parameters["failure_category"] is None
+    # failure_category is cleared with SQL NULL (null(), not a bound Python None that a JSON
+    # column stores as the token 'null'), so it renders as literal NULL and is not a bound param.
+    assert "failure_category" not in statement_parameters
+    assert "failure_category=NULL" in statement_sql.replace(" ", "")
+    # failure_attribution is persisted atomically as a bounded provisional (unattributed)
+    # document — not SQL NULL — so a stuck-run timeout never leaves permanent NULL if the per-run
+    # repair does not run. It is therefore a bound parameter carrying that document.
+    persisted_attribution = [
+        v for v in statement_parameters.values() if isinstance(v, dict) and "primary_infra_component" in v
+    ]
+    assert persisted_attribution and persisted_attribution[0]["primary_infra_component"] == "unattributed"

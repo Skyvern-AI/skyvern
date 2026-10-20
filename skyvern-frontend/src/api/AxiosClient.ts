@@ -57,6 +57,49 @@ const artifactApiClient = axios.create({
 
 const clients = [client, v2Client, clientSansApiV1] as const;
 
+type AttributionResolver = (
+  authorization: string | undefined,
+) => string | undefined;
+let attributionResolver: AttributionResolver | undefined;
+
+// Cloud supplies the ownership check; shared API code has no analytics dependency.
+export function setPostHogAttributionResolver(
+  resolver: AttributionResolver,
+): void {
+  attributionResolver = resolver;
+  removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
+}
+
+export function getPostHogAttributionHeaders(
+  authorization: string,
+): Record<string, string> {
+  try {
+    const value = attributionResolver?.(authorization);
+    return value ? { [POSTHOG_ATTRIBUTION_HEADER]: value } : {};
+  } catch {
+    return {};
+  }
+}
+
+clients.forEach((instance) => {
+  instance.interceptors.request.use((config) => {
+    if (attributionResolver) {
+      const authorization = config.headers.get("Authorization");
+      const attribution = getPostHogAttributionHeaders(
+        typeof authorization === "string" ? authorization : "",
+      );
+      config.headers.delete(POSTHOG_ATTRIBUTION_HEADER);
+      if (attribution[POSTHOG_ATTRIBUTION_HEADER]) {
+        config.headers.set(
+          POSTHOG_ATTRIBUTION_HEADER,
+          attribution[POSTHOG_ATTRIBUTION_HEADER],
+        );
+      }
+    }
+    return config;
+  });
+});
+
 type UISessionResponse = {
   token: string;
   expires_at: number;
@@ -237,6 +280,17 @@ function getResponseDetail(data: unknown): string | undefined {
   return undefined;
 }
 
+function getResponseErrorCode(data: unknown): string | undefined {
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    if (detail && typeof detail === "object" && "error_code" in detail) {
+      const errorCode = (detail as { error_code?: unknown }).error_code;
+      return typeof errorCode === "string" ? errorCode : undefined;
+    }
+  }
+  return undefined;
+}
+
 clients.forEach((instance) => {
   instance.interceptors.response.use(
     (response) => {
@@ -249,9 +303,13 @@ clients.forEach((instance) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
+        const isOrganizationAdminDenial =
+          getResponseErrorCode(error.response?.data) ===
+          "organization_admin_required";
         const retryConfig = error.config as UISessionRetryConfig | undefined;
         if (
-          (statusCode === 401 || statusCode === 403) &&
+          (statusCode === 401 ||
+            (statusCode === 403 && !isOrganizationAdminDenial)) &&
           retryConfig &&
           !retryConfig.uiSessionRetry
         ) {
@@ -266,7 +324,7 @@ clients.forEach((instance) => {
         }
         const isAuthFailure =
           statusCode === 401 ||
-          statusCode === 403 ||
+          (statusCode === 403 && !isOrganizationAdminDenial) ||
           (statusCode === 404 && detail === "Organization not found");
 
         if (statusCode && isAuthFailure) {
@@ -296,14 +354,6 @@ function removeHeaderForAllClients(header: string) {
     delete instance.defaults.headers.common[header];
     delete (instance.defaults.headers as Record<string, unknown>)[header];
   });
-}
-
-export function setPostHogAttributionHeader(value: string | undefined) {
-  if (value) {
-    setHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER, value);
-  } else {
-    removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
-  }
 }
 
 export function setAuthorizationHeader(token: string) {

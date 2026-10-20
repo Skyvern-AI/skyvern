@@ -126,7 +126,12 @@ class CustomCredentialVaultService(CredentialVaultService):
 
         return CustomCredentialAPIClient(api_base_url=config.api_base_url, api_token=config.api_token)
 
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+    ) -> Credential:
         """
         Create a new credential in the custom vault and database.
 
@@ -161,6 +166,7 @@ class CustomCredentialVaultService(CredentialVaultService):
                     data=data,
                     item_id=item_id,
                     vault_type=CredentialVaultType.CUSTOM,
+                    created_by=created_by,
                 )
             except Exception:
                 # Attempt to clean up the external credential

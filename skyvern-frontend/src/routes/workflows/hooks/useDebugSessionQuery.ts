@@ -4,6 +4,7 @@ import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
+import { waitForBrowserSessionPrewarm } from "@/routes/tasks/create/useBrowserSessionPrewarm";
 
 const DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
 const DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS = 30 * 1000;
@@ -106,6 +107,7 @@ function useDebugSessionQuery({
   return useQuery<DebugSessionApiResponse>({
     queryKey: ["debugSession", workflowPermanentId],
     queryFn: async () => {
+      await waitForBrowserSessionPrewarm();
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client
         .get(`/debug-session/${workflowPermanentId}`)

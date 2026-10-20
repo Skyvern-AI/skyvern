@@ -1,6 +1,9 @@
 import { create } from "zustand";
 
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import {
+  captureRecordBrowser,
+  setRecordBrowserContext,
+} from "@/util/recordBrowserTelemetry";
 
 export type RecordingTransport = "cdp" | "vnc";
 
@@ -104,8 +107,11 @@ export type MessageInExfiltratedEvent =
 
 export type RecordingActionKind =
   | "click"
+  | "dialog"
+  | "drag_drop"
   | "hover"
   | "input_text"
+  | "press_key"
   | "url_change"
   | "wait";
 
@@ -278,14 +284,9 @@ interface RecordingStore {
   dismissedCredentialStepIds: Array<string>;
   /**
    * Nested count of in-progress live draft title edits. While > 0, capture is
-   * paused alongside manualCapturePaused.
+   * paused.
    */
   draftEditDepth: number;
-  /**
-   * Operator toggled pause — stops exfiltration and live interpretation until
-   * resumed.
-   */
-  manualCapturePaused: boolean;
   /**
    * Set when the user hits Done: exfiltration stops, and the commit fires once
    * the finalized interpretation snapshot arrives (or a timeout elapses).
@@ -295,6 +296,7 @@ interface RecordingStore {
    * True while the process_recording mutation is in flight.
    */
   isCommitting: boolean;
+  commitToken: symbol | null;
   applyInterpretationUpdate: (update: RecordingInterpretationUpdate) => void;
   /**
    * Append an optimistic placeholder. No-op unless actively recording and
@@ -307,14 +309,14 @@ interface RecordingStore {
   dismissCredentialPromptsForUrl: (url: string | null | undefined) => void;
   beginDraftEdit: () => void;
   endDraftEdit: () => void;
-  setManualCapturePaused: (paused: boolean) => void;
   isCapturePaused: () => boolean;
   requestFinish: () => void;
-  setIsCommitting: (isCommitting: boolean) => void;
+  setIsCommitting: (isCommitting: boolean) => symbol | null;
   /**
    * Draft steps to commit: snapshot minus user deletions, with user edits
-   * applied. Null when live interpretation never produced a revision (caller
-   * should fall back to raw event processing).
+   * applied. Null when live interpretation produced no draft steps (caller
+   * should fall back to raw event processing). An empty array is reserved for
+   * the intentional case where the user deleted every generated draft.
    */
   getFinalDraftSteps: () => Array<RecordingDraftStep> | null;
   /**
@@ -472,9 +474,9 @@ function emptyRecordingState() {
     stepPatches: {} as Record<string, RecordingDraftStepPatch>,
     dismissedCredentialStepIds: [] as Array<string>,
     draftEditDepth: 0,
-    manualCapturePaused: false,
     finishRequested: false,
     isCommitting: false,
+    commitToken: null,
   };
 }
 
@@ -498,9 +500,9 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   stepPatches: {},
   dismissedCredentialStepIds: [],
   draftEditDepth: 0,
-  manualCapturePaused: false,
   finishRequested: false,
   isCommitting: false,
+  commitToken: null,
 
   applyInterpretationUpdate: (update) => {
     const state = get();
@@ -636,19 +638,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set({ draftEditDepth: Math.max(0, get().draftEditDepth - 1) });
   },
 
-  setManualCapturePaused: (paused) => {
-    set({ manualCapturePaused: paused });
-    captureRecordBrowser(
-      paused
-        ? "record_browser.capture_paused"
-        : "record_browser.capture_resumed",
-    );
-  },
-
-  isCapturePaused: () => {
-    const state = get();
-    return state.manualCapturePaused || state.draftEditDepth > 0;
-  },
+  isCapturePaused: () => get().draftEditDepth > 0,
 
   requestFinish: () => {
     if (get().finishRequested) {
@@ -657,11 +647,15 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set({ finishRequested: true });
   },
 
-  setIsCommitting: (isCommitting) => set({ isCommitting }),
+  setIsCommitting: (isCommitting) => {
+    const commitToken = isCommitting ? Symbol("recording commit") : null;
+    set({ isCommitting, commitToken });
+    return commitToken;
+  },
 
   getFinalDraftSteps: () => {
     const state = get();
-    if (state.sessionRevision === 0) {
+    if (state.sessionRevision === 0 || state.draftSteps.length === 0) {
       return null;
     }
     return applyDraftStepOverlays(
@@ -735,6 +729,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         optimistic_step_count: state.optimisticSteps.length,
       });
     }
+    setRecordBrowserContext({});
     set({
       ...emptyRecordingState(),
       isCompressing: false,
@@ -754,17 +749,21 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       const state = get();
       if (!state.isRecording) {
         const recordingTransport = state.recordingTransport;
+        const recordingAttemptId = crypto.randomUUID();
         get().clear();
         set({
           isRecording: true,
           recordingStartedAtMs: Date.now(),
           recordingTransport,
           workflowPermanentId: meta?.workflowPermanentId ?? null,
-          recordingAttemptId: crypto.randomUUID(),
+          recordingAttemptId,
         });
-        captureRecordBrowser("record_browser.started", {
+        setRecordBrowserContext({
+          recording_attempt_id: recordingAttemptId,
           workflow_permanent_id: meta?.workflowPermanentId ?? undefined,
           browser_session_id: meta?.browserSessionId ?? undefined,
+        });
+        captureRecordBrowser("record_browser.started", {
           transport: recordingTransport,
         });
       }
@@ -775,6 +774,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       isRecording: false,
       finishRequested: false,
       isCommitting: false,
+      commitToken: null,
     });
   },
 

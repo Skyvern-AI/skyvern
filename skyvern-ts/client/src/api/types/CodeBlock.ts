@@ -17,4 +17,13 @@ export interface CodeBlock {
     parameters?: Skyvern.CodeBlockParametersItem[];
     prompt?: string;
     steps?: Skyvern.CodeBlockStep[];
+    /** JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing */
+    data_schema?: CodeBlock.DataSchema;
+}
+
+export namespace CodeBlock {
+    /**
+     * JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing
+     */
+    export type DataSchema = Record<string, unknown> | unknown[] | string;
 }

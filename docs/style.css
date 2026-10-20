@@ -78,6 +78,11 @@
     min-height: 380px;
 }
 
+.sk-hero-left,
+.sk-hero-right {
+    min-width: 0;
+}
+
 .sk-hero-left {
     padding: 48px 40px;
     display: flex;
@@ -189,6 +194,34 @@
     font-size: 11.5px !important;
     line-height: 1.6 !important;
     color: #ccc;
+}
+
+/* Hero sample: a real <pre> so it copies as valid Python and scrolls instead of clipping. */
+.sk-terminal-code {
+    margin: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    overflow-x: auto;
+    font-family: var(--sk-mono) !important;
+    font-size: 11.5px !important;
+    line-height: 1.6 !important;
+    color: #ccc !important;
+}
+
+.sk-terminal-code code {
+    font-family: inherit !important;
+    font-size: inherit !important;
+    background: transparent !important;
+    color: inherit !important;
+    padding: 0 !important;
+    border: none !important;
+}
+
+.sk-code-line {
+    display: block;
+    white-space: pre;
+    min-height: 1.6em;
 }
 
 .sk-t-teal {
@@ -592,19 +625,23 @@ article a:not([class]):hover {
     border-bottom-color: var(--sk-dark) !important;
 }
 
-[class*="callout"],
-[class*="Callout"],
-[class*="note"],
-[class*="Note"] {
+/* Only Note and Info get the brand blue; Warning, Tip, Check and Danger keep a background
+   that matches their own text color. */
+[data-callout-type="note"],
+[data-callout-type="info"] {
     border-left-color: var(--sk-blue) !important;
     border-radius: 0 var(--sk-radius) var(--sk-radius) 0 !important;
     background-color: var(--sk-navy-faint) !important;
 }
 
-[class*="warning"],
-[class*="Warning"] {
+[data-callout-type="warning"] {
     border-left-color: #e5a236 !important;
     background-color: #fef9ee !important;
+}
+
+.dark [data-callout-type="warning"],
+[data-theme="dark"] [data-callout-type="warning"] {
+    background-color: rgba(229, 162, 54, 0.1) !important;
 }
 
 [class*="Accordion"],
@@ -831,6 +868,7 @@ header[class*="header"] {
 .dark .sk-terminal,
 [data-theme="dark"] .sk-terminal {
     border-color: #333;
+    background: #1b2038;
 }
 
 .dark .sk-cell-link:hover,

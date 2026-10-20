@@ -8,6 +8,7 @@ This service is responsible for:
 
 import asyncio
 import os
+import re
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -23,6 +24,9 @@ from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 
 LOG = structlog.get_logger()
+
+# Files written outside a run keep the legacy per-day folders; everything else is <org>/<run>.
+_DAY_FOLDER = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Process names to look for when cleaning up stale processes
 STALE_PROCESS_NAMES = frozenset(
@@ -128,17 +132,18 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
     TEMP_PATH is intentionally excluded, with one exception: the run-scoped namespace
     (TEMP_PATH/runs/<org>/<run>) IS swept, because it is single-tenant and keyed by run
     identity — an aged run dir is a crash-path orphan. The rest of TEMP_PATH stays out:
-    mtime is not a safe liveness signal there — reused generated-script caches
-    (TEMP_PATH/<script_id>) are overwritten in place without bumping the dir mtime, and
+    mtime is not a safe liveness signal there — revision-scoped generated-script caches
+    (TEMP_PATH/<script_id>/<script_revision_id>) are written without bumping the parent dir mtime, and
     browser-session profile dirs are written only at open/close — both read as stale while
     actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and keyed per run, so an aged
     top-level entry there is genuinely finished.
 
     DOWNLOAD_PATH is swept only when the active storage backend uploads run downloads
     elsewhere (S3/Azure/GCS), leaving the local copy as scratch. On the local backend
-    LocalStorage.save_downloaded_files is a no-op and get_downloaded_files serves the files
-    in place via file:// URIs, so DOWNLOAD_PATH/<run_id> is the run's permanent artifact
-    record — sweeping it would silently delete user data — and it is left untouched.
+    LocalStorage.save_downloaded_files copies each file into the artifact path, but a file it
+    skips (an upload failure, an older-attempt file) is still served only from
+    DOWNLOAD_PATH/<run_id> via file:// URIs, so that directory stays the fallback record and
+    is left untouched.
 
     Returns:
         Number of entries removed.
@@ -150,10 +155,11 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
 
     cutoff = time.time() - max_age_hours * 3600
     removed_count = 0
-    # VIDEO_PATH and HAR_PATH are per-day dirs like LOG_PATH; multi-activity workers no longer wipe
-    # them at teardown (SKY-14139), so the sweep is their only reaper. An unset path is skipped —
-    # Path("") is the working directory.
-    bases = [base for base in (settings.LOG_PATH, settings.VIDEO_PATH, settings.HAR_PATH) if base]
+    # A run's recordings, HAR and console log go in <root>/<org>/<run> and its teardown deletes them;
+    # files written outside a run land in per-day folders. This reaps both when a crash left them
+    # behind. An unset path is skipped — Path("") is the working directory.
+    run_roots = [base for base in (settings.LOG_PATH, settings.VIDEO_PATH, settings.HAR_PATH) if base]
+    bases = list(run_roots)
     if not isinstance(StorageFactory.get_storage(), LocalStorage):
         bases.append(settings.DOWNLOAD_PATH)
     for base in bases:
@@ -167,6 +173,10 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
             continue
         for entry in entries:
             try:
+                # An <org> folder's own mtime says nothing about a run still writing inside it, so those
+                # are reaped run by run below.
+                if base in run_roots and entry.is_dir() and not _DAY_FOLDER.fullmatch(entry.name):
+                    continue
                 # Accepted TOCTOU: a late write between this mtime check and rmtree is tolerated;
                 # the age gate + hourly cadence mean a swept entry's run finished long ago.
                 if entry.lstat().st_mtime >= cutoff:
@@ -182,36 +192,38 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
             except Exception:
                 LOG.warning("Failed to sweep stale temp entry", entry=str(entry), exc_info=True)
 
-    removed_count += _sweep_run_scoped_temp(cutoff)
+    if settings.TEMP_PATH:
+        removed_count += _sweep_run_dirs(
+            Path(settings.TEMP_PATH) / RUN_TEMP_NAMESPACE, Path(settings.TEMP_PATH), cutoff
+        )
+    for root in run_roots:
+        removed_count += _sweep_run_dirs(Path(root), Path(root), cutoff)
 
     if removed_count:
         LOG.info("Swept stale temp artifacts", removed_count=removed_count, max_age_hours=max_age_hours)
     return removed_count
 
 
-def _sweep_run_scoped_temp(cutoff: float) -> int:
-    """Reap aged ``TEMP_PATH/runs/<org>/<run>`` dirs — the one swept part of TEMP_PATH.
+def _sweep_run_dirs(root: Path, within: Path, cutoff: float) -> int:
+    """Reap aged ``<root>/<org>/<run>`` dirs: a run's files that its teardown never deleted.
 
     Two guards beyond the generic loop's (#15381 review): ancestors are never followed through
-    symlinks and every candidate must RESOLVE inside the real TEMP_PATH, or a planted link would
-    let the sweep delete foreign directories; and staleness is judged on the whole subtree, not
-    the run root's mtime — writes into an existing staging child never refresh the root, and
-    download timeouts are unbounded, so an old root can still be mid-download.
+    symlinks and every candidate must RESOLVE inside ``within``, or a planted link would let the
+    sweep delete foreign directories; and staleness is judged on the whole subtree, not the run
+    root's mtime — writes into an existing staging child never refresh the root, and download
+    timeouts are unbounded, so an old root can still be mid-download.
     """
-    if not settings.TEMP_PATH:
-        return 0
-    temp_root = Path(settings.TEMP_PATH).resolve()
-    runs_root = Path(settings.TEMP_PATH) / RUN_TEMP_NAMESPACE
-    if runs_root.is_symlink() or not runs_root.is_dir():
+    within_resolved = within.resolve()
+    if root.is_symlink() or not root.is_dir():
         return 0
     removed = 0
     try:
-        org_dirs = list(runs_root.iterdir())
+        org_dirs = list(root.iterdir())
     except OSError:
-        LOG.warning("Failed to list run-scoped temp namespace for sweep", base=str(runs_root), exc_info=True)
+        LOG.warning("Failed to list run folders for sweep", base=str(root), exc_info=True)
         return 0
     for org_dir in org_dirs:
-        if org_dir.is_symlink() or not org_dir.is_dir():
+        if org_dir.is_symlink() or not org_dir.is_dir() or _DAY_FOLDER.fullmatch(org_dir.name):
             continue
         try:
             run_dirs = list(org_dir.iterdir())
@@ -224,8 +236,8 @@ def _sweep_run_scoped_temp(cutoff: float) -> int:
                         run_dir.unlink(missing_ok=True)
                         removed += 1
                     continue
-                if not run_dir.resolve().is_relative_to(temp_root):
-                    LOG.warning("Run temp dir resolves outside TEMP_PATH; skipping", entry=str(run_dir))
+                if not run_dir.resolve().is_relative_to(within_resolved):
+                    LOG.warning("Run folder resolves outside its root; skipping", entry=str(run_dir))
                     continue
                 if not _subtree_is_stale(run_dir, cutoff):
                     continue
@@ -234,7 +246,13 @@ def _sweep_run_scoped_temp(cutoff: float) -> int:
             except FileNotFoundError:
                 continue
             except Exception:
-                LOG.warning("Failed to sweep run-scoped temp entry", entry=str(run_dir), exc_info=True)
+                LOG.warning("Failed to sweep run folder", entry=str(run_dir), exc_info=True)
+        # An org folder left empty by teardown goes once it is old too; rmdir refuses one a new run just entered.
+        try:
+            if org_dir.lstat().st_mtime < cutoff:
+                org_dir.rmdir()
+        except OSError:
+            pass
     return removed
 
 

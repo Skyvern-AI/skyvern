@@ -68,9 +68,14 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => true,
 }));
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => ({}) }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => ({}), setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.

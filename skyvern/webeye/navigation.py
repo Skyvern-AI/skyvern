@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Literal
@@ -14,8 +15,16 @@ from skyvern.constants import (
     PERMANENT_NAV_ERRORS,
     SKIP_INNER_NAV_RETRY_ERRORS,
 )
-from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
-from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
+from skyvern.exceptions import (
+    NO_ADDRESS_RECORD_NAV_ERROR_CODE,
+    BlockedHost,
+    BlockedNavigationDestination,
+    FailedToNavigateToUrl,
+    InvalidUrl,
+    UnresolvableNavigationHost,
+)
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.utils.url_validators import canonical_navigation_host, host_has_no_address_record, is_blocked_host
 
 LOG = structlog.get_logger()
 
@@ -114,6 +123,23 @@ _DEGRADATION_MAP: dict[str, list[str]] = {
 }
 
 
+# Where the driver writes its code: Playwright leads with it ("Page.goto: net::ERR_X at <url>") and the raw-CDP
+# engine ends with it ("navigation to <url> failed: net::ERR_X"). Anywhere else, such as a URL in the call log or
+# in an interrupted-navigation message, is text a page or an author chose.
+_PLAYWRIGHT_NAV_ERROR_CODE = re.compile(r"(?:[\w.]*: )?(net::ERR_[A-Z0-9_]+)")
+_SKYCDP_NAV_ERROR_CODE = re.compile(r"navigation to .* failed: (net::ERR_[A-Z0-9_]+)", re.DOTALL)
+
+
+def driver_nav_error_code(error_message: str) -> str | None:
+    """The ``net::ERR_*`` code the browser reported, read from the driver's own exception message.
+
+    Callers must pass the message of the exception the driver raised, never a value copied out of a run
+    or block row: those carry model- and page-authored text that can reproduce any code.
+    """
+    match = _PLAYWRIGHT_NAV_ERROR_CODE.match(error_message) or _SKYCDP_NAV_ERROR_CODE.fullmatch(error_message)
+    return match.group(1) if match else None
+
+
 def is_skip_inner_retry_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in SKIP_INNER_NAV_RETRY_ERRORS)
 
@@ -124,6 +150,87 @@ def is_permanent_navigation_error(error_message: str) -> bool:
 
 def is_egress_attributable_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in EGRESS_ATTRIBUTABLE_NAV_ERRORS)
+
+
+def is_egress_attributable_navigation_failure(error: BaseException) -> bool:
+    """Whether a navigation failure is attributable to our own egress rather than the target.
+
+    The error code alone does not settle it: a target with no DNS address record makes the run
+    proxy report a tunnel failure, and ``UnresolvableNavigationHost`` is that case already
+    distinguished. Prefer this over the message-only form wherever the exception is in hand.
+    """
+    if isinstance(error, UnresolvableNavigationHost):
+        return False
+    message = error.error_message if isinstance(error, FailedToNavigateToUrl) else str(error)
+    return is_egress_attributable_navigation_error(message)
+
+
+async def _unresolvable_navigation_host(url: str, error_message: str) -> str | None:
+    """The host of ``url`` when an egress-attributable failure was really a dead target.
+
+    A proxied browser delegates hostname resolution to the proxy, so a target whose address record
+    is gone comes back as the proxy failing to open a tunnel. Corroborating with our own resolver is
+    what separates "the pool cannot reach this host" from "this host no longer exists" -- the latter
+    must not redraw a proxy node, page our egress, or tell the customer our network is at fault.
+    """
+    if not is_egress_attributable_navigation_error(error_message):
+        return None
+    try:
+        host = canonical_navigation_host(url)
+    except InvalidUrl:
+        return None
+    if not host:
+        return None
+    return host if await asyncio.to_thread(host_has_no_address_record, host) else None
+
+
+async def reported_nav_error_code(error: BaseException, url: str | None) -> str | None:
+    """The driver's code for a navigation raised outside ``navigate_with_retry``.
+
+    A raw driver navigation never reaches the resolver corroboration above, so a target with no
+    address record arrives as the run proxy failing to open a tunnel. Corroborating it here answers
+    with the dead-host code, which keeps the target's verdict instead of our egress being blamed for
+    it -- and instead of the verdict being dropped, which would cost the run its terminal stop.
+    """
+    if isinstance(error, FailedToNavigateToUrl):
+        return error.nav_error_code
+    # A user-defined __str__ can raise or return a non-str, and this runs while a failure is being
+    # reported: losing the code is survivable, replacing the failure is not.
+    try:
+        message = str(error)
+        code = driver_nav_error_code(message)
+    except BaseException:
+        return None
+    if code is None or url is None:
+        return code
+    try:
+        dead_host = await _unresolvable_navigation_host(url, message)
+        return NO_ADDRESS_RECORD_NAV_ERROR_CODE if dead_host else code
+    # Exception, not BaseException: a resolver lookup that fails costs the corroboration, but a
+    # cancelled run has to stay cancelled rather than be reported as a navigation verdict.
+    except Exception:
+        return code
+
+
+async def record_task_nav_error_code(task_id: str, error: BaseException, url: str | None = None) -> None:
+    """Keep the driver's code for a failed navigation the task chose. Action paths catch the driver's error
+    themselves, so without this an egress fault reads as a defect in the run."""
+    context = skyvern_context.current()
+    if context is None:
+        return
+    # Dropped before the current attempt is read, not only on success: an attempt that reports no
+    # code of its own would otherwise be judged on the one before it.
+    context.task_nav_error_codes.pop(task_id, None)
+    code = await reported_nav_error_code(error, url)
+    if code:
+        context.task_nav_error_codes[task_id] = code
+
+
+def clear_task_nav_error_code(task_id: str) -> None:
+    """Drop a kept code once the task acts again: the earlier failure is no longer what it ends on."""
+    context = skyvern_context.current()
+    if context is not None:
+        context.task_nav_error_codes.pop(task_id, None)
 
 
 def redact_url_secrets(url: str) -> str:
@@ -210,14 +317,30 @@ async def navigate_with_retry(
             safe_error_str = error_str.replace(url, display_url) if log_url is not None else error_str
 
             if is_skip_inner_retry_error(error_str):
+                # The host is the one part of a secret URL that redaction keeps, so naming it is
+                # safe for a redacting caller too.
+                dead_host = await _unresolvable_navigation_host(url, error_str)
+                if dead_host is not None:
+                    LOG.warning(
+                        "Navigation target has no DNS address record, failing without a proxy retry",
+                        url=display_url,
+                        host=dead_host,
+                        error=safe_error_str,
+                    )
+                    raise UnresolvableNavigationHost(
+                        url=display_url, host=dead_host, error_message=safe_error_str
+                    ) from (None if redacting else error)
+
                 LOG.warning(
                     "Non-retriable navigation error, failing immediately",
                     url=display_url,
                     error=safe_error_str,
                 )
-                raise FailedToNavigateToUrl(url=display_url, error_message=safe_error_str) from (
-                    None if redacting else error
-                )
+                raise FailedToNavigateToUrl(
+                    url=display_url,
+                    error_message=safe_error_str,
+                    nav_error_code=driver_nav_error_code(error_str),
+                ) from (None if redacting else error)
 
             if attempt >= retry_times - 1:
                 # Terminal navigation failure is re-raised as FailedToNavigateToUrl and surfaced
@@ -230,9 +353,11 @@ async def navigate_with_retry(
                     error=safe_error_str,
                     exc_info=not redacting,
                 )
-                raise FailedToNavigateToUrl(url=display_url, error_message=safe_error_str) from (
-                    None if redacting else error
-                )
+                raise FailedToNavigateToUrl(
+                    url=display_url,
+                    error_message=safe_error_str,
+                    nav_error_code=driver_nav_error_code(error_str),
+                ) from (None if redacting else error)
 
             LOG.warning(
                 "Error while navigating to url, retrying",

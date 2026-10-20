@@ -457,6 +457,53 @@ describe("UI session refresh", () => {
     );
   });
 
+  it("does not retry or report organization admin denials as auth failures", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    window.sessionStorage.setItem(API_KEY_STORAGE_KEY, "member-session-canary");
+    window.sessionStorage.setItem(
+      API_KEY_EXPIRES_AT_STORAGE_KEY,
+      String(now + 120),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { getClient, initializeUiSession } = await import("./AxiosClient");
+    const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+    useAuthIssueStore.getState().clearAuthIssue();
+    await initializeUiSession();
+    const client = await getClient(null);
+    const adapter = vi.fn<AxiosAdapter>(async (config) => {
+      const response: AxiosResponse = {
+        data: {
+          detail: {
+            error_code: "organization_admin_required",
+            message: "Organization admin access is required.",
+          },
+        },
+        status: 403,
+        statusText: "Forbidden",
+        headers: {},
+        config,
+      };
+      throw new AxiosError(
+        "Request failed",
+        AxiosError.ERR_BAD_REQUEST,
+        config,
+        undefined,
+        response,
+      );
+    });
+    client.defaults.adapter = adapter;
+
+    await expect(client.get("/customer")).rejects.toMatchObject({
+      response: { status: 403 },
+    });
+
+    expect(adapter).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(useAuthIssueStore.getState().issue).toBeNull();
+  });
+
   it("holds the first request until the session token is minted", async () => {
     const token = "boot-race-session-canary";
     let releaseMint: (response: Response) => void = () => {};

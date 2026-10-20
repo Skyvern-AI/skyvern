@@ -57,6 +57,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
+            enforce_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),
@@ -71,7 +72,12 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         aws_client=SimpleNamespace(),
     )
 
-    parameter = SimpleNamespace(key="credential_param")
+    parameter = CredentialParameter.model_construct(
+        key="credential_param",
+        credential_parameter_id="cp-1",
+        workflow_id="wf-1",
+        credential_id="cred-1",
+    )
     organization = SimpleNamespace(organization_id="org-1")
 
     await context._register_credential_parameter_value("cred-1", parameter, organization)
@@ -117,6 +123,7 @@ async def _register_with_credential(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
+            enforce_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),

@@ -13,3 +13,5 @@ class BrowserSessionCloseReason(StrEnum):
     orphaned = "orphaned"
     shutdown = "shutdown"
     aborted = "aborted"
+    browser_exited = "browser_exited"
+    run_ended = "run_ended"

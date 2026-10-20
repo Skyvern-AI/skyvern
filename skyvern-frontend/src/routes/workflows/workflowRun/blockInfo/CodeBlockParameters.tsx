@@ -127,7 +127,7 @@ function CodeBlockParameters({
                   {step.action_type}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-tertiary-foreground">
-                  {step.title ?? step.description}
+                  {step.description}
                 </span>
                 {step.line_start != null ? (
                   <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">

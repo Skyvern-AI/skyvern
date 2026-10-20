@@ -98,7 +98,7 @@ async def test_export_enabled_defaults_to_this_blocks_own_extraction(
         lambda _run_id: download_directory,
     )
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
-    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app.STORAGE, "get_current_attempt_downloaded_files", AsyncMock(return_value=[]))
 
     block = _block(export_enabled=True, export_data_schema=_RECORD_SCHEMA, export_file_name="records")
     result = await block.execute("run-id", "block-id", organization_id="org-id")
@@ -162,7 +162,7 @@ async def test_export_enabled_with_null_extraction_exports_zero_rows(
         lambda _run_id: download_directory,
     )
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
-    monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app.STORAGE, "get_current_attempt_downloaded_files", AsyncMock(return_value=[]))
 
     block = _block(export_enabled=True, export_data_schema=_RECORD_SCHEMA)
     result = await block.execute("run-id", "block-id", organization_id="org-id")

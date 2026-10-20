@@ -11,6 +11,18 @@ static JSON/XML fetches, or generic web search.
 **If a browser session is already open, keep using it. Otherwise start with:** skyvern_browser_session_create -> skyvern_navigate(url="...") -> [work] -> skyvern_browser_session_close()
 **Passwords:** NEVER type passwords via skyvern_type or skyvern_act. ALWAYS use skyvern_login with stored credentials.
 
+## Chrome Extension Permissions
+
+Direct JavaScript evaluation and evaluation composites are unavailable in extension mode.
+Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page.
+Use skyvern_click, skyvern_type, skyvern_select_option, or skyvern_press_key to interact.
+Do not enable User Scripts or reroute the expression through CDP, another injection API, or a script shim.
+A debugger disconnect is a separate connection problem.
+For a non-password text input in the selected main frame, skyvern_type with a unique CSS selector \
+and input_method="value" uses a fixed bundled extension command without focusing the input. It accepts \
+only plain text, requires clear=true, and cannot combine with intent, coordinates, delay, or Enter. \
+Keep keyboard mode for controls that need real key events.
+
 ## Task Classification — classify before choosing a tool
 
 | Classification | Signal | Tool | Cost | What Happens |
@@ -123,10 +135,11 @@ GOOD (4 blocks, clear single responsibility):
 BAD: One giant block trying to do everything at once.
 
 ### Engine Selection
-- Known path (all fields/actions specified in prompt) -> skyvern-1.0 (default, omit engine field)
+- Known path (all fields/actions specified in prompt) -> omit the engine field (the default engine)
 - Dynamic planning (discover what to do at runtime) -> skyvern-2.0
+- User asks for 1.0 (or 2.0) -> set `engine: skyvern-1.0` (or `engine: skyvern-2.0`) explicitly
 - skyvern_run_task always uses 2.0 (cannot change)
-- When in doubt, split into multiple 1.0 blocks (cheaper, more observable)
+- When in doubt, split into multiple default-engine blocks (cheaper, more observable)
 
 ### Caching
 When omitted, MCP-created workflows default to run_with="agent" and code_version=2 for both JSON \

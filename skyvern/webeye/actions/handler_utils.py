@@ -12,6 +12,7 @@ from skyvern.forge.sdk.api.files import resolve_run_download_id, validate_local_
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions.actions import Action, KeypressAction
+from skyvern.webeye.actions.key_names import ENTER_KEY_ALIASES, normalize_key_name
 
 LOG = structlog.get_logger()
 
@@ -188,9 +189,6 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
     )
 
 
-ENTER_KEY_ALIASES = ("enter", "return")
-
-
 def keys_include_enter(keys: list[str]) -> bool:
     # "enter" and "return" both execute as the Enter key (see keypress() below).
     return any(key.lower() in ENTER_KEY_ALIASES for key in keys)
@@ -206,48 +204,7 @@ def should_stop_batch_after_dropdown_select(next_action: Action | None) -> bool:
 
 
 async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0, repeat: int = 1) -> None:
-    updated_keys = []
-    for key in keys:
-        key_lower_case = key.lower()
-        if key_lower_case in ENTER_KEY_ALIASES:
-            updated_keys.append("Enter")
-        elif key_lower_case == "space":
-            updated_keys.append(" ")
-        elif key_lower_case == "ctrl":
-            updated_keys.append("Control")
-        elif key_lower_case == "backspace":
-            updated_keys.append("Backspace")
-        elif key_lower_case == "pagedown":
-            updated_keys.append("PageDown")
-        elif key_lower_case == "pageup":
-            updated_keys.append("PageUp")
-        elif key_lower_case == "tab":
-            updated_keys.append("Tab")
-        elif key_lower_case == "shift":
-            updated_keys.append("Shift")
-        elif key_lower_case in ("arrowleft", "left"):
-            updated_keys.append("ArrowLeft")
-        elif key_lower_case in ("arrowright", "right"):
-            updated_keys.append("ArrowRight")
-        elif key_lower_case in ("arrowup", "up"):
-            updated_keys.append("ArrowUp")
-        elif key_lower_case in ("arrowdown", "down"):
-            updated_keys.append("ArrowDown")
-        elif key_lower_case == "home":
-            updated_keys.append("Home")
-        elif key_lower_case == "end":
-            updated_keys.append("End")
-        elif key_lower_case == "delete":
-            updated_keys.append("Delete")
-        elif key_lower_case == "esc":
-            updated_keys.append("Escape")
-        elif key_lower_case == "alt":
-            updated_keys.append("Alt")
-        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
-            # Handle function keys: f1 -> F1, f5 -> F5, etc.
-            updated_keys.append(key_lower_case.upper())
-        else:
-            updated_keys.append(key)
+    updated_keys = [normalize_key_name(key) for key in keys]
     keypress_str = "+".join(updated_keys)
     n = max(1, repeat)
     if hold:

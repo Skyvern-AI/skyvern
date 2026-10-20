@@ -15,6 +15,10 @@ vi.mock("@/api/AxiosClient", () => ({
   getClient: () => Promise.resolve({ get: mockGet }),
 }));
 
+vi.mock("@/hooks/useWorkflowTaggingEnabled", () => ({
+  useWorkflowTaggingEnabled: () => true,
+}));
+
 import { useTagValuesListQuery, useTagValuesQuery } from "./useTagValuesQuery";
 
 function wrapper({ children }: { children: ReactNode }) {

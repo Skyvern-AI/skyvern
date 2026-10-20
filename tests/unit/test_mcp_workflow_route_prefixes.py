@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -103,34 +102,6 @@ async def test_retry_workflow_run_bad_request_uses_detail(monkeypatch: pytest.Mo
 
     assert result["ok"] is False
     assert result["error"]["message"] == "Workflow run wr_x is not terminal"
-
-
-@pytest.mark.asyncio
-async def test_workflow_run_list_fetches_extra_row_for_has_more(monkeypatch: pytest.MonkeyPatch) -> None:
-    list_mock = AsyncMock(
-        return_value=[
-            SimpleNamespace(workflow_run_id="wr_1", status="completed"),
-            SimpleNamespace(workflow_run_id="wr_2", status="completed"),
-            SimpleNamespace(workflow_run_id="wr_3", status="completed"),
-        ]
-    )
-    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", list_mock)
-
-    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", page=1, page_size=2)
-
-    assert result["ok"] is True
-    list_mock.assert_awaited_once_with(
-        "wpid_x",
-        page=1,
-        page_size=3,
-        status=None,
-        search_key=None,
-        error_code=None,
-        include_child_runs=False,
-    )
-    assert result["data"]["count"] == 2
-    assert result["data"]["has_more"] is True
-    assert [run["run_id"] for run in result["data"]["runs"]] == ["wr_1", "wr_2"]
 
 
 @pytest.mark.asyncio

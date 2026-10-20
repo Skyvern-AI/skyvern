@@ -4,7 +4,9 @@ Utility functions for PDF parsing with fallback support.
 This module provides robust PDF parsing that tries pypdf first and falls back
 to pdfplumber if pypdf fails, ensuring maximum compatibility with various PDF formats.
 For image-based/scanned PDFs where text extraction yields no content, pages can be
-rendered as images via render_pdf_pages_as_images for vision-LLM OCR.
+rendered as images via render_pdf_pages_as_images for vision-LLM OCR. A text layer that
+is non-empty but glyph-scrambled needs the same OCR fallback; scrambled_text_layer_reason
+identifies it.
 """
 
 import io
@@ -19,6 +21,79 @@ from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
 
 LOG = structlog.get_logger(__name__)
+
+# A font whose ToUnicode map is wrong substitutes its glyphs out of an unrelated Unicode
+# block. Latin Extended-A/B and the private-use area are where those substitutions land;
+# a Latin-script document's own characters only appear there as in-word diacritics.
+_REMAPPED_GLYPH_RANGES: tuple[tuple[int, int], ...] = ((0x0100, 0x024F), (0xE000, 0xF8FF), (0xFFFD, 0xFFFD))
+# Below these floors the shares computed from the text layer are too noisy to act on.
+_MIN_TEXT_LAYER_CHARS = 40
+_MIN_TEXT_LAYER_WORDS = 10
+_MIN_REMAPPED_GLYPHS = 8
+_MIN_ISOLATED_WORDS = 3
+# A remapped number is a run of glyphs; a checkbox or bullet drawn from an icon font is a
+# single glyph standing alone. Only runs count, so an ordinary form keeps its text layer.
+_MIN_ISOLATED_WORD_LENGTH = 2
+# Diacritics sit inside words next to ASCII letters, so a legitimately accented language
+# keeps this share low (measured ~0.3 for Vietnamese, 0.0 for Polish/Czech/Turkish) while a
+# scrambled digit run is a whole word of nothing else (~0.9).
+_MIN_ISOLATED_GLYPH_SHARE = 0.6
+# Non-Latin scripts are read as-is: their characters fall outside the ranges above, so the
+# shares would be measuring the wrong thing.
+_MIN_ASCII_LETTER_SHARE = 0.5
+
+
+def _is_remapped_glyph(char: str) -> bool:
+    code_point = ord(char)
+    return any(start <= code_point <= end for start, end in _REMAPPED_GLYPH_RANGES)
+
+
+def _is_isolated_word(word: str) -> bool:
+    return (
+        len(word) >= _MIN_ISOLATED_WORD_LENGTH
+        and any(_is_remapped_glyph(char) for char in word)
+        and not any(char.isascii() and char.isalnum() for char in word)
+    )
+
+
+def scrambled_text_layer_reason(text: str) -> str | None:
+    """Return why a PDF text layer looks glyph-scrambled, or None if it can be trusted.
+
+    A subset font with a broken ToUnicode map keeps the document's layout and its ASCII
+    words but replaces whole runs — typically every digit — with characters from an
+    unrelated Unicode block, so the extracted text is plausible-looking and wrong.
+    """
+    words = text.split()
+    if len(words) < _MIN_TEXT_LAYER_WORDS:
+        return None
+    if sum(1 for char in text if not char.isspace()) < _MIN_TEXT_LAYER_CHARS:
+        return None
+
+    # Remapped glyphs are Latin letters to str.isalpha, so counting them here would let the
+    # corruption vote on which script the document is written in — and a page of scrambled
+    # numbers would read as non-Latin and escape every check below.
+    letters = [char for char in text if char.isalpha() and not _is_remapped_glyph(char)]
+    if letters and sum(1 for char in letters if char.isascii()) / len(letters) < _MIN_ASCII_LETTER_SHARE:
+        return None
+
+    remapped_glyphs = sum(1 for char in text if _is_remapped_glyph(char))
+    if remapped_glyphs < _MIN_REMAPPED_GLYPHS:
+        return None
+
+    isolated_words = [word for word in words if _is_isolated_word(word)]
+    if len(isolated_words) < _MIN_ISOLATED_WORDS:
+        return None
+
+    isolated_glyphs = sum(1 for word in isolated_words for char in word if _is_remapped_glyph(char))
+    isolated_share = isolated_glyphs / remapped_glyphs
+    if isolated_share < _MIN_ISOLATED_GLYPH_SHARE:
+        return None
+
+    return (
+        f"{len(isolated_words)} of {len(words)} words in the PDF text layer are built only from characters "
+        f"outside the document's script ({isolated_share:.0%} of the {remapped_glyphs} such characters found), "
+        "which means the embedded font maps its glyphs to the wrong code points"
+    )
 
 
 def extract_pdf_file(

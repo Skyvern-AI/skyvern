@@ -99,6 +99,26 @@ const rowDefinitions: Record<TrackKey, RowDefinition> = {
     links: [{ label: "Get an API key", to: "/settings#api-keys" }],
     howItWorks: DOCS_API_QUICKSTART_URL,
   },
+  agent_edited: {
+    title: "Edit an agent in the editor",
+    why: "Change a step and save it to make the agent yours",
+    links: [{ label: "Open your agents", to: "/agents" }],
+  },
+  questionnaire_completed: {
+    title: "Answer the welcome questions",
+    why: "Tell us what you want to automate",
+    links: [{ label: "Answer them", to: "/welcome" }],
+  },
+  first_successful_run: {
+    title: "Run your first agent",
+    why: "Describe a task and let an agent do it",
+    links: [{ label: "Start on Home", to: "/discover?focus=prompt" }],
+  },
+  run_feedback_given: {
+    title: "Rate a run",
+    why: "A thumbs up or down helps agents get better",
+    links: [{ label: "Open runs", to: "/runs" }],
+  },
   mcp_installed: {
     title: "Use Skyvern from Claude, Cursor, or ChatGPT",
     why: "Install the MCP server and run agents from your AI tools",
@@ -107,7 +127,7 @@ const rowDefinitions: Record<TrackKey, RowDefinition> = {
   teammate_invited: {
     title: "Bring a teammate",
     why: "Share agents and runs with your team",
-    links: [{ label: "Open settings", to: "/settings" }],
+    links: [{ label: "Open settings", to: "/settings#members" }],
   },
   credential_saved: {
     title: "Let your agent log in for you",
@@ -139,6 +159,8 @@ const productionOrder: readonly TrackKey[] = [
   "first_scheduled_run",
   "first_api_run",
   "mcp_installed",
+  "agent_edited",
+  "run_feedback_given",
   "credential_saved",
 ];
 const intentFirstRow: Record<string, TrackKey> = {
@@ -435,6 +457,11 @@ function TrackRow({
                   : "Upcoming step: "}
           </span>
           {definition.title}
+          {item.reward_credits && !isDone && !isLocked ? (
+            <span className="ml-2 whitespace-nowrap rounded-full bg-badge-success px-2 py-0.5 align-middle text-[11px] font-medium tabular-nums text-foreground">
+              +{item.reward_credits.toLocaleString()} credits
+            </span>
+          ) : null}
         </p>
         <p
           className={

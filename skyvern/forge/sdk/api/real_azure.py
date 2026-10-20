@@ -103,6 +103,10 @@ class RealAsyncAzureVaultClient(AsyncAzureVaultClient):
         try:
             secret = await secret_client.delete_secret(secret_name)
             return secret.name
+        except ResourceNotFoundError:
+            # An absent secret is already in the state a delete asks for, and a retry could never succeed.
+            LOG.info("Azure Key Vault secret already absent; nothing to delete", secret_name=secret_name)
+            return secret_name
         except Exception as e:
             LOG.exception("Failed to delete secret from Azure Key Vault.", secret_name=secret_name, error=e)
             raise e

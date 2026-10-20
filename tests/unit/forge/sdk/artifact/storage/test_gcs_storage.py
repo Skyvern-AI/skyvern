@@ -1,11 +1,16 @@
-from datetime import datetime
+import hashlib
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import skyvern.forge.sdk.api.real_gcp as real_gcp_module
+import skyvern.forge.sdk.artifact.storage.base as base_module
+import skyvern.forge.sdk.artifact.storage.gcs as gcs_module
 from skyvern.config import settings
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.gcp import STORAGE_CLASS_STANDARD
@@ -14,6 +19,9 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import SENSITIVE_SHARE_URL_EXPIRY_HOURS
 from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
 
 TEST_BUCKET = "test-gcs-bucket"
 TEST_ORGANIZATION_ID = "test-org-123"
@@ -56,12 +64,13 @@ def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Non
     Mirrors the azure/s3 storage test fixtures — the forge app isn't initialized
     in these storage-only tests, so patch the module-level ``app`` reference.
     """
-    import skyvern.forge.sdk.artifact.storage.gcs as gcs_module
 
     fake_app = MagicMock()
     fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
     fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
     fake_app.ARTIFACT_MANAGER.create_download_artifact = AsyncMock(return_value="a_test")
+    fake_app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
+    fake_app.DATABASE.workflow_run_attempts = FakeWorkflowRunAttemptsRepository()
     monkeypatch.setattr(gcs_module, "app", fake_app)
 
 
@@ -279,6 +288,69 @@ class TestGcsStorageBuildUri:
         assert uri == expected
 
 
+@pytest.mark.asyncio
+async def test_get_downloaded_files_legacy_listing_attributes_and_scopes_attempt_files(
+    gcs_storage: GcsStorageForTests, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "wr_retry"
+    attempt_one_modified_at = datetime(2026, 9, 7, 11, 0, tzinfo=UTC)
+    attempt_two_started_at = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+    blob_modified_at = datetime(2026, 9, 7, 12, 1, tzinfo=UTC)
+    old_key = f"downloads/local/{settings.ENV}/{TEST_ORGANIZATION_ID}/{run_id}/old.pdf"
+    current_key = f"downloads/local/{settings.ENV}/{TEST_ORGANIZATION_ID}/{run_id}/current.pdf"
+    old_uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{old_key}"
+    old_artifact = Artifact(
+        artifact_id="a_old",
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri=old_uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        run_id=run_id,
+        workflow_run_id=run_id,
+        created_at=attempt_one_modified_at,
+        modified_at=attempt_one_modified_at,
+    )
+
+    async def get_object_info(uri: str) -> dict[str, Any]:
+        return {
+            "Metadata": {"sha256_checksum": f"sha-{uri.rsplit('/', 1)[-1]}"},
+            "ContentLength": 10,
+            "LastModified": blob_modified_at,
+        }
+
+    gcs_storage.async_client.list_files = AsyncMock(return_value=[old_key, current_key])
+    gcs_storage.async_client.get_object_info = AsyncMock(side_effect=get_object_info)
+    gcs_storage.async_client.create_signed_urls = AsyncMock(
+        side_effect=lambda uris: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
+    )
+    rows = AsyncMock(return_value=[old_artifact])
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.storage.gcs.app.DATABASE.artifacts.list_artifacts_for_run_by_type", rows
+    )
+
+    with patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None):
+        files = await gcs_storage.get_downloaded_files(TEST_ORGANIZATION_ID, run_id)
+
+    assert len(files) == 2
+    old_file, current_file = files
+    assert old_file.artifact_id == "a_old"
+    assert old_file.modified_at == attempt_one_modified_at
+    assert current_file.artifact_id is None
+    assert current_file.modified_at == blob_modified_at
+    rows.assert_awaited_once_with(
+        run_id=run_id,
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_type=ArtifactType.DOWNLOAD,
+    )
+
+    scoped = WorkflowService()._filter_downloaded_files_to_attempt(
+        files,
+        attempt_rows=[SimpleNamespace(attempt_number=2, started_at=attempt_two_started_at)],
+        attempt_number=2,
+        artifact_ids=set(),
+    )
+    assert [file_info.filename for file_info in scoped] == ["current.pdf"]
+
+
 GCS_CONTENT_TYPE_TEST_CASES = [
     ("video.webm", "video/webm"),
     ("data.json", "application/json"),
@@ -417,8 +489,89 @@ async def test_save_downloaded_files_partial_upload_failure_raises_after_saving_
 
     monkeypatch.setattr(gcs_storage.async_client, "upload_file_from_path", _upload)
 
+    monkeypatch.setattr(base_module.app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=None))
+
     with pytest.raises(DownloadSaveIncompleteError) as raised:
         await gcs_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
     assert raised.value.skipped_files == ["a.pdf"]
     assert [uri.rsplit("/", 1)[-1] for uri in uploaded] == ["b.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_save_downloaded_files_retry_skips_stale_files_and_versions_fresh_redownloads(
+    gcs_storage: GcsStorageForTests, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "wr_retry"
+    run_dir = tmp_path / "downloads" / run_id
+    run_dir.mkdir(parents=True)
+    stale_file = run_dir / "only-attempt-1.pdf"
+    fresh_file = run_dir / "report.pdf"
+    stale_file.write_bytes(b"same bytes")
+    fresh_file.write_bytes(b"same bytes")
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+    attempt_started_at = datetime.now(UTC) - timedelta(seconds=1)
+    os.utime(stale_file, (attempt_started_at.timestamp() - 60, attempt_started_at.timestamp() - 60))
+    os.utime(fresh_file, (attempt_started_at.timestamp() + 1, attempt_started_at.timestamp() + 1))
+    checksum = hashlib.sha256(b"same bytes").hexdigest()
+    base_uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/downloads/{settings.ENV}/{TEST_ORGANIZATION_ID}/{run_id}"
+    rows = [
+        make_artifact(
+            f"{base_uri}/{stale_file.name}", artifact_id="a_stale", artifact_type=ArtifactType.DOWNLOAD
+        ).model_copy(update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}),
+        make_artifact(
+            f"{base_uri}/{fresh_file.name}", artifact_id="a_fresh", artifact_type=ArtifactType.DOWNLOAD
+        ).model_copy(update={"checksum": checksum, "modified_at": attempt_started_at - timedelta(seconds=60)}),
+    ]
+
+    async def _list_rows(**kwargs: object) -> list[Artifact]:
+        return rows
+
+    async def _save_row(*, uri: str, **kwargs: object) -> str:
+        for row_index, row in enumerate(rows):
+            if row.uri == uri:
+                rows[row_index] = row.model_copy(update={"modified_at": datetime.now(UTC)})
+                return row.artifact_id
+        rows.append(
+            make_artifact(uri, artifact_id="a_retry", artifact_type=ArtifactType.DOWNLOAD).model_copy(
+                update={"modified_at": datetime.now(UTC)}
+            )
+        )
+        return rows[-1].artifact_id
+
+    attempts_repository = FakeWorkflowRunAttemptsRepository(
+        [SimpleNamespace(attempt_number=2, started_at=attempt_started_at)]
+    )
+    monkeypatch.setattr(gcs_storage.async_client, "upload_file_from_path", AsyncMock())
+    monkeypatch.setattr(gcs_storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    monkeypatch.setattr(gcs_storage, "_get_tags_for_org", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        gcs_module,
+        "app",
+        fake_app := SimpleNamespace(
+            ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_save_row)),
+            WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+            DATABASE=SimpleNamespace(
+                artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
+                workflow_run_attempts=attempts_repository,
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            ),
+        ),
+    )
+    monkeypatch.setattr(base_module, "app", fake_app)
+
+    await gcs_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id=run_id)
+
+    assert attempts_repository.requested_workflow_run_ids == [run_id]
+    assert gcs_storage.async_client.upload_file_from_path.await_args.kwargs["uri"] == (
+        f"{base_uri}/attempts/2/{fresh_file.name}"
+    )
+    assert len(rows) == 3
+    assert all(row.modified_at < attempt_started_at for row in rows[:2])
+    registered = [
+        call.kwargs["filename"] for call in gcs_module.app.ARTIFACT_MANAGER.create_download_artifact.await_args_list
+    ]
+    assert registered == [fresh_file.name]
+    attempt_two_listing = [row.uri.rsplit("/", 1)[-1] for row in rows if row.modified_at >= attempt_started_at]
+    assert attempt_two_listing == [fresh_file.name]

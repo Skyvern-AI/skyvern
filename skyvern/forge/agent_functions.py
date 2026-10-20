@@ -5,13 +5,12 @@ import copy
 import hashlib
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
-import aiohttp
 import httpx
 import structlog
 from cachetools import TTLCache
@@ -38,11 +37,15 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
+from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
+from skyvern.forge.sdk.copilot.browser_code_contract import (
+    BrowserCodeSession,
+    BrowserCodeSessionUnavailableError,
+)
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
-    block_authoring_policy_for_request,
-    block_authoring_policy_from_code_only_mode,
+    authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -58,6 +61,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
+from skyvern.forge.sdk.schemas.feedback import FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
@@ -69,33 +73,47 @@ from skyvern.forge.sdk.services import (
     sftp_service,
 )
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
+from skyvern.forge.sdk.services.request_principal import (
+    BearerIdentityResolution,
+    BearerIdentityStatus,
+    RequestPrincipal,
+    get_request_principal,
+)
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
-from skyvern.forge.sdk.workflow.web_search import WebSearchProvider
+from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-    from skyvern.forge.sdk.workflow.code_block_authorized_files import AuthorizedFileMaterialization
+    from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+        AuthorizedFileMaterialization,
+        BlockDownloadLog,
+    )
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import DownloadEvidenceProbe
-    from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import DocumentFailureReceipt, RecordingPage
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+    from skyvern.forge.taskv3.answer_basis_audit import AnswerBasisAudit
     from skyvern.forge.taskv3.loop import ToolSpec
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
@@ -104,9 +122,40 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """Resource identifiers and field names for an audited write; never secrets or request bodies."""
+
+    organization_id: str
+    action: str
+    resource_type: str
+    resource_id: str | None
+    changed_fields: tuple[str, ...] = ()
+    related_resource_ids: tuple[str, ...] = ()
+    auth_kind: str | None = None
+    oauth_client_id: str | None = None
+
+
+async def record_request_audit_event(
+    organization_id: str,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    *,
+    changed_fields: tuple[str, ...] = (),
+    related_resource_ids: tuple[str, ...] = (),
+) -> None:
+    await app.AGENT_FUNCTION.record_audit_event(
+        get_request_principal(),
+        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+    )
+
+
 EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS = 30
 EMAIL_OTP_MAX_RESULTS = 5
 EMAIL_OTP_SEARCH_INTERVAL_SECONDS = 30
+STANDALONE_BROWSER_SESSION_FEATURE_NAME = "standalone_browser_sessions"
 
 _LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 
@@ -177,25 +226,13 @@ class TOTPVerificationResponse:
     """Normalized response shape for the TOTP verification seam.
 
     Decouples the seam contract from any specific HTTP client so the OSS
-    direct path (aiohttp) and the cloud proxy path (NATEgressProxyClient)
+    direct path (pinned httpx) and the cloud proxy path (NATEgressProxyClient)
     can both produce a response the helper consumes the same way.
     """
 
     status_code: int
     body: str
     headers: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class CopilotSiteOriginAssociation:
-    requested_name: str
-    entity_id: str
-    entity_label: str
-    official_site_url: str
-    origin: str
-    source: str
-    provider_relation_type: str
-    provider_relation_text: str
 
 
 @dataclass(frozen=True)
@@ -218,10 +255,20 @@ class CopilotCandidateNetworkHop(TypedDict):
 
 
 @dataclass(frozen=True)
-class CopilotEntrypointCandidate:
-    url: str
-    source_rank: int
-    association: CopilotSiteOriginAssociation
+class CopilotOrganizationUsage:
+    """A null field is one the deployment or account does not record; ``credits_note`` says why
+    when nothing is recorded at all."""
+
+    plan_tier: str | None = None
+    current_period_start: str | None = None
+    current_period_end: str | None = None
+    included_credits: int | None = None
+    consumed_credits: int | None = None
+    remaining_credits: int | None = None
+    topup_credits_remaining: int | None = None
+    overage_enabled: bool | None = None
+    credits_note: str | None = None
+    billing_page_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,13 +296,38 @@ class CodeBlockEngineFailure:
     final_url: str | None = None
     page_title: str | None = None
     covering_element: str | None = None
+    # Read by the worker from the driver's own error, so a consumer can tell a real browser verdict
+    # from a sentence describing one.
+    nav_error_code: str | None = None
+    # The owned page the failing operation ran on; final_url stays the block's own page.
+    receiver_url: str | None = None
+    # Whether the page the failing operation ran on showed a sign-in form, read by the worker before it
+    # closes the runner's owned pages; None when the worker could not tie the failure to a page.
+    sign_in_form_visible: bool | None = None
+    # Unredacted; associated_navigation_output masks it where it is persisted.
+    document_failure: DocumentFailureReceipt | None = None
+    # Worker-measured non-strict match count of the failed locator and how the probe resolved
+    # ("counted"/"timeout"/"error"); internal operation-attribution evidence, never user-facing.
+    locator_match_count: int | None = None
+    locator_probe_status: str | None = None
+    # Bare native worker exception class for operation attribution, so secure events are comparable
+    # to inline ones; distinct from the healing-facing exception_class above.
+    native_exception_class: str | None = None
+
+
+DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
 
 
 @dataclass(frozen=True)
 class CodeBlockDownloadOperationReceipt:
-    """Structured proof that the secure runner invoked the brokered download operation."""
+    """Structured proof that the secure runner invoked the brokered download operation.
+
+    ``outcome`` records how the claim resolved so settlement can tell a proven delivery from the
+    branch-5 placeholder return without string-matching the filename. ``None`` means an old producer
+    that did not record it — settlement must leave the truthful-completion verdict unarmed."""
 
     operation: Literal["click_and_claim_download", "expect_download"] = "click_and_claim_download"
+    outcome: DownloadClaimOutcome | None = None
 
 
 @dataclass
@@ -904,7 +976,167 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+OnePasswordTelemetryEvent = Literal[
+    "onepassword.token_saved",
+    "onepassword.token_cleared",
+    "onepassword.items_loaded",
+]
+OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeout", "upstream", "internal"]
+
+
 class AgentFunction:
+    async def accessible_workflow_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
+        """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
+        return None
+
+    async def workflow_folders_restricted(self, organization_id: str) -> bool:
+        """Cloud reports folder restrictions; OSS has no workflow-folder ACLs."""
+        return False
+
+    async def accessible_workflow_reference_ids(
+        self, principal: RequestPrincipal | None, action: str, references: set[tuple[str, str]]
+    ) -> set[tuple[str, str]]:
+        """Return references visible to this principal; OSS has no workflow-folder ACLs."""
+        return references
+
+    async def accessible_credential_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
+        """Return visible credential-folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
+        return None
+
+    async def credential_folders_restricted(self, organization_id: str) -> bool:
+        """Cloud reports folder restrictions; OSS has no credential-folder ACLs."""
+        return False
+
+    async def credential_folder_admin_bypass(self, principal: RequestPrincipal | None) -> bool:
+        """Cloud reports the credential-folder Admin bypass; OSS has no credential-folder ACLs."""
+        return False
+
+    async def accessible_credential_ids(
+        self, principal: RequestPrincipal | None, action: str, credential_ids: set[str]
+    ) -> set[str]:
+        """Return credentials visible for an action; OSS has no credential-folder ACLs."""
+        return credential_ids
+
+    async def accessible_browser_session_ids(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_ids: set[str]
+    ) -> set[str]:
+        """Return sessions whose associated workflow credentials are usable; OSS has no credential-folder ACLs."""
+        return browser_session_ids
+
+    async def enforce_folder_access(
+        self, principal: RequestPrincipal | None, action: str, resource: Mapping[str, object]
+    ) -> None:
+        """Cloud raises 403 when a workflow folder denies the action; OSS has no folder ACLs."""
+        return None
+
+    async def enforce_folder_access_for_references(
+        self, principal: RequestPrincipal | None, action: str, payload: Mapping[str, object]
+    ) -> None:
+        """Cloud raises 403 when any resource named anywhere in the payload is in a folder that denies the action."""
+        return None
+
+    async def enforce_folder_access_for_ids(
+        self, principal: RequestPrincipal | None, action: str, references: set[tuple[str, str]]
+    ) -> None:
+        """Cloud raises 403 when a folder denies the action on any (resource key, id) pair; OSS allows."""
+        return None
+
+    async def enforce_folder_access_everywhere(self, principal: RequestPrincipal | None, action: str) -> None:
+        """Cloud raises 403 unless the action is allowed in every restricted folder; OSS allows."""
+        return None
+
+    async def enforce_folder_access_for_runs(
+        self, principal: RequestPrincipal | None, action: str, run_ids: Sequence[str]
+    ) -> None:
+        """Cloud raises 403 when a folder denies the action on any of the runs, checked in one pass; OSS allows."""
+        return None
+
+    async def enforce_credential_folder_access_for_ids(
+        self,
+        principal: RequestPrincipal | None,
+        action: str,
+        references: set[tuple[str, str]],
+        *,
+        session: AsyncSession | None = None,
+    ) -> None:
+        """Cloud raises 403 when a credential folder denies the action on any referenced credential or folder."""
+        return None
+
+    async def enforce_credential_use(
+        self,
+        organization_id: str,
+        credential_id: str,
+        *,
+        principal: RequestPrincipal | None = None,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
+
+    async def enforce_totp_identifier_credential_use(
+        self, organization_id: str, totp_identifier: str, *, workflow_run_id: str | None = None
+    ) -> None:
+        """Cloud checks credentials bound to a TOTP identifier; OSS has no credential-folder ACLs."""
+
+    async def enforce_browser_session_credential_use(
+        self, principal: RequestPrincipal | None, browser_session_id: str
+    ) -> None:
+        """Cloud checks the credential linked to a saved profile before session access; OSS has no folder ACLs."""
+
+    async def enforce_workflow_run_credential_use(
+        self,
+        principal: RequestPrincipal | None,
+        workflow_run_id: str,
+        *,
+        organization_id: str | None = None,
+        browser_profile_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> None:
+        """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
+
+    async def hidden_workflow_permanent_ids(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> frozenset[str] | None:
+        """Cloud returns the workflows in folders the caller cannot see; OSS hides nothing."""
+        return None
+
+    async def on_folder_created(
+        self, session: AsyncSession, folder: FolderModel, principal: RequestPrincipal | None
+    ) -> None:
+        """Cloud uses this transaction hook to initialize folder ACLs; OSS has no ACL store."""
+        return None
+
+    async def record_audit_event(self, principal: RequestPrincipal | None, event: AuditEvent) -> None:
+        """OSS has no customer audit store; cloud overrides this best-effort hook."""
+        return None
+
+    async def authorize_request(
+        self,
+        principal: RequestPrincipal | None,
+        action: str,
+        resource: Mapping[str, object],
+    ) -> str | None:
+        return None
+
+    async def enforce_request_authorization(self, principal: RequestPrincipal | None, action: str) -> None:
+        return None
+
+    async def enforce_request_role(
+        self,
+        principal: RequestPrincipal,
+        action: str | None,
+        bearer_identity_status: BearerIdentityStatus | None,
+    ) -> None:
+        """Runs inside auth, before the handler; action is None when the route recorded none. Raising rejects."""
+        return None
+
+    async def should_redact_organization_credential_secrets(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+    ) -> bool:
+        # OSS has no cloud role policy; preserve its existing response behavior.
+        return False
+
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
     async def resolve_run_engine(
@@ -923,22 +1155,24 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
-    # OSS has no ATS-scoped guidance; cloud overrides to supply pre-authorized eligibility defaults
-    # behind a flag when the task targets a gated application-tracking-system host.
-    async def resolve_task_v3_extra_guidance(self, *, task: Task, organization: Organization) -> str | None:
+    # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
+    # the run's payload. OSS supplies no default.
+    def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
-    # Whether v3 offers the task's configured error codes to the model, so a terminal verdict names
-    # its own business outcome instead of having one matched on afterwards (SKY-15586). Cloud
-    # overrides behind a flag; False keeps codes out of the loop entirely, which makes the whole
-    # feature byte-identical to before it existed.
-    async def resolve_task_v3_error_code_choice(self, *, task: Task, organization: Organization) -> bool:
-        return False
+    # Same contract as task_v3_age_default, for the job-application availability, experience and disclosure defaults.
+    def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
+        return None
+
+    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
+    def task_v3_answer_basis_audit(
+        self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
+    ) -> AnswerBasisAudit | None:
+        return None
 
     # The v3 code tool, or None when this deployment cannot run model-authored code under a sandbox.
-    # Returning None is the ONLY safe answer without one: there is deliberately no in-process
-    # execution path here to degrade to, so a deployment with no runner offers no code tool rather
-    # than a weaker version of it. OSS ships no runner and always returns None.
+    # Uncalled while frame perception withholds the code tool on every run; it stays as the seam for
+    # when the action ledger records code-driven work. OSS ships no runner and always returns None.
     async def build_task_v3_code_tool(
         self,
         *,
@@ -972,6 +1206,40 @@ class AgentFunction:
         override can bound a duration that measures the row's age rather than compute.
         """
         return None
+
+    async def record_server_assigned_address_navigation_failure(
+        self,
+        *,
+        browser_address: str,
+        nav_error_code: str | None,
+        run_id: str | None,
+        workflow_permanent_id: str | None = None,
+    ) -> None:
+        """Report a failed navigation on a browser address this deployment assigned to the run."""
+        return None
+
+    async def record_server_assigned_address_navigation_success(
+        self,
+        *,
+        browser_address: str,
+        run_id: str | None,
+    ) -> None:
+        """Clear navigation-failure strikes after a server-assigned browser address navigates."""
+        return None
+
+    async def capture_workflow_run_created(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        workflow_permanent_id: str,
+        trigger_type: WorkflowRunTriggerType,
+    ) -> None:
+        """Capture Cloud run-creation telemetry; OSS builds have no product analytics sink."""
+        return None
+
+    def is_backup_queue_organization(self, organization_id: str) -> bool:
+        return False
 
     workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
@@ -1077,6 +1345,10 @@ class AgentFunction:
         Cloud overrides this with the flex-router → standard-router mapping.
         OSS no-op so self-hosted users without flex routers see no behavior change.
         """
+        return None
+
+    def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a standard-tier twin for the given LLM key, or None if no twin exists."""
         return None
 
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
@@ -1212,12 +1484,14 @@ class AgentFunction:
         under them; OSS has no runner, so its budget is unknown rather than unlimited."""
         return None
 
-    def web_search_provider(self) -> WebSearchProvider | None:
-        """No search engine is configured in OSS; reading a provider's result markup is
-        deployment configuration. Cloud overrides this with its configured provider."""
-        return None
-
-    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+    def redact_codeblock_parameter_values(
+        self,
+        value: Any,
+        parameters: dict[str, Any],
+        *,
+        max_disclosure_chars: int | None = None,
+        max_disclosure_nodes: int | None = None,
+    ) -> Any:
         """Cloud overrides this with the runner's canonical parameter scrubber."""
         return value
 
@@ -1286,6 +1560,7 @@ class AgentFunction:
         download_run_id: str | None = None,
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
+        download_log: BlockDownloadLog | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 
@@ -1303,6 +1578,36 @@ class AgentFunction:
     ) -> bool:
         """Base no-op; callers fail closed when worker dispatch is unavailable."""
         return False
+
+    async def copilot_browser_code_mode(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CopilotBrowserCodeMode:
+        """Whether run_browser_code joins the copilot surface, and whether it replaces the browser tools;
+        OSS has no isolated interpreter to host it."""
+        return CopilotBrowserCodeMode.OFF
+
+    async def open_copilot_browser_code_session(
+        self,
+        *,
+        page: Page,
+        lifetime_seconds: float,
+        organization_id: str,
+        chat_id: str,
+        turn_id: str,
+        browser_session_id: str | None,
+    ) -> BrowserCodeSession:
+        raise BrowserCodeSessionUnavailableError(
+            "Browser code is not available on this deployment.", error_code="unavailable"
+        )
+
+    async def get_organization_usage_quota(
+        self,
+        *,
+        organization_id: str,
+    ) -> CopilotOrganizationUsage:
+        """OSS keeps no billing records; cloud overrides this with the authenticated read."""
+        del organization_id
+        return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
@@ -1363,6 +1668,36 @@ class AgentFunction:
     ) -> dict[str, str] | None:
         """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
         return None
+
+    def capture_copilot_message_feedback(
+        self,
+        *,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_copilot_chat_message_id: str,
+        workflow_permanent_id: str | None,
+        turn_id: str | None,
+        run_id: str | None,
+        rating: str | None,
+        has_reason: bool,
+    ) -> None:
+        """Forward a thumbs rating to product analytics. OSS builds have no product analytics sink."""
+
+    async def capture_onepassword_telemetry(
+        self,
+        *,
+        organization_id: str,
+        event: OnePasswordTelemetryEvent,
+        success: bool,
+        item_count: int | None = None,
+        error_class: OnePasswordTelemetryErrorClass | None = None,
+    ) -> None:
+        """Capture safe 1Password funnel telemetry; OSS has no product analytics sink."""
+
+    async def get_workflow_run_execution_status(
+        self, workflow_run: WorkflowRun
+    ) -> Literal["running", "terminal", "absent", "unknown"]:
+        return "unknown" if workflow_run.job_id else "absent"
 
     async def is_block_scoped_workflow_run(self, workflow_run: WorkflowRun) -> bool:
         """Return whether this workflow run was created for scoped block execution."""
@@ -1482,14 +1817,20 @@ class AgentFunction:
         """
         return None
 
+    async def resolve_mcp_oauth_member_api_key(
+        self, organization_id: str, payload: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        return None
+
+    async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
+        return None
+
+    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> tuple[str, str | None, bool] | None:
+        return "full_org", None, True
+
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
-
-    async def resolve_self_heal_api_key(self, organization_id: str) -> str | None:
-        del organization_id
-        api_key = settings.SKYVERN_API_KEY
-        return api_key if api_key and api_key != "PLACEHOLDER" else None
 
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
@@ -1539,6 +1880,18 @@ class AgentFunction:
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
 
+    async def before_workflow_run_start(
+        self,
+        workflow_run: WorkflowRun,
+        *,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+    ) -> None:
+        return
+
+    async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
+        return False
+
     async def admit_recipe_step_attempt(
         self,
         task: Task,
@@ -1571,6 +1924,10 @@ class AgentFunction:
         feature_names: set[str] | None = None,
     ) -> None:
         return
+
+    def browser_session_create_admission(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+        """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
+        return nullcontext()
 
     async def parse_enterprise_totp_secret(
         self,
@@ -1677,7 +2034,8 @@ class AgentFunction:
         the agent keep going and fail safe at max steps rather than falsely completing.
         OSS accepts everything; a deployment may override to hold specific blocks (e.g. a
         submit block whose AI fallback would otherwise complete without a deterministic
-        confirmation check) to a stricter gate.
+        confirmation check) to a stricter gate. Raising CompletionGateTerminationError ends the
+        task as terminated with its reason, so callers must catch it before any broad except.
         """
         return True
 
@@ -1800,13 +2158,16 @@ class AgentFunction:
         organization_id: str,
         workflow_permanent_id: str,
         workflow_schedule_id: str,
-        cron_expression: str,
+        cron_expression: str | None,
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
         max_elapsed_time_minutes: int | None = None,
+        interval_seconds: int | None = None,
+        first_fire_at: datetime | None = None,
+        run_at: datetime | None = None,
     ) -> None:
-        """Upsert a recurring schedule with the execution backend (e.g. Temporal).
+        """Upsert a cron, interval or one-time schedule with the execution backend (e.g. Temporal).
 
         OSS base is a no-op because the local scheduler scans the database.
         Cloud overrides this to register the schedule with Temporal.
@@ -1851,6 +2212,34 @@ class AgentFunction:
     ) -> bool:
         """Solve and apply a reCAPTCHA token. OSS has no solver client."""
         return False
+
+    async def detect_vendor_challenge(self, page: Page | RecordingPage) -> ChallengeVendor | None:
+        """The vendor whose challenge page this is, detect-only; raises when the page cannot be read, so an
+        unreadable page is never taken for a cleared one. OSS has no vendor probe, so it never reports a read."""
+        raise NotImplementedError
+
+    async def run_vendor_challenge_handler(self, page: Page | RecordingPage, vendor: ChallengeVendor) -> None:
+        """Run the deployment's handler for ``vendor``'s challenge page, keeping its own failures; the caller
+        re-detects afterward rather than trusting it."""
+        return None
+
+    def supports_image_captcha_ocr(self) -> bool:
+        """Whether read_image_captcha_text has a solver behind it. OSS has none."""
+        return False
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        """Whether this organization may send a captcha image to the solver right now."""
+        return False
+
+    async def read_image_captcha_text(
+        self,
+        image_png: bytes,
+        *,
+        organization_id: str | None = None,
+        url: str | None = None,
+    ) -> str | None:
+        """Read the characters shown in an image-text captcha. OSS has no OCR solver."""
+        return None
 
     def captcha_solver_lifecycle_scope(self, page: Page | RecordingPage) -> AbstractAsyncContextManager[None]:
         """Async scope entered exactly once around a captcha-solve ladder invocation.
@@ -1936,6 +2325,9 @@ class AgentFunction:
         organization_id: str,
         credential_id: str,
         required_scopes: list[str] | None = None,
+        connection_id: str | None = None,
+        initiating_user_id: str | None = None,
+        custody_mode: str | None = None,
     ) -> str | None:
         try:
             secrets = await microsoft_oauth_service.load_credential_secrets(
@@ -1954,6 +2346,9 @@ class AgentFunction:
                 organization_id=organization_id,
                 credential_id=credential_id,
                 credential_secrets=secrets,
+                connection_id=connection_id,
+                initiating_user_id=initiating_user_id,
+                custody_mode=custody_mode,
             )
         except Exception:
             LOG.exception(
@@ -2049,9 +2444,15 @@ class AgentFunction:
                     or credential_cache_age is None
                     or credential_cache_age >= EMAIL_OTP_CREDENTIAL_REFRESH_INTERVAL_SECONDS
                 ):
+                    # Marked before the await so a cancelled refresh is not mistaken for a
+                    # completed one; CancelledError bypasses the handler below.
+                    source_context.credential_list_refresh_failed = True
                     try:
                         source_context.credential_ids = await source.list_credential_ids(organization_id)
                         source_context.credential_ids_loaded_at = now
+                        source_context.credential_list_refresh_failed = False
+                        source_context.failed_credential_ids &= set(source_context.credential_ids)
+                        source_context.completed_credential_ids &= set(source_context.credential_ids)
                     except Exception:
                         LOG.warning("Failed to list email OTP credentials", source=source.name, exc_info=True)
                         continue
@@ -2075,6 +2476,7 @@ class AgentFunction:
                             client=client,
                         )
                     except EmailOTPSearchError as exc:
+                        source_context.failed_credential_ids.add(credential_id)
                         LOG.warning(
                             "Email OTP lookup failed",
                             source=source.name,
@@ -2084,6 +2486,7 @@ class AgentFunction:
                         )
                         continue
                     except Exception:
+                        source_context.failed_credential_ids.add(credential_id)
                         LOG.warning(
                             "Unexpected email OTP lookup failure",
                             source=source.name,
@@ -2092,9 +2495,14 @@ class AgentFunction:
                         )
                         continue
 
+                    source_context.failed_credential_ids.discard(credential_id)
+                    source_context.completed_credential_ids.add(credential_id)
                     for candidate in candidates:
                         if source_context.has_seen_message(credential_id, candidate.message_id):
                             continue
+                        # Marked before the await so a wait cancelled mid-parse still shows the
+                        # message reached the parser; CancelledError bypasses the handler below.
+                        source_context.unreadable_message_keys.add((credential_id, candidate.message_id))
                         try:
                             otp_value = await parse_otp_login(
                                 candidate.content,
@@ -2102,6 +2510,7 @@ class AgentFunction:
                                 enforced_otp_type=expected_otp_type,
                             )
                         except InsufficientCreditsForOTPParse:
+                            source_context.unreadable_message_keys.discard((credential_id, candidate.message_id))
                             source_context.remember_message(credential_id, candidate.message_id)
                             return None
                         except Exception:
@@ -2113,6 +2522,7 @@ class AgentFunction:
                                 exc_info=True,
                             )
                             continue
+                        source_context.unreadable_message_keys.discard((credential_id, candidate.message_id))
                         source_context.remember_message(credential_id, candidate.message_id)
                         if otp_value is None and expected_otp_type is OTPType.TOTP:
                             # An enforced parse reports "not found" rather than the type it did see,
@@ -2415,7 +2825,7 @@ class AgentFunction:
         url: str,
         payload: str,
         headers: dict[str, str],
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS,
         organization_id: str | None = None,
         run_id: str | None = None,
         resolved_ips: tuple[str, ...] | None = None,
@@ -2443,15 +2853,28 @@ class AgentFunction:
         headers: dict[str, str],
         timeout_seconds: float = 30.0,
         organization_id: str | None = None,
+        resolved_ips: tuple[str, ...] | None = None,
+        method: str = "POST",
     ) -> TOTPVerificationResponse:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
-            async with session.post(url, data=payload, headers=headers) as response:
-                body = await response.text()
-                return TOTPVerificationResponse(
-                    status_code=response.status,
-                    body=body,
-                    headers=dict(response.headers),
+        # Redirects are left to the caller, which validates and pins each hop. httpx timeouts are per
+        # operation, so a slow-drip endpoint needs the outer cap to stay within the budget.
+        try:
+            async with asyncio.timeout(timeout_seconds), pinned_ip_client(resolved_ips) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    content=payload or None,
+                    headers=headers,
+                    timeout=httpx.Timeout(timeout_seconds),
                 )
+        except TimeoutError as e:
+            raise httpx.ReadTimeout(f"TOTP verification request exceeded {timeout_seconds}s") from e
+        return TOTPVerificationResponse(
+            status_code=response.status_code,
+            body=response.text,
+            # Original casing, as the earlier aiohttp path returned; otp_service's Content-Type gate is case-sensitive.
+            headers={key.decode("latin-1"): value.decode("latin-1") for key, value in response.headers.raw},
+        )
 
     async def upload_file_to_customer_storage(
         self,
@@ -2543,22 +2966,6 @@ class AgentFunction:
         if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
             raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
-    def get_copilot_security_rules(self) -> str:
-        """Return security guardrails for the workflow copilot system prompt.
-
-        Override in cloud to inject prompt injection defenses.
-        OSS returns empty string (no hardening).
-        """
-        return ""
-
-    async def acquire_copilot_entrypoint_candidates(
-        self,
-        *,
-        site_name: str,
-    ) -> list[CopilotEntrypointCandidate]:
-        del site_name
-        return []
-
     def copilot_candidate_network_guard(
         self,
         browser_context: BrowserContext,
@@ -2578,16 +2985,16 @@ class AgentFunction:
         raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
         yield []  # pragma: no cover
 
-    async def wait_for_copilot_candidate_network_idle(self, browser_context: BrowserContext) -> None:
-        del browser_context
-        raise RuntimeError("Copilot candidate pre-connect enforcement is unavailable")
-
     def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
-        resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
-        return CopilotConfig(
-            block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
-        )
+        del code_block_mode
+        return CopilotConfig()
+
+    async def _copilot_default_code_block_mode(self, organization_id: str | None) -> bool | None:
+        """The mode for a turn whose request states none: False is agent blocks only, None lets the model
+        choose per step, True is code blocks only."""
+        del organization_id
+        return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
 
     async def _resolve_copilot_requested_code_block_mode(
         self,
@@ -2605,6 +3012,10 @@ class AgentFunction:
         code_block_mode: bool | None = None,
     ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
+        # The composer sends no mode, so the org's dial decides it; off is the rollback lever ADR-0011
+        # names, taking every such turn to agent blocks only without a deploy.
+        if code_block_mode is None:
+            code_block_mode = await self._copilot_default_code_block_mode(organization_id)
         requested_code_block_mode = await self._resolve_copilot_requested_code_block_mode(
             organization_id,
             code_block_mode,
@@ -2619,12 +3030,11 @@ class AgentFunction:
             )
             has_code_block_access = False
         effective_code_block_mode = requested_code_block_mode and has_code_block_access
-        code_block_available = has_code_block_access if code_block_mode is not None else effective_code_block_mode
         config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.block_authoring_policy = block_authoring_policy_for_request(effective_code_block_mode)
-        config.code_block_available = code_block_available
+        config.authoring_capability = authoring_capability_for_request(code_block_mode, has_code_block_access)
+        config.code_block_available = has_code_block_access
         config.effective_code_block_mode = effective_code_block_mode
         return config
 
@@ -2793,6 +3203,18 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
+    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+        """Return a verified bearer identity or why it could not be resolved."""
+        return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
+
+    async def mirror_organization_member(
+        self,
+        principal: RequestPrincipal,
+        *,
+        role_observed_at: datetime | None = None,
+    ) -> None:
+        pass
+
     async def on_workflow_saved(
         self,
         organization_id: str,
@@ -2808,6 +3230,15 @@ class AgentFunction:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
         return
 
+    async def on_workflow_updated_by_user(
+        self,
+        organization_id: str,
+        user_id: str | None,
+        workflow: Workflow,
+    ) -> None:
+        """Fired after the update-agent routes save a new version. Overrides must be best-effort and never raise."""
+        return
+
     async def on_workflow_run_completed(
         self,
         organization_id: str,
@@ -2818,6 +3249,9 @@ class AgentFunction:
     ) -> None:
         """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
         return
+
+    def schedule_workflow_run_group_advance(self, workflow_run: WorkflowRun) -> None:
+        schedule_advance_after_terminal(workflow_run)
 
     async def on_task_completed(
         self,
@@ -2884,6 +3318,31 @@ class AgentFunction:
         workflow_run_id: str,
         organization_id: str,
         status: WorkflowRunStatus,
+        is_final_attempt: bool = True,
     ) -> None:
-        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        """Fired after a workflow attempt reaches a final status.
+
+        ``is_final_attempt`` is false for an attempt that will be retried. Overrides must be
+        best-effort and never raise.
+        """
         return
+
+    async def on_workflow_run_final(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus,
+    ) -> None:
+        """Fired once per logical run after its final retry decision.
+
+        A process paused across a side-effect lease takeover may observe a second call only if it
+        resumes between the fresh ownership check and this call. Overrides must be best-effort and
+        never raise.
+        """
+        return
+
+    # Called after a user rates a run or a copilot turn. OSS keeps the row and nothing else;
+    # cloud overrides to fan the event out (Slack, product analytics).
+    async def on_feedback_submitted(self, *, organization: Organization, event: FeedbackEvent) -> None:
+        return None

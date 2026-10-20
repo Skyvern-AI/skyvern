@@ -1,7 +1,6 @@
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-
-import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
 import { RunView } from "./runview/RunView";
@@ -32,7 +31,7 @@ export function RunTab() {
   const retryPath = `/agents/${workflowPermanentId}/run`;
   const retryState =
     workflowRun &&
-    statusIsFinalized(workflowRun) &&
+    runIsLogicallyFinal(workflowRun) &&
     workflowRun.task_v2 === null
       ? getRerunNavigationState(workflowRun)
       : undefined;

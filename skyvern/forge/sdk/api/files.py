@@ -7,8 +7,11 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
@@ -32,7 +35,9 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.signing import parse_artifact_content_url
+from skyvern.forge.sdk.artifact.storage.base import is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import (
     SSRFGuardedResolver,
     _url_origin,
@@ -62,6 +67,21 @@ LOG = structlog.get_logger()
 
 # Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
 _UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+_ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
+_ORIGINAL_FILENAME_TEMPLATE_RE = re.compile(r"\{\{\s*original_filename\s*\}\}")
+_LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
+
+
+def register_local_download_root(download_root: str) -> None:
+    _LOCAL_DOWNLOAD_ROOTS.add(os.path.realpath(download_root))
+
+
+def local_file_requires_organization(file_url: str) -> bool:
+    scheme = urlparse(file_url).scheme
+    if scheme not in ("", "file"):
+        return False
+    path = parse_uri_to_path(file_url) if scheme == "file" else file_url
+    return not Path(path).resolve().is_relative_to((Path(REPO_ROOT_DIR) / "downloads").resolve())
 
 
 def is_uploaded_file_id(value: str) -> bool:
@@ -87,6 +107,18 @@ async def resolve_uploaded_file_id(file_id: str, organization_id: str | None) ->
     if storage_uri is None:
         raise FileNotFoundError(f"File not found: {file_id}")
     return storage_uri
+
+
+async def uploaded_file_id_for_local_uri(url: str, organization_id: str | None) -> str | None:
+    """The file id behind a local-storage upload's ``file://`` URI, or None when it is not one.
+
+    Local storage hands its upload URI to clients (the run form submits it), but the org's storage
+    tree also holds artifacts and browser-session files, so only a live ``uploaded_files`` row for
+    this exact URI and organization makes it readable as an upload.
+    """
+    if organization_id is None or urlparse(url).scheme != "file" or not _storage_manages_file(url, organization_id):
+        return None
+    return await uploaded_file_service.file_id_for_storage_uri(storage_uri=url, organization_id=organization_id)
 
 
 def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[str, str]) -> tuple[str, str]:
@@ -215,6 +247,101 @@ def _determine_download_filename(
         file_name = file_name + file_suffix
 
     return sanitize_filename(file_name)
+
+
+_MAX_FILENAME_BYTES = 255
+_MAX_STAGING_SIBLINGS = 256
+
+
+def _sibling_filename(name: str, attempt: int) -> str:
+    """`report.pdf` -> `report (2).pdf`, keeping the extension and staying under NAME_MAX.
+
+    The extension is load-bearing: SKY-11982 was a fleet-wide upload regression caused by
+    attaching extensionless files that target-site validators reject.
+    """
+    stem, suffix = os.path.splitext(name)
+    # splitext reads a leading dot as a dotfile, not an extension, so ".pdf" arrives as all stem.
+    # Counting there would hand the site ".pdf (1)" and drop the extension a validator reads.
+    if not suffix and name.startswith("."):
+        stem, suffix = "", name
+    marker = f" ({attempt})"
+    # The result must fit NAME_MAX whatever it is built from: os.link raises ENAMETOOLONG rather
+    # than FileExistsError, which would escape the retry below and fail a download the overwriting
+    # path completed. A suffix wide enough to crowd out the budget is not an extension, so it is
+    # capped before the stem is given the remainder.
+    suffix = suffix.encode()[: _MAX_FILENAME_BYTES // 2].decode(errors="ignore")
+    room = max(_MAX_FILENAME_BYTES - len(marker.encode()) - len(suffix.encode()), 0)
+    stem = stem.encode()[:room].decode(errors="ignore")
+    return f"{stem}{marker}{suffix}" if stem else f"{marker.strip()}{suffix}"
+
+
+def _same_contents(left: Path, right: Path) -> bool:
+    """Compared directly rather than with `filecmp.cmp`, whose process-global cache is keyed on
+    (paths, size, mtime) and is shared by every thread, so a reused temp name could answer for a
+    file it no longer describes."""
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        while True:
+            left_chunk, right_chunk = left_file.read(65536), right_file.read(65536)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def _publish_preserving_existing(source: Path, preferred: Path) -> Path:
+    """Publish `source` at `preferred` without ever mutating a file already staged there.
+
+    The invariant: once this function has returned a path, that path's contents never change.
+    A staged path may already be held by the browser — a file chooser pins the file by identity
+    at selection time and re-validates it at submit, so replacing it underneath makes the submit
+    fail with ERR_UPLOAD_FILE_CHANGED (SKY-16614).
+
+    `os.link` publishes atomically and fails instead of replacing, so a name is only ever claimed
+    once. A byte-identical file already staged is reused rather than duplicated, which keeps the
+    common case — the same source staged repeatedly in one run — on one file under its real name.
+    """
+    for attempt in range(_MAX_STAGING_SIBLINGS):
+        candidate = preferred if attempt == 0 else preferred.with_name(_sibling_filename(preferred.name, attempt))
+        try:
+            os.link(source, candidate)
+            return candidate
+        except FileExistsError:
+            try:
+                if candidate.is_file() and _same_contents(source, candidate):
+                    return candidate
+            except OSError:
+                continue
+    # Every pretty name beside it is taken by different content. A private directory always has
+    # room and keeps the real filename, which the target site reads; failing the download here
+    # would be a worse answer than a longer path.
+    private = Path(tempfile.mkdtemp(dir=preferred.parent))
+    os.link(source, private / preferred.name)
+    return private / preferred.name
+
+
+def _publish_bytes_preserving_existing(data: bytes, file_name: str, staging_dir: str | None = None) -> str:
+    """Stage `data` under its real name in the temp dir without truncating a file already there.
+
+    The managed-storage branch otherwise opens a deterministic path with mode "wb", which rewrites
+    an already-staged file in place — same inode, new size and mtime, which is exactly the tuple a
+    file chooser re-validates at submit (SKY-16614).
+    """
+    temp_dir = staging_dir or settings.TEMP_PATH
+    create_folder_if_not_exist(temp_dir)
+    safe_file_name = sanitize_filename(file_name)
+    preferred = os.path.join(temp_dir, safe_file_name)
+    if not os.path.abspath(preferred).startswith(os.path.abspath(temp_dir) + os.sep):
+        raise ValueError(f"Unsafe filename in temporary file creation: {safe_file_name!r}")
+    staging = tempfile.NamedTemporaryFile(mode="wb", dir=temp_dir, delete=False)
+    staged = Path(staging.name)
+    try:
+        with staging as handle:
+            handle.write(data)
+        return str(_publish_preserving_existing(staged, Path(preferred)))
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _raise_download_response_for_status(response: aiohttp.ClientResponse) -> None:
@@ -362,14 +489,15 @@ async def fetch_file_bytes(
                 None,
                 current_url,
                 next_url,
+                cookie_jar=session.cookie_jar,
             )
             source_url, current_url = current_url, next_url
 
     raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
 
 
-def _resolve_legacy_download_path(candidate_path: str) -> str:
-    """Resolve a legacy file:// path and confirm it is inside the repository downloads directory.
+def _resolve_legacy_download_path(candidate_path: str, *, organization_id: str | None = None) -> str:
+    """Resolve a legacy file:// path inside repository downloads or registered download snapshots.
 
     Containment is checked on the realpath with commonpath, so dot segments, percent-decoded dot
     segments, symlinks, and sibling directories such as ``downloads-evil`` cannot escape.
@@ -377,18 +505,36 @@ def _resolve_legacy_download_path(candidate_path: str) -> str:
     allowed_dir = os.path.realpath(os.path.join(REPO_ROOT_DIR, "downloads"))
     resolved_path = os.path.realpath(candidate_path)
     try:
-        inside_allowed_dir = os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir
+        if os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir:
+            return resolved_path
     except ValueError:
-        inside_allowed_dir = False
-    if not inside_allowed_dir:
-        LOG.warning(
-            "Legacy local file path traversal blocked",
-            candidate_path=candidate_path,
-            resolved_path=resolved_path,
-            allowed_dir=allowed_dir,
-        )
-        raise PermissionError("Local file path is outside the downloads directory")
-    return resolved_path
+        pass
+    if (
+        organization_id
+        and organization_id not in (".", "..")
+        and not os.path.isabs(organization_id)
+        and "/" not in organization_id
+        and "\\" not in organization_id
+    ):
+        for root in _LOCAL_DOWNLOAD_ROOTS:
+            root = os.path.realpath(root)
+            try:
+                organization_root = os.path.realpath(os.path.join(root, settings.ENV, organization_id))
+                if (
+                    os.path.commonpath((root, organization_root)) == root
+                    and os.path.commonpath((root, resolved_path)) == root
+                    and os.path.commonpath((organization_root, resolved_path)) == organization_root
+                ):
+                    return resolved_path
+            except ValueError:
+                continue
+    LOG.warning(
+        "Legacy local file path traversal blocked",
+        candidate_path=candidate_path,
+        resolved_path=resolved_path,
+        allowed_dir=allowed_dir,
+    )
+    raise PermissionError("Local file path is outside the downloads directory")
 
 
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
@@ -436,7 +582,7 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
 
             # Validate the file path is within allowed directories
             try:
-                _resolve_legacy_download_path(parse_uri_to_path(url))
+                _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
                 return True
             except (ValueError, PermissionError):
                 return False
@@ -471,12 +617,18 @@ async def download_file(
     organization_id: str | None = None,
     allowed_redirect_origin: str | None = None,
     authorize_request_hop: RedirectHopAuthorizer[str | GuardedFileRedirect] | None = None,
+    authorize_redirect: Callable[[str], bool] | None = None,
+    preserve_existing_files: bool = False,
+    staging_dir: str | None = None,
+    *,
+    limit_managed_file_size: bool = False,
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
 
     # Resolved before the try below so a missing or cross-org file id fails loudly instead of
     # falling through to the HTTP fetch path with an id as the URL.
+    url = await uploaded_file_id_for_local_uri(url, organization_id) or url
     names_uploaded_file = is_uploaded_file_id(url)
     if names_uploaded_file:
         url = await resolve_uploaded_file_id(url, organization_id)
@@ -484,7 +636,7 @@ async def download_file(
     requested_url = url
     try:
         # Check if URL is a Google Drive link
-        if "drive.google.com" in url:
+        if _is_google_drive_download_url(url if "://" in url else f"https://{url}"):
             file_id = extract_google_drive_file_id(url)
             if file_id:
                 # Convert to direct download URL
@@ -503,6 +655,12 @@ async def download_file(
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
             app.STORAGE.assert_managed_file_access(url, organization_id)
+            managed_limit_mb = max_size_mb if limit_managed_file_size else None
+            if managed_limit_mb:
+                # Checked from storage metadata so an oversized object is refused before its bytes are loaded.
+                managed_size = await app.STORAGE.managed_file_size(url, organization_id)
+                if managed_size is not None and managed_size > managed_limit_mb * 1024 * 1024:
+                    raise DownloadFileMaxSizeExceeded(managed_limit_mb)
 
             LOG.info(
                 "Downloading managed storage file",
@@ -513,9 +671,15 @@ async def download_file(
             data = await app.STORAGE.download_managed_file(url, organization_id)
             if data is None:
                 raise Exception(f"Failed to download managed storage file: {url}")
+            if managed_limit_mb and len(data) > managed_limit_mb * 1024 * 1024:
+                raise DownloadFileMaxSizeExceeded(managed_limit_mb)
             # A local upload's URI percent-encodes its name, which can triple a non-ASCII name's
             # length past the filesystem limit; the decoded name is the one storage already wrote.
             filename = unquote(parsed.path.rsplit("/", 1)[-1]) if parsed.scheme == "file" else url.split("/")[-1]
+            if preserve_existing_files:
+                published = await asyncio.to_thread(_publish_bytes_preserving_existing, data, filename, staging_dir)
+                LOG.info(f"Downloaded file to {published}")
+                return published
             temp_file = create_named_temporary_file(delete=False, file_name=filename)
             LOG.info(f"Downloaded file to {temp_file.name}")
             temp_file.write(data)
@@ -525,7 +689,7 @@ async def download_file(
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            local_path = _resolve_legacy_download_path(parse_uri_to_path(url))
+            local_path = _resolve_legacy_download_path(parse_uri_to_path(url), organization_id=organization_id)
             LOG.info("Downloading file from local file system", url=url)
             return local_path
 
@@ -535,6 +699,10 @@ async def download_file(
             raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
         if allowed_redirect_origin is not None and _url_origin(current_url) != _url_origin(allowed_redirect_origin):
             raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+        # The Drive rewrite and scheme normalization above can move the first request off the URL
+        # the caller judged, so the caller's policy sees the URL actually dispatched.
+        if authorize_redirect is not None and not authorize_redirect(current_url):
+            raise HttpException(400, "[redacted]", "Request blocked by policy")
         request_headers = dict(headers or {})
         source_url: str | None = None
         async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
@@ -604,7 +772,21 @@ async def download_file(
                                     if max_size_mb and total_bytes_downloaded > max_size_mb * 1024 * 1024:
                                         raise DownloadFileMaxSizeExceeded(max_size_mb)
 
-                            file_path.replace(final_path)
+                            if preserve_existing_files:
+                                # Off the loop: a name collision compares whole files, and this
+                                # loop also drives every live browser session in the worker.
+                                final_path = await asyncio.to_thread(
+                                    _publish_preserving_existing, file_path, final_path
+                                )
+                                # Linking leaves the temp name behind, unlike replace. Cleanup, not
+                                # publication: the file is staged, so failing to remove the spent
+                                # name must not fail the download.
+                                try:
+                                    file_path.unlink(missing_ok=True)
+                                except OSError:
+                                    LOG.warning("Failed to remove the temp download file", file_path=str(file_path))
+                            else:
+                                file_path.replace(final_path)
                         except BaseException:
                             file_path.unlink(missing_ok=True)
                             raise
@@ -632,11 +814,14 @@ async def download_file(
                     allowed_redirect_origin
                 ):
                     raise HttpException(400, "[redacted]", "Cross-origin redirect blocked by policy")
+                if authorize_redirect is not None and not authorize_redirect(next_url):
+                    raise HttpException(400, "[redacted]", "Redirect blocked by policy")
                 request_headers, _ = strip_cross_origin_redirect_credentials(
                     request_headers,
                     None,
                     current_url,
                     next_url,
+                    cookie_jar=session.cookie_jar,
                 )
                 source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(
@@ -685,13 +870,42 @@ async def resolve_local_or_download_file(
 ) -> str:
     """Resolve a file input to a local path.
 
-    Absolute paths are validated against the run's download directory; anything else is downloaded.
+    Run-local paths are validated against the run's download directory; anything else is downloaded.
     """
-    # Absolute paths are the run-local convention; treating all non-remote strings as paths would misroute bad URLs.
-    if file_url.startswith("/"):
-        resolved = validate_local_file_path(file_url, run_id)
+    parsed_url = urlparse(file_url)
+    local_path: str | None = file_url if file_url.startswith("/") else None
+    if parsed_url.scheme == "file":
+        candidate_path = parse_uri_to_path(file_url)
+        download_root = Path(settings.DOWNLOAD_PATH).absolute()
+        candidate = Path(candidate_path)
+        local_download_root = False
+        if (
+            organization_id
+            and organization_id not in (".", "..")
+            and not os.path.isabs(organization_id)
+            and "/" not in organization_id
+            and "\\" not in organization_id
+        ):
+            resolved_candidate = candidate.resolve()
+            local_download_root = any(
+                resolved_candidate.is_relative_to((Path(root) / settings.ENV / organization_id).resolve())
+                for root in _LOCAL_DOWNLOAD_ROOTS
+            )
+        if not local_download_root and (
+            candidate.is_relative_to(download_root) or candidate.resolve().is_relative_to(download_root.resolve())
+        ):
+            # Preserve org-scoped local uploads; other files under DOWNLOAD_PATH must be run-scoped.
+            file_id = await uploaded_file_id_for_local_uri(file_url, organization_id)
+            if file_id is not None:
+                file_url = file_id
+            else:
+                local_path = candidate_path
+
+    # Explicit local paths are run-scoped; arbitrary strings must not be treated as paths instead of URLs.
+    if local_path is not None:
+        resolved = validate_local_file_path(local_path, run_id)
         if not os.path.isfile(resolved):
-            raise FileNotFoundError(f"Local file not found: {file_url}")
+            raise FileNotFoundError(f"Local file not found: {local_path}")
         if max_size_mb is not None and os.path.getsize(resolved) > max_size_mb * 1024 * 1024:
             raise DownloadFileMaxSizeExceeded(max_size_mb)
         return resolved
@@ -723,7 +937,7 @@ def unzip_bytes_to_temp_directory(zip_bytes: bytes, prefix: str) -> str:
     The archive must be CLOSED before ZipFile reopens it by path: a write smaller than the io buffer
     (~8KB) is otherwise still unflushed, so ZipFile sees an empty file and raises BadZipFile.
     """
-    temp_dir = make_temp_directory(prefix=prefix)
+    temp_dir = make_run_temp_directory(prefix=prefix)
     with create_named_temporary_file(delete=False) as temp_zip_file:
         temp_zip_file.write(zip_bytes)
         temp_zip_file_path = temp_zip_file.name
@@ -941,23 +1155,71 @@ def _is_single_path_component(value: str) -> bool:
     return bool(value) and value not in (".", "..") and Path(value).name == value
 
 
-def get_run_temp_dir(organization_id: str, run_id: str) -> str:
-    """The run's own scratch directory (``TEMP_PATH/runs/<org>/<run>``), created on first use.
+def resolve_run_dir(root: str, organization_id: str, run_id: str, *, within: str | None = None) -> str:
+    """The run's own folder under ``root``, ``<root>/<org>/<run>``, without creating it.
 
-    The one sanctioned place for per-run temp files: everything under it is deletable by run
-    identity alone — activity teardown removes the finishing run's directory and the stale sweep
-    reaps aged ones — so a tenant staging here needs no cleanup logic of its own. Both components
-    must be single plain path elements because this path is later fed to rmtree by identity.
+    Every file a run produces lives in its organization and run folder of the root it belongs to, so
+    activity teardown deletes the finishing run's folders and the stale sweep reaps aged ones by run
+    identity alone. Both components must be single plain path elements because this path is fed to
+    rmtree by identity, and the folder must resolve inside ``within`` (default ``root``); otherwise this
+    raises ValueError.
     """
     if not _is_single_path_component(organization_id) or not _is_single_path_component(run_id):
         raise ValueError("organization_id and run_id must be single path components")
-    run_dir = os.path.join(settings.TEMP_PATH, RUN_TEMP_NAMESPACE, organization_id, run_id)
-    # makedirs follows symlinked ancestors; a planted link under runs/ would materialize run dirs
-    # outside TEMP_PATH and put them beyond the reapers' reach. Resolve-check before creating.
-    if not Path(run_dir).resolve().is_relative_to(Path(settings.TEMP_PATH).resolve()):
-        raise ValueError("run temp dir resolves outside TEMP_PATH")
+    run_dir = os.path.join(root, organization_id, run_id)
+    # A symlinked ancestor would put run dirs outside the root, beyond the reapers' reach, and would let
+    # teardown delete a foreign directory.
+    if not Path(run_dir).resolve().is_relative_to(Path(within or root).resolve()):
+        raise ValueError("run dir resolves outside its root")
+    return run_dir
+
+
+def get_run_dir(root: str, organization_id: str, run_id: str, *, within: str | None = None) -> str:
+    """``resolve_run_dir``, created on first use."""
+    run_dir = resolve_run_dir(root, organization_id, run_id, within=within)
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
+
+
+def get_run_temp_dir(organization_id: str, run_id: str) -> str:
+    """The run's own scratch directory, ``TEMP_PATH/runs/<org>/<run>``; see ``get_run_dir``."""
+    return get_run_dir(
+        os.path.join(settings.TEMP_PATH, RUN_TEMP_NAMESPACE), organization_id, run_id, within=settings.TEMP_PATH
+    )
+
+
+def current_run_identity() -> tuple[str, str] | None:
+    """The (organization_id, run_id) whose folders the current run's files go in, or None outside a run."""
+    context = skyvern_context.current()
+    run_id = resolve_run_download_id(context)
+    if context is None or not context.organization_id or not run_id:
+        return None
+    if not _is_single_path_component(context.organization_id) or not _is_single_path_component(run_id):
+        return None
+    return context.organization_id, run_id
+
+
+def get_current_run_dir(root: str | None) -> str | None:
+    """``<root>/<org>/<run>`` for the run in context; None without a root, a run, or a usable folder."""
+    identity = current_run_identity()
+    if not root or identity is None:
+        return None
+    try:
+        return get_run_dir(root, *identity)
+    except (ValueError, OSError):
+        LOG.warning("Could not create the run's folder; using the shared layout", root=root, exc_info=True)
+        return None
+
+
+def make_run_temp_directory(prefix: str) -> str:
+    """A fresh temp directory in the current run's temp folder, or at the top of TEMP_PATH outside a run."""
+    identity = current_run_identity()
+    if identity is not None:
+        try:
+            return tempfile.mkdtemp(prefix=prefix, dir=get_run_temp_dir(*identity))
+        except (ValueError, OSError):
+            LOG.warning("Could not create the run's temp folder; using the top of TEMP_PATH", exc_info=True)
+    return make_temp_directory(prefix=prefix)
 
 
 def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: str | None = None) -> str | None:
@@ -973,10 +1235,31 @@ def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: s
     return fallback_run_id
 
 
-def list_files_in_directory(directory: Path, recursive: bool = False) -> list[str]:
+# The CDP download interceptor names its in-flight temp file ``<final>.<uuid4().hex>.crdownload`` (32
+# lowercase hex chars) before hard-linking to ``<final>``; Chrome-native downloads use ``<final>.crdownload``.
+# Stripped after the ``.crdownload`` suffix, this collapses both temp shapes to the same ``<final>`` identity.
+_INTERCEPTOR_TEMP_IDENTITY_RE = re.compile(r"\.[0-9a-f]{32}$")
+
+
+def normalize_download_identity(file: str) -> str:
+    """Collapse an in-flight download temp name to its settled ``<final>`` identity: Chrome-native
+    ``<final>.crdownload`` and the interceptor's ``<final>.<32-lowercase-hex>.crdownload`` both map to
+    ``<final>``; an already-final name is returned unchanged. Lets a file counted mid-flight and again once
+    settled read as one identity rather than a new arrival."""
+    if not file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+        return file
+    return _INTERCEPTOR_TEMP_IDENTITY_RE.sub("", file.removesuffix(BROWSER_DOWNLOADING_SUFFIX))
+
+
+def list_files_in_directory(
+    directory: Path, recursive: bool = False, *, attempt_started_at: datetime | None = None
+) -> list[str]:
     listed_files: list[str] = []
     for root, dirs, files in os.walk(directory):
-        listed_files.extend([os.path.join(root, file) for file in files])
+        for file in files:
+            path = os.path.join(root, file)
+            if attempt_started_at is None or is_file_from_retry_attempt(path, attempt_started_at):
+                listed_files.append(path)
         if not recursive:
             break
 
@@ -988,23 +1271,24 @@ PENDING_EXTENSION_RENAME_POLL_SECONDS = 0.1
 
 
 async def wait_for_pending_extension_rename(download_dir: str, filename: str) -> str:
-    """Return the file's final name, waiting out an in-flight extension-recovery rename.
-
-    The browser finalizes a download under an extensionless name moments before the
-    async download listener renames it in place (bare GUID -> GUID.pdf). Storage syncs
-    must never upload the intermediate name — the same bytes would get registered
-    under both names across two syncs. For an extensionless file, wait briefly for the
-    rename to land and return the renamed filename; on timeout return the original so
-    the file is still uploaded rather than dropped.
-    """
+    """Return the file's final name, giving an extensionless file a short window after its last change for the
+    download listener to rename it in place (bare GUID -> GUID.pdf). On timeout the original name is returned, so
+    the file is still saved rather than dropped."""
     if Path(filename).suffix:
         return filename
-    deadline = asyncio.get_event_loop().time() + PENDING_EXTENSION_RENAME_WAIT_SECONDS
-    while asyncio.get_event_loop().time() < deadline:
-        if not os.path.exists(os.path.join(download_dir, filename)):
+    path = os.path.join(download_dir, filename)
+    try:
+        file_stat = os.stat(path)
+    except OSError:
+        return _resolve_extension_rename_twin(download_dir, filename)
+    age = time.time() - max(file_stat.st_mtime, file_stat.st_ctime)
+    wait = min(PENDING_EXTENSION_RENAME_WAIT_SECONDS, PENDING_EXTENSION_RENAME_WAIT_SECONDS - age)
+    deadline = time.monotonic() + wait
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not os.path.exists(path):
             return _resolve_extension_rename_twin(download_dir, filename)
-        await asyncio.sleep(PENDING_EXTENSION_RENAME_POLL_SECONDS)
-    if not os.path.exists(os.path.join(download_dir, filename)):
+        await asyncio.sleep(min(PENDING_EXTENSION_RENAME_POLL_SECONDS, remaining))
+    if not os.path.exists(path):
         return _resolve_extension_rename_twin(download_dir, filename)
     return filename
 
@@ -1019,11 +1303,11 @@ def _resolve_extension_rename_twin(download_dir: str, filename: str) -> str:
 
 
 def list_downloading_files_in_directory(
-    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
+    directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX, *, attempt_started_at: datetime | None = None
 ) -> list[str]:
     # check if there's any file is still downloading
     downloading_files: list[str] = []
-    for file in list_files_in_directory(directory):
+    for file in list_files_in_directory(directory, attempt_started_at=attempt_started_at):
         path = Path(file)
         if path.suffix == downloading_suffix:
             downloading_files.append(file)
@@ -1065,9 +1349,11 @@ async def check_downloading_files_and_wait_for_download_to_complete(
     organization_id: str,
     browser_session_id: str | None = None,
     timeout: float = BROWSER_DOWNLOAD_TIMEOUT,
+    *,
+    attempt_started_at: datetime | None = None,
 ) -> None:
     # check if there's any file is still downloading
-    downloading_files = list_downloading_files_in_directory(download_dir)
+    downloading_files = list_downloading_files_in_directory(download_dir, attempt_started_at=attempt_started_at)
     if browser_session_id:
         files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
             organization_id=organization_id, browser_session_id=browser_session_id
@@ -1116,8 +1402,13 @@ def recover_download_extension(file_path: str | Path, download_suffix: str | Non
     Returns "" when ``download_suffix`` already carries its own extension, so the final
     ``download_suffix + extension`` name is not doubled (e.g. invoice.pdf + .pdf).
     """
-    if download_suffix and Path(download_suffix).suffix:
-        return ""
+    if download_suffix:
+        suffix_for_extension = _ORIGINAL_FILENAME_TEMPLATE_RE.sub(_ORIGINAL_FILENAME_MARKER, download_suffix)
+        if _ORIGINAL_FILENAME_MARKER in suffix_for_extension:
+            # Dots before the site-name placeholder are part of the prefix, not an explicit extension.
+            suffix_for_extension = suffix_for_extension.rsplit(_ORIGINAL_FILENAME_MARKER, 1)[1]
+        if Path(suffix_for_extension).suffix:
+            return ""
     return guess_extension_from_file(file_path)
 
 
@@ -1172,6 +1463,11 @@ def is_temp_working_dir(path: str) -> bool:
         return False
 
 
+def discard_temp_working_dir(path: str | None) -> None:
+    if path and is_temp_working_dir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def create_named_temporary_file(delete: bool = True, file_name: str | None = None) -> tempfile._TemporaryFileWrapper:
     temp_dir = settings.TEMP_PATH
     create_folder_if_not_exist(temp_dir)
@@ -1179,9 +1475,10 @@ def create_named_temporary_file(delete: bool = True, file_name: str | None = Non
     if file_name:
         # Sanitize the filename to remove any dangerous characters
         safe_file_name = sanitize_filename(file_name)
-        # Create file with exact name (without random characters)
-        file_path = os.path.join(temp_dir, safe_file_name)
-        if not os.path.abspath(file_path).startswith(os.path.abspath(temp_dir) + os.sep):
+        # Create file with exact name (without random characters). The normalized path is the one
+        # checked and opened, so the containment check covers the path actually written.
+        file_path = os.path.abspath(os.path.join(temp_dir, safe_file_name))
+        if not file_path.startswith(os.path.abspath(temp_dir) + os.sep):
             raise ValueError(f"Unsafe filename in temporary file creation: {safe_file_name!r}")
         # Open in binary mode and return a NamedTemporaryFile-like object
         file = open(file_path, "wb")

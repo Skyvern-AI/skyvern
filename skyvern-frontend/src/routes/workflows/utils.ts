@@ -1,16 +1,145 @@
 import { useLocation } from "react-router-dom";
-import {
-  ProxyLocation,
-  type WorkflowRunStatusApiResponseWithWorkflow,
-} from "@/api/types";
+import { useQuery } from "@tanstack/react-query";
+import { ProxyLocation } from "@/api/types";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
-export function getRerunNavigationState(
-  workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
-) {
+/**
+ * Internal react-hook-form field name for the browser-type SETTING. Hyphens make it an invalid
+ * workflow-parameter identifier, so it can never collide with a user parameter literally named
+ * `browserType`. RHF stores names that aren't valid dotted paths as flat keys, so this reads/writes
+ * as a single top-level field.
+ */
+export const RESERVED_BROWSER_TYPE_FIELD = "__skyvern-browser-type";
+
+/**
+ * Split the reserved internal browser-type setting out of the run-form values: returns the selected
+ * setting (null = Default) and the remaining values (still carrying any user parameter literally
+ * named `browserType`, whose value must reach the request `data` unchanged).
+ */
+export function extractBrowserTypeSetting(values: Record<string, unknown>): {
+  browserType: string | null;
+  rest: Record<string, unknown>;
+} {
+  const { [RESERVED_BROWSER_TYPE_FIELD]: browserTypeSetting, ...rest } = values;
+  return {
+    browserType:
+      browserTypeSetting === undefined || browserTypeSetting === null
+        ? null
+        : (browserTypeSetting as string),
+    rest,
+  };
+}
+
+/**
+ * An attached browser owns its engine: a live session (`browserSessionId`) or a remote CDP address
+ * (`browserAddress`) is the browser for the run, so the backend rejects a run-level browser_type
+ * alongside it. This is the single source of truth for suppressing the Browser Type selector and
+ * omitting browser_type from the request. A browser PROFILE is not an attachment.
+ */
+export function browserTypeSelectionDisabled(attachment: {
+  browserSessionId?: string | null;
+  browserAddress?: string | null;
+}): boolean {
+  return Boolean(
+    attachment.browserSessionId?.trim() || attachment.browserAddress?.trim(),
+  );
+}
+
+export type BrowserTypeOption = {
+  value: string;
+  label: string;
+};
+
+/**
+ * Whether the Browser Type selector should render at all. The options come from `/browser_types`,
+ * which is `undefined` while loading or on error and `[]` if the backend returns nothing; in every
+ * one of those states the control would degrade to a lone misleading `Default` item, so both the
+ * workflow-settings and run-form selectors gate on a real non-empty option set instead.
+ */
+export function hasBrowserTypeOptions(
+  options: Array<BrowserTypeOption> | undefined,
+): options is Array<BrowserTypeOption> {
+  return Array.isArray(options) && options.length > 0;
+}
+
+/**
+ * Selectable browser engines, served by the backend `GET /browser_types` endpoint (the workflow/run
+ * `BrowserType` domain source). Fetching them keeps the picker in sync with the backend without a
+ * hand-maintained frontend option list — a newly supported backend type appears here automatically.
+ */
+export function useBrowserTypeOptionsQuery() {
+  const credentialGetter = useCredentialGetter();
+
+  return useQuery<Array<BrowserTypeOption>>({
+    queryKey: ["browser-types"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client
+        .get<Array<BrowserTypeOption>>("/browser_types")
+        .then((response) => response.data);
+    },
+    staleTime: 60 * 60 * 1000,
+  });
+}
+
+/**
+ * The rerun/retry navigation-state fragment carrying the executed run's browser_type — shared by
+ * every Rerun/Retry caller (the studio callers via getRerunNavigationState, and the run-overview
+ * recovery-guidance Retry) so the destination run form preselects what actually ran. Included only
+ * when the source exposes the property, so an older backend / legacy fixture without it keeps the
+ * prior navigation-state shape; the current backend always emits persisted browser_type, so a real
+ * rerun carries it and an Edge override wins over the workflow default.
+ */
+export function rerunBrowserTypeState(source: {
+  browser_type?: string | null;
+}): { browserType?: string | null } {
+  return "browser_type" in source
+    ? { browserType: source.browser_type ?? null }
+    : {};
+}
+
+type RerunNavigationSource = {
+  parameters?: Record<string, unknown> | null;
+  proxy_location?: ProxyLocation | null;
+  webhook_callback_url?: string | null;
+  max_screenshot_scrolls?: number | null;
+  run_with?: string | null;
+  browser_profile_id?: string | null;
+  browser_type?: string | null;
+};
+
+/**
+ * Resolve the browser-type a rerun/retry form should preselect. Contract: a run-level
+ * browser_type of `null` means INHERIT the workflow setting — only workflow+run both null yields
+ * dynamic routing, and there is no "force system default" sentinel. So a non-null executed-run value
+ * wins, but a `null` OR absent rerun value falls back to the workflow's CURRENT browser_type. A source
+ * run that ran with null, after the workflow later changed to Chrome, must rerun as Chrome — matching
+ * how the backend resolves an omitted/null run value against the workflow default.
+ */
+export function resolveInitialBrowserType(
+  locationState: unknown,
+  workflowBrowserType?: string | null,
+): string | null {
+  if (
+    locationState !== null &&
+    typeof locationState === "object" &&
+    "browserType" in locationState
+  ) {
+    const stateBrowserType = (locationState as { browserType?: string | null })
+      .browserType;
+    if (stateBrowserType != null) {
+      return stateBrowserType;
+    }
+  }
+  return workflowBrowserType ?? null;
+}
+
+export function getRerunNavigationState(workflowRun: RerunNavigationSource) {
   return {
     data: workflowRun.parameters ?? {},
     proxyLocation: workflowRun.proxy_location ?? ProxyLocation.Residential,
@@ -18,6 +147,7 @@ export function getRerunNavigationState(
     maxScreenshotScrolls: workflowRun.max_screenshot_scrolls ?? null,
     runWith: workflowRun.run_with ?? "agent",
     browserProfileId: workflowRun.browser_profile_id ?? null,
+    ...rerunBrowserTypeState(workflowRun),
   };
 }
 

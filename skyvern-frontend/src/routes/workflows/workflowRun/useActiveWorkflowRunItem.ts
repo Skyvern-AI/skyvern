@@ -1,8 +1,14 @@
 import { useSearchParams } from "react-router-dom";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
-import { statusIsFinalized } from "@/routes/tasks/types";
-import { findActiveItem } from "./workflowTimelineUtils";
+import {
+  getRunAttempt,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import {
+  filterTimelineToAttempt,
+  findActiveItem,
+} from "./workflowTimelineUtils";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
 
 function useActiveWorkflowRunItem(): [
@@ -17,12 +23,17 @@ function useActiveWorkflowRunItem(): [
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
   const workflowRunIsFinalized =
-    workflowRunWithWorkflow && statusIsFinalized(workflowRunWithWorkflow);
+    workflowRunWithWorkflow && runIsLogicallyFinal(workflowRunWithWorkflow);
   const finallyBlockLabel =
     workflowRunWithWorkflow?.workflow?.workflow_definition
       ?.finally_block_label ?? null;
-  const activeItem = findActiveItem(
+  const currentAttemptTimeline = filterTimelineToAttempt(
     workflowRunTimeline ?? [],
+    workflowRunWithWorkflow?.attempts ?? [],
+    getRunAttempt(workflowRunWithWorkflow ?? {}),
+  );
+  const activeItem = findActiveItem(
+    active === null ? currentAttemptTimeline : (workflowRunTimeline ?? []),
     active,
     !!workflowRunIsFinalized,
     finallyBlockLabel,

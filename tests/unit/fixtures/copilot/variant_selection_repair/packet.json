@@ -87,7 +87,7 @@
       },
       "blocks": [
         {
-          "workflow_run_block_id": "wrb_variant_selection_fixture",
+          "workflow_run_block_id": "wrb_wr_variant_selection_fixture",
           "label": "select_variant",
           "block_type": "CODE",
           "status": "failed",
@@ -103,7 +103,7 @@
               "reasoning": null,
               "element": "#add-to-cart",
               "code_line": 6,
-              "response": "Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"#add-to-cart\")\n    - locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n      - waiting 100ms\n    6 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  "
+              "response": "Locator.click: Timeout 3000ms exceeded.\nCall log:\nwaiting for locator(\"#add-to-cart\")\n  -   locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #1\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #2\n  -   waiting 20ms\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #3\n"
             },
             {
               "action": "click",
@@ -116,7 +116,7 @@
       ],
       "action_trace_summary": [
         "click #choice-a completed",
-        "click #add-to-cart failed response=Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"#add-to-cart\")\n    - locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n      - waiting 100ms\n    6 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n   code_line=6"
+        "click #add-to-cart failed response=Locator.click: Timeout 3000ms exceeded.\nCall log:\nwaiting for locator(\"#add-to-cart\")\n  -   locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #1\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #2\n  -   waiting 20ms\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #3\n code_line=6"
       ],
       "recorder_code_line_stamps": [
         6,
@@ -140,8 +140,10 @@
           "status": "failed"
         },
         "action_observations": [],
+        "observed_block_end_urls": {},
+        "per_block_action_observations": {},
         "failure": {
-          "workflow_run_block_id": "wrb_variant_selection_fixture",
+          "workflow_run_block_id": "wrb_wr_variant_selection_fixture",
           "task_id": "tsk_variant_selection_fixture",
           "block_label": "select_variant",
           "block_type": "CODE",
@@ -152,7 +154,7 @@
           ],
           "action_trace": [
             "click #choice-a completed",
-            "click #add-to-cart failed response=Locator.click: Timeout 3000ms exceeded.\nCall log:\n  - waiting for locator(\"#add-to-cart\")\n    - locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n    - retrying click action\n      - waiting 100ms\n    6 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n   code_line=6"
+            "click #add-to-cart failed response=Locator.click: Timeout 3000ms exceeded.\nCall log:\nwaiting for locator(\"#add-to-cart\")\n  -   locator resolved to <button id=\"add-to-cart\">Add to cart</button>\n  - attempting click action\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #1\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #2\n  -   waiting 20ms\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <div id=\"notice-overlay\">\u2026</div> intercepts pointer events\n  - retrying click action, attempt #3\n code_line=6"
           ],
           "page_state": {
             "current_origin": "https://variant.fixture.test",
@@ -161,6 +163,7 @@
             "observed_after_workflow_run": true,
             "rendered_value_excerpt": "Item Option AOption B Add to cart We will let you know when this option is available again.Close",
             "form_summaries": [],
+            "value_bindings": [],
             "result_summaries": [],
             "action_summaries": [
               "Option A enabled",
@@ -185,13 +188,15 @@
         },
         "unfinished_items": [],
         "omission_notices": [
-          "action_observations empty: no same-run action observation was recorded.",
+          "action_observations empty: no same-run typed action observation was recorded.",
           "failure.locator_observations omitted: no post-action locator observation was attempted for this run.",
           "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded.",
           "downloads empty: no registered download artifact was recorded.",
           "screenshot omitted: no final or failed-block screenshot was recorded.",
           "unfinished_items empty: recorded outcome and workflow evidence identify none."
-        ]
+        ],
+        "levers": [],
+        "challenge_notices": []
       },
       "findings": [
         {

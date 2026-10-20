@@ -45,7 +45,12 @@ const mocks = vi.hoisted(() => ({
   workflow: {
     title: "Test workflow",
     workflow_definition: {
-      blocks: [],
+      blocks: [{ block_type: "navigation", label: "block_1" }] as Array<{
+        block_type: string;
+        label: string;
+        url?: string | null;
+        parameters?: Array<unknown> | null;
+      }>,
       parameters: [],
     },
     run_with: "agent",
@@ -94,6 +99,7 @@ vi.mock("@/hooks/useFeatureFlag", () => ({
 }));
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => undefined,
+  usePostHog: () => ({ capture: vi.fn() }),
 }));
 vi.mock("@/store/onboarding/useOnboardingState", () => ({
   useOnboardingStateOptional: () => null,
@@ -371,6 +377,89 @@ describe("RunWorkflowForm browser session reuse override", () => {
     expect(
       mocks.post.mock.calls.map(([, body]) => body.reuse_browser_session),
     ).toEqual([null, true, false, null]);
+  });
+});
+
+describe("RunWorkflowForm empty agent", () => {
+  test("an agent with no blocks cannot be run and says why", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(true);
+      expect(screen.getByText("This agent has no blocks yet")).toBeTruthy();
+      fireEvent.click(runButton);
+      expect(mocks.post).not.toHaveBeenCalled();
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
+  });
+
+  test("an agent with one block is runnable", async () => {
+    renderRunWorkflowForm();
+    const runButton = await screen.findByRole("button", { name: "Run agent" });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    expect(screen.queryByText("This agent has no blocks yet")).toBeNull();
+  });
+});
+
+describe("RunWorkflowForm login parameter bindings", () => {
+  test("a login with plain string parameters is runnable", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [
+      {
+        block_type: "login",
+        label: "login",
+        url: "https://example.com/login",
+        parameters: [
+          {
+            key: "username",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          },
+          {
+            key: "password",
+            parameter_type: "workflow",
+            workflow_parameter_type: "string",
+          },
+        ],
+      },
+    ];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(false);
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
+  });
+
+  test("a login with no bound parameters remains blocked", async () => {
+    const blocks = mocks.workflow.workflow_definition.blocks;
+    mocks.workflow.workflow_definition.blocks = [
+      {
+        block_type: "login",
+        label: "login",
+        url: "https://example.com/login",
+        parameters: [],
+      },
+    ];
+    try {
+      renderRunWorkflowForm();
+      const runButton = await screen.findByRole("button", {
+        name: "Run agent",
+      });
+      expect(runButton.hasAttribute("disabled")).toBe(true);
+      fireEvent.click(runButton);
+      expect(mocks.post).not.toHaveBeenCalled();
+    } finally {
+      mocks.workflow.workflow_definition.blocks = blocks;
+    }
   });
 });
 

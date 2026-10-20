@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
 import yaml
+from playwright.async_api import Page
 from typing_extensions import TypedDict
 
+from skyvern.cli.core.js_dispatch import outer_cap_seconds
+from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
@@ -35,10 +39,25 @@ from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     _elapsed_run_seconds,
     _requested_output_labels_by_path,
+    proxy_hop_failure_reason,
 )
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    _browser_session_error_disposition,
+    _browser_session_loss_result,
+    is_redaction_withheld,
+)
+from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    BrowserProbeOutcome,
+    CopilotBrowserGenerationRetired,
+    CopilotBrowserSessionUnavailable,
+    _browser_context_attachability,
+    browser_evidence_commit_lock,
+    browser_session_turn,
     effective_browser_session_id,
+    live_working_page,
+    mcp_browser_context,
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
@@ -50,8 +69,10 @@ from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.webeye.browser_errors import BrowserAutomationError
 
 LOG = structlog.get_logger()
 
@@ -96,9 +117,8 @@ async def _call_internal_browser_tool(
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
 
 
-# Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
-# as a last-resort trip wire for runaway loops — progressing runs should never
-# approach this. The OpenAI Agents SDK wraps the tool in
+# Absolute upper bound on a single ``run_blocks`` tool invocation, including a run
+# whose rows have gone silent. The OpenAI Agents SDK wraps the tool in
 # ``asyncio.wait_for(..., timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS)``; the
 # inner poll loop leaves a 10 s headroom below this ceiling for orderly
 # cleanup before the SDK cancels.
@@ -265,13 +285,6 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
-BLOCK_RUNNING_TOOLS = frozenset(
-    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
-)
-
-WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks", "edit_block_and_run"})
-
-
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
 
 
@@ -330,6 +343,12 @@ def _workflow_definition_block_labels(workflow_definition: object | None) -> lis
         if isinstance(label, str) and label:
             labels.append(label)
     return labels
+
+
+def _executable_workflow_block_labels(workflow_definition: object | None) -> list[str]:
+    """Block labels in traversal order. The finally block runs outside it, so it is never the head."""
+    finally_label = getattr(workflow_definition, "finally_block_label", None)
+    return [label for label in _workflow_definition_block_labels(workflow_definition) if label != finally_label]
 
 
 def _current_workflow_block_labels(ctx: object) -> list[str]:
@@ -414,13 +433,33 @@ def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
 
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
-    labels = _current_workflow_block_labels(ctx)
+    labels = _current_executable_workflow_block_labels(ctx)
     verified = set(getattr(ctx, "verified_prefix_labels", []) or [])
     return [label for label in labels if label not in verified]
 
 
-def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+def _current_finally_block_label(ctx: object) -> str | None:
+    """The finally block of the workflow in context, from whichever source its labels came from."""
+    definition = getattr(getattr(ctx, "last_workflow", None), "workflow_definition", None)
+    finally_label = getattr(definition, "finally_block_label", None)
+    if isinstance(finally_label, str) and finally_label:
+        return finally_label
+    # Labels fall back to the YAML when no model object is loaded yet, so this has to as well;
+    # reading only the model would leave the fallback treating the finally block as body work.
+    parsed = _parse_workflow_definition(getattr(ctx, "last_workflow_yaml", None))
+    yaml_label = parsed.get("finally_block_label") if parsed else None
+    return yaml_label if isinstance(yaml_label, str) and yaml_label else None
+
+
+def _current_executable_workflow_block_labels(ctx: object) -> list[str]:
+    """Traversal order for the workflow in context; the finally block runs outside it."""
+    finally_label = _current_finally_block_label(ctx)
     labels = _current_workflow_block_labels(ctx)
+    return [label for label in labels if label != finally_label] if finally_label else labels
+
+
+def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_executable_workflow_block_labels(ctx)
     verified = set(getattr(ctx, "composition_verified_labels", []) or [])
     return [label for label in labels if label not in verified]
 
@@ -484,9 +523,10 @@ async def _fallback_page_info(
     # page.url is a synchronous property, so it is already in hand when the title stalls, and most
     # callers here destructure the title away and want only the url.
     url = ""
+    page: Page | None = None
 
     async def _read() -> str:
-        nonlocal url
+        nonlocal url, page
         browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
             return ""
@@ -499,13 +539,16 @@ async def _fallback_page_info(
     # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
     # raising — and every caller reaches this path, since a tool result's browser_context carries
     # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    title = ""
     try:
         title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
     except TimeoutError:
         LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
-        return url, ""
     except Exception:
-        return url, ""
+        pass
+    # A document committed during title() would pair one document's url with another's title.
+    if page is not None and page.url != url:
+        return page.url, ""
     return url, title
 
 
@@ -538,6 +581,22 @@ def _raw_yaml_proxy_location(workflow_yaml: str) -> tuple[bool, Any]:
     if not isinstance(parsed_yaml, dict) or "proxy_location" not in parsed_yaml:
         return False, None
     return True, _proxy_location_trace_value(parsed_yaml.get("proxy_location"))
+
+
+def _parse_workflow_definition(yaml_str: str | None) -> dict[str, Any] | None:
+    """``workflow_definition`` as a plain dict, or None when the YAML cannot supply one."""
+    # The loader treats anything that is not a string as a stream and reads until it gets an empty
+    # chunk, so a non-string that never runs dry (a mocked context attribute) would never return.
+    if not isinstance(yaml_str, str) or not yaml_str:
+        return None
+    try:
+        parsed = safe_load_no_dates(yaml_str)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    definition = parsed.get("workflow_definition")
+    return definition if isinstance(definition, dict) else None
 
 
 def _parse_workflow_blocks(yaml_str: str | None) -> list[Any] | None:
@@ -596,8 +655,7 @@ async def _discovery_navigate(
     server = getattr(ctx, "discovery_mcp_server", None)
     if server is None:
         return {"ok": False, "error": "discovery MCP server not attached to context"}
-    nav_args: dict[str, Any] = {"url": url}
-    cap = timeout_seconds
+    nav_args: dict[str, Any] = {"url": url, "timeout": int(timeout_seconds * 1000)}
     if wait_until:
         # `load` waits for every resource (analytics/marketing beacons on heavy
         # commerce pages keep it pending past the cap, so the navigate aborts before
@@ -605,15 +663,74 @@ async def _discovery_navigate(
         # DOM is parsed — the forms/links are already present — and the recapture
         # loop settles anything still hydrating.
         nav_args["wait_until"] = wait_until
-        nav_args["timeout"] = int(timeout_seconds * 1000)
-        cap = timeout_seconds + 5
+    cap_seconds = outer_cap_seconds(nav_args["timeout"])
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_navigate", nav_args),
-            timeout=cap,
+            timeout=cap_seconds,
         )
     except TimeoutError:
-        return {"ok": False, "error": f"skyvern_navigate timed out after {timeout_seconds:g}s"}
+        return {"ok": False, "error": f"skyvern_navigate timed out after {cap_seconds:g}s"}
+    return await attribute_navigation_failure(ctx, result)
+
+
+async def browser_session_hop_proxy(
+    ctx: AgentContext, session_id: str | None = None
+) -> tuple[bool, ProxyLocationInput]:
+    """Whether a browser session made this hop, and the proxy it was given.
+
+    The session's answer governs even when it is None. The browser layer reuses an attached session's
+    existing state instead of applying the workflow's declared proxy, so falling back to that
+    declaration would name a location the hop never used.
+    """
+    session_id = session_id or effective_browser_session_id(ctx)
+    if not session_id:
+        return False, None
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, ctx.organization_id)
+    except Exception:
+        LOG.warning(
+            "Could not read the browser session's proxy for failure attribution",
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+        return True, None
+    return True, session.proxy_location if session is not None else None
+
+
+async def attribute_navigation_failure(ctx: AgentContext, result: dict[str, Any]) -> dict[str, Any]:
+    """Name Skyvern's proxy hop in a failed navigation before anything downstream renders it.
+
+    Scouting has no run row to read codes from, so the code comes off the call that failed and the
+    proxy off the browser state that made the hop. The failure text is rendered, never inspected --
+    an MCP error string is as reproducible as any other prose.
+    """
+    if result.get("ok") or not isinstance(result.get("error"), str):
+        return result
+    # Only the code this call reported. The browser state's code is cleared by a successful
+    # state-managed navigation, which an MCP hop never performs, so reading it here would let an
+    # earlier failure's code attach to a later call that reported none of its own.
+    #
+    # Asked before the state is resolved: every other failure then leaves this seam without paying
+    # for a session lookup, and a lookup that fails cannot replace a failure it was only labelling.
+    if not proxy_owns_nav_codes([result.get("nav_error_code")]):
+        return result
+    if not effective_browser_session_id(ctx):
+        return result
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+    except Exception:  # noqa: BLE001 - an unreadable session costs the proxy name, not the failure.
+        LOG.warning("Could not resolve the browser state to name the proxy hop", exc_info=True)
+        browser_state = None
+    # With no state the proxy is unknown, and proxy_hop_failure_reason drops the parenthetical
+    # rather than naming one the hop may not have used.
+    attributed = proxy_hop_failure_reason(
+        ctx,
+        result["error"],
+        browser_state.built_with_proxy_location if browser_state is not None else None,
+        session_made_hop=True,
+    )
+    return {**result, "error": attributed}
 
 
 async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
@@ -880,6 +997,8 @@ async def _composition_get_structured_evidence_result(
                 f"and {type(exc).__name__} carried no message"
             )
     if outcome is not None and outcome.payload_omitted:
+        if is_redaction_withheld(result):
+            return None, f"structured page evidence was withheld: {result.get('error')}"
         return None, "structured page evidence was omitted at the MCP boundary"
     if not result.get("ok"):
         LOG.warning(
@@ -934,3 +1053,49 @@ async def _composition_get_structured_evidence(
         timeout_seconds=timeout_seconds,
     )
     return evidence
+
+
+def browser_is_lost(page: Page) -> bool:
+    return (
+        page.is_closed() or _browser_context_attachability(page.context) is BrowserProbeOutcome.positively_unreachable
+    )
+
+
+async def on_working_page(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    no_page_error: str,
+    act: Callable[[Page], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
+    async with browser_session_turn(ctx), browser_evidence_commit_lock(ctx):
+        entered_browser = False
+        try:
+            async with mcp_browser_context(ctx):
+                entered_browser = True
+                page = await live_working_page(ctx)
+                if page is None:
+                    return {"ok": False, "error": no_page_error}
+                # An MCP call attaches this turn's inspection listeners in get_page, which a native action skips.
+                if (browser := get_current_session().browser) is not None:
+                    ensure_browser_hooks(browser)
+                return await act(page)
+        except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
+            disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")
+            return _browser_session_loss_result(
+                {}, disposition=disposition, deadline_expired=ctx.browser_session_continuity_deadline_expired
+            )
+        except Exception as exc:
+            if entered_browser:
+                raise
+            # Only a classified error's message has been through CDP-endpoint redaction; an
+            # unclassified one is named by type, and its text stays in the log.
+            detail = (str(exc).rstrip(".") if isinstance(exc, BrowserAutomationError) else "") or type(exc).__name__
+            LOG.warning(
+                "copilot native browser tool could not enter its browser",
+                tool_name=tool_name,
+                browser_session_id=ctx.browser_session_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return {"ok": False, "error": f"{tool_name} could not reach its browser: {detail}. Nothing was done."}

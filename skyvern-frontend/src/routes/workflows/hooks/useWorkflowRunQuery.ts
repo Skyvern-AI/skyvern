@@ -1,19 +1,20 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback } from "react";
 import { getClient } from "@/api/AxiosClient";
-import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
+import {
+  Status,
+  WorkflowRunRetryFields,
+  WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import {
-  statusIsNotFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+
 import {
   DefaultError,
   keepPreviousData,
   useQuery,
 } from "@tanstack/react-query";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
@@ -33,14 +34,14 @@ const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
 // fetchFailureCount, which query-core resets at the start of every fetch.
 function getRunStatusRefetchInterval(state: {
   status: "pending" | "error" | "success";
-  data?: { status: Status };
+  data?: { status: Status } & WorkflowRunRetryFields;
   dataUpdatedAt: number;
   errorUpdatedAt: number;
 }): number | false {
   if (!state.data) {
     return false;
   }
-  if (!statusIsNotFinalized(state.data)) {
+  if (!runIsLogicallyActive(state.data)) {
     return false;
   }
   if (
@@ -52,51 +53,40 @@ function getRunStatusRefetchInterval(state: {
   return RUN_STATUS_POLL_INTERVAL_MS;
 }
 
-// The key is required so that passing an options object always states a run, even
-// when that run is undefined; omitting the object entirely is what defers to the
-// route. Optional-key typing made those two cases identical to tsc.
-function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
-  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
-  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
-  const workflowPermanentId = useWorkflowPermanentId();
+// Every reader of this route shares one cache entry. A second key over the same
+// run builds the whole response again per view and doubles the status poll.
+function useWorkflowRunByIdQuery(
+  workflowRunId: string | undefined,
+  enabled: boolean,
+) {
   const credentialGetter = useCredentialGetter();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
   // A fresh arrow each render defeats query-core's select memo, re-running the
   // comparison and a deep equality check over the whole payload every time.
   const selectRequestedRun = useCallback(
-    (run: WorkflowRunStatusApiResponse) =>
+    (run: WorkflowRunStatusApiResponseWithWorkflow) =>
       run.workflow_run_id === workflowRunId ? run : undefined,
     [workflowRunId],
   );
 
   return useQuery<
-    WorkflowRunStatusApiResponse,
+    WorkflowRunStatusApiResponseWithWorkflow,
     DefaultError,
-    WorkflowRunStatusApiResponse | undefined
+    WorkflowRunStatusApiResponseWithWorkflow | undefined
   >({
     queryKey: getOrgScopedQueryKey(
-      ["workflowRun", workflowPermanentId, workflowRunId],
+      ["workflowRun", workflowRunId],
       activeOrgQueryKeyScope,
     ),
+    // The by-run-id route still serves a run whose workflow version was retired
+    // (a Copilot test version), where the per-workflow route answers 404.
     queryFn: async ({ signal }) => {
-      const client = await getClient(credentialGetter);
-      const isGlobalWorkflow = globalWorkflows?.some(
-        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
-      );
-      const params = new URLSearchParams();
-      if (isGlobalWorkflow) {
-        params.set("template", "true");
-      }
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return client
-        .get(
-          `/workflows/${workflowPermanentId}/runs/${encodeURIComponent(workflowRunId ?? "")}`,
-          {
-            params,
-            signal,
-          },
-        )
+        .get(`/workflows/runs/${encodeURIComponent(workflowRunId ?? "")}`, {
+          signal,
+        })
         .then((response) => response.data);
     },
     refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
@@ -110,16 +100,26 @@ function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data) ? "always" : false;
+      return runIsLogicallyActive(query.state.data) ? "always" : false;
     },
     refetchOnWindowFocus: (query) => {
       if (!query.state.data) {
         return false;
       }
-      return statusIsRunningOrQueued(query.state.data);
+      return runIsLogicallyActive(query.state.data);
     },
-    enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
+    enabled: enabled && !!workflowRunId,
   });
+}
+
+// The key is required so that passing an options object always states a run, even
+// when that run is undefined; omitting the object entirely is what defers to the
+// route. Optional-key typing made those two cases identical to tsc.
+function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
+  const workflowPermanentId = useWorkflowPermanentId();
+  return useWorkflowRunByIdQuery(workflowRunId, !!workflowPermanentId);
 }
 
 export {
@@ -127,5 +127,6 @@ export {
   POLL_OUTAGE_BUDGET_MS,
   RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
+  useWorkflowRunByIdQuery,
   useWorkflowRunQuery,
 };

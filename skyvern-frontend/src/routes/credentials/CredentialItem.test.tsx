@@ -7,6 +7,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getClient } from "@/api/AxiosClient";
@@ -213,5 +214,85 @@ describe("CredentialItem TOTP code preview", () => {
       },
       { timeout: 3000 },
     );
+  });
+});
+
+describe("CredentialItem saved browser session", () => {
+  it("labels the refresh link with what it does and explains it in a tooltip", async () => {
+    render(
+      <MemoryRouter>
+        <CredentialItem
+          credential={makePasswordCredential({ browser_profile_id: "bp_1" })}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole("link", { name: "Sign in again to refresh" });
+    expect(link.getAttribute("href")).toBe("/browser-profiles/bp_1?refresh=1");
+
+    fireEvent.focus(link);
+    expect(
+      (
+        await screen.findAllByText(
+          "Opens a live browser with this saved session. Sign in again, then close it to save the new session.",
+        )
+      ).length,
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe("CredentialItem 1Password metadata", () => {
+  it("shows the 1Password badge and missing-upstream note", () => {
+    render(
+      <CredentialItem
+        credential={makePasswordCredential({
+          vault_type: "onepassword",
+          vault_id: "vault-1",
+          item_id: "item-1",
+          upstream_missing_at: "2026-10-18T12:00:00Z",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("1Password")).toBeTruthy();
+    expect(screen.getByText("missing in 1Password")).toBeTruthy();
+  });
+});
+
+describe("SKY-18379 QA R1 repro: imported 1Password credential", () => {
+  it("QA1-U1: does not offer Edit on a read-only 1Password credential, whose update always 405s", () => {
+    render(
+      <MemoryRouter>
+        <CredentialItem
+          credential={makePasswordCredential({
+            vault_type: "onepassword",
+            vault_id: "vault-1",
+            item_id: "item-1",
+            credential: {
+              username: "user@example.com",
+              totp_type: "none",
+              totp_identifier: null,
+            },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("1Password")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Edit credential" }),
+    ).toBeNull();
+  });
+
+  it("keeps Edit available for a Skyvern-vault credential", () => {
+    render(
+      <CredentialItem
+        credential={makePasswordCredential({ vault_type: "skyvern" })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Edit credential" }),
+    ).toBeTruthy();
   });
 });

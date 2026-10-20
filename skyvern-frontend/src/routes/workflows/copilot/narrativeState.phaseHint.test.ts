@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  CopilotPhaseHintEvent,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateNarrativeFromPayload,
 } from "./narrativeState";
 import {
-  WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
@@ -31,18 +29,6 @@ const toolCall = (
   tool_input: {},
   iteration: 0,
   tool_call_id: "call-1",
-  ...overrides,
-});
-
-const blockProgress = (
-  overrides: Partial<WorkflowCopilotBlockProgressUpdate> &
-    Pick<WorkflowCopilotBlockProgressUpdate, "block_label" | "status">,
-): WorkflowCopilotBlockProgressUpdate => ({
-  type: "block_progress",
-  workflow_run_block_id: `wrb_${overrides.block_label}`,
-  block_type: "task",
-  iteration: 0,
-  timestamp: "2026-06-10T00:00:04Z",
   ...overrides,
 });
 
@@ -72,111 +58,33 @@ const response = (
   ...overrides,
 });
 
-const phaseHint = (hintedAtMs: number): CopilotPhaseHintEvent => ({
-  type: "client_phase_hint",
-  hintedAtMs,
-});
-
-describe("applyNarrativeEvent — client_phase_hint", () => {
-  it("sets draftingSignaledAt once", () => {
-    const s = applyNarrativeEvent(EMPTY_NARRATIVE, phaseHint(5000));
-    expect(s.draftingSignaledAt).toBe(5000);
-  });
-
-  it("is idempotent — a second hint never overwrites the first timestamp", () => {
+describe("applyNarrativeEvent — designActivity", () => {
+  it("keeps denylisted internal tools out of the visible activity log", () => {
     let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      phaseHint(5000),
-    );
-    s = applyNarrativeEvent(s, phaseHint(9000));
-    expect(s.draftingSignaledAt).toBe(5000);
-  });
-
-  it("no-ops once a block has started running (design already progressed)", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      turnStart(),
-    );
-    s = applyNarrativeEvent(
-      s,
-      blockProgress({ block_label: "block_1", status: "running" }),
-    );
-    s = applyNarrativeEvent(s, phaseHint(5000));
-    expect(s.draftingSignaledAt).toBeNull();
-  });
-
-  it("no-ops once designEnded", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(EMPTY_NARRATIVE, {
-      type: "design_end",
-      timestamp: "2026-06-10T00:00:02Z",
-    });
-    s = applyNarrativeEvent(s, phaseHint(5000));
-    expect(s.draftingSignaledAt).toBeNull();
-  });
-
-  it("no-ops once a draft already exists", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(EMPTY_NARRATIVE, {
-      type: "workflow_draft",
-      block_count: 1,
-      block_labels: ["block_1"],
-      summary: null,
-      timestamp: "2026-06-10T00:00:03Z",
-    });
-    s = applyNarrativeEvent(s, phaseHint(5000));
-    expect(s.draftingSignaledAt).toBeNull();
-  });
-});
-
-describe("applyNarrativeEvent — lastActivityAtMs", () => {
-  it("stamps with the injected nowMs on tool_call/tool_result/narration", () => {
-    const s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall(), 12345);
-    expect(s.lastActivityAtMs).toBe(12345);
-  });
-
-  it("stamps even when the tool is denylisted from the visible activity log", () => {
-    const s = applyNarrativeEvent(
       EMPTY_NARRATIVE,
       toolCall({ tool_name: "get_run_results" }),
-      777,
     );
-    expect(s.lastActivityAtMs).toBe(777);
+    s = applyNarrativeEvent(s, {
+      type: "tool_result",
+      tool_name: "get_browser_screenshot",
+      success: true,
+      summary: "",
+      iteration: 0,
+      tool_call_id: "call-2",
+    });
     expect(s.designActivity).toHaveLength(0);
   });
 
-  it("defaults to Date.now() when nowMs is omitted", () => {
-    const before = Date.now();
-    const s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
-    expect(s.lastActivityAtMs).toBeGreaterThanOrEqual(before);
-  });
-});
-
-describe("applyNarrativeEvent — authoringCount", () => {
-  it("increments only on AUTHORING_TOOLS tool_calls", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      toolCall({ tool_name: "navigate_browser" }),
-    );
-    expect(s.authoringCount).toBe(0);
-    s = applyNarrativeEvent(s, toolCall({ tool_name: "update_workflow" }));
-    expect(s.authoringCount).toBe(1);
-    s = applyNarrativeEvent(
-      s,
-      toolCall({ tool_name: "update_and_run_blocks", tool_call_id: "call-2" }),
-    );
-    expect(s.authoringCount).toBe(2);
-  });
-
-  it("survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap (does not reset when old entries scroll off)", () => {
+  it("evicts the oldest entries at the MAX_DESIGN_ACTIVITY_ENTRIES cap", () => {
     let s: TurnNarrativeState = EMPTY_NARRATIVE;
-    s = applyNarrativeEvent(s, toolCall({ tool_name: "update_workflow" }));
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 61; i++) {
       s = applyNarrativeEvent(
         s,
         toolCall({ tool_name: "navigate_browser", tool_call_id: `c${i}` }),
       );
     }
-    expect(s.authoringCount).toBe(1);
     expect(s.designActivity.length).toBeLessThan(61);
+    expect(s.designActivity[s.designActivity.length - 1]?.id).toBe("tc-c60");
   });
 });
 
@@ -210,77 +118,13 @@ describe("applyNarrativeEvent — lastRunOutcome", () => {
   });
 });
 
-describe("applyNarrativeEvent — response hydration resets phase-hint fields", () => {
-  it("regression pin: a response frame for the SAME turnId preserves draftingSignaledAt (the terminal-wipe trap)", () => {
+describe("applyNarrativeEvent — response hydration", () => {
+  it("lastRunOutcome is not grafted across the terminal swap", () => {
     let s: TurnNarrativeState = applyNarrativeEvent(
       EMPTY_NARRATIVE,
       turnStart(),
     );
-    s = applyNarrativeEvent(s, phaseHint(5000));
-    expect(s.draftingSignaledAt).toBe(5000);
-
-    s = applyNarrativeEvent(
-      s,
-      response({
-        turn_id: "turn-1",
-        narrative_payload: {
-          turnId: "turn-1",
-          turnIndex: 0,
-          designStarted: true,
-          designEnded: true,
-          draft: null,
-          blocks: [],
-          terminal: "response",
-          terminalMessage: "Done.",
-          narrativeSummary: "Done.",
-          priorBlockCount: null,
-          designActivity: [],
-          startedAt: "2026-06-10T00:00:00Z",
-          endedAt: "2026-06-10T00:02:00Z",
-        },
-      }),
-    );
-    expect(s.draftingSignaledAt).toBe(5000);
-  });
-
-  it("no graft for a DIFFERENT turnId — fresh terminal payload starts at null", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      turnStart(),
-    );
-    s = applyNarrativeEvent(s, phaseHint(5000));
-
-    s = applyNarrativeEvent(
-      s,
-      response({
-        narrative_payload: {
-          turnId: "turn-2",
-          turnIndex: 1,
-          designStarted: true,
-          designEnded: true,
-          draft: null,
-          blocks: [],
-          terminal: "response",
-          terminalMessage: "Done.",
-          narrativeSummary: "Done.",
-          priorBlockCount: null,
-          designActivity: [],
-          startedAt: "2026-06-10T00:00:00Z",
-          endedAt: "2026-06-10T00:02:00Z",
-        },
-      }),
-    );
-    expect(s.draftingSignaledAt).toBeNull();
-  });
-
-  it("authoringCount is grafted across the terminal swap; lastRunOutcome is not", () => {
-    let s: TurnNarrativeState = applyNarrativeEvent(
-      EMPTY_NARRATIVE,
-      turnStart(),
-    );
-    s = applyNarrativeEvent(s, toolCall({ tool_name: "update_workflow" }));
     s = applyNarrativeEvent(s, runOutcome({ verdict: "not_demonstrated" }));
-    expect(s.authoringCount).toBe(1);
     expect(s.lastRunOutcome).not.toBeNull();
 
     s = applyNarrativeEvent(
@@ -304,11 +148,6 @@ describe("applyNarrativeEvent — response hydration resets phase-hint fields", 
         },
       }),
     );
-    // Grafted (same turnId): the uncapped counter survives even though the
-    // payload's capped designActivity has aged out the authoring entry, so
-    // Explore stays resolved at the swap rather than flipping back.
-    expect(s.authoringCount).toBe(1);
-    // Still not grafted: the terminal payload owns the final run fact.
     expect(s.lastRunOutcome).toBeNull();
   });
 });

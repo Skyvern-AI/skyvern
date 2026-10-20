@@ -18,17 +18,22 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator
 from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from skyvern.constants import SCRUBBED_VALUE
+from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.models import Base, WorkflowRunParameterModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
+from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -38,6 +43,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.service import WorkflowService
 
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                    #
@@ -459,6 +465,14 @@ def test_encode_default_value_none_passes_through() -> None:
     assert WorkflowParametersRepository._encode_workflow_parameter_default(param) is None
 
 
+@pytest.mark.asyncio
+async def test_json_empty_string_default_survives_a_save(agent_db: AgentDB, seeded_workflow: dict[str, str]) -> None:
+    await _reconcile(agent_db, seeded_workflow, [_wp("cfg", WorkflowParameterType.JSON, default_value="")])
+
+    (stored,) = await agent_db.workflow_params.get_workflow_parameters(workflow_id=seeded_workflow["workflow_id"])
+    assert stored.default_value == ""
+
+
 # --------------------------------------------------------------------------- #
 # Regression coverage for the invariants the atomic combined method depends   #
 # on: block-level output-parameter alignment and credential-row existence.    #
@@ -631,3 +645,52 @@ async def test_atomic_write_accepts_credential_parameter_without_existing_row(
     aws_in_json = stored_params_by_key["aws_creds"]
     assert aws_in_json.aws_secret_parameter_id == "aws_from_copilot"  # type: ignore[union-attr]
     assert aws_in_json.key == "aws_creds"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ptype", "submitted"),
+    [
+        (WorkflowParameterType.INTEGER, "7"),
+        (WorkflowParameterType.FLOAT, "2.5"),
+        (WorkflowParameterType.BOOLEAN, "true"),
+        (WorkflowParameterType.JSON, '{"a": 1}'),
+        (WorkflowParameterType.STRING, "secret"),
+    ],
+)
+async def test_run_detail_shows_a_scrubbed_parameter_whatever_its_type(
+    agent_db: AgentDB,
+    seeded_workflow: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    ptype: WorkflowParameterType,
+    submitted: str,
+) -> None:
+    workflow_id = seeded_workflow["workflow_id"]
+    organization_id = seeded_workflow["organization_id"]
+    await _reconcile(agent_db, seeded_workflow, [_wp("sensitive", ptype)])
+    (parameter,) = await agent_db.workflow_params.get_workflow_parameters(workflow_id=workflow_id)
+    workflow = await agent_db.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+    assert workflow is not None
+    workflow_run = await agent_db.workflow_runs.create_workflow_run(
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_id=workflow_id,
+        organization_id=organization_id,
+    )
+    await agent_db.workflow_runs.create_workflow_run_parameter(
+        workflow_run_id=workflow_run.workflow_run_id,
+        workflow_parameter=parameter,
+        value=submitted,
+    )
+    # Retention scrubbing rewrites the column in place, whatever the parameter's type.
+    async with agent_db.Session() as session:
+        await session.execute(update(WorkflowRunParameterModel).values(value=SCRUBBED_VALUE))
+        await session.commit()
+    monkeypatch.setattr(app, "DATABASE", agent_db)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+
+    response = await agent_protocol.get_workflow_and_run_from_workflow_run_id(
+        workflow_run_id=workflow_run.workflow_run_id,
+        current_org=SimpleNamespace(organization_id=organization_id),
+    )
+
+    assert response.parameters == {"sensitive": SCRUBBED_VALUE}

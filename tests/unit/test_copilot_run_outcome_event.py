@@ -352,6 +352,20 @@ def test_challenge_failure_records_observation_without_halting_agent() -> None:
     assert ctx.turn_halt is None
 
 
+def test_a_run_this_turn_replaces_the_inherited_runs_refusal_sentence() -> None:
+    """The refusal described the run the pointers used to name; once this turn records its own run,
+    a ``last_run`` request must not be answered about the earlier one."""
+    result = _challenge_failure_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.last_run_blocks_workflow_run_id = "wr_inherited"
+    ctx.last_run_binding_unavailable_reason = "The last run this chat recorded is no longer readable."
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.last_run_blocks_workflow_run_id == "wr_challenge"
+    assert ctx.last_run_binding_unavailable_reason is None
+
+
 def test_challenge_failure_sanitizes_model_observation_reason() -> None:
     result = _challenge_failure_result()
     raw_reason = (
@@ -584,6 +598,7 @@ def test_requested_output_judge_does_not_change_completed_run_record() -> None:
 def test_run_outcome_trace_is_append_only_across_pointer_updates() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
     ctx.last_run_blocks_workflow_run_id = "wr_test"
+    ctx.dispatched_run_ids_this_turn.add("wr_test")
     committed = _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_evaluated"))
 
     assert committed == RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_test")
@@ -600,6 +615,16 @@ def test_run_outcome_trace_is_append_only_across_pointer_updates() -> None:
     assert stashed.verdict == "not_demonstrated"
     assert ctx.last_run_outcome == stashed
     assert ctx.run_outcome_trace == [committed, stashed]
+
+
+def test_an_inherited_run_id_is_not_stamped_onto_this_turns_outcome() -> None:
+    """A turn that dispatched nothing must not attribute its outcome to the run it inherited."""
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+    ctx.last_run_blocks_workflow_run_id = "wr_prior_turn"
+
+    stashed = _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_demonstrated"))
+
+    assert stashed.workflow_run_id is None
 
 
 def test_recorded_outcome_for_new_run_uses_current_run_id() -> None:

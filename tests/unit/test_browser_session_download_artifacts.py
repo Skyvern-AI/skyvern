@@ -390,41 +390,6 @@ async def test_get_shared_downloaded_files_in_browser_session_uses_artifact_urls
 
 
 @pytest.mark.asyncio
-async def test_get_shared_downloaded_files_in_browser_session_falls_back_to_presigned_for_legacy(keyring_configured):
-    """Pre-cutover sessions have no artifact rows. Files must still surface as presigned URLs."""
-    storage = S3Storage()
-    storage.async_client = MagicMock()
-    object_uri = "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_old/downloads/legacy.pdf"
-    storage.async_client.list_files = AsyncMock(return_value=[object_uri.split("/", 3)[-1]])
-    storage.async_client.get_object_info = AsyncMock(
-        return_value={
-            "Metadata": {"sha256_checksum": "sha-old", "original_filename": "legacy.pdf"},
-            "LastModified": None,
-            "ContentLength": 1024,
-        }
-    )
-    storage.async_client.create_presigned_urls = AsyncMock(
-        return_value=["https://skyvern-artifacts.s3.amazonaws.com/...?sig=old"]
-    )
-
-    mock_list = AsyncMock(return_value=[])
-    resolve_url = AsyncMock()  # must NOT be called
-
-    with patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app:
-        with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
-            s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-            base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
-            result = await storage.get_shared_downloaded_files_in_browser_session(
-                organization_id="o_1", browser_session_id="pbs_old"
-            )
-
-    assert len(result) == 1
-    assert _is_amazonaws_s3_url(result[0].url)
-    assert result[0].file_size == 1024
-    resolve_url.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_get_shared_downloaded_files_in_browser_session_filters_partial_artifacts(keyring_configured):
     """User-facing listing must hide ``*.crdownload`` rows even when DB returns them.
     Partial rows exist for the agent's "still downloading" check, not for end users."""

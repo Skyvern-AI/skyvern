@@ -4,10 +4,11 @@ import asyncio
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import structlog
 
@@ -35,6 +36,17 @@ def _read_file(src_path: str) -> bytes:
         return f.read()
 
 
+def _read_files(paths: Sequence[Path]) -> tuple[bytes, ...]:
+    return tuple(_read_file(str(path)) for path in paths)
+
+
+def _local_input_args(input_format: str | None) -> list[str]:
+    args = ["-protocol_whitelist", "file"]
+    if input_format is not None:
+        args += ["-f", input_format]
+    return args
+
+
 async def _kill_and_wait_for_process(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         try:
@@ -52,8 +64,11 @@ async def _run_ffmpeg_to_temp(
     timeout_seconds: float,
     operation: str,
     input_args: list[str] | None = None,
+    output_dir: str | None = None,
 ) -> str | None:
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as dst_tmp:
+    # ``output_dir`` places the temp output on a chosen filesystem so a caller can later swap it in
+    # with an atomic ``os.replace`` (same mount); ``None`` keeps the default system temp location.
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=output_dir) as dst_tmp:
         dst_path = dst_tmp.name
 
     keep_output = False
@@ -83,7 +98,7 @@ async def _run_ffmpeg_to_temp(
             await _kill_and_wait_for_process(proc)
             LOG.warning("ffmpeg subprocess cancelled", operation=operation, src=src_path)
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await _kill_and_wait_for_process(proc)
             LOG.warning(
                 "ffmpeg subprocess timed out", operation=operation, src=src_path, timeout_seconds=timeout_seconds
@@ -169,6 +184,30 @@ async def _remux_webm(src_path: str) -> str | None:
     )
 
 
+async def remux_mp4_faststart(src_path: str) -> str | None:
+    """Stream-copy an MP4 into a non-fragmented, faststart (front-``moov``) layout.
+
+    Fragmented MP4s (``empty_moov`` + ``moof`` fragments, no ``sidx``) carry a
+    zero-duration init ``moov`` and no seek index, so a native ``<video>`` must
+    download and demux the whole file to read a duration or seek; a ``-c copy``
+    remux rewrites one front ``moov`` with real sample tables and duration. The
+    temp output is created beside the source so the caller can swap it in with an
+    atomic ``os.replace`` on the same mount. Returns a temp path, or ``None`` if
+    ffmpeg is missing or the remux fails.
+    """
+    if shutil.which(FFMPEG_BINARY) is None:
+        LOG.warning("ffmpeg binary not found on PATH, skipping mp4 faststart remux", src=src_path)
+        return None
+    return await _run_ffmpeg_to_temp(
+        src_path,
+        suffix=".mp4",
+        output_args=["-c", "copy", "-movflags", "+faststart"],
+        timeout_seconds=FFMPEG_REMUX_TIMEOUT_SECONDS,
+        operation="ffmpeg mp4 faststart remux",
+        output_dir=os.path.dirname(src_path) or None,
+    )
+
+
 async def _prepare_recording_upload(src_path: str) -> PreparedRecordingUpload | None:
     if shutil.which(FFMPEG_BINARY) is None:
         LOG.warning("ffmpeg binary not found on PATH, returning raw recording", src=src_path)
@@ -243,7 +282,7 @@ async def finalize_webm(src_path: str) -> bytes:
         return await asyncio.to_thread(_read_file, upload_path)
 
 
-async def probe_media_duration_seconds(src_path: str) -> float | None:
+async def probe_media_duration_seconds(src_path: str, *, input_format: str | None = None) -> float | None:
     """Return the media duration in seconds via ffprobe, or None if unavailable.
 
     Used to anchor a session recording on the wall-clock timeline: a recording that
@@ -264,6 +303,7 @@ async def probe_media_duration_seconds(src_path: str) -> float | None:
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
+            *_local_input_args(input_format),
             src_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -273,6 +313,10 @@ async def probe_media_duration_seconds(src_path: str) -> float | None:
         return None
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        await _kill_and_wait_for_process(proc)
+        LOG.warning("ffprobe cancelled", src=src_path)
+        raise
     except asyncio.TimeoutError:
         await _kill_and_wait_for_process(proc)
         LOG.warning("ffprobe timed out", src=src_path, timeout_seconds=FFPROBE_TIMEOUT_SECONDS)
@@ -284,6 +328,128 @@ async def probe_media_duration_seconds(src_path: str) -> float | None:
     except ValueError:
         return None
     return duration if duration > 0 else None
+
+
+async def probe_video_packet_duration_seconds(src_path: str, *, input_format: str | None = None) -> float | None:
+    """Derive duration from video packet timestamps when a container has no Duration field."""
+    if not os.path.exists(src_path):
+        return None
+    if shutil.which(FFPROBE_BINARY) is None:
+        LOG.warning("ffprobe binary not found on PATH", src=src_path)
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFPROBE_BINARY,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time,duration_time",
+            "-of",
+            "csv=p=0",
+            *_local_input_args(input_format),
+            src_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception:
+        LOG.warning("ffprobe packet scan failed to start", src=src_path, exc_info=True)
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        await _kill_and_wait_for_process(proc)
+        LOG.warning("ffprobe packet scan cancelled", src=src_path)
+        raise
+    except asyncio.TimeoutError:
+        await _kill_and_wait_for_process(proc)
+        LOG.warning("ffprobe packet scan timed out", src=src_path, timeout_seconds=FFPROBE_TIMEOUT_SECONDS)
+        return None
+    if proc.returncode != 0:
+        return None
+
+    latest_packet_end = 0.0
+    for raw_line in stdout.decode(errors="replace").splitlines():
+        values = raw_line.split(",")
+        try:
+            pts_seconds = float(values[0])
+        except (IndexError, ValueError):
+            continue
+        try:
+            packet_duration_seconds = max(0.0, float(values[1]))
+        except (IndexError, ValueError):
+            packet_duration_seconds = 0.0
+        latest_packet_end = max(latest_packet_end, pts_seconds + packet_duration_seconds)
+    return latest_packet_end if latest_packet_end > 0 else None
+
+
+async def extract_video_frames_jpeg(
+    src_path: str,
+    *,
+    frames_per_second: int,
+    max_duration_seconds: float,
+    input_format: str | None = None,
+) -> tuple[bytes, ...]:
+    """Decode a bounded video timeline in one ffmpeg process."""
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(src_path)
+    if shutil.which(FFMPEG_BINARY) is None:
+        LOG.warning("ffmpeg binary not found on PATH; skipping video frame extraction", src=src_path)
+        return ()
+
+    frame_dir = tempfile.mkdtemp(prefix="skyvern-video-frames-")
+    output_pattern = os.path.join(frame_dir, "frame-%06d.jpg")
+    try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                FFMPEG_BINARY,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                *_local_input_args(input_format),
+                "-i",
+                src_path,
+                "-t",
+                f"{max_duration_seconds:.3f}",
+                "-map",
+                "0:v:0",
+                "-vf",
+                (
+                    f"fps={frames_per_second}:round=up,"
+                    "scale=768:768:force_original_aspect_ratio=decrease,format=yuvj420p"
+                ),
+                "-q:v",
+                "5",
+                output_pattern,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            LOG.warning("ffmpeg bulk frame extraction failed to start", src=src_path, exc_info=True)
+            return ()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=FFMPEG_CUT_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            await _kill_and_wait_for_process(proc)
+            raise
+        except TimeoutError:
+            await _kill_and_wait_for_process(proc)
+            LOG.warning("ffmpeg bulk frame extraction timed out", src=src_path)
+            return ()
+        if proc.returncode != 0:
+            LOG.warning(
+                "ffmpeg bulk frame extraction failed",
+                src=src_path,
+                returncode=proc.returncode,
+                stderr=stderr.decode(errors="replace")[:500] if stderr else "",
+            )
+            return ()
+        paths = sorted(Path(frame_dir).glob("frame-*.jpg"))
+        return await asyncio.to_thread(_read_files, paths)
+    finally:
+        await asyncio.to_thread(shutil.rmtree, frame_dir, ignore_errors=True)
 
 
 @asynccontextmanager

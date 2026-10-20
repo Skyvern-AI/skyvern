@@ -117,7 +117,7 @@ class PDFImportService:
 
             # A non-null prompt is what makes the editor render the code-first node; "" is
             # runtime-neutral (every backend prompt check is truthiness based) and leaves the
-            # Goal for the user, because a fabricated one would arm runtime self-heal.
+            # Goal for the user, because a fabricated one would arm the AI fallback.
             if blk.get("block_type") == "code" and "prompt" not in blk:
                 blk["prompt"] = ""
 
@@ -143,10 +143,6 @@ class PDFImportService:
                 keys_to_include = sorted(k for k in referenced if k in param_keys)
                 if keys_to_include:
                     blk["parameter_keys"] = keys_to_include
-
-            # Ensure engine where needed
-            if blk.get("block_type") in {"navigation", "action", "extraction", "login", "file_download"}:
-                blk.setdefault("engine", "skyvern-1.0")
 
             # Ensure url exists (can be empty string)
             if blk.get("block_type") in {"navigation", "action", "extraction", "file_download"}:

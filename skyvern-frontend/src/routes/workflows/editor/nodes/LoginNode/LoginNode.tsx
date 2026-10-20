@@ -59,7 +59,6 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
               "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader

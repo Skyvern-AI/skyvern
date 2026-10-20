@@ -106,6 +106,10 @@ vi.mock("./hooks/useWorkflowQuery", () => ({
   }),
 }));
 
+vi.mock("./hooks/useGlobalWorkflowsQuery", () => ({
+  useGlobalWorkflowsQuery: () => ({ data: [], isError: false }),
+}));
+
 vi.mock("./hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: (props: unknown) => mockWorkflowRunsQuery(props),
 }));
@@ -439,4 +443,11 @@ describe("Past Runs list state in the URL", () => {
 
     expect(locationSearch(container)).not.toContain("status=");
   });
+});
+
+it("refetches the history on mount without adding list polling", () => {
+  renderWorkflowPage();
+  const options = mockWorkflowRunsQuery.mock.lastCall?.[0];
+  expect(options.refetchOnMount).toBe("always");
+  expect(options.refetchInterval).toBeUndefined();
 });

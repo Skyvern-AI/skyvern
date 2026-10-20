@@ -59,6 +59,7 @@ if typing.TYPE_CHECKING:
         ClickActionData,
         ClickContext,
         CodeBlock,
+        CodeBlockDataSchema,
         CodeBlockParametersItem,
         CodeBlockParametersItem_AwsSecret,
         CodeBlockParametersItem_AzureSecret,
@@ -74,6 +75,7 @@ if typing.TYPE_CHECKING:
         CodeBlockStep,
         CodeBlockStepYaml,
         CodeBlockYaml,
+        CodeBlockYamlDataSchema,
         ConditionalBlock,
         ConditionalBlockYaml,
         ContextParameter,
@@ -362,6 +364,7 @@ if typing.TYPE_CHECKING:
         NonEmptyPasswordCredential,
         OnePasswordCredentialParameter,
         OnePasswordCredentialParameterYaml,
+        OneTimeDispatchStatus,
         OrganizationScheduleItem,
         OrganizationScheduleListResponse,
         OtpType,
@@ -771,7 +774,7 @@ if typing.TYPE_CHECKING:
         RangeNotSatisfiableError,
         UnprocessableEntityError,
     )
-    from . import agents, schedules, scripts
+    from . import agents, artifacts, schedules, scripts
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .schedules import SchedulesListAllRequestStatus
@@ -831,6 +834,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ClickActionData": ".types",
     "ClickContext": ".types",
     "CodeBlock": ".types",
+    "CodeBlockDataSchema": ".types",
     "CodeBlockParametersItem": ".types",
     "CodeBlockParametersItem_AwsSecret": ".types",
     "CodeBlockParametersItem_AzureSecret": ".types",
@@ -846,6 +850,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CodeBlockStep": ".types",
     "CodeBlockStepYaml": ".types",
     "CodeBlockYaml": ".types",
+    "CodeBlockYamlDataSchema": ".types",
     "ConditionalBlock": ".types",
     "ConditionalBlockYaml": ".types",
     "ConflictError": ".errors",
@@ -1138,6 +1143,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "NotFoundError": ".errors",
     "OnePasswordCredentialParameter": ".types",
     "OnePasswordCredentialParameterYaml": ".types",
+    "OneTimeDispatchStatus": ".types",
     "OrganizationScheduleItem": ".types",
     "OrganizationScheduleListResponse": ".types",
     "OtpType": ".types",
@@ -1544,6 +1550,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowTriggerBlockYaml": ".types",
     "__version__": ".version",
     "agents": ".agents",
+    "artifacts": ".artifacts",
     "schedules": ".schedules",
     "scripts": ".scripts",
 }
@@ -1625,6 +1632,7 @@ __all__ = [
     "ClickActionData",
     "ClickContext",
     "CodeBlock",
+    "CodeBlockDataSchema",
     "CodeBlockParametersItem",
     "CodeBlockParametersItem_AwsSecret",
     "CodeBlockParametersItem_AzureSecret",
@@ -1640,6 +1648,7 @@ __all__ = [
     "CodeBlockStep",
     "CodeBlockStepYaml",
     "CodeBlockYaml",
+    "CodeBlockYamlDataSchema",
     "ConditionalBlock",
     "ConditionalBlockYaml",
     "ConflictError",
@@ -1932,6 +1941,7 @@ __all__ = [
     "NotFoundError",
     "OnePasswordCredentialParameter",
     "OnePasswordCredentialParameterYaml",
+    "OneTimeDispatchStatus",
     "OrganizationScheduleItem",
     "OrganizationScheduleListResponse",
     "OtpType",
@@ -2338,6 +2348,7 @@ __all__ = [
     "WorkflowTriggerBlockYaml",
     "__version__",
     "agents",
+    "artifacts",
     "schedules",
     "scripts",
 ]

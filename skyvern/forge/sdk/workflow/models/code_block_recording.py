@@ -11,6 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -22,7 +23,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
 from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
 
 if TYPE_CHECKING:
@@ -303,6 +304,14 @@ class CodeBlockActionRecording:
             response = masked.get("response")
             if isinstance(response, str):
                 masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+            if (
+                payload.get("action_type") == ActionType.SOLVE_CAPTCHA.value
+                and payload.get("status") == ActionStatus.completed.value
+                and payload.get("response") in ("true", "false")
+            ):
+                # The recorder writes the solver builtin's own boolean here, not user data, and a boolean
+                # parameter's "false" variant would otherwise redact the verdict the copilot reads.
+                masked["response"] = payload["response"]
             # IDs, timestamps, and implicit model defaults come from a snapshot taken before user
             # code can mutate the action. Explicit page/action fields remain masked.
             masked.update(metadata)
@@ -334,16 +343,20 @@ class CodeBlockActionRecording:
 
     async def finalize(self, success: bool) -> None:
         # Finalize both task and step on every exit path (incl. CancelledError via a finally); idempotent.
+        self.recording_page._detach_document_observers()
         if self._task is None or self._finalized:
             return
         self._finalized = True
         try:
-            await app.DATABASE.tasks.update_task(
+            status = TaskStatus.completed if success else TaskStatus.failed
+            lease_lost = await run_lease_lost(self._workflow_run_id)
+            task = await app.DATABASE.tasks.update_task(
                 task_id=self._task.task_id,
                 organization_id=self._organization_id,
-                status=TaskStatus.completed if success else TaskStatus.failed,
+                status=status,
+                keep_final_status=lease_lost,
             )
-            if self._step is not None:
+            if self._step is not None and (not lease_lost or task.status == status):
                 await app.DATABASE.tasks.update_step(
                     task_id=self._task.task_id,
                     step_id=self._step.step_id,

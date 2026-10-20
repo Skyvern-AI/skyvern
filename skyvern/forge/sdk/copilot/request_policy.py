@@ -14,7 +14,6 @@ import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -54,6 +53,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
+    parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
@@ -61,11 +61,13 @@ from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
+    CopilotSteerMessage,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -211,10 +213,7 @@ async def _saved_credential_ids(citations: list[str], organization_id: str) -> s
     connection_ids = {citation for citation in citations if citation.startswith("goac_")}
     verified_ids: set[str] = set()
     if credential_ids:
-        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=organization_id,
-        )
+        credentials = await _load_credentials(organization_id, credential_ids=credential_ids)
         verified_ids.update(credential.credential_id for credential in credentials)
     if connection_ids:
         connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
@@ -386,7 +385,7 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
-async def _screen_raw_secret_safety(
+async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
     *,
@@ -494,9 +493,6 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
-# Matches any final reply containing these substrings, not just credential-blocking
-# ones; safe today because every such emitter routes through _CREDENTIALS_UI_DIRECTIONS.
-_CREDENTIAL_PROMPT_TEXT_MARKERS = ("/credentials", "credentials ui")
 # Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
 RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 RAW_SECRET_QUESTION = (
@@ -887,7 +883,23 @@ class QuestionResponseSiteURLSource:
     kind: Literal["question_response"] = field(default="question_response", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource
+@dataclass(frozen=True)
+class SteerMessageSiteURLSource:
+    steer_id: str
+    kind: Literal["steer_message"] = field(default="steer_message", init=False)
+
+
+@dataclass(frozen=True)
+class DemonstrationNavigationSiteURLSource:
+    kind: Literal["demonstration_navigation"] = field(default="demonstration_navigation", init=False)
+
+
+SiteURLSource = (
+    UserMessageSiteURLSource
+    | QuestionResponseSiteURLSource
+    | SteerMessageSiteURLSource
+    | DemonstrationNavigationSiteURLSource
+)
 
 
 @dataclass(frozen=True)
@@ -952,8 +964,18 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # The model looked up a reference the user wrote and no saved login carries it, so the card settles
+    # the login rather than a page's URL. Sticky for the turn: clearing it on a later match would let a
+    # second site's page bind an unnamed login.
+    named_login_not_found: bool = False
+    # A credential the user named before a refused cross-site fill connected a provider login in its place.
+    # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
+    origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
+    # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
+    # again drops it from live_page_admitted_urls, so the pick card reads it here.
+    carried_credential_urls: dict[str, str] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -961,10 +983,17 @@ class RequestPolicy:
     # The ordinary user message or accepted interactive response each URL came from, so a release
     # records truthful provenance without retaining or logging the response text.
     user_site_url_sources: dict[str, SiteURLSource] = field(default_factory=dict)
+    # Spreadsheet ids from every URL the user wrote, not one per origin: two sheets share an origin.
+    user_provided_spreadsheet_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
+    persisted_workflow_browser_profile_id: str | None = None
+    # The profile saved from the user's own sign-in on this turn's credential card, and its site. It may
+    # seed this turn's test runs before Accept saves it as the workflow's pick.
+    credential_pause_signed_in_profile_id: str | None = None
+    credential_pause_signed_in_site: str | None = None
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
@@ -989,6 +1018,45 @@ class RequestPolicy:
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
+
+    def project_steer_message(self, steer: CopilotSteerMessage) -> None:
+        # A delivered steer is more of the current user turn, so exact credential citations read it too.
+        self.canonical_user_message = f"{self.canonical_user_message}\n{steer.text}".strip()
+        if steer.raw_secret_detected:
+            self.apply_raw_secret_redacted_draft()
+            return
+        _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
+
+    def project_demonstration_navigation(self, url: str) -> None:
+        _project_user_provided_sites(
+            self,
+            [_SiteURLText(text=url, source=DemonstrationNavigationSiteURLSource())],
+            reset=False,
+        )
+
+    @property
+    def raw_secret_redacted_draft(self) -> bool:
+        return self.raw_secret_detected and self.raw_secret_handling == "redacted_draft"
+
+    def record_named_login_not_found(self) -> list[str]:
+        """Returns the ids of logins the server bound without the user naming them, which are withdrawn."""
+        self.named_login_not_found = True
+        # A page, this turn or the one before, may have bound its own login before the model looked the
+        # name up. One the user named, approved earlier or saved in the workflow stays; a carry the model
+        # only cited does not, because naming a different login declines it.
+        settled = (
+            self.current_turn_named_credential_ids
+            | self.prior_approved_credential_ids
+            | set(self.persisted_workflow_credential_ids)
+        )
+        withdrawn = sorted({credential.credential_id for credential in self.auto_bound_credentials} - settled)
+        self.resolved_credentials = [c for c in self.resolved_credentials if c.credential_id not in withdrawn]
+        self.auto_bound_credentials = [c for c in self.auto_bound_credentials if c.credential_id not in withdrawn]
+        # Leaving the carry's id here would renew the withdrawn proposal for the next turn.
+        self.seeded_proposal_credential_ids.difference_update(withdrawn)
+        for credential_id in withdrawn:
+            self.live_page_admitted_urls.pop(credential_id, None)
+        return withdrawn
 
     def apply_raw_secret_redacted_draft(self) -> None:
         self.raw_secret_detected = True
@@ -1034,6 +1102,7 @@ class RequestPolicy:
             "raw_secret_safety_failure_kind": self.raw_secret_safety_failure_kind,
             "raw_secret_safety_citation_count": self.raw_secret_safety_citation_count,
             "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
+            "named_login_not_found": self.named_login_not_found,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
@@ -1181,18 +1250,15 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
     )
 
 
-def credential_prompt_reason(policy: RequestPolicy | None, final_text: str | None) -> str | None:
-    # Typed clarification_reason wins, then the explicit-defer flag — narrowly, since
-    # allow_missing_credentials_in_draft alone also covers the generic skip_test
-    # fallthrough with no credential involvement — then a text marker.
-    if isinstance(policy, RequestPolicy):
-        if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
-            return policy.clarification_reason
-        if policy.credential_draft_deferred_explicitly:
-            return "credential_deferred_draft"
-    normalized = " ".join((final_text or "").lower().split())
-    if any(marker in normalized for marker in _CREDENTIAL_PROMPT_TEXT_MARKERS):
-        return "assistant_directed"
+def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
+    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
+    # also covers the generic skip_test fallthrough with no credential involvement.
+    if not isinstance(policy, RequestPolicy):
+        return None
+    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+        return policy.clarification_reason
+    if policy.credential_draft_deferred_explicitly:
+        return "credential_deferred_draft"
     return None
 
 
@@ -4160,12 +4226,32 @@ def _accepted_question_response_url_texts(interaction: QuestionInteraction) -> l
     return [_SiteURLText(text=text, source=source) for text in texts]
 
 
+def _steer_message_url_texts(steer: CopilotSteerMessage) -> list[_SiteURLText]:
+    if steer.raw_secret_detected or steer.delivered_at is None:
+        return []
+    return [_SiteURLText(text=steer.text, source=SteerMessageSiteURLSource(steer_id=steer.steer_id))]
+
+
+def _persisted_steer_message_url_texts(raw_steer: dict[str, Any]) -> list[_SiteURLText]:
+    try:
+        return _steer_message_url_texts(CopilotSteerMessage.model_validate(raw_steer))
+    except ValidationError:
+        return []
+
+
 def _persisted_question_response_url_texts(raw_interaction: dict[str, Any]) -> list[_SiteURLText]:
     try:
         interaction = QuestionInteraction.model_validate(raw_interaction)
     except ValidationError:
         return []
     return _accepted_question_response_url_texts(interaction)
+
+
+def _spreadsheet_id_in_url(url: str) -> str | None:
+    try:
+        return extract_spreadsheet_id(url)
+    except ValueError:
+        return None
 
 
 def _project_user_provided_sites(
@@ -4178,12 +4264,18 @@ def _project_user_provided_sites(
     if reset:
         policy.user_provided_site_urls = []
         policy.user_site_url_sources = {}
+        policy.user_provided_spreadsheet_ids = []
     seen_origins = {parts[2] for url in policy.user_provided_site_urls if (parts := _url_parts(url)) is not None}
     for item in url_texts:
         for candidate in URL_CANDIDATE_RE.findall(item.text):
             cleaned = candidate.rstrip(".,;:!?")
             parts = _url_parts(cleaned)
-            if parts is None or parts[2] in seen_origins:
+            if parts is None:
+                continue
+            spreadsheet_id = _spreadsheet_id_in_url(cleaned)
+            if spreadsheet_id is not None and spreadsheet_id not in policy.user_provided_spreadsheet_ids:
+                policy.user_provided_spreadsheet_ids.append(spreadsheet_id)
+            if parts[2] in seen_origins:
                 continue
             seen_origins.add(parts[2])
             policy.user_provided_site_urls.append(cleaned)
@@ -4202,10 +4294,10 @@ def _ground_user_provided_sites(
     user_message: str,
     full_chat_history: Sequence[WorkflowCopilotChatHistoryMessage],
 ) -> None:
-    """Rebuild the URL facts the person supplied in USER rows and accepted question responses.
+    """Rebuild the URL facts the person supplied in USER rows, accepted question responses and delivered steers.
 
     Linking a later site name back to a URL is the agent's job. This projection only verifies URLs
-    in the two structured user-authored text surfaces; prompts, choices, rendered history, and
+    in the three structured user-authored text surfaces; prompts, choices, rendered history, and
     PRODUCT or AI prose never become credential-origin authority.
     """
     url_texts: list[_SiteURLText] = []
@@ -4223,6 +4315,8 @@ def _ground_user_provided_sites(
             continue
         for raw_interaction in message.narrative_payload.get("questionInteractions", []):
             url_texts.extend(_persisted_question_response_url_texts(raw_interaction))
+        for raw_steer in message.narrative_payload.get("steerMessages", []):
+            url_texts.extend(_persisted_steer_message_url_texts(raw_steer))
     if user_message:
         url_texts.append(
             _SiteURLText(
@@ -4260,14 +4354,12 @@ async def _seed_prior_approved_credentials(
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
         if record.credential_id in approved_ids and record.admitted_url:
             policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.carried_credential_urls.setdefault(record.credential_id, record.admitted_url)
             policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        missing_ids,
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4292,10 +4384,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [seed.credential_id],
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4303,6 +4392,7 @@ async def _seed_proposed_credential(
     # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
     # still skips it rather than promoting a one-turn carry to durable approval.
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.
@@ -4347,7 +4437,7 @@ def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
     Callers that must pay for evidence — a browser read, a credential load — check this first so a
     turn that could never admit does not buy the evidence to decide it.
     """
-    return not policy.raw_secret_detected
+    return not policy.raw_secret_detected and not policy.named_login_not_found
 
 
 def _live_page_url_abstains(
@@ -4391,8 +4481,13 @@ async def _resolve_live_page_credentials(
     """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
     if not live_page_credentials_admissible(policy) or not page_url:
         return None
+    credentials = await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id))
+    # Tool calls in one model response run concurrently, so a lookup can close page binding while this
+    # load is awaited. Callers record the admission without another await, so re-read it here.
+    if not live_page_credentials_admissible(policy):
+        return None
     return resolve_by_url(
-        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
+        credentials,
         [page_url],
         # The scout reached this page, so its own path is the evidence; a bare host match would let
         # any other page on that host — a profile, an upload, a user-content route — claim the login.
@@ -4677,6 +4772,13 @@ async def _build_request_policy_bootstrap(
         canonical_user_message=(redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message),
     )
     policy.persisted_workflow_credential_ids = sorted(workflow_credential_ids(persisted_workflow_yaml or ""))
+    persisted_workflow = parse_workflow_yaml(persisted_workflow_yaml) if persisted_workflow_yaml else None
+    persisted_browser_profile_id = (
+        persisted_workflow.get("browser_profile_id") if isinstance(persisted_workflow, dict) else None
+    )
+    policy.persisted_workflow_browser_profile_id = (
+        persisted_browser_profile_id if isinstance(persisted_browser_profile_id, str) else None
+    )
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
@@ -4744,7 +4846,7 @@ async def _build_request_policy_bootstrap(
     # the safety-approved redacted draft update-only and prevents a browser run.
     if policy.raw_secret_detected:
         policy.allow_run_blocks = False
-        redacted_draft_candidate = policy.raw_secret_handling == "redacted_draft"
+        redacted_draft_candidate = policy.raw_secret_redacted_draft
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 
@@ -4802,7 +4904,7 @@ async def build_request_policy_trust_floor(
     selected_connected_account_id: str | None = None,
 ) -> RequestPolicy:
     del config
-    safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
+    safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
     # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it

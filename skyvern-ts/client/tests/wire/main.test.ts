@@ -3681,6 +3681,190 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("extend_browser_session (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { additional_minutes: 1 };
+        const rawResponseBody = {
+            browser_session_id: "pbs_123456",
+            organization_id: "organization_id",
+            status: "status",
+            runnable_type: "runnable_type",
+            runnable_id: "runnable_id",
+            timeout: 1,
+            browser_address: "browser_address",
+            app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
+            browser_profile_id: "browser_profile_id",
+            generate_browser_profile: true,
+            vnc_streaming_supported: true,
+            download_path: "download_path",
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            recordings: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            started_at: "2024-01-15T09:30:00Z",
+            completed_at: "2024-01-15T09:30:00Z",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_sessions/pbs_123456/extend")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.extendBrowserSession("pbs_123456", {
+            additional_minutes: 1,
+        });
+        expect(response).toEqual({
+            browser_session_id: "pbs_123456",
+            organization_id: "organization_id",
+            status: "status",
+            runnable_type: "runnable_type",
+            runnable_id: "runnable_id",
+            timeout: 1,
+            browser_address: "browser_address",
+            app_url: "app_url",
+            extensions: ["ad-blocker"],
+            browser_type: "msedge",
+            browser_profile_id: "browser_profile_id",
+            generate_browser_profile: true,
+            vnc_streaming_supported: true,
+            download_path: "download_path",
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            recordings: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            started_at: "2024-01-15T09:30:00Z",
+            completed_at: "2024-01-15T09:30:00Z",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("extend_browser_session (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { additional_minutes: 1 };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_sessions/browser_session_id/extend")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(403)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.extendBrowserSession("browser_session_id", {
+                additional_minutes: 1,
+            });
+        }).rejects.toThrow(Skyvern.ForbiddenError);
+    });
+
+    test("extend_browser_session (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { additional_minutes: 1 };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_sessions/browser_session_id/extend")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.extendBrowserSession("browser_session_id", {
+                additional_minutes: 1,
+            });
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("extend_browser_session (4)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { additional_minutes: 1 };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_sessions/browser_session_id/extend")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(409)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.extendBrowserSession("browser_session_id", {
+                additional_minutes: 1,
+            });
+        }).rejects.toThrow(Skyvern.ConflictError);
+    });
+
+    test("extend_browser_session (5)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { additional_minutes: 1 };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/browser_sessions/browser_session_id/extend")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.extendBrowserSession("browser_session_id", {
+                additional_minutes: 1,
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("get_browser_session (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });

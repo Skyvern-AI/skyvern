@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -13,9 +17,15 @@ from skyvern.exceptions import (
     ScrapingFailed,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
+    TaskTerminationError,
 )
+from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 
@@ -47,6 +57,7 @@ def mock_organization() -> Any:
 @pytest.fixture
 def mock_app() -> Any:
     app = MagicMock()
+    app.AGENT_FUNCTION.validate_task_execution = AsyncMock()
     workflow_run = MagicMock(workflow_run_id="wr_test", workflow_id="w_test")
     workflow = MagicMock(workflow_id="w_test", workflow_permanent_id="wpid_test", title="t")
     task = MagicMock(task_id="tsk_test", organization_id="o_test", max_screenshot_scrolls=None)
@@ -59,6 +70,55 @@ def mock_app() -> Any:
     app.DATABASE.observer.create_workflow_run_block = AsyncMock()
     app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context = AsyncMock()
     return app
+
+
+# An hour of margin keeps the derived age at 10 whole days however long the suite takes to reach the test.
+_CREATED_TEN_DAYS_AGO = datetime.now(timezone.utc) - timedelta(days=10, hours=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_age", "created_at", "expected"),
+    [
+        (3, _CREATED_TEN_DAYS_AGO, 3),
+        (0, _CREATED_TEN_DAYS_AGO, 0),
+        (None, _CREATED_TEN_DAYS_AGO, 10),
+        (None, None, None),
+    ],
+    ids=["preserve-parent", "preserve-same-day-parent", "derive-age", "none-timestamp"],
+)
+async def test_sdk_action_keeps_org_age_in_execution_context(
+    mock_request: Any, mock_app: Any, parent_age: int | None, created_at: datetime | None, expected: int | None
+) -> None:
+    organization = SimpleNamespace(organization_id="o_test", created_at=created_at)
+    observed: list[int | None] = []
+
+    async def capture_context(**_kwargs: object) -> dict[str, bool]:
+        context = skyvern_context.current()
+        observed.append(context.org_age if context else None)
+        return {"clicked": True}
+
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock(return_value=MagicMock())))
+    page_ai = MagicMock(ai_click=AsyncMock(side_effect=capture_context))
+    mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+    skyvern_context.reset()
+    skyvern_context.set(skyvern_context.SkyvernContext(org_age=parent_age))
+    try:
+        with (
+            patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+                new_callable=AsyncMock,
+                return_value=scraped_page,
+            ),
+            patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        ):
+            response = await run_sdk_action(mock_request, organization=organization)
+    finally:
+        skyvern_context.reset()
+
+    assert response.result == {"clicked": True}
+    assert observed == [expected]
 
 
 @pytest.mark.asyncio
@@ -137,6 +197,44 @@ async def test_caller_provided_run_keeps_general_task_type(
 
     assert mock_app.DATABASE.tasks.create_task.await_args.kwargs["task_type"] == TaskType.general
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_is_live_here", "expected_attempt"),
+    [(False, 2), (True, 3)],
+    ids=["run_owned_by_another_process", "run_live_in_this_process"],
+)
+async def test_caller_provided_run_stamps_the_current_attempt(
+    mock_request: Any, mock_organization: Any, mock_app: Any, run_is_live_here: bool, expected_attempt: int
+) -> None:
+    """A retried run owned by another process has no local context; the durable rows decide."""
+    mock_app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=run_is_live_here)
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number = MagicMock(return_value=3)
+    mock_app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(
+        return_value=[MagicMock(attempt_number=1), MagicMock(attempt_number=2)]
+    )
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock()
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop inside action"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop inside action"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert mock_app.DATABASE.tasks.create_task.await_args.kwargs["attempt_number"] == expected_attempt
+    assert mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs["attempt_number"] == expected_attempt
+    assert mock_app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context.await_args.kwargs["attempt_number"] == (
+        expected_attempt
+    )
+    assert mock_app.DATABASE.workflow_run_attempts.get_attempts.await_count == (0 if run_is_live_here else 1)
 
 
 @pytest.mark.asyncio
@@ -506,6 +604,128 @@ async def test_context_refcount_released_when_upload_drain_is_cancelled(
     mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context.assert_called_once_with("wr_test")
 
 
+async def _run_action_watching_session_activity(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> tuple[RealBrowserManager, list[list[Any]], list[Any]]:
+    """Run one inline action and report the liveness stamps that landed while it was in flight."""
+    manager = RealBrowserManager()
+    mock_app.BROWSER_MANAGER = manager
+    touch = AsyncMock()
+    stamps_before_browser_work: list[list[Any]] = []
+    stamped_during_action: list[Any] = []
+
+    async def act(*_: Any, **__: Any) -> Any:
+        stamps_before_browser_work.append(touch.await_args_list.copy())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        stamped_during_action.extend(touch.await_args_list)
+        raise RuntimeError("stop once the action is in flight")
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch("skyvern.webeye.real_browser_manager.app") as browser_app,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=act,
+        ),
+    ):
+        browser_app.DATABASE.browser_sessions.touch_last_activity = touch
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        try:
+            with pytest.raises(RuntimeError, match="stop once the action is in flight"):
+                await run_sdk_action(mock_request, organization=mock_organization)
+        finally:
+            if manager._session_activity_renewer is not None:
+                manager._session_activity_renewer.cancel()
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+    return manager, stamps_before_browser_work, stamped_during_action
+
+
+@pytest.mark.asyncio
+async def test_inline_action_renews_the_session_it_drives(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # SKY-16256: the synthetic run stores no lease, so nothing stamped last_activity_at and the
+    # session Pod — which ends a session on that mark alone — closed the browser mid-action.
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=MagicMock())
+
+    manager, stamps_before_browser_work, stamped_during_action = await _run_action_watching_session_activity(
+        mock_request, mock_organization, mock_app
+    )
+
+    assert stamps_before_browser_work == [[call("pbs_sdk")]]
+    assert stamped_during_action == [call("pbs_sdk")]
+    # The renewal is bounded by the request: nothing keeps the session alive once the action returns.
+    assert manager._renewable_session_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_inline_action_does_not_renew_a_session_the_caller_does_not_own(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    # The session id is client-supplied and the touch is org-unscoped, so an unowned id must not buy
+    # a stranger's browser another timeout window.
+    mock_request.browser_session_id = "pbs_not_ours"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
+
+    _, stamps_before_browser_work, stamped_during_action = await _run_action_watching_session_activity(
+        mock_request, mock_organization, mock_app
+    )
+
+    assert stamps_before_browser_work == [[]]
+    assert stamped_during_action == []
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session.assert_awaited_with("pbs_not_ours", "o_test")
+
+
+@pytest.mark.asyncio
+async def test_sdk_action_ownership_read_failure_creates_no_task(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(
+        side_effect=RuntimeError("database unavailable")
+    )
+
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app), pytest.raises(RuntimeError, match="database unavailable"):
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sdk_action_initial_stamp_failure_marks_task_failed(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.browser_session_id = "pbs_sdk"
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=MagicMock())
+    manager = RealBrowserManager()
+    mock_app.BROWSER_MANAGER = manager
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.webeye.real_browser_manager.app") as browser_app,
+        pytest.raises(RuntimeError, match="activity table unavailable"),
+    ):
+        browser_app.DATABASE.browser_sessions.touch_last_activity = AsyncMock(
+            side_effect=RuntimeError("activity table unavailable")
+        )
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    mock_app.DATABASE.tasks.update_task.assert_awaited_once_with(
+        task_id="tsk_test",
+        organization_id="o_test",
+        status=TaskStatus.failed,
+        failure_reason="activity table unavailable",
+    )
+    assert manager._renewable_session_ids() == set()
+    assert "wr_test" not in _sdk_action_context_refcounts
+
+
 async def _run_upload_action(
     mock_request: Any, mock_organization: Any, mock_app: Any, file_url: str
 ) -> tuple[Any, HTTPException | None]:
@@ -559,6 +779,34 @@ async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
     page_ai.ai_upload_file.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_ai_upload_file_route_accepts_a_local_storage_upload_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """upload_file hands a local-storage client its file:// URI; the gate must honor it as that upload."""
+    storage = LocalStorage(artifact_path=str(tmp_path / "artifacts"))
+    upload_uri, _ = await storage.save_legacy_file(
+        organization_id="o_test", filename="file_1_resume.pdf", fileObj=io.BytesIO(b"%PDF")
+    )
+    rows = {("o_test", upload_uri): SimpleNamespace(file_id="file_1")}
+
+    async def by_uri(storage_uri: str, organization_id: str) -> SimpleNamespace | None:
+        return rows.get((organization_id, storage_uri))
+
+    monkeypatch.setattr(forge_app, "STORAGE", storage)
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(uploaded_files=SimpleNamespace(get_uploaded_file_by_storage_uri=by_uri)),
+    )
+
+    page_ai, rejection = await _run_upload_action(mock_request, mock_organization, mock_app, upload_uri)
+
+    assert rejection is None
+    # The upload handler only accepts a file URL that appears in the task payload, which holds the URI.
+    assert page_ai.ai_upload_file.await_args.kwargs["files"] == upload_uri
+
+
 class _RejectingSlot:
     def __init__(self, organization_id: str) -> None:
         self._organization_id = organization_id
@@ -584,6 +832,22 @@ async def test_action_over_the_concurrency_cap_is_rejected_before_any_run_is_cre
             await run_sdk_action(mock_request, organization=mock_organization)
 
     assert rejected.value.status_code == 429
+    mock_app.AGENT_FUNCTION.validate_task_execution.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_awaited()
     mock_app.DATABASE.tasks.create_task.assert_not_awaited()
     mock_app.DATABASE.tasks.create_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_credit_refusal_creates_no_task(mock_request: Any, mock_organization: Any, mock_app: Any) -> None:
+    mock_app.AGENT_FUNCTION.validate_task_execution = AsyncMock(
+        side_effect=TaskTerminationError(reason="Not enough credit balance.")
+    )
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert exc_info.value.status_code == 402
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()

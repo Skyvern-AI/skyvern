@@ -3,15 +3,21 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AppNode } from "../editor/nodes";
+import {
+  makeCollapseKey,
+  useNodeCollapseStore,
+} from "../editor/collapse/useNodeCollapseStore";
 import { START_ANCHOR_TOP_PX } from "../editor/paneFit";
 import {
   BLOCK_JUMP_DURATION_MS,
   BRANCH_SETTLE_STABLE_FRAMES,
   BRANCH_SETTLE_TIMEOUT_MS,
+  beginFocusGeneration,
   blockJumpDuration,
   collectBlockSearchTargets,
   filterBlockSearchTargets,
   focusBlockTarget,
+  invalidateFocusGeneration,
   resolveConditionalBranchPath,
   resolveContainerAncestorLabels,
   waitForNodeSettle,
@@ -554,6 +560,111 @@ describe("focusBlockTarget", () => {
     );
   });
 
+  describe("centered framing", () => {
+    // loginNode sits at y=100 and is 200 tall, so its center is at flow y=200.
+    function centeredDeps(overrides?: Partial<FocusBlockDeps>) {
+      return makeDeps(nodes, {
+        framing: "centered",
+        getPaneHeight: () => 800,
+        getPaneTopInset: () => 112,
+        ...overrides,
+      });
+    }
+
+    test("centers the block in the band below the floating header and zooms in", async () => {
+      const deps = centeredDeps();
+      await focusBlockTarget("login-node", deps);
+      expect(deps.setViewport).toHaveBeenCalledWith(
+        { x: 500 - 200, y: 112 + (800 - 112) / 2 - 200, zoom: 1 },
+        { duration: 300 },
+      );
+    });
+
+    test("the landed block clears the header instead of hiding under it", async () => {
+      const deps = centeredDeps();
+      await focusBlockTarget("login-node", deps);
+      const [viewport] = vi.mocked(deps.setViewport).mock.calls[0]!;
+      // Screen-space top edge of the block after the pan.
+      const screenTop = 100 * viewport.zoom + viewport.y;
+      expect(screenTop).toBeGreaterThan(112);
+    });
+
+    test("only ever zooms in, so an already-close view is not yanked back", async () => {
+      const deps = centeredDeps({ viewportZoom: 1.5 });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.setViewport).toHaveBeenCalledWith(
+        { x: 500 - 300, y: 112 + (800 - 112) / 2 - 300, zoom: 1.5 },
+        { duration: 300 },
+      );
+    });
+
+    test("reads the inset at landing time, so a collapsed header reclaims the band", async () => {
+      const deps = centeredDeps({ getPaneTopInset: () => 0 });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.setViewport).toHaveBeenCalledWith(
+        { x: 500 - 200, y: 400 - 200, zoom: 1 },
+        { duration: 300 },
+      );
+    });
+
+    test("measures the block after its expansion settles, not while collapsed", async () => {
+      // 76 collapsed -> 400 expanded, the shape "Collapse all blocks" produces.
+      let height = 76;
+      const deps = centeredDeps({
+        getInternalNode: () => ({
+          internals: { positionAbsolute: { x: 0, y: 100 } },
+          measured: { width: 400, height },
+        }),
+        waitForSettle: vi.fn().mockImplementation(async () => {
+          height = 400;
+        }),
+      });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.waitForSettle).toHaveBeenCalledWith("login-node");
+      const calls = vi.mocked(deps.setViewport).mock.calls;
+      const [viewport] = calls[calls.length - 1]!;
+      // Centered on the EXPANDED box: 456 - (100 + 400/2) = 156.
+      expect(viewport.y).toBe(156);
+      const screenCenter = (100 + 400 / 2) * viewport.zoom + viewport.y;
+      expect(screenCenter).toBe(112 + (800 - 112) / 2);
+    });
+
+    test("top-anchored framing skips the settle wait", async () => {
+      const deps = makeDeps(nodes, { getPaneHeight: () => 800 });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.waitForSettle).not.toHaveBeenCalled();
+    });
+
+    test("falls back to the top anchor when the pane height is unknown", async () => {
+      const deps = centeredDeps({ getPaneHeight: () => 0 });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.setViewport).toHaveBeenCalledWith(
+        {
+          x: 1000 / 2 - (0 + 200) * 0.75,
+          y: START_ANCHOR_TOP_PX - 100 * 0.75,
+          zoom: 0.75,
+        },
+        { duration: 300 },
+      );
+    });
+
+    test("leaves the default (studio search) framing top-anchored", async () => {
+      const deps = makeDeps(nodes, {
+        getPaneHeight: () => 800,
+        getPaneTopInset: () => 112,
+      });
+      await focusBlockTarget("login-node", deps);
+      expect(deps.setViewport).toHaveBeenCalledWith(
+        {
+          x: 1000 / 2 - (0 + 200) * 0.75,
+          y: START_ANCHOR_TOP_PX - 100 * 0.75,
+          zoom: 0.75,
+        },
+        { duration: 300 },
+      );
+    });
+  });
+
   test("refuses unknown ids and utility nodes without side effects", async () => {
     const deps = makeDeps();
     await expect(focusBlockTarget("missing-node", deps)).resolves.toBe(false);
@@ -862,5 +973,87 @@ describe("focusBlockTarget — collapsed container ancestors", () => {
     expect(deps.expandBlock).toHaveBeenCalledTimes(1);
     expect(deps.expandBlock).toHaveBeenCalledWith("Orphan");
     expect(deps.waitForSettle).not.toHaveBeenCalled();
+  });
+});
+
+describe("beginFocusGeneration", () => {
+  afterEach(() => {
+    useNodeCollapseStore.setState({ collapsed: {} });
+    localStorage.clear();
+  });
+
+  test("the current run stays current until a newer one begins", () => {
+    const counter = { current: 0 };
+    const first = beginFocusGeneration(counter);
+    expect(first()).toBe(true);
+
+    const second = beginFocusGeneration(counter);
+    // A rapid second Locate supersedes the first, whichever resolves last.
+    expect(first()).toBe(false);
+    expect(second()).toBe(true);
+
+    const third = beginFocusGeneration(counter);
+    expect(second()).toBe(false);
+    expect(third()).toBe(true);
+  });
+
+  test("does not write persisted collapse state after unmount settles a locate", async () => {
+    const workflowId = "workflow";
+    const container = {
+      id: "container",
+      type: "loop",
+      position: { x: 0, y: 0 },
+      data: { label: "Container" },
+    } as AppNode;
+    const target = {
+      id: "target",
+      type: "task",
+      parentId: container.id,
+      position: { x: 0, y: 100 },
+      hidden: true,
+      data: { label: "Target" },
+    } as AppNode;
+    useNodeCollapseStore.setState({
+      collapsed: {
+        [makeCollapseKey(workflowId, container.data.label)]: true,
+        [makeCollapseKey(workflowId, target.data.label)]: true,
+      },
+    });
+    let settle: () => void = () => undefined;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const generation = { current: 0 };
+    const isCurrent = beginFocusGeneration(generation);
+    const focus = focusBlockTarget(target.id, {
+      getNodes: () => [container, target],
+      getInternalNode: () => undefined,
+      getPaneWidth: () => 1000,
+      viewportZoom: 1,
+      duration: 0,
+      setViewport: vi.fn(),
+      selectBlock: vi.fn(),
+      expandBlock: (label) => {
+        if (isCurrent()) {
+          useNodeCollapseStore.getState().expandBlock(workflowId, label);
+        }
+      },
+      waitForSettle: () => settled,
+      switchBranch: vi.fn(),
+    });
+
+    await Promise.resolve();
+    const beforeUnmount = useNodeCollapseStore.getState().collapsed;
+    const persistedBeforeUnmount = localStorage.getItem(
+      "skyvern:node-collapse",
+    );
+    invalidateFocusGeneration(generation);
+    settle();
+    await focus;
+
+    expect(useNodeCollapseStore.getState().collapsed).toEqual(beforeUnmount);
+    expect(localStorage.getItem("skyvern:node-collapse")).toBe(
+      persistedBeforeUnmount,
+    );
   });
 });

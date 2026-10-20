@@ -1,8 +1,20 @@
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from skyvern.forge.agent import _LLM_STEP_EXCEPTIONS, _require_actions_payload
+from skyvern.forge.agent import (
+    _LLM_STEP_EXCEPTIONS,
+    _require_actions_payload,
+    _terminate_action_from_llm_error_code,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMResponseMissingActionsError
 from skyvern.forge.sdk.api.llm.utils import _coerce_response_to_dict
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.models import StepStatus
+from skyvern.webeye.actions.handler import handle_terminate_action
+from tests.unit.helpers import make_organization, make_step, make_task
 
 
 @pytest.mark.parametrize(
@@ -145,3 +157,63 @@ def test_missing_actions_error_is_recognized_as_llm_step_failure():
     # actions guard on the code-level failure-reason path instead of the
     # LLM-fabricated one.
     assert LLMResponseMissingActionsError.__name__ in _LLM_STEP_EXCEPTIONS
+
+
+def _task_and_step(error_code_mapping):
+    now = datetime.now()
+    task = make_task(now, make_organization(now), error_code_mapping=error_code_mapping)
+    return task, make_step(now, task, step_id="step-1", status=StepStatus.running, order=0, output=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mapping_key", "llm_codes"),
+    [
+        ("website_down", {"code": "WEBSITE_DOWN"}),
+        # A single-token key is not recoverable from reasoning text, so it must survive extraction some other way.
+        ("maintenance", {"code": "Maintenance"}),
+        # An unmapped `code` must not hide a mapped `error_code`.
+        ("website_down", {"code": 503, "error_code": "website_down"}),
+    ],
+)
+async def test_empty_actions_with_mapped_error_code_terminates_with_that_code(mapping_key, llm_codes):
+    # The model named a mapped code outside `actions` and planned nothing. The
+    # synthesized TERMINATE must keep the code through handle_terminate_action even when the
+    # surfacing extractor finds nothing, or the task retries to REACH_MAX_RETRIES instead.
+    task, step = _task_and_step({mapping_key: "The site is down or under maintenance"})
+    json_response = {
+        "actions": [],
+        # Model text can echo a secret typed earlier in the run; it must not reach persisted errors.
+        "error": {**llm_codes, "reasoning": "Down after entering one-time code 918273."},
+    }
+
+    action = _terminate_action_from_llm_error_code(task, step, json_response)
+
+    assert action is not None
+    assert [error.error_code for error in action.errors] == [mapping_key]
+    assert "918273" not in action.reasoning + "".join(error.reasoning for error in action.errors)
+    scraped_page = MagicMock()
+    scraped_page.refresh = AsyncMock(return_value=MagicMock(url="https://example.com", screenshots=[]))
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        patch("skyvern.webeye.actions.handler.get_action_history", AsyncMock(return_value=[])),
+        patch(
+            "skyvern.webeye.actions.handler.get_org_aware_primary_llm_api_handler",
+            return_value=AsyncMock(return_value={"errors": []}),
+        ),
+    ):
+        await handle_terminate_action(action, MagicMock(), scraped_page, task, step)
+    assert [error.error_code for error in action.errors] == [mapping_key]
+
+
+@pytest.mark.parametrize(
+    "json_response",
+    [
+        {"actions": []},
+        {"actions": [], "error": {"code": "not_in_mapping", "reasoning": "x"}},
+        {"actions": [], "error": "website_down"},
+    ],
+)
+def test_empty_actions_without_mapped_error_code_is_not_terminated(json_response):
+    task, step = _task_and_step({"website_down": "The site is down or under maintenance"})
+    assert _terminate_action_from_llm_error_code(task, step, json_response) is None

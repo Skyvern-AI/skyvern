@@ -150,6 +150,7 @@ from .response_network import (
 from .response_storage import format_storage_response
 from .response_workflow import format_workflow_response
 from .schedule import (
+    skyvern_schedule_cancel,
     skyvern_schedule_create,
     skyvern_schedule_delete,
     skyvern_schedule_disable,
@@ -225,9 +226,17 @@ def _add_argument_validation_middleware() -> None:
     from .argument_validation import MCPArgumentValidationMiddleware  # noqa: PLC0415
 
     # Registered after telemetry so telemetry stays the outermost wrapper and
-    # still records the call; this one is innermost and rejects malformed
-    # arguments before dispatch runs (and logs a raw pydantic error).
+    # still records the call; this one rejects malformed arguments before
+    # dispatch runs (and logs a raw pydantic error).
     mcp.add_middleware(MCPArgumentValidationMiddleware())
+
+
+def _add_stateless_connection_middleware() -> None:
+    if _FASTMCP_IMPORT_ERROR is not None:
+        return
+    from .connection_scope import MCPStatelessConnectionMiddleware  # noqa: PLC0415
+
+    mcp.add_middleware(MCPStatelessConnectionMiddleware())
 
 
 # -- Tool annotation factories --
@@ -266,6 +275,7 @@ mcp = _FastMCP(
 )
 _add_telemetry_middleware()
 _add_argument_validation_middleware()
+_add_stateless_connection_middleware()
 
 # -- Browser session management --
 mcp.tool(tags={"session", "lean"}, annotations=_mut("Create Browser Session"))(skyvern_browser_session_create)
@@ -515,6 +525,7 @@ mcp.tool(tags={"schedule"}, annotations=_mut("Create Workflow Schedule"))(skyver
 mcp.tool(tags={"schedule"}, annotations=_mut("Update Workflow Schedule"))(skyvern_schedule_update)
 mcp.tool(tags={"schedule"}, annotations=_mut("Enable Workflow Schedule"))(skyvern_schedule_enable)
 mcp.tool(tags={"schedule"}, annotations=_mut("Disable Workflow Schedule"))(skyvern_schedule_disable)
+mcp.tool(tags={"schedule"}, annotations=_dest("Cancel One-Time Workflow Schedule"))(skyvern_schedule_cancel)
 mcp.tool(tags={"schedule"}, annotations=_dest("Delete Workflow Schedule"))(skyvern_schedule_delete)
 
 # -- Script/caching tools (no browser needed) --
@@ -664,6 +675,7 @@ __all__ = [
     "skyvern_schedule_update",
     "skyvern_schedule_enable",
     "skyvern_schedule_disable",
+    "skyvern_schedule_cancel",
     "skyvern_schedule_delete",
     # Script/caching
     "skyvern_script_list_for_workflow",

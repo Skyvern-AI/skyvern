@@ -1,18 +1,207 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { copyText } from "@/util/copyText";
 import { type ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { type StudioWorkspaceProps } from "./EditorTab";
 import { type StudioPaneId } from "./panes";
 import { paneAccessibleName } from "./paneMeta";
-import { StudioPane } from "./StudioShell";
+import { paneExpansionKeyframes } from "./paneLayout";
+import {
+  advanceRecordingStopLifecycle,
+  panesAfterRecordingTransition,
+} from "./recordingPaneLifecycle";
+import {
+  EmbeddedBrowserOverlays,
+  StudioPane,
+  StudioShell,
+} from "./StudioShell";
 
-vi.mock("@/util/copyText", () => ({ copyText: vi.fn() }));
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: vi.fn(), captureException: vi.fn() }),
+}));
+vi.mock("@/hooks/useLogging", () => ({
+  useLogging: () => ({ error: vi.fn() }),
+}));
+vi.mock("./BrowserPaneHeader", () => ({
+  BrowserPaneActions: () => null,
+  BrowserPaneViewPills: () => null,
+}));
+vi.mock("./CopilotPaneHeader", () => ({
+  CopilotActiveDot: () => null,
+  CopilotPaneControls: () => null,
+  CopilotPaneStatus: () => null,
+}));
+vi.mock("./EditorPaneHeader", () => ({
+  EditorPaneBlockSearch: () => null,
+  EditorPaneModeToggle: () => null,
+}));
+vi.mock("./BrowserTab", () => ({ BrowserTab: () => null }));
+vi.mock("./EditorTab", () => ({ EditorTab: () => null }));
+vi.mock("./RunTab", () => ({ RunTab: () => null }));
+vi.mock("./runview/RunPaneHeader", () => ({
+  RunPaneActions: () => null,
+  RunPaneViewToggles: () => null,
+}));
+vi.mock("./StudioBrowserStream", () => ({ StudioBrowserStream: () => null }));
+vi.mock("./StudioStageLauncher", () => ({ StudioStageLauncher: () => null }));
+vi.mock("./StudioTopBar", () => ({ StudioTopBar: () => null }));
+vi.mock("./StudioWorkflowPanels", () => ({ StudioWorkflowPanels: () => null }));
 
-const mockedCopyText = vi.mocked(copyText);
+vi.mock("./useRunVisuals", () => ({
+  useRunVisuals: () => ({
+    recordingArchived: true,
+    recordingUrls: [],
+  }),
+}));
+vi.mock("../workflowRun/WorkflowRunVerificationCodeForm", () => ({
+  WorkflowRunVerificationCodeForm: ({
+    workflowRunId,
+  }: {
+    workflowRunId: string | undefined;
+  }) => <div data-testid="verification-form">{workflowRunId}</div>,
+}));
+
+describe("EmbeddedBrowserOverlays", () => {
+  test("keeps verification available in screenshot-only browser views", () => {
+    render(
+      <EmbeddedBrowserOverlays runId="wr_1" showArchivedRecording={false} />,
+    );
+
+    expect(screen.getByTestId("verification-form").textContent).toBe("wr_1");
+    expect(screen.queryByText("Recording archived")).toBeNull();
+  });
+});
+
+describe("StudioShell inspected run header", () => {
+  test("keeps the run pane header plain when a run is inspected", () => {
+    const runId = "wr_synthetic_inspected_run";
+    const props = {
+      workflow: {
+        workflow_permanent_id: "wpid_synthetic",
+        organization_id: "org_synthetic",
+        deleted_at: null,
+        workflow_definition: { blocks: [] },
+      },
+      initialTitle: "Synthetic workflow",
+    } as unknown as StudioWorkspaceProps;
+
+    render(
+      <MemoryRouter
+        initialEntries={[`/workflows/wpid_synthetic/studio?wr=${runId}`]}
+      >
+        <StudioShell {...props} />
+      </MemoryRouter>,
+    );
+
+    const header = screen.getByRole("group", { name: "Run pane header" });
+    expect(within(header).getByText("Run", { exact: true })).toBeTruthy();
+    expect(header.textContent).toBe("Run");
+    expect(
+      within(header).queryByRole("button", { name: "Copy to clipboard" }),
+    ).toBeNull();
+  });
+});
+
+describe("panesAfterRecordingTransition", () => {
+  test("replaces the Editor with Browser and Copilot when recording starts", () => {
+    expect(
+      panesAfterRecordingTransition(["overview", "editor"], "started"),
+    ).toEqual(["overview", "browser", "copilot"]);
+  });
+
+  test("replaces Browser with Editor when a recording starts processing", () => {
+    expect(
+      panesAfterRecordingTransition(
+        ["overview", "copilot", "browser"],
+        "processing",
+      ),
+    ).toEqual(["overview", "editor", "copilot"]);
+  });
+
+  test("restores Editor but leaves Browser open when recording is discarded", () => {
+    expect(
+      panesAfterRecordingTransition(["copilot", "browser"], "ended"),
+    ).toEqual(["browser", "editor", "copilot"]);
+  });
+
+  test("remembers zero-action Done without leaking into the next Discard", () => {
+    let lifecycle = advanceRecordingStopLifecycle(false, {
+      isRecording: true,
+      wasRecording: false,
+      finishRequested: false,
+      processingRecording: false,
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: true,
+      wasRecording: true,
+      finishRequested: true,
+      processingRecording: true,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: true,
+      transition: null,
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: false,
+      wasRecording: true,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: false,
+      transition: "processing",
+    });
+
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: true,
+      wasRecording: false,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
+      isRecording: false,
+      wasRecording: true,
+      finishRequested: false,
+      processingRecording: false,
+    });
+    expect(lifecycle).toEqual({
+      finishWasRequested: false,
+      transition: "ended",
+    });
+  });
+
+  test("does not duplicate panes already in the requested layout", () => {
+    expect(
+      panesAfterRecordingTransition(
+        ["copilot", "browser", "editor"],
+        "started",
+      ),
+    ).toEqual(["browser", "copilot"]);
+  });
+});
+
+describe("paneExpansionKeyframes", () => {
+  test("grows from the pane's current bounds into its final bounds", () => {
+    expect(
+      paneExpansionKeyframes(
+        { left: 260, top: 100, width: 300, height: 500 },
+        { left: 20, top: 40, width: 1000, height: 600 },
+      ),
+    ).toEqual([
+      {
+        transform: "translate(240px, 60px) scale(0.3, 0.8333333333333334)",
+        transformOrigin: "top left",
+      },
+      { transform: "none", transformOrigin: "top left" },
+    ]);
+  });
+});
 
 // Chromium aborts a native drag when the DOM mutates inside the dragstart
 // task, so the reorder state (drop overlays, source dim) must engage on a
@@ -23,12 +212,25 @@ describe("StudioPane header", () => {
 
   const renderPane = ({
     id = "copilot",
-    runId,
     headerActions,
+    expanded = false,
+    expansionTransitioning = false,
+    onToggleExpanded = vi.fn(),
+    transitionFromBounds,
+    onTransitionEnd,
   }: {
     id?: StudioPaneId;
-    runId?: string;
     headerActions?: ReactNode;
+    expanded?: boolean;
+    expansionTransitioning?: boolean;
+    onToggleExpanded?: () => void;
+    transitionFromBounds?: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    };
+    onTransitionEnd?: () => void;
   } = {}) => {
     const reorder = {
       draggingId: null,
@@ -42,12 +244,16 @@ describe("StudioPane header", () => {
       <TooltipProvider delayDuration={0}>
         <StudioPane
           id={id}
-          runId={runId}
           open
           order={0}
           flex={undefined}
           reorder={reorder}
           onClose={vi.fn()}
+          expanded={expanded}
+          expansionTransitioning={expansionTransitioning}
+          onToggleExpanded={onToggleExpanded}
+          transitionFromBounds={transitionFromBounds}
+          onTransitionEnd={onTransitionEnd}
           headerActions={headerActions}
         >
           <div>content</div>
@@ -70,6 +276,9 @@ describe("StudioPane header", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    Reflect.deleteProperty(HTMLElement.prototype, "animate");
   });
 
   test("gives each pane a clear two-pixel outline", () => {
@@ -77,6 +286,123 @@ describe("StudioPane header", () => {
 
     expect(pane.className).toContain("border-2");
     expect(pane.className).toContain("border-border");
+  });
+
+  test("expands a pane to the full studio stage from its header", () => {
+    const onToggleExpanded = vi.fn();
+    const { pane } = renderPane({ onToggleExpanded });
+    const expand = screen.getByRole("button", {
+      name: "Expand Copilot pane",
+    });
+
+    expect(expand.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(expand);
+
+    expect(onToggleExpanded).toHaveBeenCalledTimes(1);
+    expect(pane.className).not.toContain("absolute");
+  });
+
+  test("restores an expanded pane to the multi-pane layout", () => {
+    const onToggleExpanded = vi.fn();
+    const { pane } = renderPane({ expanded: true, onToggleExpanded });
+    const restore = screen.getByRole("button", {
+      name: "Restore Copilot pane",
+    });
+
+    expect(restore.getAttribute("aria-pressed")).toBe("true");
+    expect(pane.className).toContain("absolute");
+    expect(pane.className).toContain("inset-3");
+    fireEvent.click(restore);
+
+    expect(onToggleExpanded).toHaveBeenCalledTimes(1);
+  });
+
+  test("prevents another fullscreen toggle during the transition", () => {
+    const onToggleExpanded = vi.fn();
+    renderPane({ expansionTransitioning: true, onToggleExpanded });
+    const expand = screen.getByRole("button", {
+      name: "Expand Copilot pane",
+    });
+
+    expect(expand.getAttribute("aria-disabled")).toBe("true");
+    expect((expand as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(expand);
+    expect(onToggleExpanded).not.toHaveBeenCalled();
+  });
+
+  test("animates from the measured pane bounds over 200ms", () => {
+    const animation = {
+      cancel: vi.fn(),
+      onfinish: null,
+    } as unknown as Animation;
+    const animate = vi.fn(() => animation);
+    Object.defineProperty(HTMLElement.prototype, "animate", {
+      configurable: true,
+      value: animate,
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      left: 20,
+      top: 40,
+      width: 1000,
+      height: 600,
+    } as DOMRect);
+    const onTransitionEnd = vi.fn();
+
+    renderPane({
+      transitionFromBounds: {
+        left: 260,
+        top: 100,
+        width: 300,
+        height: 500,
+      },
+      onTransitionEnd,
+    });
+
+    expect(animate).toHaveBeenCalledWith(
+      paneExpansionKeyframes(
+        { left: 260, top: 100, width: 300, height: 500 },
+        { left: 20, top: 40, width: 1000, height: 600 },
+      ),
+      {
+        duration: 200,
+        easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+        fill: "both",
+      },
+    );
+    animation.onfinish?.(new Event("finish") as AnimationPlaybackEvent);
+    expect(onTransitionEnd).toHaveBeenCalledTimes(1);
+  });
+
+  test("finishes immediately when reduced motion is preferred", () => {
+    const animate = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "animate", {
+      configurable: true,
+      value: animate,
+    });
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn(() => ({ matches: true })),
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      left: 20,
+      top: 40,
+      width: 1000,
+      height: 600,
+    } as DOMRect);
+    const onTransitionEnd = vi.fn();
+
+    renderPane({
+      transitionFromBounds: {
+        left: 260,
+        top: 100,
+        width: 300,
+        height: 500,
+      },
+      onTransitionEnd,
+    });
+
+    expect(animate).not.toHaveBeenCalled();
+    expect(onTransitionEnd).toHaveBeenCalledTimes(1);
   });
 
   test("dragstart sets the drag payload synchronously but engages reorder on a later task", () => {
@@ -121,36 +447,13 @@ describe("StudioPane header", () => {
     expect(reorder.onStart).not.toHaveBeenCalled();
   });
 
-  test("a drag starting on the run id copy control is prevented", () => {
-    const { reorder, header } = renderPane({
-      id: "overview",
-      runId: "wr_5574abcdef",
-    });
+  test("the run pane header stays plain and has no copy action", () => {
+    renderPane({ id: "overview" });
 
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: "Copy to clipboard" }),
-    );
-    const notPrevented = fireEvent.dragStart(header, {
-      dataTransfer: dataTransfer(),
-    });
-
-    expect(notPrevented).toBe(false);
-    vi.runAllTimers();
-    expect(reorder.onStart).not.toHaveBeenCalled();
-  });
-
-  test("shows the full run id on hover and copies it from the header control", () => {
-    const runId = "wr_5574abcdef";
-    renderPane({ id: "overview", runId });
-
-    expect(screen.getByText("Run: wr_5574…")).toBeTruthy();
-    const fullRunId = screen.getByText(`Run: ${runId}`);
-    expect(fullRunId.getAttribute("title")).toBe(`Run: ${runId}`);
-    expect(fullRunId.className).toContain("truncate");
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
-
-    expect(mockedCopyText).toHaveBeenCalledWith(runId);
+    expect(screen.getByText("Run")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Copy to clipboard" }),
+    ).toBeNull();
   });
 
   test("groups pane utilities separately from close", () => {

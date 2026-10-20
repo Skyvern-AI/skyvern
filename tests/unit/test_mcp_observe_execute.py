@@ -1035,6 +1035,7 @@ class TestSkyvernObserveMCP:
             interactive_only=False,
             max_elements=7,
             include_values=False,
+            propagate_page_change=True,
         )
 
     @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Sequence, cast
+from urllib.parse import quote
 
 import libcst as cst
 import structlog
@@ -35,6 +36,8 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     ScriptNotFound,
     ScriptTerminationException,
+    StepTerminationError,
+    TaskNotFound,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -52,16 +55,23 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
+from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
-from skyvern.forge.sdk.workflow.context_manager import BlockMetadata
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, register_secret_derived_output
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    InsecureCodeDetected,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.loop_download_filter import (
     filter_downloaded_files_for_current_iteration as _filter_downloaded_files_for_current_iteration,
 )
@@ -102,7 +112,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
     CreateScriptResponse,
@@ -117,10 +127,15 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileDownloadTarget, FileStorageType, FileType
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.utils.script_file_paths import SCRIPT_FILE_PATH_ERROR, normalize_script_file_path
+from skyvern.utils.templating import reject_jinja_transformations_on_variable
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction, reasoning_is_turn_scoped
-from skyvern.webeye.cdp_download_interceptor import download_filename_from_suffix
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    download_filename_from_suffix,
+)
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -463,14 +478,10 @@ async def load_scripts(
     script: Script,
     script_files: list[ScriptFile],
 ) -> set[str]:
-    """Copy the revision's files locally and return the paths actually written by THIS call.
+    """Copy a revision's files locally and return the paths actually written by this call.
 
-    Callers must gate on the returned set rather than os.path.exists: TEMP_PATH is reused across
-    runs and keyed by script_id rather than revision, so a file on disk may belong to an earlier
-    run whose code has since been retention-deleted. Absence from the set means "this run has no
-    code for that path", which is the only question the caller can answer from here -- a retention
-    deletion and an exhausted-retry S3 failure both surface as empty content and are not
-    distinguishable at this layer.
+    Callers gate on this set rather than os.path.exists because a failed or expired artifact read
+    must not let a cached copy stand in for a file that was not loaded for this revision.
     """
     organization_id = script.organization_id
     written: set[str] = set()
@@ -483,7 +494,7 @@ async def load_scripts(
             LOG.error("Artifact not found", artifact_id=file.artifact_id, script_id=script.script_id)
             continue
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
-        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
+        file_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, file.file_path)
         if not file_content:
             continue
         # create the directory if it doesn't exist
@@ -510,6 +521,15 @@ async def load_scripts(
     return written
 
 
+def _validate_stored_script_sources(main_script_path: str) -> None:
+    main_path = Path(main_script_path)
+    if not main_path.is_file():
+        raise InsecureCodeDetected("stored script files are unavailable")
+    for script_path in main_path.parent.rglob("*"):
+        if script_path.is_file() and script_path.suffix.lower() == ".py":
+            is_safe_script_code(script_path.read_text(encoding="utf-8"))
+
+
 async def execute_script(
     script_id: str,
     organization_id: str,
@@ -532,7 +552,7 @@ async def execute_script(
     )
 
     # step 3: copy the script files to the local directory
-    await load_scripts(script, script_files)
+    written_paths = await load_scripts(script, script_files)
 
     # step 4: execute the script
     if workflow_run_id and not parameters:
@@ -540,7 +560,10 @@ async def execute_script(
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
-    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
+    script_path = os.path.join(settings.TEMP_PATH, script.script_id, script.script_revision_id, "main.py")
+    if script_path not in written_paths:
+        LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
+        raise Exception(f"Script main.py not found at {script_path}")
 
     if background_tasks:
         # Execute asynchronously in background
@@ -556,19 +579,15 @@ async def execute_script(
         )
     else:
         # Execute synchronously
-        if os.path.exists(script_path):
-            await run_script(
-                script_path,
-                parameters=parameters,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-                script_id=script_id,
-                script_revision_id=script.script_revision_id,
-            )
-        else:
-            LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
-            raise Exception(f"Script main.py not found at {script_path}")
+        await run_script(
+            script_path,
+            parameters=parameters,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+            script_id=script_id,
+            script_revision_id=script.script_revision_id,
+        )
 
     LOG.info("Script executed successfully", script_id=script_id)
 
@@ -654,6 +673,7 @@ async def _create_workflow_block_run_and_task(
 
     workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
         workflow_run_id=workflow_run_id,
+        attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
         parent_workflow_run_block_id=context.parent_workflow_run_block_id,
         organization_id=organization_id,
         block_type=block_type,
@@ -690,12 +710,15 @@ async def _create_workflow_block_run_and_task(
             # (e.g. file upload) can find URLs like resume_link in the payload,
             # plus the current loop value so a fallback search uses the intended value.
             nav_payload = _build_fallback_navigation_payload(context)
+            terminate_criterion, error_code_mapping = await _resolve_block_termination_config(label)
             task = await app.DATABASE.tasks.create_task(
                 # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
                 url=url or "",
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
                 complete_criterion=None,
+                terminate_criterion=terminate_criterion,
+                error_code_mapping=error_code_mapping,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
                 extracted_information_schema=schema,
                 navigation_payload=nav_payload,
@@ -704,6 +727,7 @@ async def _create_workflow_block_run_and_task(
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
+                attempt_number=app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id),
                 model=model,
                 # always use the action history for validation in caching/script run
                 include_action_history_in_verification=True,
@@ -769,6 +793,21 @@ async def _create_workflow_block_run_and_task(
             admitted = await app.AGENT_FUNCTION.admit_recipe_step_attempt(task, step, is_cached=True)
             if not admitted:
                 raise RuntimeError("Recipe step was not admitted")
+        else:
+            try:
+                await app.AGENT_FUNCTION.validate_step_execution(task, step)
+            except StepTerminationError as e:
+                await _update_workflow_block(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=e.message,
+                    step_id=step_id,
+                    step_status=StepStatus.failed,
+                    label=label,
+                )
+                raise
 
     # The agent path settles a prior failed block's owned capture in execute_safe; a cached
     # successor reaches the same browser here, so it settles it before its own reads. Kept above
@@ -925,6 +964,8 @@ async def _handle_script_termination(
             step_status=StepStatus.failed,
             label=cache_key,
             failure_reason=str(e),
+            user_defined_errors=e.user_defined_errors,
+            error_codes=[error.error_code for error in e.user_defined_errors or []],
         )
 
 
@@ -940,6 +981,8 @@ async def _update_workflow_block(
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
     ai_fallback_triggered: bool | None = None,
+    user_defined_errors: list[UserDefinedError] | None = None,
+    error_codes: list[str] | None = None,
 ) -> None:
     """Update workflow_run_block status, optionally setting `script_run`.
 
@@ -964,6 +1007,7 @@ async def _update_workflow_block(
 
         final_output = output
         if task_id:
+            lease_lost = await run_lease_lost(context.workflow_run_id)
             if step_id:
                 # Build step output from script actions similar to agent flow
                 step_output = None
@@ -982,6 +1026,30 @@ async def _update_workflow_block(
                         errors=errors,
                     )
 
+                if not lease_lost:
+                    await app.DATABASE.tasks.update_step(
+                        step_id=step_id,
+                        task_id=task_id,
+                        organization_id=context.organization_id,
+                        status=step_status,
+                        is_last=is_last,
+                        output=step_output,
+                    )
+            if lease_lost and not task_status.is_final():
+                updated_task = await app.DATABASE.tasks.get_task(task_id, context.organization_id)
+                if updated_task is None:
+                    raise TaskNotFound(task_id)
+            else:
+                updated_task = await app.DATABASE.tasks.update_task(
+                    task_id=task_id,
+                    organization_id=context.organization_id,
+                    status=task_status,
+                    failure_reason=failure_reason,
+                    extracted_information=output,
+                    errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
+                    keep_final_status=lease_lost,
+                )
+            if lease_lost and step_id and updated_task.status == task_status:
                 await app.DATABASE.tasks.update_step(
                     step_id=step_id,
                     task_id=task_id,
@@ -990,17 +1058,12 @@ async def _update_workflow_block(
                     is_last=is_last,
                     output=step_output,
                 )
-            updated_task = await app.DATABASE.tasks.update_task(
-                task_id=task_id,
-                organization_id=context.organization_id,
-                status=task_status,
-                failure_reason=failure_reason,
-                extracted_information=output,
-            )
+            if run_lease_tasks_enabled() and lease_lost:
+                return
             downloaded_files: list[FileInfo] = []
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    downloaded_files = await app.STORAGE.get_downloaded_files(
+                    downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
                         organization_id=context.organization_id,
                         run_id=context.workflow_run_id,
                     )
@@ -1009,6 +1072,7 @@ async def _update_workflow_block(
             downloaded_files = _filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 context.loop_internal_state,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
 
             task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
@@ -1059,7 +1123,9 @@ async def _update_workflow_block(
             # final_output is already set to `output` at line 596.
             pass
 
-        await app.DATABASE.observer.update_workflow_run_block(
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
+        updated_block = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=context.organization_id if context else None,
             status=status,
@@ -1068,6 +1134,19 @@ async def _update_workflow_block(
             ai_fallback_triggered=ai_fallback_triggered,
         )
 
+        # The row carries the block label even when the caller passed none (a cached wait block).
+        if updated_block.label:
+            try:
+                app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).record_block_outcome(
+                    updated_block.label, status, error_codes or [], failure_reason
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record cached block outcome", workflow_run_block_id=workflow_run_block_id, exc_info=True
+                )
+
+        if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
+            return
         recorded_output_parameter = await _record_output_parameter_value(
             context.workflow_run_id,
             context.workflow_id,
@@ -1409,12 +1488,25 @@ async def _detect_user_defined_errors(
         return []
 
 
-def _resolve_original_block_engine(cache_key: str, workflow: Workflow) -> RunEngine | None:
+def _resolve_original_block_engine(cache_key: str, workflow: Workflow, workflow_run_id: str | None) -> RunEngine | None:
     # Recursive: a cached block inside a for/while loop must keep its engine too (labels are
-    # validated globally unique, so the first match is the block).
+    # validated globally unique, so the first match is the block). Resolved rather than read, so an
+    # unset engine follows the run's routing like the block itself would.
     for block in get_all_blocks(workflow.workflow_definition.blocks):
         if block.label == cache_key:
-            return block.engine if isinstance(block, BaseTaskBlock) else None
+            return block.resolve_engine(workflow_run_id) if isinstance(block, BaseTaskBlock) else None
+    return None
+
+
+def _script_block_engine(workflow: Workflow, label: str) -> RunEngine | None:
+    # In a run that honors chosen engines the helper's block carries the stored choice, pin or unset. Elsewhere
+    # unset routes exactly as the skyvern-1.0 these helpers used to set, so nothing changes before the cutoff.
+    context = skyvern_context.current()
+    if not run_honors_chosen_engine(context.workflow_run_id if context else None):
+        return None
+    for block in get_all_blocks(workflow.workflow_definition.blocks):
+        if block.label == label and isinstance(block, BaseTaskBlock):
+            return block.engine
     return None
 
 
@@ -1533,8 +1625,8 @@ async def _fallback_to_ai_run(
 
             # Update workflow block with failure reason (include detected errors if any)
             task_failure_reason = str(error)
-            if detected_errors:
-                error_codes = [e.error_code for e in detected_errors]
+            error_codes = [e.error_code for e in detected_errors]
+            if error_codes:
                 task_failure_reason = f"{task_failure_reason}. Detected errors: {', '.join(error_codes)}"
 
             if workflow_run_block_id:
@@ -1549,6 +1641,7 @@ async def _fallback_to_ai_run(
                     step_id=script_step_id,
                     step_status=StepStatus.failed,
                     label=cache_key,
+                    error_codes=error_codes,
                 )
             return
 
@@ -1662,7 +1755,7 @@ async def _fallback_to_ai_run(
         # Inherit the original block's engine when the caller left it at default; fail open to v1 on any miss.
         if engine == RunEngine.skyvern_v1:
             try:
-                resolved_engine = _resolve_original_block_engine(cache_key, workflow)
+                resolved_engine = _resolve_original_block_engine(cache_key, workflow, workflow_run_id)
                 if resolved_engine is not None and resolved_engine != RunEngine.skyvern_v1:
                     engine = resolved_engine
                     LOG.debug(
@@ -1701,6 +1794,15 @@ async def _fallback_to_ai_run(
             complete_verification=complete_verification,
             include_action_history_in_verification=include_action_history_in_verification,
         )
+        if workflow_run_block_id and engine == RunEngine.skyvern_v3:
+            # The row was created for cached code with no engine; script generation and the reviewer
+            # read this column to keep a v3 run's actions out of the workflow's script. Not swallowed:
+            # a v3 fallback whose row still reads v1 could be minted into a dead-selector script.
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                engine=engine.value,
+            )
         await app.agent.execute_step(
             organization=organization,
             task=task,
@@ -1727,6 +1829,11 @@ async def _fallback_to_ai_run(
                 task = refreshed_task
             if task.status in [TaskStatus.terminated, TaskStatus.failed]:
                 failure_reason = task.failure_reason
+            error_codes = [
+                error["error_code"]
+                for error in task.errors or []
+                if isinstance(error, dict) and isinstance(error.get("error_code"), str)
+            ]
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
@@ -1734,6 +1841,7 @@ async def _fallback_to_ai_run(
                 failure_reason=failure_reason,
                 label=cache_key,
                 ai_fallback_triggered=True,
+                error_codes=error_codes,
             )
 
         # 5. After successful AI execution, regenerate the script block and create new version
@@ -2172,6 +2280,37 @@ def _find_block_definition(blocks: list[Any], label: str) -> Any | None:
     return None
 
 
+async def _resolve_block_termination_config(label: str | None) -> tuple[str | None, dict[str, str] | None]:
+    context = skyvern_context.current()
+    if (
+        not label
+        or not context
+        or not context.workflow_id
+        or not context.organization_id
+        or not context.workflow_run_id
+    ):
+        return None, None
+    workflow = await app.DATABASE.workflows.get_workflow(
+        workflow_id=context.workflow_id, organization_id=context.organization_id
+    )
+    if not workflow:
+        return None, None
+    block = _find_block_definition(workflow.workflow_definition.blocks, label)
+    if not isinstance(block, BaseTaskBlock):
+        return None, None
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+    criterion = block.terminate_criterion
+    if criterion:
+        criterion = block.render_templatable_field("terminate_criterion", criterion, workflow_run_context)
+    mapping = block.error_code_mapping
+    workflow_mapping = workflow.workflow_definition.error_code_mapping
+    if mapping or workflow_mapping:
+        mapping = block._render_error_code_mapping(
+            mapping, workflow_mapping, workflow_run_context, for_generated_code=False
+        )
+    return criterion, mapping
+
+
 async def _resolve_block_otp_config(
     label: str | None,
     totp_identifier: str | None,
@@ -2304,7 +2443,7 @@ async def run_task(
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
-            engine=RunEngine.skyvern_v1,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             model=model,
         )
         block_output = await task_block.execute_safe(
@@ -2437,6 +2576,40 @@ async def download(
         )
         navigation_prompt = _render_template_with_label(navigation_prompt, cache_key)
         context = skyvern_context.ensure_context()
+        context.download_suffix_applied_files.clear()
+        if download_suffix:
+            workflow_values = (
+                app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id).values
+                if context.workflow_run_id
+                else {}
+            )
+            script_parameters = context.script_run_parameters
+            if not (
+                isinstance(workflow_values, dict)
+                and ORIGINAL_FILENAME_TEMPLATE_VARIABLE in workflow_values
+                or isinstance(script_parameters, dict)
+                and ORIGINAL_FILENAME_TEMPLATE_VARIABLE in script_parameters
+            ):
+                reject_jinja_transformations_on_variable(
+                    download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
+        cached_download_suffix = (
+            quote(
+                _render_template_with_label(
+                    download_suffix,
+                    cache_key,
+                    extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
+                ),
+                safe="",
+            )
+            if download_suffix
+            else None
+        )
+        previous_download_suffix = context.download_suffix
+        # Cached downloads use the CDP target-path hook too, so stamp the suffix before the click for provenance.
+        context.download_suffix = cached_download_suffix
         file_download_block: FileDownloadBlock | None = None
         storage_type: FileStorageType | None = None
         destination_delivery_started = False
@@ -2502,6 +2675,17 @@ async def download(
             context.workflow_run_id or ""
         )
 
+        attempt_started_at = await get_download_retry_started_at(context.organization_id, download_run_id)
+
+        def current_attempt_local_files(directory: Path) -> list[str]:
+            if not directory.exists():
+                return []
+            return [
+                file_path
+                for file_path in list_files_in_directory(directory)
+                if attempt_started_at is None or is_file_from_retry_attempt(file_path, attempt_started_at)
+            ]
+
         try:
             await _prepare_cached_block_inputs(cache_key, navigation_prompt)
 
@@ -2529,7 +2713,7 @@ async def download(
 
             # Track local files before download for renaming with download_suffix
             local_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            local_files_before = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+            local_files_before = current_attempt_local_files(local_download_dir)
             local_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in local_files_before:
                 try:
@@ -2550,6 +2734,7 @@ async def download(
                 download_dir=local_download_dir,
                 organization_id=org_id,
                 browser_session_id=context.browser_session_id,
+                attempt_started_at=attempt_started_at,
             )
 
             # Poll local filesystem for newly downloaded files.
@@ -2582,7 +2767,7 @@ async def download(
             while True:
                 _now = _loop.time()
                 _elapsed = _now - _poll_start
-                _local_files_now = list_files_in_directory(local_download_dir) if local_download_dir.exists() else []
+                _local_files_now = current_attempt_local_files(local_download_dir)
                 _new_files = [file_path for file_path in _local_files_now if file_path not in local_files_before]
                 _changed_files = []
                 for file_path in _local_files_now:
@@ -2658,30 +2843,36 @@ async def download(
             # Rename runs BEFORE S3 upload so that remote storage receives the
             # correctly-named file and subsequent blocks get the right URLs.
             # This matches the agent path ordering in agent.py.
-            if download_suffix and local_download_dir.exists():
-                local_files_after = list_files_in_directory(local_download_dir)
+            if cached_download_suffix and local_download_dir.exists():
+                local_files_after = current_attempt_local_files(local_download_dir)
                 files_to_rename = [file_path for file_path in newly_downloaded_files if file_path in local_files_after]
                 newly_downloaded_files = []
                 for file_path in files_to_rename:
-                    file_extension = Path(file_path).suffix
+                    local_basename = Path(file_path).name
                     # Skip incomplete downloads
-                    if file_extension == BROWSER_DOWNLOADING_SUFFIX:
+                    if Path(local_basename).suffix == BROWSER_DOWNLOADING_SUFFIX:
                         continue
+                    applied_download = context.download_suffix_applied_files.get(local_basename)
+                    file_extension = Path(applied_download[0] if applied_download else local_basename).suffix
                     if not file_extension:
-                        file_extension = recover_download_extension(file_path, download_suffix)
+                        file_extension = recover_download_extension(file_path, cached_download_suffix)
                         if file_extension:
                             LOG.info(
                                 "Recovered missing download file extension from file content",
                                 file=file_path,
                                 extension=file_extension,
                             )
-                    local_basename = Path(file_path).name
                     existing_names = {
                         Path(f).name
                         for f in list_files_in_directory(local_download_dir)
                         if Path(f).name != local_basename
                     }
-                    desired_name = download_filename_from_suffix(download_suffix, file_extension, existing_names)
+                    desired_name = download_filename_from_suffix(
+                        cached_download_suffix,
+                        file_extension,
+                        existing_names,
+                        original_filename=applied_download[0] if applied_download else local_basename,
+                    )
                     # context suffix fields are omitted: cached-script mode bakes the suffix into the
                     # generated script (no per-step contextvar stamping), so there is no task_block-vs-
                     # context divergence to attribute; task_id/block_label give per-download attribution.
@@ -2694,7 +2885,7 @@ async def download(
                         finalize_task_id=task_id,
                         block_label=cache_key,
                         pre_rename_filename_fp=diagnostic_fingerprint(local_basename),
-                        passed_download_suffix_fp=diagnostic_fingerprint(download_suffix),
+                        passed_download_suffix_fp=diagnostic_fingerprint(cached_download_suffix),
                         desired_name_fp=diagnostic_fingerprint(desired_name),
                         will_rename=local_basename != desired_name,
                     )
@@ -2809,9 +3000,7 @@ async def download(
 
             LOG.warning("Failed to run download block. Falling back to AI run.", exc_info=True)
             fallback_download_dir = get_path_for_workflow_download_directory(download_run_id)
-            fallback_files_before = (
-                list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-            )
+            fallback_files_before = current_attempt_local_files(fallback_download_dir)
             fallback_file_signatures_before: dict[str, tuple[int, int]] = {}
             for file_path in fallback_files_before:
                 try:
@@ -2826,15 +3015,13 @@ async def download(
                 url=url,
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
-                download_suffix=download_suffix,
+                download_suffix=cached_download_suffix,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
             if file_download_block is not None and storage_type is not None:
-                fallback_files_after = (
-                    list_files_in_directory(fallback_download_dir) if fallback_download_dir.exists() else []
-                )
+                fallback_files_after = current_attempt_local_files(fallback_download_dir)
                 fallback_downloaded_files = []
                 for file_path in fallback_files_after:
                     signature_before = fallback_file_signatures_before.get(file_path)
@@ -2884,6 +3071,7 @@ async def download(
                     raise
         finally:
             context.prompt = None
+            context.download_suffix = previous_download_suffix
             _clear_cached_block_overrides(cache_key)
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
@@ -2897,7 +3085,7 @@ async def download(
             totp_identifier=totp_identifier,
             totp_verification_url=totp_url,
             include_action_history_in_verification=True,
-            engine=RunEngine.skyvern_v1,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             model=model,
             download_suffix=download_suffix,
             **destination_block_kwargs,
@@ -2985,6 +3173,7 @@ async def action(
         block_validation_output = await _validate_and_get_output_parameter(label)
         action_block = ActionBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             output_parameter=block_validation_output.output_parameter,
             task_type=TaskType.action,
             url=url,
@@ -3077,6 +3266,7 @@ async def login(
         block_validation_output = await _validate_and_get_output_parameter(label)
         login_block = LoginBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             output_parameter=block_validation_output.output_parameter,
             url=url,
             navigation_goal=prompt,
@@ -3085,6 +3275,7 @@ async def login(
             totp_verification_url=totp_url,
             model=model,
         )
+        login_block._built_by_script = True
         await login_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
@@ -3157,6 +3348,7 @@ async def extract(
         block_validation_output = await _validate_and_get_output_parameter(label)
         extraction_block = ExtractionBlock(
             label=block_validation_output.label,
+            engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
             url=url,
             data_extraction_goal=prompt,
             max_steps_per_run=max_steps,
@@ -3264,6 +3456,7 @@ async def execute_validation(
     block_validation_output = await _validate_and_get_output_parameter(label)
     validation_block = ValidationBlock(
         label=block_validation_output.label,
+        engine=_script_block_engine(block_validation_output.workflow, block_validation_output.label),
         output_parameter=block_validation_output.output_parameter,
         task_type=TaskType.validation,
         complete_criterion=complete_criterion,
@@ -3403,6 +3596,18 @@ async def run_script(
     spec = importlib.util.spec_from_file_location("user_script", path)
     if not spec or not spec.loader:
         raise Exception(f"Failed to import script from {path}")
+    if script_id is not None:
+        try:
+            _validate_stored_script_sources(path)
+        except Exception as exc:
+            LOG.warning(
+                "Refusing to load unsafe stored script body",
+                script_id=script_id,
+                script_revision_id=script_revision_id,
+                reason="safety_validation_failed",
+                error_type=type(exc).__name__,
+            )
+            raise InsecureCodeDetected("stored script safety validation failed") from None
     user_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(user_script)
 
@@ -3437,7 +3642,9 @@ async def run_script(
                 LOG.warning("Failed to clean up script browser resources", script_id=script_id, exc_info=True)
 
 
-def _render_template_with_label(template: str, label: str | None = None) -> str:
+def _render_template_with_label(
+    template: str, label: str | None = None, *, extra_template_data: dict[str, Any] | None = None
+) -> str:
     template_data = {}
     context = skyvern_context.current()
     if context and context.workflow_run_id:
@@ -3475,6 +3682,8 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
             template_data["current_date"] = datetime.now(timezone.utc).strftime(CURRENT_DATE_FORMAT)
         if "browser_session_id" not in template_data:
             template_data["browser_session_id"] = workflow_run_context.browser_session_id or ""
+    if extra_template_data:
+        template_data = {**extra_template_data, **template_data}
     return render_template(template, data=template_data)
 
 
@@ -3487,6 +3696,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     template_data = data.copy() if data else {}
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
+    run_secrets: dict[str, Any] | None = None
     if context:
         template_data.update(context.script_run_parameters)
         if context.workflow_run_id:
@@ -3495,6 +3705,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             template_data.update(workflow_run_context.values)
             if template in template_data:
                 return template_data[template]
+            run_secrets = workflow_run_context.secrets
         # Inject for_loop / while_loop metadata (current_value, current_index, current_item) so
         # that cached function bodies inside script loops can resolve {{ current_value }}
         # in page.goto() and other template-rendered calls. while_loop only sets current_index.
@@ -3502,7 +3713,10 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             for key in ("current_value", "current_index", "current_item"):
                 if key in context.loop_metadata:
                     template_data[key] = context.loop_metadata[key]
-    return jinja_template.render(template_data)
+    rendered = jinja_template.render(template_data)
+    if run_secrets is not None:
+        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+    return rendered
 
 
 def render_list(template: str, data: dict[str, Any] | None = None) -> list[str]:
@@ -3705,11 +3919,42 @@ async def upload_file(
     )
 
 
+async def _send_email_via_gmail(block_validation_output: BlockValidationOutput, credential_id: str | None) -> None:
+    # The message comes from the workflow definition, never from the generated call, so recipients, subject
+    # and body stay out of the cached script and the logs that print it.
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    if not isinstance(definition, SendEmailBlock) or definition.transport != EmailTransport.GMAIL:
+        raise Exception("No Gmail send_email block with this label exists in the workflow")
+    if (credential_id or "") != (definition.credential_id or ""):
+        raise Exception("The cached script names a different Gmail connection than the workflow block")
+    context = block_validation_output.context
+    loop_metadata = context.loop_metadata or {}
+    current_value = loop_metadata.get("current_value")
+    send_email_block = definition.model_copy(deep=True)
+    result = await send_email_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+        current_value=str(current_value) if current_value is not None else None,
+        current_index=loop_metadata.get("current_index"),
+    )
+    _append_to_loop_output(
+        result.output_parameter_value,
+        block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+    )
+    if not result.success and not send_email_block.continue_on_failure:
+        raise Exception(result.failure_reason or "Gmail send failed")
+
+
 async def send_email(
-    sender: str,
-    recipients: list[str] | str,
-    subject: str,
-    body: str,
+    sender: str = "",
+    recipients: list[str] | str | None = None,
+    subject: str = "",
+    body: str = "",
     file_attachments: list[str] = [],
     label: str | None = None,
     parameters: list[str] | None = None,
@@ -3718,9 +3963,21 @@ async def send_email(
     custom_smtp_username: str | None = None,
     custom_smtp_password: str | None = None,
     body_format: EmailBodyFormat = EmailBodyFormat.TEXT,
+    transport: EmailTransport | None = None,
+    credential_id: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
+    if transport == EmailTransport.GMAIL:
+        await _send_email_via_gmail(block_validation_output, credential_id)
+        return
+    definition = _find_block_definition(
+        block_validation_output.workflow.workflow_definition.blocks, block_validation_output.label
+    )
+    if isinstance(definition, SendEmailBlock) and definition.transport == EmailTransport.GMAIL:
+        # A script cached before the block switched to Gmail must not send its old message over SMTP.
+        raise Exception("The cached script predates this block's Gmail transport")
     sender = _render_template_with_label(sender, label)
+    recipients = recipients or []
     if isinstance(recipients, str):
         recipients = render_list(_render_template_with_label(recipients, label))
     subject = _render_template_with_label(subject, label)
@@ -3818,13 +4075,19 @@ async def parse_file(
     label: str | None = None,
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
+    worksheet: str | None = None,
+    force_ocr: bool = False,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
+    if worksheet:
+        worksheet = _render_template_with_label(worksheet, label)
     file_parser_block = FileParserBlock(
         file_url=file_url,
         file_type=file_type,
         json_schema=schema,
+        worksheet=worksheet,
+        force_ocr=force_ocr,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
@@ -3977,6 +4240,40 @@ async def prompt(
     return result.output_parameter_value
 
 
+_LoopState = tuple[str | None, dict[str, Any] | None, dict[str, Any] | None, list[list[dict[str, Any]]] | None]
+
+
+def _capture_loop_state(context: skyvern_context.SkyvernContext) -> _LoopState:
+    return (
+        context.parent_workflow_run_block_id,
+        context.loop_metadata,
+        context.loop_internal_state,
+        context.loop_output_values,
+    )
+
+
+def _restore_loop_state(
+    context: skyvern_context.SkyvernContext,
+    loop_workflow_run_block_id: str | None,
+    previous: _LoopState,
+    label: str,
+    output_parameter: OutputParameter,
+) -> None:
+    # A loop the script abandoned is finalized late by the garbage collector, after the context may have
+    # moved on, so the enclosing loop's state is put back only while this loop still owns the context.
+    if context.parent_workflow_run_block_id != loop_workflow_run_block_id:
+        return
+    finished_loop_output = context.loop_output_values
+    (
+        context.parent_workflow_run_block_id,
+        context.loop_metadata,
+        context.loop_internal_state,
+        context.loop_output_values,
+    ) = previous
+    # A nested loop's output is one entry of the enclosing iteration, as ForLoopBlock.execute records it.
+    _append_to_loop_output(finished_loop_output, label, output_parameter=output_parameter)
+
+
 async def loop(
     values: Sequence[Any] | str,
     complete_if_empty: bool = False,
@@ -4027,7 +4324,7 @@ async def loop(
         await loop_block.record_output_parameter_value(workflow_run_context, workflow_run_id, [])
         # step 4. build response (success/failure) given the complete_if_empty value
         if complete_if_empty:
-            await loop_block.build_block_result(
+            empty_result = await loop_block.build_block_result(
                 success=True,
                 failure_reason=None,
                 output_parameter_value=[],
@@ -4035,18 +4332,25 @@ async def loop(
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-            return
         else:
-            await loop_block.build_block_result(
+            empty_result = await loop_block.build_block_result(
                 success=False,
                 failure_reason="No iterable value found for the loop block",
                 status=BlockStatus.terminated,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        loop_block.record_result_outcome(workflow_run_id, empty_result)
+        if not complete_if_empty:
             raise Exception("No iterable value found for the loop block")
+        # An empty nested loop is still one entry of the enclosing iteration, as ForLoopBlock.execute records it.
+        _append_to_loop_output(
+            [], block_validation_output.label, output_parameter=block_validation_output.output_parameter
+        )
+        return
 
     # register the loop in the global context
+    previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
 
@@ -4067,7 +4371,7 @@ async def loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )
@@ -4123,10 +4427,13 @@ async def loop(
             )
         raise
     finally:
-        block_validation_output.context.parent_workflow_run_block_id = None
-        block_validation_output.context.loop_metadata = None
-        block_validation_output.context.loop_internal_state = None
-        block_validation_output.context.loop_output_values = None
+        _restore_loop_state(
+            block_validation_output.context,
+            workflow_run_block_id,
+            previous_loop_state,
+            block_validation_output.label,
+            block_validation_output.output_parameter,
+        )
 
 
 def _while_loop_branch_criteria(
@@ -4165,6 +4472,7 @@ async def while_loop(
         loop_blocks=[],
     )
 
+    previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
 
@@ -4218,7 +4526,7 @@ async def while_loop(
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_file_signatures_before_iteration = [
                         _to_downloaded_file_signature(file_info)
-                        for file_info in await app.STORAGE.get_downloaded_files(
+                        for file_info in await app.STORAGE.get_current_attempt_downloaded_files(
                             organization_id=organization_id or "",
                             run_id=workflow_run_id,
                         )
@@ -4276,7 +4584,10 @@ async def while_loop(
             )
         raise
     finally:
-        block_validation_output.context.parent_workflow_run_block_id = None
-        block_validation_output.context.loop_metadata = None
-        block_validation_output.context.loop_internal_state = None
-        block_validation_output.context.loop_output_values = None
+        _restore_loop_state(
+            block_validation_output.context,
+            workflow_run_block_id,
+            previous_loop_state,
+            block_validation_output.label,
+            block_validation_output.output_parameter,
+        )

@@ -365,12 +365,12 @@ export const topRankedFootballTeam = {
   errorCodeMapping: null,
 };
 
-export const extractIntegrationsFromGong = {
-  url: "https://www.gong.io",
+export const extractIntegrationsFromSkyvern = {
+  url: "https://skyvern.com",
   navigationGoal:
-    "Navigate to the 'Integrations' page on the Gong website. COMPLETE when the page displaying a list of integrations is fully loaded. Ensure not to click on any external links or advertisements.",
+    "Navigate to 'Resources' -> 'Integrations'. COMPLETE when the page listing the supported integrations is fully loaded.",
   dataExtractionGoal:
-    "Extract the names and descriptions of all integrations listed on the Gong integrations page.",
+    "Extract the names and descriptions of all the supported integrations.",
   navigationPayload: null,
   extractedInformationSchema: null,
   webhookCallbackUrl: null,
@@ -421,8 +421,8 @@ export function getSample(sample: SampleCase) {
     case "topRankedFootballTeam": {
       return topRankedFootballTeam;
     }
-    case "extractIntegrationsFromGong": {
-      return extractIntegrationsFromGong;
+    case "extractIntegrationsFromSkyvern": {
+      return extractIntegrationsFromSkyvern;
     }
     case "blank": {
       return blank;

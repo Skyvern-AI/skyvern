@@ -172,7 +172,7 @@ describe("PastRunsList", () => {
     ).toBe("true");
   });
 
-  test("clicking a different run switches the run and signals close", () => {
+  test("switches runs, drops the pane override, and signals close", () => {
     mocks.runs = [makeRun({ workflow_run_id: "wr_2" })];
     useRunViewStore.getState().pinFrame("act_5");
     renderList("/agents/wpid_1?panes=browser&wr=wr_9&active=act_5&bl=blk");
@@ -181,7 +181,7 @@ describe("PastRunsList", () => {
 
     const params = searchParams();
     expect(params.get("wr")).toBe("wr_2");
-    expect(params.get("panes")).toBe("browser");
+    expect(params.get("panes")).toBeNull();
     expect(params.get("active")).toBeNull();
     expect(params.get("bl")).toBeNull();
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
@@ -266,20 +266,28 @@ describe("PastRunsList", () => {
 });
 
 describe("searchWithRunSwitched", () => {
-  test("sets ?wr=, clears ?active=, ?bl= and ?iteration=, preserves ?panes=", () => {
+  test("sets ?wr= and clears run selection and pane overrides", () => {
     expect(
       searchWithRunSwitched(
         "?panes=browser&wr=wr_9&active=act_5&bl=blk&iteration=2",
         "wr_2",
       ),
-    ).toBe("?panes=browser&wr=wr_2");
+    ).toBe("?wr=wr_2");
   });
 
-  test("adds ?wr= when the url carries none, keeping other params", () => {
+  test("adds ?wr= and drops ?panes= when no run is selected", () => {
     const params = new URLSearchParams(
       searchWithRunSwitched("?panes=browser", "wr_7"),
     );
     expect(params.get("wr")).toBe("wr_7");
-    expect(params.get("panes")).toBe("browser");
+    expect(params.get("panes")).toBeNull();
   });
+});
+
+test("the attempt chip adds no tab stop inside its run row", () => {
+  mocks.runs = [makeRun({ attempt: 2 })];
+  renderList();
+  const chip = screen.getByText("Attempt 2");
+  expect(chip.hasAttribute("tabindex")).toBe(false);
+  expect(chip.closest("button")).toBeTruthy();
 });

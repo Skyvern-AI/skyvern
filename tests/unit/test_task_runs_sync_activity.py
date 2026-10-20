@@ -1,11 +1,12 @@
 import importlib.util
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, insert, select
 from sqlalchemy.orm import declarative_base
 
 
@@ -28,6 +29,7 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
 
         id = Column(Integer, primary_key=True)
         run_id = Column(String)
+        organization_id = Column(String)
         task_run_type = Column(String)
         status = Column(String)
         started_at = Column(DateTime)
@@ -47,6 +49,7 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
 
         id = Column(Integer, primary_key=True)
         workflow_run_id = Column(String)
+        organization_id = Column(String)
         status = Column(String)
         started_at = Column(DateTime)
         finished_at = Column(DateTime)
@@ -54,6 +57,16 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
         workflow_permanent_id = Column(String)
         parent_workflow_run_id = Column(String)
         debug_session_id = Column(String)
+
+    class WorkflowRunAttemptModel(base):
+        __tablename__ = "workflow_run_attempts"
+
+        id = Column(Integer, primary_key=True)
+        workflow_run_id = Column(String)
+        organization_id = Column(String)
+        attempt_number = Column(Integer)
+        retry_decision = Column(String)
+        next_attempt_prepared_at = Column(DateTime)
 
     class WorkflowRunParameterModel(base):
         __tablename__ = "workflow_run_parameters"
@@ -89,6 +102,7 @@ def _load_task_runs_sync_activity_module(monkeypatch: pytest.MonkeyPatch):
     models_module.TaskRunModel = TaskRunModel
     models_module.TaskV2Model = TaskV2Model
     models_module.WorkflowRunModel = WorkflowRunModel
+    models_module.WorkflowRunAttemptModel = WorkflowRunAttemptModel
     models_module.WorkflowRunParameterModel = WorkflowRunParameterModel
 
     cloud_db_stub = SimpleNamespace(Session=MagicMock())
@@ -139,24 +153,27 @@ async def test_task_runs_sync_activity_commits_each_successful_sync(monkeypatch:
     task_runs_sync_activity = _load_task_runs_sync_activity_module(monkeypatch)
 
     workflow_session = _mock_session(2)
+    reopened_session = _mock_session(1)
     task_session = _mock_session(3)
     task_v2_session = _mock_session(5)
 
     monkeypatch.setattr(
         task_runs_sync_activity.cloud_db,
         "Session",
-        MagicMock(side_effect=[workflow_session, task_session, task_v2_session]),
+        MagicMock(side_effect=[workflow_session, reopened_session, task_session, task_v2_session]),
     )
 
     results = await task_runs_sync_activity.task_runs_sync_activity()
 
     assert results == {
         "workflow_runs_synced": 2,
+        "workflow_runs_reopened": 1,
         "tasks_synced": 3,
         "task_v2_synced": 5,
         "errors": [],
     }
     workflow_session.commit.assert_awaited_once()
+    reopened_session.commit.assert_awaited_once()
     task_session.commit.assert_awaited_once()
     task_v2_session.commit.assert_awaited_once()
 
@@ -167,6 +184,7 @@ async def test_task_runs_sync_activity_handles_partial_failure(monkeypatch: pyte
     task_runs_sync_activity = _load_task_runs_sync_activity_module(monkeypatch)
 
     workflow_session = _mock_session(2)
+    reopened_session = _mock_session(1)
     failing_session = _mock_session(0)
     failing_session.execute = AsyncMock(side_effect=Exception("DB error"))
     task_v2_session = _mock_session(5)
@@ -174,7 +192,7 @@ async def test_task_runs_sync_activity_handles_partial_failure(monkeypatch: pyte
     monkeypatch.setattr(
         task_runs_sync_activity.cloud_db,
         "Session",
-        MagicMock(side_effect=[workflow_session, failing_session, task_v2_session]),
+        MagicMock(side_effect=[workflow_session, reopened_session, failing_session, task_v2_session]),
     )
 
     results = await task_runs_sync_activity.task_runs_sync_activity()
@@ -189,9 +207,8 @@ async def test_task_runs_sync_activity_handles_partial_failure(monkeypatch: pyte
 async def test_sync_statements_include_created_at_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify that all three sync statements include created_at >= cutoff."""
     mod = _load_task_runs_sync_activity_module(monkeypatch)
-    from datetime import datetime, timezone
 
-    cutoff = datetime.now(timezone.utc)
+    cutoff = datetime.now(UTC)
 
     for builder_name in ("_build_sync_workflow_runs_stmt", "_build_sync_tasks_stmt", "_build_sync_task_v2_stmt"):
         builder = getattr(mod, builder_name)
@@ -205,9 +222,8 @@ async def test_tasks_sync_includes_task_v3(monkeypatch: pytest.MonkeyPatch) -> N
     """A task_v3 row must be repaired by the catch-up sync like task_v1/CUA rows, or a v3 run whose
     write-through failed would sit non-terminal in /runs history forever."""
     mod = _load_task_runs_sync_activity_module(monkeypatch)
-    from datetime import datetime, timezone
 
-    stmt = mod._build_sync_tasks_stmt(datetime.now(timezone.utc))
+    stmt = mod._build_sync_tasks_stmt(datetime.now(UTC))
     bound_values: list = []
     for value in stmt.compile().params.values():
         if isinstance(value, (list, tuple)):
@@ -216,3 +232,74 @@ async def test_tasks_sync_includes_task_v3(monkeypatch: pytest.MonkeyPatch) -> N
             bound_values.append(value)
     assert "task_v3" in bound_values
     assert "task_v1" in bound_values  # existing types still covered
+
+
+def test_reopened_run_sync_is_bounded_and_preserves_other_organizations(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_task_runs_sync_activity_module(monkeypatch)
+    engine = create_engine("sqlite:///:memory:")
+    mod.TaskRunModel.metadata.create_all(engine)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(hours=168)
+    count = mod.REOPENED_RUN_BATCH_SIZE + 5
+    with engine.begin() as conn:
+        conn.execute(
+            insert(mod.WorkflowRunModel),
+            [
+                {"id": i, "workflow_run_id": f"wr_{i:04}", "organization_id": "o_retry", "status": "running"}
+                for i in range(count)
+            ],
+        )
+        conn.execute(
+            insert(mod.WorkflowRunAttemptModel),
+            [
+                {
+                    "id": i,
+                    "workflow_run_id": f"wr_{i:04}",
+                    "organization_id": "o_retry",
+                    "attempt_number": 1,
+                    "retry_decision": "retry",
+                    "next_attempt_prepared_at": now,
+                }
+                for i in range(count)
+            ],
+        )
+        conn.execute(
+            insert(mod.TaskRunModel),
+            [
+                {
+                    "id": i,
+                    "run_id": f"wr_{i:04}",
+                    "organization_id": "o_retry",
+                    "status": "failed",
+                    "task_run_type": "workflow_run",
+                    "finished_at": now,
+                }
+                for i in range(count)
+            ],
+        )
+        conn.execute(
+            insert(mod.TaskRunModel),
+            {
+                "id": count,
+                "run_id": "wr_0000",
+                "organization_id": "o_other",
+                "status": "failed",
+                "task_run_type": "workflow_run",
+                "finished_at": now,
+            },
+        )
+        stmt = mod._build_sync_reopened_workflow_runs_stmt(cutoff)
+        conn.execute(stmt)
+        statuses = conn.execute(select(mod.TaskRunModel.status)).scalars().all()
+        assert statuses.count("running") == mod.REOPENED_RUN_BATCH_SIZE
+        conn.execute(stmt)
+        statuses = conn.execute(select(mod.TaskRunModel.status)).scalars().all()
+        assert statuses.count("running") == count
+        assert statuses.count("failed") == 1
+        assert (
+            conn.execute(select(mod.TaskRunModel.finished_at).where(mod.TaskRunModel.status == "running"))
+            .scalars()
+            .all()
+            == [None] * count
+        )
+    engine.dispose()

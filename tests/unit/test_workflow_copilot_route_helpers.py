@@ -20,13 +20,17 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
+from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_timeout_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.interruption import UNTESTED_DRAFT_PRESERVED, cancel_notice
+from skyvern.forge.sdk.copilot.tools.run_execution import _record_executed_block_labels
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
     _attachment_filenames_from_history,
+    _attachment_video_evidence_from_history,
+    _attachment_video_processing_statuses_from_history,
+    _attachment_video_safety_statuses_from_history,
     _blockless_submission_fallback,
     _build_proposed_workflow_data,
     _effective_auto_accept,
@@ -43,9 +47,12 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _should_restore_persisted_workflow,
     _turn_attachment_ids,
     _workflow_copilot_ingress_log_fields,
+    convert_to_history_messages,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
+    CopilotVideoEvidenceArtifact,
+    CopilotVideoObservation,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
@@ -58,7 +65,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    RECEIPT_WORKFLOW_YAML,
+    make_copilot_ctx,
+    receipt_coverage_after,
+    receipt_message,
+)
 
 
 def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
@@ -95,10 +107,66 @@ def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> 
         sender=WorkflowCopilotChatSender.AI,
         narrative_payload={"testedBlockFingerprints": {"step": ["version_b"], "other": ["version_c"]}},
     )
+    crashed = MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload={"terminal": "error"})
 
-    assert _assistant_execution_receipts([first, second]) == {
-        "step": {"version_a", "version_b"},
+    assert _assistant_execution_receipts([first, second, crashed], None) == {
+        "step": {"version_b"},
         "other": {"version_c"},
+    }
+    assert _assistant_execution_receipts([], {"_copilot_tested_block_fingerprints": {"step": ["version_a"]}}) == {
+        "step": {"version_a"}
+    }
+
+
+def _receipt_turn(seed: dict[str, set[str]], statuses: dict[str, str]) -> tuple[CopilotContext, MagicMock]:
+    ctx = make_copilot_ctx(workflow_yaml=RECEIPT_WORKFLOW_YAML, executed_block_fingerprints=seed)
+    _record_executed_block_labels(
+        ctx,
+        {"ok": True, "data": {"blocks": [{"label": label, "status": status} for label, status in statuses.items()]}},
+    )
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+    return ctx, receipt_message(payload)
+
+
+@pytest.mark.parametrize(
+    ("turn_1", "turn_2", "tested_in_turn_3"),
+    [
+        (
+            {"sign_in": "completed", "read_metric": "completed"},
+            {"sign_in": "failed", "read_metric": "completed"},
+            {"read_metric"},
+        ),
+        ({"sign_in": "completed"}, {"read_metric": "completed"}, {"sign_in", "read_metric"}),
+        (
+            {"sign_in": "completed", "read_metric": "completed"},
+            {"sign_in": "failed", "read_metric": "failed"},
+            set(),
+        ),
+    ],
+    ids=["latest_failure_stays_untested", "earlier_pass_carries_forward", "all_retracted_stays_untested"],
+)
+def test_turn_start_receipts_follow_each_block_latest_run(
+    turn_1: dict[str, str], turn_2: dict[str, str], tested_in_turn_3: set[str]
+) -> None:
+    workflow = MagicMock()
+    workflow.title = "Metric"
+    workflow.model_dump.return_value = {"workflow_id": "w_test"}
+    ctx_1, message_1 = _receipt_turn({}, turn_1)
+    stale_proposal = _build_proposed_workflow_data(
+        workflow,
+        AgentResult(
+            user_response="done",
+            updated_workflow=None,
+            global_llm_context=None,
+            workflow_yaml=RECEIPT_WORKFLOW_YAML,
+            executed_block_fingerprints=ctx_1.executed_block_fingerprints,
+        ),
+    )
+    _, message_2 = _receipt_turn(_assistant_execution_receipts([message_1], stale_proposal), turn_2)
+
+    assert receipt_coverage_after([message_1, message_2], stale_proposal) == {
+        label: "current_source" if label in tested_in_turn_3 else "different_source"
+        for label in ("sign_in", "read_metric")
     }
 
 
@@ -593,6 +661,21 @@ def _persisted_message(narrative_payload: dict[str, Any]) -> WorkflowCopilotChat
     )
 
 
+def test_chat_history_keeps_demonstration_items_in_the_narrative_payload_only() -> None:
+    message = _persisted_message(
+        {
+            **_non_error_narrative_payload(),
+            "demonstrationItems": ["Navigate to example.com", "Click Submit"],
+        }
+    )
+
+    history = convert_to_history_messages([message])
+
+    assert history[0].narrative_payload is not None
+    assert history[0].narrative_payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
+    assert "demonstration_items" not in history[0].model_dump()
+
+
 def _non_error_narrative_payload() -> dict[str, Any]:
     """The shape the acting path builds — every key it actually supplies, and nothing else."""
     return {
@@ -841,6 +924,59 @@ class TestCopilotAttachedFiles:
         assert _turn_attachment_ids(request, prior) == ["file_303"]
         assert _attachment_filenames_from_history(prior) == {"file_303": "targets.xlsx"}
 
+    def test_a_detected_unsafe_video_status_is_carried_into_follow_up_turns(self) -> None:
+        prior = [
+            self._chat_message(
+                [
+                    {
+                        "file_id": "file_unsafe",
+                        "filename": "demo.mp4",
+                        "video_safety_status": "unsafe",
+                    }
+                ]
+            )
+        ]
+
+        assert _attachment_video_safety_statuses_from_history(prior) == {"file_unsafe": "unsafe"}
+
+    def test_an_overlength_video_status_is_carried_into_follow_up_turns(self) -> None:
+        prior = [
+            self._chat_message(
+                [
+                    {
+                        "file_id": "file_long",
+                        "filename": "demo.mp4",
+                        "video_processing_status": "too_long",
+                    }
+                ]
+            )
+        ]
+
+        assert _attachment_video_processing_statuses_from_history(prior) == {"file_long": "too_long"}
+
+    def test_a_video_evidence_artifact_is_carried_into_follow_up_turns(self) -> None:
+        artifact = CopilotVideoEvidenceArtifact(
+            version="1",
+            duration_seconds=20.0,
+            sampled_frame_count=8,
+            observations=(
+                CopilotVideoObservation(timestamp_seconds=2.0, description="A menu opens.", confidence="high"),
+            ),
+        )
+        prior = [
+            self._chat_message(
+                [
+                    {
+                        "file_id": "file_video",
+                        "filename": "demo.mp4",
+                        "video_evidence": artifact.model_dump(mode="json"),
+                    }
+                ]
+            )
+        ]
+
+        assert _attachment_video_evidence_from_history(prior) == {"file_video": artifact}
+
     def test_the_current_attachment_is_listed_before_older_ones(self) -> None:
         request = WorkflowCopilotChatRequest(
             workflow_permanent_id="wpid_1",
@@ -893,13 +1029,23 @@ async def test_reload_reports_a_file_that_expired_since_it_was_attached(
 
     monkeypatch.setattr(app.DATABASE.uploaded_files, "get_uploaded_files_by_ids", fake_get)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    artifact = CopilotVideoEvidenceArtifact(
+        version="1",
+        duration_seconds=1.0,
+        sampled_frame_count=1,
+        observations=(
+            CopilotVideoObservation(
+                timestamp_seconds=0.0, description="A settings page is visible.", confidence="high"
+            ),
+        ),
+    )
     stored = WorkflowCopilotChatMessage(
         workflow_copilot_chat_message_id="wccm_1",
         workflow_copilot_chat_id="wcc_1",
         sender=WorkflowCopilotChatSender.USER,
         content="check every row",
         attached_files=[
-            CopilotAttachedFile(file_id="file_1", filename="targets.xlsx"),
+            CopilotAttachedFile(file_id="file_1", filename="targets.mp4", video_evidence=artifact),
             # Written before ids were validated, so the resolver skips it and it has no entry to
             # overlay. The fallback must still refuse to claim it is usable.
             CopilotAttachedFile(file_id="legacy-junk", filename="mystery.csv"),
@@ -911,9 +1057,10 @@ async def test_reload_reports_a_file_that_expired_since_it_was_attached(
     history = await _history_with_resolved_attachments([stored], "o_1")
 
     assert [(f.file_id, f.filename, f.available) for f in history[0].attached_files] == [
-        ("file_1", "targets.xlsx", False),
+        ("file_1", "targets.mp4", False),
         ("legacy-junk", "mystery.csv", False),
     ]
+    assert history[0].attached_files[0].video_evidence is None
 
 
 @pytest.mark.asyncio

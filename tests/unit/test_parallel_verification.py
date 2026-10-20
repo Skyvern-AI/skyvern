@@ -13,6 +13,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.steps import AgentStepOutput
+from skyvern.utils import stall_watch
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
@@ -389,6 +390,153 @@ async def test_orchestrator_skips_speculative_in_script_mode_not_achieved_path(
     # Sequential-continuation branch returns (None, None, next_step):
     assert completed is None
     assert returned_next_step == next_step
+
+
+def _never_finishes(
+    running: list[asyncio.Task], entered: asyncio.Event | None = None, *, holds_cancellation: bool = False
+) -> Any:
+    async def call(*_args: Any, **_kwargs: Any) -> None:
+        running.append(asyncio.current_task())
+        if entered is not None:
+            entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if not holds_cancellation:
+                raise
+            await asyncio.Event().wait()
+
+    return call
+
+
+def _setup_hung_parallel_phase(
+    monkeypatch: pytest.MonkeyPatch, *, verification: Any, speculation: Any
+) -> tuple[ForgeAgent, dict[str, Any], Step]:
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(
+        now,
+        task,
+        step_id="step-hung",
+        status=StepStatus.completed,
+        order=0,
+        output=AgentStepOutput(action_results=[], actions_and_results=[]),
+    )
+    next_step = make_step(now, task, step_id="step-after-hung", status=StepStatus.created, order=1, output=None)
+    setup_parallel_verification_mocks(
+        agent,
+        step=step,
+        task=task,
+        monkeypatch=monkeypatch,
+        next_step=next_step,
+        complete_action=None,
+        handle_action_responses=[],
+    )
+    if verification is not None:
+        monkeypatch.setattr(agent, "check_user_goal_complete", verification)
+    monkeypatch.setattr(agent, "_speculate_next_step_plan", speculation)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.ForgeAgent._check_workflow_run_step_budget",
+        AsyncMock(return_value=None),
+    )
+    browser_state, scraped_page, page = make_browser_state()
+    kwargs = dict(
+        organization=organization,
+        task=task,
+        step=step,
+        page=page,
+        browser_state=browser_state,
+        scraped_page=scraped_page,
+        engine=RunEngine.skyvern_v1,
+    )
+    return agent, kwargs, next_step
+
+
+@pytest.mark.asyncio
+async def test_verification_and_speculation_that_never_finish_do_not_hold_the_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.PARALLEL_VERIFICATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(stall_watch, "ABANDONED_TASK_RECANCEL_SECONDS", 0.05)
+    running: list[asyncio.Task] = []
+    agent, kwargs, next_step = _setup_hung_parallel_phase(
+        monkeypatch,
+        verification=_never_finishes(running, holds_cancellation=True),
+        speculation=_never_finishes(running, holds_cancellation=True),
+    )
+
+    handled = asyncio.ensure_future(agent._handle_completed_step_with_parallel_verification(**kwargs))
+    done, _ = await asyncio.wait({handled}, timeout=5)
+
+    assert handled in done
+    completed, _last_step, returned_next_step = handled.result()
+    # Unverified, so the next step runs sequentially with a fresh scrape.
+    assert completed is None
+    assert returned_next_step == next_step
+    assert len(running) == 2
+    await asyncio.wait(running, timeout=5)
+    assert all(child.cancelled() for child in running)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["exhausted", "preflight_failed"])
+async def test_a_cancelled_speculative_plan_that_holds_its_cancellation_does_not_hold_the_step(
+    budget: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.PARALLEL_VERIFICATION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(stall_watch, "ABANDONED_TASK_RECANCEL_SECONDS", 0.05)
+    running: list[asyncio.Task] = []
+    agent, kwargs, _next_step = _setup_hung_parallel_phase(
+        monkeypatch, verification=None, speculation=_never_finishes(running, holds_cancellation=True)
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.ForgeAgent._check_workflow_run_step_budget",
+        AsyncMock(return_value=(5, 5)) if budget == "exhausted" else AsyncMock(side_effect=RuntimeError("down")),
+    )
+    monkeypatch.setattr(agent, "_terminate_for_workflow_run_step_budget", AsyncMock(return_value=kwargs["step"]))
+
+    handled = asyncio.ensure_future(agent._handle_completed_step_with_parallel_verification(**kwargs))
+    done, _ = await asyncio.wait({handled}, timeout=5)
+
+    assert handled in done
+    if budget == "exhausted":
+        assert handled.result() == (False, kwargs["step"], None)
+    else:
+        with pytest.raises(RuntimeError):
+            handled.result()
+    assert len(running) == 1
+    await asyncio.wait(running, timeout=5)
+    assert running[0].cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiting_on", ["verification", "speculation"])
+async def test_cancelling_the_step_during_the_parallel_phase_cancels_the_step_and_its_children(
+    waiting_on: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifying, speculating, budget_checked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    running: list[asyncio.Task] = []
+    agent, kwargs, _next_step = _setup_hung_parallel_phase(
+        monkeypatch,
+        verification=_never_finishes(running, verifying) if waiting_on == "verification" else None,
+        speculation=_never_finishes(running, speculating),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.ForgeAgent._check_workflow_run_step_budget",
+        AsyncMock(side_effect=lambda *_args, **_kwargs: budget_checked.set()),
+    )
+    handled = asyncio.ensure_future(agent._handle_completed_step_with_parallel_verification(**kwargs))
+    await asyncio.wait_for(speculating.wait(), timeout=5)
+    await asyncio.wait_for((verifying if waiting_on == "verification" else budget_checked).wait(), timeout=5)
+    await asyncio.wait({handled}, timeout=0.05)
+
+    handled.cancel()
+    await asyncio.wait({handled, *running}, timeout=5)
+
+    assert handled.cancelled()
+    assert running and all(child.cancelled() for child in running)
 
 
 @pytest.mark.asyncio

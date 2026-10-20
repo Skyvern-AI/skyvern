@@ -1,6 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  getRunAttempt,
+  runIsLogicallyFinal,
+  runIsRetryWaiting,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MagnifyingGlassIcon } from "@radix-ui/react-icons";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 
 import { Status } from "@/api/types";
 import {
@@ -16,12 +27,15 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import {
   SELECTED_BLOCK_SEARCH_PARAM,
   SYSTEM_BLOCK_FOCUS_PARAM,
 } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
-import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
+import {
+  type RunPaneView,
+  useRunPaneViewStore,
+} from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
@@ -30,12 +44,31 @@ import {
   usePageSlots,
 } from "@/store/PageSlots";
 import { isRecord } from "@/util/utils";
+import {
+  FirstRunRecoveryGuidance,
+  shouldShowRecoveryGuidance,
+} from "@/components/onboarding/FirstRunRecoveryGuidance";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import {
+  getRecoveryGuidanceRetryNavigation,
+  RecoveryGuidanceTelemetry,
+  retryRunHasStarted,
+  type RecoveryGuidanceTelemetryContext,
+} from "@/util/onboarding/recoveryGuidanceTelemetry";
 
+import { constructCacheKeyValue } from "../../editor/utils";
+import { useBlockScriptsQuery } from "../../hooks/useBlockScriptsQuery";
+import { useFallbackEpisodesQuery } from "../../hooks/useFallbackEpisodesQuery";
+import { useRefreshOnboardingOnRunCompletion } from "../../hooks/useRefreshOnboardingOnRunCompletion";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
+import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
+import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
@@ -43,16 +76,20 @@ import { pickDownloadedFileFilename } from "../../workflowRun/blockDownloadedFil
 import {
   buildBlockOrderIndex,
   collectTimelineSearchTargets,
+  filterTimelineToAttempt,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   flattenTimelineChronologically,
+  parseActiveIterationParam,
   type TimelineSearchTarget,
 } from "../../workflowRun/workflowTimelineUtils";
-import { getOrderedRunParameters } from "../../utils";
+import { getOrderedRunParameters, getRerunNavigationState } from "../../utils";
 import {
   buildFilmstrip,
   ELAPSED_NEVER_STARTED,
   formatElapsed,
   resolveLandingSelectionId,
+  runErrorCodes,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
@@ -73,6 +110,7 @@ import {
 } from "./RunOutputsSection";
 import { failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
@@ -81,6 +119,18 @@ import {
 } from "./RunFailurePresentation";
 import { resolveEditorSelectionPin } from "./editorSelectionPin";
 import { resolveTimelineBlockJumpNodeId } from "./timelineBlockJump";
+
+const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
+  "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
+
+function isRunPaneView(value: string | null): value is RunPaneView {
+  return (
+    value === "timeline" ||
+    value === "inputs" ||
+    value === "outputs" ||
+    value === "code"
+  );
+}
 
 type RunViewProps = {
   workflowRunId?: string;
@@ -178,7 +228,8 @@ function TimelineBlockSearch({
               {targets.map((target) => (
                 <CommandItem
                   key={target.block.workflow_run_block_id}
-                  value={target.label}
+                  value={target.block.workflow_run_block_id}
+                  keywords={[target.label]}
                   onSelect={() => {
                     onJump(target);
                     closeAndReset();
@@ -225,47 +276,221 @@ export function RunView({
     isPlaceholderData: runIsPlaceholder,
     isError: statusUnavailable,
   } = useWorkflowRunWithWorkflowQuery(queryOptions);
+  useRefreshOnboardingOnRunCompletion(
+    runIsPlaceholder ? undefined : workflowRun,
+  );
   const { data: retainedTimeline, isPlaceholderData: timelineIsPlaceholder } =
     useWorkflowRunTimelineQuery(queryOptions);
   // The timeline payload carries no run id of its own, so keepPreviousData serves
   // the previous run's timeline on both a switch and a clear.
   const timeline =
     !workflowRunId || timelineIsPlaceholder ? undefined : retainedTimeline;
+  const currentTimeline = useMemo(
+    () =>
+      timeline
+        ? filterTimelineToAttempt(
+            timeline,
+            workflowRun?.attempts ?? [],
+            getRunAttempt(workflowRun ?? {}),
+          )
+        : undefined,
+    [timeline, workflowRun],
+  );
   const pinnedFrameId = useRunViewStore((s) => s.pinnedFrameId);
   const activeIteration = useRunViewStore((s) => s.activeIteration);
   const pinFrame = useRunViewStore((s) => s.pinFrame);
+  const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const resetRunView = useRunViewStore((s) => s.reset);
-  const { panes: studioPanes, openPane } = useStudioPanes();
+  const {
+    panes: studioPanes,
+    openPane,
+    setOpenPanes,
+    preserveNextEntry,
+  } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
+  const embedded = searchParams.get("embed") === "true";
+  const requestedView = searchParams.get("view");
+  const requestedActive = searchParams.get("active");
+  const requestedIteration = requestedActive
+    ? parseActiveIterationParam(searchParams.get("iteration"))
+    : null;
   const searchParamsRef = useRef(searchParams);
   searchParamsRef.current = searchParams;
   const view = useRunPaneViewStore((s) => s.view);
   const setPaneView = useRunPaneViewStore((s) => s.setView);
   const resetPaneView = useRunPaneViewStore((s) => s.reset);
   const [outputSummary, setOutputSummary] = useState<string | null>(null);
+  const finalized =
+    !statusUnavailable && workflowRun
+      ? runIsLogicallyFinal(workflowRun)
+      : false;
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
+  const isWorkflowDeleted = Boolean(workflow?.deleted_at);
+  const cacheKey = workflow?.cache_key ?? "";
+  const cacheKeyValue =
+    constructCacheKeyValue({ codeKey: cacheKey, workflow, workflowRun }) ?? "";
+  const { data: blockScriptsPublished } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    enabled: finalized && !isWorkflowDeleted,
+    workflowPermanentId,
+    status: "published",
+    workflowRunId: workflowRun?.workflow_run_id,
+  });
+  const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
+    workflowPermanentId,
+    workflowRunId: workflowRun?.workflow_run_id,
+    enabled: finalized && !isWorkflowDeleted,
+  });
+  const onboarding = useOnboardingStateOptional();
+  const recoveryGuidanceTreatmentSurfaceEnabled =
+    useFeatureFlag(RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG) === true;
+  const recoveryGuidanceAssignment =
+    onboarding?.recoveryGuidanceAssignment ?? null;
+  const recoveryGuidanceTelemetryContext =
+    useMemo<RecoveryGuidanceTelemetryContext | null>(() => {
+      if (!recoveryGuidanceAssignment || !workflowRun) {
+        return null;
+      }
+      return {
+        organizationId: recoveryGuidanceAssignment.organization_id,
+        experimentVersion: recoveryGuidanceAssignment.experiment_version,
+        arm: recoveryGuidanceAssignment.arm,
+        eligibleRunId: recoveryGuidanceAssignment.eligible_run_id,
+        failureCategory: workflowRun.failure_category?.[0]?.category ?? null,
+      };
+    }, [recoveryGuidanceAssignment, workflowRun]);
+  const showFirstFailedRunRecovery = shouldShowRecoveryGuidance({
+    assignment: recoveryGuidanceAssignment,
+    workflowRunId: workflowRun?.workflow_run_id,
+    treatmentSurfaceEnabled: recoveryGuidanceTreatmentSurfaceEnabled,
+  });
+  const recoveryGuidanceRetry = getRecoveryGuidanceRetryNavigation(
+    location.state,
+  );
+  const reportedRecoveryRetryStartRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (
+      !recoveryGuidanceRetry ||
+      !retryRunHasStarted({
+        retryRunId: recoveryGuidanceRetry.retryRunId,
+        observedRunId: workflowRun?.workflow_run_id,
+        status: workflowRun?.status,
+        startedAt: workflowRun?.started_at,
+      }) ||
+      reportedRecoveryRetryStartRef.current === recoveryGuidanceRetry.retryRunId
+    ) {
+      return;
+    }
+    reportedRecoveryRetryStartRef.current = recoveryGuidanceRetry.retryRunId;
+    RecoveryGuidanceTelemetry.retryStarted(
+      recoveryGuidanceRetry,
+      recoveryGuidanceRetry.retryRunId,
+    );
+  }, [
+    recoveryGuidanceRetry,
+    workflowRun?.started_at,
+    workflowRun?.status,
+    workflowRun?.workflow_run_id,
+  ]);
+
+  const handleFirstFailedRunRetry = useCallback(() => {
+    if (
+      !workflowRun ||
+      !workflowPermanentId ||
+      !recoveryGuidanceTelemetryContext
+    ) {
+      return;
+    }
+    navigate(`/agents/${workflowPermanentId}/run`, {
+      state: {
+        ...getRerunNavigationState(workflowRun),
+        recoveryGuidanceRetry: recoveryGuidanceTelemetryContext,
+      },
+    });
+  }, [
+    navigate,
+    recoveryGuidanceTelemetryContext,
+    workflowPermanentId,
+    workflowRun,
+  ]);
 
   // Last editor selection the canvas→run sync below acted on.
   const syncedBlockLabelRef = useRef<string | null>(null);
 
-  // A pinned frame belongs to one run; drop it when the run changes, then re-seed
-  // from ?active= to restore a deep-linked selection.
+  // A pinned frame belongs to one run; drop it when the run changes.
   useEffect(() => {
     resetRunView();
     setOutputSummary(null);
     resetPaneView();
-    const active = searchParamsRef.current.get("active");
-    if (active) {
-      pinFrame(active);
-    }
     // Adopt the standing editor selection without acting on it, so a cold open
     // and a run switch land via ?active= / the auto-pin one-shot rather than
     // racing them; the sync applies from the next selection change onward.
     syncedBlockLabelRef.current = searchParamsRef.current.get(
       SELECTED_BLOCK_SEARCH_PARAM,
     );
-  }, [workflowRunId, resetRunView, resetPaneView, pinFrame]);
+  }, [workflowRunId, resetRunView, resetPaneView]);
+
+  // Rehydrate deep-linked selections on cold load, run switches, and browser
+  // history changes that update ?active= / ?iteration= for the same run.
+  const lastHydratedSelectionRef = useRef<{
+    runId: string | undefined;
+    active: string | null;
+    iteration: number | null;
+  } | null>(null);
+  useEffect(() => {
+    const previous = lastHydratedSelectionRef.current;
+    if (
+      previous !== null &&
+      previous.runId === workflowRunId &&
+      previous.active === requestedActive &&
+      previous.iteration === requestedIteration
+    ) {
+      return;
+    }
+    lastHydratedSelectionRef.current = {
+      runId: workflowRunId,
+      active: requestedActive,
+      iteration: requestedIteration,
+    };
+
+    const current = useRunViewStore.getState();
+    if (requestedActive) {
+      if (
+        previous?.runId !== workflowRunId ||
+        current.pinnedFrameId !== requestedActive ||
+        current.activeIteration !== requestedIteration
+      ) {
+        pinFrame(requestedActive, requestedIteration);
+      }
+    } else if (
+      previous !== null &&
+      previous.runId === workflowRunId &&
+      previous.active !== null &&
+      (current.pinnedFrameId !== null || current.activeIteration !== null)
+    ) {
+      jumpToLive();
+    }
+  }, [
+    jumpToLive,
+    pinFrame,
+    requestedActive,
+    requestedIteration,
+    workflowRunId,
+  ]);
+
+  useEffect(() => {
+    if (isRunPaneView(requestedView)) {
+      setPaneView(requestedView);
+    } else if (requestedView !== "recording") {
+      resetPaneView();
+    }
+  }, [requestedView, resetPaneView, setPaneView, workflowRunId]);
 
   // Mirror the pinned item to ?active= so selection survives reload. Skip the first
   // pass after a run change so the seed above doesn't fight the URL.
@@ -282,7 +507,12 @@ export function RunView({
     );
     const desired =
       pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
-    if ((next.get("active") ?? null) === desired) {
+    const desiredIteration =
+      desired && activeIteration !== null ? String(activeIteration) : null;
+    if (
+      (next.get("active") ?? null) === desired &&
+      (next.get("iteration") ?? null) === desiredIteration
+    ) {
       return;
     }
     if (desired) {
@@ -290,8 +520,21 @@ export function RunView({
     } else {
       next.delete("active");
     }
-    navigate({ search: toReadableSearch(next) }, { replace: true });
-  }, [pinnedFrameId, workflowRunId, navigate]);
+    if (desiredIteration) {
+      next.set("iteration", desiredIteration);
+    } else {
+      next.delete("iteration");
+    }
+    const search = toReadableSearch(next);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [
+    activeIteration,
+    pinnedFrameId,
+    workflowRunId,
+    navigate,
+    preserveNextEntry,
+  ]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
   // the Overview pane being open: RunView stays mounted while its pane is closed.
@@ -321,25 +564,27 @@ export function RunView({
     if (new URLSearchParams(live).get("wr")) {
       return;
     }
-    navigate(
-      { search: searchWithRunReference(live, workflowRunId) },
-      { replace: true },
-    );
-  }, [runPaneOpen, workflowRunId, pathRunId, navigate]);
+    const search = searchWithRunReference(live, workflowRunId);
+    preserveNextEntry(search);
+    navigate({ search }, { replace: true });
+  }, [runPaneOpen, workflowRunId, pathRunId, navigate, preserveNextEntry]);
 
-  const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
+  const frames = useMemo(
+    () => buildFilmstrip(currentTimeline),
+    [currentTimeline],
+  );
   const searchTargets = useMemo(
     () =>
-      timeline
+      currentTimeline
         ? collectTimelineSearchTargets(
-            flattenTimelineChronologically(timeline),
-            buildBlockOrderIndex(timeline),
+            flattenTimelineChronologically(currentTimeline),
+            buildBlockOrderIndex(currentTimeline),
           )
         : [],
-    [timeline],
+    [currentTimeline],
   );
 
-  const outcome = runOutcomeFromStatus(workflowRun?.status);
+  const outcome = runOutcomeFromStatus(workflowRun);
   // A user-canceled run isn't a failure — don't show the "run failed" CTA.
   const canceled = workflowRun?.status === Status.Canceled;
   // While a run switch is still serving the previous payload, this status belongs to the old run
@@ -349,27 +594,25 @@ export function RunView({
     !runIsPlaceholder &&
     outcome === "failed" &&
     !canceled;
-  const finalized =
-    !statusUnavailable && workflowRun ? statusIsFinalized(workflowRun) : false;
   useLiveClock(Boolean(workflowRun) && !finalized && !statusUnavailable);
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   const landingSelectionId = useMemo(
-    () => resolveLandingSelectionId(frames, timeline, finalized),
-    [frames, timeline, finalized],
+    () => resolveLandingSelectionId(frames, currentTimeline, finalized),
+    [frames, currentTimeline, finalized],
   );
   const codeFailure = useMemo(
     () =>
       findRunCodeBlockFailure(
         workflowRun?.failure_reason,
-        timeline,
+        currentTimeline,
         finallyBlockLabel,
       ),
-    [workflowRun?.failure_reason, timeline, finallyBlockLabel],
+    [workflowRun?.failure_reason, currentTimeline, finallyBlockLabel],
   );
   const failedBlock = useMemo(
-    () => failingBlock(timeline, finallyBlockLabel),
-    [timeline, finallyBlockLabel],
+    () => failingBlock(currentTimeline, finallyBlockLabel),
+    [currentTimeline, finallyBlockLabel],
   );
   const failureBlockId =
     codeFailure?.workflowRunBlockId ??
@@ -399,7 +642,7 @@ export function RunView({
     if (runIsPlaceholder || timelineIsPlaceholder) {
       return;
     }
-    if (!statusIsFinalized(workflowRun)) {
+    if (!runIsLogicallyFinal(workflowRun)) {
       // Still running: leave the one-shot open so the terminal transition of
       // a watched run lands the same last-item pin as a cold open.
       watchedLiveRunRef.current = workflowRunId;
@@ -454,50 +697,6 @@ export function RunView({
     timelineIsPlaceholder,
   ]);
 
-  // A run that had already succeeded when it was opened lands on its Outputs;
-  // a failed one keeps the timeline, where its failure section and Fix/Retry live.
-  // Explicit choices win here for the same reason they do for the pin above:
-  // a deep link names what to show, and switching the pane hides it.
-  const outputsLandingDecidedForRunRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (
-      !workflowRunId ||
-      outputsLandingDecidedForRunRef.current === workflowRunId ||
-      !workflowRun ||
-      runIsPlaceholder ||
-      timelineIsPlaceholder
-    ) {
-      return;
-    }
-    outputsLandingDecidedForRunRef.current = workflowRunId;
-    if (!finalized || outcome !== "success") {
-      return;
-    }
-    if (
-      hasExplicitSelection(
-        new URLSearchParams(
-          window.location.search || searchParamsRef.current.toString(),
-        ),
-      )
-    ) {
-      return;
-    }
-    if (
-      runHasOutputs(workflowRun) &&
-      useRunPaneViewStore.getState().view === "timeline"
-    ) {
-      setPaneView("outputs");
-    }
-  }, [
-    workflowRunId,
-    workflowRun,
-    finalized,
-    outcome,
-    runIsPlaceholder,
-    timelineIsPlaceholder,
-    setPaneView,
-  ]);
-
   // This pane never hosts the live stream, so a "stream" pin (or no pin) follows
   // the live edge — the same resolution the Browser pane applies in useRunVisuals.
   const selectedId =
@@ -506,8 +705,13 @@ export function RunView({
       : landingSelectionId;
   const activeItem = useMemo(
     () =>
-      findActiveItem(timeline ?? [], selectedId, finalized, finallyBlockLabel),
-    [timeline, selectedId, finalized, finallyBlockLabel],
+      findActiveItem(
+        (selectedId ? timeline : currentTimeline) ?? [],
+        selectedId,
+        finalized,
+        finallyBlockLabel,
+      ),
+    [timeline, currentTimeline, selectedId, finalized, finallyBlockLabel],
   );
 
   // Selecting a block on the editor canvas moves the run selection onto it, so
@@ -527,7 +731,7 @@ export function RunView({
       return;
     }
     syncedBlockLabelRef.current = selectedBlockLabel;
-    const blockId = resolveEditorSelectionPin({
+    const selection = {
       editorOpen: studioPanes.includes("editor"),
       runPaneOpen,
       finalized,
@@ -536,6 +740,12 @@ export function RunView({
       selectedBlockLabel,
       systemFocusLabel: searchParamsRef.current.get(SYSTEM_BLOCK_FOCUS_PARAM),
       pinnedFrameId: useRunViewStore.getState().pinnedFrameId,
+    };
+    // An explicit historical ID wins over the current attempt's same-label block.
+    if (resolveEditorSelectionPin(selection) === null) return;
+    const blockId = resolveEditorSelectionPin({
+      ...selection,
+      timeline: currentTimeline,
     });
     if (blockId) {
       pinFrame(blockId);
@@ -543,6 +753,7 @@ export function RunView({
   }, [
     selectedBlockLabel,
     timeline,
+    currentTimeline,
     studioPanes,
     runPaneOpen,
     finalized,
@@ -586,6 +797,10 @@ export function RunView({
   const runErrors = useMemo<RunOutputError[]>(() => {
     return normalizeRunOutputErrors(workflowRun?.errors);
   }, [workflowRun]);
+  const failureErrorCodes = useMemo(
+    () => runErrorCodes(runErrors),
+    [runErrors],
+  );
 
   const runInputs = useMemo(() => {
     const definitionParameters =
@@ -711,32 +926,80 @@ export function RunView({
   // would rewrite working code.
   const showFix = codeFailure === null || codeFailure.recovery !== "retry";
   const hasFixAction = Boolean(onFix && showFix);
-  const recovery = failed ? (
-    <FailureRecoveryActions
-      onFix={
-        onFix && hasFixAction
-          ? () => onFix(failedBlock?.label ?? null)
-          : undefined
-      }
-      onRetry={onRetry}
-    />
-  ) : null;
+  const recovery =
+    failed && !embedded ? (
+      <>
+        <FailureRecoveryActions
+          onFix={
+            onFix && hasFixAction
+              ? () => onFix(failedBlock?.label ?? null)
+              : undefined
+          }
+          onRetry={onRetry}
+        />
+        {onRetry &&
+        showFirstFailedRunRecovery &&
+        recoveryGuidanceTelemetryContext ? (
+          <FirstRunRecoveryGuidance
+            telemetryContext={recoveryGuidanceTelemetryContext}
+            workflowPermanentId={workflowPermanentId}
+            onRetry={handleFirstFailedRunRetry}
+          />
+        ) : null}
+      </>
+    ) : null;
   const jumpToFailedBlock = failedBlock
     ? () => selectTimelineBlock(failedBlock)
     : undefined;
+  const awaitingHumanInteraction = currentTimeline
+    ? findAwaitingHumanInteractionBlock(currentTimeline)
+    : null;
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col gap-2 overflow-hidden p-2">
       <WorkflowRunVerificationCodeForm
         workflowRunId={workflowRun.workflow_run_id}
       />
+      {awaitingHumanInteraction ? (
+        <WorkflowRunHumanInteraction
+          workflowRunBlock={awaitingHumanInteraction}
+        />
+      ) : null}
+      {embedded ? null : (
+        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <RunTagsEditor workflowRunId={workflowRun.workflow_run_id} />
+          {workflowRun.retried_from_workflow_run_id ? (
+            <Link
+              className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              to={`/runs/${workflowRun.retried_from_workflow_run_id}`}
+            >
+              Retried from {workflowRun.retried_from_workflow_run_id}
+            </Link>
+          ) : null}
+          {workflowRun.retried_by_workflow_run_id ? (
+            <Link
+              className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              to={`/runs/${workflowRun.retried_by_workflow_run_id}`}
+            >
+              Retried by {workflowRun.retried_by_workflow_run_id}
+            </Link>
+          ) : null}
+        </div>
+      )}
       {WorkflowRunMilestoneCard &&
       runPaneOpen &&
       !runIsPlaceholder &&
+      runIsLogicallyFinal(workflowRun) &&
       workflowRun.status === Status.Completed ? (
         <WorkflowRunMilestoneCard
           workflowRunId={workflowRun.workflow_run_id}
-          rerun={milestoneRerun}
+          rerun={embedded ? undefined : milestoneRerun}
+        />
+      ) : null}
+      {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 ? (
+        <ScriptUpdateCard
+          episodes={fallbackEpisodes.episodes}
+          scriptId={blockScriptsPublished?.script_id}
         />
       ) : null}
 
@@ -744,7 +1007,7 @@ export function RunView({
         <div className="flex min-h-0 flex-1 flex-col gap-2">
           <RunSummaryStrip
             workflowRun={workflowRun}
-            timeline={timeline}
+            timeline={currentTimeline}
             liveElapsed={statusUnavailable ? null : liveElapsed}
             statusUnavailable={statusUnavailable}
             trailing={
@@ -754,9 +1017,21 @@ export function RunView({
               />
             }
           />
-          {failed ? (
+          {!statusUnavailable &&
+          !runIsPlaceholder &&
+          !canceled &&
+          runIsLogicallyFinal(workflowRun) ? (
+            <RunFeedback
+              targetType="workflow_run"
+              targetId={workflowRun.workflow_run_id}
+              variant={failed ? "report" : "thumbs"}
+            />
+          ) : null}
+          {failed || runIsRetryWaiting(workflowRun) ? (
             <RunFailureLine
+              workflowRun={workflowRun}
               blockLabel={failedBlock?.label ?? null}
+              errorCodes={failureErrorCodes}
               headline={failureHeadline}
               detail={failureDetail}
               onJump={jumpToFailedBlock}
@@ -800,13 +1075,21 @@ export function RunView({
                 <WorkflowRunBlockDetail
                   activeItem={activeItem}
                   activeIteration={activeIteration}
-                  timeline={timeline ?? []}
+                  timeline={
+                    (pinnedFrameId && pinnedFrameId !== "stream"
+                      ? timeline
+                      : currentTimeline) ?? []
+                  }
                   timelineReady={Boolean(timeline)}
                   showDownloadedFiles
                   workflowRunId={workflowRunId}
                   onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
                   onViewScreenshot={(workflowRunBlockId) => {
-                    openPane("browser");
+                    if (embedded) {
+                      setOpenPanes(["browser"], { byUser: true });
+                    } else {
+                      openPane("browser");
+                    }
                     // Let the pane-open navigation commit before mirroring the
                     // pin; otherwise the pin's URL writer can drop `browser`.
                     requestAnimationFrame(() => pinFrame(workflowRunBlockId));

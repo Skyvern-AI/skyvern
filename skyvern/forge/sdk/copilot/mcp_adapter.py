@@ -5,19 +5,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import posixpath
+import re
 import time
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, TypedDict, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from agents.agent import AgentBase
+from agents.mcp import MCPToolMetaContext
 from agents.mcp.server import MCPServer
 from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
 from fastmcp import Client
 from fastmcp.client.client import CallToolResult as FastMCPCallToolResult
 from mcp import Tool as MCPTool
@@ -27,62 +33,87 @@ from mcp.types import (
     ListPromptsResult,
     TextContent,
 )
-from playwright.async_api import Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, Page
 
-from skyvern.cli.core.session_manager import request_session_scope
+from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
+from skyvern.cli.core.result import ErrorCode
+from skyvern.cli.core.session_manager import (
+    RequestFailure,
+    RequestFailureLog,
+    newest_per_failure_text_first,
+    request_session_scope,
+)
+from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS
 from skyvern.forge import app
-from skyvern.forge.agent_functions import CopilotCandidateNetworkHop
 from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for_llm, sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.output_utils import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mark_mcp_result_untrusted_for_llm,
+    sanitize_tool_result_for_llm,
+    screened_recorded_url,
+)
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
+    RAW_SECRET_BROWSER_ERROR,
     AgentContext,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
+    RunSecretsNotRegistered,
     bound_call_browser_session,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
+    browser_session_recovery,
+    browser_session_turn,
     close_browser_session_quietly,
     current_call_browser_session_override,
+    current_demonstrated_action,
+    effective_browser_session_id,
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
-    resolve_browser_state_for_context,
+    raw_secret_browser_denied,
     retire_browser_session_id,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
+    capturing_tool_call,
     enqueue_screenshot_from_result,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    encoded_secret_variants,
+    is_registered_scrub_value,
     matching_origin_run_redaction_parameters,
+    registered_scrub_values,
     scrub_secrets_from_structure,
+    scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import PAGE_REQUEST_FAILURES_KEY
+from skyvern.forge.sdk.workflow.models.block import parameter_strings
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_retirement import BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.tools.scouting import PageState
 
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
     BrowserSessionBinding,
+    last_run_facts,
     resolve_browser_session_binding,
 )
 
@@ -96,7 +127,24 @@ __all__ = [
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
 
+
+class PageStateReader(Protocol):
+    async def __call__(
+        self,
+        ctx: AgentContext,
+        *,
+        tool_name: str,
+        result: dict[str, Any],
+        binding: BrowserSessionBinding,
+        probe: bool,
+    ) -> tuple[PageState, Page | None]: ...
+
+
 _SHARED_BROWSER_OUTCOME_TOOLS = frozenset({"skyvern_evaluate", "skyvern_screenshot"})
+_REPORTED_REQUEST_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"})
+_MAX_REPORTED_REQUEST_FAILURES = 5
+_MAX_REPORTED_FAILURE_TEXT_CHARS = 200
+_MAX_REPORTED_URL_CHARS = 300
 _BrowserCallErrorKind = Literal["tool", "protocol"]
 _BrowserSessionLossDisposition = Literal["reestablished", "generation_retired", "failed"]
 
@@ -128,16 +176,20 @@ class _BrowserCallOutcome:
     replacement_browser_session_id: str | None = None
     completion_browser_session_id: str | None = None
     completion_browser_session_generation: int | None = None
-    evidence_drain_complete: bool | None = None
     cancelled: bool = False
     protocol_error_detail: str | None = None
+    last_run_facts: dict[str, str] = field(default_factory=dict)
     _raw_result_payload: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def raw_result(self) -> dict[str, Any]:
         return deepcopy(self._raw_result_payload)
 
     def with_raw_result(self, raw_result: dict[str, Any]) -> _BrowserCallOutcome:
-        return replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+        outcome = replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+        return outcome.as_redaction_withheld() if is_redaction_withheld(raw_result) else outcome
+
+    def as_redaction_withheld(self) -> _BrowserCallOutcome:
+        return replace(self, ok=False, payload_omitted=True, error_kind=self.error_kind or "tool")
 
 
 @dataclass(frozen=True)
@@ -164,6 +216,207 @@ def _browser_error_code(raw_result: dict[str, Any]) -> str | None:
         return None
     code = error.get("code")
     return code if isinstance(code, str) and code else None
+
+
+class ReportedRequestFailure(TypedDict):
+    method: str
+    resource_type: str
+    failure_text: str
+    url: NotRequired[str]
+    page_url: NotRequired[str]
+
+
+def _reported_url(url: str) -> str | None:
+    # The query goes first because _redact_url's masks would make the screen withhold the whole URL.
+    try:
+        path_only = urlunsplit(urlsplit(url)._replace(query="", fragment=""))
+    except ValueError:
+        return None
+    screened = screened_recorded_url(path_only)[0]
+    return screened if screened is not None and len(screened) <= _MAX_REPORTED_URL_CHARS else None
+
+
+def _reported_request_url(url: str, page_url: str) -> str | None:
+    # A cross-origin path can carry a token the model has no use for, so only its origin is shown.
+    if (screened := _reported_url(url)) is None or (origin := safe_page_origin(screened)) is None:
+        return None
+    return (urlsplit(screened).path or "/") if origin == safe_page_origin(page_url) else origin.rstrip("/")
+
+
+def _screened_request_failure(entry: RequestFailure) -> ReportedRequestFailure:
+    # The method and failure text are page-influenced strings, so both are bounded before the model sees them.
+    method = entry["method"].upper()
+    reported = ReportedRequestFailure(
+        method=method if method in _REPORTED_REQUEST_METHODS else "OTHER",
+        resource_type=entry["resource_type"],
+        failure_text=entry["failure_text"][:_MAX_REPORTED_FAILURE_TEXT_CHARS],
+    )
+    if (url := _reported_request_url(entry["url"], entry["page_url"])) is not None:
+        reported["url"] = url
+    if (page_url := _reported_url(entry["page_url"])) is not None:
+        reported["page_url"] = page_url
+    return reported
+
+
+def reported_request_failures(entries: list[RequestFailure]) -> list[ReportedRequestFailure]:
+    return [
+        _screened_request_failure(entry)
+        for entry in newest_per_failure_text_first(entries, _MAX_REPORTED_REQUEST_FAILURES)
+    ]
+
+
+# Chromium serializes URLs and net error names as ASCII with quotes percent-encoded, so JSON escaping adds nothing.
+_LARGEST_REPORTED_REQUEST_FAILURE_CHARS = len(
+    json.dumps(
+        ReportedRequestFailure(
+            method="OPTIONS",
+            resource_type="document",
+            failure_text="f" * _MAX_REPORTED_FAILURE_TEXT_CHARS,
+            url="u" * _MAX_REPORTED_URL_CHARS,
+            page_url="u" * _MAX_REPORTED_URL_CHARS,
+        )
+    )
+)
+
+
+def _refit_scrubbed_failure(entry: dict[str, str]) -> dict[str, str] | None:
+    # Scrubbing can lengthen a field after its bound was checked, so a URL that no longer fits is left out.
+    fitted = {
+        key: value
+        for key, value in entry.items()
+        if key not in ("url", "page_url") or len(value) <= _MAX_REPORTED_URL_CHARS
+    }
+    return fitted if len(json.dumps(fitted)) <= _LARGEST_REPORTED_REQUEST_FAILURE_CHARS else None
+
+
+def _secret_url_markers(ctx: AgentContext) -> set[str]:
+    """Lowercased forms a registered value can take in a URL Chromium recorded: the value, every form of the part
+    before its first ``?`` or ``#``, its compatibility mapping in a host, and what dot-segment removal leaves of it."""
+    values = registered_scrub_values(ctx)
+    heads = {head for value in values if (head := value.partition("?")[0].partition("#")[0]) and head != value}
+    markers = {value.lower() for value in values} | {
+        form.lower() for head in heads for form in encoded_secret_variants(head)
+    }
+    for text in (*values, *heads):
+        if not text.isascii():
+            markers.add(unicodedata.normalize("NFKC", text).casefold())
+        if "/" in text and "." in text:
+            markers.add(posixpath.normpath(f"/{text}").lstrip("/").lower())
+    markers.discard("")
+    return markers
+
+
+def _with_decoded_host(url: str) -> str:
+    # Chromium punycode-encodes a whole non-ASCII host label, so a secret inside one is matched only once decoded.
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return url
+    if not host or "xn--" not in host:
+        return url
+    labels = []
+    for label in host.split("."):
+        if label.startswith("xn--"):
+            try:
+                label = label[4:].encode("ascii").decode("punycode")
+            except UnicodeError:
+                pass
+        labels.append(label)
+    return url.replace(host, ".".join(labels), 1)
+
+
+def _scrubbed_url(ctx: AgentContext, url: str, secret_markers: set[str]) -> str:
+    # Scrubbed whole, before the report drops the query and fragment: a secret can span the path and the query.
+    scrubbed = scrub_secrets_from_text(ctx, url)
+    # What the exact scrub cannot match: a host Chromium lowercased or punycode-encoded, or a secret cut at
+    # its ? or # (a masked query value, or a fragment the browser never sends).
+    lowered = _with_decoded_host(scrubbed).lower()
+    return "" if any(marker in lowered for marker in secret_markers) else scrubbed
+
+
+def _with_scrubbed_urls(ctx: AgentContext, entry: RequestFailure, secret_markers: set[str]) -> RequestFailure:
+    scrubbed = entry.copy()
+    scrubbed["url"] = _scrubbed_url(ctx, entry["url"], secret_markers)
+    scrubbed["page_url"] = _scrubbed_url(ctx, entry["page_url"], secret_markers)
+    return scrubbed
+
+
+@dataclass
+class HeldRequestFailures:
+    taken: list[tuple[RequestFailureLog, Page, list[RequestFailure]]] = field(default_factory=list)
+
+    def take(self, ctx: AgentContext, page: Page | None) -> list[ReportedRequestFailure]:
+        session_id = effective_browser_session_id(ctx)
+        log = ctx.request_failure_logs_by_browser_session.get(session_id) if session_id else None
+        if log is None or page is None:
+            return []
+        taken = log.take_tab(str(id(page)))
+        if not taken:
+            return []
+        self.taken.append((log, page, taken))
+        secret_markers = _secret_url_markers(ctx)
+        return reported_request_failures([_with_scrubbed_urls(ctx, entry, secret_markers) for entry in taken])
+
+    def restore(self) -> None:
+        for log, page, taken in reversed(self.taken):
+            # A closed tab's id() can be reused by a later page, which would inherit these entries.
+            if not page.is_closed():
+                log.restore(taken)
+        self.taken.clear()
+
+    def release(self) -> None:
+        self.taken.clear()
+
+
+# Set while a model-facing post-hook runs, so a hook that stamps its own page_state drains into the call's hold.
+POST_HOOK_HELD_REQUEST_FAILURES: ContextVar[HeldRequestFailures | None] = ContextVar(
+    "post_hook_held_request_failures", default=None
+)
+
+
+def _json_chars(value: dict[str, Any]) -> int:
+    return len(json.dumps(value, default=str))
+
+
+def stamp_page_facts(
+    ctx: AgentContext,
+    held: HeldRequestFailures | None,
+    result: dict[str, Any],
+    page_state: PageState,
+    page: Page | None,
+) -> dict[str, Any]:
+    """``result`` led by ``page_state`` and the failed requests of the tab it was read from, taken into ``held``.
+    A page_state read from no tab, or a call with no ``held``, drains nothing."""
+    stamped: dict[str, Any] = {"page_state": page_state, **result}
+    if held is None or not (failures := held.take(ctx, page)):
+        return stamped
+    reported = scrub_model_facing_tool_result(ctx, {PAGE_REQUEST_FAILURES_KEY: failures}).get(PAGE_REQUEST_FAILURES_KEY)
+    fitted = [f for entry in reported if (f := _refit_scrubbed_failure(entry))] if isinstance(reported, list) else []
+    with_failures = {"page_state": page_state, PAGE_REQUEST_FAILURES_KEY: fitted, **result}
+    # Failures never push a result past the recent-output cap, where its tail would be cut off.
+    if fitted and (
+        _json_chars(with_failures) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+        or _json_chars(stamped) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+    ):
+        return with_failures
+    held.restore()
+    return stamped
+
+
+def _scrub_stamped_tool_result(
+    ctx: AgentContext, held: HeldRequestFailures, result: Any, *, tool_name: str
+) -> dict[str, Any]:
+    # Failures must not be what withholds a result that passes without them, so they go back instead.
+    if (
+        isinstance(result, dict)
+        and PAGE_REQUEST_FAILURES_KEY in result
+        and _scrub_model_facing_tool_result(ctx, result) == "redaction_budget"
+    ):
+        del result[PAGE_REQUEST_FAILURES_KEY]
+    scrubbed = scrub_model_facing_tool_result(ctx, result, tool_name=tool_name)
+    if PAGE_REQUEST_FAILURES_KEY not in scrubbed:
+        held.restore()
+    return scrubbed
 
 
 def _screenshot_reference(raw_tool_name: str, raw_result: dict[str, Any]) -> tuple[bool, str | None]:
@@ -337,7 +590,6 @@ def _record_browser_call_outcome(
             replacement_browser_session_id=outcome.replacement_browser_session_id,
             completion_browser_session_id=outcome.completion_browser_session_id,
             completion_browser_session_generation=outcome.completion_browser_session_generation,
-            evidence_drain_complete=outcome.evidence_drain_complete,
             response_truncated=outcome.response_truncated,
             payload_omitted=outcome.payload_omitted,
             **_copilot_log_fields(cast("CopilotContext", ctx)),
@@ -345,7 +597,11 @@ def _record_browser_call_outcome(
 
 
 def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome) -> _BrowserCallOutcome:
-    scrubbed = outcome.with_raw_result(scrub_model_facing_tool_result(ctx, outcome.raw_result()))
+    scrubbed = outcome.with_raw_result(
+        scrub_model_facing_tool_result(ctx, outcome.raw_result(), tool_name=outcome.raw_tool_name)
+    )
+    if outcome.error_kind == "protocol":
+        scrubbed = replace(scrubbed, last_run_facts=last_run_facts(ctx, outcome.source_browser_session_id))
     if outcome.protocol_error_detail is None:
         return scrubbed
     detail_result = scrub_model_facing_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
@@ -396,6 +652,16 @@ def _project_browser_call_outcome(
             disposition=outcome.session_loss_disposition,
             deadline_expired=outcome.session_loss_deadline_expired,
         )
+    # A cancelled or timed-out call projects no continuity block of its own, and that is the shape
+    # the other browser matters most on, so the carrier is made rather than skipped.
+    if outcome.last_run_facts and result.get("ok") is not True:
+        data = result.setdefault("data", {})
+        if isinstance(data, dict):
+            continuity = data.get("browser_call_continuity") or data.get("browser_session_continuity")
+            if not isinstance(continuity, dict):
+                continuity = {"source": "direct_mcp", "failed_tool": display_tool_name}
+                data["browser_call_continuity"] = continuity
+            continuity.update(outcome.last_run_facts)
     return result
 
 
@@ -471,8 +737,19 @@ class SchemaOverlay:
     # Params the copilot offers on top of the MCP tool's own schema. A hook consumes them; they are
     # stripped before the call, so the underlying tool never sees an argument it cannot accept.
     copilot_params: dict[str, Any] = field(default_factory=dict)
+    # Merged over an MCP param's own schema (an enum, a description) while the argument still reaches the tool.
+    param_patches: dict[str, dict[str, Any]] = field(default_factory=dict)
     requires_browser: bool = False
-    redacts_sensitive_origin_structured_result: bool = False
+    # Dispatch overwrites binds_chat_workflow_param with the chat's own workflow, so the model cannot
+    # aim the call at any other workflow. Pair it with hiding that param from the schema.
+    binds_chat_workflow: bool = False
+    binds_chat_workflow_param: str = "workflow_permanent_id"
+    # Creates or changes future runs, so a turn without browser authority, which may not start a
+    # run either, does not see it.
+    requires_run_authority: bool = False
+    # Set when the post-hook is what keeps stored values from the model: a crash then withholds the
+    # result instead of falling back to the unfiltered one.
+    post_hook_fails_closed: bool = False
     timeout: int | None = None
     pre_hook: PreHook | None = None
     post_hook: PostHook | None = None
@@ -481,7 +758,9 @@ class SchemaOverlay:
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 _SESSION_EXPIRED_ERROR_CODE = "SESSION_EXPIRED"
+_EFFECT_UNKNOWN_GUIDANCE = "The call timed out before its result was confirmed; read the page before retrying."
 _BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
+BROWSER_SESSION_LOSS_ERROR_CODES = frozenset({_SESSION_EXPIRED_ERROR_CODE, _BROWSER_GENERATION_RETIRED_ERROR_CODE})
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
 _SESSION_LOST_USER_FACING_REASON = (
     "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
@@ -560,16 +839,6 @@ async def _browser_session_continuity_lock(organization_id: str, lost_session_id
         entry.users -= 1
         if entry.users == 0 and _LOCAL_CONTINUITY_LOCKS.get(local_key) is entry:
             _LOCAL_CONTINUITY_LOCKS.pop(local_key, None)
-
-
-@asynccontextmanager
-async def _context_browser_session_recovery_lock(ctx: AgentContext) -> AsyncIterator[None]:
-    lock = getattr(ctx, "browser_session_recovery_lock", None)
-    if lock is None:
-        yield
-        return
-    async with lock:
-        yield
 
 
 def _decode_continuity_outcome(raw: object) -> _BrowserSessionContinuityOutcome | None:
@@ -661,10 +930,19 @@ def _mapping_keys_preserved(source: Any, scrubbed: Any) -> bool:
     return True
 
 
-def scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any]:
-    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
-    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
-        return {}
+# A driver navigation token names a Chromium error, but a registered value occurring inside it (a
+# parameter "net") would corrupt it: the model would read a mangled code, and a proxy outage would
+# reach attribution as an authoring defect. A token that is itself a registered value is left scrubbed.
+_DRIVER_NAV_ERROR_CODE = re.compile(r"net::ERR_[A-Z0-9_]+")
+
+
+# Only the navigation tool reports a driver code, and only its own reader writes one. Preserving the
+# field for any tool would let one that echoes an argument into it disclose a registered value.
+_NAVIGATION_TOOL_NAME = "skyvern_navigate"
+
+
+def _active_parameter_sets(ctx: AgentContext) -> list[dict[str, Any]]:
+    """The redaction parameter sets this scrub applies, in the order it applies them."""
     parameter_sets: list[dict[str, Any]] = []
     parameters = getattr(ctx, "codeblock_redaction_parameters", None)
     if isinstance(parameters, dict) and parameters:
@@ -672,12 +950,130 @@ def scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, 
     origin_parameters = matching_origin_run_redaction_parameters(ctx)
     if origin_parameters:
         parameter_sets.append(origin_parameters)
+    return parameter_sets
 
+
+def _preserved_nav_code(ctx: AgentContext, tool_name: str | None, value: object) -> str | None:
+    if tool_name != _NAVIGATION_TOOL_NAME:
+        return None
+    if not isinstance(value, str) or not _DRIVER_NAV_ERROR_CODE.fullmatch(value):
+        return None
+    if is_registered_scrub_value(ctx, value):
+        return None
+    # The scrub redacts registered values AND the run's redaction parameters, so a guard that reads
+    # only the first restores whatever the second was hiding. A walk that does not finish cannot say
+    # the code is absent, so it refuses too.
+    for parameter_set in _active_parameter_sets(ctx):
+        carried_strings = parameter_strings(parameter_set)
+        if carried_strings is None or value in carried_strings:
+            return None
+    return value
+
+
+# Where a navigation code sits: the flattened Copilot result, and the raw MCP error's details.
+_NAV_ERROR_CODE_PARENTS: tuple[tuple[str, ...], ...] = ((), ("error", "details"))
+
+
+def _mapping_at(value: Any, path: tuple[str, ...]) -> dict[str, Any] | None:
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+_REDACTION_WITHHELD_KEY = "redaction_withheld"
+_RedactionWithheldReason = Literal["redaction_budget", "redaction_unavailable"]
+
+
+def is_redaction_withheld(result: object) -> bool:
+    data = result.get("data") if isinstance(result, dict) else None
+    return isinstance(data, dict) and isinstance(data.get(_REDACTION_WITHHELD_KEY), dict)
+
+
+def _original_chars(result: Any) -> int | None:
+    if is_redaction_withheld(result):
+        inherited = result["data"][_REDACTION_WITHHELD_KEY].get("original_chars")
+        return inherited if type(inherited) is int else None
+    try:
+        return len(json.dumps(result, default=str, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _redaction_withheld_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None, failure: _RedactionWithheldReason
+) -> dict[str, Any]:
+    original_chars = _original_chars(result)
+    rewithheld = is_redaction_withheld(result)
+    if rewithheld:
+        inherited_budget = result["data"][_REDACTION_WITHHELD_KEY].get("reason") == "redaction_budget"
+        failure = "redaction_budget" if inherited_budget else "redaction_unavailable"
+    # An inherited size can be missing because it was dropped as a registered value, not because it was small.
+    over_budget = original_chars > MCP_MAX_RESPONSE_CHARS if original_chars is not None else rewithheld
+    reason: _RedactionWithheldReason = (
+        "redaction_budget" if failure == "redaction_budget" and over_budget else "redaction_unavailable"
+    )
+    # A size equal to a registered value would disclose it, so the size is only reported when it scrubs to itself.
+    if original_chars is not None:
+        probe = {"original_chars": original_chars, "text": str(original_chars)}
+        if _scrub_model_facing_tool_result(ctx, probe) != probe:
+            original_chars = None
+    if not rewithheld:
+        LOG.warning(
+            "copilot_model_facing_result_withheld",
+            tool_name=tool_name,
+            reason=reason,
+            original_chars=original_chars,
+            active_parameter_sets=len(_active_parameter_sets(ctx)),
+        )
+    withheld: dict[str, Any] = {"reason": reason}
+    if original_chars is not None:
+        withheld["original_chars"] = original_chars
+    if reason == "redaction_budget":
+        size = f" ({original_chars} characters)" if original_chars is not None else ""
+        error = f"Result withheld, too large to redact{size}."
+    else:
+        error = "Result withheld: it could not be redacted safely."
+    return {"ok": False, "error": error, "data": {_REDACTION_WITHHELD_KEY: withheld}}
+
+
+def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name: str | None = None) -> dict[str, Any]:
+    driver_codes = {
+        path: code
+        for path in _NAV_ERROR_CODE_PARENTS
+        if (code := _preserved_nav_code(ctx, tool_name, (_mapping_at(result, path) or {}).get("nav_error_code")))
+        is not None
+    }
+    scrubbed = _scrub_model_facing_tool_result(ctx, result)
+    if not isinstance(scrubbed, dict):
+        return _redaction_withheld_result(ctx, result, tool_name=tool_name, failure=scrubbed)
+    for path, code in driver_codes.items():
+        parent = _mapping_at(scrubbed, path)
+        if parent is not None:
+            parent["nav_error_code"] = code
+    return scrubbed
+
+
+def _scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any] | _RedactionWithheldReason:
+    scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
+    if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
+        return "redaction_unavailable"
     scrubbed = scrubbed_secrets
-    for parameter_set in parameter_sets:
-        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(scrubbed, parameter_set)
-        if not isinstance(candidate, dict) or not _mapping_keys_preserved(scrubbed, candidate):
-            return {}
+    for parameter_set in _active_parameter_sets(ctx):
+        candidate = app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+            scrubbed,
+            parameter_set,
+            max_disclosure_chars=MCP_MAX_RESPONSE_CHARS,
+            max_disclosure_nodes=MCP_MAX_RESPONSE_CHARS,
+        )
+        if not isinstance(candidate, dict):
+            # The redactor returns the same non-dict for a blown budget and for a parameter set it refuses,
+            # so ask it about an empty input to tell the two apart.
+            refuses_parameters = not isinstance(
+                app.AGENT_FUNCTION.redact_codeblock_parameter_values({}, parameter_set), dict
+            )
+            return "redaction_unavailable" if refuses_parameters else "redaction_budget"
+        if not _mapping_keys_preserved(scrubbed, candidate):
+            return "redaction_unavailable"
         if type(scrubbed.get("ok")) is bool:
             candidate["ok"] = scrubbed["ok"]
         scrubbed = candidate
@@ -694,9 +1090,7 @@ def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseExce
     return scrub_model_facing_tool_result(ctx, {"ok": False, "error": error})
 
 
-_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "evidence_drain", "context_exit"]
-# The segments charged to the wall clock. ``evidence_drain`` names where a call died but is never
-# charged here, so the residual stays the remainder of what the record actually reports.
+_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "context_exit"]
 _MCP_CALL_SEGMENTS: tuple[_MCPCallPhase, ...] = ("session_prepare", "context_enter", "dispatch", "context_exit")
 
 
@@ -712,7 +1106,6 @@ class _PhaseClock:
         self._excluded_seconds = 0.0
         self.current: _MCPCallPhase | None = None
         self.elapsed: dict[_MCPCallPhase, int] = {}
-        self.drain_ms: int | None = None
 
     def _charge(self, now: float) -> None:
         if self._bucket is not None:
@@ -755,12 +1148,6 @@ class _PhaseClock:
             self._wall = int((now - self._started - self._excluded_seconds) * 1000)
         return self._wall
 
-    def record_drain(self, started: float, *, failed: bool) -> None:
-        """Settling the page runs after the wall is frozen: the caller waits for it, but it is not part of the call."""
-        self.drain_ms = int((time.monotonic() - started) * 1000)
-        if failed:
-            self.current = "evidence_drain"
-
     def settle(self) -> None:
         """The call answered, so no segment holds a failure and ``timing_phase`` would misname a returned error."""
         self.current = None
@@ -779,7 +1166,9 @@ def _log_mcp_timing(
     phases: _PhaseClock,
     raw_mcp: dict[str, Any],
     call_path: Literal["model", "internal"],
-    call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
+    call_status: Literal[
+        "ok", "timeout", "error", "session_error", "cancelled", "not_connected", "raw_secret_denied"
+    ] = "ok",
     *,
     dispatch_started: bool | None = None,
 ) -> None:
@@ -810,7 +1199,6 @@ def _log_mcp_timing(
             phase_context_enter_ms=spent["context_enter"],
             phase_dispatch_ms=dispatch_ms,
             phase_context_exit_ms=spent["context_exit"],
-            post_call_evidence_drain_ms=phases.drain_ms,
             phase_residual_ms=wall_clock_ms - sum(spent.values()),
             timing_phase=phases.current if call_status != "ok" else None,
             phase_dispatch_untimed_ms=untimed_ms,
@@ -951,6 +1339,24 @@ async def _handle_browser_session_loss(
         )
         return "failed"
 
+    # Promotion of retained browser-code source holds this same context lock through persistence.
+    # Recovery must not retire the browser or advance its generation while that promotion is in flight.
+    async with browser_session_recovery(ctx):
+        return await _handle_browser_session_loss_under_context_lock(
+            ctx,
+            tool_name=tool_name,
+            call_path=call_path,
+            lost_session_id=lost_session_id,
+        )
+
+
+async def _handle_browser_session_loss_under_context_lock(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    call_path: Literal["model", "internal"],
+    lost_session_id: str,
+) -> Literal["reestablished", "failed"]:
     local_replacements = getattr(ctx, "browser_session_replacements", {})
     if lost_session_id in local_replacements:
         return "reestablished" if local_replacements[lost_session_id] is not None else "failed"
@@ -958,7 +1364,7 @@ async def _handle_browser_session_loss(
     async with _browser_session_continuity_lock(ctx.organization_id, lost_session_id):
         recorded = await _get_continuity_outcome(ctx.organization_id, lost_session_id)
         if recorded is not None:
-            _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+            await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
             return recorded.disposition
 
         root_session_id = await _get_continuity_root(ctx.organization_id, lost_session_id)
@@ -974,7 +1380,7 @@ async def _handle_browser_session_loss(
             deadline_expired=deadline_expired,
         )
         await close_browser_session_quietly(ctx.organization_id, lost_session_id)
-        retire_browser_session_id(ctx, lost_session_id)
+        await retire_browser_session_id(ctx, lost_session_id)
 
         if root_session_id is not None:
             outcome = _BrowserSessionContinuityOutcome(
@@ -994,7 +1400,7 @@ async def _handle_browser_session_loss(
             replacement_session_id = ctx.browser_session_id if recovery_error is None else None
             if recovery_error is not None and ctx.browser_session_id is not None:
                 await close_browser_session_quietly(ctx.organization_id, ctx.browser_session_id)
-                retire_browser_session_id(ctx, ctx.browser_session_id)
+                await retire_browser_session_id(ctx, ctx.browser_session_id)
             outcome = _BrowserSessionContinuityOutcome(
                 lost_session_id=lost_session_id,
                 root_session_id=lost_session_id,
@@ -1004,7 +1410,7 @@ async def _handle_browser_session_loss(
             )
 
         await _store_continuity_outcome(ctx.organization_id, outcome)
-        _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
+        await _apply_continuity_outcome(ctx, outcome, tool_name=tool_name, call_path=call_path)
         _emit_continuity_event(
             ctx,
             tool_name=tool_name,
@@ -1078,32 +1484,33 @@ def _emit_continuity_event(
             )
 
 
-def _apply_continuity_outcome(
+async def _apply_continuity_outcome(
     ctx: AgentContext,
     outcome: _BrowserSessionContinuityOutcome,
     *,
     tool_name: str,
     call_path: Literal["model", "internal"],
 ) -> None:
-    ctx.browser_session_id = outcome.replacement_session_id
-    replacements = getattr(ctx, "browser_session_replacements", None)
-    if not isinstance(replacements, dict):
-        replacements = {}
-        ctx.browser_session_replacements = replacements
-    replacements[outcome.lost_session_id] = outcome.replacement_session_id
-    ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
-    ctx.browser_session_continuity_disposition = outcome.disposition
-    ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
-    if outcome.disposition == "failed":
-        stash_blocker_signal(
-            ctx,
-            _browser_session_loss_blocker_signal(
-                tool_name=tool_name,
-                call_path=call_path,
-                lost_session_id=outcome.lost_session_id,
-                deadline_expired=outcome.deadline_expired,
-            ),
-        )
+    async with browser_session_recovery(ctx):
+        ctx.browser_session_id = outcome.replacement_session_id
+        replacements = getattr(ctx, "browser_session_replacements", None)
+        if not isinstance(replacements, dict):
+            replacements = {}
+            ctx.browser_session_replacements = replacements
+        replacements[outcome.lost_session_id] = outcome.replacement_session_id
+        ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
+        ctx.browser_session_continuity_disposition = outcome.disposition
+        ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
+        if outcome.disposition == "failed":
+            stash_blocker_signal(
+                ctx,
+                _browser_session_loss_blocker_signal(
+                    tool_name=tool_name,
+                    call_path=call_path,
+                    lost_session_id=outcome.lost_session_id,
+                    deadline_expired=outcome.deadline_expired,
+                ),
+            )
 
 
 async def _prepare_browser_session_for_dispatch(
@@ -1114,13 +1521,15 @@ async def _prepare_browser_session_for_dispatch(
     observed_generation: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
     """Verify the current session and return any error, continuity result, and fresh disposition."""
+    if raw_secret_browser_denied(ctx):
+        return {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}, None, None
     targeted_session_id = current_call_browser_session_override()
     if targeted_session_id is not None and targeted_session_id != ctx.browser_session_id:
         # This call acts in a browser the chat does not own, so the chat's continuity is not its
         # precondition. The dispatch is the oracle for the targeted session; a dead one lands in
         # _handle_browser_session_loss, which refuses the call without disturbing the chat.
         return None, None, None
-    async with _context_browser_session_recovery_lock(ctx):
+    async with browser_session_recovery(ctx):
         if getattr(ctx, "browser_session_continuity_generation", 0) != observed_generation:
             disposition: Literal["reestablished", "failed"] = (
                 "reestablished"
@@ -1144,7 +1553,7 @@ async def _prepare_browser_session_for_dispatch(
         async with _browser_session_continuity_lock(ctx.organization_id, prior_session_id):
             recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
             if recorded is not None:
-                _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
+                await _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
                 return (
                     None,
                     _browser_session_loss_result(
@@ -1208,10 +1617,16 @@ def _apply_schema_overlay(
             required.remove(mcp_param)
             required.append(copilot_param)
 
+    for param, patch in overlay.param_patches.items():
+        if param in props:
+            props[param] = {**props[param], **patch}
+
     props.update(overlay.copilot_params)
 
     if overlay.required_overrides is not None:
-        required = overlay.required_overrides
+        required = list(overlay.required_overrides)
+    if USER_FACING_REASON_PARAM in props and USER_FACING_REASON_PARAM not in required:
+        required.append(USER_FACING_REASON_PARAM)
 
     return {
         **input_schema,
@@ -1249,17 +1664,6 @@ def _copilot_to_call_tool_result(
     return CallToolResult(content=content, isError=is_error)
 
 
-def _evidence_candidate_url_origin(url: str) -> str | None:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            return None
-        port = f":{parsed.port}" if parsed.port else ""
-    except ValueError:
-        return None
-    return f"https://{parsed.hostname.lower()}{port}"
-
-
 @asynccontextmanager
 async def service_worker_blocked_context(
     browser_state: BrowserState,
@@ -1268,7 +1672,7 @@ async def service_worker_blocked_context(
 ) -> AsyncIterator[BrowserContext]:
     original_context = browser_state.browser_context
     if original_context is None:
-        raise RuntimeError("Evidence-candidate browser does not support an isolated context")
+        raise RuntimeError("This browser does not support an isolated context")
     original_page = await browser_state.get_working_page()
     browser = original_context.browser
     fallback_browser: Browser | None = None
@@ -1301,6 +1705,14 @@ async def service_worker_blocked_context(
                 await fallback_browser.close()
 
 
+_TOOL_CALL_ID_META_KEY = "tool_call_id"
+
+
+def _owning_tool_call_meta(context: MCPToolMetaContext) -> dict[str, Any] | None:
+    run_context = context.run_context
+    return {_TOOL_CALL_ID_META_KEY: run_context.tool_call_id} if isinstance(run_context, ToolContext) else None
+
+
 class SkyvernOverlayMCPServer(MCPServer):
     """MCP server that wraps a FastMCP transport with schema overlays and
     copilot-specific dispatch logic (loop detection, browser injection, hooks).
@@ -1316,10 +1728,12 @@ class SkyvernOverlayMCPServer(MCPServer):
         *,
         ordered_allowlist: tuple[str, ...] | None = None,
         enforce_dispatch_allowlist: bool = False,
+        page_state_reader: PageStateReader | None = None,
     ) -> None:
-        super().__init__(use_structured_content=False)
+        super().__init__(use_structured_content=False, tool_meta_resolver=_owning_tool_call_meta)
         self._transport = transport
         self._overlays = overlays
+        self._page_state_reader = page_state_reader
         self._alias_map = alias_map  # copilot_name -> mcp_name
         self._reverse_alias: dict[str, str] = {v: k for k, v in alias_map.items()}
         self._ordered_allowlist = ordered_allowlist
@@ -1329,19 +1743,26 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_raw_tools: list[MCPTool] | None = None
-        self._evidence_candidate_origin: str | None = None
-        self._evidence_candidate_guarded_hops: list[CopilotCandidateNetworkHop] | None = None
 
     @property
     def name(self) -> str:
         return "skyvern"
 
     async def connect(self) -> None:
+        ctx = self._context_provider()
+        if not ctx.api_key:
+            raise RuntimeError("Copilot agent context missing api_key")
         stack = AsyncExitStack()
         await stack.__aenter__()
         client = Client(self._transport)
-        with request_session_scope(self._context_provider().organization_id):
-            await stack.enter_async_context(client)
+        # The in-process transport's server task copies context vars once, at client entry, so a
+        # per-call override never reaches tool bodies; without this they authenticate as the server key.
+        override_token = set_api_key_override(ctx.api_key)
+        try:
+            with request_session_scope(ctx.organization_id):
+                await stack.enter_async_context(client)
+        finally:
+            reset_api_key_override(override_token)
         self._client = client
         self._exit_stack = stack
 
@@ -1351,82 +1772,6 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._client = None
         self._exit_stack = None
         self._cached_raw_tools = None
-
-    @asynccontextmanager
-    async def evidence_candidate_navigation_guard(
-        self,
-        expected_origin: str,
-    ) -> AsyncIterator[list[CopilotCandidateNetworkHop]]:
-        if self._evidence_candidate_origin is not None:
-            raise RuntimeError("Evidence-candidate navigation guard is already active")
-        normalized_origin = _evidence_candidate_url_origin(expected_origin)
-        if normalized_origin != expected_origin:
-            raise ValueError("Evidence-candidate origin must be an exact HTTPS origin")
-        ctx = self._context_provider()
-        session_error = await ensure_browser_session(ctx)
-        if session_error is not None:
-            raise RuntimeError(str(session_error.get("error", "Evidence-candidate browser session unavailable")))
-        examined_session_id = ctx.browser_session_id
-        try:
-            browser_state = await resolve_browser_state_for_context(ctx)
-            if browser_state is None:
-                retire_browser_session_id(ctx, examined_session_id)
-                raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
-            async with service_worker_blocked_context(
-                browser_state,
-                organization_id=ctx.organization_id,
-            ) as browser_context:
-                cookies = await browser_context.cookies()
-                if (
-                    cookies
-                    or browser_context.service_workers
-                    or any(page.url not in {"", "about:blank"} for page in browser_context.pages)
-                ):
-                    raise RuntimeError("Evidence-candidate navigation guard requires a pristine browser context")
-                async with app.AGENT_FUNCTION.copilot_candidate_network_guard(
-                    browser_context, expected_origin=normalized_origin
-                ) as guarded_hops:
-                    self._evidence_candidate_origin = normalized_origin
-                    self._evidence_candidate_guarded_hops = guarded_hops
-                    try:
-                        yield guarded_hops
-                    finally:
-                        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
-        finally:
-            self._evidence_candidate_origin = None
-            self._evidence_candidate_guarded_hops = None
-
-    async def _drain_evidence_candidate_response_tasks(self) -> None:
-        if self._evidence_candidate_origin is None:
-            return
-        browser_state = await resolve_browser_state_for_context(self._context_provider())
-        browser_context = browser_state.browser_context if browser_state is not None else None
-        if browser_context is None:
-            raise RuntimeError("Evidence-candidate browser context became unavailable")
-        await app.AGENT_FUNCTION.wait_for_copilot_candidate_network_idle(browser_context)
-
-    async def evidence_candidate_browser_url(self) -> str:
-        if self._evidence_candidate_origin is None:
-            raise RuntimeError("Evidence-candidate navigation guard is not active")
-        browser_state = await resolve_browser_state_for_context(self._context_provider())
-        page = await browser_state.get_working_page() if browser_state is not None else None
-        if page is None:
-            raise RuntimeError("Evidence-candidate working page is unavailable")
-        browser_url = page.url
-        last_enforced_url = next(
-            (
-                hop["url"]
-                for hop in reversed(self._evidence_candidate_guarded_hops or [])
-                if hop["resource_type"] == "document"
-            ),
-            None,
-        )
-        if (
-            _evidence_candidate_url_origin(browser_url) != self._evidence_candidate_origin
-            or browser_url != last_enforced_url
-        ):
-            raise RuntimeError("candidate_browser_url_not_peer_verified")
-        return browser_url
 
     async def list_tools(
         self,
@@ -1484,33 +1829,43 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments: dict[str, Any] | None,
         meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
+        if arguments is not None:
+            arguments = {name: value for name, value in arguments.items() if name != USER_FACING_REASON_PARAM}
         propagated_error: BaseException
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
+        demonstrated_action = current_demonstrated_action()
         # Bound out here so one call's browser reaches everything it touches: pre-hooks, session
         # preparation, dispatch and post-hooks. Binding only the dispatch would collect evidence
         # from one browser, act in another, then record the result from the first.
         # Resolved once. A sibling call in the same turn can record or clear the run session, so
         # resolving again for dispatch could bind the hooks to one browser and the dispatch to another.
         call_binding = (
-            resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None
+            (resolve_browser_session_binding(copilot_ctx, arguments or {}) if overlay.requires_browser else None)
+            if demonstrated_action is None
+            else None
         )
+        owning_call_id = (meta or {}).get(_TOOL_CALL_ID_META_KEY)
         try:
-            if overlay.requires_browser:
-                async with browser_page_custody_lock(
+            if overlay.requires_browser and demonstrated_action is None:
+                async with browser_session_turn(
                     copilot_ctx, session_id=call_binding.session_id_for(copilot_ctx) if call_binding else None
                 ):
                     with (
                         pending_operation(f"mcp.call_tool:{tool_name}"),
                         bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                        capturing_tool_call(owning_call_id),
                     ):
                         return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
             else:
                 with (
                     pending_operation(f"mcp.call_tool:{tool_name}"),
                     bound_call_browser_session(call_binding.session_id_override if call_binding else None),
+                    capturing_tool_call(owning_call_id),
                 ):
                     return await self._call_tool(tool_name, arguments, meta, binding=call_binding)
+        except RunSecretsNotRegistered as exc:
+            return _copilot_to_call_tool_result({"ok": False, "error": str(exc)}, tool_name)
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 LOG.warning("MCP tool dispatch failed")
@@ -1541,6 +1896,71 @@ class SkyvernOverlayMCPServer(MCPServer):
         mcp_name = self._alias_map.get(tool_name, tool_name)
         if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
             raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
+        held_failures = HeldRequestFailures()
+        demonstrated_action = current_demonstrated_action()
+        if demonstrated_action is not None:
+            existing_interactions = {id(item) for item in copilot_ctx.scouted_interactions}
+            existing_trajectory = {id(item) for item in copilot_ctx.scout_trajectory}
+
+            def stamp_user_actor() -> None:
+                for item in copilot_ctx.scouted_interactions:
+                    if id(item) not in existing_interactions:
+                        item["actor"] = "user"
+                for item in copilot_ctx.scout_trajectory:
+                    if id(item) not in existing_trajectory:
+                        item["actor"] = "user"
+
+            if overlay.pre_hook is not None:
+                refusal = await overlay.pre_hook(arguments, copilot_ctx)
+                if refusal is not None:
+                    LOG.info("copilot_demonstration_replay_refused", tool=tool_name)
+                    stamp_user_actor()
+                    projected_refusal = scrub_model_facing_tool_result(copilot_ctx, refusal, tool_name=mcp_name)
+                    projected_refusal = _scrub_stamped_tool_result(
+                        copilot_ctx, held_failures, projected_refusal, tool_name=mcp_name
+                    )
+                    record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, projected_refusal)
+                    return _copilot_to_call_tool_result(projected_refusal, tool_name)
+
+            raw_mcp = scrub_model_facing_tool_result(
+                copilot_ctx,
+                deepcopy(demonstrated_action.synthesized_result),
+                tool_name=mcp_name,
+            )
+            copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
+            if overlay.post_hook is not None:
+                async with browser_evidence_commit_lock(copilot_ctx):
+                    base_copilot_result = deepcopy(copilot_result)
+                    ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                    held_token = POST_HOOK_HELD_REQUEST_FAILURES.set(held_failures)
+                    try:
+                        copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+                    except asyncio.CancelledError:
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        raise
+                    except Exception:  # noqa: BLE001
+                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
+                        )
+                        copilot_result = (
+                            {
+                                "ok": False,
+                                "error": f"{tool_name} result could not be prepared for display and is withheld.",
+                            }
+                            if overlay.post_hook_fails_closed
+                            else base_copilot_result
+                        )
+                    finally:
+                        POST_HOOK_HELD_REQUEST_FAILURES.reset(held_token)
+            stamp_user_actor()
+            copilot_result = _scrub_stamped_tool_result(copilot_ctx, held_failures, copilot_result, tool_name=mcp_name)
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
+            held_failures.release()
+            return _copilot_to_call_tool_result(copilot_result, tool_name)
+
         observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
         attempt_browser_session_id = current_call_browser_session_override() or getattr(
             copilot_ctx, "browser_session_id", None
@@ -1552,19 +1972,30 @@ class SkyvernOverlayMCPServer(MCPServer):
         if binding is None:
             binding = resolve_browser_session_binding(copilot_ctx, arguments or {})
 
+        async def _stamp_page_state(result: dict[str, Any], *, probe: bool = True) -> None:
+            reader = self._page_state_reader
+            if reader is None or not result or not overlay.requires_browser or "page_state" in result:
+                return
+            # Failures an abandoned result took go back, so this one reports the tab it reads.
+            held_failures.restore()
+            # First, so a head-truncated copy of a long result still carries it.
+            page_state, page = await reader(
+                copilot_ctx, tool_name=tool_name, result=result, binding=binding, probe=probe
+            )
+            stamped = stamp_page_facts(copilot_ctx, held_failures, result, page_state, page)
+            result.clear()
+            result.update(stamped)
+
         if overlay.requires_browser and binding.unavailable_reason:
             # Refused before dispatch: a call aimed at the run's browser must not quietly act in
             # the chat's, where a click or a fill would be a real side effect in the wrong place.
             result = {"ok": False, "error": binding.unavailable_reason, **binding.provenance()}
+            await _stamp_page_state(result)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
-        policy = copilot_ctx.request_policy
-        if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
-            result = {
-                "ok": False,
-                "error": "A raw-secret draft cannot use browser tools. Save only the redacted draft.",
-            }
+        if overlay.requires_browser and raw_secret_browser_denied(copilot_ctx):
+            result = {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}
             if uses_shared_browser_outcome:
                 outcome = _not_dispatched_browser_call_outcome(
                     raw_tool_name=mcp_name,
@@ -1577,8 +2008,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
             else:
-                result = scrub_model_facing_tool_result(copilot_ctx, result)
+                result = scrub_model_facing_tool_result(copilot_ctx, result, tool_name=mcp_name)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
+            await _stamp_page_state(result)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
@@ -1611,7 +2043,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                     hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
-                    hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result)
+                    hook_result = scrub_model_facing_tool_result(copilot_ctx, hook_result, tool_name=mcp_name)
+                await _stamp_page_state(hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result, tool_name)
             return None
@@ -1622,6 +2055,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 return pre_hook_result
 
         mcp_args = _transform_args(arguments, overlay)
+        if overlay.binds_chat_workflow:
+            mcp_args[overlay.binds_chat_workflow_param] = copilot_ctx.workflow_permanent_id
 
         if overlay.requires_browser:
             phases.enter("session_prepare")
@@ -1657,7 +2092,15 @@ class SkyvernOverlayMCPServer(MCPServer):
                     _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 raise
             if err:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+                _log_mcp_timing(
+                    copilot_ctx,
+                    tool_name,
+                    mcp_name,
+                    phases,
+                    {},
+                    "model",
+                    "raw_secret_denied" if raw_secret_browser_denied(copilot_ctx) else "session_error",
+                )
                 if uses_shared_browser_outcome:
                     outcome = _not_dispatched_browser_call_outcome(
                         raw_tool_name=mcp_name,
@@ -1671,6 +2114,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     err = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
                     err = scrub_model_facing_tool_result(copilot_ctx, err)
+                await _stamp_page_state(err, probe=False)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err, tool_name)
             if continuity_result is not None:
@@ -1689,6 +2133,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     continuity_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
                 else:
                     continuity_result = scrub_model_facing_tool_result(copilot_ctx, continuity_result)
+                await _stamp_page_state(continuity_result, probe=False)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
                 return _copilot_to_call_tool_result(continuity_result, tool_name)
             mcp_args["session_id"] = binding.session_id_for(copilot_ctx)
@@ -1727,12 +2172,12 @@ class SkyvernOverlayMCPServer(MCPServer):
             phases.pause()
             # Scrub before the post hook so evidence the hooks record from raw_mcp
             # (flow evidence, scout observations) is scrubbed too.
-            raw_mcp = scrub_model_facing_tool_result(copilot_ctx, raw_mcp)
+            raw_mcp = scrub_model_facing_tool_result(copilot_ctx, raw_mcp, tool_name=mcp_name)
             session_lost = False
             error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
             if (
                 overlay.requires_browser
-                and copilot_ctx.turn_origin != TurnOrigin.runtime_self_heal
+                and copilot_ctx.turn_origin != TurnOrigin.code_block_ai_fallback
                 and isinstance(call_browser_session_id, str)
                 and call_browser_session_id
                 and error_code == _SESSION_EXPIRED_ERROR_CODE
@@ -1789,6 +2234,10 @@ class SkyvernOverlayMCPServer(MCPServer):
                 # Stamped before the post-hook, which is allowed to fail back to this base result: a
                 # browser answer whose provenance dropped is a silent cross-browser read.
                 copilot_result.update(binding.provenance())
+                error = copilot_result.get("error")
+                if copilot_result.get("error_code") == ErrorCode.TIMEOUT and isinstance(error, str):
+                    separator = " " if error.endswith((".", "?", "!")) else ". "
+                    copilot_result["error"] = f"{error}{separator}{_EFFECT_UNKNOWN_GUIDANCE}"
 
             if overlay.post_hook and not session_lost:
                 async with AsyncExitStack() as evidence_stack:
@@ -1796,37 +2245,39 @@ class SkyvernOverlayMCPServer(MCPServer):
                         await evidence_stack.enter_async_context(browser_evidence_commit_lock(copilot_ctx))
                     base_copilot_result = deepcopy(copilot_result)
                     ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+                    held_token = POST_HOOK_HELD_REQUEST_FAILURES.set(held_failures)
                     try:
                         copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
                     except asyncio.CancelledError:
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
                         raise
                     except Exception:
-                        # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                        # An enrichment hook's crash must not fail the action or keep partial credit.
                         _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        LOG.warning("MCP post-hook failed; returning base tool result", tool=tool_name)
-                        copilot_result = base_copilot_result
-                    # The last disclosure boundary, so it also runs after a crashed post-hook. It fails
-                    # closed when an unexpected producer marks the exact session while an enrichment awaits.
-                    sensitive_result_is_scrubbable = (
-                        overlay.redacts_sensitive_origin_structured_result
-                        and not sensitive_origin_page_facts_withheld(
-                            copilot_ctx, getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+                        LOG.warning(
+                            "MCP post-hook failed",
+                            tool=tool_name,
+                            fails_closed=overlay.post_hook_fails_closed,
                         )
-                    )
-                    if (
-                        overlay.requires_browser
-                        and sensitive_origin_page_is_tainted(copilot_ctx)
-                        and not sensitive_result_is_scrubbable
-                    ):
-                        _restore_post_hook_context(copilot_ctx, ctx_snapshot)
-                        copilot_result = {
-                            "ok": False,
-                            "error": SENSITIVE_ORIGIN_PAGE_ERROR,
-                            **binding.provenance(),
-                        }
+                        if overlay.post_hook_fails_closed:
+                            server_outcome = ", which reported an error" if failed else ", which reported success"
+                            copilot_result = {
+                                "ok": False,
+                                "error": (
+                                    f"{tool_name} reached the server{server_outcome}, but its result could not "
+                                    "be prepared for display and is withheld."
+                                ),
+                            }
+                        else:
+                            copilot_result = base_copilot_result
+                    finally:
+                        POST_HOOK_HELD_REQUEST_FAILURES.reset(held_token)
 
-            copilot_result = scrub_model_facing_tool_result(copilot_ctx, copilot_result)
+            if isinstance(copilot_result, dict):
+                await _stamp_page_state(copilot_result)
+            copilot_result = _scrub_stamped_tool_result(copilot_ctx, held_failures, copilot_result, tool_name=mcp_name)
+            if browser_outcome is not None and is_redaction_withheld(copilot_result):
+                browser_outcome = browser_outcome.as_redaction_withheld()
 
             def _commit_evidence() -> None:
                 if browser_outcome is not None:
@@ -1853,6 +2304,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         if isinstance(workflow_run_id, str) and workflow_run_id
                         else None,
                         action_relation=ScreenshotActionRelation.TOOL_RESULT,
+                        viewport_css_px=screenshot_viewport_css_px(copilot_result),
                     ),
                 )
 
@@ -1881,27 +2333,35 @@ class SkyvernOverlayMCPServer(MCPServer):
                     try:
                         async with browser_scope:
                             pre_hook_result = await _run_pre_hook()
-                            if pre_hook_result is not None:
-                                return pre_hook_result
-                            phases.enter("dispatch")
-                            dispatch_started = True
-                            try:
-                                raw_result = await asyncio.wait_for(
-                                    self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
-                                    timeout=overlay.timeout,
+                            # A refusal is returned only after the scope exits, which can still fail and
+                            # abandon it; its failures stay held until then.
+                            if pre_hook_result is None:
+                                phases.enter("dispatch")
+                                dispatch_started = True
+                                try:
+                                    raw_result = await asyncio.wait_for(
+                                        self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                                        timeout=overlay.timeout,
+                                    )
+                                except BaseException:
+                                    phases.unwind()
+                                    raise
+                                projected_result, timing_raw_mcp, failed, commit_evidence = await _project_result(
+                                    raw_result,
+                                    defer_evidence=True,
+                                    evidence_lock_held=True,
                                 )
-                            except BaseException:
-                                phases.unwind()
-                                raise
-                            projected_result, timing_raw_mcp, failed, commit_evidence = await _project_result(
-                                raw_result,
-                                defer_evidence=True,
-                                evidence_lock_held=True,
-                            )
-                            phases.enter("context_exit")
+                                phases.enter("context_exit")
                     except (asyncio.CancelledError, CopilotBrowserGenerationRetired):
                         _restore_post_hook_context(copilot_ctx, lease_context_snapshot)
                         raise
+                    finally:
+                        # The click post hook is skipped on session loss, timeout, and errors, and
+                        # the viewport bytes the pre hook held for it must not outlive this call.
+                        copilot_ctx.pending_scout_click_pre_frame = None
+                    if pre_hook_result is not None:
+                        held_failures.release()
+                        return pre_hook_result
                     commit_evidence()
                 phases.settle()
                 _log_mcp_timing(
@@ -1913,6 +2373,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     "model",
                     "error" if failed else "ok",
                 )
+                held_failures.release()
                 return projected_result
             else:
                 phases.enter("dispatch")
@@ -1940,10 +2401,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             within = f" within {overlay.timeout}s" if overlay.timeout is not None else ""
             err = {
                 "ok": False,
-                "error": (
-                    f"{tool_name} did not answer{within} and was cancelled. "
-                    "Whether it took effect is unknown; read the page before trying it again."
-                ),
+                "error": f"{tool_name} did not answer{within} and was cancelled. {_EFFECT_UNKNOWN_GUIDANCE}",
             }
             if uses_shared_browser_outcome:
                 outcome = _browser_call_outcome_from_mapping(
@@ -1966,6 +2424,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
             else:
                 err = scrub_model_facing_tool_result(copilot_ctx, err)
+            await _stamp_page_state(err, probe=False)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
@@ -2021,6 +2480,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
                     ),
                 )
+            await _stamp_page_state(err, probe=False)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err, tool_name)
         except asyncio.CancelledError:
@@ -2063,8 +2523,12 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
             else:
                 err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
+            await _stamp_page_state(err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
+            held_failures.release()
             return _copilot_to_call_tool_result(err, tool_name)
+        finally:
+            held_failures.restore()
 
     async def call_internal_tool(
         self,
@@ -2127,6 +2591,22 @@ class SkyvernOverlayMCPServer(MCPServer):
         call_session_override = current_call_browser_session_override()
         attempt_browser_session_id = requested_session_id or call_session_override or ctx.browser_session_id
         uses_shared_browser_outcome = mcp_tool_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        if current_demonstrated_action() is not None:
+            result = {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=copilot_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
         dispatch_started = False
         if not self._client:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "not_connected")
@@ -2145,7 +2625,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
                     browser_outcome=outcome,
                 )
-            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result))
+            return _InternalToolCallResult(result=scrub_model_facing_tool_result(ctx, result, tool_name=mcp_tool_name))
         phases.enter("session_prepare")
         try:
             err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
@@ -2179,7 +2659,15 @@ class SkyvernOverlayMCPServer(MCPServer):
                 _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
         if err:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            _log_mcp_timing(
+                ctx,
+                copilot_name,
+                mcp_tool_name,
+                phases,
+                {},
+                "internal",
+                "raw_secret_denied" if raw_secret_browser_denied(ctx) else "session_error",
+            )
             if uses_shared_browser_outcome:
                 outcome = _not_dispatched_browser_call_outcome(
                     raw_tool_name=mcp_tool_name,
@@ -2219,7 +2707,6 @@ class SkyvernOverlayMCPServer(MCPServer):
         merged_args = {**mcp_args, "session_id": call_browser_session_id}
         call_browser_session_generation = ctx.browser_session_continuity_generation
         browser_outcome: _BrowserCallOutcome | None = None
-        post_dispatch_status: Literal["ok", "error", "session_error"] = "ok"
         try:
             phases.enter("context_enter")
             # Only pass the override when there is one, as the model-facing path does: an
@@ -2245,45 +2732,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     phases.unwind()
                     raise
                 phases.enter("context_exit")
-            # The evidence drain runs outside the dispatch span this record covers.
             phases.close()
-            if self._evidence_candidate_origin is not None:
-                drain_started = time.monotonic()
-                try:
-                    await asyncio.sleep(0)
-                    await self._drain_evidence_candidate_response_tasks()
-                except asyncio.CancelledError:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is not None:
-                        browser_outcome = replace(
-                            browser_outcome,
-                            evidence_drain_complete=False,
-                            cancelled=True,
-                            completion_browser_session_id=ctx.browser_session_id,
-                            completion_browser_session_generation=ctx.browser_session_continuity_generation,
-                        )
-                        _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
-                    raise
-                except CopilotBrowserSessionUnavailable:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is None:
-                        raise
-                    post_dispatch_status = "session_error"
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
-                    LOG.warning("Internal MCP evidence drain lost its browser session", tool=mcp_tool_name)
-                except Exception:
-                    phases.record_drain(drain_started, failed=True)
-                    if browser_outcome is None:
-                        raise
-                    post_dispatch_status = "error"
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
-                    LOG.warning("Internal MCP evidence drain failed", tool=mcp_tool_name)
-                else:
-                    phases.record_drain(drain_started, failed=False)
-                    if browser_outcome is not None:
-                        browser_outcome = replace(browser_outcome, evidence_drain_complete=True)
         except asyncio.CancelledError:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
             if uses_shared_browser_outcome and browser_outcome is None:
@@ -2388,14 +2837,13 @@ class SkyvernOverlayMCPServer(MCPServer):
                 else:
                     raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
             failed = raw.is_error or raw_mcp.get("ok", True) is not True
-        if post_dispatch_status == "ok":
-            phases.settle()
-        call_status = "error" if failed else post_dispatch_status
+        phases.settle()
+        call_status: Literal["ok", "error"] = "error" if failed else "ok"
         _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
-        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp)
+        scrubbed = scrub_model_facing_tool_result(ctx, raw_mcp, tool_name=mcp_tool_name)
         error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
         if (
-            ctx.turn_origin != TurnOrigin.runtime_self_heal
+            ctx.turn_origin != TurnOrigin.code_block_ai_fallback
             and call_browser_session_id is not None
             and error_code == _SESSION_EXPIRED_ERROR_CODE
         ):

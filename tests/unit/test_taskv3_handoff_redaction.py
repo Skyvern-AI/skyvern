@@ -6,39 +6,10 @@ from __future__ import annotations
 import pytest
 
 from skyvern.forge.taskv3.handoff_redaction import (
-    MAX_HANDOFF_REASON_CHARS,
     MAX_HANDOFF_URL_CHARS,
     mask_signed_urls_in_text,
-    sanitize_handoff_reason,
     sanitize_handoff_url,
 )
-from tests.unit._taskv3_block_fakes import PLAIN_URL, SIGNED_URL
-
-
-def test_sanitize_handoff_reason_collapses_multiline_to_one_line() -> None:
-    assert sanitize_handoff_reason("line one\nline two\r\n  line three") == "line one line two line three"
-
-
-def test_sanitize_handoff_reason_masks_signed_url_but_keeps_plain_url() -> None:
-    text = f"stopped at {SIGNED_URL} after also visiting {PLAIN_URL}"
-    result = sanitize_handoff_reason(text)
-    assert result is not None
-    assert "[signed-url]" in result
-    assert SIGNED_URL not in result
-    assert PLAIN_URL in result  # nosemgrep: incomplete-url-substring-sanitization
-
-
-def test_sanitize_handoff_reason_truncates_overlong_text() -> None:
-    text = "x" * (MAX_HANDOFF_REASON_CHARS + 50)
-    result = sanitize_handoff_reason(text)
-    assert result is not None
-    assert len(result) <= MAX_HANDOFF_REASON_CHARS
-    assert result.endswith("…")
-
-
-@pytest.mark.parametrize("value", [None, ""])
-def test_sanitize_handoff_reason_none_or_empty_returns_none(value: str | None) -> None:
-    assert sanitize_handoff_reason(value) is None
 
 
 def test_sanitize_handoff_url_strips_query_and_fragment() -> None:

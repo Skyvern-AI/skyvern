@@ -26,6 +26,7 @@ export type ObserverThought = {
 };
 
 export type WorkflowRunBlock = {
+  attempt_number?: number | null;
   workflow_run_block_id: string;
   workflow_run_id: string;
   parent_workflow_run_block_id: string | null;
@@ -86,6 +87,7 @@ export function isWorkflowRunLoopContainerBlock(block: {
 }
 
 export type WorkflowRunTimelineBlockItem = {
+  attempt?: number;
   type: "block";
   block: WorkflowRunBlock;
   children: Array<WorkflowRunTimelineItem>;
@@ -95,6 +97,7 @@ export type WorkflowRunTimelineBlockItem = {
 };
 
 export type WorkflowRunTimelineThoughtItem = {
+  attempt?: number;
   type: "thought";
   block: null;
   children: Array<WorkflowRunTimelineItem>;
@@ -280,7 +283,8 @@ export type BranchEvaluation = {
   branch_index: number;
   criteria_type: "jinja2_template" | "prompt" | null;
   original_expression: string | null;
-  rendered_expression: string | null;
+  // The backend drops this key on every branch that did not match.
+  rendered_expression?: string | null;
   result: boolean | null;
   is_matched: boolean;
   is_default: boolean;
@@ -291,6 +295,7 @@ export type BranchEvaluation = {
 export type ConditionalBlockOutput = {
   evaluations?: Array<BranchEvaluation>;
   matched_branch_index?: number | null;
+  evaluation_error?: string | null;
 };
 
 export function hasEvaluations(
@@ -302,4 +307,43 @@ export function hasEvaluations(
     "evaluations" in output &&
     Array.isArray((output as ConditionalBlockOutput).evaluations)
   );
+}
+
+export type GmailSendOutput = {
+  transport: "gmail";
+  outcome: "accepted" | "failed" | "unknown";
+  provider_message_id: string | null;
+  replayed: boolean;
+};
+
+export function readGmailSendOutput(output: unknown): GmailSendOutput | null {
+  if (typeof output !== "object" || output === null) {
+    return null;
+  }
+  const candidate = output as Partial<GmailSendOutput>;
+  if (
+    candidate.transport !== "gmail" ||
+    (candidate.outcome !== "accepted" &&
+      candidate.outcome !== "failed" &&
+      candidate.outcome !== "unknown")
+  ) {
+    return null;
+  }
+  return {
+    transport: "gmail",
+    outcome: candidate.outcome,
+    provider_message_id: candidate.provider_message_id ?? null,
+    replayed: candidate.replayed === true,
+  };
+}
+
+export const gmailOutcomeTitles: Record<GmailSendOutput["outcome"], string> = {
+  accepted: "Gmail accepted the message",
+  failed: "Not sent",
+  unknown: "Outcome unknown",
+};
+
+export function gmailSendOutcomeSummary(output: GmailSendOutput): string {
+  const title = gmailOutcomeTitles[output.outcome];
+  return output.replayed ? `${title} (not sent again)` : title;
 }

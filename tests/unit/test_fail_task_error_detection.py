@@ -10,13 +10,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import CaptchaNotSolvedInTime, MissingBrowserStatePage, get_user_facing_exception_message
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import Action, ActionType
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
 
 _EXPECTED_500 = "An HTTP request made during the download action returned HTTP 500, and no file was received."
@@ -608,3 +610,96 @@ async def test_reason_none_stays_none_even_when_updated_task_carries_a_stale_rea
 
     assert result is True
     assert mock_detect.await_args.kwargs["failure_reason"] is None
+
+
+def _captcha_failed() -> tuple[Action, list]:
+    return Action(action_type=ActionType.SOLVE_CAPTCHA), [ActionFailure(CaptchaNotSolvedInTime("task-1", "unsolved"))]
+
+
+def _captcha_solved() -> tuple[Action, list]:
+    return Action(action_type=ActionType.SOLVE_CAPTCHA), [ActionSuccess()]
+
+
+def _clicked() -> tuple[Action, list]:
+    return Action(action_type=ActionType.CLICK, element_id="submit"), [ActionSuccess()]
+
+
+def _captcha_input_failed() -> tuple[Action, list]:
+    action = Action(action_type=ActionType.INPUT_TEXT, element_id="answer")
+    return action, [ActionFailure(CaptchaNotSolvedInTime("task-1", "unsolved"))]
+
+
+def _captcha_input_solved() -> tuple[Action, list]:
+    # An input-setup captcha guard reports its solved challenge as an abort of the input action.
+    return Action(action_type=ActionType.INPUT_TEXT, element_id="answer"), [ActionAbort()]
+
+
+def _other_input_typed() -> tuple[Action, list]:
+    return Action(action_type=ActionType.INPUT_TEXT, element_id="username"), [ActionSuccess()]
+
+
+async def _classify_browser_loss_after(agent: ForgeAgent, outcomes: list) -> list[dict]:
+    """Drive fail_task with the browser-gone exception a run raises when its context closes mid-run."""
+    now = datetime.now()
+    task = make_task(now, make_organization(now))
+    prior = [
+        make_step(
+            now,
+            task,
+            step_id=f"step-{order}",
+            status=StepStatus.completed,
+            order=order,
+            output=_step_output([outcome()]),
+        )
+        for order, outcome in enumerate(outcomes)
+    ]
+    terminal = make_step(now, task, step_id="step-terminal", status=StepStatus.running, order=len(prior), output=None)
+    browser_loss = MissingBrowserStatePage()
+
+    with (
+        patch.object(agent, "update_step", new_callable=AsyncMock),
+        patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task,
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_update_task.side_effect = _echo_persisted_reason(task)
+        mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+        mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+        mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[*prior, terminal])
+
+        await agent.fail_task(task, terminal, get_user_facing_exception_message(browser_loss), exception=browser_loss)
+
+    return mock_update_task.await_args.kwargs["failure_category"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        pytest.param([_clicked, _captcha_failed], id="captcha-failed-on-the-step-before"),
+        pytest.param([_captcha_failed, _clicked], id="submit-retried-after-the-captcha-failed"),
+        pytest.param([_captcha_input_failed, _other_input_typed], id="another-field-typed-after-an-input-captcha"),
+    ],
+)
+async def test_a_browser_loss_while_stuck_on_a_captcha_is_anti_bot_not_a_browser_error(agent, outcomes):
+    categories = await _classify_browser_loss_after(agent, outcomes)
+
+    assert categories[0]["category"] == "ANTI_BOT_DETECTION"
+    assert derive_failure_attribution(categories)["primary_infra_component"] != "browser"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        pytest.param([_clicked, _clicked], id="no-captcha"),
+        pytest.param([_captcha_failed, _captcha_solved], id="captcha-solved-after-failing"),
+        pytest.param([_captcha_input_failed, _captcha_input_solved], id="input-captcha-solved-after-failing"),
+        pytest.param([_captcha_input_failed, _captcha_solved], id="input-captcha-solved-by-a-solve-action"),
+        pytest.param([_captcha_failed, _clicked, _clicked], id="captcha-failed-steps-earlier"),
+    ],
+)
+async def test_a_browser_loss_without_an_unsolved_captcha_stays_a_browser_error(agent, outcomes):
+    categories = await _classify_browser_loss_after(agent, outcomes)
+
+    assert categories[0]["category"] == "BROWSER_ERROR"
+    assert derive_failure_attribution(categories)["primary_infra_component"] == "browser"

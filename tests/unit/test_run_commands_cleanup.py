@@ -382,6 +382,8 @@ def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(monkeypatch: pytest.Mon
     monkeypatch.setattr(run_commands._thread, "interrupt_main", request_shutdown)
     monkeypatch.setattr(run_commands.os, "_exit", force_exit)
     monkeypatch.setattr(run_commands.select, "poll", lambda: poller)
+    # pytest's captured stdin raises on fileno(); the poller is mocked, so any fd stands in.
+    monkeypatch.setattr(run_commands.sys, "stdin", SimpleNamespace(fileno=lambda: 123))
     monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", return_on_eof)
 

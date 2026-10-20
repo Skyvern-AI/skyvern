@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { Status } from "@/api/types";
+import { Status, type WorkflowRunAttempt } from "@/api/types";
 import {
   countActionsInTimeline,
   type ObserverThought,
@@ -10,6 +10,8 @@ import {
 } from "../types/workflowRunTypes";
 import type { WorkflowBlock } from "../types/workflowTypes";
 import {
+  groupTimelineByAttempt,
+  filterTimelineToAttempt,
   aggregateIterationStatus,
   classifyUnexecutedDefinedBlocks,
   findActiveItem,
@@ -305,6 +307,15 @@ describe("findLastExecutedBlock", () => {
 });
 
 describe("findActiveItem default selection", () => {
+  test("ignores previous-attempt blocks for the default but resolves explicit history", () => {
+    const previousBlock = buildBlock({ workflow_run_block_id: "wrb_attempt1" });
+    const timeline = [{ ...buildBlockItem(previousBlock), attempt: 1 }];
+    const currentTimeline = filterTimelineToAttempt(timeline, [], 2);
+
+    expect(findActiveItem(currentTimeline, null, true)).toBeNull();
+    expect(findActiveItem(timeline, "wrb_attempt1", true)).toBe(previousBlock);
+  });
+
   test("returns 'stream' when no active param and the run is still in progress", () => {
     const timeline = [buildBlockItem(buildBlock({ status: Status.Running }))];
     expect(findActiveItem(timeline, null, false)).toBe("stream");
@@ -1145,4 +1156,52 @@ describe("resolveScreenshotBlockId", () => {
     const timeline = [buildBlockItem(loop, [buildBlockItem(newest)])];
     expect(resolveScreenshotBlockId(timeline, loop, 99)).toBe("wrb_iter1_leaf");
   });
+});
+
+test("keeps blocks tagged with attempt_number when attempt summaries are absent", () => {
+  const item = buildBlockItem(buildBlock({ attempt_number: 2 }));
+
+  expect(filterTimelineToAttempt([item], [], 2)).toEqual([item]);
+});
+
+test("attributes nested-run roots to their parent attempt window and keeps children together", () => {
+  const attempts: Array<WorkflowRunAttempt> = [1, 2].map((attempt) => ({
+    attempt_number: attempt,
+    status: Status.Completed,
+    started_at: `2026-01-01T00:0${attempt - 1}:00Z`,
+    finished_at: null,
+    failure_reason: null,
+    error_codes: [],
+    retry_decision: null,
+    decision_reason: null,
+    next_attempt_at: null,
+    webhook_sent_at: null,
+  }));
+  const child = buildBlockItem(buildBlock({ workflow_run_block_id: "child" }));
+  const nested = {
+    ...buildBlockItem(
+      buildBlock({
+        workflow_run_block_id: "nested",
+        attempt_number: null,
+        created_at: "2026-01-01T00:01:05Z",
+      }),
+      [child],
+    ),
+    attempt: 1,
+  };
+  const groups = groupTimelineByAttempt([nested], attempts, 2);
+  expect(
+    groups.map((group) => [
+      group.attemptNumber,
+      group.items.length,
+      group.isCurrent,
+    ]),
+  ).toEqual([
+    [1, 0, false],
+    [2, 1, true],
+  ]);
+  expect(groups[1]?.summary).toBe(attempts[1]);
+  expect(groups[1]?.items[0]).toBe(nested);
+  expect(groups[1]?.items[0]?.children).toEqual([child]);
+  expect(filterTimelineToAttempt([nested], attempts, 2)).toEqual([nested]);
 });

@@ -7,6 +7,7 @@ share these rules without pulling the heavier ``browser_sessions`` schema module
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import overload
 
 MIN_TIMEOUT = 5
@@ -24,6 +25,9 @@ RENEWAL_MIN_REMAINING_SECONDS = 60
 EXTENSION_MIN_REMAINING_SECONDS = 120
 # A found reusable session with less lifetime left than this is retired and replaced rather than handed to a run.
 REUSE_MIN_REMAINING_LIFETIME_SECONDS = 30 * 60
+# How far short of its budget a session may end and still count as having run it out: a renewal closes a
+# session with under RENEWAL_MIN_REMAINING_SECONDS left, and a deadline is noticed on a periodic heartbeat.
+LIFETIME_END_TOLERANCE_SECONDS = 120
 DEFAULT_TIMEOUT = 60
 
 MAX_TIMEOUT_EXCEEDED_MESSAGE = (
@@ -70,6 +74,18 @@ def creation_timeout_minutes(requested_minutes: int | None) -> int | None:
     if requested_minutes is None:
         return None
     return min(requested_minutes, MAX_TIMEOUT)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+
+
+def lived_full_lifetime(*, started_at: datetime | None, ended_at: datetime | None, timeout_minutes: int | None) -> bool:
+    """Whether a session ended only after running out its whole budget, rather than being closed early."""
+    if started_at is None or ended_at is None or not timeout_minutes:
+        return False
+    lived_seconds = (_as_utc(ended_at) - _as_utc(started_at)).total_seconds()
+    return lived_seconds >= timeout_minutes * 60 - LIFETIME_END_TOLERANCE_SECONDS
 
 
 def lifetime_cap_seconds(base_timeout_seconds: float, *, floor_seconds: float = MAX_LIFETIME_SECONDS) -> float:

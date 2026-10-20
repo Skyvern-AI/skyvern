@@ -128,6 +128,13 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     if not await _retry_enabled_for_organization(organization_id, workflow_run):
         return None
 
+    # A run group moves to its next item when this child fails, so a fallback run would act beside it under
+    # another login. A lookup error raises, and the wrapper then skips the retry.
+    if workflow_run.start_fresh_browser and await app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id(
+        workflow_run.workflow_run_id
+    ):
+        return None
+
     is_block_scoped_run = await app.AGENT_FUNCTION.is_block_scoped_workflow_run(workflow_run)
     if not is_block_scoped_run:
         is_block_scoped_run = await app.DATABASE.debug.has_block_run_for_workflow_run(

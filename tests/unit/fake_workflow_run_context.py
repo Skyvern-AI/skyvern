@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 
 
 class FakeWorkflowRunContext:
@@ -36,6 +36,9 @@ class FakeWorkflowRunContext:
         self.organization_id: str | None = None
         self.browser_session_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
+        self.block_outcomes: dict[str, BlockOutcome] = {}
+        self.carried_block_labels: set[str] = set()
+        self.parameters: dict[str, Any] = {}
         self.workflow = None
 
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
@@ -75,5 +78,7 @@ class FakeWorkflowRunContext:
             return self.secrets[secret_id_or_value]
         return None
 
-    # Borrow the real implementation so scoping behavior cannot drift from production.
+    # Borrow the real implementations so scoping and outcome behavior cannot drift from production.
     credential_template_entries = WorkflowRunContext.credential_template_entries
+    record_block_outcome = WorkflowRunContext.record_block_outcome
+    get_block_outcome = WorkflowRunContext.get_block_outcome

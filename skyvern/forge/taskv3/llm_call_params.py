@@ -1,6 +1,6 @@
 """Per-call LLM parameters for the Task V3 loop: the kwargs handed to ``LLMCaller.call()``.
 
-Separate from prompt assembly -- these shape HOW the model is called (tool_choice, reasoning
+Separate from prompt assembly -- these shape HOW the model is called (the reasoning
 summary), never what it is told.
 """
 
@@ -8,17 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from skyvern.config import settings
-
 
 def build_call_kwargs(step: Any, llm_caller: Any) -> dict[str, Any] | None:
-    # Asking here rather than only letting the LLM layer drop it keeps the run's own telemetry
-    # honest: a run that reports tool_choice in effect has to have actually sent it.
     call_kwargs: dict[str, Any] = {}
     if step is not None:
         call_kwargs["step"] = step
-    if settings.TASK_V3_TOOL_CHOICE_REQUIRED and llm_caller.supports_tool_choice():
-        call_kwargs["tool_choice"] = "required"
     reasoning_with_summary = reasoning_effort_with_summary(llm_caller)
     if reasoning_with_summary is not None:
         call_kwargs["reasoning_effort"] = reasoning_with_summary

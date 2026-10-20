@@ -5,8 +5,11 @@ from typing import TYPE_CHECKING, Any
 import pydantic
 import pydantic.json
 import structlog
+from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
+from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
     ActionModel,
@@ -43,13 +46,17 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenOrganizationAuthToken,
     Organization,
     OrganizationAuthToken,
+    TwilioCredential,
+    TwilioOrganizationAuthToken,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -68,8 +75,14 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    capped_extracted_information,
+    collect_extracted_information,
+    precomputed_capped_value,
+)
+from skyvern.schemas.browser_settings import BrowserSettingsReceipt, BrowserSettingsStatus
 from skyvern.schemas.proxy_pinning import redact_proxy_location
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse, read_browser_type
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
@@ -128,6 +141,13 @@ def escape_like_term(term: str) -> str:
 
 def nullable_column_equals(column: Any, value: Any) -> Any:
     return column.is_(None) if value is None else column == value
+
+
+def browser_settings_receipt_replaceable(column: Column[Any], receipt: BrowserSettingsReceipt) -> ColumnElement[bool]:
+    """A recorded verified, mismatch or unapplied receipt is final; only a measured result may replace unknown."""
+    if receipt.status not in (BrowserSettingsStatus.verified, BrowserSettingsStatus.mismatch):
+        return column.is_(None)
+    return or_(column.is_(None), column["status"].as_string() == BrowserSettingsStatus.unknown.value)
 
 
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
@@ -194,13 +214,7 @@ def deserialize_proxy_location(
                     subdivision=redact_proxy_location(subdivision),
                 )
                 data["subdivision"] = None
-            result = GeoTarget.model_validate(data)
-            LOG.info(
-                "Deserialized proxy_location as GeoTarget",
-                db_value=redact_proxy_location(value),
-                result=redact_proxy_location(result),
-            )
-            return result
+            return GeoTarget.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             if raise_on_invalid_geo_target:
                 raise
@@ -305,14 +319,27 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
-def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
-    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+def as_stored_json(value: typing.Any) -> typing.Any:
+    """Return value as a JSON column hands it back after a write: NULs stripped, non-JSON types encoded."""
+    if value is None:
+        return None
+    return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
+
+
+class _GuardedJsonbValue(typing.NamedTuple):
+    value: Any
+    # None when the size was never taken: a scalar fast path, or a failed serialization.
+    size_bytes: int | None
+    serialized: str | None = None
+
+
+def _guard_jsonb_size(value: Any, *, context: dict | None = None) -> _GuardedJsonbValue:
     # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
     # that 99.9% of writes would pay for nothing.
     if value is None or isinstance(value, (bool, int, float)):
-        return value
+        return _GuardedJsonbValue(value, None)
     if isinstance(value, str) and len(value) <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
-        return value
+        return _GuardedJsonbValue(value, None)
 
     try:
         serialized = _custom_json_serializer(value)
@@ -322,11 +349,11 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
             exc_info=True,
             context=context or {},
         )
-        return value
+        return _GuardedJsonbValue(value, None)
 
     size_bytes = len(serialized.encode("utf-8"))
     if size_bytes <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
-        return value
+        return _GuardedJsonbValue(value, size_bytes, serialized)
 
     LOG.warning(
         "Truncating oversized jsonb value",
@@ -334,12 +361,83 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
         limit_bytes=OUTPUT_PARAMETER_MAX_VALUE_BYTES,
         **(context or {}),
     )
-    return {
-        "truncated": True,
-        "reason": "exceeded_max_jsonb_value_size",
-        "original_size_bytes": size_bytes,
-        "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
-    }
+    return _GuardedJsonbValue(
+        {
+            "truncated": True,
+            "reason": "exceeded_max_jsonb_value_size",
+            "original_size_bytes": size_bytes,
+            "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+        },
+        size_bytes,
+    )
+
+
+def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
+    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+    return _guard_jsonb_size(value, context=context).value
+
+
+class CappedJsonbWrite(typing.NamedTuple):
+    """The raw value and any response-sized cache to persist."""
+
+    value: Any
+    capped_value: Any | None
+    extracted_information: list[Any] | None = None
+
+
+def capped_jsonb_write(
+    value: Any, *, context: dict | None = None, with_extracted_information: bool = False
+) -> CappedJsonbWrite:
+    """Apply the storage guard and precompute the capped copy run-detail reads need.
+
+    Capping costs a pass over the value, so pay it here — once, on the worker — instead of on
+    the API event loop on every view of the run. An ordinary write skips it on the size the
+    storage guard already measured, without serializing again: ``_custom_json_serializer``
+    escapes non-ASCII and pads its separators, so its byte count is never below the compact
+    wire size the response cap measures.
+    """
+    guarded = _guard_jsonb_size(value, context=context)
+    if guarded.value is not value:
+        # The storage guard replaced the value with a marker, which is already tiny.
+        return CappedJsonbWrite(guarded.value, None)
+    if value is None or isinstance(value, (bool, int, float)):
+        return CappedJsonbWrite(value, None)
+    # Through the module, not a local binding: the cap has one runtime source of truth.
+    if guarded.size_bytes is not None and guarded.size_bytes <= response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES:
+        return CappedJsonbWrite(value, None)
+
+    try:
+        stored_value = json.loads(guarded.serialized) if guarded.serialized is not None else as_stored_json(value)
+    except Exception:
+        LOG.warning("Failed to normalize jsonb value for response capping; leaving it uncached", exc_info=True)
+        return CappedJsonbWrite(value, None)
+
+    capped = precomputed_capped_value(stored_value, **(context or {}))
+    if capped is None:
+        return CappedJsonbWrite(value, None)
+    extracted_information = None
+    if with_extracted_information:
+        extracted_information = capped_extracted_information(
+            collect_extracted_information(stored_value), **(context or {})
+        )
+    return CappedJsonbWrite(value, capped, extracted_information)
+
+
+def prefer_capped_columns(table: Table, *, raw: str, capped: str) -> list[ColumnElement[Any]]:
+    """``table``'s columns with ``raw`` replaced by ``COALESCE(capped, raw)`` under its own name.
+
+    Postgres COALESCE stops at its first non-null argument, so a row that has a capped copy
+    never dereferences the raw column's TOAST pointer: the multi-megabyte value is neither
+    decompressed nor sent. Rows written before the capped column existed fall through to the
+    raw value and the reader trims it on the fly.
+    """
+    return [
+        func.coalesce(table.c[capped], table.c[raw], type_=table.c[raw].type).label(raw)
+        if column.name == raw
+        else column
+        for column in table.c
+        if column.name != capped
+    ]
 
 
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
@@ -377,6 +475,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         extra_http_headers=task_obj.extra_http_headers,
         cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
+        attempt_number=task_obj.attempt_number,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
         retry=task_obj.retry,
@@ -453,8 +552,19 @@ def convert_to_workflow_copilot_chat_message(
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
+        feedback=_message_feedback_from_row(message_model),
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
+    )
+
+
+def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:
+    if message_model.feedback_rating not in ("up", "down") or message_model.feedback_at is None:
+        return None
+    return WorkflowCopilotMessageFeedback(
+        rating=message_model.feedback_rating,
+        reason=message_model.feedback_reason,
+        rated_at=message_model.feedback_at,
     )
 
 
@@ -483,6 +593,8 @@ def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
 
 
 def convert_to_organization(org_model: OrganizationModel) -> Organization:
+    # Side effect: every org read records created_at in the process-wide cache that gives log lines org_age.
+    remember_organization_created_at(org_model.organization_id, org_model.created_at)
     return Organization(
         organization_id=org_model.organization_id,
         organization_name=org_model.organization_name,
@@ -504,7 +616,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel, token_type: str
-) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken:
+) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | TwilioOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
@@ -523,6 +635,17 @@ async def convert_to_organization_auth_token(
     elif token_type == OrganizationAuthTokenType.bitwarden_credential:
         credential = BitwardenCredential.model_validate_json(token)
         return BitwardenOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    elif token_type == OrganizationAuthTokenType.twilio_credential:
+        credential = TwilioCredential.model_validate_json(token)
+        return TwilioOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,
             token_type=OrganizationAuthTokenType(org_auth_token.token_type),
@@ -632,6 +755,7 @@ def convert_to_workflow(
         extra_http_headers=workflow_model.extra_http_headers,
         cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
+        browser_type=read_browser_type(workflow_model),
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         adaptive_caching=workflow_model.adaptive_caching,
@@ -644,6 +768,8 @@ def convert_to_workflow(
         import_error=workflow_model.import_error,
         created_by=workflow_model.created_by,
         edited_by=workflow_model.edited_by,
+        edited_for=workflow_model.edited_for,
+        build_source=workflow_model.build_source,
     )
 
 
@@ -670,6 +796,8 @@ def convert_to_workflow_run(
         start_fresh_browser=workflow_run_model.start_fresh_browser,
         reuse_browser_session=workflow_run_model.reuse_browser_session,
         reuse_bound_key=workflow_run_model.reuse_bound_key,
+        workflow_definition_sha256=workflow_run_model.workflow_definition_sha256,
+        task_queue=workflow_run_model.task_queue,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
         retried_from_workflow_run_id=workflow_run_model.retried_from_workflow_run_id,
@@ -691,6 +819,7 @@ def convert_to_workflow_run(
         cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        setup_completed=workflow_run_model.setup_completed,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
         sequential_credential_id=workflow_run_model.sequential_credential_id,
@@ -698,13 +827,17 @@ def convert_to_workflow_run(
         if workflow_run_model.script_run
         else None,
         run_with=workflow_run_model.run_with,
+        browser_type=read_browser_type(workflow_run_model),
         code_gen=workflow_run_model.code_gen,
         ai_fallback=workflow_run_model.ai_fallback,
         trigger_type=_safe_trigger_type(workflow_run_model.trigger_type),
         workflow_schedule_id=workflow_run_model.workflow_schedule_id,
         failure_category=workflow_run_model.failure_category,
+        browser_settings=workflow_run_model.browser_settings,
+        browser_settings_receipt=workflow_run_model.browser_settings_receipt,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
         copilot_session_id=workflow_run_model.copilot_session_id,
+        created_by=workflow_run_model.created_by,
         credits_used=workflow_run_model.credits_used or 0,
         cached_credits_used=workflow_run_model.cached_credits_used or 0,
     )
@@ -777,6 +910,7 @@ def convert_to_bitwarden_login_credential_parameter(
         bitwarden_collection_id=bitwarden_login_credential_parameter_model.bitwarden_collection_id,
         bitwarden_item_id=bitwarden_login_credential_parameter_model.bitwarden_item_id,
         url_parameter_key=bitwarden_login_credential_parameter_model.url_parameter_key,
+        totp_identifier=bitwarden_login_credential_parameter_model.totp_identifier,
         created_at=bitwarden_login_credential_parameter_model.created_at,
         modified_at=bitwarden_login_credential_parameter_model.modified_at,
         deleted_at=bitwarden_login_credential_parameter_model.deleted_at,
@@ -846,6 +980,11 @@ def convert_to_workflow_run_output_parameter(
         output_parameter_id=workflow_run_output_parameter_model.output_parameter_id,
         value=workflow_run_output_parameter_model.value,
         created_at=workflow_run_output_parameter_model.created_at,
+        precomputed_extracted_information=(
+            None
+            if "capped_extracted_information" in inspect(workflow_run_output_parameter_model).unloaded
+            else workflow_run_output_parameter_model.capped_extracted_information
+        ),
     )
 
 
@@ -861,10 +1000,14 @@ def convert_to_workflow_run_parameter(
             workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
         )
 
+    value = workflow_run_parameter_model.value
+    # Retention scrubbing overwrites the value with SCRUBBED_VALUE whatever the declared type, so it is not convertible.
+    if value != SCRUBBED_VALUE:
+        value = workflow_parameter.workflow_parameter_type.convert_value(value)
     return WorkflowRunParameter(
         workflow_run_id=workflow_run_parameter_model.workflow_run_id,
         workflow_parameter_id=workflow_run_parameter_model.workflow_parameter_id,
-        value=workflow_parameter.workflow_parameter_type.convert_value(workflow_run_parameter_model.value),
+        value=value,
         created_at=workflow_run_parameter_model.created_at,
     )
 
@@ -884,6 +1027,7 @@ def convert_to_workflow_run_block(
     block = WorkflowRunBlock(
         workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
         workflow_run_id=workflow_run_block_model.workflow_run_id,
+        attempt_number=workflow_run_block_model.attempt_number,
         block_workflow_run_id=workflow_run_block_model.block_workflow_run_id,
         organization_id=workflow_run_block_model.organization_id,
         parent_workflow_run_block_id=workflow_run_block_model.parent_workflow_run_block_id,

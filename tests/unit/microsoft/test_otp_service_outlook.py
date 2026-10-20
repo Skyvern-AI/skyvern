@@ -100,8 +100,17 @@ async def test_outlook_source_uses_mail_read_credential_and_persists_candidate(
     tokenless = _agent(monkeypatch, [SimpleNamespace(id="without_token", scopes_granted=["Mail.Read"])])
     monkeypatch.setattr(tokenless, "get_microsoft_credentials", AsyncMock(return_value=None))
     search.reset_mock()
-    assert await tokenless.get_otp_value_from_email(organization_id="org", totp_identifier="user@example.com") is None
+    tokenless_context = otp_email.EmailOTPVerificationContext()
+    assert (
+        await tokenless.get_otp_value_from_email(
+            organization_id="org", totp_identifier="user@example.com", context=tokenless_context
+        )
+        is None
+    )
     search.assert_not_awaited()
+    tokenless_source = tokenless_context.for_source(otp_email.OutlookOTPSource.name)
+    assert tokenless_source.failed_credential_ids == {"without_token"}
+    assert tokenless_source.completed_credential_ids == set()
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StreamPresenter } from "./StreamPresenter";
+import { type StudioPaneId } from "./panes";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useExecutingBlockRun } from "./useExecutingBlockRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -12,13 +13,21 @@ import { useStudioPanes } from "./useStudioPanes";
  * The studio's single live-browser stream, portaled into a host node re-parented
  * between the open panes so the socket persists instead of re-booting.
  */
-export function StudioBrowserStream() {
+export function StudioBrowserStream({
+  visiblePanes,
+}: {
+  visiblePanes?: readonly StudioPaneId[];
+}) {
   const { panes } = useStudioPanes();
-  const browserPaneOpen = panes.includes("browser");
+  const renderedPanes = visiblePanes ?? panes;
+  const browserPaneOpen = renderedPanes.includes("browser");
   const isRecording = useRecordingStore((s) => s.isRecording);
   const resetRecording = useRecordingStore((s) => s.reset);
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
+  const setDebugStreamState = useStudioBrowserStore(
+    (s) => s.setDebugStreamState,
+  );
   const markActivity = useStudioBrowserStore((s) => s.markActivity);
   const clearActivity = useStudioBrowserStore((s) => s.clearActivity);
   const reset = useStudioBrowserStore((s) => s.reset);
@@ -87,8 +96,9 @@ export function StudioBrowserStream() {
         // header already shows the timer + step count — an on-stream REC pill
         // would duplicate it. Closing that pane brings the pill back on either
         // transport (VNC renders it in BrowserStream, CDP in StreamPresenter).
-        hideRecordingIndicator={panes.includes("copilot")}
+        hideRecordingIndicator={renderedPanes.includes("copilot")}
         onUrlChange={handleUrlChange}
+        onStreamStateChange={setDebugStreamState}
         onActivity={handleActivity}
       />
       {coDriving && debugStreamShown ? (

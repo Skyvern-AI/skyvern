@@ -87,6 +87,8 @@ vi.mock("../../panels/useHasInteractedThisSession", () => ({
 vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
   getParentLoopSkipsOnFail: () => false,
+  isFirstBrowserTaskBlock: () => false,
+  isMissingRequiredStartUrl: () => false,
   isNodeInsideForLoop: () => false,
 }));
 

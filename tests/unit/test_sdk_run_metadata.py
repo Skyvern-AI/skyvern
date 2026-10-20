@@ -852,3 +852,36 @@ async def test_connect_to_cloud_browser_session_threads_app_url(monkeypatch: pyt
 
     assert browser.app_url == "https://app.example.test/browser-sessions/pbs_123"
     assert browser.browser_session_id == "pbs_123"
+
+
+@pytest.mark.asyncio
+async def test_connect_to_cloud_browser_session_hands_downloads_back_to_the_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LibrarySkyvern(base_url="https://api.example.test", api_key="test-key")
+    sent: list[tuple[str, dict]] = []
+    detached: list[bool] = []
+
+    async def send(method: str, params: dict) -> dict:
+        sent.append((method, params))
+        return {}
+
+    async def detach() -> None:
+        detached.append(True)
+
+    cdp_browser = SimpleNamespace(
+        contexts=[SimpleNamespace(_loop=None)],
+        new_browser_cdp_session=AsyncMock(return_value=SimpleNamespace(send=send, detach=detach)),
+    )
+    fake_playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=cdp_browser)))
+    monkeypatch.setattr(client, "_get_playwright", AsyncMock(return_value=fake_playwright))
+    browser_session = SimpleNamespace(
+        browser_session_id="pbs_123",
+        browser_address="wss://cdp.example.test",
+        app_url="https://app.example.test/browser-sessions/pbs_123",
+    )
+
+    await client._connect_to_cloud_browser_session(browser_session)
+
+    assert sent == [("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": True})]
+    assert detached == []

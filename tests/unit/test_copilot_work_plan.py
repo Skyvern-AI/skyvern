@@ -71,6 +71,9 @@ class _ChatStore:
         assert workflow_copilot_chat_id == self.row.workflow_copilot_chat_id
         return []
 
+    async def get_workflow_copilot_claim_expires_in(self, organization_id: str, workflow_permanent_id: str) -> None:
+        return None
+
 
 @pytest.fixture
 def store(monkeypatch: pytest.MonkeyPatch) -> _ChatStore:
@@ -357,6 +360,7 @@ def _unfinished_plan_agent_result(work_plan: list[str] | None) -> AgentResult:
         global_llm_context=None,
         response_type="REPLY",
         proposal_disposition="review_untested",
+        turn_id="turn-plan",
         narrative_payload=terminal_narrative_payload(),
     )
     result.work_plan = work_plan
@@ -372,7 +376,7 @@ async def _finalise_with_plan(
         proposed_workflow=None,
         auto_accept=False,
     )
-    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical", extra_http_headers=None, cdp_connect_headers=None)
     agent_result = _unfinished_plan_agent_result(work_plan)
     _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     stream = MagicMock(send=AsyncMock(return_value=True))
@@ -402,7 +406,7 @@ async def test_an_unfinished_plan_naming_the_requested_output_still_leaves_the_r
     with_plan, params = await _finalise_with_plan(monkeypatch, plan)
     without_plan, _ = await _finalise_with_plan(monkeypatch, None)
 
-    assert params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]["workflow_id"] == "wf-draft"
+    assert params.publish_workflow_copilot_candidate.await_args.kwargs["proposal"]["workflow_id"] == "wf-draft"
     assert with_plan.message == "Saved a draft; I have not run it yet."
     assert (
         params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs["content"]

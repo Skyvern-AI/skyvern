@@ -10,6 +10,8 @@ from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_lo
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
+# The shape of every issued credential ID (see generate_credential_id).
+_ISSUED_CREDENTIAL_ID_RE = re.compile(r"cred_\d+")
 
 
 def parse_workflow_yaml(workflow_yaml: str) -> Any:
@@ -44,6 +46,28 @@ def url_origin(url: str) -> str | None:
 def saved_credential_ids(candidates: Iterable[str]) -> set[str]:
     # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
     return {candidate for candidate in candidates if isinstance(candidate, str) and candidate.startswith("cred_")}
+
+
+def declared_non_credential_keys(parsed: dict[str, Any]) -> set[str]:
+    """Parameter keys that are only names, so a `cred_`-prefixed key is not reported as a credential ID. A
+    key with the issued-ID shape, or one also bound as a credential value, is still reported."""
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return set()
+    parameters = list(workflow_definition.get("parameters") or [])
+    for block in workflow_blocks(parsed):
+        block_parameters = block.get("parameters")
+        if isinstance(block_parameters, list):
+            parameters.extend(block_parameters)
+    keys = {
+        parameter["key"]
+        for parameter in parameters
+        if isinstance(parameter, dict) and isinstance(parameter.get("key"), str)
+    }
+    bound_ids = workflow_credential_ids_from_parsed(parsed)
+    for ids in credential_param_ids(parameters).values():
+        bound_ids.update(ids)
+    return {key for key in keys if not _ISSUED_CREDENTIAL_ID_RE.fullmatch(key) and key not in bound_ids}
 
 
 def credential_params(parameters: Any) -> dict[str, str]:

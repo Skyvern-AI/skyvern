@@ -6,24 +6,34 @@ import enum
 import typing as t
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
-    WorkflowDefinitionYamlBlocksItem_Code,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 )
 
+# A navigation this soon after a click or text submit was caused by it; the emitted
+# click/press already waits for the load, so no goto is emitted for that navigation.
+CLICK_NAVIGATION_WINDOW_MS = 3000
+
 
 class ActionKind(enum.StrEnum):
     CLICK = "click"
+    DIALOG = "dialog"
+    DRAG_DROP = "drag_drop"
     HOVER = "hover"
     INPUT_TEXT = "input_text"
     PRESS_KEY = "press_key"
     URL_CHANGE = "url_change"
     WAIT = "wait"
+
+
+class IncompleteCaptureReason(enum.StrEnum):
+    CHILD_FRAME = "child_frame"
+    UNATTACHED_FRAME = "unattached_frame"
 
 
 class RecordingDraftStepStatus(enum.StrEnum):
@@ -46,6 +56,14 @@ class ActionBase(BaseModel):
     timestamp_start: float
     timestamp_end: float
     url: str
+    navigated_to: str | None = Field(default=None, repr=False)
+    incomplete_capture_reason: IncompleteCaptureReason | None = None
+
+    @model_validator(mode="after")
+    def mark_unattached_frame(self) -> t.Self:
+        if self.incomplete_capture_reason is None:
+            self.incomplete_capture_reason = self.target.frame_capture_gap()
+        return self
 
 
 class ActionClick(ActionBase):
@@ -57,6 +75,25 @@ class ActionHover(ActionBase):
     # --
     DURATION_THRESHOLD_MS: t.ClassVar[int] = 2000
     MIN_DURATION_THRESHOLD_MS: t.ClassVar[int] = 1000
+
+
+class ActionDragDrop(ActionBase):
+    kind: t.Literal[ActionKind.DRAG_DROP]
+    source: "ActionTarget"
+
+    @model_validator(mode="after")
+    def mark_unattached_source_frame(self) -> t.Self:
+        if self.incomplete_capture_reason is None:
+            self.incomplete_capture_reason = self.source.frame_capture_gap()
+        return self
+
+
+class ActionDialog(ActionBase):
+    kind: t.Literal[ActionKind.DIALOG]
+    dialog_type: str
+    response: Literal["accept", "dismiss"]
+    prompt_text: str | None = None
+    prompt_text_redacted: bool = False
 
 
 class ActionInputText(ActionBase):
@@ -77,15 +114,26 @@ class ActionUrlChange(ActionBase):
 
 
 class ActionWait(ActionBase):
+    """Compatibility model for recordings captured before inferred waits were disabled."""
+
     kind: t.Literal[ActionKind.WAIT]
     # --
     duration_ms: int
     MIN_DURATION_THRESHOLD_MS: t.ClassVar[int] = 5000
 
 
-Action = ActionClick | ActionHover | ActionInputText | ActionPressKey | ActionUrlChange | ActionWait
+Action = (
+    ActionClick
+    | ActionDialog
+    | ActionDragDrop
+    | ActionHover
+    | ActionInputText
+    | ActionPressKey
+    | ActionUrlChange
+    | ActionWait
+)
 
-ActionBlockable = ActionClick | ActionHover | ActionInputText | ActionPressKey
+ActionBlockable = ActionClick | ActionDialog | ActionDragDrop | ActionHover | ActionInputText | ActionPressKey
 
 CredentialKind = Literal["password", "totp", "credit_card", "secret", "magic_link"]
 
@@ -104,6 +152,15 @@ class ActionTarget(BaseModel):
     accessible_name: str | None = None
     input_type: str | None = None
     autocomplete: str | None = None
+    # Locators are synthesized against the main frame, so they cannot replay an element inside an iframe.
+    in_child_frame: bool = False
+
+    def frame_capture_gap(self) -> IncompleteCaptureReason | None:
+        if self.in_child_frame:
+            return IncompleteCaptureReason.CHILD_FRAME
+        if (self.tag_name or "").lower() == "iframe":
+            return IncompleteCaptureReason.UNATTACHED_FRAME
+        return None
 
 
 class Mouse(BaseModel):
@@ -115,6 +172,8 @@ class Mouse(BaseModel):
     """
     0 to 1.0 inclusive, percentage down the viewport
     """
+    offset_x: float | None = None
+    offset_y: float | None = None
 
 
 OutputBlock = t.Union[
@@ -123,10 +182,6 @@ OutputBlock = t.Union[
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Wait,
 ]
-
-# What process_recording can return: legacy interpretable blocks, plus code blocks
-# when code-first mode is enabled. The live interpreter only ever sees OutputBlock.
-ProcessedBlock = t.Union[OutputBlock, WorkflowDefinitionYamlBlocksItem_Code]
 
 
 class RecordingDraftStep(BaseModel):
@@ -165,6 +220,7 @@ class TargetInfo(BaseModel):
     attached: bool | None = None
     browserContextId: str | None = None
     canAccessOpener: bool | None = None
+    openerId: str | None = None
     targetId: str | None = None
     title: str | None = None
     type: str | None = None
@@ -174,6 +230,8 @@ class TargetInfo(BaseModel):
 class CdpEventFrame(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    id: str | None = None
+    parentId: str | None = None
     url: str | None = None
 
 
@@ -193,6 +251,14 @@ class ExfiltratedEventCdpParams(BaseModel):
     # net:activity events
     count: int | None = None
 
+    # javascript dialog events
+    defaultPrompt: str | None = None
+    hasBrowserHandler: bool | None = None
+    message: str | None = None
+    result: bool | None = None
+    type: str | None = None
+    userInput: str | None = None
+
 
 class EventTarget(BaseModel):
     className: str | None = None
@@ -209,6 +275,7 @@ class EventTarget(BaseModel):
     accessibleName: str | None = None
     inputType: str | None = None
     autocomplete: str | None = None
+    inChildFrame: bool = False
 
 
 class MousePosition(BaseModel):
@@ -216,6 +283,8 @@ class MousePosition(BaseModel):
     ya: float | None = None
     xp: float | None = None
     yp: float | None = None
+    offsetX: float | None = None
+    offsetY: float | None = None
 
 
 class BoundingRect(BaseModel):

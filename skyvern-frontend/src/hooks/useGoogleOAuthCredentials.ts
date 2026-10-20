@@ -10,6 +10,11 @@ import {
   GoogleOAuthCredentialResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useHasCapability } from "@/store/PageSlots";
+import {
+  GOOGLE_GMAIL_REQUIRED_SCOPES,
+  GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
+} from "@/util/googleScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:google-oauth-credentials";
 
@@ -102,6 +107,35 @@ export function attemptedGoogleOAuthIntegrationScopes(
   return hasGoogleOAuthCredentialScopes(credential, capabilityScopes);
 }
 
+export type GmailCapability = "read" | "send";
+
+export function googleCredentialGmailCapabilities(
+  credential: GoogleOAuthCredential,
+): Record<GmailCapability, boolean> {
+  return {
+    read: hasGoogleOAuthCredentialScopes(
+      credential,
+      GOOGLE_GMAIL_REQUIRED_SCOPES,
+    ),
+    send: credential.gmail_send_ready === true,
+  };
+}
+
+// A cancelled send upgrade leaves the send scope requested but not granted;
+// that connection still belongs with the Gmail ones.
+export function googleCredentialHasGmailCapability(
+  credential: GoogleOAuthCredential,
+): boolean {
+  const scopes = new Set([
+    ...getGoogleOAuthCredentialScopesGranted(credential),
+    ...getGoogleOAuthCredentialScopesRequested(credential),
+  ]);
+  return (
+    hasGoogleOAuthCredentialScopes(credential, GOOGLE_GMAIL_REQUIRED_SCOPES) ||
+    GOOGLE_GMAIL_SEND_REQUIRED_SCOPES.some((scope) => scopes.has(scope))
+  );
+}
+
 // Falls back to the first credential even when none are active, so a single
 // needs-reconnect account is still selected rather than left blank.
 export function getDefaultGoogleOAuthCredentialId(
@@ -131,6 +165,10 @@ export function useGoogleOAuthCredentials({
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canAuthorize = useHasCapability("google_oauth.authorize");
+  const canCallback = useHasCapability("google_oauth.callback");
+  const canUpdate = useHasCapability("google_oauth.update");
+  const canDelete = useHasCapability("google_oauth.delete");
 
   useEffect(() => {
     if (!credentialBroadcastChannel) return;
@@ -173,6 +211,11 @@ export function useGoogleOAuthCredentials({
 
   const authorizeMutation = useMutation({
     mutationFn: async (data: CreateGoogleOAuthAuthorizeRequest) => {
+      if (!canAuthorize) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .post("/google/oauth/authorize", data)
@@ -192,6 +235,11 @@ export function useGoogleOAuthCredentials({
 
   const oauthCallbackMutation = useMutation({
     mutationFn: async (data: { code: string; state: string }) => {
+      if (!canCallback) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .post("/google/oauth/callback", data)
@@ -224,6 +272,11 @@ export function useGoogleOAuthCredentials({
       credentialId: string;
       credentialName: string;
     }) => {
+      if (!canUpdate) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .patch(`/google/oauth/credentials/${input.credentialId}`, {
@@ -255,6 +308,11 @@ export function useGoogleOAuthCredentials({
 
   const deleteCredentialMutation = useMutation({
     mutationFn: async (credentialId: string) => {
+      if (!canDelete) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client.delete(`/google/oauth/credentials/${credentialId}`);
     },

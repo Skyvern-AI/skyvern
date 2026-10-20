@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.signing import (
     sign_artifact_url,
     verify_artifact_signature,
 )
+from skyvern.forge.sdk.artifact.storage.base import artifact_filename_from_uri
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
@@ -32,7 +33,11 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.utils.secret_redaction import redact_har_bytes, redact_secrets_from_bytes
+from skyvern.utils.secret_redaction import (
+    redact_har_bytes,
+    redact_multi_field_totp_artifact_bytes,
+    redact_secrets_from_bytes,
+)
 
 if TYPE_CHECKING:
     from skyvern.schemas.action_log import ActionLogEvent
@@ -98,10 +103,29 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
 )
 
 
+_MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES = _REDACTABLE_TEXT_ARTIFACT_TYPES | frozenset(
+    {
+        ArtifactType.HAR,
+        ArtifactType.BROWSER_SESSION_ACTION_LOG,
+        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP,
+        ArtifactType.EVAL_SCORE,
+        ArtifactType.EVAL_TRAJECTORY,
+        ArtifactType.EVAL_RUBRICS,
+        ArtifactType.SCRIPT_FILE,
+    }
+)
+
+
 def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
+    if artifact_type == ArtifactType.HAR:
+        if skyvern_context.multi_field_totp_masking_task_ids():
+            data = redact_har_bytes(data, set())
+    elif artifact_type in _MULTI_FIELD_TOTP_TEXT_ARTIFACT_TYPES:
+        data = redact_multi_field_totp_artifact_bytes(data)
     if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
         return data
-
     try:
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
@@ -111,17 +135,27 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
             if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
                 return data
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-            if not secret_values:
+            if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
                 return data
         else:
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
+    # The prompt/response artifacts are the record of what crossed the model boundary, which exempts
+    # the run's placeholder ids; scrubbing one here would make the record disagree. Read separately
+    # from the secret lookup above: losing an exemption only widens the scrub, so it must not take
+    # the same bail-out that stops redacting altogether.
+    try:
+        placeholder_ids: frozenset[str] = app.WORKFLOW_CONTEXT_MANAGER.registered_placeholder_ids_for_run(
+            resolved_workflow_run_id
+        )
+    except Exception:
+        placeholder_ids = frozenset()
     if artifact_type == ArtifactType.HAR:
-        return redact_har_bytes(data, secret_values)
-    if not secret_values:
+        return redact_har_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
+    if not secret_values and not skyvern_context.multi_field_totp_masking_task_ids():
         return data
-    return redact_secrets_from_bytes(data, secret_values)
+    return redact_secrets_from_bytes(data, secret_values, multi_field_totp=False, placeholder_ids=placeholder_ids)
 
 
 def _safe_file_size_from_path(path: str | None) -> int | None:
@@ -421,6 +455,7 @@ class ArtifactManager:
         workflow_run_block_id: str | None = None,
         data: bytes | None = None,
         path: str | None = None,
+        upload_key: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
         uri = app.STORAGE.build_log_uri(
@@ -430,7 +465,9 @@ class ArtifactManager:
             artifact_type=artifact_type,
         )
         return await self._create_artifact(
-            aio_task_primary_key=log_entity_id,
+            # The entity id is a barrier every caller for that entity waits on; a caller that
+            # cancels its own upload passes a key of its own so the others never see it.
+            aio_task_primary_key=upload_key or log_entity_id,
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             uri=uri,
@@ -461,22 +498,14 @@ class ArtifactManager:
         row so the file can be served through the signed ``/v1/artifacts/{id}/content``
         endpoint.
         """
-        # Idempotent on (run_id, uri): if a DOWNLOAD artifact already exists for the
-        # same physical file (e.g. a loop iteration re-uploads the same download dir),
-        # return the existing artifact_id so signed URLs stay stable across calls —
-        # otherwise ``loop_download_filter.to_downloaded_file_signature`` would treat
-        # every iteration's URL as new.
+        context = skyvern_context.current()
+        # Retry uploads use attempt-specific URIs; reuse within one attempt keeps loop URLs stable.
         existing = await app.DATABASE.artifacts.find_download_artifact(
             organization_id=organization_id,
             run_id=run_id,
             uri=uri,
         )
         if existing is not None:
-            # Changed bytes under the same uri refresh the row's checksum so the loop filter's
-            # (filename, checksum, url) signature moves with the content instead of hiding a
-            # genuine re-download behind the stale row. A failed refresh propagates: the stale
-            # row must not vouch for bytes it does not describe, so the save loop records the
-            # file as skipped and workflow finalization's re-save retries the refresh.
             if checksum is not None and existing.checksum != checksum:
                 await app.DATABASE.artifacts.refresh_download_artifact_content(
                     artifact_id=existing.artifact_id,
@@ -487,7 +516,6 @@ class ArtifactManager:
             return existing.artifact_id
 
         artifact_id = generate_artifact_id()
-        context = skyvern_context.current()
         if workflow_run_id is None and context is not None:
             workflow_run_id = context.workflow_run_id
         await app.DATABASE.artifacts.create_artifact(
@@ -994,7 +1022,7 @@ class ArtifactManager:
                 aio_task = asyncio.create_task(app.STORAGE.store_artifact_from_path(artifact, artifact_data.path))
                 self._track_upload_aiotask(request.primary_key, aio_task)
 
-        return [model.artifact_id for model in artifact_models]
+        return [artifact.artifact_id for artifact in artifacts]
 
     def _prepare_step_artifacts(
         self,
@@ -1482,9 +1510,7 @@ class ArtifactManager:
             # in ``bundle_key``; non-bundled artifacts have it as the URI
             # basename. Without this fallback the path basename is just
             # "content" and the UI falls back to a literal "download" label.
-            artifact_name = artifact.bundle_key
-            if artifact_name is None and artifact.uri:
-                artifact_name = artifact.uri.rsplit("/", 1)[-1] or None
+            artifact_name = artifact.bundle_key or artifact_filename_from_uri(artifact.uri) or None
             return self._bundle_content_url(
                 artifact.artifact_id,
                 artifact_name=artifact_name,

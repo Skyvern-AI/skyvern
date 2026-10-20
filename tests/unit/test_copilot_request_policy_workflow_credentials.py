@@ -422,6 +422,7 @@ async def test_list_credentials_normalizes_pagination(
         organization_id="org-1",
         page=expected_page,
         page_size=expected_page_size,
+        allowed_folder_ids=None,
     )
     assert result["data"]["page"] == expected_page
     assert result["data"]["page_size"] == expected_page_size
@@ -848,7 +849,7 @@ async def test_a_card_answered_after_the_seed_still_wins_the_fill_seam(
         organization_id="org-1",
         global_llm_context=_ask_turn_context(proposed) or "",
     )
-    credential_pause_module._apply_connected_credential_to_policy(
+    credential_pause_module.apply_connected_credential_to_policy(
         SimpleNamespace(test_after_update_done=True, credential_pause_connected_credential_id=None), policy, picked
     )
 
@@ -1398,3 +1399,23 @@ def test_a_page_admitting_a_second_credential_proposes_the_new_one() -> None:
     proposed = StructuredContext.from_json_str(recorded).proposed_credential
     assert proposed is not None
     assert proposed.credential_id == freshly_admitted.credential_id
+
+
+@pytest.mark.asyncio
+async def test_the_settled_profile_pick_comes_from_the_saved_row_not_the_submitted_draft() -> None:
+    def workflow_yaml(browser_profile_id: str) -> str:
+        return (
+            f"title: t\nbrowser_profile_id: {browser_profile_id}\n"
+            "workflow_definition:\n  parameters: []\n  blocks: []\n"
+        )
+
+    policy = await _build_request_policy_bootstrap(
+        user_message="test the first block",
+        workflow_yaml=workflow_yaml("bp_draft"),
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=workflow_yaml("bp_saved"),
+    )
+
+    assert policy.persisted_workflow_browser_profile_id == "bp_saved"

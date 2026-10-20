@@ -76,6 +76,7 @@ async function renderControllingInputHook(
   clipboardCallbacks: {
     onClipboardPaste?: (text: string) => void;
     onClipboardCopy?: () => void;
+    forwardCopyShortcut?: boolean;
   } = {},
 ) {
   const { result } = renderHook(() =>
@@ -701,6 +702,31 @@ describe("useCdpInput key handling", () => {
     });
 
     expect(onClipboardPaste).not.toHaveBeenCalled();
+  });
+
+  it("syncs Cmd+C and still delivers it to the page only when forwarding is on", async () => {
+    for (const forwardCopyShortcut of [true, false]) {
+      const onClipboardCopy = vi.fn();
+      const result = await renderControllingInputHook({
+        onClipboardCopy,
+        forwardCopyShortcut,
+      });
+      const send = latestSocketSend();
+      send.mockClear();
+
+      act(() => {
+        result.current.handlers.handleKeyDown(
+          fakeKeyboardEvent("c", "KeyC", { metaKey: true }),
+        );
+        result.current.handlers.handleKeyUp(fakeKeyboardEvent("c", "KeyC"));
+      });
+
+      expect(onClipboardCopy).toHaveBeenCalledTimes(1);
+      const sentCodes = send.mock.calls.map(
+        (call) => JSON.parse(String(call[0])).code,
+      );
+      expect(sentCodes).toEqual(forwardCopyShortcut ? ["KeyC", "KeyC"] : []);
+    }
   });
 
   it("forwards an ordinary key pair after intercepting a clipboard chord", async () => {

@@ -1,0 +1,1306 @@
+---
+title: "Page actions"
+description: "AI and selector-based actions on a page: act, extract, validate, click, fill and more."
+slug: sdk-reference/browser-automation/page
+keywords:
+  - "page.act"
+  - "page.extract"
+  - "page.click"
+  - "page.fill"
+  - "AI locator"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+A Skyvern page is a Playwright `Page` with AI methods added. Every Playwright method still works; the methods below are the ones Skyvern adds or extends. Most accept a CSS `selector`, a natural-language `prompt`, or both (the selector is tried first and AI is the fallback).
+
+## AI methods
+
+### page.act
+
+Perform an action on the page using AI based on a natural language prompt.
+
+<CodeGroup>
+```python Python
+await page.act(
+    prompt: str,
+    skip_refresh: bool = False,
+    use_economy_tree: bool = False,
+) -> None
+```
+
+```typescript TypeScript
+page.act(prompt: string): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"prompt"} type={"str"} required>
+Natural language description of the action to perform.
+</ParamField>
+
+<ParamField path={"skip_refresh"} type={"bool"}>
+Default: `False` · Python only
+</ParamField>
+
+<ParamField path={"use_economy_tree"} type={"bool"}>
+Default: `False` · Python only
+</ParamField>
+
+**Returns** `None` · TypeScript `Promise<void>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.act(prompt="Click the 'Sign in' button")
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+await page.act("Click the 'Sign in' button");
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.extract
+
+Extract structured data from the page using AI.
+
+<CodeGroup>
+```python Python
+await page.extract(
+    prompt: str,
+    schema: dict[str, Any] | list | str | None = None,
+    error_code_mapping: dict[str, str] | None = None,
+    intention: str | None = None,
+) -> dict[str, Any] | list | str | None
+```
+
+```typescript TypeScript
+page.extract(options: { prompt: string; schema?: Record<string, unknown> | unknown[] | string; errorCodeMapping?: Record<string, string>; intention?: string; data?: string | Record<string, unknown>; }): Promise<Record<string, unknown> | unknown[] | string | null>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"prompt"} type={"str"} required>
+Natural language description of what data to extract.
+</ParamField>
+
+<ParamField path={"schema"} type={"dict[str, Any] | list | str | None"}>
+JSON Schema defining the structure of data to extract.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code_mapping"} type={"dict[str, str] | None"}>
+Mapping of error codes to custom error messages.
+
+Default: `None` · TypeScript: `errorCodeMapping`
+</ParamField>
+
+<ParamField path={"intention"} type={"str | None"}>
+Additional context about the extraction intent.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"data"} type={"string | Record<string, unknown>"}>
+TypeScript only
+</ParamField>
+
+**Returns** `dict[str, Any] | list | str | None` · TypeScript `Promise<Record<string, unknown> | unknown[] | string | null>` — Extracted data matching the provided schema, or None if extraction fails.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.extract(prompt="Extract the title and price of every product on the page")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.extract({
+    prompt: "Extract the title and price of every product on the page",
+});
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.validate
+
+Validate the current page state using AI.
+
+<CodeGroup>
+```python Python
+await page.validate(prompt: str, model: dict[str, Any] | str | None = None) -> bool
+```
+
+```typescript TypeScript
+page.validate(prompt: string, model?: Record<string, unknown> | string): Promise<boolean>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"prompt"} type={"str"} required>
+Validation criteria or condition to check
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | str | None"}>
+Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gpt-4")
+
+Default: `None`
+</ParamField>
+
+**Returns** `bool` · TypeScript `Promise<boolean>` — True if validation passes, False otherwise
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.validate(prompt="The user is signed in")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.validate("The user is signed in");
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.prompt
+
+Send a prompt to the LLM and get a response based on the provided schema.
+
+This method allows you to interact with the LLM directly without requiring page context.
+It's useful for making decisions, generating text, or processing information using AI.
+
+<CodeGroup>
+```python Python
+await page.prompt(
+    prompt: str,
+    schema: dict[str, Any] | None = None,
+    model: dict[str, Any] | str | None = None,
+) -> dict[str, Any] | list | str | None
+```
+
+```typescript TypeScript
+page.prompt(prompt: string, schema?: Record<string, unknown>, model?: Record<string, unknown> | string): Promise<Record<string, unknown> | unknown[] | string | null>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"prompt"} type={"str"} required>
+The prompt to send to the LLM
+</ParamField>
+
+<ParamField path={"schema"} type={"dict[str, Any] | None"}>
+Optional JSON schema to structure the response. If provided, the LLM response will be validated against this schema.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | str | None"}>
+Optional model configuration. Can be either: - A dict with model configuration (e.g., \{"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048\}) - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+
+Default: `None`
+</ParamField>
+
+**Returns** `dict[str, Any] | list | str | None` · TypeScript `Promise<Record<string, unknown> | unknown[] | string | null>` — LLM response structured according to the schema if provided, or unstructured response otherwise.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.prompt(prompt="What is the main heading on this page?")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+const result = await page.prompt("What is the main heading on this page?");
+console.log(result);
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.locator
+
+Get a Playwright locator using a CSS selector, AI-powered prompt, or both.
+
+This method extends Playwright's locator() with AI capabilities. It supports three modes:
+- **Selector-based**: Get locator using CSS selector (standard Playwright behavior)
+- **AI-powered**: Use natural language to describe the element (returns lazy AILocator)
+- **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+The AI-powered locator is lazy - it only calls ai_locate_element when you actually
+use the locator (e.g., when you call .click(), .fill(), etc.). Note that using this
+AI locator lookup with prompt only works for elements you can interact with on the page.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+page.locator(
+    selector: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+    **kwargs: Any,
+) -> Locator
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which element to locate.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'`
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+All Playwright locator parameters (has_text, has, etc.)
+
+Sent only when you pass it
+</ParamField>
+
+**Returns** `Locator` — A Playwright Locator object (or AILocator proxy that acts like one).
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = page.locator(prompt="the search box")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+## Element actions
+
+### page.click
+
+Click an element using a CSS selector, AI-powered prompt matching, or both.
+
+This method supports three modes:
+- **Selector-based**: Click the element matching the CSS selector
+- **AI-powered**: Use natural language to describe which element to click
+- **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+<CodeGroup>
+```python Python
+await page.click(
+    selector: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+    mode: str | None = None,
+    desired_state: bool | None = None,
+    **kwargs: Any,
+) -> str | None
+```
+
+```typescript TypeScript
+page.click(selector: string, options?: Parameters<Page["click"]>[1]): Promise<void>
+page.click(options: { prompt: string; } & Partial<Parameters<Page["click"]>[1]>): Promise<void>
+page.click(selector: string, options: { prompt: string; } & Partial<Parameters<Page["click"]>[1]>): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which element to click.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"mode"} type={"str | None"}>
+When `"direct"`, perform a raw Playwright click with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"desired_state"} type={"bool | None"}>
+Level-triggered toggle intent recorded with the action. When set, a selector-first click is suppressed if the control already holds that state, so a replay never toggles an already-satisfied control back off. Ignored by `mode="direct"`.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+All Playwright click parameters (timeout, force, modifiers, etc.)
+
+Sent only when you pass it · Python only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"click\"]>[1]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
+
+**Returns** `str | None` · TypeScript `Promise<void>` — The selector string that was successfully used to click the element, or None.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.click(prompt="Click the 'Sign in' button")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+await page.click({ prompt: "Click the 'Sign in' button" });
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.fill
+
+Fill an input field using a CSS selector, AI-powered prompt matching, or both.
+
+This method supports three modes:
+- **Selector-based**: Fill the input field with a value using CSS selector
+- **AI-powered**: Use natural language prompt (AI extracts value from prompt)
+- **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+<CodeGroup>
+```python Python
+await page.fill(
+    selector: str | None = None,
+    value: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+    mode: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+) -> str
+```
+
+```typescript TypeScript
+page.fill(selector: string, value: string, options?: Parameters<Page["fill"]>[2]): Promise<void>
+page.fill(options: { prompt: string; value?: string; } & Partial<Parameters<Page["fill"]>[2]>): Promise<void>
+page.fill(selector: string, value: string, options: { prompt: string; } & Partial<Parameters<Page["fill"]>[2]>): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target input element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The text value to input into the field.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which field to fill and what value.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"mode"} type={"str | None"}>
+When `"direct"`, perform a raw Playwright fill with no AI fallback or element preparation. The action is still recorded in the DB so it appears in the timeline.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+TOTP identifier for time-based one-time password fields.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from for authentication.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"fill\"]>[2]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
+
+**Returns** `str` · TypeScript `Promise<void>` — The value that was successfully filled into the field.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.fill(prompt="the email field", value="jane@example.com")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+await page.fill({ prompt: "the email field", value: "jane@example.com" });
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.select_option
+
+Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
+
+This method supports three modes:
+- **Selector-based**: Select the option with a value using CSS selector
+- **AI-powered**: Use natural language prompt (AI extracts value from prompt)
+- **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+<CodeGroup>
+```python Python
+await page.select_option(
+    selector: str | None = None,
+    value: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+) -> str | None
+```
+
+```typescript TypeScript
+page.selectOption(selector: string, values: string | string[], options?: Parameters<Page["selectOption"]>[2]): Promise<void>
+page.selectOption(options: { prompt: string; value?: string; } & Partial<Parameters<Page["selectOption"]>[2]>): Promise<void>
+page.selectOption(selector: string, values: string | string[], options: { prompt: string; } & Partial<Parameters<Page["selectOption"]>[2]>): Promise<void>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the target select/dropdown element.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The option value to select.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which option to select.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+
+Default: `'fallback'` · Python only
+</ParamField>
+
+<ParamField path={"values"} type={"string | string[]"}>
+TypeScript only
+</ParamField>
+
+<ParamField path={"options"} type={"Parameters<Page[\"selectOption\"]>[2]"}>
+Playwright options for this call.
+
+TypeScript only
+</ParamField>
+
+**Returns** `str | None` · TypeScript `Promise<void>` — The value that was successfully selected.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.select_option(prompt="the country dropdown", value="Canada")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+await page.goto("https://example.com");
+await page.selectOption({ prompt: "the country dropdown", value: "Canada" });
+await browser.close();
+```
+</CodeGroup>
+
+---
+
+### page.type
+
+Enter text into an input using a selector, AI, or both. Behaves the same as `fill`.
+
+With a selector, the value is set in one step (Playwright's `fill`), not typed key by key. For inputs
+that need real key events, use `fill_autocomplete`, `keypress`, or `press_sequentially` on a Playwright locator.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.type(
+    selector: str | None = None,
+    value: str | None = None,
+    ai: str | None = 'fallback',
+    prompt: str | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    **kwargs: Any,
+) -> str
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the input.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"value"} type={"str | None"}>
+The text to enter.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. Defaults to "fallback", which tries the selector first, then AI.
+
+Default: `'fallback'`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which input to type into.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier of the 2FA code to type, when `value` is a TOTP placeholder.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"**kwargs"} type={"Any"}>
+Playwright options such as `timeout`.
+
+Sent only when you pass it
+</ParamField>
+
+**Returns** `str` — The value that was entered.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.type(selector="#search", value="skyvern")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.hover
+
+Move the mouse over the element identified by `selector`.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.hover(
+    selector: str,
+    *,
+    timeout: float = 5000,
+    hold_seconds: float = 0.0,
+    intention: str | None = None,
+) -> str
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str"} required>
+CSS selector for the element.
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for the element, in milliseconds.
+
+Default: `5000`
+</ParamField>
+
+<ParamField path={"hold_seconds"} type={"float"}>
+How long to keep the mouse over the element, in seconds.
+
+Default: `0.0`
+</ParamField>
+
+<ParamField path={"intention"} type={"str | None"}>
+Description of why you are hovering, recorded with the action.
+
+Default: `None`
+</ParamField>
+
+**Returns** `str` — The selector that was hovered.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.hover(selector="#account-menu")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.upload_file
+
+Upload a file to a file input, using a selector, AI, or both.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.upload_file(
+    selector: str | None = None,
+    files: str | None = None,
+    *,
+    prompt: str | None = None,
+    ai: str | None = 'fallback',
+) -> str
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the file input.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"files"} type={"str | None"}>
+URL of the file to upload. One file per call.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Natural language description of which file input to use.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai"} type={"str | None"}>
+AI behavior mode. With the default "fallback", a selector-only call uploads through the selector. When a prompt is passed, the selector is tried first and AI then always runs the upload, using the selector only if it worked.
+
+Default: `'fallback'`
+</ParamField>
+
+**Returns** `str` — The file URL that was uploaded.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.upload_file(
+        files="https://example.com/resume.pdf",
+        prompt="the resume upload field",
+    )
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.keypress
+
+Press one or more keys, such as `["Enter"]` or `["Control", "a"]`.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.keypress(keys: list[str], hold: bool = False, duration: float = 0) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"keys"} type={"list[str]"} required>
+Keys to press, using Playwright key names.
+</ParamField>
+
+<ParamField path={"hold"} type={"bool"}>
+Hold the keys down for `duration` seconds instead of tapping them.
+
+Default: `False`
+</ParamField>
+
+<ParamField path={"duration"} type={"float"}>
+How long to hold the keys, in seconds, when `hold` is true.
+
+Default: `0`
+</ParamField>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.keypress(keys=["Enter"])
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.scroll
+
+Scroll the page by a number of pixels.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.scroll(scroll_x: int, scroll_y: int) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"scroll_x"} type={"int"} required>
+Pixels to scroll horizontally (negative scrolls left).
+</ParamField>
+
+<ParamField path={"scroll_y"} type={"int"} required>
+Pixels to scroll vertically (negative scrolls up).
+</ParamField>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.scroll(scroll_x=0, scroll_y=600)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.drag
+
+Drag with the mouse from a start point along a path of points.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.drag(start_x: int, start_y: int, path: list[tuple[int, int]]) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"start_x"} type={"int"} required>
+Horizontal start position in pixels.
+</ParamField>
+
+<ParamField path={"start_y"} type={"int"} required>
+Vertical start position in pixels.
+</ParamField>
+
+<ParamField path={"path"} type={"list[tuple[int, int]]"} required>
+Points `(x, y)` to drag through, ending where the mouse is released.
+</ParamField>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.drag(start_x=100, start_y=200, path=[[300, 200]])
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.move
+
+Move the mouse cursor to a point on the page.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.move(x: int, y: int) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"x"} type={"int"} required>
+Horizontal position in pixels from the left of the viewport.
+</ParamField>
+
+<ParamField path={"y"} type={"int"} required>
+Vertical position in pixels from the top of the viewport.
+</ParamField>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.move(x=100, y=200)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.wait
+
+Pause the script for a fixed time, recorded as a wait action.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.wait(seconds: float | None = None) -> None
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"seconds"} type={"float | None"}>
+How long to wait, in seconds.
+
+Default: `None`
+</ParamField>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.wait()
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.download_file
+
+Download a file from a URL and save it locally during cached script replay.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.download_file(
+    file_name: str | None = None,
+    download_url: str | None = None,
+) -> str
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"file_name"} type={"str | None"}>
+The original file name (for logging/reference). Defaults to UUID if empty.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"download_url"} type={"str | None"}>
+The URL to download the file from.
+
+Default: `None`
+</ParamField>
+
+**Returns** `str` — The local file path where the file was saved.
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    result = await page.download_file(download_url="https://example.com/invoice.pdf")
+    print(result)
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>
+
+---
+
+### page.reload_page
+
+Reload the current page, recorded as an action.
+
+<Note>Python only: the TypeScript SDK has no equivalent.</Note>
+
+<CodeGroup>
+```python Python
+await page.reload_page() -> None
+```
+</CodeGroup>
+
+**Returns** `None`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    browser = await skyvern.launch_cloud_browser()
+    page = await browser.get_working_page()
+    await page.goto("https://example.com")
+    await page.reload_page()
+    await browser.close()
+
+
+asyncio.run(main())
+```
+</CodeGroup>

@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+    composition_structured_evidence_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _BARE_MAGNITUDE_RE,
@@ -53,7 +54,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _selector_for,
     _structural_path,
     _structured_modal_dismiss_controls,
-    composition_page_evidence_error,
+    composition_page_evidence_missing,
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
@@ -64,13 +65,19 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     parse_composition_structured,
     unresolved_requested_targets,
+    without_authoring_facts,
 )
-from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
+from skyvern.forge.sdk.copilot.output_extraction_plan import (
+    _relation_label_child_index,
+    candidate_page_context,
+    value_designation_probe_expression,
+)
+from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import _runtime_form_summaries
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
-from skyvern.forge.sdk.copilot.tools.composition_capture import _model_facing_inspect_result
+from skyvern.forge.sdk.copilot.tools.composition_capture import _PAGE_STATE_RESERVE_CHARS, _model_facing_inspect_result
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
@@ -81,7 +88,6 @@ class _Ctx:
     flow_evidence: list[dict] = field(default_factory=list)
     # Looser than AgentContext so tests can feed malformed refs into the gate.
     block_observation_refs: dict[str, object] = field(default_factory=dict)
-    raw_block_observation_refs: object | None = None
     prior_observed_acted_pages: list[dict] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
@@ -1086,14 +1092,11 @@ def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() 
         "navigation_goal": "Enter the person name into the name search field and click Search.",
     }
 
-    assert composition_page_evidence_error(_Ctx(), _yaml(goto_block)) is None
+    assert composition_page_evidence_missing(_Ctx(), _yaml(goto_block)) is False
 
-    error = composition_page_evidence_error(_Ctx(), _yaml(goto_block, search_block))
+    missing = composition_page_evidence_missing(_Ctx(), _yaml(goto_block, search_block))
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
-    assert "save only the initial goto_url block" in error
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_finding_does_not_depend_on_a_phase_gate() -> None:
@@ -1107,10 +1110,9 @@ def test_composition_finding_does_not_depend_on_a_phase_gate() -> None:
     )
     ctx = _Ctx()
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -> None:
@@ -1124,13 +1126,12 @@ def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -
             "navigation_goal": "Click the Add to cart button on the current page.",
         }
 
-        error = composition_page_evidence_error(_Ctx(), _yaml(goto_block, acting_block))
+        missing = composition_page_evidence_missing(_Ctx(), _yaml(goto_block, acting_block))
 
-        assert error is not None, f"{acting_type} should require page evidence"
-        assert f"do_{acting_type}" in error
+        assert missing is True, f"{acting_type} should require page evidence"
 
 
-def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> None:
+def test_composition_gate_flags_extraction_only_blocks_without_page_evidence() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_results", "url": "https://example.com/results"},
         {
@@ -1140,12 +1141,9 @@ def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> Non
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(), workflow_yaml)
 
-    assert error is not None
-    assert "page-dependent blocks" in error
-    assert "navigation/login" not in error
-    assert "extract_results (extraction)" in error
+    assert missing is True
 
 
 @pytest.mark.parametrize(
@@ -1170,10 +1168,9 @@ def test_composition_gate_rejects_stale_page_evidence(stale_url: str) -> None:
         "current_url": stale_url,
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "page-dependent build blocks need observed page evidence" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_untyped_browser_observation_evidence() -> None:
@@ -1192,10 +1189,9 @@ def test_composition_gate_rejects_untyped_browser_observation_evidence() -> None
         "source_tool": "get_browser_screenshot",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_precompose_screenshot_evidence_outside_inspection_tool() -> None:
@@ -1217,10 +1213,9 @@ def test_composition_gate_rejects_precompose_screenshot_evidence_outside_inspect
         "visual_evidence_summary": "A search form is visible.",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> None:
@@ -1239,9 +1234,9 @@ def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> 
         "visual_evidence_summary": "A challenge is visible below the search form.",
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_accepts_structured_evaluate_evidence_on_target_page() -> None:
@@ -1266,9 +1261,9 @@ def test_composition_gate_accepts_structured_evaluate_evidence_on_target_page() 
         ],
     }
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=evidence), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_accepts_structured_evaluate_same_origin_after_initial_block() -> None:
@@ -1291,9 +1286,9 @@ def test_composition_gate_accepts_structured_evaluate_same_origin_after_initial_
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_rejects_post_run_browser_observation_outside_inspection_tool() -> None:
@@ -1328,10 +1323,9 @@ def test_composition_gate_rejects_post_run_browser_observation_outside_inspectio
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_structured_evaluate_evidence_for_same_origin_continuation() -> None:
@@ -1367,9 +1361,9 @@ def test_composition_gate_allows_structured_evaluate_evidence_for_same_origin_co
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_continuation() -> None:
@@ -1405,9 +1399,9 @@ def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_con
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_observation() -> None:
@@ -1447,9 +1441,9 @@ def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_obse
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_rejects_hollow_inspect_evidence() -> None:
@@ -1476,10 +1470,9 @@ def test_composition_gate_rejects_hollow_inspect_evidence() -> None:
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "observed page evidence" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_extraction_added_with_new_page_changing_block() -> None:
@@ -1519,9 +1512,9 @@ def test_composition_gate_allows_extraction_added_with_new_page_changing_block()
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_extraction_after_matching_current_page_evidence() -> None:
@@ -1556,9 +1549,9 @@ def test_composition_gate_allows_extraction_after_matching_current_page_evidence
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
@@ -1593,41 +1586,9 @@ def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
-
-
-def test_composition_gate_error_names_nearest_url_before_new_page_block() -> None:
-    existing_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "goto_url",
-            "label": "open_find_record",
-            "url": "https://example.com/registry/",
-        },
-    )
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {
-            "block_type": "goto_url",
-            "label": "open_find_record",
-            "url": "https://example.com/registry/",
-        },
-        {
-            "block_type": "navigation",
-            "label": "search_standard_record",
-            "url": "https://example.com/registry/search",
-            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
-        },
-    )
-    ctx = _Ctx(composition_page_evidence=None)
-    ctx.workflow_yaml = existing_yaml
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "target_url='https://example.com/registry/search'" in error
+    assert missing is False
 
 
 def test_composition_gate_rejects_same_origin_browser_observation_before_run_continuation() -> None:
@@ -1650,10 +1611,9 @@ def test_composition_gate_rejects_same_origin_browser_observation_before_run_con
     ctx = _Ctx(composition_page_evidence=evidence)
     ctx.workflow_yaml = existing_yaml
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "inspect_page_for_composition" in error
+    assert missing is True
 
 
 def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks() -> None:
@@ -1673,10 +1633,9 @@ def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks()
         workflow_yaml=existing_yaml,
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "search_lookup" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_page_dependent_blocks_without_target_url() -> None:
@@ -1688,10 +1647,9 @@ def test_composition_gate_rejects_page_dependent_blocks_without_target_url() -> 
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is not None
-    assert "target_url=None" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_navigation_after_matching_evidence() -> None:
@@ -1707,9 +1665,9 @@ def test_composition_gate_allows_navigation_after_matching_evidence() -> None:
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_observation() -> None:
@@ -1735,9 +1693,9 @@ def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_
         },
     )
 
-    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+    missing = composition_page_evidence_missing(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_navigation_split_blocks_sharing_entrypoint_observation_ref() -> None:
@@ -1768,9 +1726,9 @@ def test_composition_gate_allows_navigation_split_blocks_sharing_entrypoint_obse
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 # ---------------- SKY-10562: block-type-agnostic, per-acted-page, multi-page gate ----------------
@@ -1785,18 +1743,17 @@ def test_composition_gate_gates_non_entrypoint_goto_url_block() -> None:
         {"block_type": "validation", "label": "confirm_item", "complete_criterion": "An item is in the cart."},
     )
 
-    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
-    assert error is not None
-    assert "open_cart (goto_url)" in error
+    missing = composition_page_evidence_missing(_Ctx(), workflow_yaml)
+    assert missing is True
 
     ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/cart")])
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_entrypoint_goto_url_stays_ungated() -> None:
     # The first goto_url is the scaffold the agent scouts from — never gated.
     workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+    assert composition_page_evidence_missing(_Ctx(), workflow_yaml) is False
 
 
 def test_composition_gate_pure_code_block_is_ungated() -> None:
@@ -1804,7 +1761,7 @@ def test_composition_gate_pure_code_block_is_ungated() -> None:
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "code", "label": "transform", "code": "result = 1 + 1"},
     )
-    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+    assert composition_page_evidence_missing(_Ctx(), workflow_yaml) is False
 
 
 def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> None:
@@ -1817,9 +1774,8 @@ def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> 
         {"block_type": "validation", "label": "confirm_secure", "complete_criterion": "Secure area is shown."},
     )
     only_login = _Ctx(flow_evidence=[_flow_entry("https://example.com/login")])
-    error = composition_page_evidence_error(only_login, workflow_yaml)
-    assert error is not None
-    assert "open_secure (goto_url)" in error
+    missing = composition_page_evidence_missing(only_login, workflow_yaml)
+    assert missing is True
 
     both = _Ctx(
         flow_evidence=[
@@ -1827,7 +1783,7 @@ def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> 
             _flow_entry("https://example.com/secure", reached_via="post_run"),
         ]
     )
-    assert composition_page_evidence_error(both, workflow_yaml) is None
+    assert composition_page_evidence_missing(both, workflow_yaml) is False
 
 
 def test_composition_gate_requires_block_observation_refs_for_click_reached_pages() -> None:
@@ -1842,12 +1798,9 @@ def test_composition_gate_requires_block_observation_refs_for_click_reached_page
         block_observation_refs={"search_product": 0},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "requires a block_observation_refs entry" in error
-    assert "Pass an interaction- or post_run-reached observation_step" in error
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observation_ref() -> None:
@@ -1866,12 +1819,9 @@ def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observ
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "references observation_step 0" in error
-    assert "reached via 'navigate'" in error
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_current_page_read_after_matching_interaction_reached_page() -> None:
@@ -1892,7 +1842,7 @@ def test_composition_gate_allows_current_page_read_after_matching_interaction_re
         },
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_accepts_scout_interaction_observation_for_click_reached_block() -> None:
@@ -1912,7 +1862,7 @@ def test_composition_gate_accepts_scout_interaction_observation_for_click_reache
         block_observation_refs={"search_product": 1, "add_to_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_hollow_interaction_observation_without_schema() -> None:
@@ -1933,7 +1883,7 @@ def test_composition_gate_rejects_hollow_interaction_observation_without_schema(
         block_observation_refs={"search_product": 1, "add_to_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_credits_current_page_read_after_schema_less_scout_interaction() -> None:
@@ -1951,7 +1901,7 @@ def test_composition_gate_credits_current_page_read_after_schema_less_scout_inte
         block_observation_refs={"open_results": 1, "read_results": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_finding_reuses_reached_page_evidence_independent_of_block_order() -> None:
@@ -1981,7 +1931,7 @@ def test_composition_finding_reuses_reached_page_evidence_independent_of_block_o
             *page_blocks,
         )
 
-        assert composition_page_evidence_error(ctx, workflow_yaml) is None
+        assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_current_page_read_credited_by_a_later_interaction() -> None:
@@ -1999,7 +1949,7 @@ def test_composition_gate_rejects_current_page_read_credited_by_a_later_interact
         block_observation_refs={"open_results": 2, "read_results": 1},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_finding_reuses_one_interaction_observation_for_multiple_blocks() -> None:
@@ -2018,7 +1968,7 @@ def test_composition_finding_reuses_one_interaction_observation_for_multiple_blo
         block_observation_refs={"read_results": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_left_and_reopened() -> None:
@@ -2038,7 +1988,7 @@ def test_composition_gate_rejects_current_page_read_after_the_reached_page_was_l
         block_observation_refs={"open_results": 1, "read_results": 4},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_rejects_current_page_read_after_same_url_navigation_reopened_page() -> None:
@@ -2057,7 +2007,7 @@ def test_composition_gate_rejects_current_page_read_after_same_url_navigation_re
         block_observation_refs={"open_results": 1, "read_results": 3},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_rejects_current_page_read_without_a_same_location_interaction() -> None:
@@ -2075,7 +2025,7 @@ def test_composition_gate_rejects_current_page_read_without_a_same_location_inte
         block_observation_refs={"open_results": 1, "read_cart": 2},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is True
 
 
 def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -> None:
@@ -2094,7 +2044,7 @@ def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -
         block_observation_refs={},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_rejects_click_reached_block_with_no_interaction_observation() -> None:
@@ -2108,10 +2058,9 @@ def test_composition_gate_rejects_click_reached_block_with_no_interaction_observ
         block_observation_refs={},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "add_to_cart (action)" in error
+    assert missing is True
 
 
 def test_composition_finding_auto_credit_does_not_consume_interaction_observations() -> None:
@@ -2128,7 +2077,7 @@ def test_composition_finding_auto_credit_does_not_consume_interaction_observatio
     one = _Ctx(
         flow_evidence=base + [_scout_interaction_entry("https://example.com/", step=1)], block_observation_refs={}
     )
-    assert composition_page_evidence_error(one, workflow_yaml) is None
+    assert composition_page_evidence_missing(one, workflow_yaml) is False
 
     two = _Ctx(
         flow_evidence=base
@@ -2138,10 +2087,10 @@ def test_composition_finding_auto_credit_does_not_consume_interaction_observatio
         ],
         block_observation_refs={},
     )
-    assert composition_page_evidence_error(two, workflow_yaml) is None
+    assert composition_page_evidence_missing(two, workflow_yaml) is False
 
 
-def test_composition_gate_reports_missing_referenced_observation_step() -> None:
+def test_composition_gate_flags_block_citing_an_observation_step_not_in_flow_evidence() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
         {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
@@ -2155,33 +2104,9 @@ def test_composition_gate_reports_missing_referenced_observation_step() -> None:
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "references observation_step 9" in error
-    assert "observation step was not found in flow evidence" in error
-    assert "add_first_result (action)" in error
-
-
-def test_composition_gate_reports_evicted_referenced_observation_step() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
-        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
-    )
-    ctx = _Ctx(
-        flow_evidence=[_flow_entry("https://example.com/cart", reached_via="interaction", step=65)],
-        block_observation_refs={
-            "search_product": 65,
-            "add_first_result": 9,
-        },
-    )
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "references observation_step 9" in error
-    assert "no longer available in the flow-evidence window" in error
+    assert missing is True
 
 
 def test_normalize_block_observation_refs_rejects_string_steps() -> None:
@@ -2230,35 +2155,6 @@ def test_parse_structured_evidence_warns_on_unknown_size_compaction_category() -
     )
 
 
-def test_composition_gate_reports_string_typed_observation_step_from_raw_refs() -> None:
-    workflow_yaml = _yaml(
-        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
-        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
-        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
-    )
-    ctx = _Ctx(
-        # No interaction-reached observation exists, so auto-credit cannot ground the block and the
-        # string-typed-ref diagnostic fires instead.
-        flow_evidence=[
-            _flow_entry("https://example.com/", reached_via="navigate", step=0),
-        ],
-        block_observation_refs={
-            "search_product": 0,
-        },
-        raw_block_observation_refs=[
-            {"label": "search_product", "observation_step": 0},
-            {"label": "add_first_result", "observation_step": "1"},
-        ],
-    )
-
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-
-    assert error is not None
-    assert "observation_step '1' as a string" in error
-    assert "Pass the integer observation_step" in error
-    assert "add_first_result (action)" in error
-
-
 def test_composition_gate_rejects_action_after_navigation_reusing_entrypoint_observation_ref() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -2273,10 +2169,9 @@ def test_composition_gate_rejects_action_after_navigation_reusing_entrypoint_obs
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "add_first_result (action)" in error
+    assert missing is True
 
 
 def test_composition_gate_allows_click_reached_pages_with_block_observation_refs() -> None:
@@ -2299,9 +2194,9 @@ def test_composition_gate_allows_click_reached_pages_with_block_observation_refs
         },
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_allows_truthfully_empty_observed_confirmation_page() -> None:
@@ -2337,9 +2232,9 @@ def test_composition_gate_allows_truthfully_empty_observed_confirmation_page() -
         block_observation_refs={"submit_form": 0, "confirm_done": 1},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is None
+    assert missing is False
 
 
 def test_composition_gate_regates_changed_block_url() -> None:
@@ -2353,13 +2248,12 @@ def test_composition_gate_regates_changed_block_url() -> None:
     )
     ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/old")])
     ctx.workflow_yaml = previous
-    error = composition_page_evidence_error(ctx, workflow_yaml)
-    assert error is not None
-    assert "open_page (navigation)" in error
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
+    assert missing is True
 
     ctx_observed = _Ctx(flow_evidence=[_flow_entry("https://example.com/new")])
     ctx_observed.workflow_yaml = previous
-    assert composition_page_evidence_error(ctx_observed, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx_observed, workflow_yaml) is False
 
 
 def test_composition_gate_credits_cross_turn_observed_page_summary() -> None:
@@ -2374,7 +2268,7 @@ def test_composition_gate_credits_cross_turn_observed_page_summary() -> None:
             {"url": "https://example.com/lookup", "had_bounded_schema": True, "reached_via": "navigate"}
         ]
     )
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> None:
@@ -2392,9 +2286,8 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
         ]
     )
     sibling_only.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    error = composition_page_evidence_error(sibling_only, workflow_yaml)
-    assert error is not None
-    assert "open_admin (goto_url)" in error
+    missing = composition_page_evidence_missing(sibling_only, workflow_yaml)
+    assert missing is True
 
     exact = _Ctx(
         prior_observed_acted_pages=[
@@ -2402,7 +2295,7 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
         ]
     )
     exact.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
-    assert composition_page_evidence_error(exact, workflow_yaml) is None
+    assert composition_page_evidence_missing(exact, workflow_yaml) is False
 
 
 def test_composition_gate_credits_safe_cross_turn_location_fingerprint() -> None:
@@ -2422,7 +2315,7 @@ def test_composition_gate_credits_safe_cross_turn_location_fingerprint() -> None
         ]
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_candidate_page_context_exposes_origin_not_path_or_query() -> None:
@@ -2453,10 +2346,9 @@ def test_composition_gate_matches_url_blocks_against_target_when_observation_ref
         block_observation_refs={"open_cart": 0},
     )
 
-    error = composition_page_evidence_error(ctx, workflow_yaml)
+    missing = composition_page_evidence_missing(ctx, workflow_yaml)
 
-    assert error is not None
-    assert "open_cart (goto_url)" in error
+    assert missing is True
 
 
 # Bounded structured-evidence extractor
@@ -3890,7 +3782,7 @@ async def test_interaction_blocking_layer_evidence_matches_on_the_same_rendered_
 
     assert structured is not None
     assert structured["modal_overlays"] == parsed["modal_overlays"] == []
-    structured_obstruction = structured["page_obstructions"][0]
+    structured_obstruction = without_authoring_facts(structured["page_obstructions"][0])
     parsed_obstruction = parsed["page_obstructions"][0]
     assert structured_obstruction["selector"] == parsed_obstruction["selector"] == "#veil"
     assert structured_obstruction["kind"] == parsed_obstruction["kind"] == "interaction_blocking_layer"
@@ -3934,7 +3826,7 @@ async def test_aria_role_button_and_root_selectors_match_on_the_same_blocking_la
     for evidence in (structured, parsed):
         assert evidence["modal_overlays"] == []
         assert len(evidence["page_obstructions"]) == 1
-    structured_obstruction = structured["page_obstructions"][0]
+    structured_obstruction = without_authoring_facts(structured["page_obstructions"][0])
     parsed_obstruction = parsed["page_obstructions"][0]
     assert (
         structured_obstruction["selector"] == parsed_obstruction["selector"] == ('section[aria-label="Blocking layer"]')
@@ -4445,6 +4337,142 @@ async def test_blocking_layer_twins_report_exact_omitted_control_count() -> None
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_candidate_counts_reach_an_author_only_where_a_selector_is_not_unique_or_matches_hidden_elements() -> (
+    None
+):
+    url = "https://test.example.com/catalog"
+    raw, content = await _capture_live_dom(
+        url,
+        (
+            "<html><head><style>.legacy{display:none}</style></head><body>"
+            '<form id="search">'
+            '<button type="submit" class="go" style="display:none">Search</button>'
+            '<button type="submit" class="go legacy">Search</button>'
+            '<input id="q" name="q" type="text">'
+            '<button type="submit" class="go">Search</button></form></body></html>'
+        ),
+        "#q",
+    )
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    parsed = parse_composition_html(content, inspected_url=url, current_url=url)
+
+    assert structured is not None
+    assert [control["text"] for control in structured["forms"][0]["submit_controls"]] == ["Search"]
+
+    def controls(packet: dict[str, Any]) -> list[dict[str, Any]]:
+        return [*packet["forms"][0]["fields"], *packet["forms"][0]["submit_controls"]]
+
+    authoring = controls(model_visible_composition_evidence(structured, authoring_facts=True))
+    candidates = {
+        candidate["selector"]: candidate for control in authoring for candidate in control["selector_candidates"]
+    }
+    assert candidates["button.go"] == {
+        "selector": "button.go",
+        "source": "class",
+        "match_count": 3,
+        "visible_match_count": 1,
+        "first_match_visible": False,
+    }
+    assert candidates["#q"] == {"selector": "#q", "source": "id"}
+    assert [control["pointer_at_center"] for control in authoring] == ["reaches_control", "reaches_control"]
+
+    # Every other reader gets no counts, and neither does an author reading stored HTML, which cannot see that
+    # a stylesheet hides one of the two buttons it still counts.
+    stored_html_counts = [
+        candidate.get("match_count") for control in controls(parsed) for candidate in control["selector_candidates"]
+    ]
+    assert 2 in stored_html_counts
+    for packet in (
+        model_visible_composition_evidence(structured),
+        model_visible_composition_evidence(parsed, authoring_facts=True),
+    ):
+        for control in controls(packet):
+            assert all(set(candidate) == {"selector", "source"} for candidate in control["selector_candidates"])
+    assert all(
+        "pointer_at_center" not in control for control in controls(model_visible_composition_evidence(structured))
+    )
+
+    visible_first_raw, _ = await _capture_live_dom(
+        url,
+        (
+            "<html><head><style>.legacy{display:none}</style></head><body>"
+            '<form id="search"><input id="q" name="q" type="text">'
+            '<button type="submit" class="go">Search</button>'
+            '<button type="submit" class="go legacy">Search</button></form></body></html>'
+        ),
+        "#q",
+    )
+    visible_first = parse_composition_structured(json.loads(visible_first_raw), inspected_url=url, current_url=url)
+    assert visible_first is not None
+    visible_first_candidates = {
+        candidate["selector"]: candidate
+        for control in controls(model_visible_composition_evidence(visible_first, authoring_facts=True))
+        for candidate in control["selector_candidates"]
+    }
+    assert visible_first_candidates["button.go"] == {
+        "selector": "button.go",
+        "source": "class",
+        "match_count": 2,
+        "visible_match_count": 1,
+        "first_match_visible": True,
+    }
+
+
+_VISUALLY_HIDDEN = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"
+_HIT_TEST_EDGE_PAGE = f"""<!doctype html><html><head><style>html {{ overflow-y: scroll; }} body {{ margin: 0; }}</style><script>
+customElements.define("scroll-box", class extends HTMLElement {{
+  constructor() {{
+    super();
+    this.attachShadow({{ mode: "open" }}).innerHTML =
+      '<div style="height:40px;overflow:auto"><div style="height:80px"></div><slot></slot></div>';
+  }}
+}});
+</script></head><body><form id="prefs">
+<label><input type="checkbox" id="remember" name="remember" style="{_VISUALLY_HIDDEN}">Remember me</label>
+<div style="height:20px;overflow:hidden"><input id="clipped" name="clipped" style="margin-top:40px"></div>
+<scroll-box><label><input type="checkbox" id="slotted" name="slotted" style="{_VISUALLY_HIDDEN}">Slotted</label>
+</scroll-box>
+<div style="position:relative;width:200px;height:40px;overflow:auto;border-right:40px solid #ccc">
+<label style="position:absolute;left:215px;top:5px"><input type="checkbox" id="under-border" name="under-border"
+ style="{_VISUALLY_HIDDEN}">Under border</label></div>
+<div style="height:1500px"></div>
+<label><input type="checkbox" id="scrolled-to" name="scrolled-to" style="{_VISUALLY_HIDDEN}">Scrolled to</label>
+<div style="height:1500px"></div>
+</form></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interaction", "reaches_other_element"),
+    [(None, ["remember"]), ("scroll", ["scrolled-to"]), ("throw", [])],
+    ids=["hit_tested", "page_scrolled", "hit_test_throws"],
+)
+async def test_a_control_hit_testing_skips_reads_as_covered_unless_an_ancestor_clips_it(
+    interaction: str | None, reaches_other_element: list[str]
+) -> None:
+    url = "https://test.example.com/preferences"
+
+    async def interact(page: Page) -> None:
+        if interaction == "scroll":
+            await page.evaluate("() => window.scrollTo(0, 1500)")
+        if interaction == "throw":
+            await page.evaluate("() => { document.elementsFromPoint = () => { throw new Error('no hit test'); }; }")
+
+    raw, _ = await _capture_live_dom(url, _HIT_TEST_EDGE_PAGE, "#remember", interact=interact)
+    structured = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+
+    assert structured is not None
+    fields = structured["forms"][0]["fields"]
+    assert {field["id"]: field["pointer_at_center"] for field in fields} == {
+        field_id: "reaches_other_element" if field_id in reaches_other_element else "not_measured"
+        for field_id in ("remember", "clipped", "slotted", "under-border", "scrolled-to")
+    }
+    assert [field["id"] for field in fields if "element_at_center" in field] == reaches_other_element
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_rendered_snapshot_skips_hit_testing_for_non_viewport_fixed_layers() -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -4666,13 +4694,15 @@ async def test_structured_extractor_emits_reveal_shape_relation_on_live_dom() ->
         ("", "Billing period: Mar 1 - Mar 31, 2026", 2),
     ]
     assert all(relation["value_text"] != "Amount due: $9,999.99" for relation in structured["key_value_relations"])
-    # Uniqueness of a text anchor and a node's role are live-DOM observations, so the static parse
-    # reports the relation without them rather than guessing.
+    # A node's role is a live-DOM observation, and each producer verifies its candidates against its own DOM.
     live_only = {"selector_candidates", "identity"}
     assert [
         {key: value for key, value in relation.items() if key not in live_only}
         for relation in structured["key_value_relations"]
-    ] == html_parsed["key_value_relations"]
+    ] == [
+        {key: value for key, value in relation.items() if key not in live_only}
+        for relation in html_parsed["key_value_relations"]
+    ]
     assert has_witnessed_value_content(structured) is True
 
 
@@ -5069,7 +5099,9 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     raw = server.results[0]
     assert len(raw) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
     compaction = json.loads(raw)["size_compaction"]
-    assert compaction["original_char_count"] == len(expected_raw)
+    # Counted after pointer states and visible counts are dropped, as the packet would have been without them.
+    without_them = re.sub(r',"(pointer_at_center":"[a-z_]+"|visible_match_count":\d+)', "", expected_raw)
+    assert compaction["original_char_count"] == len(without_them)
     assert compaction["omissions"][0] == {
         "category": "visible_text_excerpt",
         "omitted_count": len(expected_payload["visible_text_excerpt"]),
@@ -5078,6 +5110,237 @@ async def test_capture_reports_python_character_counts_for_compacted_astral_pack
     assert error is None
     assert evidence is not None
     assert evidence["size_compaction"] == compaction
+
+
+def _full_forms_under_a_page_wide_layer_html(
+    form_count: int = 5, chrome_count: int = 40, placeholder_chars: int = 0
+) -> str:
+    style = (
+        "body{margin:2px;font:8px sans-serif}input{width:44px;height:10px;font:8px sans-serif;margin:0}"
+        "label{display:inline-block;width:38px;overflow:hidden;white-space:nowrap}"
+        "a,button{font:8px sans-serif;margin:0 2px;padding:0}"
+        ".layer{position:fixed;left:0;top:0;right:0;bottom:0;z-index:1000;background:rgba(0,0,0,.4)}"
+    )
+    links = "".join(f'<a class="nav-link" href="/section/{index}">Section {index}</a>' for index in range(chrome_count))
+    actions = "".join(f'<button type="button" class="action">Action {index}</button>' for index in range(chrome_count))
+    forms = "".join(
+        f'<form id="form-{form_index}" action="/submit/{form_index}" method="post">'
+        + "".join(
+            f'<label for="f{form_index}-{field_index}">Field {form_index} {field_index}</label>'
+            f'<input id="f{form_index}-{field_index}" name="form{form_index}_field{field_index}" '
+            f'class="field-input" placeholder="Value {field_index}{"." * placeholder_chars}">'
+            for field_index in range(20)
+        )
+        + f'<button type="submit" class="submit-btn">Submit {form_index}</button></form>'
+        for form_index in range(form_count)
+    )
+    return (
+        f"<html><head><title>Full forms under a layer</title><style>{style}</style></head><body>"
+        f"<nav>{links}</nav><div>{actions}</div>{forms}"
+        '<div id="notice" class="layer" role="dialog" aria-label="Notice">'
+        '<button type="button" id="notice-close">Close</button></div></body></html>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placeholder_chars", [0, 200], ids=["fits", "over_the_bound"])
+async def test_capture_over_its_bound_drops_pointer_states_and_visible_counts_before_a_page_fact(
+    placeholder_chars: int,
+) -> None:
+    unbounded_expression = COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION.replace(
+        "return boundedStructuredEvidence(structuredEvidence);",
+        "return JSON.stringify(structuredEvidence);",
+    )
+    html = _full_forms_under_a_page_wide_layer_html(placeholder_chars=placeholder_chars).replace(
+        "<nav>", '<button type="submit" class="submit-btn" hidden>Submit</button><nav>'
+    )
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
+        try:
+            page = await browser.new_page()
+            await page.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
+            await page.goto("https://example.com/forms")
+            unbounded = json.loads(await page.evaluate(unbounded_expression))
+            bounded = json.loads(await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION))
+        finally:
+            await browser.close()
+
+    without_them = without_authoring_facts(unbounded)
+    assert len(json.dumps(without_them, separators=(",", ":"))) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+    controls = [control for form in unbounded["forms"] for control in [*form["fields"], *form["submit_controls"]]]
+    assert all("pointer_at_center" in control and "element_at_center" in control for control in controls)
+    assert all(
+        "visible_match_count" in candidate for control in controls for candidate in control["selector_candidates"]
+    )
+    assert any(
+        candidate.get("first_match_visible") is False
+        for control in controls
+        for candidate in control["selector_candidates"]
+    )
+    over_the_bound = len(json.dumps(unbounded, separators=(",", ":"))) > COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+
+    assert bounded == (without_them if over_the_bound else unbounded)
+    assert over_the_bound == bool(placeholder_chars)
+    parsed = parse_composition_structured(
+        bounded, inspected_url="https://example.com/forms", current_url="https://example.com/forms"
+    )
+    assert parsed is not None
+    assert all(parsed[key] for key in ("modal_overlays", "page_obstructions", "clickable_controls"))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("form_count", [2, 3], ids=["fits", "over_the_bound"])
+async def test_inspect_result_over_the_model_bound_is_the_packet_without_authoring_facts(form_count: int) -> None:
+    url = "https://example.com/forms"
+    raw, _ = await _capture_live_dom(
+        url, _full_forms_under_a_page_wide_layer_html(form_count=form_count, chrome_count=2), "#notice"
+    )
+    parsed = parse_composition_structured(json.loads(raw), inspected_url=url, current_url=url)
+    assert parsed is not None
+    stored = json.dumps(parsed)
+    with_them = model_visible_composition_evidence(parsed, authoring_facts=True)
+    without_them = model_visible_composition_evidence(parsed)
+    page_state = {"read": "ok", "url": url + "/" + "p" * 1975, "title": "T" * 240, "challenge_vendor": None}
+
+    def model_facing(data: dict[str, Any]) -> str:
+        return json.dumps({"page_state": page_state, "ok": True, "data": data})
+
+    assert with_them != without_them and len(model_facing(without_them)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+    over_the_bound = len(model_facing(with_them)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert over_the_bound == (form_count == 3)
+
+    data = _model_facing_inspect_result({"ok": True, "data": parsed})["data"]
+
+    assert json.dumps(parsed) == stored
+    assert data == (without_them if over_the_bound else with_them)
+    head = model_facing(data)[:_RECENT_TOOL_OUTPUT_CHAR_CAP]
+    for key in ("modal_overlays", "page_obstructions", "clickable_controls"):
+        assert data[key] and json.dumps({key: data[key]})[1:-1] in head
+
+
+@pytest.mark.parametrize("reader", ["inspect_result", "post_run_result"])
+@pytest.mark.parametrize(
+    ("relation_first_match_visible", "fitting", "expected"),
+    [
+        (False, "projected", "projected"),
+        (False, "read_counts", "read_counts"),
+        (False, "without_counts", "without_counts"),
+        (False, "nothing", "read_counts"),
+        (True, "read_counts", "without_counts"),
+        (True, "nothing", "without_counts"),
+    ],
+)
+def test_size_fallback_keeps_counts_only_on_a_value_relation_whose_first_match_is_hidden(
+    reader: str, relation_first_match_visible: bool, fitting: str, expected: str
+) -> None:
+    relation_candidate = {
+        "selector": "span.stat",
+        "source": "class",
+        "match_count": 4,
+        "visible_match_count": 2,
+        "first_match_visible": relation_first_match_visible,
+    }
+    # A hidden-first candidate unrelated to the read, such as a responsive nav copy, must not keep counts.
+    field_candidate = {
+        "selector": "input.nav",
+        "source": "class",
+        "match_count": 2,
+        "visible_match_count": 1,
+        "first_match_visible": False,
+    }
+    evidence = {
+        "page_title": "Stats",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "id": f"f{index}",
+                        "type": "text",
+                        "selector_candidates": [field_candidate],
+                        "pointer_at_center": "reaches_other_element",
+                        "element_at_center": {"tag": "div", "label_context": "Promo banner"},
+                    }
+                    for index in range(100)
+                ]
+            }
+        ],
+        "key_value_relations": [{"value_text": "23.2k", "selector_candidates": [relation_candidate] * 40}],
+    }
+    bare_fields = [
+        {"id": f"f{index}", "type": "text", "selector_candidates": [{"selector": "input.nav", "source": "class"}]}
+        for index in range(100)
+    ]
+    tiers = {
+        "projected": evidence,
+        "read_counts": {
+            "page_title": "Stats",
+            "forms": [{"fields": bare_fields}],
+            "key_value_relations": [{"value_text": "23.2k", "selector_candidates": [relation_candidate] * 40}],
+        },
+        "without_counts": {
+            "page_title": "Stats",
+            "forms": [{"fields": bare_fields}],
+            "key_value_relations": [
+                {"value_text": "23.2k", "selector_candidates": [{"selector": "span.stat", "source": "class"}] * 40}
+            ],
+        },
+    }
+
+    def result(packet: dict[str, Any], padding: int) -> dict[str, Any]:
+        padded = {**packet, "visible_text_excerpt": "x" * padding}
+        if reader == "inspect_result":
+            return {"ok": True, "data": padded}
+        return {"ok": True, "data": {"workflow_run_id": "wr_1", "blocks": [], "post_run_page_evidence": padded}}
+
+    bound = _RECENT_TOOL_OUTPUT_CHAR_CAP - (_PAGE_STATE_RESERVE_CHARS if reader == "inspect_result" else 0)
+    padding = bound if fitting == "nothing" else bound - len(json.dumps(result(tiers[fitting], 0)))
+    captured = result(evidence, padding)
+
+    shaped = (
+        _model_facing_inspect_result(captured)
+        if reader == "inspect_result"
+        else sanitize_tool_result_for_llm("run_blocks_and_collect_debug", captured)
+    )
+
+    packet = shaped["data"] if reader == "inspect_result" else shaped["data"]["post_run_page_evidence"]
+    assert {key: value for key, value in packet.items() if key != "visible_text_excerpt"} == tiers[expected]
+
+
+def test_inspect_result_with_authoring_facts_fits_the_largest_page_state_stamp() -> None:
+    largest_stamp = {
+        "read": "ok",
+        "url": "\U0001f600" * 200,
+        "title": "\U0001f600" * 240,
+        "challenge_vendor": "challenges.cloudflare",
+    }
+    shared = {"selector": "button.row", "source": "class", "match_count": 40, "visible_match_count": 20}
+    fields = [
+        {"id": f"f{index}", "type": "text", "pointer_at_center": "reaches_control", "selector_candidates": [shared]}
+        for index in range(25)
+    ]
+
+    def evidence(padding: int) -> dict[str, Any]:
+        return {"page_title": "Rows", "forms": [{"fields": fields}], "visible_text_excerpt": "x" * padding}
+
+    def stamped(result: dict[str, Any]) -> int:
+        return len(json.dumps({"page_state": largest_stamp, **result}))
+
+    unpadded = len(
+        json.dumps({"ok": True, "data": model_visible_composition_evidence(evidence(0), authoring_facts=True)})
+    )
+    data = evidence(46_000 - unpadded)
+    with_them = {"ok": True, "data": model_visible_composition_evidence(data, authoring_facts=True)}
+    without_them = {"ok": True, "data": model_visible_composition_evidence(data)}
+    # Main's packet fits with the stamp; the authoring packet is under the old 47,500 threshold but does not.
+    assert stamped(without_them) <= _RECENT_TOOL_OUTPUT_CHAR_CAP < stamped(with_them)
+    assert len(json.dumps(with_them)) < _RECENT_TOOL_OUTPUT_CHAR_CAP - 2_500
+
+    assert stamped(_model_facing_inspect_result({"ok": True, "data": data})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
 
 
 @pytest.mark.asyncio
@@ -6163,10 +6426,9 @@ def test_structured_preserves_typed_selector_candidates_and_identity_on_every_ca
     assert relation["identity"]["label_context"] == "Visitors"
 
 
-def test_structured_element_address_packets_withdraw_candidate_counts_after_neutral_ablation() -> None:
+def test_structured_element_address_packets_carry_candidate_counts_only_for_an_author() -> None:
     payload = _typed_candidate_payload()
     for carrier in (
-        payload["forms"][0]["fields"][0],
         payload["forms"][0]["submit_controls"][0],
         payload["navigation_targets"][0],
         payload["result_containers"][0],
@@ -6175,8 +6437,13 @@ def test_structured_element_address_packets_withdraw_candidate_counts_after_neut
         payload["modal_overlays"][0],
     ):
         carrier["selector_match_count"] = 1
-        for index, candidate in enumerate(carrier["selector_candidates"]):
-            candidate["match_count"] = index + 1
+        for candidate in carrier["selector_candidates"]:
+            candidate.update(match_count=2, visible_match_count=1)
+    payload["forms"][0]["fields"][0]["selector_candidates"][0].update(match_count=1, visible_match_count=1)
+    for candidate in payload["navigation_targets"][0]["selector_candidates"]:
+        del candidate["visible_match_count"]
+    for candidate in payload["clickable_controls"][0]["selector_candidates"]:
+        candidate["visible_match_count"] = 3
 
     parsed = parse_composition_structured(
         payload,
@@ -6185,28 +6452,51 @@ def test_structured_element_address_packets_withdraw_candidate_counts_after_neut
     )
 
     assert parsed is not None
-    model_visible = model_visible_composition_evidence(parsed)
-    carriers = [
-        model_visible["forms"][0]["fields"][0],
-        model_visible["forms"][0]["submit_controls"][0],
-        model_visible["navigation_targets"][0],
-        model_visible["result_containers"][0],
-        model_visible["clickable_controls"][0],
-        model_visible["challenge_controls"][0],
-        model_visible["modal_overlays"][0],
-        model_visible["key_value_relations"][0],
-    ]
-    for carrier in carriers:
-        assert "selector" not in carrier
-        assert "selector_match_count" not in carrier
-        assert "container_selector" not in carrier
-        assert "container_match_count" not in carrier
-        assert all(set(candidate) == {"selector", "source"} for candidate in carrier["selector_candidates"])
+
+    def counts(*carriers: dict[str, Any]) -> list[dict[str, Any]]:
+        carried = [
+            {key: value for key, value in candidate.items() if key not in {"selector", "source"}}
+            for carrier in carriers
+            for candidate in carrier["selector_candidates"]
+        ]
+        assert carried
+        return carried
+
+    for authoring_facts in (False, True):
+        model_visible = model_visible_composition_evidence(parsed, authoring_facts=authoring_facts)
+        shared_with_a_hidden_match = [
+            model_visible["forms"][0]["submit_controls"][0],
+            model_visible["result_containers"][0],
+            model_visible["challenge_controls"][0],
+            model_visible["modal_overlays"][0],
+        ]
+        unique = model_visible["forms"][0]["fields"][0]
+        visibility_not_measured = [
+            model_visible["key_value_relations"][0],
+            model_visible["navigation_targets"][0],
+            model_visible["clickable_controls"][0],
+        ]
+        for carrier in [*shared_with_a_hidden_match, unique, *visibility_not_measured]:
+            assert "selector" not in carrier
+            assert "selector_match_count" not in carrier
+            assert "container_selector" not in carrier
+            assert "container_match_count" not in carrier
+        if not authoring_facts:
+            assert not any(counts(*shared_with_a_hidden_match, unique, *visibility_not_measured))
+            continue
+        assert all(
+            carried == {"match_count": 2, "visible_match_count": 1} for carried in counts(*shared_with_a_hidden_match)
+        )
+        assert counts(unique) == [{}]
+        # A total with no measured visible count would read as every match being visible, so none is shown.
+        assert not any(counts(*visibility_not_measured))
 
 
 def test_model_facing_inspect_projection_preserves_internal_selector_custody() -> None:
+    payload = _typed_candidate_payload()
+    payload["navigation_targets"][0]["selector_candidates"][0]["match_count"] = 1
     parsed = parse_composition_structured(
-        _typed_candidate_payload(),
+        payload,
         inspected_url="https://example.com/web",
         current_url="https://example.com/web",
     )
@@ -6223,7 +6513,7 @@ def test_model_facing_inspect_projection_preserves_internal_selector_custody() -
     ]
 
 
-def test_live_html_relations_withdraw_singular_selector_aliases_without_candidates() -> None:
+def test_live_html_relations_withdraw_singular_selector_aliases() -> None:
     metric = parse_composition_html(
         _METRIC_DASHBOARD_HTML,
         inspected_url="https://example.test/web",
@@ -6238,9 +6528,9 @@ def test_live_html_relations_withdraw_singular_selector_aliases_without_candidat
 
     stored_metric = next(relation for relation in metric["key_value_relations"] if relation["key_text"] == "Visitors")
     stored_nested = next(relation for relation in nested["key_value_relations"] if relation["key_text"] == "Visitors")
-    assert "selector_candidates" not in stored_metric
+    assert stored_metric["selector_candidates"]
     assert stored_metric["container_selector"]
-    assert "selector_candidates" not in stored_nested
+    assert stored_nested["selector_candidates"]
     assert stored_nested["container_selector"]
     assert stored_nested["label_selector"]
 
@@ -6282,6 +6572,30 @@ def test_live_html_table_withdraws_server_derived_row_and_expand_selectors() -> 
         {"selector": candidate["selector"], "source": candidate["source"]}
         for candidate in stored["selector_candidates"]
     ]
+
+
+def test_structured_form_keeps_only_a_known_pointer_at_center_state_and_only_for_an_author() -> None:
+    payload = _typed_candidate_payload()
+    cover = {"tag": "DIV", "role": "dialog", "label_context": "Cookie preferences " + "x" * 200}
+    payload["forms"][0]["fields"][0].update(pointer_at_center="reaches_other_element", element_at_center=cover)
+    payload["forms"][0]["submit_controls"][0].update(pointer_at_center="definitely_clickable", element_at_center=cover)
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/web", current_url="https://example.com/web"
+    )
+
+    assert parsed is not None
+    form = model_visible_composition_evidence(parsed, authoring_facts=True)["forms"][0]
+    assert form["fields"][0]["pointer_at_center"] == "reaches_other_element"
+    assert form["fields"][0]["element_at_center"] == {
+        "tag": "div",
+        "role": "dialog",
+        "label_context": ("Cookie preferences " + "x" * 200)[:120],
+    }
+    assert "pointer_at_center" not in form["submit_controls"][0]
+    assert "element_at_center" not in form["submit_controls"][0]
+    default_field = model_visible_composition_evidence(parsed)["forms"][0]["fields"][0]
+    assert "pointer_at_center" not in default_field and "element_at_center" not in default_field
 
 
 def test_structured_element_address_never_falls_back_to_a_singular_selector() -> None:
@@ -7306,7 +7620,7 @@ def test_composition_gate_falls_back_to_observed_page_for_a_stale_ref_on_an_unre
         block_observation_refs={"search_product": 99},
     )
 
-    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+    assert composition_page_evidence_missing(ctx, workflow_yaml) is False
 
 
 def test_merge_visual_composition_evidence_keeps_only_typed_requested_value_pairs() -> None:
@@ -7341,3 +7655,131 @@ def test_unresolved_requested_targets_ignores_case_and_invisible_relations() -> 
     }
 
     assert unresolved_requested_targets(evidence, ("Sessions Started", "Failure rate", "  ")) == ("Failure rate",)
+
+
+_TWO_PANEL_CARD = (
+    '<div class="panel"><span class="lbl">Visitors</span><span class="delta">+78.0%</span>'
+    '<span class="val">{total}</span><span class="prior">vs. 5.74K prior.</span></div>'
+)
+_TWO_PANEL_ROW_CARD = (
+    '<div class="panel"><span class="lbl">Visitors</span>'
+    '<div class="row"><span class="val">{total}</span><span class="delta">+78.0%</span></div></div>'
+)
+_TWO_PANEL_TABLE = (
+    '<div class="panel"><table><thead><tr><th>Path</th><th>{header}</th><th>Views</th></tr></thead>'
+    "<tbody><tr><td>/</td><td>6,621</td><td>8,259</td></tr></tbody></table></div>"
+)
+
+
+async def _emitted_label_anchors(page: Page, html: str, total: str) -> dict[str, list[str]]:
+    """The label-anchored candidates each emitter produces for the Visitors total: page capture, HTML parse, probe."""
+    await page.set_content(html)
+    raw = await page.evaluate(composition_structured_evidence_expression(("Visitors",)))
+    live = parse_composition_structured(json.loads(raw), inspected_url="about:blank", current_url="about:blank")
+    probe = await page.evaluate(value_designation_probe_expression(total, "Visitors"))
+    parsed = parse_composition_html(
+        html, inspected_url="about:blank", current_url="about:blank", requested_targets=("Visitors",)
+    )
+    assert live is not None
+    return {
+        "live": [
+            candidate["selector"]
+            for relation in live["key_value_relations"]
+            if relation["key_text"] == "Visitors"
+            for candidate in relation["selector_candidates"]
+            if ":text-is(" in candidate["selector"]
+        ],
+        "parsed": [
+            candidate["selector"]
+            for relation in parsed["key_value_relations"]
+            if relation["key_text"] == "Visitors"
+            for candidate in relation["selector_candidates"]
+            if ":text-is(" in candidate["selector"]
+        ],
+        "probe": [
+            candidate["selector"] for candidate in probe["selector_candidates"] if ":text-is(" in candidate["selector"]
+        ],
+    }
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("panels", "total", "label_shape"),
+    [
+        (_TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header="Visitors"), "10.2K", "span"),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_CARD.format(total="11.3K"), "11.3K", "span"),
+        (_TWO_PANEL_TABLE.format(header="Visitors") + _TWO_PANEL_ROW_CARD.format(total="11.3K"), "11.3K", "span"),
+        (
+            _TWO_PANEL_CARD.format(total="10.2K") + _TWO_PANEL_TABLE.format(header='<span class="lbl">Visitors</span>'),
+            "10.2K",
+            None,
+        ),
+        (
+            _TWO_PANEL_CARD.format(total="10.2K")
+            + _TWO_PANEL_TABLE.format(header='<span class="legend">Visitors</span>'),
+            "10.2K",
+            "span.lbl",
+        ),
+    ],
+    ids=["original", "reordered", "row_with_delta", "header_shares_label_shape", "header_shares_label_tag"],
+)
+async def test_label_anchor_names_the_panel_whose_label_a_same_class_panel_repeats(
+    panels: str, total: str, label_shape: str | None
+) -> None:
+    html = f"<html><head><style>th{{text-transform:uppercase}}</style></head><body><main>{panels}</main></body></html>"
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            emitted = await _emitted_label_anchors(page, html, total)
+            resolved = {
+                selector: (await page.locator(selector).count(), await page.locator(selector).first.inner_text())
+                for selectors in emitted.values()
+                for selector in selectors
+            }
+        finally:
+            await browser.close()
+
+    for selector, (count, text) in resolved.items():
+        assert count == 1, f"{selector} resolves to {count} elements"
+        assert total in text and "6,621" not in text, f"{selector} resolves to {text!r}"
+    if label_shape:
+        assert len(emitted["live"]) == 1 and emitted["parsed"] == emitted["live"], emitted
+        assert emitted["live"][0].startswith(f'div.panel:has({label_shape}:text-is("Visitors"))'), emitted
+        assert len(emitted["probe"]) == 1, emitted
+    else:
+        assert emitted["live"] == [] and emitted["parsed"] == [], emitted
+
+
+_DRIFT_CARD = (
+    '<div class="card"><div class="{classes}">Visitors</div><div class="text-2xl font-bold">{total}</div></div>'
+)
+_DRIFT_TABLE = '<div class="card"><table><thead><tr><th>Region</th><th>Visitors</th></tr></thead></table></div>'
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_label_anchor_resolves_after_the_label_class_set_changes() -> None:
+    def dashboard(classes: str) -> str:
+        cards = _DRIFT_CARD.format(classes=classes, total="10.2K") + _DRIFT_TABLE
+        return f"<html><body><main>{cards}</main></body></html>"
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            emitted = await _emitted_label_anchors(page, dashboard("text-sm font-medium"), "10.2K")
+            await page.set_content(dashboard("text-sm font-semibold"))
+            resolved = {
+                selector: (await page.locator(selector).count(), await page.locator(selector).first.inner_text())
+                for selectors in emitted.values()
+                for selector in selectors
+            }
+        finally:
+            await browser.close()
+
+    assert len(emitted["live"]) == 1 and emitted["parsed"] == emitted["live"], emitted
+    assert len(emitted["probe"]) == 1, emitted
+    for selector, (count, text) in resolved.items():
+        assert count == 1 and "10.2K" in text, f"{selector} resolves to {count} elements reading {text!r}"

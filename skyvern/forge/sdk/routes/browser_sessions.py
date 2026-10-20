@@ -3,6 +3,7 @@ import base64
 import binascii
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import structlog
 from fastapi import Depends, HTTPException, Path, Query, Request, status
@@ -10,9 +11,16 @@ from fastapi.responses import ORJSONResponse
 from pydantic import ValidationError
 
 from skyvern import analytics
-from skyvern.exceptions import BrowserSessionExtensionUnconfirmed, BrowserSessionNotExtendable
+from skyvern.exceptions import (
+    TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE,
+    BrowserSessionExtensionUnconfirmed,
+    BrowserSessionNotExtendable,
+    ExternalBrowserUnavailable,
+)
 from skyvern.forge import app
+from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAME
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
@@ -27,8 +35,15 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    API_BROWSER_SESSION_CREATED_BY,
+    PersistentBrowserSession,
+    PersistentBrowserSessionStatus,
+    is_external_cdp_session,
+    is_final_status,
+)
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
     ACTION_LOG_DEFAULT_PAGE_SIZE,
@@ -40,6 +55,8 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_session_metadata import BrowserSessionMetadata, BrowserSessionWorkflowMetadata
 from skyvern.schemas.browser_session_timeouts import (
     MAX_EXTENDED_TIMEOUT,
     MAX_TIMEOUT,
@@ -52,13 +69,25 @@ from skyvern.schemas.browser_sessions import (
     ExtendBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
     ProcessBrowserSessionRecordingResponse,
+    RegisterExternalBrowserSessionRequest,
     UpdateBrowserSessionRequest,
 )
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.services.browser_recording.session_registry import interpretation_registry
+from skyvern.webeye.external_cdp_sessions import (
+    close_expired_external_cdp_sessions,
+    connect_external_cdp_browser,
+    seal_cdp_url,
+)
 from skyvern.webeye.schemas import BrowserSessionResponse
 
 LOG = structlog.get_logger(__name__)
+
+MAX_OPEN_EXTERNAL_BROWSER_SESSIONS = 5
+MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE = 10
+# ponytail: a per-process bound on in-flight registration probes; a shared limiter if API pods cannot each absorb 4.
+_REGISTRATION_PROBES = asyncio.Semaphore(4)
 
 _ACTION_LOG_MAX_PAST_AGE = timedelta(days=7)
 _ACTION_LOG_MAX_FUTURE_SKEW = timedelta(minutes=5)
@@ -67,6 +96,54 @@ _ACTION_LOG_MAX_CURSOR_LENGTH = 256
 
 def _browser_session_not_found() -> HTTPException:
     return HTTPException(status_code=404, detail={"code": "browser_session_not_found"})
+
+
+async def _filter_credential_inaccessible_sessions(
+    sessions: list[PersistentBrowserSession], organization_id: str
+) -> list[PersistentBrowserSession]:
+    if not sessions:
+        return []
+    principal = get_request_principal()
+    profile_ids = {session.browser_profile_id for session in sessions if session.browser_profile_id}
+    try:
+        profile_accessible_ids = {session.persistent_browser_session_id for session in sessions}
+        if principal is None:
+            profile_accessible_ids = {
+                session.persistent_browser_session_id for session in sessions if not session.browser_profile_id
+            }
+        elif profile_ids and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id):
+            links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+                profile_ids, organization_id
+            )
+            credential_ids = {credential_id for links in links_by_profile.values() for credential_id, _ in links}
+            accessible_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+                principal, "credential.use", credential_ids
+            )
+            profile_accessible_ids = {
+                session.persistent_browser_session_id
+                for session in sessions
+                if not session.browser_profile_id
+                or {credential_id for credential_id, _ in links_by_profile.get(session.browser_profile_id, [])}
+                <= accessible_credential_ids
+            }
+        run_credential_accessible_ids = await app.AGENT_FUNCTION.accessible_browser_session_ids(
+            principal,
+            organization_id,
+            {session.persistent_browser_session_id for session in sessions},
+        )
+    except Exception:
+        LOG.warning(
+            "Browser session credential authorization failed; denying",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return []
+    return [
+        session
+        for session in sessions
+        if session.persistent_browser_session_id in profile_accessible_ids
+        and session.persistent_browser_session_id in run_credential_accessible_ids
+    ]
 
 
 async def _read_action_log_body(request: Request) -> bytes:
@@ -139,6 +216,7 @@ async def get_browser_sessions_all(
         page=page,
         page_size=page_size,
     )
+    browser_sessions = await _filter_credential_inaccessible_sessions(browser_sessions, current_org.organization_id)
 
     responses = await asyncio.gather(
         *[
@@ -148,6 +226,37 @@ async def get_browser_sessions_all(
     )
 
     return responses
+
+
+@base_router.get(
+    "/browser_sessions/{session_id}/metadata", response_model=BrowserSessionMetadata, include_in_schema=False
+)
+async def get_browser_session_metadata(
+    session_id: str = Path(..., pattern=r"^pbs_[0-9]{1,20}$"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionMetadata:
+    """Read stored metadata without reconciling or contacting browser infrastructure."""
+    session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        session_id, current_org.organization_id
+    )
+    if session is None:
+        raise _browser_session_not_found()
+    session_status = session.status
+    if session_status is None:
+        raise HTTPException(status_code=503, detail={"code": "browser_session_metadata_unavailable"})
+    runs = await app.DATABASE.workflow_runs.get_workflow_metadata_for_browser_session(
+        session_id, current_org.organization_id
+    )
+    return BrowserSessionMetadata(
+        browser_session_id=session.persistent_browser_session_id,
+        organization_id=session.organization_id,
+        status=PersistentBrowserSessionStatus(session_status),
+        created_at=session.created_at,
+        completed_at=session.completed_at,
+        runnable_id=session.runnable_id,
+        associated_workflow_runs=[BrowserSessionWorkflowMetadata.model_validate(run) for run in runs[:100]],
+        association_index_complete=len(runs) <= 100,
+    )
 
 
 @base_router.post(
@@ -172,6 +281,22 @@ async def get_browser_sessions_all(
         400: {"description": "Invalid request"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
         404: {"description": "Browser profile not found"},
+        429: {
+            "description": "Too many browser sessions are starting for this organization at once. "
+            "Retry after the number of seconds in the Retry-After header.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail", "error_code"],
+                        "properties": {
+                            "detail": {"type": "string"},
+                            "error_code": {"type": "string", "enum": [TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE]},
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.post(
@@ -182,6 +307,7 @@ async def get_browser_sessions_all(
 async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> BrowserSessionResponse:
     timeout_minutes = browser_session_request.timeout
     timeout_warning: str | None = None
@@ -222,21 +348,100 @@ async def create_browser_session(
             detail="proxy_session_id is only supported with RESIDENTIAL_ISP proxy_location",
         )
 
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+    await app.AGENT_FUNCTION.validate_enterprise_feature_access(
         organization_id=current_org.organization_id,
-        url=browser_session_request.url,
-        timeout_minutes=timeout_minutes,
-        proxy_location=proxy_location,
-        proxy_session_id=proxy_session_id,
-        extensions=browser_session_request.extensions,
-        browser_type=browser_session_request.browser_type,
-        browser_profile_id=browser_session_request.browser_profile_id,
-        generate_browser_profile=browser_session_request.generate_browser_profile,
-        needs_live_view=browser_session_request.needs_live_view,
+        feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
     )
+    async with app.AGENT_FUNCTION.browser_session_create_admission(organization_id=current_org.organization_id):
+        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=current_org.organization_id,
+            url=browser_session_request.url,
+            timeout_minutes=timeout_minutes,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            extensions=browser_session_request.extensions,
+            browser_type=browser_session_request.browser_type,
+            browser_profile_id=browser_session_request.browser_profile_id,
+            generate_browser_profile=browser_session_request.generate_browser_profile,
+            needs_live_view=browser_session_request.needs_live_view,
+            created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+            session_kind=BrowserSessionKind.api,
+            browser_settings=browser_session_request.browser_settings,
+        )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
     return response
+
+
+@base_router.post(
+    "/browser_sessions/external",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+@base_router.post(
+    "/browser_sessions/external/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def register_external_browser_session(
+    request: RegisterExternalBrowserSessionRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    organization_id = current_org.organization_id
+    browser_sessions = app.DATABASE.browser_sessions
+    try:
+        sealed_cdp_url = await seal_cdp_url(request.cdp_url)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registering an external browser needs encryption enabled on this deployment (ENABLE_ENCRYPTION).",
+        )
+    if _REGISTRATION_PROBES.locked():
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many external browser registrations are in progress. Retry shortly.",
+        )
+    async with _REGISTRATION_PROBES:
+        # Not every deployment runs a reaper, so expired registrations are closed here rather than counted.
+        await close_expired_external_cdp_sessions(browser_sessions, organization_id)
+        reserved = await browser_sessions.reserve_external_cdp_session(
+            organization_id,
+            request.timeout,
+            max_open=MAX_OPEN_EXTERNAL_BROWSER_SESSIONS,
+            max_attempts_per_minute=MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE,
+        )
+        if reserved is None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"An organization can hold {MAX_OPEN_EXTERNAL_BROWSER_SESSIONS} external browser registrations "
+                f"at once and attempt {MAX_EXTERNAL_REGISTRATION_ATTEMPTS_PER_MINUTE} per minute. Close one or wait, "
+                "then retry.",
+            )
+        session_id = reserved.persistent_browser_session_id
+        try:
+            probe = await connect_external_cdp_browser(request.cdp_url)
+            try:
+                await probe.close()
+            except Exception as error:
+                # A peer the probe cannot detach from would strand a driver on every later attach too.
+                LOG.warning("Failed to detach the registration probe", error_type=type(error).__name__)
+                raise ExternalBrowserUnavailable("connection failed") from None
+        except Exception:
+            await browser_sessions.update_persistent_browser_session(
+                session_id, status="failed", organization_id=organization_id, completed_at=naive_utc_now()
+            )
+            raise
+    browser_session = await browser_sessions.update_persistent_browser_session(
+        session_id, status="running", organization_id=organization_id, upstream_cdp_url=sealed_cdp_url
+    )
+    LOG.info(
+        "Registered external CDP browser session",
+        browser_session_id=session_id,
+        organization_id=organization_id,
+        cdp_host=urlparse(request.cdp_url).hostname,
+        timeout_minutes=request.timeout,
+    )
+    return await BrowserSessionResponse.from_browser_session(browser_session)
 
 
 @base_router.post(
@@ -273,13 +478,16 @@ async def close_browser_session(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # A plain row read: close_session's own signal already handles a workflow that is gone, so the
+    # manager's reconciling read would only add a Temporal round trip to every close.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
+    if browser_session.completed_at is None:
+        await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
     return ORJSONResponse(
         content={"message": "Browser session closed"},
         status_code=200,
@@ -349,6 +557,11 @@ async def extend_browser_session(
         raise HTTPException(
             status_code=409,
             detail=f"Browser session {browser_session_id} has already ended and can no longer be extended.",
+        )
+    if is_external_cdp_session(existing):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Browser session {browser_session_id} is a registered external browser whose lifetime is fixed.",
         )
     try:
         extension = await app.PERSISTENT_SESSIONS_MANAGER.extend_session(
@@ -478,9 +691,11 @@ async def get_browser_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     analytics.capture("skyvern-oss-agent-browser-session-get")
+    # Polled every few seconds per live session; a dead runtime shows up on a later poll.
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
         browser_session_id,
         current_org.organization_id,
+        reconcile_in_background=True,
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
@@ -489,6 +704,7 @@ async def get_browser_session(
         app.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
+        concurrent_listings=True,
     )
 
 
@@ -557,10 +773,20 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
+    visible_ids = await app.DATABASE.browser_sessions.get_folder_visible_browser_session_ids(
+        current_org.organization_id,
+        [browser_session.persistent_browser_session_id for browser_session in browser_sessions],
+    )
+    visible_sessions = [
+        browser_session
+        for browser_session in browser_sessions
+        if browser_session.persistent_browser_session_id in visible_ids
+    ]
+    visible_sessions = await _filter_credential_inaccessible_sessions(visible_sessions, current_org.organization_id)
     return await asyncio.gather(
         *[
             BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
-            for browser_session in browser_sessions
+            for browser_session in visible_sessions
         ]
     )
 
@@ -583,7 +809,8 @@ async def create_browser_session_action_logs(
     events = [sanitize_action_log_event(event) for event in batch.events]
     _validate_action_log_timestamps(events)
 
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    # Ownership is all this needs (closed sessions still accept logs), so no runtime reconciliation.
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -610,7 +837,7 @@ async def get_browser_session_action_logs(
     page_size: int = Query(default=ACTION_LOG_DEFAULT_PAGE_SIZE, ge=1, le=ACTION_LOG_MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ActionLogPage:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+    browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
         browser_session_id,
         current_org.organization_id,
     )
@@ -673,17 +900,40 @@ async def process_recording(
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
 
+    # Record Browser now emits Code blocks exclusively. Reject processing before
+    # producing a workflow that this organization cannot execute.
+    await app.AGENT_FUNCTION.validate_code_block(current_org.organization_id)
+
+    recorded_actions = interpretation_registry.get_finalized_actions(
+        interpretation_session_id=recording_request.interpretation_session_id,
+        browser_session_id=browser_session_id,
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=recording_request.workflow_permanent_id,
+    )
+    if recorded_actions is None and recording_request.interpretation_session_id is not None:
+        # Done can reach this route while the websocket is still flushing its
+        # final snapshot. Join that stop task so a successful chunk fallback
+        # cannot leave a late finalized-action cache entry behind.
+        await interpretation_registry.stop_session(browser_session_id)
+        recorded_actions = interpretation_registry.get_finalized_actions(
+            interpretation_session_id=recording_request.interpretation_session_id,
+            browser_session_id=browser_session_id,
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=recording_request.workflow_permanent_id,
+        )
     blocks, parameters, recording_id, evidence = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
         organization_id=current_org.organization_id,
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
         workflow_permanent_id=recording_request.workflow_permanent_id,
         draft_steps=recording_request.draft_steps,
-        code_first=recording_request.code_first,
+        recorded_actions=recorded_actions,
         supports_credential_tokens=recording_request.supports_credential_tokens,
         recording_attempt_id=recording_request.recording_attempt_id,
         interpretation_session_id=recording_request.interpretation_session_id,
     )
+    if recorded_actions is not None:
+        interpretation_registry.discard_finalized_actions(recording_request.interpretation_session_id)
 
     return ProcessBrowserSessionRecordingResponse(
         recording_id=recording_id,

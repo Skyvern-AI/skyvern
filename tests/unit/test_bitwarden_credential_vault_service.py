@@ -30,6 +30,7 @@ def _credential() -> Credential:
         username="user_test",
         totp_type="none",
         totp_identifier=None,
+        has_totp_seed=False,
         card_last4=None,
         card_brand=None,
         secret_label=None,

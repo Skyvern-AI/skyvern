@@ -74,7 +74,9 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
 
-const flagState = vi.hoisted(() => ({ taggingEnabled: true as boolean }));
+const flagState = vi.hoisted(() => ({
+  taggingEnabled: true as boolean | undefined,
+}));
 
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: () => flagState.taggingEnabled,
@@ -270,6 +272,39 @@ describe("RunHistory tag filter control", () => {
 
     const lastCall = runsQueryCalls[runsQueryCalls.length - 1];
     expect(lastCall?.tags).toBeUndefined();
+  });
+
+  it("holds a ?tags= link while the tagging flag is pending, then loads it filtered", () => {
+    flagState.taggingEnabled = undefined;
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    function tagLinkWrapper({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/history?tags=adhoc"]}>
+            {children}
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+    }
+
+    const view = render(<RunHistory />, { wrapper: tagLinkWrapper });
+
+    // No unfiltered run list is requested or shown while the flag is pending.
+    expect(
+      runsQueryCalls.filter((call) => call.enabled !== false && !call.tags),
+    ).toEqual([]);
+    expect(screen.queryByText("My Run")).toBeNull();
+
+    flagState.taggingEnabled = true;
+    view.rerender(<RunHistory />);
+
+    const pageQueries = runsQueryCalls.filter((call) => call.page === 1);
+    const pageQuery = pageQueries[pageQueries.length - 1];
+    expect(pageQuery?.tags).toBe("adhoc");
+    expect(pageQuery?.enabled).toBe(true);
+    expect(screen.getByText("My Run")).toBeTruthy();
   });
 
   it("filters by a standalone label", () => {

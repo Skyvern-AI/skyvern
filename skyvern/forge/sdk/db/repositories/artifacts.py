@@ -4,14 +4,15 @@ import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, false, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.models import ActionModel, ArtifactModel
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.models import ActionModel, ArtifactModel, StepModel, TaskModel, WorkflowRunBlockModel
 from skyvern.forge.sdk.db.protocols import RunReader
 from skyvern.forge.sdk.db.utils import convert_to_artifact
 from skyvern.forge.sdk.trace import traced
@@ -51,6 +52,64 @@ def _session_download_filters(
         *_session_download_scope_filters(browser_session_id, organization_id, run_started_at),
         or_(ArtifactModel.run_id == run_id, ArtifactModel.run_id.is_(None)),
     ]
+
+
+def _download_attempt_scope_filter(
+    attempt_number: int,
+    attempt_started_at: datetime.datetime | None,
+) -> ColumnElement[bool]:
+    attributed_entity = or_(
+        ArtifactModel.task_id.is_not(None),
+        ArtifactModel.step_id.is_not(None),
+        ArtifactModel.workflow_run_block_id.is_not(None),
+    )
+    task_attempt = (
+        select(1)
+        .select_from(TaskModel)
+        .where(
+            TaskModel.task_id == ArtifactModel.task_id,
+            func.coalesce(TaskModel.attempt_number, 1) == attempt_number,
+        )
+        .exists()
+    )
+    step_attempt = (
+        select(1)
+        .select_from(StepModel)
+        .join(TaskModel, TaskModel.task_id == StepModel.task_id)
+        .where(
+            StepModel.step_id == ArtifactModel.step_id,
+            func.coalesce(TaskModel.attempt_number, 1) == attempt_number,
+        )
+        .exists()
+    )
+    block_attempt = (
+        select(1)
+        .select_from(WorkflowRunBlockModel)
+        .where(
+            WorkflowRunBlockModel.workflow_run_block_id == ArtifactModel.workflow_run_block_id,
+            func.coalesce(WorkflowRunBlockModel.attempt_number, 1) == attempt_number,
+        )
+        .exists()
+    )
+    run_level = (
+        false()
+        if attempt_started_at is None
+        else and_(~attributed_entity, ArtifactModel.created_at >= attempt_started_at)
+    )
+    touched_since_attempt = (
+        false()
+        if attempt_started_at is None
+        else func.coalesce(ArtifactModel.modified_at, ArtifactModel.created_at) >= attempt_started_at
+    )
+    return or_(
+        touched_since_attempt,
+        and_(
+            or_(ArtifactModel.task_id.is_not(None), ArtifactModel.step_id.is_not(None)),
+            or_(task_attempt, step_attempt),
+        ),
+        and_(ArtifactModel.workflow_run_block_id.is_not(None), block_attempt),
+        run_level,
+    )
 
 
 class ArtifactsRepository(BaseRepository):
@@ -105,16 +164,18 @@ class ArtifactsRepository(BaseRepository):
                 browser_session_id=browser_session_id,
             )
             session.add(new_artifact)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            artifact = convert_to_artifact(new_artifact, self.debug_enabled)
             await session.commit()
-            await session.refresh(new_artifact)
-            return convert_to_artifact(new_artifact, self.debug_enabled)
+            return artifact
 
     @db_operation("refresh_download_artifact_content")
     async def refresh_download_artifact_content(
         self,
         artifact_id: str,
         organization_id: str,
-        checksum: str,
+        checksum: str | None,
         file_size: int | None,
     ) -> None:
         # file_size is written unconditionally: a None (size unreadable) is more honest than a
@@ -127,7 +188,7 @@ class ArtifactsRepository(BaseRepository):
                     ArtifactModel.organization_id == organization_id,
                     ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
                 )
-                .values(checksum=checksum, file_size=file_size)
+                .values(checksum=checksum, file_size=file_size, modified_at=naive_utc_now())
             )
             await session.commit()
 
@@ -171,6 +232,8 @@ class ArtifactsRepository(BaseRepository):
         """
         Bulk create multiple artifacts in a single database transaction.
 
+        The commit expires the passed-in models, so read the returned Artifacts, not the models.
+
         Args:
             artifact_models: List of ArtifactModel instances to insert
 
@@ -182,13 +245,10 @@ class ArtifactsRepository(BaseRepository):
 
         async with self.Session() as session:
             session.add_all(artifact_models)
+            await session.flush()
+            artifacts = [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
             await session.commit()
-
-            # Refresh all artifacts to get their created_at and modified_at values
-            for artifact in artifact_models:
-                await session.refresh(artifact)
-
-            return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifact_models]
+            return artifacts
 
     @db_operation("get_artifacts_for_task_v2")
     async def get_artifacts_for_task_v2(
@@ -362,6 +422,7 @@ class ArtifactsRepository(BaseRepository):
         *,
         organization_id: str | None,
         artifact_type: ArtifactType | None = None,
+        artifact_types: list[ArtifactType] | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -377,6 +438,8 @@ class ArtifactsRepository(BaseRepository):
 
             if artifact_type is not None:
                 query = query.filter_by(artifact_type=artifact_type)
+            if artifact_types is not None:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
             if task_id is not None:
                 query = query.filter_by(task_id=task_id)
             if step_id is not None:
@@ -506,6 +569,35 @@ class ArtifactsRepository(BaseRepository):
                     .filter(ArtifactModel.run_id == run_id)
                     .filter(ArtifactModel.artifact_type == artifact_type)
                     .filter(ArtifactModel.organization_id == organization_id)
+                    .order_by(ArtifactModel.created_at)
+                )
+            ).all()
+            return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+
+    @db_operation("list_download_artifacts_for_attempt")
+    async def list_download_artifacts_for_attempt(
+        self,
+        run_id: str,
+        organization_id: str,
+        attempt_number: int,
+        attempt_started_at: datetime.datetime | None,
+    ) -> list[Artifact]:
+        """List DOWNLOAD artifacts attributable to one workflow-run attempt.
+
+        Task, step, and workflow-block artifacts use their stamped attempt number (with NULL
+        retaining the legacy attempt-one meaning). Artifacts without one of those attributions
+        are run-level rows and use the attempt start as their lower time bound.
+        """
+        async with self.Session() as session:
+            artifacts = (
+                await session.scalars(
+                    select(ArtifactModel)
+                    .where(
+                        ArtifactModel.run_id == run_id,
+                        ArtifactModel.organization_id == organization_id,
+                        ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+                        _download_attempt_scope_filter(attempt_number, attempt_started_at),
+                    )
                     .order_by(ArtifactModel.created_at)
                 )
             ).all()
@@ -648,16 +740,16 @@ class ArtifactsRepository(BaseRepository):
         browser_session_id: str,
         organization_id: str,
         run_started_at: datetime.datetime,
+        attempt_number: int | None = None,
     ) -> set[str]:
         """Ids of the session-scoped DOWNLOAD artifacts attributable to this run, both stamped and
         still-unbound in-window rows, so a grader reading before the claim is not short. Ids rather
         than a count because a caller combining this with a run-scoped read would double-count."""
+        filters = _session_download_filters(run_id, browser_session_id, organization_id, run_started_at)
+        if attempt_number is not None:
+            filters.append(_download_attempt_scope_filter(attempt_number, run_started_at))
         async with self.Session() as session:
-            result = await session.scalars(
-                select(ArtifactModel.artifact_id).where(
-                    *_session_download_filters(run_id, browser_session_id, organization_id, run_started_at)
-                )
-            )
+            result = await session.scalars(select(ArtifactModel.artifact_id).where(*filters))
             return set(result.all())
 
     @db_operation("delete_artifact_for_browser_session")
@@ -824,6 +916,8 @@ class ArtifactsRepository(BaseRepository):
     async def update_action_screenshot_artifact_id(
         self, *, organization_id: str, action_id: str, screenshot_artifact_id: str
     ) -> None:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the row is created before its screenshot id exists.
         async with self.Session() as session:
             await session.execute(
                 update(ActionModel)

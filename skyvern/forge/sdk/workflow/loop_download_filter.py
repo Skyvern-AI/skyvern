@@ -1,5 +1,6 @@
 import urllib.parse
 from collections import Counter
+from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
 
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -31,6 +32,8 @@ def to_downloaded_file_signature(file_info: FileInfo) -> DownloadedFileSignature
 def filter_downloaded_files_for_current_iteration(
     downloaded_files: list[FileInfo],
     loop_internal_state: dict[str, Any] | None,
+    *,
+    aliases: Callable[[FileInfo], Iterable[DownloadedFileSignature]] | None = None,
 ) -> list[FileInfo]:
     """Filters downloaded files excluding previous iteration matches"""
     if not loop_internal_state:
@@ -55,7 +58,15 @@ def filter_downloaded_files_for_current_iteration(
         if previous_file_counter[signature] > 0:
             previous_file_counter[signature] -= 1
             continue
-        current_iteration_files.append(file_info)
+        if aliases is not None:
+            for alias in aliases(file_info):
+                if previous_file_counter[alias] > 0:
+                    previous_file_counter[alias] -= 1
+                    break
+            else:
+                current_iteration_files.append(file_info)
+        else:
+            current_iteration_files.append(file_info)
 
     return current_iteration_files
 

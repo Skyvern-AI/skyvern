@@ -178,7 +178,7 @@ class TaskRequest(TaskBase):
         url_validation_result = validate_url(url)
 
         if url_validation_result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
 
         self.url = url_validation_result
         return self
@@ -207,7 +207,7 @@ class TaskRequest(TaskBase):
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name="totp_verification_url")
 
 
 class PromptedTaskRequest(TaskRequest):
@@ -333,6 +333,7 @@ class Task(TaskBase):
     )
     organization_id: str
     workflow_run_id: str | None = None
+    attempt_number: int | None = None
     workflow_permanent_id: str | None = None
     browser_session_id: str | None = None
     order: int | None = None

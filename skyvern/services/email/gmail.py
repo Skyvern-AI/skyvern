@@ -1,3 +1,6 @@
+import base64
+import binascii
+from dataclasses import dataclass
 from datetime import timezone
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from typing import Any
@@ -5,6 +8,7 @@ from urllib.parse import quote
 
 import httpx
 
+from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.services.email.gmail_client import (
     GMAIL_API_BASE,
     GmailAPIError,
@@ -14,6 +18,41 @@ from skyvern.services.email.gmail_client import (
 )
 from skyvern.services.email.types import EmailAttachment, EmailMessage
 
+GMAIL_SEND_URL = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send"
+GMAIL_SEND_TIMEOUT_SECONDS = 120.0
+# Gmail's documented ceiling for an uploaded message.
+GMAIL_MAX_MESSAGE_BYTES = 35 * 1024 * 1024
+# google.rpc.Code names: the only provider text kept from a rejected send.
+_GOOGLE_RPC_CODES = frozenset(
+    {
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+    }
+)
+# The only statuses read as "not sent". A send recorded as failed may be attempted again, so any other
+# status, including 408 and 409, stays unknown.
+_REJECTED_STATUS_ERROR_CODES = {
+    400: GmailSendErrorCode.PROVIDER_REJECTED,
+    401: GmailSendErrorCode.RECONNECT,
+    403: GmailSendErrorCode.PROVIDER_REJECTED,
+    404: GmailSendErrorCode.PROVIDER_REJECTED,
+    413: GmailSendErrorCode.ATTACHMENT_TOO_LARGE,
+    429: GmailSendErrorCode.RATE_LIMITED,
+}
 _SYSTEM_LABELS = {"INBOX", "SENT", "DRAFT", "SPAM", "TRASH", "STARRED", "IMPORTANT", "UNREAD"}
 
 
@@ -79,15 +118,28 @@ def _attachments(payload: dict[str, Any]) -> list[EmailAttachment]:
     raw_body = payload.get("body")
     body = raw_body if isinstance(raw_body, dict) else {}
     attachment_id = body.get("attachmentId")
-    if isinstance(filename, str) and filename and isinstance(attachment_id, str):
+    embedded_data = body.get("data") if not isinstance(attachment_id, str) else None
+    headers = {
+        header["name"].casefold(): header["value"]
+        for header in payload.get("headers") or []
+        if isinstance(header, dict) and isinstance(header.get("name"), str) and isinstance(header.get("value"), str)
+    }
+    disposition = headers.get("content-disposition", "").split(";", 1)[0].strip().casefold()
+    named = isinstance(filename, str) and bool(filename)
+    if (named or disposition == "attachment") and (isinstance(attachment_id, str) or isinstance(embedded_data, str)):
         size = body.get("size")
         mime_type = payload.get("mimeType")
+        # Content-ID alone marks a related part, but an explicit disposition wins: senders that
+        # stamp a Content-ID on a real attachment would otherwise have it skipped as inline.
+        is_inline = disposition == "inline" or (not disposition and bool(headers.get("content-id", "").strip()))
         attachments.append(
             EmailAttachment(
-                name=filename,
+                name=filename if isinstance(filename, str) and filename else "attachment",
                 mime_type=mime_type if isinstance(mime_type, str) else None,
                 size=size if isinstance(size, int) else None,
-                attachment_id=attachment_id,
+                attachment_id=attachment_id if isinstance(attachment_id, str) else None,
+                is_inline=is_inline,
+                embedded_data=embedded_data if isinstance(embedded_data, str) else None,
             )
         )
     for part in payload.get("parts") or []:
@@ -116,7 +168,9 @@ def _date_header_to_iso(value: str | None) -> str | None:
     return parsed.astimezone(timezone.utc).isoformat()
 
 
-def _message_from_gmail(message: dict[str, Any], include_body: bool) -> EmailMessage | None:
+def _message_from_gmail(
+    message: dict[str, Any], include_body: bool, *, include_attachments: bool = False
+) -> EmailMessage | None:
     message_id = message.get("id")
     if not isinstance(message_id, str):
         return None
@@ -131,7 +185,7 @@ def _message_from_gmail(message: dict[str, Any], include_body: bool) -> EmailMes
         html_parts = _payload_text_by_mime(payload, {"text/html"})
         body_text = "\n".join(text_parts) if text_parts else "\n".join(payload_text(payload))
         body_html = "\n".join(html_parts) if html_parts else None
-    attachments = _attachments(payload) if include_body else []
+    attachments = _attachments(payload) if include_body or include_attachments else []
     raw_label_ids = message.get("labelIds")
     label_ids = raw_label_ids if isinstance(raw_label_ids, list) else []
     thread_id = message.get("threadId") if isinstance(message.get("threadId"), str) else None
@@ -148,7 +202,7 @@ def _message_from_gmail(message: dict[str, Any], include_body: bool) -> EmailMes
         snippet=message.get("snippet") if isinstance(message.get("snippet"), str) else "",
         body_text=body_text,
         body_html=body_html,
-        has_attachments=bool(attachments) if include_body else None,
+        has_attachments=bool(attachments) if include_body or include_attachments else None,
         attachments=attachments,
         is_read="UNREAD" not in label_ids,
         web_link=f"https://mail.google.com/mail/u/0/#all/{link_id}",
@@ -168,6 +222,7 @@ async def list_folder_messages(
     newer_than_days: int | None = None,
     max_results: int = 25,
     include_body: bool = True,
+    include_attachments: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> list[EmailMessage]:
     async def _list(client_: httpx.AsyncClient) -> list[EmailMessage]:
@@ -196,14 +251,151 @@ async def list_folder_messages(
                 client_,
                 f"{GMAIL_API_BASE}/users/me/messages/{quote(message_id, safe='')}",
                 access_token=access_token,
-                params={"format": "full" if include_body else "metadata"},
+                params={"format": "full" if include_body or include_attachments else "metadata"},
             )
-            normalized = _message_from_gmail(message, include_body)
+            normalized = _message_from_gmail(message, include_body, include_attachments=include_attachments)
             if normalized:
                 messages.append(normalized)
         return messages
 
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=20.0) as owned_client:
+                return await _list(owned_client)
+        return await _list(client)
+    except GmailAPIError as exc:
+        if include_attachments and exc.status == 401 and exc.code != "reconnect_required":
+            raise GmailAPIError(
+                status=exc.status,
+                code="reconnect_required",
+                message="Gmail attachment access requires reconnecting",
+            ) from exc
+        raise
+
+
+async def download_attachment(
+    *,
+    access_token: str,
+    message_id: str,
+    attachment_id: str,
+    max_size_bytes: int | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> bytes:
+    async def _download(client_: httpx.AsyncClient) -> bytes:
+        try:
+            payload = await get_json(
+                client_,
+                f"{GMAIL_API_BASE}/users/me/messages/{quote(message_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+                access_token=access_token,
+            )
+        except GmailAPIError as exc:
+            if exc.status == 401 and exc.code != "reconnect_required":
+                raise GmailAPIError(
+                    status=exc.status,
+                    code="reconnect_required",
+                    message="Gmail attachment access requires reconnecting",
+                ) from exc
+            raise
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise GmailAPIError(
+                status=502, code="invalid_attachment", message="Gmail returned invalid attachment data"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GmailAPIError(status=502, code="invalid_attachment", message="Gmail returned invalid attachment data")
+        data = payload.get("data")
+        if not isinstance(data, str):
+            raise GmailAPIError(status=502, code="invalid_attachment", message="Gmail returned invalid attachment data")
+        return decode_attachment_data(data, max_size_bytes=max_size_bytes)
+
     if client is None:
         async with httpx.AsyncClient(timeout=20.0) as owned_client:
-            return await _list(owned_client)
-    return await _list(client)
+            return await _download(owned_client)
+    return await _download(client)
+
+
+def decode_attachment_data(data: str, *, max_size_bytes: int | None = None) -> bytes:
+    if max_size_bytes is not None and len(data) > 4 * ((max_size_bytes + 2) // 3):
+        raise GmailAPIError(status=413, code="file_size_limit", message="Gmail attachment exceeds the download limit")
+    try:
+        encoded = data.encode("ascii") + b"=" * (-len(data) % 4)
+        content = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
+        raise GmailAPIError(
+            status=502, code="invalid_attachment", message="Gmail returned invalid attachment data"
+        ) from exc
+    if max_size_bytes is not None and len(content) > max_size_bytes:
+        raise GmailAPIError(status=413, code="file_size_limit", message="Gmail attachment exceeds the download limit")
+    return content
+
+
+@dataclass(frozen=True)
+class GmailSendResult:
+    outcome: GmailSendOutcome
+    provider_message_id: str | None = None
+    error_code: GmailSendErrorCode | None = None
+    provider_status: int | None = None
+    provider_reason: str | None = None
+
+
+def _response_object(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _response_error(response: httpx.Response) -> dict[str, Any]:
+    error = _response_object(response).get("error")
+    return error if isinstance(error, dict) else {}
+
+
+def _accepted_message_id(response: httpx.Response) -> str | None:
+    message_id = _response_object(response).get("id")
+    return message_id if isinstance(message_id, str) and message_id else None
+
+
+async def send_raw_message(
+    access_token: str, mime_bytes: bytes, client: httpx.AsyncClient | None = None
+) -> GmailSendResult:
+    """Send one RFC 822 message with exactly one HTTP attempt."""
+
+    async def _post(client_: httpx.AsyncClient) -> httpx.Response:
+        return await client_.post(
+            GMAIL_SEND_URL,
+            params={"uploadType": "media"},
+            content=mime_bytes,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "message/rfc822"},
+            timeout=GMAIL_SEND_TIMEOUT_SECONDS,
+        )
+
+    # Never retried: after a timeout, a dropped connection or a 5xx, Gmail may already have accepted the message.
+    try:
+        if client is not None:
+            response = await _post(client)
+        else:
+            async with httpx.AsyncClient() as owned_client:
+                response = await _post(owned_client)
+    except Exception:
+        return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+
+    status = response.status_code
+    if 200 <= status < 300:
+        message_id = _accepted_message_id(response)
+        if message_id is not None:
+            return GmailSendResult(GmailSendOutcome.ACCEPTED, provider_message_id=message_id)
+        return GmailSendResult(
+            GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN, provider_status=status
+        )
+    error_code = _REJECTED_STATUS_ERROR_CODES.get(status)
+    if error_code is not None:
+        rpc_code = _response_error(response).get("status")
+        return GmailSendResult(
+            GmailSendOutcome.FAILED,
+            error_code=error_code,
+            provider_status=status,
+            provider_reason=rpc_code if rpc_code in _GOOGLE_RPC_CODES else None,
+        )
+    return GmailSendResult(
+        GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN, provider_status=status
+    )

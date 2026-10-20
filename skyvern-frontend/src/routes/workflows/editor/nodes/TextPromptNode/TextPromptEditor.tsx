@@ -52,6 +52,7 @@ function TextPromptEditorBody({
           <HelpTooltip content={helpTooltips["textPrompt"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="prompt"
           aiImprove={AI_IMPROVE_CONFIGS.textPrompt.prompt}
           nodeId={blockId}
           value={prompt}
@@ -67,6 +68,7 @@ function TextPromptEditorBody({
         onChange={(next) => update({ model: next })}
       />
       <WorkflowDataSchemaInputGroup
+        deferKey={JSON.stringify([blockId, "jsonSchema"])}
         exampleValue={dataSchemaExampleValue}
         value={jsonSchema}
         onChange={(next) => update({ jsonSchema: next })}

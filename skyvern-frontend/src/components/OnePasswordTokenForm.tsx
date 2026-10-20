@@ -36,6 +36,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
     isError,
     createOrUpdateToken,
     isUpdating,
+    createOrUpdateTokenError,
     clearToken,
     isClearing,
   } = useOnePasswordToken();
@@ -150,7 +151,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
                     )}
                   </Button>
                 </div>
-                <FormMessage />
+                <FormMessage>{createOrUpdateTokenError}</FormMessage>
               </FormItem>
             )}
           />

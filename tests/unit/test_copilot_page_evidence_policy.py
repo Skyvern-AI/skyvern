@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import DEFAULT_MAX_TURNS
 from skyvern.forge.sdk.copilot.tools import (
     BlockObservationRef,
@@ -15,17 +14,7 @@ from skyvern.forge.sdk.copilot.tools import (
     update_and_run_blocks_tool,
     update_workflow_tool,
 )
-
-_AGENT_TEMPLATE_DEFAULTS = {
-    "workflow_knowledge_base": "test kb",
-    "current_datetime": "2026-01-01T00:00:00Z",
-    "tool_usage_guide": "",
-    "security_rules": "",
-}
-
-
-def _render_agent_prompt() -> str:
-    return prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
+from tests.unit.conftest import render_agent_prompt as _render_agent_prompt
 
 
 def test_agent_prompt_keeps_page_evidence_in_the_build_and_repair_loop() -> None:
@@ -35,7 +24,6 @@ def test_agent_prompt_keeps_page_evidence_in_the_build_and_repair_loop() -> None
     assert "inspect the resulting page and run evidence before deciding what to change" in rendered
     assert "preserve known-good blocks" in rendered
     assert "retry unchanged only when fresh evidence shows the action did not land" in rendered
-    assert "A page challenge (CAPTCHA, anti-bot wall) is an observation, not a verdict" in rendered
     assert "PAGE EVIDENCE POLICY" not in rendered
     assert "GOTO_URL STATE SHORTCUT POLICY" not in rendered
     assert "Before extraction on stateful search/result tasks" not in rendered

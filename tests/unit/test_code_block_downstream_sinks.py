@@ -24,6 +24,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import webhook_service
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 LONG_CREDENTIAL = "templated-password-very-long-13668"
 SHORT_CREDENTIAL = "12"
@@ -119,6 +120,7 @@ async def _status_response_from_captured_output(
                 ),
                 get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
+            workflow_run_attempts=make_workflow_run_attempts_fake(),
         ),
     )
     monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", SimpleNamespace(workflow_run_contexts={}))

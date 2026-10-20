@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +28,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_settings import BrowserSettings
 from skyvern.schemas.workflows import BlockType
 
 
@@ -374,17 +377,17 @@ class TestCheckTriggerDepth:
     """Test _check_trigger_depth: boundary conditions at/above/below MAX_TRIGGER_DEPTH."""
 
     @pytest.mark.asyncio
-    async def test_no_parent_returns_zero(self) -> None:
+    async def test_no_parent_returns_the_run_itself(self) -> None:
         block = _make_block()
         mock_run = MagicMock()
         mock_run.parent_workflow_run_id = None
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=mock_run)
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == 0
+            root = await block._check_trigger_depth("wr_current")
+        assert root == "wr_current"
 
     @pytest.mark.asyncio
-    async def test_single_parent_returns_one(self) -> None:
+    async def test_single_parent_returns_the_parent(self) -> None:
         block = _make_block()
         run_with_parent = MagicMock()
         run_with_parent.parent_workflow_run_id = "wr_parent"
@@ -393,8 +396,8 @@ class TestCheckTriggerDepth:
 
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=[run_with_parent, run_no_parent])
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == 1
+            root = await block._check_trigger_depth("wr_current")
+        assert root == "wr_parent"
 
     @pytest.mark.asyncio
     async def test_depth_at_max_raises(self) -> None:
@@ -421,16 +424,16 @@ class TestCheckTriggerDepth:
 
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=runs)
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == block.MAX_TRIGGER_DEPTH - 1
+            root = await block._check_trigger_depth("wr_current")
+        assert root == f"wr_parent_{block.MAX_TRIGGER_DEPTH - 2}"
 
     @pytest.mark.asyncio
-    async def test_run_not_found_returns_zero(self) -> None:
+    async def test_run_not_found_returns_the_run_id(self) -> None:
         block = _make_block()
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
-            depth = await block._check_trigger_depth("wr_nonexistent")
-        assert depth == 0
+            root = await block._check_trigger_depth("wr_nonexistent")
+        assert root == "wr_nonexistent"
 
 
 @pytest.mark.asyncio
@@ -488,7 +491,7 @@ async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: p
 
     monkeypatch.setattr(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock())
     monkeypatch.setattr(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None)
-    monkeypatch.setattr(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0))
+    monkeypatch.setattr(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent"))
     monkeypatch.setattr(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock())
     monkeypatch.setattr(WorkflowTriggerBlock, "build_block_result", AsyncMock(return_value=MagicMock()))
 
@@ -557,11 +560,12 @@ async def test_sync_trigger_fails_closed_when_child_resolves_sequential_credenti
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
         patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
-        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
         patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
         patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
     ):
         mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=child_run)
         mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock()
         mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
@@ -587,6 +591,7 @@ async def _run_sync_trigger_fence(
     *,
     created_session_id: str | None,
     setup_raises: bool = False,
+    target_workflow: SimpleNamespace | None = None,
 ) -> tuple[MagicMock, dict[str, Any]]:
     child_run = MagicMock()
     child_run.workflow_run_id = "wr_child"
@@ -607,16 +612,19 @@ async def _run_sync_trigger_fence(
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
         patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
-        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
         patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
         patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
     ):
         mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(proxy_location=None))
         created_session = MagicMock()
         created_session.persistent_browser_session_id = created_session_id
         mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+        if target_workflow is not None:
+            mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=target_workflow)
         if setup_raises:
             mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(side_effect=RuntimeError("setup boom"))
         else:
@@ -643,12 +651,35 @@ async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
 
     mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh")
 
+    assert (
+        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["session_kind"]
+        == BrowserSessionKind.workflow_run
+    )
     mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
     assert captured["success"] is False
     mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
         "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_creates_the_child_session_with_the_target_version_timezone() -> None:
+    target_workflow = SimpleNamespace(
+        workflow_id="w_child_v3",
+        browser_type=None,
+        workflow_definition=SimpleNamespace(browser_settings=BrowserSettings(timezone_id="Africa/Kampala")),
+    )
+
+    mock_app, _ = await _run_sync_trigger_fence(
+        _make_block(), created_session_id="pbs_fresh", target_workflow=target_workflow
+    )
+
+    create_kwargs = mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs
+    setup_kwargs = mock_app.WORKFLOW_SERVICE.setup_workflow_run.await_args.kwargs
+    assert create_kwargs["browser_settings"].timezone_id == "Africa/Kampala"
+    assert create_kwargs["created_for_workflow_run_id"] is not None
+    assert create_kwargs["created_for_workflow_run_id"] == setup_kwargs["workflow_run_id"]
 
 
 @pytest.mark.asyncio
@@ -752,11 +783,12 @@ async def _run_async_trigger(run_workflow_stub: Any) -> tuple[dict[str, Any], di
         patch("skyvern.services.workflow_service.run_workflow", side_effect=run_workflow_stub),
         patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
         patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
-        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
         patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock(side_effect=_capture_record)),
         patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
     ):
         mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
         await block.execute(
             workflow_run_id="wr_parent",
             workflow_run_block_id="wrb_parent",

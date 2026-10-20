@@ -9,13 +9,16 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
+from skyvern.forge.api_app import SecurityHeadersMiddleware
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
@@ -51,6 +54,17 @@ def _make_org(organization_id: str = "o_1") -> Organization:
     )
 
 
+def _patch_app() -> Any:
+    # The artifact routes check the owning run's workflow folder, which awaits the agent function.
+    return patch(
+        "skyvern.forge.sdk.routes.agent_protocol.app",
+        **{
+            "AGENT_FUNCTION.accessible_workflow_folder_ids": AsyncMock(return_value=None),
+            "AGENT_FUNCTION.enforce_folder_access": AsyncMock(),
+        },
+    )
+
+
 def _make_client() -> TestClient:
     test_app = FastAPI()
     test_app.include_router(base_router, prefix="/v1")
@@ -63,7 +77,7 @@ class TestGetArtifactSignedUrl:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -94,7 +108,7 @@ class TestGetArtifactSignedUrl:
     def test_unknown_artifact_returns_404(self) -> None:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -115,7 +129,7 @@ class TestGetArtifactSignedUrl:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org("o_2")),
@@ -141,7 +155,7 @@ class TestMintedUrlAgainstContentEndpoint:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -191,7 +205,7 @@ class TestMintedUrlAgainstContentEndpoint:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -235,7 +249,7 @@ class TestSensitiveArtifactEmbeddedUrl:
         real_time = time.time
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch("skyvern.forge.sdk.artifact.signing.time.time", new=lambda: real_time() + age_seconds),
         ):
             app_module.DATABASE.artifacts.get_artifact_by_id_no_org = AsyncMock(return_value=artifact)
@@ -268,7 +282,7 @@ class TestKeyringUnsetFallback:
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -284,3 +298,37 @@ class TestKeyringUnsetFallback:
         body = resp.json()
         assert body["signed_url"] == "https://bucket.s3.amazonaws.com/a_1.png?X-Amz-Signature=abc"
         assert body["expires_at"] is None
+
+
+class TestArtifactContentCsp:
+    @pytest.mark.parametrize(
+        ("artifact_type", "expected_csp"),
+        [
+            (
+                ArtifactType.HTML_SCRAPE,
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            ),
+            (ArtifactType.SCREENSHOT_ACTION, "frame-ancestors 'none'"),
+        ],
+    )
+    def test_scraped_html_is_sandboxed_through_security_middleware(
+        self, artifact_type: ArtifactType, expected_csp: str
+    ) -> None:
+        artifact = _make_artifact().model_copy(update={"artifact_type": artifact_type})
+        test_app = FastAPI()
+        test_app.include_router(base_router, prefix="/v1")
+        test_app.add_middleware(SecurityHeadersMiddleware)
+        with (
+            _patch_app() as app_module,
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org()),
+            ),
+        ):
+            app_module.DATABASE.artifacts.get_artifact_by_id = AsyncMock(return_value=artifact)
+            app_module.ARTIFACT_MANAGER.retrieve_artifact = AsyncMock(return_value=b"<script>alert(1)</script>")
+            resp = TestClient(test_app).get("/v1/artifacts/a_1/content", headers={"x-api-key": "key"})
+
+        assert resp.status_code == 200
+        # Exact-string assertion is intentional: the CSP is security-critical.
+        assert resp.headers["Content-Security-Policy"] == expected_csp

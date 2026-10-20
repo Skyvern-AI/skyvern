@@ -10,6 +10,9 @@ const badgeVariants = cva(
         secondary: "border-transparent bg-badge-neutral text-foreground",
         success: "border-transparent bg-badge-success text-foreground",
         warning: "border-transparent bg-badge-warning text-foreground",
+        // Work in flight: neutral, because it is not yet a verdict. Badge adds the moving
+        // indicator so this pole never relies on colour alone.
+        progress: "gap-1 border-transparent bg-badge-neutral text-foreground",
         destructive: "border-transparent bg-badge-destructive text-foreground",
         terminated: "border-transparent bg-badge-terminated text-foreground",
         outline: "text-foreground",

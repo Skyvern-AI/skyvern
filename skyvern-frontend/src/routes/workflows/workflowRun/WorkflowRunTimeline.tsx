@@ -1,3 +1,4 @@
+import { formatCodeBlockErrorCode } from "./codeBlockFailure";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -7,18 +8,31 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
-import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
+import {
+  getRunAttempt,
+  runIsExecuting,
+  runIsLogicallyFinal,
+  runIsRetryWaiting,
+} from "./runRetryState";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { formatElapsed } from "../studio/runProjections";
 import { cn } from "@/util/utils";
 import { DotFilledIcon } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   countActionsInTimeline,
   countCompletedTopLevelBlocks,
+  isAction,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
+  isWorkflowRunBlock,
   ObserverThought,
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
@@ -29,12 +43,16 @@ import {
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
 import {
+  StatusDot,
   type SkippedBranchGroup,
   WorkflowRunTimelineBlockItem,
 } from "./WorkflowRunTimelineBlockItem";
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
 import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
+  groupTimelineByAttempt,
+  filterTimelineToAttempt,
+  findActiveItem,
   buildBlockOrderIndex,
   classifyUnexecutedDefinedBlocks,
   flattenTimelineChronologically,
@@ -162,12 +180,77 @@ function WorkflowRunTimeline({
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery({ workflowRunId });
+  const currentAttempt = getRunAttempt(workflowRun ?? {});
+  const groups = useMemo(
+    () =>
+      groupTimelineByAttempt(
+        workflowRunTimeline ?? [],
+        workflowRun?.attempts ?? [],
+        currentAttempt,
+      ).map((group) => ({
+        ...group,
+        blockOrder: buildBlockOrderIndex(group.items),
+      })),
+    [workflowRunTimeline, workflowRun?.attempts, currentAttempt],
+  );
+  const currentTimeline = useMemo(
+    () =>
+      filterTimelineToAttempt(
+        workflowRunTimeline ?? [],
+        workflowRun?.attempts ?? [],
+        currentAttempt,
+      ),
+    [workflowRunTimeline, workflowRun?.attempts, currentAttempt],
+  );
+  const activeItemId = isWorkflowRunBlock(activeItem)
+    ? activeItem.workflow_run_block_id
+    : isObserverThought(activeItem)
+      ? activeItem.thought_id
+      : isAction(activeItem)
+        ? activeItem.action_id
+        : null;
+  const activeAttempt = useMemo(
+    () =>
+      activeItemId === null
+        ? undefined
+        : groups.find((group) =>
+            findActiveItem(group.items, activeItemId, false),
+          )?.attemptNumber,
+    [activeItemId, groups],
+  );
+  const [expansion, setExpansion] = useState(() => ({
+    workflowRunId,
+    attempt: currentAttempt,
+    activeItemId,
+    activeAttempt,
+    overrides: new Map<number, boolean>(),
+  }));
+  if (
+    expansion.workflowRunId !== workflowRunId ||
+    expansion.attempt !== currentAttempt ||
+    expansion.activeItemId !== activeItemId ||
+    expansion.activeAttempt !== activeAttempt
+  ) {
+    const overrides =
+      expansion.workflowRunId === workflowRunId
+        ? new Map(expansion.overrides)
+        : new Map<number, boolean>();
+    if (expansion.attempt !== currentAttempt) {
+      overrides.delete(currentAttempt);
+    }
+    if (activeAttempt !== undefined) {
+      overrides.delete(activeAttempt);
+    }
+    setExpansion({
+      workflowRunId,
+      attempt: currentAttempt,
+      activeItemId,
+      activeAttempt,
+      overrides,
+    });
+  }
   const displayTimeline = useMemo(
     () => flattenTimelineChronologically(workflowRunTimeline ?? []),
-    [workflowRunTimeline],
-  );
-  const blockOrder = useMemo(
-    () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
   );
   const codeStepsByLabel = useMemo(
@@ -177,12 +260,10 @@ function WorkflowRunTimeline({
       ),
     [workflowRun],
   );
-  const workflowRunIsNotFinalized =
-    workflowRun && !statusUnavailable
-      ? statusIsNotFinalized(workflowRun)
-      : false;
+  const workflowRunIsExecuting =
+    workflowRun && !statusUnavailable ? runIsExecuting(workflowRun) : false;
   const workflowRunIsFinalized = workflowRun
-    ? statusIsFinalized(workflowRun)
+    ? runIsLogicallyFinal(workflowRun)
     : false;
   const definedBlocks = useMemo(
     () => workflowRun?.workflow?.workflow_definition?.blocks ?? [],
@@ -191,12 +272,9 @@ function WorkflowRunTimeline({
   const unexecutedBlocks = useMemo(
     () =>
       workflowRunIsFinalized
-        ? classifyUnexecutedDefinedBlocks(
-            definedBlocks,
-            workflowRunTimeline ?? [],
-          )
+        ? classifyUnexecutedDefinedBlocks(definedBlocks, currentTimeline)
         : [],
-    [definedBlocks, workflowRunIsFinalized, workflowRunTimeline],
+    [definedBlocks, workflowRunIsFinalized, currentTimeline],
   );
   const { skippedBranchBlocksByConditionalId, trailingUnexecutedBlocks } =
     useMemo(() => {
@@ -281,6 +359,79 @@ function WorkflowRunTimeline({
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
+  const showAttemptGroups = groups.length > 1 || currentAttempt > 1;
+  const unexecutedRows = trailingUnexecutedBlocks.map(({ block, reason }) => (
+    <WorkflowRunTimelineUnexecutedBlockItem
+      key={`unexecuted-${block.label}`}
+      block={block}
+      reason={reason}
+    />
+  ));
+  const renderTimelineItem = (
+    timelineItem: WorkflowRunTimelineItem,
+    blockOrder: ReadonlyMap<string, number> | undefined,
+  ) => {
+    const itemId = isBlockItem(timelineItem)
+      ? timelineItem.block.workflow_run_block_id
+      : isThoughtItem(timelineItem)
+        ? timelineItem.thought.thought_id
+        : null;
+    const isNew =
+      itemId !== null &&
+      !isInitialRenderRef.current &&
+      !knownItemIdsRef.current.has(itemId);
+
+    if (isBlockItem(timelineItem)) {
+      return (
+        <div
+          key={timelineItem.block.workflow_run_block_id}
+          className={cn({
+            "duration-300 animate-in fade-in slide-in-from-top-3": isNew,
+          })}
+        >
+          <WorkflowRunTimelineBlockItem
+            subItems={timelineItem.children}
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            block={timelineItem.block}
+            blockOrder={blockOrder}
+            codeStepsByLabel={codeStepsByLabel}
+            skippedBranchBlocksByConditionalId={
+              skippedBranchBlocksByConditionalId
+            }
+            onActionClick={onActionItemSelected}
+            onBlockItemClick={onBlockItemSelected}
+            onIterationClick={onIterationSelected}
+            onThoughtClick={onThoughtItemSelected}
+            finallyBlockLabel={finallyBlockLabel}
+            workflowRunIsFinalized={workflowRunIsFinalized}
+          />
+        </div>
+      );
+    }
+    if (isThoughtItem(timelineItem)) {
+      return (
+        <div
+          key={timelineItem.thought.thought_id}
+          className={cn(
+            "py-1",
+            isNew && "duration-300 animate-in fade-in slide-in-from-top-3",
+          )}
+        >
+          <ThoughtCard
+            active={
+              isObserverThought(activeItem) &&
+              activeItem.thought_id === timelineItem.thought.thought_id
+            }
+            onClick={onThoughtItemSelected}
+            thought={timelineItem.thought}
+          />
+        </div>
+      );
+    }
+    return null;
+  };
+
   return (
     <div
       className={cn(
@@ -295,7 +446,7 @@ function WorkflowRunTimeline({
               Timeline
             </span>
             <div className="min-w-0 flex-1" />
-            {workflowRunIsNotFinalized && (
+            {workflowRunIsExecuting && (
               <button
                 type="button"
                 onClick={onLiveStreamSelected}
@@ -319,7 +470,7 @@ function WorkflowRunTimeline({
           <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1.5 text-xs">
             <TimelineRunCounts
               workflowRun={workflowRun}
-              timeline={workflowRunTimeline}
+              timeline={currentTimeline}
             />
           </div>
         </>
@@ -327,85 +478,92 @@ function WorkflowRunTimeline({
       <ScrollArea className="min-h-0 flex-1">
         <ScrollAreaViewport className="h-full max-h-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="p-2">
-            {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
-                Formulating actions...
-              </div>
-            )}
-            {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
-              <div>Workflow timeline is empty</div>
-            )}
-            {displayTimeline.map((timelineItem) => {
-              const itemId = isBlockItem(timelineItem)
-                ? timelineItem.block.workflow_run_block_id
-                : isThoughtItem(timelineItem)
-                  ? timelineItem.thought.thought_id
-                  : null;
-              const isNew =
-                itemId !== null &&
-                !isInitialRenderRef.current &&
-                !knownItemIdsRef.current.has(itemId);
-
-              if (isBlockItem(timelineItem)) {
-                return (
-                  <div
-                    key={timelineItem.block.workflow_run_block_id}
-                    className={cn({
-                      "duration-300 animate-in fade-in slide-in-from-top-3":
-                        isNew,
-                    })}
-                  >
-                    <WorkflowRunTimelineBlockItem
-                      subItems={timelineItem.children}
-                      activeItem={activeItem}
-                      activeIteration={activeIteration}
-                      block={timelineItem.block}
-                      blockOrder={blockOrder}
-                      codeStepsByLabel={codeStepsByLabel}
-                      skippedBranchBlocksByConditionalId={
-                        skippedBranchBlocksByConditionalId
+            {!showAttemptGroups &&
+              workflowRunIsExecuting &&
+              workflowRunTimeline.length === 0 && (
+                <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                  Formulating actions...
+                </div>
+              )}
+            {!showAttemptGroups &&
+              workflowRunIsFinalized &&
+              workflowRunTimeline.length === 0 && (
+                <div>Workflow timeline is empty</div>
+              )}
+            {showAttemptGroups
+              ? groups.map((group) => {
+                  const status =
+                    group.summary?.status ??
+                    (group.isCurrent ? workflowRun.status : null);
+                  return (
+                    <Collapsible
+                      key={group.attemptNumber}
+                      open={
+                        expansion.overrides.get(group.attemptNumber) ??
+                        (group.isCurrent ||
+                          group.attemptNumber === activeAttempt)
                       }
-                      onActionClick={onActionItemSelected}
-                      onBlockItemClick={onBlockItemSelected}
-                      onIterationClick={onIterationSelected}
-                      onThoughtClick={onThoughtItemSelected}
-                      finallyBlockLabel={finallyBlockLabel}
-                      workflowRunIsFinalized={workflowRunIsFinalized}
-                    />
-                  </div>
-                );
-              }
-              if (isThoughtItem(timelineItem)) {
-                return (
-                  <div
-                    key={timelineItem.thought.thought_id}
-                    className={cn(
-                      "py-1",
-                      isNew &&
-                        "duration-300 animate-in fade-in slide-in-from-top-3",
-                    )}
-                  >
-                    <ThoughtCard
-                      active={
-                        isObserverThought(activeItem) &&
-                        activeItem.thought_id ===
-                          timelineItem.thought.thought_id
+                      onOpenChange={(open) =>
+                        setExpansion((previous) => {
+                          const overrides = new Map(previous.overrides);
+                          overrides.set(group.attemptNumber, open);
+                          return { ...previous, overrides };
+                        })
                       }
-                      onClick={onThoughtItemSelected}
-                      thought={timelineItem.thought}
-                    />
-                  </div>
-                );
-              }
-              return null;
-            })}
-            {trailingUnexecutedBlocks.map(({ block, reason }) => (
-              <WorkflowRunTimelineUnexecutedBlockItem
-                key={`unexecuted-${block.label}`}
-                block={block}
-                reason={reason}
-              />
-            ))}
+                    >
+                      <CollapsibleTrigger className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-xs hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
+                        <StatusDot
+                          status={status}
+                          isFinalized={
+                            !group.isCurrent || workflowRunIsFinalized
+                          }
+                        />
+                        <span className="font-medium">
+                          Attempt {group.attemptNumber}
+                        </span>
+                        {status ? (
+                          <span>{status.replace("_", " ")}</span>
+                        ) : null}
+                        {group.isCurrent && runIsRetryWaiting(workflowRun) ? (
+                          <span>Retry pending</span>
+                        ) : null}
+                        {group.summary?.error_codes[0] ? (
+                          <span>
+                            {formatCodeBlockErrorCode(
+                              group.summary.error_codes[0],
+                            )}
+                          </span>
+                        ) : null}
+                        {group.summary?.started_at ? (
+                          <span className="ml-auto tabular-nums text-muted-foreground">
+                            {formatElapsed(
+                              group.summary.started_at,
+                              group.summary.finished_at,
+                            )}
+                          </span>
+                        ) : null}
+                      </CollapsibleTrigger>
+                      <CollapsibleContent>
+                        {group.items.length === 0 &&
+                          (group.isCurrent && workflowRunIsExecuting ? (
+                            <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                              Formulating actions...
+                            </div>
+                          ) : (
+                            <div>Workflow timeline is empty</div>
+                          ))}
+                        {flattenTimelineChronologically(group.items).map(
+                          (item) => renderTimelineItem(item, group.blockOrder),
+                        )}
+                        {group.isCurrent ? unexecutedRows : null}
+                      </CollapsibleContent>
+                    </Collapsible>
+                  );
+                })
+              : displayTimeline.map((item) =>
+                  renderTimelineItem(item, groups[0]?.blockOrder),
+                )}
+            {!showAttemptGroups ? unexecutedRows : null}
           </div>
         </ScrollAreaViewport>
       </ScrollArea>

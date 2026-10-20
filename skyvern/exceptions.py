@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.util import find_spec
-from typing import NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
+
+from skyvern.schemas.browser_session_timeouts import MAX_EXTENDED_TIMEOUT
+
+if TYPE_CHECKING:
+    from skyvern.errors.errors import UserDefinedError
 
 # Representative modules that indicate the local extra is installed enough for
 # embedded/browser import graphs. Keep this list intentionally small, but include
@@ -73,6 +78,10 @@ class SkyvernPageAnalysisTimeout(SkyvernException):
     pass
 
 
+class ActionDeadlineExceeded(SkyvernPageAnalysisTimeout):
+    """A driver call synthesized as timed out by its caller, as opposed to one the page analyzer raised."""
+
+
 class SkyvernExtraNotInstalled(ImportError):
     def __init__(self, feature: str, extra: str = "server"):
         self.feature = feature
@@ -129,9 +138,44 @@ class SkyvernClientException(SkyvernException):
 
 
 class SkyvernHTTPException(SkyvernException):
-    def __init__(self, message: str | None = None, status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST):
+    def __init__(
+        self,
+        message: str | None = None,
+        status_code: int | HTTPStatus = HTTPStatus.BAD_REQUEST,
+        error_code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = int(status_code)
+        # Serialized alongside `detail` only when set, so a caller can branch on the cause without
+        # matching on prose. Treat a code as a published contract once a response carries it.
+        self.error_code = error_code
+        self.headers = headers
         super().__init__(message)
+
+
+class WorkflowPinnedByRunGroup(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} is running as a workflow run group, so it cannot be edited in place "
+            "until that group finishes. Save the change as a new version instead.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
+class WorkflowChangedSinceReview(SkyvernHTTPException):
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"Workflow version {workflow_id} changed after it was reviewed, so the group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
+class GroupAccountsRanSinceReview(SkyvernHTTPException):
+    def __init__(self, item_keys: list[str]) -> None:
+        super().__init__(
+            f"{item_keys} started in another group after the review, so this group was not submitted.",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 _BROWSER_CONNECTION_GUIDANCE = "Please try re-running. If this continues, contact support@skyvern.com."
@@ -150,6 +194,17 @@ _BROWSER_CONNECTION_PATTERNS = (
 
 def _is_browser_connection_error(message: str) -> bool:
     return any(pattern in message for pattern in _BROWSER_CONNECTION_PATTERNS)
+
+
+def is_stalled_attach_handshake(message: str) -> bool:
+    """True for a CDP connect timeout that fired after the socket was already open.
+
+    Playwright leaves that socket attached to the browser, where it keeps buffering events, so
+    reconnecting to the same browser gets slower rather than faster. A timeout before
+    ``<ws connected>`` is cleaned up and stays safe to retry.
+    """
+    lowered = message.lower()
+    return "connect_over_cdp" in lowered and "timeout" in lowered and "<ws connected>" in lowered
 
 
 def _is_session_closed_error(message: str) -> bool:
@@ -190,6 +245,13 @@ def get_user_facing_exception_message(exception: Exception) -> str:
                 "Start a new browser session to continue. "
                 "If this is unexpected, contact support@skyvern.com."
             )
+        if is_stalled_attach_handshake(raw):
+            return (
+                "Failed to connect to the browser session: it accepted the connection but did not "
+                "finish the attach handshake in time. Start a new browser session to continue -- "
+                "reconnecting to the same one is likely to fail again. "
+                "If this continues, contact support@skyvern.com."
+            )
         return (
             f"Failed to connect to the browser session. "
             f"This is usually caused by high demand and is transient. {_BROWSER_CONNECTION_GUIDANCE}"
@@ -214,6 +276,15 @@ class BrowserActionPolicyNotEnforceable(SkyvernHTTPException):
         self.reasons = tuple(reasons)
         super().__init__(
             f"Workflow cannot run under a browser action policy: {', '.join(self.reasons)}",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+class BrowserSettingsUnsupported(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            "browser_settings.timezone_id cannot be applied by the browser provider selected for this run. Remove "
+            "the timezone setting or run on Skyvern's own browsers.",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
@@ -404,6 +475,17 @@ class MissingElement(SkyvernException):
         )
 
 
+class FrameChainLoop(MissingElement):
+    """Subclasses MissingElement so action handlers treat it as a known failure; the element was not removed."""
+
+    def __init__(self, frame_id: str) -> None:
+        SkyvernException.__init__(
+            self,
+            "The element's iframe chain in the scraped page loops back on itself or nests too deeply, so the"
+            f" element cannot be located on this page state. frame_id={frame_id}",
+        )
+
+
 class MissingExtractActionsResponse(SkyvernException):
     def __init__(self) -> None:
         super().__init__("extract-actions response missing")
@@ -591,6 +673,14 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
+class WorkflowHasNoBlocks(SkyvernHTTPException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(
+            f"Workflow {workflow_permanent_id} has no blocks to run. Add at least one block before running it.",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
 class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
     def __init__(
         self,
@@ -608,9 +698,14 @@ class WorkflowRunNotFound(SkyvernHTTPException):
 
 
 class MissingValueForParameter(SkyvernHTTPException):
-    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
+    def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str | None = None) -> None:
+        location = (
+            f"workflow run {workflow_run_id} of workflow {workflow_id}"
+            if workflow_run_id
+            else f"workflow {workflow_id}"
+        )
         super().__init__(
-            f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
+            f"Missing value for parameter {parameter_key} in {location}",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
@@ -638,6 +733,19 @@ class UnrecognizedWorkflowParameters(SkyvernHTTPException):
         if hints:
             message += f" Did you mean {'; '.join(hints)}?"
         super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
+
+
+class WorkflowRetryAttemptLookupError(Exception):
+    pass
+
+
+class WorkflowAttemptDispatchSuperseded(Exception):
+    """The dispatch sweep released this dispatch's stale claim and started the attempt elsewhere."""
+
+    def __init__(self, workflow_run_id: str, attempt_number: int) -> None:
+        super().__init__(f"Workflow run {workflow_run_id} attempt {attempt_number} is owned by a newer dispatch")
+        self.workflow_run_id = workflow_run_id
+        self.attempt_number = attempt_number
 
 
 class WorkflowRunParameterPersistenceError(SkyvernException):
@@ -751,9 +859,13 @@ class WorkflowParameterNotFound(SkyvernHTTPException):
 
 
 class FailedToNavigateToUrl(SkyvernException):
-    def __init__(self, url: str, error_message: str) -> None:
+    def __init__(self, url: str, error_message: str, nav_error_code: str | None = None) -> None:
         self.url = url
         self.error_message = error_message
+        # The driver's own error code, read where the driver raised it. Downstream layers flatten
+        # this exception into a sentence, and a sentence cannot say who wrote it; carrying the code
+        # as a field is what lets a consumer attribute the failure without parsing prose.
+        self.nav_error_code = nav_error_code
         super().__init__(f"Failed to navigate to url {url}. Error message: {error_message}")
 
 
@@ -765,6 +877,36 @@ class BlockedNavigationDestination(FailedToNavigateToUrl):
     def __init__(self, url: str, reason: str) -> None:
         self.reason = reason
         super().__init__(url=url, error_message=f"blocked navigation destination: {reason}")
+
+
+# Leads the error_message below, and so the run's failure_reason. A consumer that only ever sees
+# that string matches on this instead of restating the prose, since the egress-attributable browser
+# error code stays in the message and would otherwise classify the failure as ours.
+NO_ADDRESS_RECORD_NAV_ERROR_MARKER = "has no DNS address record"
+
+# Shaped like a driver code on purpose: the scrub/restore/preservation pipeline in
+# nav_attribution.py and block.py pattern-matches `net::ERR_[A-Z0-9_]+`, and this rides that same
+# path rather than needing its own case in every one of those gates. It is not a real Chromium
+# error, so no driver or page text can ever produce it; only UnresolvableNavigationHost sets it.
+NO_ADDRESS_RECORD_NAV_ERROR_CODE = "net::ERR_SKYVERN_UNRESOLVABLE_HOST"
+
+
+class UnresolvableNavigationHost(FailedToNavigateToUrl):
+    """The navigation target's host has no DNS address record, so no egress of ours can reach it.
+
+    A browser behind a proxy hands the hostname to the proxy (HTTP CONNECT, SOCKS remote DNS), so a
+    target whose record is gone surfaces as the proxy failing to open a tunnel rather than as
+    ERR_NAME_NOT_RESOLVED. The distinct type is what keeps that borrowed error code from being read
+    as our own egress failing; it subclasses FailedToNavigateToUrl so the failure stays terminal.
+    """
+
+    def __init__(self, url: str, host: str, error_message: str) -> None:
+        self.host = host
+        super().__init__(
+            url=url,
+            error_message=f"{host} {NO_ADDRESS_RECORD_NAV_ERROR_MARKER}: {error_message}",
+            nav_error_code=NO_ADDRESS_RECORD_NAV_ERROR_CODE,
+        )
 
 
 class FailedToReloadPage(SkyvernException):
@@ -1148,6 +1290,15 @@ class CredentialParameterNotFoundError(SkyvernException):
         )
 
 
+# ValueError subclasses so existing handlers and the user-facing failure text stay as they were.
+class CredentialItemNotFoundError(ValueError):
+    """The credential binding resolved, but its vault holds no such item or key."""
+
+
+class CredentialSourceNotConfiguredError(ValueError):
+    """The organization or workflow lacks configuration a credential read needs."""
+
+
 class CredentialVaultShapeMismatchError(SkyvernHTTPException):
     def __init__(self, credential_id: str, stored_credential_type: str) -> None:
         super().__init__(
@@ -1179,6 +1330,12 @@ class TerminationError(SkyvernException):
 class StepTerminationError(TerminationError):
     def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
+
+
+class CompletionGateTerminationError(TerminationError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class TaskTerminationError(TerminationError):
@@ -1444,26 +1601,26 @@ class IllegitComplete(SkyvernException):
         super().__init__(f"Illegit complete{data_str}")
 
 
-class CachedActionPlanError(SkyvernException):
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-
-
 class InvalidUrl(SkyvernHTTPException):
-    def __init__(self, url: str) -> None:
-        super().__init__(f"Invalid URL: {url}. Skyvern supports HTTP and HTTPS urls with max 2083 character length.")
+    def __init__(
+        self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
+    ) -> None:
+        super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 
 class BlockedHost(SkyvernHTTPException):
-    def __init__(self, host: str) -> None:
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
         super().__init__(
-            f"The host in your url is blocked: {host}",
+            f"Invalid {field_name}: blocked host.",
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
 class UnresolvableHost(BlockedHost):
-    pass
+    def __init__(self, host: str, *, field_name: str = "url") -> None:
+        SkyvernHTTPException.__init__(
+            self, f"Invalid {field_name}: unresolvable host.", status_code=HTTPStatus.BAD_REQUEST
+        )
 
 
 class InvalidWorkflowParameter(SkyvernHTTPException):
@@ -1613,7 +1770,30 @@ class LLMCallerNotFoundError(SkyvernException):
 
 class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, runnable_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} is already occupied by {runnable_id}")
+        super().__init__(
+            f"Browser session {browser_session_id} is already occupied by {runnable_id}. "
+            "Wait for that run to finish or cancel it, then retry."
+        )
+
+
+class BrowserSessionAlreadyEndedError(SkyvernException):
+    """A late writer tried to publish liveness or a non-final status onto an already-terminal row;
+    the DB layer raises this rather than resurrect a session a concurrent close/timeout already ended.
+    Distinct from cloud's query-side BrowserSessionAlreadyTerminalError; carried values are identifiers
+    and a timestamp only, never a secret-bearing address or token."""
+
+    def __init__(
+        self,
+        browser_session_id: str,
+        status: str | None,
+        completed_at: datetime | None = None,
+    ) -> None:
+        self.browser_session_id = browser_session_id
+        self.status = status
+        self.completed_at = completed_at
+        super().__init__(
+            f"Browser session {browser_session_id} has already ended; refusing to publish liveness or status"
+        )
 
 
 class BrowserSessionOwnershipConflict(SkyvernHTTPException):
@@ -1662,11 +1842,88 @@ class MissingRoutedVncAddressError(SkyvernException):
         super().__init__(f"Browser session {browser_session_id} has no routed VNC address.")
 
 
+REREGISTER_EXTERNAL_BROWSER = (
+    "A registered browser cannot be extended or replaced by a new session: register it again "
+    "(POST /v1/browser_sessions/external) and pass the new id."
+)
+
+# HTTP error codes are separate from persisted failure_category reason codes, even where their values match.
+BROWSER_SESSION_EXPIRED_ERROR_CODE = "browser_session_expired"
+BROWSER_SESSION_CLOSED_ERROR_CODE = "browser_session_closed"
+BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE = "browser_session_startup_timeout"
+TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE = "too_many_starting_browser_sessions"
+
+
 class BrowserSessionClosed(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str, *, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        browser_session_id: str,
+        *,
+        reason: str | None = None,
+        registered: bool = False,
+        error_code: str = BROWSER_SESSION_CLOSED_ERROR_CODE,
+    ) -> None:
+        remedy = REREGISTER_EXTERNAL_BROWSER if registered else "Create a new browser session and retry."
         super().__init__(
-            f"Browser session {browser_session_id} {reason or 'is closed'}. Create a new browser session and retry.",
+            f"Browser session {browser_session_id} {reason or 'is closed'}. {remedy}",
             status_code=HTTPStatus.GONE,
+            error_code=error_code,
+        )
+
+
+def _utc_minute(moment: datetime) -> str:
+    aware = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    return aware.strftime("%Y-%m-%d %H:%M UTC")
+
+
+class BrowserSessionExpired(BrowserSessionClosed):
+    """The session ran out its configured lifetime. Carries the session facts that decide whether a run sent to it
+    is the caller's to fix (see the browser-lease seam in the workflow service)."""
+
+    def __init__(
+        self,
+        browser_session_id: str,
+        *,
+        started_at: datetime | None,
+        ended_at: datetime | None,
+        timeout_minutes: int | None,
+        created_by: str | None,
+        bound: bool = False,
+        refused_at_submission: bool = False,
+        registered: bool = False,
+    ) -> None:
+        self.browser_session_id = browser_session_id
+        self.started_at = started_at
+        self.ended_at = ended_at
+        self.timeout_minutes = timeout_minutes
+        self.created_by = created_by
+        self.bound = bound
+        if refused_at_submission and not registered:
+            SkyvernHTTPException.__init__(
+                self,
+                self.expired_before_run_message(run_created=False),
+                status_code=HTTPStatus.GONE,
+                error_code=BROWSER_SESSION_EXPIRED_ERROR_CODE,
+            )
+        else:
+            super().__init__(
+                browser_session_id,
+                reason="expired after reaching its configured lifetime",
+                registered=registered,
+                error_code=BROWSER_SESSION_EXPIRED_ERROR_CODE,
+            )
+
+    def expired_before_run_message(self, *, run_created: bool) -> str:
+        """States that the session ended before the run was submitted, so use it only once that is established."""
+        ended = f" at {_utc_minute(self.ended_at)}" if self.ended_at is not None else ""
+        limit = f"its {self.timeout_minutes}-minute limit" if self.timeout_minutes else "its configured lifetime"
+        outcome = "so the run did not start" if run_created else "so no run was created"
+        return (
+            f"Browser session {self.browser_session_id} expired{ended} after {limit}, before this run was submitted, "
+            f"{outcome}. To fix it: create a new browser session and pass its id, or leave browser_session_id empty "
+            "to start a fresh browser. To reuse one session for many runs, extend it before it ends "
+            "(POST /v1/browser_sessions/{browser_session_id}/extend, "
+            f"up to {MAX_EXTENDED_TIMEOUT // 60} hours in total)."
         )
 
 
@@ -1675,6 +1932,28 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         super().__init__(
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=HTTPStatus.NOT_FOUND,
+        )
+
+
+class ExternalBrowserUnavailable(SkyvernHTTPException):
+    def __init__(self, cause: str) -> None:
+        super().__init__(
+            f"The registered browser's CDP endpoint is unavailable: {cause}. "
+            "Check that the browser is still running and reachable from Skyvern, then retry.",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    @classmethod
+    def lost(cls) -> "ExternalBrowserUnavailable":
+        return cls("the browser is no longer reachable")
+
+
+class ExternalBrowserEndpointNotEncrypted(SkyvernHTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            "The registered browser's CDP endpoint, and any websocket it advertises, must use https:// or wss:// "
+            "outside local development.",
+            status_code=HTTPStatus.BAD_REQUEST,
         )
 
 
@@ -1702,8 +1981,21 @@ class BrowserSessionSwitchNotAllowed(SkyvernException):
 class BrowserSessionStartupTimeout(SkyvernHTTPException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(
-            f"Browser session {browser_session_id} failed to start within the timeout period.",
+            f"Browser session {browser_session_id} failed to start within the timeout period. "
+            "Create a new browser session and retry with its id.",
             status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            error_code=BROWSER_SESSION_STARTUP_TIMEOUT_ERROR_CODE,
+        )
+
+
+class TooManyStartingBrowserSessions(SkyvernHTTPException):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__(
+            "Too many browser sessions are starting for this organization at once. "
+            f"Retry in {retry_after_seconds} seconds.",
+            status_code=HTTPStatus.TOO_MANY_REQUESTS,
+            error_code=TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE,
+            headers={"Retry-After": str(retry_after_seconds)},
         )
 
 
@@ -1746,7 +2038,9 @@ class NoTOTPSecretFound(SkyvernException):
 
 
 class NoElementFound(SkyvernException):
-    def __init__(self) -> None:
+    def __init__(self, *, canvas_app: bool = False) -> None:
+        # Set when the page is an app that draws its interface on a canvas: it loaded, it just exposed nothing to read.
+        self.canvas_app = canvas_app
         super().__init__("No element found.")
 
 
@@ -1781,7 +2075,10 @@ class AzureConfigurationError(AzureBaseError):
 
 
 class ScriptTerminationException(SkyvernException):
-    def __init__(self, reason: str | None = None) -> None:
+    def __init__(
+        self, reason: str | None = None, *, user_defined_errors: list["UserDefinedError"] | None = None
+    ) -> None:
+        self.user_defined_errors = user_defined_errors
         super().__init__(reason)
 
 

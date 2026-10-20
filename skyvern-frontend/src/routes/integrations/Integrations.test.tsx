@@ -103,3 +103,30 @@ describe("Integrations reconnect", () => {
     expect(screen.getByRole("button", { name: /reconnect/i })).toBeTruthy();
   });
 });
+
+describe("Integrations Gmail", () => {
+  it("connects for reading only by default and adds sending to a connection in place", async () => {
+    installHook([
+      {
+        ...credential("goac_mail", "Mail Bot", "active"),
+        email_address: "mail@example.com",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+      },
+    ]);
+    render(<Integrations />);
+    const choices = screen.getByRole("group", { name: /What can Skyvern do/ });
+
+    fireEvent.click(choices.nextElementSibling!);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Enable send email for Mail Bot" }),
+    );
+
+    await waitFor(() => expect(mocks.startAuthorize).toHaveBeenCalledTimes(2));
+    expect(mocks.startAuthorize.mock.calls.map(([args]) => args)).toMatchObject(
+      [
+        { scope_profile: "gmail" },
+        { credential_id: "goac_mail", scope_profile: "gmail_send" },
+      ],
+    );
+  });
+});

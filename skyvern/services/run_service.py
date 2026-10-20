@@ -1,4 +1,7 @@
 import asyncio
+from collections.abc import Callable, Coroutine, Hashable
+from datetime import datetime, timedelta
+from typing import Any, TypeVar, TypeVarTuple
 
 import structlog
 from fastapi import HTTPException, status
@@ -6,12 +9,15 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.service import (
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
 )
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
 from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,
@@ -30,6 +36,40 @@ from skyvern.services import (
 )
 
 LOG = structlog.get_logger()
+
+# A cancel of a run live longer than this sends its final webhook at once rather than leaving it to the run's finalizer.
+CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING = timedelta(hours=4)
+
+T = TypeVar("T")
+Ts = TypeVarTuple("Ts")
+
+_IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
+
+
+async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
+    """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
+    reused. A caller that joins an in-flight build can get a result older than its own request."""
+    # The key is the whole call, so the build must take everything that changes its result as an argument.
+    key = (build, *args)
+    task = _IN_FLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(build(*args))
+        _IN_FLIGHT[key] = task
+
+        def _forget(done: asyncio.Task[T]) -> None:
+            if _IN_FLIGHT.get(key) is done:
+                del _IN_FLIGHT[key]
+            if not done.cancelled():
+                # Marks the exception retrieved so asyncio does not log it when every waiter cancelled.
+                done.exception()
+
+        task.add_done_callback(_forget)
+    # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
+    return await asyncio.shield(task)
+
+
+async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
+    return await coalesce_in_flight(get_run_response, run_id, organization_id, cap_output_values)
 
 
 async def get_run_response(
@@ -147,6 +187,24 @@ async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> No
         await uploaded_file_service.delete_files_attached_to_run(run_id=task_v2.workflow_run_id)
 
 
+async def _live_execution_sends_final_webhook(before_cancel: WorkflowRun, after_cancel: WorkflowRun) -> bool:
+    # A retried cancel reads the row its first request already canceled, while the run it stopped may still be live.
+    retried_cancel_of_started_run = (
+        before_cancel.status == WorkflowRunStatus.canceled and before_cancel.started_at is not None
+    )
+    if (
+        before_cancel.status not in (WorkflowRunStatus.running, WorkflowRunStatus.paused)
+        and not retried_cancel_of_started_run
+    ):
+        return False
+    if after_cancel.status != WorkflowRunStatus.canceled:
+        return False
+    live_since = to_naive_utc(before_cancel.started_at or before_cancel.created_at)
+    if live_since is None or naive_utc_now() - live_since > CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING:
+        return False
+    return await AsyncExecutorFactory.get_executor().sends_final_webhook_after_cancel(before_cancel)
+
+
 async def cancel_workflow_run(
     workflow_run_id: str, organization_id: str | None = None, api_key: str | None = None
 ) -> None:
@@ -156,6 +214,7 @@ async def cancel_workflow_run(
     )
     if not workflow_run:
         raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+    before_cancel = workflow_run
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
@@ -171,9 +230,58 @@ async def cancel_workflow_run(
         ]:
             continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if workflow_run.status.is_final() and attempt_rows:
+        latest_attempt = max(attempt_rows, key=lambda attempt: attempt.attempt_number)
+        await app.DATABASE.workflow_run_attempts.revoke_or_abandon_attempt(
+            workflow_run_id=workflow_run_id,
+            attempt_number=latest_attempt.attempt_number,
+            decision="revoked",
+            reason="cancel",
+        )
+        workflow_run = (
+            await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            or workflow_run
+        )
+
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if attempt_rows:
+        decision = await get_recorded_decision(workflow_run_id)
+        if decision is None:
+            attempt_number = max(attempt_rows, key=lambda attempt: attempt.attempt_number).attempt_number
+            decision = RetryDecision(False, attempt_number, 0, True, "cancel")
+        attempt = next((row for row in attempt_rows if row.attempt_number == decision.attempt_number), None)
+        side_effects_claim_at = getattr(attempt, "side_effects_released_at", None)
+        if isinstance(side_effects_claim_at, datetime):
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+                side_effects_claim_at=side_effects_claim_at,
+                side_effects_stale_before=naive_utc_now() - timedelta(seconds=LEASE_TAKEOVER_SECONDS),
+            )
+        else:
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+            )
+    else:
+        await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
+        # The execution's own webhook after teardown carries the run's downloaded files and recording.
+        if await _live_execution_sends_final_webhook(before_cancel, workflow_run):
+            LOG.info(
+                "Leaving the canceled run's final webhook to its execution",
+                workflow_run_id=workflow_run_id,
+                status_before_cancel=before_cancel.status,
+            )
+            return
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, finalizer="api_cancel")
 
 
 async def cancel_run(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:

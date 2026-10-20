@@ -300,6 +300,35 @@ describe("describeCodeBlockFailure", () => {
     });
   });
 
+  test("a machinery failure inside Skyvern is never the block's own raise", () => {
+    for (const exception of ["KeyError", "TimeoutError"]) {
+      const failure = describeCodeBlockFailure(
+        block({
+          failure_reason: `CodeBlock failed with ${exception} inside Skyvern while running line 3.`,
+        }),
+      );
+      expect(failure).toMatchObject({
+        kind: "infrastructure",
+        code: null,
+        line: 3,
+        recovery: "retry",
+      });
+      expect(failure?.title).not.toContain("raised");
+    }
+  });
+
+  test("a user exception whose message mimics the machinery wording stays a user-code failure", () => {
+    const failure = describeCodeBlockFailure(
+      block({
+        failure_reason:
+          "Failed to execute code block. Reason: ValueError: failed inside Skyvern while running line 999",
+        actions: [failedAction(3)],
+      }),
+    );
+    expect(failure).toMatchObject({ kind: "user-code", code: null, line: 3 });
+    expect(failure?.recovery).not.toBe("retry");
+  });
+
   test("falls back to the failing action's line when the reason has none", () => {
     expect(
       describeCodeBlockFailure(
@@ -416,7 +445,7 @@ describe("failureSupportsScreenshot", () => {
 });
 
 describe("guard denials under unsupported_page_operation", () => {
-  // All four guards report the same error code, so the code alone cannot pick the remedy.
+  // All five guards report the same error code, so the code alone cannot pick the remedy.
   // The regression these guard against: telling someone who exhausted the per-run operation
   // budget, or who navigated somewhere refused, to "use a supported page method" instead.
   const denial = (exceptionClass: string | null): FailedBlock =>
@@ -445,6 +474,20 @@ describe("guard denials under unsupported_page_operation", () => {
     expect(egress?.guidance).not.toMatch(/supported page method/i);
     expect(quota?.guidance).toMatch(/split the work|narrow/i);
     expect(egress?.guidance).toMatch(/url|destination/i);
+  });
+
+  test("a handle-table breach is told apart from the operation quota", () => {
+    const handles = describeCodeBlockFailure(
+      denial("codeblock.page_operation_broker.HandleLimitExceeded"),
+    );
+    const quota = describeCodeBlockFailure(
+      denial("codeblock.page_operation_broker.PageOperationLimitExceeded"),
+    );
+
+    expect(handles?.kind).toBe("limit");
+    expect(handles?.title).not.toBe(quota?.title);
+    expect(handles?.guidance).not.toMatch(/supported page method/i);
+    expect(handles?.guidance).toMatch(/browser (elements|objects)|handles/i);
   });
 
   test("an unrecognised or absent class still falls back to the generic denial", () => {

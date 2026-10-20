@@ -32,8 +32,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.47",
-                    "User-Agent": "@skyvern/client/1.0.47",
+                    "X-Fern-SDK-Version": "1.0.55",
+                    "User-Agent": "@skyvern/client/1.0.55",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -3744,6 +3744,102 @@ export class SkyvernClient {
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
                     "Timeout exceeded when calling POST /v1/browser_sessions/{browser_session_id}/close.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
+     *
+     * @param {string} browserSessionId - The ID of the browser session. browser_session_id starts with `pbs_`
+     * @param {Skyvern.ExtendBrowserSessionRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.ForbiddenError}
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.ConflictError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.extendBrowserSession("pbs_123456", {
+     *         additional_minutes: 1
+     *     })
+     */
+    public extendBrowserSession(
+        browserSessionId: string,
+        request: Skyvern.ExtendBrowserSessionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserSessionResponse> {
+        return core.HttpResponsePromise.fromPromise(
+            this.__extendBrowserSession(browserSessionId, request, requestOptions),
+        );
+    }
+
+    private async __extendBrowserSession(
+        browserSessionId: string,
+        request: Skyvern.ExtendBrowserSessionRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}/extend`,
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserSessionResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 403:
+                    throw new Skyvern.ForbiddenError(_response.error.body as unknown, _response.rawResponse);
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 409:
+                    throw new Skyvern.ConflictError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling POST /v1/browser_sessions/{browser_session_id}/extend.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({

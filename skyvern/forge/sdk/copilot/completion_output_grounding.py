@@ -11,6 +11,7 @@ from typing import Any, Literal, Protocol
 import structlog
 import yaml
 
+from skyvern.forge.sdk.copilot.challenge_evidence import CHALLENGE_FRAMES_KEY
 from skyvern.forge.sdk.copilot.completion_verification import CriterionVerdict, EvidenceSourceKind, RunEvidenceSnapshot
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
@@ -43,7 +44,10 @@ _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 _MIN_CARRIER_VALUE_CHARS = 4
 _MAX_CARRIER_TEXT_CHARS = 20_000
-_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"})
+# Keys the harness writes onto page evidence: facts about the capture, never page content.
+PAGE_EVIDENCE_STAMP_KEYS = frozenset(
+    {"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id", CHALLENGE_FRAMES_KEY}
+)
 
 
 class _GroundingCtx(Protocol):
@@ -512,7 +516,7 @@ def page_evidence_prose_text(evidence: Mapping[str, Any]) -> str:
     parts: list[str] = []
     total = 0
     for key, value in evidence.items():
-        if key in _PAGE_EVIDENCE_STAMP_KEYS:
+        if key in PAGE_EVIDENCE_STAMP_KEYS:
             continue
         for scalar in _iter_prose_scalars(value):
             parts.append(scalar)

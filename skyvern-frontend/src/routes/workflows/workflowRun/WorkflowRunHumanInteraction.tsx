@@ -3,8 +3,9 @@ import { Status as WorkflowRunStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
+import { HandIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import {
   Dialog,
@@ -39,12 +40,34 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
 
   const positiveLabel = workflowRunBlock.positive_descriptor || "Approve";
   const negativeLabel = workflowRunBlock.negative_descriptor || "Reject";
-
-  const buttonLayout =
-    positiveLabel.length < 8 && negativeLabel.length < 8 ? "inline" : "stacked";
+  const instructions =
+    workflowRunBlock.instructions ||
+    "The agent is paused and waiting for your review.";
 
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [choice, setChoice] = useState<"approve" | "reject" | null>(null);
+
+  const [expanded, setExpanded] = useState(false);
+  const [isCutOff, setIsCutOff] = useState(false);
+  const instructionsRef = useRef<HTMLParagraphElement>(null);
+
+  // The toggle only means something when the clamp is actually hiding text, so
+  // measure instead of guessing from the length.
+  useLayoutEffect(() => {
+    const element = instructionsRef.current;
+    if (!isAwaitingInteraction || !element || expanded) {
+      return;
+    }
+    const measure = () =>
+      setIsCutOff(element.scrollHeight > element.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [isAwaitingInteraction, expanded, instructions]);
 
   const approveMutation = useMutation({
     mutationFn: async () => {
@@ -115,7 +138,10 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
   }
 
   return (
-    <div className="mt-4 flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4">
+    <section
+      aria-label="Action needed"
+      className="flex shrink-0 flex-col gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3"
+    >
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
         <DialogContent>
           <DialogHeader>
@@ -148,35 +174,60 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
         </DialogContent>
       </Dialog>
 
-      <div className="text-sm">
-        {workflowRunBlock.instructions ||
-          "The agent is paused and waiting for your review."}
+      <div className="flex items-center gap-2">
+        <HandIcon className="size-5 shrink-0 text-amber-600 dark:text-amber-400" />
+        <span className="text-sm font-semibold">Your action is needed</span>
+        {workflowRunBlock.label ? (
+          <span className="ml-auto truncate font-mono text-xs text-muted-foreground">
+            {workflowRunBlock.label}
+          </span>
+        ) : null}
       </div>
-      <div
-        className={cn("flex gap-2", {
-          "justify-between": buttonLayout === "inline",
-          "flex-col": buttonLayout === "stacked",
-        })}
-      >
+      <div className="flex flex-col items-start gap-1">
+        <p
+          ref={instructionsRef}
+          id={`${workflowRunBlock.workflow_run_block_id}-instructions`}
+          className={cn("w-full whitespace-pre-line break-words text-sm", {
+            "line-clamp-3": !expanded,
+            "max-h-[8.75rem] overflow-y-auto overscroll-contain pr-1": expanded,
+          })}
+        >
+          {instructions}
+        </p>
+        {isCutOff || expanded ? (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={`${workflowRunBlock.workflow_run_block_id}-instructions`}
+            className="text-xs font-semibold text-amber-700 underline underline-offset-2 hover:text-amber-600 dark:text-amber-400 dark:hover:text-amber-300"
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        ) : null}
+      </div>
+      <div className="flex gap-2">
         <Button
-          variant="destructive"
+          variant="outline"
+          className="h-auto min-h-9 flex-1 whitespace-normal border-red-500/40 bg-transparent py-2 text-red-600 hover:bg-red-500/10 hover:text-red-600 dark:text-red-400 dark:hover:text-red-400"
           onClick={() => {
             setChoice("reject");
             setIsDialogOpen(true);
           }}
         >
-          <div>{negativeLabel}</div>
+          {negativeLabel}
         </Button>
         <Button
           variant="default"
+          className="h-auto min-h-9 flex-1 whitespace-normal py-2"
           onClick={() => {
             setChoice("approve");
             setIsDialogOpen(true);
           }}
         >
-          <div>{positiveLabel}</div>
+          {positiveLabel}
         </Button>
       </div>
-    </div>
+    </section>
   );
 }

@@ -8,11 +8,25 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
-import { AI_IMPROVE_CONFIGS } from "../../constants";
+import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
+import { type EmailTransport } from "@/routes/workflows/types/workflowTypes";
+import { GOOGLE_GMAIL_SEND_REQUIRED_SCOPES } from "@/util/googleScopes";
+
+import {
+  AI_IMPROVE_CONFIGS,
+  SKYVERN_DOWNLOAD_DIRECTORY,
+} from "../../constants";
 import { helpTooltips } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { EmailBodyFormatSelect } from "../components/EmailBodyFormatSelect";
@@ -29,6 +43,15 @@ function SendEmailEditor({ blockId }: { blockId: string }) {
   return <SendEmailEditorBody blockId={blockId} data={nodeSlice.data} />;
 }
 
+// Saving a workflow that sends only through Gmail removes these parameters, and
+// the server declares them again for an SMTP block that does not name them.
+const PLATFORM_SMTP_SECRET_FIELDS = [
+  ["smtpHostSecretParameterKey", "smtp_host"],
+  ["smtpPortSecretParameterKey", "smtp_port"],
+  ["smtpUsernameSecretParameterKey", "smtp_username"],
+  ["smtpPasswordSecretParameterKey", "smtp_password"],
+] as const;
+
 function SendEmailEditorBody({
   blockId,
   data,
@@ -43,20 +66,78 @@ function SendEmailEditorBody({
     body,
     bodyFormat,
     fileAttachments,
-    sender,
-    customSmtpHost,
-    customSmtpPort,
-    customSmtpUsername,
-    customSmtpPassword,
+    transport,
+    credentialId,
+    cc,
+    bcc,
   } = data;
   const update = useUpdate<SendEmailNode["data"]>({ id: blockId, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
+  const isGmail = transport === "gmail";
+
+  // The SMTP settings stay in the node while Gmail is selected, so switching back
+  // restores them; a Gmail block is saved without them.
+  const changeTransport = (next: EmailTransport) => {
+    if (next !== "gmail") {
+      update({ transport: next, credentialId: "", cc: "", bcc: "" });
+      return;
+    }
+    const namedPlatformSecrets = PLATFORM_SMTP_SECRET_FIELDS.filter(
+      ([field, key]) => data[field] === key,
+    );
+    update({
+      transport: next,
+      ...Object.fromEntries(
+        namedPlatformSecrets.map(([field]) => [field, undefined]),
+      ),
+    });
+  };
 
   return (
     <div data-testid="send-email-block-form" className="space-y-4 px-4 py-4">
       <div className="space-y-2">
+        <Label className="text-xs text-tertiary-foreground">Send with</Label>
+        <Select
+          value={transport}
+          onValueChange={(next) => changeTransport(next as EmailTransport)}
+          disabled={!editable}
+        >
+          <SelectTrigger
+            aria-label="Send with"
+            className="nopan text-xs"
+            data-testid="send-email-transport"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="smtp">SMTP</SelectItem>
+            <SelectItem value="gmail">Connected Gmail account</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {isGmail ? (
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-tertiary-foreground">
+              Gmail account
+            </Label>
+            <HelpTooltip content="The email is sent from this account. Only accounts connected for sending on the Integrations page are listed." />
+          </div>
+          <GoogleOAuthCredentialSelector
+            nodeId={blockId}
+            value={credentialId}
+            onChange={(value) => update({ credentialId: value })}
+            requiredScopes={GOOGLE_GMAIL_SEND_REQUIRED_SCOPES}
+            gmailSendOnly
+          />
+        </div>
+      ) : null}
+      <Separator />
+      <div className="space-y-2">
         <div className="flex justify-between">
-          <Label className="text-xs text-tertiary-foreground">Recipients</Label>
+          <Label className="text-xs text-tertiary-foreground">
+            {isGmail ? "To" : "Recipients"}
+          </Label>
           {isFirstWorkflowBlock ? (
             <div className="flex justify-end text-xs text-muted-foreground">
               Tip: Use the {"+"} button to add inputs!
@@ -64,6 +145,7 @@ function SendEmailEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInput
+          name="recipients"
           nodeId={blockId}
           onChange={(value) => update({ recipients: value })}
           value={recipients}
@@ -71,10 +153,35 @@ function SendEmailEditorBody({
           className="nopan text-xs"
         />
       </div>
+      {isGmail ? (
+        <>
+          <div className="space-y-2">
+            <Label className="text-xs text-tertiary-foreground">Cc</Label>
+            <WorkflowBlockInput
+              name="cc"
+              nodeId={blockId}
+              onChange={(value) => update({ cc: value })}
+              value={cc}
+              className="nopan text-xs"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label className="text-xs text-tertiary-foreground">Bcc</Label>
+            <WorkflowBlockInput
+              name="bcc"
+              nodeId={blockId}
+              onChange={(value) => update({ bcc: value })}
+              value={bcc}
+              className="nopan text-xs"
+            />
+          </div>
+        </>
+      ) : null}
       <Separator />
       <div className="space-y-2">
         <Label className="text-xs text-tertiary-foreground">Subject</Label>
         <WorkflowBlockInput
+          name="subject"
           nodeId={blockId}
           onChange={(value) => update({ subject: value })}
           value={subject}
@@ -92,6 +199,7 @@ function SendEmailEditorBody({
           />
         </div>
         <WorkflowBlockInputTextarea
+          name="body"
           aiImprove={AI_IMPROVE_CONFIGS.sendEmail.body}
           nodeId={blockId}
           onChange={(value) => update({ body: value })}
@@ -106,17 +214,62 @@ function SendEmailEditorBody({
           <Label className="text-xs text-tertiary-foreground">
             File Attachments
           </Label>
-          <HelpTooltip content={helpTooltips["sendEmail"]["fileAttachments"]} />
+          <HelpTooltip
+            content={
+              isGmail
+                ? "Comma-separated files to attach: file paths from this run, uploaded files or file URLs. Folders and the download directory are not attached."
+                : helpTooltips["sendEmail"]["fileAttachments"]
+            }
+          />
         </div>
-        <WorkflowBlockInput
-          nodeId={blockId}
-          value={fileAttachments}
-          onChange={(value) => update({ fileAttachments: value })}
-          disabled
-          hideParameterSelect
-          className="nopan text-xs"
-        />
+        {isGmail ? (
+          <WorkflowBlockInput
+            name="fileAttachments"
+            nodeId={blockId}
+            value={
+              fileAttachments === SKYVERN_DOWNLOAD_DIRECTORY
+                ? ""
+                : fileAttachments
+            }
+            onChange={(value) => update({ fileAttachments: value })}
+            className="nopan text-xs"
+          />
+        ) : (
+          <WorkflowBlockInput
+            name="fileAttachments"
+            nodeId={blockId}
+            value={fileAttachments}
+            onChange={(value) => update({ fileAttachments: value })}
+            disabled
+            hideParameterSelect
+            className="nopan text-xs"
+          />
+        )}
       </div>
+      {isGmail ? null : <SmtpAdvancedSettings blockId={blockId} data={data} />}
+    </div>
+  );
+}
+
+function SmtpAdvancedSettings({
+  blockId,
+  data,
+}: {
+  blockId: string;
+  data: SendEmailNode["data"];
+}) {
+  const {
+    editable,
+    sender,
+    customSmtpHost,
+    customSmtpPort,
+    customSmtpUsername,
+    customSmtpPassword,
+  } = data;
+  const update = useUpdate<SendEmailNode["data"]>({ id: blockId, editable });
+
+  return (
+    <>
       <Separator />
       <Accordion type="single" collapsible>
         <AccordionItem value="advanced" className="border-b-0">
@@ -133,6 +286,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="The From address for the email. When using a custom SMTP server below, set this to an address that server is allowed to send as." />
                 </div>
                 <WorkflowBlockInput
+                  name="sender"
                   nodeId={blockId}
                   onChange={(value) => update({ sender: value })}
                   value={sender}
@@ -156,6 +310,7 @@ function SendEmailEditorBody({
                   SMTP Host
                 </Label>
                 <WorkflowBlockInput
+                  name="customSmtpHost"
                   nodeId={blockId}
                   onChange={(value) => update({ customSmtpHost: value })}
                   value={customSmtpHost ?? ""}
@@ -171,6 +326,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="Numeric only. Defaults to 587 if left blank." />
                 </div>
                 <WorkflowBlockInput
+                  name="customSmtpPort"
                   nodeId={blockId}
                   onChange={(value) =>
                     update({ customSmtpPort: value.replace(/[^0-9]/g, "") })
@@ -192,6 +348,7 @@ function SendEmailEditorBody({
                   SMTP Username
                 </Label>
                 <WorkflowBlockInput
+                  name="customSmtpUsername"
                   nodeId={blockId}
                   onChange={(value) => update({ customSmtpUsername: value })}
                   value={customSmtpUsername ?? ""}
@@ -207,6 +364,7 @@ function SendEmailEditorBody({
                   <HelpTooltip content="Encrypted at rest on Skyvern Cloud and on self-hosted deployments with encryption keys configured; stored as-is otherwise. For Gmail, use an App Password. You can also reference a secret parameter." />
                 </div>
                 <WorkflowBlockInput
+                  name="customSmtpPassword"
                   nodeId={blockId}
                   type="password"
                   onChange={(value) => update({ customSmtpPassword: value })}
@@ -218,7 +376,7 @@ function SendEmailEditorBody({
           </AccordionContent>
         </AccordionItem>
       </Accordion>
-    </div>
+    </>
   );
 }
 

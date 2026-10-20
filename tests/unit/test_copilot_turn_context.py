@@ -508,6 +508,72 @@ def test_a_filename_shaped_like_a_credential_is_redacted_while_ordinary_names_su
     assert "[REDACTED_SECRET].csv (file_id: file_7)" in rendered
 
 
+def _goal_workflow_yaml(*, goal_needs_regeneration: bool | None) -> str:
+    stale = (
+        ""
+        if goal_needs_regeneration is None
+        else f"    goal_needs_regeneration: {str(goal_needs_regeneration).lower()}\n"
+    )
+    return (
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: get_invoice\n"
+        "    prompt: Download last month's invoice\n"
+        "    user_owned_goal: true\n"
+        f"{stale}"
+        "    code: |\n"
+        "      await page.goto(url)\n"
+    )
+
+
+def test_a_block_awaiting_a_goal_rebuild_reaches_the_prompt_as_a_fact() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="how long does this take to run?",
+            workflow_yaml=_goal_workflow_yaml(goal_needs_regeneration=True),
+        )
+    )
+
+    assert packet.user_goal_context is not None
+    assert packet.user_goal_context.block_labels == ["get_invoice"]
+
+    rendered = _build_user_context(
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message="how long does this take to run?",
+        user_goal_summary=packet.user_goal_context.rendered_summary,
+    )
+
+    assert "USER-WRITTEN GOALS NOT APPLIED YET" in rendered
+    assert "get_invoice" in rendered
+
+
+def test_a_user_owned_goal_already_rebuilt_carries_no_prompt_section() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            request_policy=RequestPolicy(),
+            user_message="how long does this take to run?",
+            workflow_yaml=_goal_workflow_yaml(goal_needs_regeneration=False),
+        )
+    )
+
+    assert packet.user_goal_context is None
+
+    rendered = _build_user_context(
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text="",
+        user_message="how long does this take to run?",
+    )
+
+    assert "USER-WRITTEN GOALS NOT APPLIED YET" not in rendered
+
+
 def test_a_secret_in_an_attachment_filename_never_reaches_the_prompt() -> None:
     """The filename is user-chosen text that bypasses the message safety screen, and it is replayed
     on every later turn — so the prompt boundary has to redact it like every other value."""

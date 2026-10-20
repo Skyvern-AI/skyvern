@@ -26,7 +26,7 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
         # Set health checks to wait until postgres has started
         options: >-
-          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+          --health-cmd "pg_isready -U skyvern" --health-interval 10s --health-timeout 5s --health-retries 5
         ports:
           # Maps tcp port 5432 on service container to the host
           - 5432:5432
@@ -108,7 +108,8 @@ jobs:
           OPENAI_API_KEY: "sk-dummy"
           AWS_ACCESS_KEY_ID: "dummy"
           AWS_SECRET_ACCESS_KEY: "dummy"
-        run: uv run pytest
+        # pytest.ini streams all test output (--capture=no) for local runs; CI prints output only for failing tests.
+        run: uv run pytest --capture=fd --disable-warnings
   fe-lint-build:
     name: Frontend Lint and Build
     runs-on: ubuntu-latest

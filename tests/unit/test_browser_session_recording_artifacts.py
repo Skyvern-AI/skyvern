@@ -434,45 +434,6 @@ async def test_get_shared_recordings_sorts_newest_first(keyring_configured):
 
 
 @pytest.mark.asyncio
-async def test_get_shared_recordings_falls_back_to_presigned_for_legacy_session(keyring_configured):
-    """Legacy session: no RECORDING rows. Files in S3 still surface as presigned
-    URLs via the listing fallback so existing recordings remain reachable."""
-    storage = S3Storage()
-    storage.async_client = MagicMock()
-    s3_key = "v1/local/o_1/browser_sessions/pbs_old/videos/2026-04-26/legacy.webm"
-    storage.async_client.list_files = AsyncMock(return_value=[s3_key])
-    storage.async_client.get_object_info = AsyncMock(
-        return_value={
-            "Metadata": {"sha256_checksum": "sha-old"},
-            "LastModified": None,
-            "ContentLength": 1024,
-        }
-    )
-    storage.async_client.create_presigned_urls = AsyncMock(
-        return_value=["https://skyvern-artifacts.s3.amazonaws.com/...?sig=old"]
-    )
-
-    mock_list = AsyncMock(return_value=[])  # no rows
-    resolve_url = AsyncMock()  # must NOT be called
-
-    with (
-        patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app,
-        patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
-    ):
-        s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-        base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
-        base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
-        result = await storage.get_shared_recordings_in_browser_session(
-            organization_id="o_1", browser_session_id="pbs_old"
-        )
-
-    assert len(result) == 1
-    assert _is_amazonaws_s3_url(result[0].url)
-    assert result[0].file_size == 1024
-    resolve_url.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_get_shared_recordings_keyring_unset_skips_artifact_lookup():
     """OSS default (no keyring) skips the artifact path — webhook consumers
     can't hit the signed endpoint without an API key."""

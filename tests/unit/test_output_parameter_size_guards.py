@@ -4,23 +4,32 @@
 - ``_maybe_truncate_loop_outputs`` (Layer 2: loop accumulator OOM guard)
 - ``_trim_branch_evaluations`` / ``_cap_debug_field`` (Layer 3: DecisionBlock filter)
 - ``truncate_oversized_response_value`` (Layer 4: run-detail API read path)
+- ``capped_jsonb_write`` / ``prefer_capped`` reads (Layer 5: capped copy stored at write
+  time so a run-detail read costs the size of the cap, not the size of the value )
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.orm import undefer
 
 from skyvern.constants import SKYVERN_UI_USER_AGENT
-from skyvern.forge.sdk.db.utils import _custom_json_serializer, truncate_oversized_jsonb_value
+from skyvern.forge.sdk.db.models import WorkflowRunBlockModel, WorkflowRunOutputParameterModel
+from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+from skyvern.forge.sdk.db.utils import _custom_json_serializer, capped_jsonb_write, truncate_oversized_jsonb_value
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.trigger_type import caps_run_response_values
 from skyvern.forge.sdk.schemas.task_v2 import Thought
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.block import (
     DECISION_BLOCK_FIELD_MAX_BYTES,
@@ -28,20 +37,23 @@ from skyvern.forge.sdk.workflow.models.block import (
     _maybe_truncate_loop_outputs,
     _trim_branch_evaluations,
 )
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
     WorkflowRun,
+    WorkflowRunOutputParameter,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.forge.sdk.workflow.service import WorkflowService, truncate_oversized_response_value
+from skyvern.forge.sdk.workflow.response_value_caps import truncate_oversized_response_value
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import RunType
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import run_service, task_v2_service
-from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, InputTextAction
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 # ---------- Layer 1: truncate_oversized_jsonb_value ----------
 
@@ -271,7 +283,7 @@ def test_truncate_oversized_response_value_passes_small_value_through() -> None:
 def test_truncate_oversized_response_value_returns_marker_above_cap() -> None:
     cap = 64 * 1024
     big = ["x" * 1024 for _ in range(cap // 512)]
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(big, workflow_run_id="wr_x", output_key="sheet_read_output")
     # Entries that fit are kept; the trailing marker is what makes the drop explicit.
     marker = result[-1]
@@ -292,13 +304,13 @@ def test_truncate_oversized_response_value_fails_open_on_serialization_error() -
             raise RuntimeError("boom")
 
     value: Any = {"u": _Unencodable()}
-    with patch("skyvern.forge.sdk.workflow.service.LOG") as log:
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.LOG") as log:
         assert truncate_oversized_response_value(value, workflow_run_id="wr_x") is value
     log.warning.assert_called_once()
 
 
 def test_truncate_oversized_response_value_fast_path_skips_serialization_for_scalars() -> None:
-    with patch("skyvern.forge.sdk.workflow.service.json.dumps") as dumps:
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.json.dumps") as dumps:
         for v in (None, True, False, 0, 42, 3.14):
             assert truncate_oversized_response_value(v) is v
         dumps.assert_not_called()
@@ -327,7 +339,7 @@ async def test_get_workflow_run_timeline_caps_oversized_block_output(monkeypatch
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -351,6 +363,7 @@ async def _build_status_response(
     output_value: Any = None,
     refresh_output_urls: Any = None,
     failure_reason: str | None = None,
+    precomputed_extracted_information: list[Any] | None = None,
 ) -> WorkflowRunResponseBase:
     now = datetime.now(timezone.utc)
     workflow = Workflow(
@@ -376,7 +389,13 @@ async def _build_status_response(
         modified_at=now,
     )
     output_parameter = SimpleNamespace(key="sheet_read_output")
-    output = SimpleNamespace(value=_oversized_value(cap) if output_value is None else output_value)
+    output = WorkflowRunOutputParameter(
+        workflow_run_id="wr_1",
+        output_parameter_id="op_1",
+        value=_oversized_value(cap) if output_value is None else output_value,
+        created_at=now,
+        precomputed_extracted_information=precomputed_extracted_information,
+    )
 
     monkeypatch.setattr(
         workflow_service_module.app,
@@ -390,9 +409,10 @@ async def _build_status_response(
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
                 get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
+            workflow_run_attempts=make_workflow_run_attempts_fake(),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     service = WorkflowService()
     monkeypatch.setattr(service, "get_workflow_run", AsyncMock(return_value=workflow_run))
@@ -478,7 +498,7 @@ async def test_task_run_response_caps_failure_reason_only_when_opted_in(monkeypa
     monkeypatch.setattr(run_service.task_v1_service, "get_task_v1_response", AsyncMock(return_value=task_v1_response))
     monkeypatch.setattr(run_service, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(run_service, "TaskRunRequest", lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     capped = await run_service.get_run_response("tsk_1", organization_id="o_1", cap_output_values=True)
     assert capped is not None
@@ -495,7 +515,7 @@ def test_truncate_oversized_response_value_measures_non_ascii_at_wire_size() -> 
     value = {"text": "世" * 15000}
     assert len(json.dumps(value, ensure_ascii=False).encode("utf-8")) < cap
     assert len(json.dumps(value).encode("utf-8")) > cap
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         assert truncate_oversized_response_value(value, workflow_run_id="wr_x") is value
 
 
@@ -507,7 +527,7 @@ def test_truncate_oversized_response_value_keeps_small_siblings_of_an_oversized_
         "downloaded_file_urls": ["https://example.com/a.pdf"],
         "workflow_run_id": "wr_child_1",
     }
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
     assert result["downloaded_file_urls"] == ["https://example.com/a.pdf"]
     assert result["workflow_run_id"] == "wr_child_1"
@@ -522,7 +542,7 @@ def test_truncate_oversized_response_value_reserves_budget_for_siblings_of_a_lar
         "downloaded_file_urls": [f"https://example.com/{index}/{'a' * 96}" for index in range(12)],
         "task_screenshot_artifact_ids": [f"artifact_{index}_{'b' * 32}" for index in range(12)],
     }
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
 
     assert result["downloaded_file_urls"] == value["downloaded_file_urls"]
@@ -539,7 +559,7 @@ def test_truncate_oversized_response_value_reserves_budget_for_later_list_elemen
         "task_screenshot_artifact_ids": [f"artifact_{index}_{'b' * 32}" for index in range(12)],
     }
     value = [["x" * 1024 for _ in range(200)], later_metadata]
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
 
     assert result[1] == later_metadata
@@ -551,9 +571,9 @@ def test_truncate_oversized_response_value_marks_whole_value_when_no_single_entr
     """Many medium siblings — trimming per-entry can't get under the cap, so mark the whole value."""
     cap = 64 * 1024
     value = {f"k{i}": "x" * (cap // 4) for i in range(8)}
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
-    marker = result[workflow_service_module.TRUNCATION_MARKER_KEY]
+    marker = result[response_value_caps.TRUNCATION_MARKER_KEY]
     assert marker["truncated"] is True
     assert marker["reason"] == "exceeded_max_run_response_value_size"
     # Some siblings survive rather than the whole dict collapsing.
@@ -582,7 +602,7 @@ def test_truncate_oversized_response_value_measures_at_compact_separator_size() 
     wire = len(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     padded = len(json.dumps(rows, ensure_ascii=False).encode("utf-8"))
     assert wire < cap < padded, "fixture must straddle the cap between the two encodings"
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         assert truncate_oversized_response_value(rows, workflow_run_id="wr_x") is rows
 
 
@@ -602,8 +622,8 @@ def test_truncate_oversized_response_value_stops_descending_past_the_depth_cap()
         return real_dumps(*args, **kwargs)
 
     with (
-        patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap),
-        patch("skyvern.forge.sdk.workflow.service.json.dumps", side_effect=counting_dumps),
+        patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap),
+        patch("skyvern.forge.sdk.workflow.response_value_caps.json.dumps", side_effect=counting_dumps),
     ):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
 
@@ -637,7 +657,7 @@ async def test_get_workflow_run_timeline_caps_oversized_loop_values(monkeypatch:
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -648,7 +668,7 @@ async def test_get_workflow_run_timeline_caps_oversized_loop_values(monkeypatch:
     assert isinstance(loop_values, list)
     # 200/200, not 200/1: the run-detail page reads its iteration count off this length.
     assert len(loop_values) == 200
-    assert loop_values[0] == workflow_service_module.LOOP_VALUE_TRUNCATED_PLACEHOLDER
+    assert loop_values[0] == response_value_caps.LOOP_VALUE_TRUNCATED_PLACEHOLDER
     assert len(json.dumps(loop_values, separators=(",", ":")).encode("utf-8")) <= cap
 
 
@@ -709,7 +729,7 @@ def test_truncate_oversized_response_value_preserves_list_envelope() -> None:
         [{"output_value": {"downloaded_file_urls": [f"https://example.com/{i}.pdf"]}}] for i in range(3)
     ]
     iterations[1][0]["output_value"]["blob"] = "x" * (cap * 2)
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(iterations, workflow_run_id="wr_x")
     assert isinstance(result, list) and len(result) == 3
     # Untouched iterations keep their nested per-block data.
@@ -744,7 +764,7 @@ def test_truncate_oversized_response_value_preserves_nested_loop_output_envelope
         ]
     ]
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(loop_output, workflow_run_id="wr_x")
 
     output_value = result[0][0]["output_value"]
@@ -771,7 +791,7 @@ def test_truncate_oversized_response_value_reserves_loop_envelope_overhead() -> 
     assert len(json.dumps(entry["output_value"], separators=(",", ":")).encode("utf-8")) < cap
     assert len(json.dumps(value, separators=(",", ":")).encode("utf-8")) > cap
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
 
     capped_entry = result[0][0]
@@ -792,7 +812,7 @@ def test_truncate_oversized_response_value_bounds_nested_loop_envelope_depth() -
             "output_value": nested_output,
         }
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value([[nested_output]], workflow_run_id="wr_x")
 
     assert json.dumps(result, separators=(",", ":")).count('"output_value"') < 12
@@ -824,7 +844,7 @@ async def test_get_workflow_run_timeline_caps_navigation_payload_and_data_schema
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -848,8 +868,8 @@ def test_truncate_oversized_response_value_bails_out_before_serializing_every_el
         return real_dumps(*args, **kwargs)
 
     with (
-        patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap),
-        patch("skyvern.forge.sdk.workflow.service.json.dumps", side_effect=counting_dumps),
+        patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap),
+        patch("skyvern.forge.sdk.workflow.response_value_caps.json.dumps", side_effect=counting_dumps),
     ):
         result = truncate_oversized_response_value(rows, workflow_run_id="wr_x")
 
@@ -867,7 +887,7 @@ def test_truncate_oversized_response_value_counts_dict_keys_and_separators() -> 
     real = len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
     assert children_only < cap < real, (children_only, cap, real)
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(value, workflow_run_id="wr_x")
 
     # Whatever comes back must actually fit on the wire.
@@ -896,7 +916,7 @@ async def test_get_workflow_run_timeline_caps_current_value(monkeypatch: pytest.
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -946,7 +966,7 @@ async def test_get_workflow_run_timeline_leaves_blocks_untouched_for_api_callers
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(workflow_run_id="wr_1", organization_id="o_1")
 
@@ -956,12 +976,12 @@ async def test_get_workflow_run_timeline_leaves_blocks_untouched_for_api_callers
 def test_capped_loop_values_keeps_placeholder_list_under_the_cap() -> None:
     """At ~150k iterations even one placeholder each overruns the cap."""
     cap = 64 * 1024
-    placeholder_cost = len(json.dumps(workflow_service_module.LOOP_VALUE_TRUNCATED_PLACEHOLDER)) + 1
+    placeholder_cost = len(json.dumps(response_value_caps.LOOP_VALUE_TRUNCATED_PLACEHOLDER)) + 1
     count = (cap // placeholder_cost) + 500
     loop_values = [{"row": i, "pad": "x" * 64} for i in range(count)]
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
-        result = workflow_service_module._capped_loop_values(loop_values, workflow_run_id="wr_x")
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        result = response_value_caps.capped_loop_values(loop_values, workflow_run_id="wr_x")
 
     assert result is not None
     assert len(json.dumps(result, separators=(",", ":")).encode("utf-8")) <= cap
@@ -976,7 +996,7 @@ def test_capped_response_text_measures_at_json_wire_size() -> None:
     value = '"' * (cap - 1000)
     assert len(value.encode("utf-8")) < cap < len(json.dumps(value).encode("utf-8"))
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = workflow_service_module.truncate_oversized_response_text(value)
 
     assert isinstance(result, str)
@@ -994,7 +1014,7 @@ def test_truncate_oversized_response_value_keeps_rows_from_a_marginally_oversize
     rows = [list(row) for _ in range(count)]
     assert len(json.dumps(rows, separators=(",", ":")).encode("utf-8")) > cap
 
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
         result = truncate_oversized_response_value(rows, workflow_run_id="wr_x")
 
     marker = result[-1]
@@ -1010,7 +1030,7 @@ def test_truncate_oversized_response_value_never_drops_entries_without_a_marker(
     cap = 64 * 1024
     for row_size in (256, 512, 1024, 2048):
         rows = [{"pad": "x" * row_size} for _ in range(400)]
-        with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
             result = truncate_oversized_response_value(rows, workflow_run_id="wr_x")
         if isinstance(result, list) and len(result) < len(rows):
             assert result[-1].get("truncated") is True, f"silent drop at row_size={row_size}"
@@ -1033,7 +1053,7 @@ async def test_get_task_v2_caps_output_for_the_app_only(monkeypatch: pytest.Monk
         model_dump=lambda by_alias: {"output": stored_output},
     )
     monkeypatch.setattr(agent_protocol.task_v2_service, "get_task_v2", AsyncMock(return_value=task_v2), raising=False)
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
     organization = SimpleNamespace(organization_id="o_1")
     assert now is not None
 
@@ -1071,7 +1091,7 @@ async def test_get_task_v1_caps_extracted_information_for_the_app_only(monkeypat
         AsyncMock(return_value=task_response),
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", MagicMock())
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
     organization = SimpleNamespace(organization_id="o_1")
 
     from_app = await agent_protocol.get_task_v1(
@@ -1158,7 +1178,7 @@ async def test_get_workflow_run_timeline_caps_unbounded_text_fields(monkeypatch:
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -1176,8 +1196,8 @@ def test_capped_text_list_keeps_every_element_a_string() -> None:
     """recipients/attachments are list[str]; a marker dict inside them breaks the type."""
     cap = 4 * 1024
     values = ["a" * (cap * 2) + "@example.com", "small@example.com"]
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
-        result = workflow_service_module._capped_text_list(values, workflow_run_id="wr_x")
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        result = response_value_caps.capped_text_list(values, workflow_run_id="wr_x")
     assert result is not None
     assert all(isinstance(v, str) for v in result), [type(v).__name__ for v in result]
     assert len(json.dumps(result, separators=(",", ":")).encode("utf-8")) <= cap
@@ -1186,8 +1206,8 @@ def test_capped_text_list_keeps_every_element_a_string() -> None:
 def test_capped_text_list_marker_is_a_string_when_many_entries_drop() -> None:
     cap = 4 * 1024
     values = [f"{'x' * 200}{i}@example.com" for i in range(200)]
-    with patch("skyvern.forge.sdk.workflow.service.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
-        result = workflow_service_module._capped_text_list(values, workflow_run_id="wr_x")
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        result = response_value_caps.capped_text_list(values, workflow_run_id="wr_x")
     assert result is not None
     assert all(isinstance(v, str) for v in result)
     assert "truncated" in result[-1]
@@ -1200,6 +1220,48 @@ def test_timeline_block_list_fields_never_receive_a_marker_dict() -> None:
         annotation = str(WorkflowRunBlock.model_fields[field].annotation)
         assert "str" in annotation and "dict" not in annotation, f"{field}: {annotation}"
         assert field not in workflow_service_module.UNBOUNDED_BLOCK_JSON_FIELDS
+
+
+# Action fields a reader could mistake for free text but which are bounded by construction, plus
+# the two structured fields capped separately as JSON.
+_EXEMPT_ACTION_FIELDS = {
+    "action_id",
+    "source_action_id",
+    "organization_id",
+    "workflow_run_id",
+    "task_id",
+    "step_id",
+    "created_by",
+    "element_id",
+    "skyvern_element_hash",
+    "screenshot_artifact_id",
+    "tool_call_id",
+    "xpath",  # a locator; a truncated one no longer locates anything
+    "downloaded_files",  # one short name per file the run actually downloaded
+    "totp_timing_info",  # fixed-shape record of ints and timestamps
+    "skyvern_element_data",  # capped as JSON by cap_action_payloads
+    "output",  # capped as JSON by cap_action_payloads
+}
+
+
+def test_action_text_field_coverage() -> None:
+    """A new free-text field on Action must be capped or explicitly exempted.
+
+    ``data_extraction_goal`` and ``description`` shipped uncapped for exactly this reason: they have
+    no ActionModel column, hydration restores them from ``action_json``, and the cap list had been
+    extended a field at a time. Excluded fields are skipped -- they never reach the wire.
+    """
+    capped = set(workflow_service_module.ACTION_TEXT_FIELDS)
+    unbounded_types = {
+        name for name, field in Action.model_fields.items() if not field.exclude and "str" in str(field.annotation)
+    }
+
+    uncovered = unbounded_types - capped - _EXEMPT_ACTION_FIELDS
+    assert not uncovered, (
+        f"Action fields can hold unbounded content but are neither capped nor exempt: "
+        f"{sorted(uncovered)}. Add them to ACTION_TEXT_FIELDS, or to _EXEMPT_ACTION_FIELDS "
+        f"with a reason."
+    )
 
 
 @pytest.mark.asyncio
@@ -1215,8 +1277,8 @@ async def test_get_workflow_run_timeline_caps_action_text(monkeypatch: pytest.Mo
         created_at=now,
         modified_at=now,
     )
-    action = Action(
-        action_type=ActionType.INPUT_TEXT,
+    action = InputTextAction(
+        element_id="street",
         task_id="tsk_1",
         response="r" * (cap * 3),
         text="t" * (cap * 3),
@@ -1229,7 +1291,7 @@ async def test_get_workflow_run_timeline_caps_action_text(monkeypatch: pytest.Mo
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[action])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -1262,7 +1324,7 @@ async def test_get_thought_timelines_caps_text_fields_when_opted_in(monkeypatch:
         "DATABASE",
         SimpleNamespace(observer=SimpleNamespace(get_thoughts=AsyncMock(return_value=[thought]))),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     capped = await task_v2_service.get_thought_timelines(
         task_v2_id="tsk_v2_1", organization_id="o_1", cap_output_values=True
@@ -1300,7 +1362,7 @@ async def test_get_workflow_run_timeline_preserves_string_list_field_types(
             tasks=SimpleNamespace(get_tasks_actions=AsyncMock(return_value=[])),
         ),
     )
-    monkeypatch.setattr(workflow_service_module, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
     timeline = await WorkflowService().get_workflow_run_timeline(
         workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
@@ -1313,3 +1375,355 @@ async def test_get_workflow_run_timeline_preserves_string_list_field_types(
         assert all(isinstance(value, str) for value in values), field
         assert "[truncated" in values[-1], field
         assert len(json.dumps(values, separators=(",", ":")).encode("utf-8")) <= cap, field
+
+
+# ---------- Layer 5: capped copy written once, read without the whole value ----------
+
+
+class _NoTasks:
+    async def get_task(self, task_id: str, organization_id: str | None = None) -> None:
+        return None
+
+    async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Any]:
+        return []
+
+
+def _oversized_sheet_rows(cap: int) -> dict[str, Any]:
+    """A sheet-read shape: many small rows, each with the per-cell formatting that drives size."""
+    return {
+        "rows": [
+            {"cell": f"value-{index}", "format": {"bold": False, "fontFamily": "Arial", "fontSize": 10}}
+            for index in range(cap // 64)
+        ],
+        "extracted_information": [{"row": index} for index in range(5)],
+    }
+
+
+@pytest.mark.asyncio
+async def test_capped_read_returns_the_stored_capped_copy_and_leaves_the_value_whole(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of the write-time cap: a capped read never has to walk the whole value."""
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = WorkflowRunsRepository(session_factory=factory)
+    value = _oversized_sheet_rows(cap)
+
+    await repo.create_or_update_workflow_run_output_parameter(
+        workflow_run_id="wr_1", output_parameter_id="op_1", value=value
+    )
+
+    async with factory() as session:
+        row = (
+            await session.scalars(
+                select(WorkflowRunOutputParameterModel)
+                .options(
+                    undefer(WorkflowRunOutputParameterModel.capped_value),
+                    undefer(WorkflowRunOutputParameterModel.capped_extracted_information),
+                )
+                .filter_by(output_parameter_id="op_1")
+            )
+        ).one()
+        assert row.value == value, "the whole value stays authoritative for SDK and webhook reads"
+        assert len(json.dumps(row.capped_value, separators=(",", ":")).encode("utf-8")) <= cap
+
+    capped = await repo.get_workflow_run_output_parameters("wr_1", prefer_capped=True)
+    assert capped[0].value == row.capped_value
+    assert capped[0].value["rows"][-1]["truncated"] is True
+    # Capping drops most rows, so the extracted information has to come from the write.
+    assert capped[0].precomputed_extracted_information == [{"row": index} for index in range(5)]
+
+    uncapped = await repo.get_workflow_run_output_parameters("wr_1")
+    assert uncapped[0].value == value
+
+
+@pytest.mark.asyncio
+async def test_capped_read_falls_back_to_the_value_for_rows_written_before_the_capped_column(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows without a capped copy still have to trim the raw value on the fly."""
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    value = _oversized_sheet_rows(cap)
+    async with factory() as session:
+        session.add(
+            WorkflowRunOutputParameterModel(workflow_run_id="wr_legacy", output_parameter_id="op_1", value=value)
+        )
+        await session.commit()
+
+    capped = await WorkflowRunsRepository(session_factory=factory).get_workflow_run_output_parameters(
+        "wr_legacy", prefer_capped=True
+    )
+
+    assert capped[0].value == value
+    assert capped[0].precomputed_extracted_information is None
+
+
+@pytest.mark.asyncio
+async def test_capped_timeline_read_returns_the_stored_capped_block_output(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = ObserverRepository(session_factory=factory, task_reader=_NoTasks())
+    output = _oversized_sheet_rows(cap)
+
+    created = await repo.create_workflow_run_block(
+        workflow_run_id="wr_1", organization_id="o_1", block_type=BlockType.ACTION, output=output
+    )
+
+    async with factory() as session:
+        row = (
+            await session.scalars(
+                select(WorkflowRunBlockModel)
+                .options(undefer(WorkflowRunBlockModel.capped_output))
+                .filter_by(workflow_run_block_id=created.workflow_run_block_id)
+            )
+        ).one()
+        assert row.output == output
+
+    capped = await repo.get_workflow_run_blocks(workflow_run_id="wr_1", organization_id="o_1", prefer_capped=True)
+    assert capped[0].output == row.capped_output
+    assert capped[0].output["rows"][-1]["truncated"] is True
+
+    uncapped = await repo.get_workflow_run_blocks(workflow_run_id="wr_1", organization_id="o_1")
+    assert uncapped[0].output == output
+
+
+@pytest.mark.asyncio
+async def test_run_detail_services_pass_capped_reads_to_real_repositories(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    workflow_runs = WorkflowRunsRepository(session_factory=factory)
+    observer = ObserverRepository(session_factory=factory, task_reader=_NoTasks())
+    value = _oversized_value(cap)
+    now = datetime.now(UTC)
+
+    await workflow_runs.create_or_update_workflow_run_output_parameter("wr_1", "op_1", value)
+    created_block = await observer.create_workflow_run_block(
+        workflow_run_id="wr_1",
+        organization_id="o_1",
+        block_type=BlockType.GOOGLE_SHEETS_READ,
+        output=value,
+    )
+    async with factory() as session:
+        parameter = (
+            await session.scalars(
+                select(WorkflowRunOutputParameterModel)
+                .options(
+                    undefer(WorkflowRunOutputParameterModel.capped_value),
+                    undefer(WorkflowRunOutputParameterModel.capped_extracted_information),
+                )
+                .filter_by(workflow_run_id="wr_1", output_parameter_id="op_1")
+            )
+        ).one()
+        parameter.capped_value = {"source": "cached status output"}
+        parameter.capped_extracted_information = [{"source": "cached aggregate"}]
+        block = await session.get(WorkflowRunBlockModel, created_block.workflow_run_block_id)
+        assert block is not None
+        block.capped_output = {"source": "cached timeline output"}
+        await session.commit()
+
+    output_parameter = OutputParameter(
+        output_parameter_id="op_1",
+        workflow_id="w_1",
+        key="sheet_read_output",
+        created_at=now,
+        modified_at=now,
+    )
+    workflow = Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="T",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[output_parameter], blocks=[]),
+        created_at=now,
+        modified_at=now,
+        status=WorkflowStatus.published,
+    )
+    workflow_run = WorkflowRun(
+        workflow_run_id="wr_1",
+        workflow_id="w_1",
+        workflow_permanent_id="wpid_1",
+        organization_id="o_1",
+        status=WorkflowRunStatus.completed,
+        created_at=now,
+        modified_at=now,
+    )
+    workflow_runs.get_workflow_run_parameters = AsyncMock(return_value=[])
+    workflow_runs.get_workflow_run_block_errors = AsyncMock(return_value=[])
+    workflow_runs.get_workflow_run_retried_by = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        workflow_service_module.app,
+        "DATABASE",
+        SimpleNamespace(
+            workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
+            workflow_runs=workflow_runs,
+            workflow_params=SimpleNamespace(get_workflow_output_parameters_by_ids=AsyncMock(return_value=[])),
+            workflow_run_attempts=make_workflow_run_attempts_fake(),
+            observer=observer,
+            tasks=SimpleNamespace(
+                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_tasks_actions=AsyncMock(return_value=[]),
+            ),
+        ),
+    )
+    service = WorkflowService()
+    monkeypatch.setattr(service, "get_recent_workflow_screenshot_urls", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_fetch_recording_urls", AsyncMock(return_value=([], False)))
+    monkeypatch.setattr(service, "_fetch_downloaded_files", AsyncMock(return_value=([], None)))
+    monkeypatch.setattr(service, "_refresh_output_urls", AsyncMock(side_effect=lambda values, **_: values))
+
+    response = await service.build_workflow_run_status_response(
+        workflow_permanent_id="wpid_1",
+        workflow_run_id="wr_1",
+        organization_id="o_1",
+        cap_output_values=True,
+        workflow_run=workflow_run,
+    )
+    timeline = await service.get_workflow_run_timeline(
+        workflow_run_id="wr_1", organization_id="o_1", cap_output_values=True
+    )
+
+    assert response.outputs["sheet_read_output"] == {"source": "cached status output"}
+    assert response.outputs["extracted_information"] == [{"source": "cached aggregate"}]
+    assert timeline[0].block is not None
+    assert timeline[0].block.output == {"source": "cached timeline output"}
+
+
+@pytest.mark.asyncio
+async def test_rewriting_a_block_output_under_the_cap_clears_the_stale_capped_copy(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A block is written repeatedly as it runs; a stale capped copy would shadow the final output."""
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = ObserverRepository(session_factory=factory, task_reader=_NoTasks())
+    created = await repo.create_workflow_run_block(
+        workflow_run_id="wr_1", organization_id="o_1", block_type=BlockType.ACTION, output=_oversized_sheet_rows(cap)
+    )
+
+    await repo.update_workflow_run_block(
+        workflow_run_block_id=created.workflow_run_block_id, organization_id="o_1", output={"rows": ["final"]}
+    )
+
+    capped = await repo.get_workflow_run_blocks(workflow_run_id="wr_1", organization_id="o_1", prefer_capped=True)
+    assert capped[0].output == {"rows": ["final"]}
+
+
+@pytest.mark.asyncio
+async def test_rewriting_an_output_parameter_under_the_cap_clears_the_stale_capped_copy(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 64 * 1024
+    monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = WorkflowRunsRepository(session_factory=factory)
+    await repo.create_or_update_workflow_run_output_parameter("wr_1", "op_1", _oversized_sheet_rows(cap))
+
+    await repo.update_workflow_run_output_parameter("wr_1", "op_1", {"rows": ["final"]})
+
+    capped = await repo.get_workflow_run_output_parameters("wr_1", prefer_capped=True)
+    assert capped[0].value == {"rows": ["final"]}
+
+
+@pytest.mark.asyncio
+async def test_status_response_reuses_the_extracted_information_recorded_at_write_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capped read loads only the capped copy, so the walk for extracted_information is gone."""
+    cap = 64 * 1024
+    response = await _build_status_response(
+        monkeypatch,
+        cap=cap,
+        cap_output_values=True,
+        output_value={"rows": [{"kept": 1}]},
+        precomputed_extracted_information=[{"row": index} for index in range(60)],
+    )
+    assert [entry["row"] for entry in response.outputs["extracted_information"]] == list(range(60))
+
+
+@pytest.mark.asyncio
+async def test_an_uncapped_read_collects_extracted_information_from_the_whole_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Webhook delivery and SDK reads keep full fidelity, so they must not use the capped list."""
+    cap = 64 * 1024
+    response = await _build_status_response(
+        monkeypatch,
+        cap=cap,
+        cap_output_values=False,
+        output_value={"iterations": [{"extracted_information": [{"row": index}]} for index in range(60)]},
+        precomputed_extracted_information=[{"row": 0}],
+    )
+    assert [entry["row"] for entry in response.outputs["extracted_information"]] == list(range(60))
+
+
+@pytest.mark.parametrize(
+    "collected",
+    [
+        pytest.param([{"blob": "x" * 2048} for _ in range(4)], id="entries_each_over_the_cap"),
+        pytest.param([{"row": index} for index in range(2000)], id="many_small_entries"),
+        pytest.param([{"blob": "x" * 40960}], id="one_entry_far_over_the_cap"),
+        pytest.param([{"deep": {"deep": {"deep": {"deep": {"blob": "x" * 40960}}}}}], id="past_the_depth_cap"),
+        pytest.param([{"unmeasurable": {object(): "x" * 4096}}], id="unmeasurable"),
+    ],
+)
+def test_oversized_extracted_information_is_never_stored_uncapped(collected: list[Any]) -> None:
+    """Storing it uncapped would put the value this change avoids back on every capped read.
+
+    The column also feeds a ``list[Any] | None`` field, so a marker dict from a collapsed trim
+    must not be stored either. Either outcome is fine; both have to hold whatever the shape.
+    """
+    cap = 2048
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        stored = response_value_caps.capped_extracted_information(collected, workflow_run_id="wr_x")
+    if stored is None:
+        return
+    assert isinstance(stored, list)
+    assert len(json.dumps(stored, default=str, separators=(",", ":")).encode("utf-8")) <= cap
+
+
+def test_extracted_information_is_capped_rather_than_dropped_when_a_prefix_fits() -> None:
+    cap = 8192
+    collected = [{"row": index} for index in range(2000)]
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        stored = response_value_caps.capped_extracted_information(collected, workflow_run_id="wr_x")
+    assert isinstance(stored, list)
+    assert stored[-1]["truncated"] is True
+    assert len(json.dumps(stored, separators=(",", ":")).encode("utf-8")) <= cap
+
+
+def test_extracted_information_keeps_marker_when_no_item_fits() -> None:
+    cap = 512
+    collected = [{"items": ["x" * 50 for _ in range(3)]} for _ in range(5)]
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", cap):
+        stored = response_value_caps.capped_extracted_information(collected, workflow_run_id="wr_x")
+
+    assert stored == [
+        {
+            "truncated": True,
+            "reason": "exceeded_max_run_response_value_size",
+            "original_size_bytes": 856,
+            "limit_bytes": cap,
+        }
+    ]
+
+
+def test_capped_write_normalizes_values_as_the_json_column_will() -> None:
+    value = {"items": {str(index) for index in range(1200)}}
+    with patch("skyvern.forge.sdk.workflow.response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES", 1024):
+        write = capped_jsonb_write(value)
+
+    assert isinstance(write.capped_value, dict)
+    assert isinstance(write.capped_value["items"], list)
+    assert write.capped_value["items"][-1]["truncated"] is True

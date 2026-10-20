@@ -525,13 +525,13 @@ class TestPatchAgentSpanAttributes:
         from agents import GenerationSpanData
         from litellm.types.utils import Usage
 
-        from skyvern.forge.sdk.copilot.model_telemetry import model_call_telemetry_scope
+        from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope
         from skyvern.forge.sdk.copilot.tracing_setup import _patch_agent_span_attributes
 
         monkeypatch.setattr(tracing_setup, "_attach_cost_attr", lambda attrs, telemetry, model: None)
         _patch_agent_span_attributes()
 
-        with model_call_telemetry_scope(6) as telemetry:
+        with _model_call_telemetry_scope(6) as telemetry:
             telemetry.response_model = "gpt-5.6-sol-2026-07-09"
             telemetry.capture(
                 Usage(
@@ -576,13 +576,13 @@ class TestPatchAgentSpanAttributes:
         import logfire._internal.integrations.openai_agents as _oai_mod
         from agents import GenerationSpanData
 
-        from skyvern.forge.sdk.copilot.model_telemetry import model_call_telemetry_scope
+        from skyvern.forge.sdk.copilot.model_telemetry import _model_call_telemetry_scope
         from skyvern.forge.sdk.copilot.tracing_setup import _patch_agent_span_attributes
 
         monkeypatch.setattr(tracing_setup, "_attach_cost_attr", lambda attrs, telemetry, model: None)
         _patch_agent_span_attributes()
 
-        with model_call_telemetry_scope(2) as telemetry:
+        with _model_call_telemetry_scope(2) as telemetry:
             telemetry.cache_mode = "explicit"
             telemetry.cache_breakpoint_count = 1
             telemetry.cache_stable_prefix_chars = 12000

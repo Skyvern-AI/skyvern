@@ -4,7 +4,6 @@ import asyncio
 import re
 import time
 from collections.abc import Mapping
-from contextlib import AsyncExitStack
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
@@ -16,8 +15,6 @@ try:
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
-from skyvern.forge import app
-from skyvern.forge.agent_functions import CopilotCandidateNetworkHop, CopilotEntrypointCandidate
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -41,7 +38,6 @@ _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
 _DISCOVERY_CANDIDATE_FORM_FIELDS_MAX = 10
 _DISCOVERY_HTML_BYTES_MAX = 200_000
 _DISCOVERY_CONCRETE_HOMEPAGE_CONFIDENCE = 0.6
-_DISCOVERY_RESULT_CONTRACT_VERSION = "discover_workflow_entrypoint_v3"
 
 _DISCOVERY_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 # host + optional path/query/fragment — handles `example.com/login`,
@@ -50,7 +46,6 @@ _DISCOVERY_DOMAIN_WITH_PATH_RE = re.compile(
     r"^[a-z0-9-]+(\.[a-z]{2,})+([/?#][^\s]*)?$",
     re.IGNORECASE,
 )
-_DISCOVERY_BARE_WORD_RE = re.compile(r"^[a-z0-9-]{2,32}$", re.IGNORECASE)
 _DISCOVERY_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS = frozenset({"a", "an", "and", "for", "in", "of", "on", "or", "the", "to"})
 _DISCOVERY_LOGIN_TITLE_RE = re.compile(r"\b(sign\s*in|log\s*in|login)\b", re.IGNORECASE)
@@ -60,72 +55,10 @@ _DISCOVERY_PASSWORD_INPUT_RE = re.compile(
 )
 
 
-def _normalize_discovery_name(value: str) -> str:
-    return "".join(_DISCOVERY_TOKEN_RE.findall(value.lower()))
-
-
-def _discovery_candidate_identity_bound(
-    candidate: CopilotEntrypointCandidate,
-    requested_name: str | None,
-) -> bool:
-    association = candidate.association
-    normalized_names = {
-        _normalize_discovery_name(value)
-        for value in (requested_name or "", association.requested_name, association.provider_relation_text)
-    }
-    return "" not in normalized_names and len(normalized_names) == 1
-
-
-def _user_provided_entry_url(copilot_ctx: CopilotContext) -> str | None:
-    """A site the user gave this chat, when name lookup found nothing.
-
-    Lookup asks the world what a name refers to; this asks the conversation. A user who pasted the
-    URL has already answered, so exhausting the lookup and telling them to supply a URL they already
-    supplied is the dead end this avoids. Only the sole site they gave answers; several is a question.
-    """
-    policy = copilot_ctx.request_policy
-    urls = list(policy.user_provided_site_urls) if policy is not None else []
-    return urls[0] if len(urls) == 1 else None
-
-
-def _site_name_names_host(site_name: str, url: str) -> bool:
-    """Whether a hostname label opens with the requested name.
-
-    A label may extend the name (`datadog` names `datadoghq`) but may not merely contain it, so
-    `ups` does not name `groupsupport`.
-    """
-    normalized = _normalize_discovery_name(site_name or "")
-    if len(normalized) < 3:
-        return False
-    try:
-        host = urlparse(url).hostname or ""
-    except ValueError:
-        return False
-    return any(_normalize_discovery_name(label).startswith(normalized) for label in host.split("."))
-
-
-def _credential_entry_url(copilot_ctx: CopilotContext, site_name: str) -> str | None:
-    """The login page a credential resolved for this turn already signs in at.
-
-    Only a credential whose host carries the requested name answers, because approvals persist
-    across turns and a later request for a different site would otherwise open this one.
-    """
-    policy = copilot_ctx.request_policy
-    credentials = list(policy.resolved_credentials) if policy is not None else []
-    named: list[str] = []
-    for credential in credentials:
-        url = (credential.tested_url or "").strip()
-        if url and url not in named and _site_name_names_host(site_name, url):
-            named.append(url)
-    return named[0] if len(named) == 1 else None
-
-
 def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
-    """Resolve the user-supplied site name/URL into a navigable URL.
+    """Returns ``(resolved_url, kind)`` where ``kind`` is ``url``, ``domain`` or ``unresolved``.
 
-    Returns ``(resolved_url, kind)`` where ``kind`` is one of
-    ``url`` / ``domain`` / ``bare_word`` / ``unresolved``. Bare words are
-    classified here but acquired asynchronously by the AgentFunction boundary.
+    A site name is not a URL and resolves to nothing: deciding which site a name means is the model's call.
     """
     token = (site_or_url or "").strip()
     if not token:
@@ -134,46 +67,7 @@ def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
         return token, "url"
     if _DISCOVERY_DOMAIN_WITH_PATH_RE.match(token):
         return f"https://{token}", "domain"
-    if _DISCOVERY_BARE_WORD_RE.match(token):
-        return None, "bare_word"
     return None, "unresolved"
-
-
-def _discovery_origin(url: str) -> str | None:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        return None
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"https://{parsed.hostname.lower()}{port}"
-
-
-def _rank_discovery_entrypoint_candidates(
-    requested_name: str,
-    candidates: list[CopilotEntrypointCandidate],
-) -> list[CopilotEntrypointCandidate]:
-    admitted: list[CopilotEntrypointCandidate] = []
-    seen_urls: set[str] = set()
-    for candidate in candidates:
-        association = candidate.association
-        candidate_origin = _discovery_origin(candidate.url)
-        official_origin = _discovery_origin(association.official_site_url)
-        if (
-            not requested_name.strip()
-            or requested_name.strip().casefold() != association.requested_name.strip().casefold()
-            or requested_name.strip().casefold() != association.provider_relation_text.strip().casefold()
-            or candidate_origin is None
-            or candidate_origin != official_origin
-            or candidate_origin != association.origin
-            or candidate.source_rank < 1
-            or candidate.url in seen_urls
-        ):
-            continue
-        seen_urls.add(candidate.url)
-        admitted.append(candidate)
-    return sorted(admitted, key=lambda candidate: (candidate.source_rank, candidate.url))
 
 
 def _concrete_homepage_entrypoint(entry_url: str | None, kind: str) -> str | None:
@@ -241,8 +135,6 @@ def _discovery_build_result(
     evidence_trail: list[dict[str, Any]],
     confidence: float,
     failure_reason: str | None,
-    candidate_provenance: dict[str, str | int] | None = None,
-    navigation_evidence: dict[str, str | bool | list[str] | list[CopilotCandidateNetworkHop]] | None = None,
     ok: bool = True,
     error: str | None = None,
 ) -> dict[str, Any]:
@@ -261,10 +153,6 @@ def _discovery_build_result(
         "confidence": float(confidence),
         "failure_reason": failure_reason,
     }
-    if candidate_provenance is not None:
-        data["candidate_provenance"] = candidate_provenance
-    if navigation_evidence is not None:
-        data["navigation_evidence"] = navigation_evidence
     return {"ok": ok, "data": data, "error": error}
 
 
@@ -276,18 +164,6 @@ def _redact_discovery_url_for_log(value: str | None) -> str | None:
     except ValueError:
         return None
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-
-
-def _redact_guarded_hops_for_log(
-    value: list[dict[str, str | list[str]]] | None,
-) -> list[dict[str, str | list[str] | None]] | None:
-    if value is None:
-        return None
-    redacted: list[dict[str, str | list[str] | None]] = []
-    for hop in value:
-        hop_url = hop.get("url")
-        redacted.append({**hop, "url": _redact_discovery_url_for_log(hop_url if isinstance(hop_url, str) else None)})
-    return redacted
 
 
 def _record_discovery_resolution_on_ctx(ctx: Any, result: Mapping[str, Any]) -> None:
@@ -486,9 +362,6 @@ async def _discovery_walk(
     *,
     entry_url: str,
     intent_hint: str,
-    entrypoint_candidate: CopilotEntrypointCandidate | None = None,
-    requested_name: str | None = None,
-    guarded_hops: list[CopilotCandidateNetworkHop] | None = None,
 ) -> dict[str, Any]:
     """Deterministic anchor-scoring walker. No inner LLM call.
 
@@ -504,41 +377,12 @@ async def _discovery_walk(
     current_page_title = ""
     retried_deep_link_from_origin = False
     started = time.monotonic()
-    candidate_provenance: dict[str, str | int] | None = None
-    navigation_evidence: dict[str, str | bool | list[str] | list[CopilotCandidateNetworkHop]] | None = None
-    if entrypoint_candidate is not None:
-        candidate_provenance = {
-            "source": entrypoint_candidate.association.source,
-            "source_rank": entrypoint_candidate.source_rank,
-            "entity_id": entrypoint_candidate.association.entity_id,
-            "associated_origin": entrypoint_candidate.association.origin,
-            "provider_relation_type": entrypoint_candidate.association.provider_relation_type,
-            "provider_relation_text": entrypoint_candidate.association.provider_relation_text,
-        }
-
-    def build_result(
-        *,
-        candidate_url: str | None,
-        candidate_form_fields: list[dict[str, Any]],
-        evidence_trail: list[dict[str, Any]],
-        confidence: float,
-        failure_reason: str | None,
-    ) -> dict[str, Any]:
-        return _discovery_build_result(
-            candidate_url=candidate_url,
-            candidate_form_fields=candidate_form_fields,
-            evidence_trail=evidence_trail,
-            confidence=confidence,
-            failure_reason=failure_reason,
-            candidate_provenance=candidate_provenance,
-            navigation_evidence=navigation_evidence,
-        )
 
     for step in range(_DISCOVERY_STEP_CAP):
         ctx.discovery_step_count = step + 1
         elapsed = time.monotonic() - started
         if elapsed > _DISCOVERY_WALL_CLOCK_SECONDS:
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=None,
                 candidate_form_fields=[],
                 evidence_trail=evidence_trail,
@@ -560,13 +404,12 @@ async def _discovery_walk(
                         "transition_reason": f"navigate_failed: {nav_result.get('error', 'unknown')}"[:240],
                     }
                 )
-                strict_candidate = entrypoint_candidate is not None
-                return build_result(
-                    candidate_url=None if strict_candidate else current_url,
+                return _discovery_build_result(
+                    candidate_url=current_url,
                     candidate_form_fields=[],
                     evidence_trail=evidence_trail,
-                    confidence=0.0 if strict_candidate else _DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE,
-                    failure_reason="candidate_navigation_failed" if strict_candidate else None,
+                    confidence=_DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE,
+                    failure_reason=None,
                 )
 
             current_url = _discovery_extract_current_url(nav_result, current_url)
@@ -576,26 +419,6 @@ async def _discovery_walk(
         # to identify a usable entrypoint. (Discovery only resolves the entrypoint, so a sliced
         # tail does not matter here.)
         html, _, _, _ = await _composition_get_html(ctx)
-        if entrypoint_candidate is not None:
-            server = ctx.discovery_mcp_server
-            if server is None:
-                return build_result(
-                    candidate_url=None,
-                    candidate_form_fields=[],
-                    evidence_trail=evidence_trail,
-                    confidence=0.0,
-                    failure_reason="candidate_guard_unavailable",
-                )
-            try:
-                current_url = await server.evidence_candidate_browser_url()
-            except Exception:
-                return build_result(
-                    candidate_url=None,
-                    candidate_form_fields=[],
-                    evidence_trail=evidence_trail,
-                    confidence=0.0,
-                    failure_reason="candidate_browser_url_unverified",
-                )
         parsed_title, anchors, form_fields = _discovery_parse_html(html)
         page_title = parsed_title or navigation_title
 
@@ -663,80 +486,19 @@ async def _discovery_walk(
                 current_url = origin_url
                 retried_deep_link_from_origin = True
                 continue
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=None,
                 candidate_form_fields=[],
                 evidence_trail=evidence_trail,
                 confidence=0.0,
                 failure_reason="anti_bot_wall",
             )
-        if login_wall_detected and login_page_is_the_only_lead and entrypoint_candidate is None:
-            # A sign-in page is where a credentialed workflow starts, so a URL the user or their
-            # own credential supplied is reported as the candidate rather than refused. Sign-in
-            # pages routinely ship verification widgets, which the run solves; a page carrying a
-            # challenge and nothing else already refused above. A machine-selected candidate falls
-            # through to the binding checks below instead.
+        if login_wall_detected and login_page_is_the_only_lead:
+            # A sign-in page is where a credentialed workflow starts, so it is reported as the
+            # candidate rather than refused. Sign-in pages routinely ship verification widgets,
+            # which the run solves; a page carrying a challenge and nothing else already refused above.
             evidence_trail[-1]["page_kind"] = "login"
-            return build_result(
-                candidate_url=current_url,
-                candidate_form_fields=form_fields,
-                evidence_trail=evidence_trail,
-                confidence=1.0,
-                failure_reason=None,
-            )
-
-        if entrypoint_candidate is not None:
-            final_origin = _discovery_origin(current_url)
-            origin_bound = final_origin == entrypoint_candidate.association.origin
-            last_enforced_hop = next(
-                (hop for hop in reversed(guarded_hops or []) if hop["resource_type"] == "document"),
-                None,
-            )
-            enforcement_bound = last_enforced_hop is not None and last_enforced_hop["url"] == current_url
-            identity_bound = _discovery_candidate_identity_bound(entrypoint_candidate, requested_name)
-            navigation_evidence = {
-                "requested_name": requested_name or "",
-                "final_url": current_url,
-                "final_page_title": page_title[:240],
-                "https": final_origin is not None,
-                "tls_valid": final_origin is not None,
-                "resolved_public_ips": list(last_enforced_hop["resolved_public_ips"]) if last_enforced_hop else [],
-                "associated_origin": entrypoint_candidate.association.origin,
-                "origin_bound": origin_bound,
-                "enforcement_bound": enforcement_bound,
-                "identity_bound": identity_bound,
-                "guarded_hops": list(guarded_hops or [])[:_DISCOVERY_EVIDENCE_TRAIL_MAX],
-            }
-            evidence_trail[-1]["candidate_source"] = entrypoint_candidate.association.source
-            evidence_trail[-1]["candidate_source_rank"] = entrypoint_candidate.source_rank
-            evidence_trail[-1]["https"] = final_origin is not None
-            evidence_trail[-1]["tls_valid"] = final_origin is not None
-            evidence_trail[-1]["origin_bound"] = origin_bound
-            if not enforcement_bound:
-                return build_result(
-                    candidate_url=None,
-                    candidate_form_fields=[],
-                    evidence_trail=evidence_trail,
-                    confidence=0.0,
-                    failure_reason="candidate_final_url_unenforced",
-                )
-            if not origin_bound:
-                return build_result(
-                    candidate_url=None,
-                    candidate_form_fields=[],
-                    evidence_trail=evidence_trail,
-                    confidence=0.0,
-                    failure_reason="candidate_origin_mismatch",
-                )
-            if not identity_bound:
-                return build_result(
-                    candidate_url=None,
-                    candidate_form_fields=[],
-                    evidence_trail=evidence_trail,
-                    confidence=0.0,
-                    failure_reason="candidate_identity_mismatch",
-                )
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=current_url,
                 candidate_form_fields=form_fields,
                 evidence_trail=evidence_trail,
@@ -746,7 +508,7 @@ async def _discovery_walk(
 
         if intent_tokens and title_score >= 2 and (form_fields or best_score <= title_score):
             confidence = min(1.0, title_score / max(1, len(intent_tokens)))
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=current_url,
                 candidate_form_fields=form_fields,
                 evidence_trail=evidence_trail,
@@ -756,7 +518,7 @@ async def _discovery_walk(
 
         if form_fields and (title_score >= 1 or step > 0):
             confidence = 0.6 if title_score >= 1 else 0.4
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=current_url,
                 candidate_form_fields=form_fields,
                 evidence_trail=evidence_trail,
@@ -765,7 +527,7 @@ async def _discovery_walk(
             )
 
         if not intent_tokens:
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=current_url,
                 candidate_form_fields=form_fields,
                 evidence_trail=evidence_trail,
@@ -774,7 +536,7 @@ async def _discovery_walk(
             )
 
         if best_score == 0 or best_href is None:
-            return build_result(
+            return _discovery_build_result(
                 candidate_url=None,
                 candidate_form_fields=[],
                 evidence_trail=evidence_trail,
@@ -801,7 +563,7 @@ async def _discovery_walk(
 
         current_url = best_href
 
-    return build_result(
+    return _discovery_build_result(
         candidate_url=None,
         candidate_form_fields=[],
         evidence_trail=evidence_trail,
@@ -820,48 +582,21 @@ async def _discover_workflow_entrypoint_impl(
     machinery.
     """
     arguments = {"site_or_url": site_or_url, "intent_hint": intent_hint}
-    input_kind: str | None = None
 
     def finish(result: dict[str, Any], *, site_or_url_kind: str | None = None) -> dict[str, Any]:
         _record_discovery_resolution_on_ctx(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
         data_payload = result.get("data")
         data = data_payload if isinstance(data_payload, Mapping) else {}
-        if isinstance(data_payload, dict) and input_kind == "bare_word":
-            data_payload.setdefault("contract_version", _DISCOVERY_RESULT_CONTRACT_VERSION)
         candidate_url = data.get("candidate_url")
-        candidate_provenance = data.get("candidate_provenance")
-        provenance = candidate_provenance if isinstance(candidate_provenance, Mapping) else {}
-        navigation_payload = data.get("navigation_evidence")
-        navigation_evidence = navigation_payload if isinstance(navigation_payload, Mapping) else {}
         failure_reason = data.get("failure_reason")
         if not isinstance(failure_reason, str) or not failure_reason:
             error = result.get("error")
             failure_reason = error if isinstance(error, str) and error else None
         LOG.info(
             "discover_workflow_entrypoint completed",
-            contract_version=data.get("contract_version"),
             ok=result.get("ok"),
             candidate_url=_redact_discovery_url_for_log(candidate_url if isinstance(candidate_url, str) else None),
-            candidate_source=provenance.get("source"),
-            candidate_source_rank=provenance.get("source_rank"),
-            candidate_entity_id=provenance.get("entity_id"),
-            candidate_associated_origin=provenance.get("associated_origin"),
-            candidate_provider_relation_type=provenance.get("provider_relation_type"),
-            candidate_provider_relation_text=provenance.get("provider_relation_text"),
-            candidate_final_url=_redact_discovery_url_for_log(
-                navigation_evidence.get("final_url") if isinstance(navigation_evidence.get("final_url"), str) else None
-            ),
-            candidate_https=navigation_evidence.get("https"),
-            candidate_tls_valid=navigation_evidence.get("tls_valid"),
-            candidate_resolved_public_ips=navigation_evidence.get("resolved_public_ips"),
-            candidate_guarded_hops=_redact_guarded_hops_for_log(
-                navigation_evidence.get("guarded_hops")
-                if isinstance(navigation_evidence.get("guarded_hops"), list)
-                else None
-            ),
-            candidate_origin_bound=navigation_evidence.get("origin_bound"),
-            candidate_enforcement_bound=navigation_evidence.get("enforcement_bound"),
             failure_reason=failure_reason,
             site_or_url_kind=site_or_url_kind,
         )
@@ -873,30 +608,6 @@ async def _discover_workflow_entrypoint_impl(
         return finish(result)
 
     entry_url, kind = _resolve_discovery_entry_url(site_or_url)
-    input_kind = kind
-    entrypoint_candidate: CopilotEntrypointCandidate | None = None
-    if kind == "bare_word":
-        try:
-            candidates = await app.AGENT_FUNCTION.acquire_copilot_entrypoint_candidates(
-                site_name=site_or_url.strip(),
-            )
-        except Exception:
-            LOG.exception("Copilot entrypoint candidate acquisition raised")
-            candidates = []
-        ranked_candidates = _rank_discovery_entrypoint_candidates(site_or_url, candidates)
-        if ranked_candidates:
-            entrypoint_candidate = ranked_candidates[0]
-            entry_url = entrypoint_candidate.url
-            kind = "evidence_candidate"
-        else:
-            entry_url = _user_provided_entry_url(copilot_ctx)
-            kind = "user_provided_site" if entry_url else "unresolved"
-    if entry_url is None:
-        # A multi-word site name is not a bare word, so this is the only point a stored login page
-        # is reachable for one.
-        entry_url = _credential_entry_url(copilot_ctx, site_or_url)
-        if entry_url:
-            kind = "credential_tested_url"
     if entry_url is None:
         result = _discovery_build_result(
             candidate_url=None,
@@ -935,23 +646,7 @@ async def _discover_workflow_entrypoint_impl(
         },
     ):
         try:
-            async with AsyncExitStack() as guard_stack:
-                guarded_hops: list[CopilotCandidateNetworkHop] = []
-                if entrypoint_candidate is not None:
-                    server = copilot_ctx.discovery_mcp_server
-                    if server is None:
-                        raise RuntimeError("discovery MCP server not attached to context")
-                    guarded_hops = await guard_stack.enter_async_context(
-                        server.evidence_candidate_navigation_guard(entrypoint_candidate.association.origin)
-                    )
-                result = await _discovery_walk(
-                    copilot_ctx,
-                    entry_url=entry_url,
-                    intent_hint=intent_hint or "",
-                    entrypoint_candidate=entrypoint_candidate,
-                    requested_name=site_or_url.strip() if entrypoint_candidate is not None else None,
-                    guarded_hops=guarded_hops,
-                )
+            result = await _discovery_walk(copilot_ctx, entry_url=entry_url, intent_hint=intent_hint or "")
         except Exception as exc:
             LOG.exception("discover_workflow_entrypoint walker raised")
             result = {
@@ -972,7 +667,6 @@ async def _discover_workflow_entrypoint_impl(
     copilot_ctx.discovery_evidence_trail = list(evidence_trail)
     if (
         result.get("ok")
-        and entrypoint_candidate is None
         and not data.get("candidate_url")
         and data.get("failure_reason") in _DISCOVERY_SCORER_MISS_REASONS
     ):
@@ -985,12 +679,6 @@ async def _discover_workflow_entrypoint_impl(
                 evidence_trail=evidence_trail,
                 confidence=_DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE,
                 failure_reason=None,
-                candidate_provenance=(
-                    data.get("candidate_provenance") if isinstance(data.get("candidate_provenance"), dict) else None
-                ),
-                navigation_evidence=(
-                    data.get("navigation_evidence") if isinstance(data.get("navigation_evidence"), dict) else None
-                ),
             )
             rebuilt_data = result.get("data")
             data = rebuilt_data if isinstance(rebuilt_data, dict) else {}

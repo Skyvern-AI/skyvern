@@ -34,6 +34,7 @@ class DebugRepository(BaseRepository):
                     .filter_by(deleted_at=None)
                     .filter_by(status="created")
                     .order_by(DebugSessionModel.created_at.desc())
+                    .limit(1)
                 )
             ).first()
 

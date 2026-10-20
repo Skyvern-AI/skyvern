@@ -4,7 +4,8 @@ Enabled by ``COPILOT_DUMP_FRONTIER_PROVENANCE=<directory>``; see
 ``dev_scripts/replay_frontier_provenance.py`` for the replayer that consumes these packets.
 
 Local development only. Packets carry unredacted workflow definitions and extracted block
-outputs, so setting this anywhere real writes customer data to disk.
+outputs, so setting this anywhere real writes customer data to disk. A credential-bearing run
+keeps its browser position, so the block end URLs here can include post-login pages.
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
+from skyvern.forge.sdk.copilot.repair_origin_run import OutputCarrier
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 
 LOG = structlog.get_logger()
@@ -36,12 +38,20 @@ def trust_snapshot(ctx: AgentContext) -> dict[str, Any]:
         return _trust_snapshot(ctx)
     except Exception:
         LOG.debug("Frontier provenance trust snapshot failed", exc_info=True)
-        return {"trust_snapshot_failed": True}
+        return {"capture_version": 2, "capture_complete": False, "trust_snapshot_failed": True}
 
 
 def _trust_snapshot(ctx: AgentContext) -> dict[str, Any]:
     evidence = ctx.workflow_verification_evidence
     return {
+        "capture_version": 2,
+        "capture_complete": True,
+        "output_carrier": TypeAdapter(OutputCarrier).dump_python(ctx.repair_origin_outputs, mode="json"),
+        "latest_recorded_build_test_outcome": (
+            ctx.latest_recorded_build_test_outcome.model_dump(mode="json")
+            if ctx.latest_recorded_build_test_outcome is not None
+            else None
+        ),
         "verified_prefix_labels": list(ctx.verified_prefix_labels or []),
         "composition_verified_labels": list(ctx.composition_verified_labels or []),
         "verified_block_outputs": _json_safe(ctx.verified_block_outputs),
@@ -49,6 +59,7 @@ def _trust_snapshot(ctx: AgentContext) -> dict[str, Any]:
         "verified_prefix_block_end_session_id": ctx.verified_prefix_block_end_session_id,
         "verified_prefix_terminal_label": ctx.verified_prefix_terminal_label,
         "frontier_resume_session_id": ctx.frontier_resume_session_id,
+        "repair_origin_outputs_run_id": ctx.repair_origin_outputs_run_id,
         "frontier_start_provenance": ctx.frontier_start_provenance,
         "last_full_workflow_test_ok": ctx.last_full_workflow_test_ok,
         "last_requested_block_labels": list(ctx.last_requested_block_labels or []),
@@ -84,7 +95,4 @@ def write_packet(kind: str, payload: dict[str, Any]) -> None:
 
 
 def _json_safe(value: dict[str, Any] | None) -> dict[str, Any]:
-    try:
-        return json.loads(json.dumps(value or {}, default=str))
-    except Exception:
-        return {}
+    return json.loads(json.dumps(value or {}))

@@ -345,5 +345,5 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
   return { showExitDialog, onExitConfirm, onExitCancel };
 }
 
-export { useEditorOnboardingTour };
+export { BASE_DRIVER_CONFIG, useEditorOnboardingTour };
 export type { UseEditorOnboardingTourReturn };

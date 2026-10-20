@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH
 
@@ -16,6 +16,12 @@ class UserDefinedError(BaseModel):
     reasoning: str
     confidence_float: float = Field(..., ge=0, le=1)
     error_type: Literal[ErrorType.USER_DEFINED_ERROR] = ErrorType.USER_DEFINED_ERROR
+    # Private so no LLM or API payload can set it; only SkyvernDefinedError.to_user_defined_error does.
+    _skyvern_defined: bool = PrivateAttr(default=False)
+
+    @property
+    def is_skyvern_defined(self) -> bool:
+        return self._skyvern_defined
 
     @field_validator("reasoning")
     @classmethod
@@ -62,6 +68,16 @@ def filter_to_user_defined_codes(
     return kept, dropped
 
 
+def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, str] | None) -> str | None:
+    """Return the error_code_mapping key that `code` names: an exact match, else the only case-insensitive one."""
+    if not isinstance(code, str) or not error_code_mapping:
+        return None
+    if code in error_code_mapping:
+        return code
+    matches = [key for key in error_code_mapping if key.lower() == code.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
 class SkyvernDefinedError(BaseModel):
     error_code: str
     reasoning: str
@@ -71,7 +87,9 @@ class SkyvernDefinedError(BaseModel):
         return f"{self.reasoning}(error_code={self.error_code})"
 
     def to_user_defined_error(self) -> UserDefinedError:
-        return UserDefinedError(error_code=self.error_code, reasoning=self.reasoning, confidence_float=1.0)
+        error = UserDefinedError(error_code=self.error_code, reasoning=self.reasoning, confidence_float=1.0)
+        error._skyvern_defined = True
+        return error
 
 
 class ReachMaxStepsError(SkyvernDefinedError):

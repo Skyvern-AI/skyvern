@@ -29,6 +29,7 @@ def _block_result(
         status=status,
         failure_reason=failure_reason,
         output_parameter_value=None,
+        sign_in_form_visible=False,
     )
 
 

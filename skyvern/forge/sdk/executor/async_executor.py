@@ -4,9 +4,22 @@ from typing import Any
 from fastapi import BackgroundTasks, Request
 
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 
 
 class AsyncExecutor(abc.ABC):
+    async def recover_pending_retries(self) -> None:
+        """Recover retry decisions left pending by an executor process restart."""
+        return
+
+    async def stop_retry_recovery(self) -> None:
+        """Stop any periodic retry recovery started by recover_pending_retries."""
+        return
+
+    async def sends_final_webhook_after_cancel(self, workflow_run: WorkflowRun) -> bool:
+        """Whether a started run's own finalizer still sends its final webhook after a cancel, even if its process dies."""
+        return False
+
     @abc.abstractmethod
     async def execute_task(
         self,
@@ -35,9 +48,11 @@ class AsyncExecutor(abc.ABC):
         browser_session_id: str | None,
         block_labels: list[str] | None,
         block_outputs: dict[str, Any] | None,
+        resolved_workflow: Workflow | None = None,
         **kwargs: dict,
     ) -> None:
-        pass
+        """``resolved_workflow`` is the version the caller just resolved for this run, so an executor
+        that needs it can skip re-reading it."""
 
     @abc.abstractmethod
     async def execute_task_v2(

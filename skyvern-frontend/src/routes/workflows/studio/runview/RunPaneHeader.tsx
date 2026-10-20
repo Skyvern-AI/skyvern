@@ -1,4 +1,10 @@
+import {
+  runIsRetryWaiting,
+  runIsExecuting,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
 import { useCallback, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   ActivityLogIcon,
   CodeIcon,
@@ -25,7 +31,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { Status } from "@/api/types";
-import { statusIsFinalized } from "@/routes/tasks/types";
+
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -36,12 +42,13 @@ import { cn } from "@/util/utils";
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
-import { runOutcomeFromStatus } from "../runProjections";
+import { WorkflowRunStatusAlert } from "../../workflowRun/WorkflowRunStatusAlert";
 import { studioPanelId } from "../constants";
 import { useStudioPaneCompact } from "../StudioShellContext";
 import { useStudioInspectedRun } from "../useStudioInspectedRun";
 import { useStudioPanes } from "../useStudioPanes";
 import { ViewToggle } from "../ViewToggle";
+import { toReadableSearch } from "../panes";
 
 /**
  * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs
@@ -57,9 +64,11 @@ export function RunPaneViewToggles() {
     useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const view = useRunPaneViewStore((s) => s.view);
   const setView = useRunPaneViewStore((s) => s.setView);
+  const location = useLocation();
+  const navigate = useNavigate();
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
-  const { openPane } = useStudioPanes();
+  const { openPane, resolveLivePanes } = useStudioPanes();
   const cacheKey = workflowRun?.workflow?.cache_key ?? "";
   const codeGenerating = useIsGeneratingCode({
     cacheKey,
@@ -68,13 +77,22 @@ export function RunPaneViewToggles() {
       workflow: workflowRun?.workflow,
       workflowRun,
     }),
-    // Same guard as the legacy run page: script queries 404 once the source
-    // agent is deleted.
+    // Script queries 404 once the source agent is deleted.
     workflowPermanentId: workflowRun?.workflow?.deleted_at
       ? undefined
       : workflowPermanentId,
     workflowRunId: runId,
   });
+  const selectView = useCallback(
+    (nextView: Parameters<typeof setView>[0]) => {
+      setView(nextView);
+      const next = new URLSearchParams(location.search);
+      next.set("view", nextView);
+      if (!resolveLivePanes().includes("overview")) openPane("overview");
+      navigate({ search: toReadableSearch(next) }, { replace: true });
+    },
+    [location.search, navigate, openPane, resolveLivePanes, setView],
+  );
 
   const focusBrowserPane = useCallback(() => {
     // An explicit "watch live": unpin back to the live edge and hand the
@@ -98,11 +116,11 @@ export function RunPaneViewToggles() {
   if (!workflowRun) {
     return null;
   }
-  const outcome = runOutcomeFromStatus(workflowRun.status);
   const provisioning =
     workflowRun.status === Status.Created ||
     workflowRun.status === Status.Queued;
-  const showLive = !statusUnavailable && outcome === "running" && !provisioning;
+  const showLive =
+    !statusUnavailable && runIsExecuting(workflowRun) && !provisioning;
 
   return (
     <>
@@ -113,21 +131,21 @@ export function RunPaneViewToggles() {
       >
         <ViewToggle
           active={view === "timeline"}
-          onClick={() => setView("timeline")}
+          onClick={() => selectView("timeline")}
           compact={compact}
           label="Timeline"
           icon={<ActivityLogIcon className="h-3 w-3" />}
         />
         <ViewToggle
           active={view === "inputs"}
-          onClick={() => setView("inputs")}
+          onClick={() => selectView("inputs")}
           compact={compact}
           label="Inputs"
           icon={<ListBulletIcon className="h-3 w-3" />}
         />
         <ViewToggle
           active={view === "outputs"}
-          onClick={() => setView("outputs")}
+          onClick={() => selectView("outputs")}
           compact={compact}
           label="Outputs"
           icon={<FileTextIcon className="h-3 w-3" />}
@@ -169,7 +187,7 @@ export function RunPaneViewToggles() {
               menu reads as part of the toggle cluster, not a full-size menu. */}
           <DropdownMenuContent align="start" sideOffset={6} className="min-w-0">
             <DropdownMenuItem
-              onSelect={() => setView("code")}
+              onSelect={() => selectView("code")}
               className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-xs font-medium text-muted-foreground focus:text-foreground"
             >
               <CodeIcon className="h-3 w-3" />
@@ -218,21 +236,28 @@ export function RunPaneActions() {
   const compact = useStudioPaneCompact();
   const apiCredential = useApiCredential();
   const { runId } = useStudioInspectedRun();
-  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
-    workflowRunId: runId,
-  });
+  const { data: workflowRun, isError: statusUnavailable } =
+    useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const [replayOpen, setReplayOpen] = useState(false);
   if (!workflowRun) {
     return null;
   }
+  const finalized = runIsLogicallyFinal(workflowRun);
+  const statusAlert = (
+    <WorkflowRunStatusAlert
+      run={workflowRun}
+      title={workflowRun.workflow?.title}
+      visible={!statusUnavailable && !finalized}
+    />
+  );
   // Legacy parity: the menu re-runs the workflow via API, which is gone with
-  // the source agent.
+  // the source agent. Status notifications still apply to its in-flight run.
   if (workflowRun.workflow?.deleted_at) {
-    return null;
+    return statusAlert;
   }
-  const finalized = statusIsFinalized(workflowRun);
   return (
     <>
+      {statusAlert}
       <ApiWebhookActionsMenu
         triggerTooltip={compact ? "API & Webhooks" : undefined}
         trigger={
@@ -273,6 +298,11 @@ export function RunPaneActions() {
             headers,
           } satisfies ApiCommandOptions;
         }}
+        disabledReason={
+          workflowRun && runIsRetryWaiting(workflowRun)
+            ? "Unavailable while a retry is pending"
+            : undefined
+        }
         webhookDisabled={!finalized}
         onTestWebhook={() => setReplayOpen(true)}
       />

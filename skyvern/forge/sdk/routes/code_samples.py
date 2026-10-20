@@ -8,9 +8,7 @@ RUN_TASK_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.runTask({
-    body: {
-        prompt: "Find the top 3 posts on Hacker News."
-    }
+    prompt: "Find the top 3 posts on Hacker News."
 })
 """
 RUN_WORKFLOW_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -22,10 +20,8 @@ RUN_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client"
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.runWorkflow({
-    body: {
-        workflow_id: "wpid_123",
-        parameters: { parameter1: "value1", parameter2: "value2" }
-    }
+    agent_id: "wpid_123",
+    parameters: { parameter1: "value1", parameter2: "value2" }
 });
 """
 GET_RUN_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -233,7 +229,6 @@ workflow_definition:
       block_type: navigation
       url: "{{website_url}}"
       title: Fill_Out_Contact_Form
-      engine: skyvern-1.0
       navigation_goal: >-
         Find the contact form. Fill out the contact us form and submit it. Your
         goal is complete when the page says your message has been sent. In the
@@ -321,7 +316,6 @@ workflow_definition = {
                 "block_type": "navigation",
                 "url": "{{website_url}}",
                 "title": "Fill_Out_Contact_Form",
-                "engine": "skyvern-1.0",
                 "navigation_goal": "Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}",
                 "error_code_mapping": None,
                 "max_retries": 0,
@@ -405,7 +399,6 @@ const workflowDefinition = {
                 block_type: "navigation",
                 url: "{{website_url}}",
                 title: "Fill_Out_Contact_Form",
-                engine: "skyvern-1.0",
                 navigation_goal: "Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}",
                 error_code_mapping: null,
                 max_retries: 0,
@@ -483,7 +476,6 @@ workflow_definition:
       block_type: navigation
       url: "{{website_url}}"
       title: Fill_Out_Contact_Form
-      engine: skyvern-1.0
       navigation_goal: >-
         Find the contact form. Fill out the contact us form and submit it. Your
         goal is complete when the page says your message has been sent. In the
@@ -570,7 +562,6 @@ updated_workflow_definition = {
                 "block_type": "navigation",
                 "url": "{{website_url}}",
                 "title": "Fill_Out_Contact_Form",
-                "engine": "skyvern-1.0",
                 "navigation_goal": "Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}",
                 "error_code_mapping": None,
                 "max_retries": 0,
@@ -653,7 +644,6 @@ const updatedWorkflowDefinition = {
                 block_type: "navigation",
                 url: "{{website_url}}",
                 title: "Fill_Out_Contact_Form",
-                engine: "skyvern-1.0",
                 navigation_goal: "Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}",
                 error_code_mapping: null,
                 max_retries: 0,

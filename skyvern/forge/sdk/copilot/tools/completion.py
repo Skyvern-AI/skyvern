@@ -9,6 +9,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
+    PAGE_EVIDENCE_STAMP_KEYS,
     _artifact_contract_paths,
     _GroundingCtx,
     floor_rekeyed_path_backing,
@@ -54,6 +55,8 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
     derive_from_block_outputs,
+    generated_file_artifact_ids,
+    registered_download_proof_view,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
@@ -90,22 +93,9 @@ LOG = structlog.get_logger()
 
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
-# Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
-# and observation flag cannot be traversed as observed page content.
-_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset(
-    {"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"}
-)
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
-_VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT = (
-    " For validation-only pre-submit Review pages, do not repair by returning only booleans such as "
-    "pre_submit_review_reached, submit_control_visible, submit_or_finalize_clicked, or per-field *_verified flags. "
-    "The Review block output must include an explicit validation-only marker such as `validation_only: true` or "
-    '`submit_mode: "validation_only"`, `review_values` or `review_fields` as visible Review-page label/value '
-    "strings, `evidence_text` containing the visible Review-page text that verbatim contains those values, and an "
-    "explicit false submit/finalize-click signal. Stop on the Review page; do not click Submit/Finalize."
-)
 
 
 def _completion_request_policy(copilot_ctx: Any) -> Any | None:
@@ -141,8 +131,21 @@ def _result_block_outputs_by_label(result: dict[str, Any]) -> dict[str, Any]:
     return block_outputs
 
 
+def _result_generated_file_artifact_ids(result: dict[str, Any]) -> frozenset[str]:
+    data = _result_data(result)
+    blocks = data.get("blocks")
+    rows = blocks if isinstance(blocks, list) else []
+    return generated_file_artifact_ids(
+        [
+            *(block.get("extracted_data") for block in rows if isinstance(block, dict)),
+            *(registered.get("value") for registered in _registered_output_parameter_payloads(data)),
+        ]
+    )
+
+
 def _result_has_registered_download_block_output(result: dict[str, Any]) -> bool:
-    return derive_from_block_outputs(_result_block_outputs_by_label(result)) is not None
+    generated = _result_generated_file_artifact_ids(result)
+    return derive_from_block_outputs(_result_block_outputs_by_label(result), generated=generated) is not None
 
 
 def _registered_download_requested_output_criterion(criterion: CompletionCriterion) -> bool:
@@ -563,8 +566,8 @@ async def _maybe_run_completion_verification_from_page_observation(
     observed_data: object | None = None,
 ) -> CompletionVerificationResult | None:
     """Verify completion only for the isolated unattended recovery agent."""
-    if getattr(copilot_ctx, "turn_origin", None) != TurnOrigin.runtime_self_heal:
-        raise RuntimeError("page-observation completion verification is runtime-self-heal only")
+    if getattr(copilot_ctx, "turn_origin", None) != TurnOrigin.code_block_ai_fallback:
+        raise RuntimeError("page-observation completion verification is code-block-ai-fallback only")
 
     existing = getattr(copilot_ctx, "completion_verification_result", None)
     if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():
@@ -777,7 +780,8 @@ def _download_file_name(value: Any) -> str | None:
     return name or None
 
 
-def _completion_evidence_payload(output: Any) -> Any:
+def _completion_evidence_payload(output: Any, generated: frozenset[str]) -> Any:
+    output = registered_download_proof_view(output, generated)
     if not isinstance(output, dict):
         return output
     # Root scope only: the execution layer binds registration keys at the root of every block
@@ -813,6 +817,7 @@ _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
         "ANTI_BOT_DETECTION",
         "AUTH_FAILURE",
         "BROWSER_ERROR",
+        "BROWSER_SESSION_EXPIRED",
         "CREDENTIAL_ERROR",
         "INFRASTRUCTURE_ERROR",
         "NAVIGATION_FAILURE",
@@ -966,7 +971,7 @@ def _bind_independent_post_run_page_evidence(
     if evidence is None:
         return
     block_outputs[_POST_RUN_PAGE_OBSERVATION_LABEL] = model_visible_composition_evidence(
-        {key: value for key, value in evidence.items() if key not in _POST_RUN_PAGE_EVIDENCE_STAMP_KEYS}
+        {key: value for key, value in evidence.items() if key not in PAGE_EVIDENCE_STAMP_KEYS}
     )
     block_output_sources[_POST_RUN_PAGE_OBSERVATION_LABEL] = "independent_page_evidence"
     LOG.info(
@@ -985,16 +990,20 @@ def _bind_registered_artifact_evidence(
     run_id: str | None,
     block_outputs: dict[str, Any],
     block_output_sources: dict[str, EvidenceSourceKind],
+    generated: frozenset[str] = frozenset(),
 ) -> None:
     if _REGISTERED_ARTIFACT_OBSERVATION_LABEL in block_outputs:
         return
     if not isinstance(run_id, str) or not run_id:
         return
-    if evidence is None or evidence.workflow_run_id != run_id or not evidence.entries:
+    if evidence is None or evidence.workflow_run_id != run_id:
+        return
+    entries = [entry for entry in evidence.entries if entry.artifact_id not in generated]
+    if not entries:
         return
     block_outputs[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = {
-        "parsed_text": " ".join(entry.parsed_text for entry in evidence.entries),
-        "file_names": [entry.file_name for entry in evidence.entries],
+        "parsed_text": " ".join(entry.parsed_text for entry in entries),
+        "file_names": [entry.file_name for entry in entries],
     }
     block_output_sources[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = "registered_artifact_content"
 
@@ -1023,6 +1032,7 @@ def _floor_rekeyed_emission_evidence(
     if not isinstance(run_data, Mapping):
         return block_outputs, block_output_sources, block_types, runtime_envelope_labels
     current_labels = set(_current_workflow_block_labels(copilot_ctx))
+    generated = _result_generated_file_artifact_ids({"data": dict(run_data)})
     blocks = run_data.get("blocks")
     if isinstance(blocks, list):
         for block in blocks:
@@ -1030,7 +1040,7 @@ def _floor_rekeyed_emission_evidence(
                 continue
             label = block.get("label")
             block_type = block.get("block_type")
-            extracted = block.get("extracted_data")
+            extracted = registered_download_proof_view(block.get("extracted_data"), generated)
             if isinstance(label, str) and label in current_labels:
                 if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES:
                     runtime_envelope_labels.add(label)
@@ -1040,10 +1050,13 @@ def _floor_rekeyed_emission_evidence(
                     block_output_sources[label] = "runtime_output"
                     block_types[label] = block_type
             for output_key, output_value in _workflow_output_parameter_payloads(extracted).items():
-                block_outputs[output_key] = _registered_output_payload_view(output_value, block_type)
+                block_outputs[output_key] = _registered_output_payload_view(
+                    registered_download_proof_view(output_value, generated), block_type
+                )
                 block_output_sources[output_key] = "registered_output_parameter"
                 block_types[output_key] = block_type
     for output_key, output_value in _workflow_output_parameter_payloads(run_data.get("output")).items():
+        output_value = registered_download_proof_view(output_value, generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs.setdefault(output_key, output_value)
@@ -1051,7 +1064,9 @@ def _floor_rekeyed_emission_evidence(
     for registered in _registered_output_parameter_payloads(run_data):
         registered_output_key = registered.get("output_parameter_key")
         registered_block_type = registered.get("block_type")
-        registered_output_value = _registered_output_payload_view(registered.get("value"), registered_block_type)
+        registered_output_value = _registered_output_payload_view(
+            registered_download_proof_view(registered.get("value"), generated), registered_block_type
+        )
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             block_outputs[registered_output_key] = registered_output_value
@@ -1112,17 +1127,19 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     block_outputs: dict[str, Any] = {}
     block_output_sources: dict[str, EvidenceSourceKind] = {}
     registered_output_values: dict[str, Any] = {}
+    generated = _result_generated_file_artifact_ids(result)
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             label = block.get("label")
             output = block.get("extracted_data")
-            evidence_output = _completion_evidence_payload(output)
+            evidence_output = _completion_evidence_payload(output, generated)
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
                 block_outputs[label] = evidence_output
                 block_output_sources[label] = "runtime_output"
             for output_key, output_value in _workflow_output_parameter_payloads(output).items():
+                output_value = registered_download_proof_view(output_value, generated)
                 if not _is_meaningful_extracted_data(
                     _registered_output_payload_view(output_value, block.get("block_type"))
                 ):
@@ -1130,13 +1147,14 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                 block_outputs[output_key] = output_value
                 block_output_sources[output_key] = "registered_output_parameter"
     for output_key, output_value in _workflow_output_parameter_payloads(data.get("output")).items():
+        output_value = registered_download_proof_view(output_value, generated)
         if not _is_meaningful_extracted_data(_registered_output_payload_view(output_value, None)):
             continue
         block_outputs[output_key] = output_value
         block_output_sources[output_key] = "registered_output_parameter"
     for registered in _registered_output_parameter_payloads(data):
         registered_output_key = registered.get("output_parameter_key")
-        registered_output_value = _completion_evidence_payload(registered.get("value"))
+        registered_output_value = _completion_evidence_payload(registered.get("value"), generated)
         registered_block_label = registered.get("block_label")
         if isinstance(registered_output_key, str) and registered_output_key:
             registered_output_values[registered_output_key] = registered_output_value
@@ -1178,6 +1196,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         run_id if isinstance(run_id, str) else None,
         block_outputs,
         block_output_sources,
+        generated,
     )
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []

@@ -34,7 +34,12 @@ class SkyvernCredentialVaultService(CredentialVaultService):
     def __init__(self) -> None:
         self._fernet: Fernet | None = None
 
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+    ) -> Credential:
         item_id = self._generate_item_id()
         item = CredentialItem(
             item_id=item_id,
@@ -50,6 +55,7 @@ class SkyvernCredentialVaultService(CredentialVaultService):
                 data=data,
                 item_id=item_id,
                 vault_type=CredentialVaultType.SKYVERN,
+                created_by=created_by,
             )
         except BaseException:
             await self._reclaim_orphaned_vault_item(

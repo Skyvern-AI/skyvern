@@ -1,5 +1,4 @@
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
-import { WorkflowRunHumanInteraction } from "../WorkflowRunHumanInteraction";
 import { GoalText, Section } from "./shared";
 
 type Props = {
@@ -33,7 +32,6 @@ function BlockDetailHumanInteraction({ block }: Props) {
           </ul>
         </Section>
       )}
-      <WorkflowRunHumanInteraction workflowRunBlock={block} />
     </div>
   );
 }

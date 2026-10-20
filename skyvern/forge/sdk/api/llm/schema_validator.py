@@ -18,7 +18,7 @@ _TYPE_DEFAULT_FACTORIES: dict[str, Any] = {
 }
 
 
-def _resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str | None:
+def resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str | None:
     """Normalize a schema type definition to a single string value."""
     if isinstance(schema_type, list):
         non_null_types = [str(t).lower() for t in schema_type if str(t).lower() != "null"]
@@ -38,7 +38,7 @@ def _resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str 
 
 def get_default_value_for_type(schema_type: str | list[Any] | None, path: str = "root") -> Any:
     """Get a default value based on JSON schema type."""
-    normalized_type = _resolve_schema_type(schema_type, path)
+    normalized_type = resolve_schema_type(schema_type, path)
     if normalized_type is None:
         return None
 
@@ -65,7 +65,7 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
         LOG.debug("Schema is permissive", path=path, schema=schema)
         return data
 
-    schema_type = _resolve_schema_type(schema.get("type"), path)
+    schema_type = resolve_schema_type(schema.get("type"), path)
     raw_schema_type = schema.get("type")
 
     if schema_type == "null" and data is None:
@@ -203,7 +203,7 @@ def _is_all_default_values(data: dict[str, Any], schema: dict[str, Any]) -> bool
             continue
 
         field_value = data[field_name]
-        field_type = _resolve_schema_type(field_schema.get("type"), f"check.{field_name}")
+        field_type = resolve_schema_type(field_schema.get("type"), f"check.{field_name}")
         default_value = get_default_value_for_type(field_type)
 
         # If any field has a non-default value, the record is meaningful
@@ -258,7 +258,7 @@ def extraction_shape_matches(value: Any, schema: dict[str, Any] | list | str | N
     ``fill_missing_fields``."""
     if not isinstance(schema, dict):
         return False
-    root_type = _resolve_schema_type(schema.get("type"), "root")
+    root_type = resolve_schema_type(schema.get("type"), "root")
     expects_object = root_type == "object" or "properties" in schema
     expects_array = root_type == "array"
     return (expects_object and isinstance(value, dict)) or (expects_array and isinstance(value, list))

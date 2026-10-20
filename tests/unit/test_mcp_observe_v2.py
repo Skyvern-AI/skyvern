@@ -3250,3 +3250,103 @@ def test_observe_v2_override_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> N
         assert observe_v2_enabled() is True
     finally:
         reset_observe_v2_override(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("v2", [True, False])
+@pytest.mark.parametrize("message, attempts", [("Execution context was destroyed", 2), ("Read failed", 1)])
+async def test_observe_page_change_retry_refreshes_publication(
+    monkeypatch: pytest.MonkeyPatch, message: str, attempts: int, v2: bool
+) -> None:
+    monkeypatch.setenv(_FLAG, "true" if v2 else "false")
+    page = _page()
+    page.page.is_closed = lambda: False
+    ctx = BrowserContext(mode="local")
+    state = make_session_state(context=ctx)
+    state._active_page = page.page
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    generations = []
+
+    async def read(*args: Any, **kwargs: Any) -> ObserveResult:
+        generations.append(session_manager.session_ref_generation())
+        if len(generations) <= 2:
+            page.url = "https://fixture.test/two"
+            raise RuntimeError(message)
+        assert not state._observed_refs.get("refs")
+        return _result(page.url, "#fresh")
+
+    monkeypatch.setattr(mcp_browser, "do_observe", read)
+    async with scoped_session(state):
+        result = await mcp_browser.skyvern_observe()
+
+    assert len(generations) == (3 if attempts == 2 else 1)
+    assert result["ok"] is (attempts == 2)
+    if attempts == 2:
+        assert generations[2] > generations[1] > generations[0]
+        assert result["data"]["url"] == page.url
+        assert state._observed_refs["refs"]["e0"]["selector"] == "#fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("v2", [True, False])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Execution context was destroyed",
+        "The page changed while the extension operation was running.",
+        "The page changed before the extension operation started.",
+    ],
+)
+async def test_observe_retries_real_dom_scan_page_change(
+    monkeypatch: pytest.MonkeyPatch, v2: bool, message: str
+) -> None:
+    monkeypatch.setenv(_FLAG, "true" if v2 else "false")
+    page = _page()
+    page.page.is_closed = lambda: False
+    ctx = BrowserContext(mode="local")
+    state = make_session_state(context=ctx)
+    state._active_page = page.page
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    scans = 0
+    generations = []
+
+    async def evaluate(script: str, *args: Any) -> Any:
+        nonlocal scans
+        if script == browser_ops._DOMUTILS_INTERACTABILITY_READY_JS:
+            return True
+        if script == browser_ops._OBSERVE_INTERACTABLES_JS:
+            scans += 1
+            generations.append(session_manager.session_ref_generation())
+            if scans <= 2:
+                raise RuntimeError(message)
+            return [{"role": "button", "name": "Fresh", "selector": "#fresh", "tag": "button"}]
+        return None
+
+    page.evaluate = AsyncMock(side_effect=evaluate)
+    async with scoped_session(state):
+        result = await mcp_browser.skyvern_observe()
+
+    assert result["ok"] is True
+    assert scans == 3
+    assert generations[2] > generations[1] > generations[0]
+    assert result["data"]["elements"][0]["selector"] == "#fresh"
+    assert state._observed_refs["refs"]["e0"]["selector"] == "#fresh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scan_selectors", [None, ["#options"]])
+async def test_custom_select_dom_scan_still_swallows_page_change(scan_selectors: list[str] | None) -> None:
+    page = SimpleNamespace(evaluate=AsyncMock(side_effect=RuntimeError("Execution context was destroyed")))
+    assert await browser_ops._get_dom_observe_elements(page) == []
+    assert await browser_ops._custom_select_dom_elements(page, scan_selectors) == []
+
+
+@pytest.mark.asyncio
+async def test_non_retried_observe_keeps_best_effort_dom_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_FLAG, "false")
+    page = _page()
+    page.evaluate = AsyncMock(side_effect=RuntimeError("Execution context was destroyed"))
+    result = await browser_ops.do_observe(page)
+    assert result.elements == []
+    assert result.total_on_page == 0
+    page.evaluate.assert_awaited_once()

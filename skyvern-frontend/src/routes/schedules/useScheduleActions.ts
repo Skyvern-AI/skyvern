@@ -8,6 +8,7 @@ import type {
   UpdateScheduleRequest,
   WorkflowScheduleResponse,
 } from "@/routes/workflows/types/scheduleTypes";
+import { buildDuplicateSchedulePayload } from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 
 function useEnableScheduleMutation() {
   const credentialGetter = useCredentialGetter();
@@ -99,13 +100,7 @@ function useDuplicateScheduleMutation() {
       const client = await getClient(credentialGetter);
       await client.post(
         `/workflows/${schedule.workflow_permanent_id}/schedules`,
-        {
-          cron_expression: schedule.cron_expression,
-          timezone: schedule.timezone,
-          enabled: schedule.enabled,
-          parameters: schedule.parameters,
-          name: `${schedule.name ?? schedule.workflow_title} (copy)`,
-        },
+        buildDuplicateSchedulePayload(schedule),
       );
     },
     onSuccess: () => {

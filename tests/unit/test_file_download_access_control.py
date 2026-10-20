@@ -8,11 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api import files
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
@@ -76,6 +80,101 @@ def test_validate_download_url_rejects_legacy_path_escape(legacy_download_uris: 
 async def test_download_file_returns_canonical_legacy_download(legacy_download_uris: dict[str, str]) -> None:
     safe_path = files.parse_uri_to_path(legacy_download_uris["canonical"])
     assert await files.download_file(legacy_download_uris["canonical"]) == os.path.realpath(safe_path)
+
+
+@pytest.mark.asyncio
+async def test_local_download_snapshots_remain_readable_and_contained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_download_uris: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads")) in files._LOCAL_DOWNLOAD_ROOTS
+    default_root = tmp_path / "artifacts" / "downloads"
+    custom_root = tmp_path / "custom-artifacts" / "downloads"
+    malformed_org_ids = ("/", str(tmp_path), "../..", "", ".", "..", "o_test/wr_test", "o_test\\wr_test")
+    monkeypatch.setattr(files, "_LOCAL_DOWNLOAD_ROOTS", {str(default_root)})
+    monkeypatch.setattr(settings, "ENV", "local")
+    LocalStorage(str(custom_root.parent))
+    assert (
+        files.validate_download_url((custom_root / "local/o_1/wr_1/report.pdf").as_uri(), organization_id="o_1") is True
+    )
+    assert (
+        files.validate_download_url(
+            (custom_root.parent / "downloads-evil/local/o_1/wr_1/report.pdf").as_uri(), organization_id="o_1"
+        )
+        is False
+    )
+
+    for root in (default_root, custom_root):
+        for attempt_path in ("report.txt", "attempts/2/report.txt"):
+            snapshot = root / "local" / "o_test" / "wr_test" / attempt_path
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_text("preserved download")
+
+            for organization_id in (None, "o_other", "o_tes", *malformed_org_ids):
+                caplog.clear()
+                assert files.validate_download_url(snapshot.as_uri(), organization_id=organization_id) is False
+                assert "Legacy local file path traversal blocked" in caplog.text
+                caplog.clear()
+                with pytest.raises(PermissionError, match="outside the downloads directory"):
+                    await files.download_file(snapshot.as_uri(), organization_id=organization_id)
+                assert "Legacy local file path traversal blocked" in caplog.text
+
+            assert files.validate_download_url(snapshot.as_uri(), organization_id="o_test") is True
+            assert files._resolve_legacy_download_path(str(snapshot), organization_id="o_test") == str(
+                snapshot.resolve()
+            )
+            resolved = await files.download_file(snapshot.as_uri(), organization_id="o_test")
+            assert Path(resolved).read_text() == "preserved download"
+
+        other_org = root / "local" / "o_other"
+        other_org.mkdir()
+        cross_org_link = other_org / "report.txt"
+        cross_org_link.symlink_to(snapshot)
+        for rejected_uri in (
+            cross_org_link.as_uri(),
+            (other_org / ".." / "o_test" / "wr_test" / "report.txt").as_uri(),
+            f"{other_org.as_uri()}/%2E%2E/o_test/wr_test/report.txt",
+        ):
+            assert files.validate_download_url(rejected_uri, organization_id="o_other") is False
+            with pytest.raises(PermissionError, match="outside the downloads directory"):
+                await files.download_file(rejected_uri, organization_id="o_other")
+
+        sibling = root.parent / "downloads-evil" / "secret.txt"
+        sibling.parent.mkdir()
+        sibling.write_text("outside snapshot root")
+        for organization_id in malformed_org_ids:
+            assert files.validate_download_url(sibling.as_uri(), organization_id=organization_id) is False
+            with pytest.raises(PermissionError, match="outside the downloads directory"):
+                await files.download_file(sibling.as_uri(), organization_id=organization_id)
+
+        scope_symlink = root / "local" / "o_link"
+        scope_symlink.symlink_to(sibling.parent, target_is_directory=True)
+        for rejected_uri in ((scope_symlink / sibling.name).as_uri(), sibling.as_uri()):
+            caplog.clear()
+            assert files.validate_download_url(rejected_uri, organization_id="o_link") is False
+            assert "Legacy local file path traversal blocked" in caplog.text
+            caplog.clear()
+            with pytest.raises(PermissionError, match="outside the downloads directory"):
+                await files.download_file(rejected_uri, organization_id="o_link")
+            assert "Legacy local file path traversal blocked" in caplog.text
+
+        symlink = root / "local" / "o_test" / "escape.txt"
+        symlink.symlink_to(sibling)
+        for rejected_uri in (sibling.as_uri(), symlink.as_uri(), legacy_download_uris["parent_traversal"]):
+            assert files.validate_download_url(rejected_uri, organization_id="o_test") is False
+            with pytest.raises(PermissionError, match="outside the downloads directory"):
+                await files.download_file(rejected_uri, organization_id="o_test")
+
+    for organization_id in (None, "o_test", "o_other", *malformed_org_ids):
+        canonical_uri = legacy_download_uris["canonical"]
+        assert files.validate_download_url(canonical_uri, organization_id=organization_id) is True
+        assert await files.download_file(canonical_uri, organization_id=organization_id) == os.path.realpath(
+            files.parse_uri_to_path(canonical_uri)
+        )
+    monkeypatch.setattr(settings, "ENV", "prod")
+    assert files.validate_download_url(snapshot.as_uri(), organization_id="o_test") is False
 
 
 @pytest.mark.asyncio
@@ -363,14 +462,78 @@ async def test_download_file_strips_credentials_on_cross_origin_redirect(
 
     result = await files.download_file(
         "https://example.com/start.pdf",
-        headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "sid=abc",
+            "Accept": "application/pdf",
+            "X-Keep": "1",
+        },
         output_dir=str(tmp_path),
     )
 
     assert Path(result).read_bytes() == b"file-bytes"
     assert requested_headers[0]["Authorization"] == "Bearer secret"
     assert requested_headers[0]["Cookie"] == "sid=abc"
-    assert requested_headers[1] == {"X-Keep": "1"}
+    assert requested_headers[1] == {"Accept": "application/pdf"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("download_path", ["fetch_file_bytes", "download_file"])
+async def test_file_redirect_paths_clear_cookie_jar_on_cross_origin_hops(
+    download_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def pin_local_url(url: str, resolver: files.SSRFGuardedResolver) -> str:
+        resolver.pin_url_ips(url, ("127.0.0.1",))
+        return url
+
+    async def pin_local_redirect(_url: str, location: str, resolver: files.SSRFGuardedResolver) -> str:
+        resolver.pin_url_ips(location, ("127.0.0.1",))
+        return location
+
+    monkeypatch.setattr(files, "validate_and_pin_fetch_url", pin_local_url)
+    monkeypatch.setattr(files, "validate_and_pin_redirect_url", pin_local_redirect)
+
+    redirect_target = ""
+    received_cookies: dict[str, str] = {}
+
+    async def redirect(_request: web.Request) -> web.Response:
+        response = web.Response(status=302, headers={"Location": redirect_target})
+        response.set_cookie("server-cookie", "synthetic")
+        return response
+
+    async def final(request: web.Request) -> web.Response:
+        received_cookies.update(request.cookies)
+        return web.Response(body=b"file-bytes", content_type="application/octet-stream")
+
+    source_app = web.Application()
+    source_app.router.add_get("/start", redirect)
+    source_server = TestServer(source_app, host="localhost")
+    target_app = web.Application()
+    target_app.router.add_get("/final.pdf", final)
+    target_server = TestServer(target_app, host="localhost")
+    await source_server.start_server()
+    await target_server.start_server()
+    source_url = str(source_server.make_url("/start"))
+    redirect_target = str(target_server.make_url("/final.pdf"))
+
+    try:
+        if download_path == "fetch_file_bytes":
+            scope = "test-download-scope"
+            response = await files.fetch_file_bytes(
+                source_url,
+                authorize_request_hop=RunScopedRedirectHopAuthorizer(download_scope=scope),
+                download_scope=scope,
+                approved_initial_url=source_url,
+            )
+            assert response.body == b"file-bytes"
+        else:
+            result = await files.download_file(source_url, output_dir=str(tmp_path))
+            assert Path(result).read_bytes() == b"file-bytes"
+    finally:
+        await target_server.close()
+        await source_server.close()
+
+    assert received_cookies == {}
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ import {
 import { Tip } from "@/components/Tip";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
@@ -74,8 +75,9 @@ import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { legacyRunDetailPath, workflowEditorPath } from "./studioNavigation";
+import { workflowEditorPath, workflowRunDetailPath } from "./studioNavigation";
 import { TableSearchInput } from "@/components/TableSearchInput";
+import { WORKFLOW_RUN_SEARCH_FIELDS_HINT } from "@/util/runSearch";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
@@ -83,9 +85,11 @@ import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
 import { useFeatureFlagVariantKey } from "posthog-js/react";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { useAnalyticsDashboardFlag } from "@/hooks/useAnalyticsDashboardFlag";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 import { usePageSlots } from "@/store/PageSlots";
@@ -148,21 +152,25 @@ function WorkflowPage() {
     setSearchParams,
   );
 
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // A stale ?tags= URL param would 403 the request when tagging is off.
+  const { tags: urlTags, hold: holdForTaggingFlag } =
+    useUrlTagFilter(tagsParam);
 
-  const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
-    workflowPermanentId,
-    statusFilters,
-    page,
-    pageSize,
-    search: debouncedSearch,
-    createdAtStart: runWindow.createdAtStart,
-    createdAtEnd: runWindow.createdAtEnd,
-    // A stale ?tags= URL param would 403 the request when tagging is disabled.
-    tags: taggingEnabled ? tagsParam : undefined,
-    refetchOnMount: "always",
-  });
+  const { data: workflowRuns, isLoading: isRunsQueryLoading } =
+    useWorkflowRunsQuery({
+      workflowPermanentId,
+      statusFilters,
+      page,
+      pageSize,
+      search: debouncedSearch,
+      createdAtStart: runWindow.createdAtStart,
+      createdAtEnd: runWindow.createdAtEnd,
+      tags: urlTags || undefined,
+      enabled: !holdForTaggingFlag,
+      refetchOnMount: "always",
+    });
+  const isLoading = isRunsQueryLoading || holdForTaggingFlag;
 
   useEffect(() => {
     if (!isLoading && workflowRuns && workflowRuns.length === 0 && page > 1) {
@@ -172,9 +180,15 @@ function WorkflowPage() {
     }
   }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
 
-  const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
+  const {
+    data: workflow,
+    isLoading: workflowIsLoading,
+    isError: workflowIsError,
+  } = useWorkflowQuery({
     workflowPermanentId,
   });
+  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
+  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
 
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
@@ -252,6 +266,14 @@ function WorkflowPage() {
     return null; // this should never happen
   }
 
+  const analyticsWorkflow =
+    workflow?.workflow_permanent_id === workflowPermanentId
+      ? workflow
+      : undefined;
+  // A disabled or placeholder workflow query is not loading, but its data is not this agent's yet.
+  const analyticsWorkflowIsLoading =
+    !analyticsWorkflow && !workflowIsError && !globalWorkflowsIsError;
+
   return (
     <div className="space-y-8">
       <header className="flex flex-col gap-4">
@@ -322,10 +344,14 @@ function WorkflowPage() {
             </Button>
           </div>
         </div>
-        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
         {WorkflowAnalyticsPanel ? (
-          <WorkflowAnalyticsPanel workflowPermanentId={workflowPermanentId} />
+          <WorkflowAnalyticsPanel
+            workflowPermanentId={workflowPermanentId}
+            workflow={analyticsWorkflow}
+            workflowIsLoading={analyticsWorkflowIsLoading}
+          />
         ) : null}
+        <WorkflowReliabilityPanel workflowPermanentId={workflowPermanentId} />
       </header>
       <div className="space-y-4">
         <header>
@@ -377,7 +403,8 @@ function WorkflowPage() {
                     params.set("page", "1");
                     setSearchParams(params, { replace: true });
                   }}
-                  placeholder="Search runs by input..."
+                  placeholder="Search by run ID, input, credential..."
+                  title={WORKFLOW_RUN_SEARCH_FIELDS_HINT}
                   className="w-48 lg:w-72"
                 />
                 {taggingEnabled ? (
@@ -467,12 +494,9 @@ function WorkflowPage() {
                       const isRowSelected = isSelected(
                         workflowRun.workflow_run_id,
                       );
-                      const runPath = studioEnabled
-                        ? `/runs/${workflowRun.workflow_run_id}`
-                        : legacyRunDetailPath(
-                            workflowPermanentId,
-                            workflowRun.workflow_run_id,
-                          );
+                      const runPath = workflowRunDetailPath(
+                        workflowRun.workflow_run_id,
+                      );
 
                       const mainRow = (kebab: React.ReactNode) => (
                         <TableRow
@@ -520,6 +544,11 @@ function WorkflowPage() {
                           <TableCell>
                             <div className="flex items-center gap-2">
                               <StatusBadge status={workflowRun.status} />
+                              <WorkflowRunAttemptChip
+                                attempt={workflowRun.attempt}
+                                retryPending={workflowRun.retry_pending}
+                                nextAttemptAt={workflowRun.next_attempt_at}
+                              />
                               <CredentialFallbackRetryBadge
                                 retriedFromWorkflowRunId={
                                   workflowRun.retried_from_workflow_run_id

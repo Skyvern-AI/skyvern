@@ -80,7 +80,9 @@ def test_yaml_import_defaults_when_new_keys_omitted() -> None:
 
     validation_block = blocks["v"]
     assert isinstance(validation_block, ValidationBlock)
-    assert validation_block.engine == RunEngine.skyvern_v1
+    # Stored unset, and resolved exactly like the old skyvern_v1 default outside a chosen-engine run.
+    assert validation_block.engine is None
+    assert validation_block.resolve_engine(None) == RunEngine.skyvern_v1
     assert validation_block.max_steps_per_run == 2
 
     action_block = blocks["a"]

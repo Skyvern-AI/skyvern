@@ -7,12 +7,10 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { getReadableActionType, type ActionsApiResponse } from "@/api/types";
 import {
-  ActionTypes,
-  getReadableActionType,
-  type ActionsApiResponse,
-} from "@/api/types";
-import {
+  getActionInputValue,
+  getActionOutcome,
   isRecorderCallText,
   taskV3CallText,
 } from "@/routes/workflows/workflowBlockUtils";
@@ -24,9 +22,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
 import {
   getBlockOutputDisplayValue,
+  readGmailSendOutput,
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import { GmailSendOutcome } from "../blockInfo/SendEmailBlockInfo";
 import { jsonClipboardText } from "./formatValue";
 import { BlockDetailFailure } from "./shared";
 
@@ -443,14 +443,6 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   return fields;
 }
 
-function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Script-generated input text lives in response, not text.
-  if (action.action_type === ActionTypes.InputText) {
-    return action.text ?? action.response;
-  }
-  return action.text;
-}
-
 function getActionSummaryFields(
   action: ActionsApiResponse,
 ): Array<InspectorField> {
@@ -472,20 +464,6 @@ function getActionSummaryFields(
   }
   pushField(fields, "Tool call", taskV3CallText(action.description), "mono");
   return fields;
-}
-
-function getActionOutputValue(action: ActionsApiResponse): unknown {
-  // response doubles as stored input only for input-text actions — don't echo
-  // it back as output there. Other action types legitimately carry their
-  // result in response even when it equals text, so never suppress for them.
-  if (
-    action.action_type === ActionTypes.InputText &&
-    typeof action.response === "string" &&
-    action.response === getActionInputValue(action)
-  ) {
-    return null;
-  }
-  return action.response;
 }
 
 function isSameStepInstance(
@@ -596,9 +574,7 @@ function BlockInspector({
   );
   const showsExtractedInformation =
     !action && shouldShowExtractedInformation(block);
-  const outputValue = action
-    ? getActionOutputValue(action)
-    : getOutputValue(block);
+  const outputValue = action ? getActionOutcome(action) : getOutputValue(block);
   const hasOutput = showsExtractedInformation || !isEmptyValue(outputValue);
   const outputRootLabel = showsExtractedInformation
     ? "extracted_information"
@@ -608,13 +584,16 @@ function BlockInspector({
   const outputTabLabel = showsExtractedInformation
     ? "Extracted Information"
     : "Outputs";
+  const gmailSendOutput = action ? null : readGmailSendOutput(block.output);
   // A failed block/action opens on Summary so its failure reason (the only
-  // place it now renders) is visible without hunting through tabs.
-  const defaultTab = block.failure_reason
-    ? "summary"
-    : hasOutput
-      ? "outputs"
-      : "summary";
+  // place it now renders) is visible without hunting through tabs. A Gmail
+  // send opens there too: Summary is where its outcome is stated.
+  const defaultTab =
+    block.failure_reason || gmailSendOutput
+      ? "summary"
+      : hasOutput
+        ? "outputs"
+        : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
   const diagnosticsTaskId = action?.task_id ?? block.task_id;
   const diagnosticsStepIndex = action
@@ -673,11 +652,18 @@ function BlockInspector({
           )}
         </TabsList>
         <TabsContent value="summary" className="m-0 space-y-3">
-          <BlockDetailFailure
-            block={block}
-            onViewScreenshot={onViewScreenshot}
-            statedFailureHeadline={statedFailureHeadline}
-          />
+          {gmailSendOutput ? (
+            <GmailSendOutcome
+              output={gmailSendOutput}
+              failureReason={block.failure_reason}
+            />
+          ) : (
+            <BlockDetailFailure
+              block={block}
+              onViewScreenshot={onViewScreenshot}
+              statedFailureHeadline={statedFailureHeadline}
+            />
+          )}
           <FieldList
             fields={summaryFields}
             emptyText="No additional summary data."

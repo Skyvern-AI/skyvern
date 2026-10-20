@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -23,7 +24,6 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _ExecutionResult,
     _record_run_blocks_result,
     _recorded_run_block_result,
-    _run_blocks_and_collect_debug,
     _RunExecution,
     finalize_build_test_result,
 )
@@ -59,6 +59,7 @@ def _block() -> CodeBlock:
     now = datetime.now(UTC)
     return CodeBlock(
         label="run_code",
+        prompt="Run the code block",
         code="raise RuntimeError('failed')",
         output_parameter=OutputParameter(
             parameter_type=ParameterType.OUTPUT,
@@ -159,6 +160,7 @@ async def test_failure_is_committed_before_exact_page_capture_finishes(
             engine="secure_runner",
             resolved_download_id=None,
             download_dir_before=None,
+            attempt_started_at=None,
         )
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
@@ -233,6 +235,7 @@ async def test_continuation_cancels_pending_capture_without_attaching(
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
     await context.cancel_failure_evidence_capture()
@@ -395,10 +398,16 @@ async def test_cancel_capture_joins_owned_task_before_preserving_caller_cancella
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
+    )
     healed = BlockResult(
         success=True,
         output_parameter=block.output_parameter,
@@ -412,8 +421,6 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", AsyncMock(return_value=b"frame"))
     monkeypatch.setattr(block_module.app.DATABASE.observer, "update_workflow_run_block", update_block)
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(block_module.app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=healed))
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -421,6 +428,8 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
 
     result = await block._resolve_failure_with_heal(
+        authored_code=None,
+        code_failure_reason=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -449,6 +458,7 @@ async def test_successful_self_heal_never_starts_failure_capture(monkeypatch: py
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("_sample", range(5))
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_outer_deadline_during_staging_still_publishes_the_healable_failure(
     monkeypatch: pytest.MonkeyPatch, _sample: int
 ) -> None:
@@ -457,7 +467,12 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
     still reach the caller."""
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
+    )
     staging_entered = asyncio.Event()
     published: list[str] = []
     screenshot_attempts = 0
@@ -481,9 +496,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
     heal = AsyncMock()
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", cancelled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
-    monkeypatch.setattr(block_module.app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
     monkeypatch.setattr(block, "_bind_and_grade_downloads", AsyncMock(return_value=(None, None)))
@@ -492,6 +505,8 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
     task = asyncio.create_task(
         block._resolve_failure_with_heal(
+            authored_code=None,
+            code_failure_reason=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=build_failure_result,
@@ -526,6 +541,7 @@ async def test_outer_deadline_during_staging_still_publishes_the_healable_failur
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("_sample", range(5))
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     monkeypatch: pytest.MonkeyPatch, _sample: int
 ) -> None:
@@ -534,7 +550,12 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
     heal proceeds without a frame."""
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
+    )
     heal_reached = asyncio.Event()
 
     async def stalled_screenshot(**_: object) -> bytes:
@@ -552,8 +573,6 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
     monkeypatch.setattr(block_module.settings, "BROWSER_SCREENSHOT_TIMEOUT_MS", 10)
     monkeypatch.setattr(block_module.SkyvernFrame, "take_scrolling_screenshot", stalled_screenshot)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(block_module.app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", heal)
     monkeypatch.setattr(block, "_register_downloaded_files", AsyncMock(return_value=([], set())))
@@ -562,6 +581,8 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
     result = await asyncio.wait_for(
         block._resolve_failure_with_heal(
+            authored_code=None,
+            code_failure_reason=None,
             exception=RuntimeError("initial failure"),
             failing_line=1,
             build_failure_result=AsyncMock(),
@@ -585,10 +606,16 @@ async def test_healable_failure_is_not_held_behind_a_stalled_frame(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("ai_fallback_on_in_an_ordinary_run")
 async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _block()
     context = _context()
-    recorder = SimpleNamespace(recording_page=SimpleNamespace(), finalize=AsyncMock())
+    recorder = SimpleNamespace(
+        recording_page=SimpleNamespace(
+            failure_nav_error_code=lambda _exception: None, failure_document_receipt=lambda _exception: None
+        ),
+        finalize=AsyncMock(),
+    )
     failed = BlockResult(
         success=False,
         failure_reason="specific healed-attempt failure",
@@ -610,14 +637,14 @@ async def test_failed_self_heal_is_not_persisted_twice_before_capture(monkeypatc
         ),
     )
     monkeypatch.setattr(block_module.app.ARTIFACT_MANAGER, "create_workflow_run_block_artifact", create_artifact)
-    monkeypatch.setattr(block, "_self_heal_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(block_module.app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
     monkeypatch.setattr(block, "_write_heal_episode_safe", AsyncMock())
     monkeypatch.setattr(block, "_attempt_self_heal", AsyncMock(return_value=failed))
     monkeypatch.setattr(block, "_failure_output_with_downloads", AsyncMock(return_value=None))
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock())
 
     result = await block._resolve_failure_with_heal(
+        authored_code=None,
+        code_failure_reason=None,
         exception=RuntimeError("initial failure"),
         failing_line=1,
         build_failure_result=AsyncMock(),
@@ -736,6 +763,7 @@ async def test_end_url_is_persisted_while_the_frame_is_still_stalled(
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_started.wait(), timeout=1)
 
@@ -831,6 +859,7 @@ async def test_capture_failure_leaves_committed_failure_intact(monkeypatch: pyte
         engine="secure_runner",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
     await asyncio.wait_for(capture_attempted.wait(), timeout=1)
     await context.drain_failure_evidence_capture()
@@ -870,6 +899,7 @@ async def test_missing_page_publishes_failure_without_starting_capture(monkeypat
         engine="inline",
         resolved_download_id=None,
         download_dir_before=None,
+        attempt_started_at=None,
     )
 
     assert result.failure_reason == failure_reason
@@ -1377,6 +1407,8 @@ async def test_cached_script_successor_settles_capture_before_browser_reads(monk
 
 @pytest.mark.asyncio
 async def test_capture_settlement_failure_uses_protected_block_failure_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This test exercises settlement handling, independent of process-wide log processors.
+    monkeypatch.setattr(block_module, "LOG", MagicMock())
     context = _context()
     context.cancel_failure_evidence_capture = AsyncMock(side_effect=RuntimeError("capture settlement failed"))
     create_run_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_successor"))
@@ -1396,7 +1428,9 @@ async def test_capture_settlement_failure_uses_protected_block_failure_path(monk
     monkeypatch.setattr(CodeBlock, "_invalidate_stale_output_on_failure", AsyncMock())
     monkeypatch.setattr(CodeBlock, "build_block_result", build_result)
 
-    result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
+    # structlog's unconfigured default renderer cannot format the failure log's list-valued `stack`.
+    with capture_logs():
+        result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
 
     assert result.failure_reason == "CodeBlock execution failed."
     assert build_result.await_args.kwargs["workflow_run_block_id"] == "wrb_successor"
@@ -1637,11 +1671,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert packet["failure"]["error_codes"] == ["browser_operation_failed"]
     assert persisted_row.output == {"failure": "specific runner failure"}
 
-    dispatch_lookup = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.run_execution.app.DATABASE.workflows.get_workflow_by_permanent_id",
-        dispatch_lookup,
-    )
     first_result = SimpleNamespace(context_wrapper=SimpleNamespace(usage=None), cancel=MagicMock())
     unfinished_report = SimpleNamespace(
         context_wrapper=SimpleNamespace(usage=None),
@@ -1667,8 +1696,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
             return
         assert copilot_context.last_run_outcome is outcome
         assert workflow_context.has_failure_evidence_capture is True
-        denial = await _run_blocks_and_collect_debug({"block_labels": ["run_code"]}, copilot_context)
-        assert denial["data"] == {"budget_expired": True, "run_dispatched": False, "source": "deadline"}
         report_started.set()
         try:
             await asyncio.Event().wait()
@@ -1703,7 +1730,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert copilot_context.budget_expiry_state.drain_attempted is True
     assert copilot_context.budget_expiry_state.hard_backstop_reached is True
     assert unfinished_report.final_output is None
-    dispatch_lookup.assert_not_awaited()
     assert workflow_context.has_failure_evidence_capture is True
 
     hard_result = _build_timeout_exit_result(copilot_context, global_llm_context=None)
@@ -1760,7 +1786,6 @@ async def test_real_soft_and_hard_deadlines_persist_and_emit_held_production_fai
     assert emitted.narrative_payload["turnFacts"]["recordedFailure"] == "specific runner failure"
     assert emitted.narrative_payload["turnFacts"]["runId"] == "wr_test"
     assert emitted.narrative_payload["turnFacts"]["evaluationState"] == "not_demonstrated"
-    dispatch_lookup.assert_not_awaited()
     assert workflow_context.has_failure_evidence_capture is True
 
     capture_release.set()

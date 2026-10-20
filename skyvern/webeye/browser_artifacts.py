@@ -121,6 +121,16 @@ class BrowserArtifacts(BaseModel):
     _seed_capture_failed: bool = PrivateAttr(default=False)
     _action_download_source: ActionDownloadSource | None = PrivateAttr(default=None)
 
+    def local_paths(self) -> list[str]:
+        """Files and folders on this host that the browser writes to: recordings, HAR, traces, profile, console log."""
+        paths = [video.video_path for video in self.video_artifacts if video.video_path]
+        paths += [
+            path
+            for path in (self.har_path, self.traces_dir, self.browser_session_dir, self.browser_console_log_path)
+            if path
+        ]
+        return paths
+
     def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
         self._action_download_source = source
 

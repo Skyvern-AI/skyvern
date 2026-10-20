@@ -11,17 +11,26 @@ from typing import Any
 from urllib.parse import urlparse
 
 import structlog
+from agents import FunctionTool
+from agents.tool_context import ToolContext
 
-from skyvern.forge.sdk.copilot.challenge_evidence import ChallengeKind, challenge_evidence_unsettled
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_FRAMES_KEY,
+    ChallengeKind,
+    challenge_evidence_unsettled,
+    stamp_challenge_frame_fact,
+)
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    DECLARED_IFRAME_SRC_EXPRESSION,
     value_witness_read_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_KEY_VALUE_RELATIONS,
     CONSENT_OBSTRUCTION_KIND,
+    fit_authoring_facts,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
@@ -33,20 +42,20 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import author_time_levers
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _requested_output_labels_by_path
+from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    _requested_output_labels_by_path,
+)
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_extraction_plan import _exact_path, _value_witness_bindings
+from skyvern.forge.sdk.copilot.run_outcome import run_outcome_display_reason
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     bound_call_browser_session,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
-    clear_sensitive_origin_page_taint,
+    browser_session_turn,
     effective_browser_session_id,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
+    resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -59,12 +68,13 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    register_matching_origin_run_redaction_values,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 
 from ._shared import (
     _CURRENT_PAGE_INSPECTION_TARGETS,
@@ -80,13 +90,17 @@ from ._shared import (
     _requested_capture_targets,
     _workflow_verification_evidence,
 )
+from .banned_blocks import upload_routes_for
 from .blockers import _allows_post_run_current_page_inspection_budget_bypass
 from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_read
 from .scouting import (
+    _PAGE_STATE_TITLE_MAX_CHARS,
+    _PAGE_STATE_URL_MAX_CHARS,
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
+    _evidence_list_len,
     _mark_post_run_page_observed,
 )
 
@@ -115,18 +129,57 @@ def _capture_result_parts(
 
 
 _POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
+_POST_RUN_CHILD_FRAME_READ_TIMEOUT_SECONDS = 5.0
+_MAX_POST_RUN_FRAME_URLS = 64
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
 
-def _model_facing_inspect_result(result: dict[str, Any]) -> dict[str, Any]:
+def _attach_field_upload_routes(data: dict[str, Any], upload_routes: list[dict[str, str]]) -> None:
+    if not upload_routes:
+        return
+    for form in data.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for field in form.get("fields") or []:
+            if isinstance(field, dict) and field.get("type") == "file":
+                field["upload_routes"] = [dict(route) for route in upload_routes]
+
+
+# Room for the page_state the tool wrapper prepends after this fit, at its largest: a url and title at their
+# bounds, every character astral (JSON escapes each to 12), and the longest vendor signature.
+_PAGE_STATE_RESERVE_CHARS = len(
+    json.dumps(
+        {
+            "page_state": {
+                "read": "ok",
+                "url": "\U0001f600" * _PAGE_STATE_URL_MAX_CHARS,
+                "title": "\U0001f600" * _PAGE_STATE_TITLE_MAX_CHARS,
+                "challenge_vendor": max(CHALLENGE_VENDOR_SIGNATURE.split("|"), key=len),
+            }
+        }
+    )
+)
+
+
+def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentContext | None = None) -> dict[str, Any]:
     """Detach stored evidence, remove locator recommendations, and fit the complete model packet."""
     if result.get("ok") is not True:
         return result
     shaped = copy.deepcopy(result)
     data = shaped.get("data")
     if isinstance(data, dict):
-        shaped["data"] = model_visible_composition_evidence(data)
+        upload_routes = upload_routes_for(copilot_ctx)
+        projected, bare = (model_visible_composition_evidence(data, authoring_facts=facts) for facts in (True, False))
+        for packet in (projected, bare):
+            _attach_field_upload_routes(packet, upload_routes)
+
+        def fits(packet: dict[str, Any]) -> bool:
+            return (
+                len(json.dumps({**shaped, "data": packet})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS
+            )
+
+        shaped["data"] = fit_authoring_facts(projected, bare, fits)
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")
@@ -377,6 +430,7 @@ async def _composition_capture_visual_summary(
             dispatch_browser_session_id=capture_session_id,
             producer_browser_session_id=producer_session_id,
             session_binding=session_binding,
+            viewport_css_px=screenshot_viewport_css_px(screenshot_result),
         )
         if screenshot_b64
         else None
@@ -450,6 +504,11 @@ async def _composition_evidence_after_navigation_failure(
     navigation_error: str,
     requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> tuple[dict[str, Any], CapturedFrame | None] | None:
+    # The capture succeeds on Chrome's error page, so without the error the packet is the interstitial.
+    # The text is model-facing, so it takes the same redaction and URL-to-origin rewrite as a run reason.
+    displayed_error = run_outcome_display_reason(navigation_error) or ""
+    before_html_capture = f"navigation_error_before_html_capture: {displayed_error}"
+    before_evidence_capture = f"navigation_error_before_evidence_capture: {displayed_error}"
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
     requested_targets = _seeded_capture_targets(ctx, requested_reads)
@@ -462,7 +521,7 @@ async def _composition_evidence_after_navigation_failure(
     if structured is not None and has_bounded_page_schema(structured):
         evidence = _composition_add_inspection_warning(
             structured,
-            "navigation_error_before_html_capture",
+            before_html_capture,
         )
         frame = None
         if page_evidence_needs_visual_fallback(evidence):
@@ -475,7 +534,7 @@ async def _composition_evidence_after_navigation_failure(
         evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
             evidence,
-            "navigation_error_before_evidence_capture",
+            before_evidence_capture,
         )
         evidence = _composition_add_inspection_warning(
             evidence,
@@ -495,7 +554,7 @@ async def _composition_evidence_after_navigation_failure(
         )
         evidence = _composition_add_inspection_warning(
             evidence,
-            "navigation_error_before_html_capture",
+            before_html_capture,
         )
         if html_truncated:
             evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
@@ -508,7 +567,7 @@ async def _composition_evidence_after_navigation_failure(
     evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
     evidence = _composition_add_inspection_warning(
         evidence,
-        "navigation_error_before_evidence_capture",
+        before_evidence_capture,
     )
     evidence = _composition_add_inspection_warning(
         evidence,
@@ -932,6 +991,50 @@ async def _capture_composition_evidence(
     return CompositionEvidenceCapture(evidence, None, frame)
 
 
+async def _run_session_child_frame_urls(ctx: CopilotContext, run_session_id: str) -> tuple[list[str], bool] | None:
+    """URLs of every committed non-main frame (nested included) plus the top document's ``iframe@src`` values, and
+    whether both reads succeeded uncapped. ``None`` when neither read succeeded, which is not a page with no frames."""
+    # The session manager owns the attach bound (decision 0032); the deadline covers only the page reads.
+    browser_state = await resolve_browser_state_for_context(ctx, session_id=run_session_id)
+    deadline = time.monotonic() + _POST_RUN_CHILD_FRAME_READ_TIMEOUT_SECONDS
+    page = (
+        await asyncio.wait_for(browser_state.get_working_page(), timeout=max(0.0, deadline - time.monotonic()))
+        if browser_state is not None
+        else None
+    )
+    if page is None:
+        return None
+    frame_urls: list[str] = []
+    committed_read = False
+    truncated = False
+    try:
+        # ``main_frame`` raises on the raw-CDP facade until a main frame id is bound, which would
+        # otherwise take the iframe-src read down with it.
+        main_frame = page.main_frame
+        child_urls = [frame.url for frame in page.frames if frame is not main_frame]
+        truncated = len(child_urls) > _MAX_POST_RUN_FRAME_URLS
+        frame_urls.extend(child_urls[:_MAX_POST_RUN_FRAME_URLS])
+        committed_read = True
+    except Exception:
+        LOG.debug("Post-run child frame list read failed", exc_info=True)
+    declared_read = False
+    try:
+        # The element read is awaited after the committed list is already in hand, so a timeout here
+        # narrows the record to a partial read instead of discarding the frames that were read.
+        declared = await asyncio.wait_for(
+            page.evaluate(DECLARED_IFRAME_SRC_EXPRESSION), timeout=max(0.0, deadline - time.monotonic())
+        )
+        if isinstance(declared, list):
+            truncated = truncated or len(declared) > _MAX_POST_RUN_FRAME_URLS
+            frame_urls.extend(src for src in declared[:_MAX_POST_RUN_FRAME_URLS] if isinstance(src, str) and src)
+            declared_read = True
+    except Exception:
+        LOG.debug("Post-run iframe src read failed", exc_info=True)
+    if not committed_read and not declared_read:
+        return None
+    return list(dict.fromkeys(frame_urls)), committed_read and declared_read and not truncated
+
+
 async def _read_run_session_page_evidence(
     ctx: CopilotContext,
     *,
@@ -954,6 +1057,19 @@ async def _read_run_session_page_evidence(
             LOG.debug("Post-run run-session page capture failed", exc_info=True)
             observation_error = observation_error or "Post-run page capture against the run session failed."
             evidence = None
+        if isinstance(evidence, dict):
+            frame_read: tuple[list[str], bool] | None = None
+            try:
+                frame_read = await _run_session_child_frame_urls(ctx, run_session_id)
+            except Exception:
+                LOG.debug("Post-run child frame read failed", exc_info=True)
+            # An unreadable frame list stamps the read as failed rather than dropping the packet the
+            # capture already produced.
+            evidence = stamp_challenge_frame_fact(
+                evidence,
+                frame_read[0] if frame_read is not None else None,
+                complete=frame_read[1] if frame_read is not None else False,
+            )
 
     if not observed_session_id:
         # An unknown source id grants post-run identity, so an unprovable source drops the packet
@@ -990,6 +1106,10 @@ def store_post_run_page_evidence(
         run_id=run_id,
         run_browser_session_id=run_browser_session_id,
     )
+    # A path that stored a packet without reading frames records that, rather than leaving the key
+    # absent for a reader to mistake for a page that mounted no challenge frame.
+    if CHALLENGE_FRAMES_KEY not in stamped:
+        stamped = stamp_challenge_frame_fact(stamped, None)
     LOG.info(
         "copilot_post_run_page_evidence_sourced",
         run_id=run_id,
@@ -997,6 +1117,7 @@ def store_post_run_page_evidence(
         run_browser_session_id=run_browser_session_id,
         matched=source_browser_session_id == run_browser_session_id,
         granted=stamped.get("observed_after_workflow_run") is True,
+        key_value_relation_count=_evidence_list_len(stamped, "key_value_relations"),
     )
     if current_url and not stamped.get("current_url"):
         stamped["current_url"] = current_url
@@ -1047,10 +1168,7 @@ async def _inspect_page_for_composition_impl(
     target_url: str,
     requested_reads: tuple[AdmittedOutputRead, ...] = (),
 ) -> dict[str, Any]:
-    # Named navigation is the only route that may release sensitive-page custody. Keep navigation,
-    # release, capture, and evidence admission atomic with sensitive-run registration so this call
-    # cannot clear a newer run's taint after its navigation returns.
-    async with browser_page_custody_lock(copilot_ctx):
+    async with browser_session_turn(copilot_ctx):
         async with browser_evidence_commit_lock(copilot_ctx):
             return await _inspect_page_for_composition_under_custody(copilot_ctx, target_url, requested_reads)
 
@@ -1133,8 +1251,6 @@ async def _inspect_page_for_composition_under_custody(
     authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
     if authority_error:
         return {"ok": False, "error": authority_error}
-    if sensitive_origin_page_has_active_run(copilot_ctx):
-        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
     capture_session_id = effective_browser_session_id(copilot_ctx) if isinstance(copilot_ctx, AgentContext) else None
     capture_tracks_debug_session = (
         isinstance(copilot_ctx, AgentContext) and capture_session_id == copilot_ctx.browser_session_id
@@ -1145,7 +1261,6 @@ async def _inspect_page_for_composition_under_custody(
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
-    sensitive_same_turn_run = register_matching_origin_run_redaction_values(copilot_ctx, run_id)
     if not use_current_page:
         _clear_pending_browser_interaction_observation(copilot_ctx)
     bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
@@ -1175,11 +1290,6 @@ async def _inspect_page_for_composition_under_custody(
     if use_current_page:
         inspect_target_url = current_url
         on_target_page = True
-    elif sensitive_same_turn_run:
-        # Do not inspect the sensitive run page merely to decide whether navigation can be skipped.
-        # A named URL is the legitimate route: navigate first, then inspect the resulting page.
-        inspect_target_url = entry_url
-        on_target_page = False
     else:
         live_url, _ = await _fallback_page_info(copilot_ctx)
         on_target_page = _same_inspect_target(live_url, entry_url)
@@ -1215,14 +1325,6 @@ async def _inspect_page_for_composition_under_custody(
             )
             if not nav_result.get("ok"):
                 nav_error = str(nav_result.get("error") or "unknown")
-                if sensitive_same_turn_run:
-                    # Navigation failure may leave the browser on the sensitive origin page.
-                    # Do not inspect that page through the ordinary failure fallback.
-                    return {
-                        "ok": False,
-                        "data": None,
-                        "error": f"inspect_page_for_composition could not navigate: {nav_error}",
-                    }
                 failure_capture = await _composition_evidence_after_navigation_failure(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1239,7 +1341,6 @@ async def _inspect_page_for_composition_under_custody(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                clear_sensitive_origin_page_taint(copilot_ctx)
                 capture = await _capture_composition_evidence(
                     copilot_ctx,
                     inspected_url=entry_url,
@@ -1247,9 +1348,6 @@ async def _inspect_page_for_composition_under_custody(
                     requested_reads=requested_reads,
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
-
-    if sensitive_origin_page_facts_withheld(copilot_ctx, run_id):
-        return {"ok": False, "data": None, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
 
     if (
         isinstance(copilot_ctx, AgentContext)
@@ -1285,10 +1383,7 @@ async def _inspect_page_for_composition_under_custody(
             "error": "inspect_page_for_composition could not capture page evidence.",
         }
 
-    if sensitive_same_turn_run:
-        evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
-        # Exact-value scrubbing applies to structured evidence, not pixels.
-        visual_fallback_frame = None
+    evidence = scrub_secrets_from_structure(copilot_ctx, evidence)
 
     if isinstance(run_id, str) and run_id:
         session_provenance = evidence.get("browser_session_provenance")
@@ -1385,7 +1480,7 @@ async def _inspect_page_for_composition_under_custody(
     await _bind_login_credential_for_observed_url(copilot_ctx, str(current_url), result)
     if observation_step is not None:
         result["observation_step"] = observation_step
-    result = _model_facing_inspect_result(result)
+    result = _model_facing_inspect_result(result, copilot_ctx=copilot_ctx)
     if visual_fallback_frame is not None:
         workflow_run_id = evidence.get("workflow_run_id")
         enqueue_screenshot(
@@ -1402,6 +1497,7 @@ async def _inspect_page_for_composition_under_custody(
                 dispatch_browser_session_id=visual_fallback_frame.dispatch_browser_session_id,
                 producer_browser_session_id=visual_fallback_frame.producer_browser_session_id,
                 session_binding=visual_fallback_frame.session_binding,
+                viewport_css_px=visual_fallback_frame.viewport_css_px,
             ),
             captured_at=visual_fallback_frame.captured_at,
         )
@@ -1416,3 +1512,64 @@ def _attach_author_time_levers(copilot_ctx: Any, evidence: dict[str, Any]) -> No
     challenge_state["levers"] = [
         lever.model_dump(mode="json", exclude_none=True) for lever in author_time_levers(copilot_ctx)
     ]
+
+
+CURRENT_PAGE_INSPECTION_TARGET = "current_page"
+_CURRENT_PAGE_INSPECTION_DESCRIPTION = """Inspect the page the browser is currently on before composing workflow blocks.
+
+This is a bounded read of current page state, not a way to reach a page: it cannot navigate, and
+it observes whichever page the browser already shows. Use it for uncertainty about controls,
+selectors, visible state or layout, before authoring blocks that fill fields, submit searches,
+filter results or expand result rows, and after a run to read the page that run stopped on.
+`target="debug"` (the default) reads the browser this chat drives; `target="last_run"` reads the
+browser used by the most recent test run. The packet describes the page only as it is at that
+moment.
+
+Returns observed page evidence. The
+returned `observation_step` is the side-channel id to pass in `block_observation_refs` when a newly
+authored block acts on this observed page. Do NOT paste the evidence into workflow YAML; use it to
+ground concise block prompts. If a select reports `options_omitted=true`, `option_count` is the
+observed total and its selector remains available. If those options are needed, read that one select
+from browser code; do not repeat the full-page inspection. If a block run changes pages, inspect the
+reached page before authoring downstream form/search/result blocks. If the evidence shows required
+fields or controls that the user did not supply enough information for, ask the user for that
+observed missing input. If evidence is sufficient, compose and run workflow blocks from the observed
+fields. `challenge_state` reports what the page looks like, which is not what a run will do: it does
+not establish that a submit/search path is closed, and a run settles that.
+
+When the page visibly shows a requested output but its markup is unclear, pass
+`requested_output_reads` with the `output_path` your block will return, the exact rendered
+`value_text`, and its visible `label`. The browser verifies the designation and returns every
+observed selector candidate as facts; you remain responsible for choosing a selector and authoring
+the workflow read."""
+
+
+def current_page_inspection_tool(tool: FunctionTool) -> FunctionTool:
+    """The URL target is dropped from the advertised schema and forced at dispatch, so no
+    navigation is reachable through this tool even if a model supplies the argument anyway."""
+    schema = copy.deepcopy(tool.params_json_schema)
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("target_url", None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [name for name in required if name != "target_url"]
+    navigating_invoke = tool.on_invoke_tool
+
+    # The agents runner hands a wrapper annotated with RunContextWrapper a forked bare context, and
+    # the delegate's generated invoke reads tool_name off it; only a ToolContext annotation keeps it.
+    async def invoke_on_current_page(ctx: ToolContext[CopilotContext], arguments: str) -> Any:
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except ValueError:
+            return await navigating_invoke(ctx, arguments)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        parsed["target_url"] = CURRENT_PAGE_INSPECTION_TARGET
+        return await navigating_invoke(ctx, json.dumps(parsed))
+
+    projected = copy.copy(tool)
+    projected.description = _CURRENT_PAGE_INSPECTION_DESCRIPTION
+    projected.params_json_schema = schema
+    projected.on_invoke_tool = invoke_on_current_page
+    return projected

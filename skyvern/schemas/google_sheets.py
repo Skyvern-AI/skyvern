@@ -1,5 +1,6 @@
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 _SPREADSHEET_URL_RE = re.compile(r"/spreadsheets(?:/u/\d+)?/d/([a-zA-Z0-9-_]+)")
 _BARE_ID_RE = re.compile(r"^[a-zA-Z0-9-_]{20,}$")
@@ -28,6 +29,33 @@ def extract_spreadsheet_id(url_or_id: str) -> str:
     if _BARE_ID_RE.match(url_or_id):
         return url_or_id
     raise ValueError(f"Could not extract spreadsheet id from: {url_or_id}")
+
+
+def extract_sheet_gid(url: str) -> int | None:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    for component in (parts.fragment, parts.query):
+        values = parse_qs(component).get("gid")
+        if values:
+            try:
+                return int(values[0])
+            except ValueError:
+                return None
+    return None
+
+
+def is_plain_cell_range(cell_range: str) -> bool:
+    """True for cell or column A1 with no sheet title (``D8``, ``D:D``, ``A2:D5``); a named range is not."""
+    parts = cell_range.strip().split(":")
+    if len(parts) > 2 or (len(parts) == 1 and not _A1_CELL_RE.match(parts[0])):
+        return False
+    for part in parts:
+        match = _A1_CELL_RE.match(part) or _A1_COLUMN_ONLY_RE.match(part)
+        if match is None or column_letters_to_index(match.group(1)) > MAX_COLUMN_INDEX:
+            return False
+    return True
 
 
 def quote_sheet_name(name: str) -> str:

@@ -2,14 +2,11 @@ import type { Node } from "@xyflow/react";
 import {
   EMAIL_BLOCK_SENDER,
   SKYVERN_DOWNLOAD_DIRECTORY,
-  SMTP_HOST_PARAMETER_KEY,
-  SMTP_PASSWORD_PARAMETER_KEY,
-  SMTP_PORT_PARAMETER_KEY,
-  SMTP_USERNAME_PARAMETER_KEY,
 } from "../../constants";
 import { NodeBaseData } from "../types";
 import {
   type EmailBodyFormat,
+  type EmailTransport,
   debuggableWorkflowBlockTypes,
 } from "@/routes/workflows/types/workflowTypes";
 
@@ -28,6 +25,10 @@ export type SendEmailNodeData = NodeBaseData & {
   customSmtpPort: string | null;
   customSmtpUsername: string | null;
   customSmtpPassword: string | null;
+  transport: EmailTransport;
+  credentialId: string;
+  cc: string;
+  bcc: string;
 };
 
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
@@ -42,14 +43,14 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   editable: true,
   label: "",
   sender: EMAIL_BLOCK_SENDER,
-  smtpHostSecretParameterKey: SMTP_HOST_PARAMETER_KEY,
-  smtpPortSecretParameterKey: SMTP_PORT_PARAMETER_KEY,
-  smtpUsernameSecretParameterKey: SMTP_USERNAME_PARAMETER_KEY,
-  smtpPasswordSecretParameterKey: SMTP_PASSWORD_PARAMETER_KEY,
   customSmtpHost: null,
   customSmtpPort: null,
   customSmtpUsername: null,
   customSmtpPassword: null,
+  transport: "smtp",
+  credentialId: "",
+  cc: "",
+  bcc: "",
   continueOnFailure: false,
   model: null,
 } as const;

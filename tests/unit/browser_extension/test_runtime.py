@@ -81,6 +81,9 @@ class StubAdapter:
     def target_attachment_snapshot(self, target_id: str) -> bool:
         return target_id == "target-17"
 
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None:
+        return 17 if target_id == "target-17" else None
+
 
 @pytest_asyncio.fixture(autouse=True)
 async def reset_runtime(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[None]:
@@ -102,7 +105,7 @@ def install_stubs(
     adapters: list[StubAdapter] = []
     calls: list[str] = []
 
-    def relay_factory(token, port, on_event, on_disconnect) -> StubRelay:
+    def relay_factory(token, port, on_event, on_disconnect, *, order_debugger_events=False) -> StubRelay:
         relay = StubRelay(
             token,
             port,
@@ -147,28 +150,6 @@ async def test_singleton_is_idempotent_and_late_binds_adapter_callbacks(monkeypa
     assert relays[0].on_disconnect is not None
     await relays[0].on_disconnect()
     assert adapters[0].disconnect_count == 1
-
-
-@pytest.mark.asyncio
-async def test_evaluate_routes_to_active_controlled_tab() -> None:
-    relay = MagicMock()
-    relay.ensure_root_lease = AsyncMock(return_value={"tabId": 17})
-    relay.list_scoped_tabs = AsyncMock(
-        return_value=[
-            {"tabId": 17, "active": False},
-            {"tabId": 18, "active": True},
-        ]
-    )
-    relay.request = AsyncMock(return_value={"result": {"answer": 42}})
-    runtime = BrowserExtensionRuntime(relay, MagicMock())
-
-    assert await runtime.evaluate("({ answer: 6 * 7 })") == {"answer": 42}
-    relay.ensure_root_lease.assert_awaited_once_with()
-    relay.list_scoped_tabs.assert_awaited_once_with()
-    relay.request.assert_awaited_once_with(
-        "dom.evaluate",
-        {"tabId": 18, "expression": "({ answer: 6 * 7 })"},
-    )
 
 
 @pytest.mark.asyncio
@@ -600,3 +581,58 @@ async def test_windows_default_logs_and_uses_legacy_relay(monkeypatch: pytest.Mo
         platform="win32",
     )
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_targets_selected_page_instead_of_active_chrome_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(
+        connected=True,
+        scoped_tabs=[{"tabId": 17, "active": True}, {"tabId": 42, "active": False}],
+        request=AsyncMock(return_value={"textLength": 3}),
+    )
+    adapter = SimpleNamespace(scoped_tab_id_for_target=lambda target: 42 if target == "selected-target" else None)
+    runtime = BrowserExtensionRuntime(relay, adapter)
+    monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: 100.0))
+    binding = AsyncMock(return_value="selected-target")
+    monkeypatch.setattr(runtime, "_target_id_for_page", binding)
+
+    assert await runtime.fill_input(page, "#email", "abc", timeout=5.0) == {"textLength": 3}
+    binding.assert_awaited_once_with(page)
+    relay.request.assert_awaited_once_with(
+        "dom.fill", {"tabId": 42, "selector": "#email", "text": "abc", "deadline": 105000}, timeout=5.0
+    )
+    page.evaluate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_refuses_a_target_that_lost_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(connected=True, request=AsyncMock())
+    runtime = BrowserExtensionRuntime(relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: None))
+    monkeypatch.setattr(runtime, "_target_id_for_page", AsyncMock(return_value="old-target"))
+
+    with pytest.raises(BrowserExtensionError, match="selected page"):
+        await runtime.fill_input(page, "#email", "abc")
+    relay.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_keeps_deadline_while_binding_selected_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(connected=True, request=AsyncMock())
+    runtime = BrowserExtensionRuntime(relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: 42))
+    clock = [100.0]
+    monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: clock[0]))
+
+    async def bind(_page):
+        clock[0] += 2.0
+        return "selected-target"
+
+    monkeypatch.setattr(runtime, "_target_id_for_page", bind)
+    with pytest.raises(TimeoutError, match="expired"):
+        await runtime.fill_input(page, "#email", "example", timeout=1.0)
+    relay.request.assert_not_awaited()

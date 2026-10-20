@@ -10,7 +10,10 @@ import {
 } from "@/routes/workflows/editor/nodes";
 import { blockTypeFromNode } from "@/routes/workflows/editor/nodes/blockTypeFromNode";
 import { isConditionalNode } from "@/routes/workflows/editor/nodes/ConditionalNode/types";
-import { START_ANCHOR_TOP_PX } from "@/routes/workflows/editor/paneFit";
+import {
+  START_ANCHOR_MAX_ZOOM,
+  START_ANCHOR_TOP_PX,
+} from "@/routes/workflows/editor/paneFit";
 import { type WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 
 export type BlockSearchTarget = {
@@ -196,10 +199,24 @@ export function waitForNodeSettle(
   });
 }
 
+// "top-anchored" pans at the caller's zoom and parks the block just below the
+// pane top — right for the studio, whose search palette sits outside the canvas.
+// "centered" centers the block in the pane and zooms in, which is what Locate
+// needs on the legacy canvas: its header floats *over* the canvas, so a
+// top-anchored target lands underneath it.
+export type FocusFraming = "top-anchored" | "centered";
+
 export type FocusBlockDeps = {
   getNodes: () => Array<AppNode>;
   getInternalNode: (nodeId: string) => InternalNodeLike | undefined;
   getPaneWidth: () => number;
+  // Required for "centered"; a pane of unknown height falls back to top-anchored.
+  getPaneHeight?: () => number;
+  // Pixels of the pane's top edge covered by chrome floating over the canvas.
+  // Measured per call, never assumed: the legacy header collapses, expands, and
+  // animates between the two, so a fixed offset would be wrong most of the time.
+  getPaneTopInset?: () => number;
+  framing?: FocusFraming;
   viewportZoom: number;
   duration: number;
   setViewport: (
@@ -217,17 +234,55 @@ export type FocusBlockDeps = {
   waitForSettle: (nodeId: string) => Promise<void>;
 };
 
+// Centers the block in the pane's *visible* band — the pane minus whatever
+// chrome currently floats over its top — and zooms in to a readable 1:1.
+// Only ever zooms in, so locating from an already-close view doesn't yank the
+// canvas backwards. Returns null when the pane height is unknown, leaving the
+// caller to fall back to the top anchor.
+function centeredViewport(
+  node: AppNode,
+  deps: FocusBlockDeps,
+  position: { x: number; y: number },
+  width: number,
+): { x: number; y: number; zoom: number } | null {
+  const paneHeight = deps.getPaneHeight?.() ?? 0;
+  if (paneHeight <= 0) {
+    return null;
+  }
+  const internal = deps.getInternalNode(node.id);
+  const height = internal?.measured?.height ?? node.measured?.height ?? 0;
+  const topInset = Math.min(
+    Math.max(deps.getPaneTopInset?.() ?? 0, 0),
+    paneHeight,
+  );
+  const zoom = Math.max(deps.viewportZoom, START_ANCHOR_MAX_ZOOM);
+  const bandCenterY = topInset + (paneHeight - topInset) / 2;
+  return {
+    x: deps.getPaneWidth() / 2 - (position.x + width / 2) * zoom,
+    y: bandCenterY - (position.y + height / 2) * zoom,
+    zoom,
+  };
+}
+
 // Horizontally centers the block but anchors its TOP edge at the
 // start-anchored-fit offset below the pane top, at the current zoom: a tall
 // container lands on its header instead of vertically centering on its
 // unrelated inner children.
-function anchorViewportToNode(node: AppNode, deps: FocusBlockDeps): void {
+function anchorViewportToNode(
+  node: AppNode,
+  deps: FocusBlockDeps,
+  framing: FocusFraming = "top-anchored",
+): void {
   const internal = deps.getInternalNode(node.id);
   const position = internal?.internals.positionAbsolute ?? node.position;
   const width = internal?.measured?.width ?? node.measured?.width ?? 0;
   const zoom = deps.viewportZoom;
+  const centered =
+    framing === "centered"
+      ? centeredViewport(node, deps, position, width)
+      : null;
   deps.setViewport(
-    {
+    centered ?? {
       x: deps.getPaneWidth() / 2 - (position.x + width / 2) * zoom,
       y: START_ANCHOR_TOP_PX - position.y * zoom,
       zoom,
@@ -263,6 +318,25 @@ export function resolveContainerAncestorLabels(
     current = parent;
   }
   return labels;
+}
+
+/**
+ * Latest-wins guard for concurrent focus/locate runs. Each call bumps the
+ * shared counter and returns a predicate that stays true only until the next
+ * call, so a superseded run can turn its pan / selection / branch writes into
+ * no-ops instead of racing a later Locate to a stale block. `focusBlockTarget`
+ * awaits re-layout, so a nested reveal can resolve after a quicker later one —
+ * the guard, not resolution order, decides which viewport wins.
+ */
+export function beginFocusGeneration(counter: {
+  current: number;
+}): () => boolean {
+  const generation = (counter.current += 1);
+  return () => generation === counter.current;
+}
+
+export function invalidateFocusGeneration(counter: { current: number }): void {
+  counter.current += 1;
 }
 
 /**
@@ -330,6 +404,15 @@ export async function focusBlockTarget(
   }
   deps.selectBlock(nodeId);
   deps.expandBlock(settled.data.label);
-  anchorViewportToNode(settled, deps);
+  // Centering divides by the block's height, so it must be measured after the
+  // expansion above commits — measuring in the same tick centers the collapsed
+  // box and leaves an expanded block hanging below the middle. The top anchor
+  // reads only position and width, so it is unaffected and skips the wait.
+  if (deps.framing === "centered") {
+    await deps.waitForSettle(nodeId);
+  }
+  // Only the final landing honours the caller's framing; the intermediate
+  // anchors above are mid-reveal waypoints on container ancestors.
+  anchorViewportToNode(findNode(nodeId) ?? settled, deps, deps.framing);
   return true;
 }

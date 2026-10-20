@@ -13,8 +13,9 @@ import textwrap
 from collections import Counter
 from collections.abc import Callable
 from string import Formatter
+from time import struct_time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 
@@ -65,6 +66,9 @@ BLOCKED_ATTRS: frozenset[str] = frozenset(
         "co_consts",
         "co_names",
         "co_varnames",
+        "CodeType",
+        "FunctionType",
+        "LambdaType",
         "gi_frame",
         "gi_code",
         "cr_frame",
@@ -97,10 +101,13 @@ BLOCKED_ATTRS: frozenset[str] = frozenset(
         "get_type_hints",
     }
 )
+# The names module_shims binds; importing one binds its shim and loads nothing.
+SANDBOX_IMPORTABLE_MODULES: frozenset[str] = frozenset({"asyncio", "datetime", "html", "json", "re"})
+SANDBOX_MODULES_GLOBAL = "__codeblock_modules__"
 ALLOWED_SCRIPT_ATTRS: frozenset[str] = frozenset(
     {"format", "listdir", "makedirs", "rmdir", "stderr", "stdin", "stdout"}
 )
-BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle"}
+BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle", "sys"}
 BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
     {
         "antigravity",
@@ -131,9 +138,11 @@ BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
         "site",
         "socket",
         "subprocess",
+        "sys",
         "thread",
         "timeit",
         "trace",
+        "types",
         "webbrowser",
         "zipfile",
         "zipimport",
@@ -212,6 +221,14 @@ SANDBOX_ONLY_BUILTINS: frozenset[str] = frozenset(
 )
 
 
+def json_safe_default(item: object) -> str:
+    # isinstance falls back to reading item.__class__, which runs a block-defined __getattribute__.
+    # A datetime is a date subclass and keeps the placeholder rather than losing its time.
+    if issubclass(type(item), datetime.date) and not issubclass(type(item), datetime.datetime):
+        return datetime.date.isoformat(item)  # type: ignore[arg-type]
+    return f"Object '{type(item)}' is not JSON serializable"
+
+
 def safe_builtins() -> dict[str, Any]:
     """Builtins a CodeBlock may use while sharing the worker process; dunders drop out via the underscore filter."""
     denied = ALWAYS_DENIED_BUILTINS | SANDBOX_ONLY_BUILTINS
@@ -220,6 +237,108 @@ def safe_builtins() -> dict[str, Any]:
 
 def module_shims() -> dict[str, SimpleNamespace]:
     """Fresh module-shaped namespaces both CodeBlock executors bind as globals."""
+
+    # Built per call so the writable heap types stay contained to a single execution.
+    class _SandboxTime(datetime.time):
+        """CPython's C date methods resolve ``__import__`` from the calling frame's globals, which a
+        CodeBlock's globals deliberately lack; these delegates put a trusted frame in between."""
+
+        __slots__ = ()
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        # Python 3.14 gives date and time their own C strptime, which imports from the calling frame.
+        if "strptime" in vars(datetime.time):
+
+            @classmethod
+            def strptime(cls, date_string: str, format: str, /) -> Self:
+                return super().strptime(date_string, format)  # type: ignore[misc]
+
+    class _SandboxDate(datetime.date):
+        __slots__ = ()
+
+        @classmethod
+        def today(cls) -> Self:
+            return super().today()
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        def timetuple(self) -> struct_time:
+            return super().timetuple()
+
+        if "strptime" in vars(datetime.date):
+
+            @classmethod
+            def strptime(cls, date_string: str, format: str, /) -> Self:
+                return super().strptime(date_string, format)  # type: ignore[misc]
+
+    # ``_SandboxDate`` precedes ``datetime.datetime`` in the MRO, so any delegate added to
+    # ``_SandboxDate`` must be mirrored here or it shadows ``datetime.datetime``'s version.
+    class _SandboxDateTime(_SandboxDate, datetime.datetime):
+        __slots__ = ()
+
+        @classmethod
+        def today(cls) -> Self:
+            return super().today()
+
+        @classmethod
+        def strptime(cls, date_string: str, format: str, /) -> Self:
+            return super().strptime(date_string, format)
+
+        # Their DeprecationWarning is raised from the calling frame, and the warning machinery
+        # imports from that frame, so these reach the same hidden import under any active filter.
+        @classmethod
+        def utcnow(cls) -> Self:
+            return super().utcnow()
+
+        @classmethod
+        def utcfromtimestamp(cls, timestamp: float, /) -> Self:
+            return super().utcfromtimestamp(timestamp)
+
+        def strftime(self, format: str) -> str:
+            return super().strftime(format)
+
+        def timetuple(self) -> struct_time:
+            return super().timetuple()
+
+        def utctimetuple(self) -> struct_time:
+            return super().utctimetuple()
+
+        def date(self) -> datetime.date:
+            return _SandboxDate(self.year, self.month, self.day)
+
+        def time(self) -> datetime.time:
+            return _SandboxTime(self.hour, self.minute, self.second, self.microsecond, fold=self.fold)
+
+        def timetz(self) -> datetime.time:
+            return _SandboxTime(self.hour, self.minute, self.second, self.microsecond, self.tzinfo, fold=self.fold)
+
+    # Instance reprs print ``tp_name``, which follows ``__name__``, and ``repr(type)`` prints
+    # ``__module__`` plus ``__qualname__``; both match the stdlib while ``__name__`` itself does not.
+    # A delegate's qualname reaches the block's failure_reason, where the defining frame would leak.
+    for sandbox_type, stdlib_name in ((_SandboxTime, "time"), (_SandboxDate, "date"), (_SandboxDateTime, "datetime")):
+        sandbox_type.__module__ = "datetime"
+        sandbox_type.__name__ = f"datetime.{stdlib_name}"
+        sandbox_type.__qualname__ = stdlib_name
+        for attribute, member in vars(sandbox_type).items():
+            if attribute.startswith("_"):
+                continue
+            function = member.__func__ if isinstance(member, classmethod) else member
+            if callable(function):
+                function.__module__ = "datetime"
+                function.__qualname__ = f"datetime.{stdlib_name}.{attribute}"
+
+    # The C types hand these bounds out as plain instances, and a plain instance re-breaks strftime
+    # one call later.
+    _SandboxTime.min = _SandboxTime.fromisoformat(datetime.time.min.isoformat())
+    _SandboxTime.max = _SandboxTime.fromisoformat(datetime.time.max.isoformat())
+    _SandboxDate.min = _SandboxDate.fromisoformat(datetime.date.min.isoformat())
+    _SandboxDate.max = _SandboxDate.fromisoformat(datetime.date.max.isoformat())
+    _SandboxDateTime.min = _SandboxDateTime.fromisoformat(datetime.datetime.min.isoformat())
+    _SandboxDateTime.max = _SandboxDateTime.fromisoformat(datetime.datetime.max.isoformat())
+
     return {
         "asyncio": SimpleNamespace(sleep=asyncio.sleep),
         "re": SimpleNamespace(
@@ -241,8 +360,8 @@ def module_shims() -> dict[str, SimpleNamespace]:
         "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
         "html": SimpleNamespace(escape=html.escape),
         "datetime": SimpleNamespace(
-            datetime=datetime.datetime,
-            date=datetime.date,
+            datetime=_SandboxDateTime,
+            date=_SandboxDate,
             timedelta=datetime.timedelta,
             timezone=datetime.timezone,
             UTC=datetime.UTC,
@@ -268,6 +387,56 @@ def _import_paths(node: ast.Import | ast.ImportFrom) -> tuple[str, ...]:
 
 def _normalized_import_root(module_name: str) -> str:
     return module_name.lstrip("_")
+
+
+def sandbox_import_error(node: ast.Import | ast.ImportFrom) -> str | None:
+    """Why a CodeBlock may not run this import, or None when it names a module the sandbox already provides."""
+    if isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    else:
+        modules = ["." * node.level + (node.module or "")]
+    for module in modules:
+        if module not in SANDBOX_IMPORTABLE_MODULES:
+            importable = ", ".join(sorted(SANDBOX_IMPORTABLE_MODULES))
+            return f"Not allowed to import module '{module}'; code blocks can import only {importable}"
+    for alias in node.names:
+        if isinstance(node, ast.ImportFrom) and (
+            alias.name == "*" or alias.name.startswith("_") or alias.name in BLOCKED_ATTRS
+        ):
+            return f"Not allowed to import '{alias.name}'"
+        if alias.asname is not None and alias.asname.startswith("__"):
+            return "Not allowed to access private methods or attributes"
+    return None
+
+
+class BindSandboxModuleImports(ast.NodeTransformer):
+    """Rewrites each import sandbox_import_error admits into an assignment from SANDBOX_MODULES_GLOBAL, recording
+    the names those imports bind."""
+
+    def __init__(self) -> None:
+        self.bound_names: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> list[ast.stmt]:
+        self.bound_names.update(alias.asname or alias.name for alias in node.names)
+        return [
+            _bind_sandbox_name(alias.asname or alias.name, _sandbox_module(alias.name), node) for alias in node.names
+        ]
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> list[ast.stmt]:
+        self.bound_names.update(alias.asname or alias.name for alias in node.names)
+        module = _sandbox_module(node.module or "")
+        return [
+            _bind_sandbox_name(alias.asname or alias.name, ast.Attribute(module, alias.name, ast.Load()), node)
+            for alias in node.names
+        ]
+
+
+def _sandbox_module(name: str) -> ast.expr:
+    return ast.Subscript(ast.Name(SANDBOX_MODULES_GLOBAL, ast.Load()), ast.Constant(name), ast.Load())
+
+
+def _bind_sandbox_name(name: str, value: ast.expr, node: ast.stmt) -> ast.stmt:
+    return ast.copy_location(ast.Assign([ast.Name(name, ast.Store())], value), node)
 
 
 def _is_self_or_super(node: ast.expr) -> bool:
@@ -560,13 +729,15 @@ def _validate_tree(
             if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
                 raise error_factory("Wildcard imports are not allowed")
             if blocked_imports is None:
-                raise error_factory("Not allowed to import modules")
-            for module_name in _import_roots(node):
-                if _normalized_import_root(module_name) in blocked_imports:
-                    raise error_factory(f"Not allowed to import module '{module_name}'")
-            for module_path in _import_paths(node):
-                if module_path in blocked_import_paths:
-                    raise error_factory(f"Not allowed to import module '{module_path}'")
+                if (reason := sandbox_import_error(node)) is not None:
+                    raise error_factory(reason)
+            else:
+                for module_name in _import_roots(node):
+                    if _normalized_import_root(module_name) in blocked_imports:
+                        raise error_factory(f"Not allowed to import module '{module_name}'")
+                for module_path in _import_paths(node):
+                    if module_path in blocked_import_paths:
+                        raise error_factory(f"Not allowed to import module '{module_path}'")
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     if (
@@ -638,7 +809,7 @@ def is_safe_code(
     *,
     error_factory: Callable[[str], Exception] = InsecureCodeDetected,
 ) -> None:
-    """Reject imports, private members, and known escape hatches.
+    """Reject imports of anything but the sandbox's own modules, private members, and known escape hatches.
 
     Leaves bare builtin names like `globals`/`locals` unblocked here; the caller decides
     whether and how those (and any other) builtins are bound in the dict it execs the

@@ -45,6 +45,9 @@ interface CommandCedeControl {
 
 interface CommandEndExfiltration {
   kind: "end-exfiltration";
+  discard: boolean;
+  interpretation_session_id?: string;
+  workflow_permanent_id?: string;
 }
 
 interface CommandTakeControl {
@@ -93,8 +96,8 @@ export type Command =
 export interface UseRecordingMessageChannelResult {
   messageSocket: WebSocket | null;
   isMessageConnected: boolean;
-  /** send a command over the message socket if open */
-  sendCommand: (command: Command) => void;
+  /** send a command over the message socket if open; false when it was not sent */
+  sendCommand: (command: Command) => boolean;
 }
 
 const messageInKinds = [
@@ -244,6 +247,11 @@ function getMessage(data: unknown): MessageIn | undefined {
   }
 }
 
+const CLIPBOARD_FAILURE_TITLES: Record<string, string> = {
+  "clipboard-paste": "Paste failed",
+  "clipboard-copy": "Copy failed",
+};
+
 function handleMessage(
   data: unknown,
   ws: WebSocket | null,
@@ -300,10 +308,12 @@ function handleMessage(
       break;
     }
     case "copied-text": {
-      if (clipboard === "none") {
+      const text = message.text;
+      // Copying with nothing selected must leave the local clipboard alone, as a
+      // native Cmd/Ctrl+C does.
+      if (clipboard === "none" || !text) {
         break;
       }
-      const text = message.text;
 
       copyText(text)
         .then((success) => {
@@ -335,6 +345,12 @@ function handleMessage(
     case "error": {
       if (message.failed_kind === "begin-exfiltration") {
         onBeginExfiltrationError();
+      } else if (CLIPBOARD_FAILURE_TITLES[message.failed_kind]) {
+        toast({
+          variant: "destructive",
+          title: CLIPBOARD_FAILURE_TITLES[message.failed_kind],
+          description: message.message,
+        });
       } else {
         console.warn("Message channel command failed:", message);
       }
@@ -410,6 +426,10 @@ export function useRecordingMessageChannel(
   const optionsRef = useRef(options);
   const exfiltrateRef = useRef(exfiltrate);
   const beganRef = useRef(false);
+  const retainedFinalizationRef = useRef<{
+    interpretationSessionId: string;
+    workflowPermanentId: string;
+  } | null>(null);
   const previousExfiltrateRef = useRef(false);
   const beginRetryAttemptsRef = useRef(0);
   const beginRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -422,6 +442,38 @@ export function useRecordingMessageChannel(
       beginRetryTimerRef.current = null;
     }
   }, []);
+
+  const sendEndExfiltration = useCallback(
+    (socket: WebSocket, discard: boolean) => {
+      const store = useRecordingStore.getState();
+      const finalizationIdentity = retainedFinalizationRef.current ?? {
+        interpretationSessionId: store.interpretationSessionId,
+        workflowPermanentId: optionsRef.current.workflowPermanentId,
+      };
+      socket.send(
+        JSON.stringify({
+          kind: "end-exfiltration",
+          discard,
+          interpretation_session_id:
+            finalizationIdentity.interpretationSessionId ?? undefined,
+          workflow_permanent_id:
+            finalizationIdentity.workflowPermanentId ?? undefined,
+        }),
+      );
+      if (discard) {
+        retainedFinalizationRef.current = null;
+      } else if (
+        finalizationIdentity.interpretationSessionId &&
+        finalizationIdentity.workflowPermanentId
+      ) {
+        retainedFinalizationRef.current = {
+          interpretationSessionId: finalizationIdentity.interpretationSessionId,
+          workflowPermanentId: finalizationIdentity.workflowPermanentId,
+        };
+      }
+    },
+    [],
+  );
 
   const sendBeginExfiltration = useCallback(() => {
     const socket = messageSocketRef.current;
@@ -549,13 +601,14 @@ export function useRecordingMessageChannel(
       // session resumable (SKY-12429), so it does not send END. Once the store
       // says recording ended, cleanup flushes END for a same-commit panel
       // unmount that prevented the exfiltrate falling-edge effect from running.
-      if (
-        ws?.readyState === WebSocket.OPEN &&
-        beganRef.current &&
-        !useRecordingStore.getState().isRecording
-      ) {
-        ws.send(JSON.stringify({ kind: "end-exfiltration" }));
-        beganRef.current = false;
+      const store = useRecordingStore.getState();
+      if (ws?.readyState === WebSocket.OPEN && !store.isRecording) {
+        if (beganRef.current) {
+          sendEndExfiltration(ws, !store.finishRequested);
+          beganRef.current = false;
+        } else if (retainedFinalizationRef.current && !store.finishRequested) {
+          sendEndExfiltration(ws, true);
+        }
       }
       messageSocketRef.current = null;
       try {
@@ -573,15 +626,18 @@ export function useRecordingMessageChannel(
     enabled,
     reconnectTrigger,
     scheduleBeginRetry,
+    sendEndExfiltration,
     socketUrl,
   ]);
 
   const sendCommand = useCallback((command: Command) => {
-    if (!messageSocketRef.current) {
-      return;
+    const socket = messageSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
     }
 
-    messageSocketRef.current.send(JSON.stringify(command));
+    socket.send(JSON.stringify(command));
+    return true;
   }, []);
 
   // effect for exfiltration
@@ -600,7 +656,10 @@ export function useRecordingMessageChannel(
       beginRetryAttemptsRef.current = 0;
       const socket = messageSocketRef.current;
       if (socket?.readyState === WebSocket.OPEN && beganRef.current) {
-        socket.send(JSON.stringify({ kind: "end-exfiltration" }));
+        sendEndExfiltration(
+          socket,
+          !useRecordingStore.getState().finishRequested,
+        );
         beganRef.current = false;
       }
     }
@@ -610,18 +669,14 @@ export function useRecordingMessageChannel(
     messageSocket,
     recordingAttemptId,
     sendBeginExfiltration,
+    sendEndExfiltration,
     workflowPermanentId,
   ]);
 
-  const manualCapturePaused = useRecordingStore(
-    (state) => state.manualCapturePaused,
-  );
-  const draftEditDepth = useRecordingStore((state) => state.draftEditDepth);
-  const capturePaused = manualCapturePaused || draftEditDepth > 0;
+  const capturePaused = useRecordingStore((state) => state.draftEditDepth > 0);
   const previousCapturePausedRef = useRef(false);
 
-  // Pause exfiltration + live interpretation while the operator edits drafts
-  // or explicitly pauses capture.
+  // Pause exfiltration + live interpretation while the operator edits drafts.
   useEffect(() => {
     if (!exfiltrate || !messageSocket) {
       // Backend pause state is per exfiltration session, so start the next

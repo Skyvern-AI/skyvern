@@ -30,6 +30,7 @@ vi.mock("posthog-js/react", () => ({
 
 const COMPLETED_STATE: OnboardingState = {
   tour_completed_at: "2026-06-01T00:00:00Z",
+  studio_tour_completed_at: null,
   modal_dismissed_at: null,
   first_save_at: null,
   first_run_at: null,

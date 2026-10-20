@@ -208,11 +208,11 @@ def test_watchdog_cancel_with_stale_challenge_markup_is_not_promoted() -> None:
     }
     result = {
         "ok": False,
-        "error": "Run canceled after 90s of stagnation while a Cloudflare interstitial was displayed.",
+        "error": "Run canceled at the safety ceiling while a Cloudflare interstitial was displayed.",
         "data": {
             "workflow_run_id": "wr_cancelled",
             "overall_status": "canceled",
-            "failure_reason": "Run canceled after stagnation.",
+            "failure_reason": "Run canceled at the safety ceiling.",
             "blocks": [],
         },
     }

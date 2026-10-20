@@ -14,6 +14,10 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
@@ -54,6 +58,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
   const isCollapsed = useIsBlockCollapsed(label);
   const prevIsCollapsed = useRef<boolean | null>(null);
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const { open } = useCollapseContext();
 
   // Callback ref re-runs on every mount/unmount of the inner card, which is
@@ -70,6 +75,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       lastHeaderHeight.current = undefined;
       const observer = new ResizeObserver(() => {
         const height = Math.round(el.offsetHeight);
+        // A header hidden with display:none measures 0, which is not a height:
+        // layout would fall back to its default margin.
+        if (height === 0) return;
         if (lastHeaderHeight.current !== height) {
           lastHeaderHeight.current = height;
           updateNodeData(id, { _headerHeight: height });
@@ -91,6 +99,8 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   // would reset RF's `measured` and cause marginy to fall back to the
   // 225px default, producing a large gap above the start block).
   useEffect(() => {
+    // Keep the last applied state until graph writes are allowed again.
+    if (mutationLocked || prevIsCollapsed.current === isCollapsed) return;
     if (prevIsCollapsed.current === null && !isCollapsed) {
       prevIsCollapsed.current = false;
       return;
@@ -115,7 +125,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       previousIsCollapsed,
       isCollapsed,
     );
-  }, [id, isCollapsed, setNodes, workflowPermanentId]);
+  }, [id, isCollapsed, mutationLocked, setNodes, workflowPermanentId]);
 
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
@@ -167,7 +177,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -219,7 +228,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 "bg-background outline outline-2 outline-ring":
                   thisBlockIsTargetted,
               },
-              data.comparisonColor,
             )}
           >
             <NodeHeader

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime, timezone
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,7 +15,8 @@ import pytest
 from skyvern.config import Settings
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services import planner_levers, task_v2_service
 from skyvern.services.task_v2_service import _should_run_post_block_completion_check
 
@@ -38,7 +39,12 @@ async def _run_task_v2_wiring_case(
     task_v2.url, task_v2.workflow_run_id = "https://example.test", "wr_test"
     queued_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued)
     running_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running)
-    workflow = MagicMock(workflow_id="wf_test", workflow_permanent_id="wp_test", title="Test")
+    workflow = MagicMock(
+        workflow_id="wf_test",
+        workflow_permanent_id="wp_test",
+        title="Test",
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+    )
     block_result = MagicMock(failure_reason=None, output_parameter_value={}, success=completion_case)
     block = SimpleNamespace(execute_safe=AsyncMock(return_value=block_result))
     scraped_page = SimpleNamespace(screenshots=[])
@@ -208,6 +214,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
         status=WorkflowRunStatus.running,
+        extra_http_headers={"X-Run-Only": "synthetic-run-value"},
         browser_profile_id=None,
     )
     workflow = SimpleNamespace(
@@ -216,6 +223,9 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         title="Test workflow",
         description=None,
         status="published",
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     block_result = SimpleNamespace(
         status="failed",
@@ -229,10 +239,23 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         get_workflow_run=AsyncMock(side_effect=[queued_run, running_run]),
         get_workflow=AsyncMock(return_value=workflow),
         mark_workflow_run_as_running=AsyncMock(),
-        create_workflow_from_request=AsyncMock(return_value=workflow),
+        setup_workflow_run=AsyncMock(return_value=queued_run),
     )
+    persisted_requests = []
+
+    async def persist_workflow(*, request: Any, **kwargs: Any) -> SimpleNamespace:
+        persisted_requests.append(request)
+        workflow.extra_http_headers = request.extra_http_headers
+        workflow.cdp_connect_headers = request.cdp_connect_headers
+        return workflow
+
+    workflow_service.create_workflow_from_request = persist_workflow
+    workflow_service.create_empty_workflow = MethodType(WorkflowService.create_empty_workflow, workflow_service)
     database = SimpleNamespace(
-        observer=SimpleNamespace(update_task_v2=AsyncMock(return_value=task_v2)),
+        observer=SimpleNamespace(
+            create_task_v2=AsyncMock(return_value=task_v2),
+            update_task_v2=AsyncMock(return_value=task_v2),
+        ),
         tasks=SimpleNamespace(
             get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
             get_total_unique_step_order_count_by_task_ids=AsyncMock(return_value=0),
@@ -262,8 +285,6 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     monkeypatch.setattr(task_v2_service, "_set_up_workflow_context", AsyncMock())
     monkeypatch.setattr(task_v2_service, "_resolve_max_iterations", lambda _override: 1)
     monkeypatch.setattr(task_v2_service, "_generate_goto_url_task", goto_task)
-    monkeypatch.setattr(task_v2_service, "WorkflowDefinitionYAML", MagicMock())
-    monkeypatch.setattr(task_v2_service, "WorkflowCreateYAMLRequest", MagicMock())
     monkeypatch.setattr(task_v2_service, "runtime_proxy_location", lambda _location: None)
     monkeypatch.setattr(task_v2_service, "_get_extracted_data_from_block_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(task_v2_service, "handle_block_result", AsyncMock(return_value=running_run))
@@ -276,6 +297,16 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     )
     monkeypatch.setattr(task_v2_service, "mark_task_v2_as_failed", AsyncMock(return_value=task_v2))
 
+    await task_v2_service.initialize_task_v2(
+        organization=organization,
+        user_prompt="visit the page",
+        publish_workflow=True,
+        extra_http_headers={"X-Request": "synthetic-http"},
+        cdp_connect_headers={"X-Request-CDP": "synthetic-cdp"},
+    )
+    assert persisted_requests[0].extra_http_headers == {"X-Request": "synthetic-http"}
+    assert persisted_requests[0].cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp"}
+
     result = await task_v2_service.run_task_v2_helper(
         organization,
         task_v2,
@@ -284,7 +315,11 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     )
 
     assert result == (workflow, running_run, task_v2)
-    goto_task.assert_awaited_once()
+    request = persisted_requests[-1]
+    assert request.extra_http_headers == {"X-Request": "synthetic-http"}
+    assert request.cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp"}
+    assert {"extra_http_headers", "cdp_connect_headers"} <= request.model_fields_set
+    assert "X-Run-Only" not in request.extra_http_headers
 
 
 @pytest.mark.asyncio
@@ -323,6 +358,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         title="Test workflow",
         description=None,
         status="published",
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     page = MagicMock()
     scraped_page = SimpleNamespace(screenshots=[])

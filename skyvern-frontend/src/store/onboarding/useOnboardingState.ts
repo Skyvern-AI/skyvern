@@ -14,11 +14,16 @@ type ConfirmedOnboardingStateWriter = (
 type OnboardingContextValue = {
   state: OnboardingState | null;
   isLoading: boolean;
+  // The state read failed and is not being retried; isLoading is false and state stays null.
+  loadFailed?: boolean;
+  retryLoad?: () => void;
   updateState: (patch: LegacyOnboardingStatePatch) => void;
   updateStateConfirmed: ConfirmedOnboardingStateWriter;
   isNewUser: boolean;
   abVariant: string | null;
   recoveryGuidanceAssignment: RecoveryGuidanceAssignment | null;
+  // The Skyvern organization the onboarding state was read for.
+  organizationId?: string | null;
 };
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);

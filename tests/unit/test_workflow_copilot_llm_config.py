@@ -18,7 +18,6 @@ import pytest
 
 from skyvern.config import Settings
 from skyvern.forge.sdk.copilot import llm_config as copilot_llm_config
-from skyvern.forge.sdk.copilot import narration
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 
@@ -64,14 +63,9 @@ async def test_resolve_raw_secret_safety_handler_has_no_main_fallback(monkeypatc
     assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is None
 
 
-# ---------------------------------------------------------------------------
-# _get_narrator_handler fallback chain
-# ---------------------------------------------------------------------------
-
-
 class _AppHolderStub:
     """Mimic the AppHolder proxy: missing attributes raise RuntimeError, not
-    AttributeError. The narration fallback must catch both."""
+    AttributeError. The main handler fallback must catch both."""
 
     def __init__(self, **attrs: Any) -> None:
         for key, value in attrs.items():
@@ -79,48 +73,6 @@ class _AppHolderStub:
 
     def __getattr__(self, name: str) -> Any:
         raise RuntimeError(f"ForgeApp is not initialized (accessed {name})")
-
-
-def test_narrator_handler_prefers_dedicated_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    dedicated = object()
-    secondary = object()
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(
-            WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=dedicated,
-            SECONDARY_LLM_API_HANDLER=secondary,
-        ),
-    )
-    assert narration._get_narrator_handler() is dedicated
-
-
-@pytest.mark.parametrize(
-    "make_app",
-    [
-        # A plain object lacking the dedicated attribute raises AttributeError.
-        pytest.param(lambda secondary: SimpleNamespace(SECONDARY_LLM_API_HANDLER=secondary), id="attribute_error"),
-        # AppHolder.__getattr__ raises bare RuntimeError pre-startup, not AttributeError.
-        pytest.param(lambda secondary: _AppHolderStub(SECONDARY_LLM_API_HANDLER=secondary), id="runtime_error"),
-        # A custom forge-app initializer that sets the new attribute to None must not disable narration.
-        pytest.param(
-            lambda secondary: SimpleNamespace(
-                WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=None,
-                SECONDARY_LLM_API_HANDLER=secondary,
-            ),
-            id="dedicated_is_none",
-        ),
-    ],
-)
-def test_narrator_handler_falls_back_to_secondary(monkeypatch: pytest.MonkeyPatch, make_app: Any) -> None:
-    secondary = object()
-    monkeypatch.setattr(copilot_llm_config, "app", make_app(secondary))
-    assert narration._get_narrator_handler() is secondary
-
-
-def test_narrator_handler_returns_none_when_both_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(copilot_llm_config, "app", _AppHolderStub())
-    assert narration._get_narrator_handler() is None
 
 
 # ---------------------------------------------------------------------------
@@ -249,99 +201,6 @@ async def test_resolve_main_copilot_handler_falls_back_to_primary(
 
     handler = await copilot_llm_config.resolve_main_copilot_handler("wpid_1", "org_1")
     assert handler is primary
-
-
-# ---------------------------------------------------------------------------
-# resolve_narrator_handler PostHog override + env-driven fallback
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_resolve_narrator_handler_posthog_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    posthog_handler = object()
-    fast = object()
-
-    async def _posthog_lookup(prompt_type: str, *_args: object, **_kwargs: object) -> object:
-        assert prompt_type == "workflow-copilot-fast"
-        return posthog_handler
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=fast, SECONDARY_LLM_API_HANDLER=object()),
-    )
-
-    handler = await narration.resolve_narrator_handler("wpid_1", "org_1")
-    assert handler is posthog_handler
-
-
-@pytest.mark.asyncio
-async def test_resolve_narrator_handler_falls_back_to_fast_when_posthog_returns_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fast = object()
-
-    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=fast, SECONDARY_LLM_API_HANDLER=object()),
-    )
-
-    handler = await narration.resolve_narrator_handler("wpid_1", "org_1")
-    assert handler is fast
-
-
-@pytest.mark.asyncio
-async def test_resolve_narrator_handler_falls_back_when_posthog_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PostHog can raise (network, AppHolder pre-startup, payload parse error).
-    Narration must never propagate; fall through to the env-driven handler."""
-    fast = object()
-
-    async def _raising_lookup(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("posthog down")
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _raising_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=fast, SECONDARY_LLM_API_HANDLER=object()),
-    )
-
-    handler = await narration.resolve_narrator_handler("wpid_1", "org_1")
-    assert handler is fast
-
-
-@pytest.mark.asyncio
-async def test_resolve_narrator_handler_skips_posthog_when_ids_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PostHog needs both distinct_id and organization_id to evaluate the
-    flag; without them, skip the lookup and go straight to env-driven."""
-    fast = object()
-    posthog_called = False
-
-    async def _posthog_lookup(*_args: object, **_kwargs: object) -> object:
-        nonlocal posthog_called
-        posthog_called = True
-        return object()
-
-    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
-    monkeypatch.setattr(
-        copilot_llm_config,
-        "app",
-        SimpleNamespace(WORKFLOW_COPILOT_FAST_LLM_API_HANDLER=fast, SECONDARY_LLM_API_HANDLER=object()),
-    )
-
-    handler = await narration.resolve_narrator_handler(None, "org_1")
-    assert handler is fast
-    assert posthog_called is False
-
-    handler = await narration.resolve_narrator_handler("wpid_1", None)
-    assert handler is fast
-    assert posthog_called is False
 
 
 # ---------------------------------------------------------------------------

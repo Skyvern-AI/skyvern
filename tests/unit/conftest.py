@@ -3,17 +3,21 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import logging
+import os
 import shutil
 import sys
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypeVar
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,22 +27,102 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from sqlalchemy import create_engine
+from playwright.async_api import Download
+from playwright.async_api import Error as PlaywrightError
+from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+import skyvern._cli_bootstrap as cli_bootstrap
+from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
-from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.storage.base import BaseStorage
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
+from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
+from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+LOOPBACK_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# The schema fixture only adds and drops a schema, so it also accepts the compose service name.
+LOCAL_POSTGRES_HOSTS = LOOPBACK_POSTGRES_HOSTS | {"postgres"}
+# Any other query key (host, hostaddr, service, dbname, port, user, options, ...) can change which server or database
+# libpq reaches, so unknown keys are rejected instead of listing the bad ones.
+POSTGRES_NON_ROUTING_QUERY_KEYS = frozenset({"connect_timeout", "application_name", "sslmode"})
+# These env vars redirect a connection even when the URL names its host; PGPORT does so only when the URL has no port.
+POSTGRES_HOST_OVERRIDE_ENV_VARS = ("PGHOSTADDR", "PGSERVICE")
+
+
+def skip_unless_local_postgres(url: URL, hosts: frozenset[str] = LOCAL_POSTGRES_HOSTS) -> None:
+    if url.get_backend_name() != "postgresql" or url.host not in hosts:
+        pytest.skip(f"needs a PostgreSQL on one of: {', '.join(sorted(hosts))}")
+    overrides = sorted(set(url.query) - POSTGRES_NON_ROUTING_QUERY_KEYS)
+    overrides += [name for name in POSTGRES_HOST_OVERRIDE_ENV_VARS if os.environ.get(name)]
+    if url.port is None and os.environ.get("PGPORT"):
+        overrides.append("PGPORT")
+    if overrides:
+        pytest.skip(f"{', '.join(overrides)} could redirect the connection away from the intended local PostgreSQL")
+
+
+def fake_download_registration_app(
+    register: Callable[..., Awaitable[None]], rows: list[Artifact], storage: BaseStorage | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
+        DATABASE=SimpleNamespace(
+            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
+        ),
+    )
+
+
+class FakeWorkflowRunAttemptsRepository:
+    """Small in-memory repository for tests that need durable attempt resolution."""
+
+    def __init__(self, attempts: list[Any] | None = None) -> None:
+        self.attempts = list(attempts or [])
+        self.requested_workflow_run_ids: list[str] = []
+
+    async def get_attempts(self, workflow_run_id: str) -> list[Any]:
+        self.requested_workflow_run_ids.append(workflow_run_id)
+        return list(self.attempts)
+
+    async def refresh_attempt_finished_at(self, workflow_run_id: str, attempt_number: int, *, finished_at: Any) -> Any:
+        for attempt in self.attempts:
+            if attempt.workflow_run_id == workflow_run_id and attempt.attempt_number == attempt_number:
+                if getattr(attempt, "retry_decision", None) is not None:
+                    attempt.finished_at = finished_at
+                return attempt
+        return None
 
 
 @pytest.fixture
@@ -89,12 +173,14 @@ def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
         mask_secrets: bool = True,
         secrets: dict[str, str] | None = None,
         runtime_otp_values: set[str] | None = None,
+        attempt_number: int = 1,
     ) -> WorkflowContextManager:
         manager = WorkflowContextManager()
         manager.workflow_run_contexts[workflow_run_id] = SimpleNamespace(
             mask_secrets=mask_secrets,
             secrets=dict(secrets or {}),
             runtime_otp_values=set(runtime_otp_values or set()),
+            attempt_number=attempt_number,
         )
         return manager
 
@@ -157,6 +243,7 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
             runtime._ATTACHED_TURNS_PER_SESSION.clear()
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
             runtime._DRIVER_RELEASE_EPOCHS.clear()
+            runtime._SCRUB_VALUES_CLEARED_ON_RELEASE.clear()
 
     _clear()
     yield
@@ -176,6 +263,29 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_cli_runtime_entry() -> Iterator[None]:
+    """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
+
+    A CLI command also labels the process's API client as the CLI, which must not leak into a later MCP test.
+
+    Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
+    against the default production URL in any later test that builds a cloud client. The env
+    load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
+    """
+    entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    command_running = cli_bootstrap._CLI_COMMAND_RUNNING
+    loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
+    yield
+    cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    cli_bootstrap._CLI_COMMAND_RUNNING = command_running
+    for name, value in loaded.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+@pytest.fixture(autouse=True)
 def reset_mcp_stateless_http_mode():
     """Keep MCP transport mode from leaking between independently collected test files."""
     from skyvern.cli.core import session_manager
@@ -192,12 +302,21 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
     current_datetime="2026-01-01T00:00:00Z",
     tool_usage_guide="",
     security_rules="",
+    model_written_context_fields=model_written_context_fields(),
+    tool_recorded_context_fields=tool_recorded_context_fields(),
 )
 
 
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
+    now = datetime.now(UTC)
+    return OutputParameter(
+        output_parameter_id=f"{key}_id", key=key, workflow_id=workflow_id, created_at=now, modified_at=now
+    )
 
 
 def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
@@ -273,6 +392,12 @@ def span_exporter() -> InMemorySpanExporter:
     exporter.clear()
 
 
+@pytest.fixture(scope="module")
+def gpt56_litellm_models() -> Iterator[None]:
+    with registered_gpt56_litellm_models():
+        yield
+
+
 # -- shared in-memory SQLite engine for repository/route unit tests --
 #
 # ``Base.metadata.create_all`` issues DDL for every mapped table (~50) on every
@@ -303,7 +428,7 @@ async def sqlite_engine_factory(
     def _make() -> AsyncEngine:
         db_path = tmp_path / f"db_{next(counter)}.db"
         shutil.copyfile(sqlite_schema_template, db_path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", json_serializer=_custom_json_serializer)
         engines.append(engine)
         return engine
 
@@ -316,6 +441,34 @@ async def sqlite_engine_factory(
 @pytest_asyncio.fixture
 async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
     return sqlite_engine_factory()
+
+
+@pytest.fixture
+def postgres_scratch_database() -> Iterator[Engine]:
+    url = make_url(str(settings.DATABASE_STRING))
+    # Loopback only: a generic name like postgres could resolve to a shared server, and this drops a database.
+    skip_unless_local_postgres(url, LOOPBACK_POSTGRES_HOSTS)
+    url = url.set(drivername="postgresql+psycopg")
+    # A database, not a schema: CREATE INDEX CONCURRENTLY waits for every older snapshot in its database, so a
+    # transaction another test leaves open in the shared one would stall the build until statement_timeout.
+    database = f"test_scratch_{uuid.uuid4().hex}"
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            if not connection.exec_driver_sql(
+                "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user"
+            ).scalar_one():
+                pytest.skip("needs a PostgreSQL role that can create databases")
+            connection.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        engine = create_engine(url.set(database=database))
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+            with admin.connect() as connection:
+                connection.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        admin.dispose()
 
 
 def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object] | None = None) -> MagicMock:
@@ -360,6 +513,51 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
 
         el.get_attr = AsyncMock(side_effect=_get_attr)
     return el
+
+
+def make_claimed_download_mock(
+    *,
+    path: Path | str | None,
+    suggested_filename: str,
+    path_error: BaseException | None = None,
+    failure: str | None = None,
+    failure_error: BaseException | None = None,
+    context: object | None = None,
+) -> Download:
+    """A Playwright ``Download`` double for the value a ``page.expect_download`` claim resolves to.
+    ``spec`` is the real class so the attach guard's ``isinstance`` check sees what it does live."""
+    download = MagicMock(spec=Download)
+    if path_error is not None:
+        download.path.side_effect = path_error
+    else:
+        download.path.return_value = None if path is None else str(path)
+    if failure_error is not None:
+        download.failure.side_effect = failure_error
+    else:
+        download.failure.return_value = failure
+    download.suggested_filename = suggested_filename
+    download.page = SimpleNamespace(context=context)
+    return download
+
+
+SESSION_DOWNLOAD_BYTES = b"session-delivered certificate"
+
+
+def registered_download_row(
+    filename: str = "certificate.pdf",
+    content: bytes = SESSION_DOWNLOAD_BYTES,
+    artifact_id: str | None = "a_session",
+    checksum: str | None = None,
+    file_size: int | None = None,
+) -> FileInfo:
+    """A DOWNLOAD row as the run's registration lists it for a file a remote browser session delivered."""
+    return FileInfo(
+        url=f"https://storage.test/{filename}",
+        filename=filename,
+        checksum=hashlib.sha256(content).hexdigest() if checksum is None else checksum,
+        file_size=len(content) if file_size is None else file_size,
+        artifact_id=artifact_id,
+    )
 
 
 @dataclass
@@ -521,50 +719,143 @@ def fake_api_request_context() -> Callable[[], object]:
     return _build
 
 
-class FakeSearchPage:
-    """Temporary tab a `search_web` call opens on the run's browser context."""
+def serpapi_page(*links: str, next_start: int | None = None) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "search_metadata": {"status": "Success"},
+        "organic_results": [{"title": f"Title {link}", "link": link, "snippet": f"About {link}"} for link in links],
+    }
+    if next_start is not None:
+        page["serpapi_pagination"] = {"next": f"https://serpapi.com/search.json?start={next_start}"}
+    return page
 
-    def __init__(self, html: str, page_title: str, goto_error: Exception | None, http_status: int = 200) -> None:
-        self._html = html
-        self._page_title = page_title
-        self._goto_error = goto_error
-        self.http_status = http_status
+
+SearchApiReply = tuple[int, object] | BaseException
+
+
+class FakeSearchApi:
+    """Stands in for `aiohttp_request` under the search client: answers each call with the next queued
+    (status, body) reply or raises it, repeating the last reply once the queue runs out."""
+
+    def __init__(self, *replies: SearchApiReply) -> None:
+        self._replies = list(replies)
+        self.urls: list[str] = []
+
+    async def __call__(self, *, url: str, **_kwargs: object) -> tuple[int, dict[str, str], object]:
+        self.urls.append(url)
+        reply = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        status, body = reply
+        return status, {}, body
+
+
+def arm_search_api(
+    monkeypatch: pytest.MonkeyPatch,
+    *replies: SearchApiReply,
+    serpapi_key: str | None = "serp-test-key",
+    exa_key: str | None = None,
+) -> FakeSearchApi:
+    """Configures the search keys, answers the vendor calls from `replies`, and admits every result
+    destination; a test that screens destinations patches `web_search.classify_url_async` after this."""
+
+    async def allow(_url: str) -> str | None:
+        return None
+
+    api = FakeSearchApi(*replies)
+    monkeypatch.setattr(web_search_client, "aiohttp_request", api)
+    monkeypatch.setattr(web_search_client.settings, "SERPAPI_API_KEY", serpapi_key)
+    monkeypatch.setattr(web_search_client.settings, "EXA_API_KEY", exa_key)
+    monkeypatch.setattr(SettingsManager.get_settings(), "ENABLE_SEARCH_WEB", True)
+    monkeypatch.setattr(web_search, "classify_url_async", allow)
+    return api
+
+
+class FakeSearchPage:
+    """A tab the block's browser context opens for an `open_page` call. A URL ending in ``/refused``
+    fails to load; the title is derived from the URL."""
+
+    def __init__(self, context: "FakeSearchBrowserContext | None" = None) -> None:
+        self.context = context
+        self.url = "about:blank"
         self.closed = False
         self.requested_url: str | None = None
 
-    async def goto(self, url: str, timeout: float | None = None) -> SimpleNamespace:
+    async def goto(self, url: str, timeout: float | None = None, **_kwargs: object) -> SimpleNamespace:
         self.requested_url = url
-        if self._goto_error is not None:
-            raise self._goto_error
-        return SimpleNamespace(status=self.http_status)
+        if url.endswith("/refused"):
+            raise PlaywrightError("net::ERR_FAILED")
+        self.url = url
+        return SimpleNamespace(status=200)
 
     async def title(self) -> str:
-        return self._page_title
+        return f"title of {self.url}"
 
     async def content(self) -> str:
-        return self._html
+        return ""
 
-    async def close(self) -> None:
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self, **_kwargs: object) -> None:
         self.closed = True
 
 
 class FakeSearchBrowserContext:
-    def __init__(
-        self, html: str = "", page_title: str = "", goto_error: Exception | None = None, http_status: int = 200
-    ) -> None:
-        self.page = FakeSearchPage(html, page_title, goto_error, http_status)
+    def __init__(self) -> None:
+        self.opened: list[FakeSearchPage] = []
+
+    @property
+    def page(self) -> FakeSearchPage:
+        return self.opened[0]
+
+    @property
+    def pages(self) -> list[FakeSearchPage]:
+        return list(self.opened)
 
     async def new_page(self) -> FakeSearchPage:
-        return self.page
+        page = FakeSearchPage(context=self)
+        self.opened.append(page)
+        return page
 
 
 class FakeCdpSession:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        storage_reachable: bool = True,
+        origins_refusing_clear: tuple[str, ...] = (),
+        origins_failing_unexpectedly: tuple[str, ...] = (),
+        refuses_clear: bool = False,
+        refusal_error: type[BaseException] = PlaywrightError,
+        storage_key: str | None = None,
+    ) -> None:
         self.sent: list[tuple[str, dict | None]] = []
         self.detached = False
+        self.storage_key = storage_key
+        self.storage_reachable = storage_reachable
+        self.origins_refusing_clear = origins_refusing_clear
+        self.origins_failing_unexpectedly = origins_failing_unexpectedly
+        self.refuses_clear = refuses_clear
+        self.refusal_error = refusal_error
 
     async def send(self, method: str, params: dict | None = None) -> dict:
         self.sent.append((method, params))
+        if method == "Runtime.evaluate":
+            # Answers for whatever document this session is attached to, as the real one does.
+            return {"result": {"value": "reachable" if self.storage_reachable else "unreachable"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-of-this-session"}}}
+        if method == "Storage.getStorageKeyForFrame":
+            if self.storage_key is None:
+                raise self.refusal_error(
+                    "Protocol error (Storage.getStorageKeyForFrame): Frame corresponds to an opaque origin"
+                )
+            return {"storageKey": self.storage_key}
+        if method == "DOMStorage.clear":
+            origin = (params or {}).get("storageId", {}).get("securityOrigin")
+            if origin in self.origins_failing_unexpectedly:
+                raise ValueError("not a browser-driver error")
+            if self.refuses_clear or origin in self.origins_refusing_clear:
+                raise self.refusal_error("Protocol error (DOMStorage.clear): Frame not found for the given storage id")
         return {}
 
     async def detach(self) -> None:
@@ -572,17 +863,59 @@ class FakeCdpSession:
 
 
 class FakeClearingBrowserContext:
-    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out."""
+    """Browser context a `clear_browser_data` call clears: records the cookie wipe and every CDP session it hands out.
 
-    def __init__(self) -> None:
+    `pages` is what the clear enumerates origins from, so a test that expects storage to be cleared has
+    to put its page in it, the way a live context holds its open tabs.
+    """
+
+    def __init__(self, clear_cookies_error: Exception | None = None) -> None:
         self.clear_cookies_calls = 0
+        self.clear_cookies_error = clear_cookies_error
         self.cdp_sessions: list[tuple[object, FakeCdpSession]] = []
+        self.pages: list[object] = []
+        # Documents whose session reports no reachable storage, the way a sandboxed frame's does.
+        self.frames_without_storage: list[object] = []
+        # Origins whose DOMStorage.clear fails, whichever session carries it.
+        self.origins_refusing_clear: list[str] = []
+        # Frames sharing their parent's renderer: Playwright refuses them a session of their own.
+        self.frames_without_own_session: list[object] = []
+        # Origins whose clear fails with something that is not a browser-driver error at all.
+        self.origins_failing_unexpectedly: list[str] = []
+        # Frames whose own clear fails, however the origin is spelled -- a sandboxed frame does this
+        # while an ordinary frame at the same origin clears fine.
+        self.frames_refusing_clear: list[object] = []
+        # Raise this engine's refusal instead of the Playwright family's, as a raw-CDP run would.
+        self.refusal_error: type[BaseException] = PlaywrightError
+        # Storage key the browser reports for a tab whose URL names no origin, as it does for a
+        # window opened on about:blank. A tab absent from this list has an opaque origin and none.
+        self.inherited_storage_keys: list[tuple[object, str]] = []
+        # (frame, page) pairs whose frame session is attached to the page's target, as raw-CDP attaches
+        # a same-process frame, so protocol calls on it answer for the page's document.
+        self.frames_attached_to_page_target: list[tuple[object, object]] = []
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
+        if self.clear_cookies_error is not None:
+            raise self.clear_cookies_error
+
+    async def _probe_storage(self, document: object) -> str:
+        return "unreachable" if document in self.frames_without_storage else "reachable"
 
     async def new_cdp_session(self, page: object) -> FakeCdpSession:
-        session = FakeCdpSession()
+        if not hasattr(page, "evaluate"):
+            page.evaluate = lambda expression, document=page: self._probe_storage(document)  # type: ignore[attr-defined]
+        if page in self.frames_without_own_session:
+            raise PlaywrightError("This frame does not have a separate CDP session")
+        answering = next((held for frame, held in self.frames_attached_to_page_target if frame is page), page)
+        session = FakeCdpSession(
+            storage_reachable=answering not in self.frames_without_storage,
+            origins_refusing_clear=tuple(self.origins_refusing_clear),
+            origins_failing_unexpectedly=tuple(self.origins_failing_unexpectedly),
+            refuses_clear=page in self.frames_refusing_clear,
+            refusal_error=self.refusal_error,
+            storage_key=next((key for held, key in self.inherited_storage_keys if held is page), None),
+        )
         self.cdp_sessions.append((page, session))
         return session
 
@@ -637,6 +970,26 @@ class ScopeRecordingAgentFunction(AgentFunction):
         return False
 
 
+class OcrRecordingAgentFunction(ScopeRecordingAgentFunction):
+    def __init__(self, text: str | None, *, enabled: bool = True) -> None:
+        super().__init__(record_arms=False)
+        self.text = text
+        self.enabled = enabled
+        self.images: list[bytes] = []
+
+    def supports_image_captcha_ocr(self) -> bool:
+        return True
+
+    async def image_captcha_ocr_enabled(self, organization_id: str | None = None, url: str | None = None) -> bool:
+        return self.enabled
+
+    async def read_image_captcha_text(
+        self, image_png: bytes, *, organization_id: str | None = None, url: str | None = None
+    ) -> str | None:
+        self.images.append(image_png)
+        return self.text
+
+
 _T = TypeVar("_T")
 
 
@@ -666,6 +1019,45 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+class DriverReplyProbe:
+    """A driver call that keeps its protocol reply the way playwright and patchright do.
+
+    The pending reply is abandoned from a done-callback on the task that issued the call, and only if
+    that task ends cancelled (``_impl/_connection.py::ProtocolCallback``). A caller that is cancelled
+    without its task ending therefore leaves the reply live, and the driver's late error lands on it
+    with nobody left to retrieve it."""
+
+    def __init__(self, error: BaseException, answers_after_seconds: float = 0.05) -> None:
+        self._error = error
+        self._answers_after_seconds = answers_after_seconds
+        self.called = asyncio.Event()
+        self.reply: asyncio.Future[Any] | None = None
+
+    async def __call__(self, *args: object, **kwargs: object) -> Any:
+        loop = asyncio.get_running_loop()
+        reply: asyncio.Future[Any] = loop.create_future()
+        self.reply = reply
+        self.called.set()
+        issuing_task = asyncio.current_task()
+        assert issuing_task is not None
+
+        def abandon_reply(task: asyncio.Task[Any]) -> None:
+            if task.cancelled():
+                reply.cancel()
+
+        issuing_task.add_done_callback(abandon_reply)
+        loop.call_later(self._answers_after_seconds, lambda: reply.done() or reply.set_exception(self._error))
+        # The driver abandons an unanswered reply on the line after this await, which cancellation skips.
+        await asyncio.wait({reply}, return_when=asyncio.FIRST_COMPLETED)
+        return reply.result()
+
+    async def orphaned_reply(self, wait_seconds: float = 2.0) -> bool:
+        """Whether the late reply carries an error nobody retrieved -- asyncio's never-retrieved line."""
+        assert self.reply is not None, "the driver was never called"
+        await asyncio.wait({self.reply}, timeout=wait_seconds)
+        return self.reply.done() and not self.reply.cancelled() and self.reply.exception() is not None
+
+
 def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
     """A ``take_fullpage_screenshot`` stand-in that drives the real ``take_scrolling_screenshot`` with a stalled
     stitched-capture helper, so a caller test exercises the primitive's own deadline."""
@@ -687,3 +1079,117 @@ def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> Asyn
             )
 
     return AsyncMock(side_effect=_capture)
+
+
+RUN_GROUP_ORG = "o_test"
+RUN_GROUP_OTHER_ORG = "o_other"
+RUN_GROUP_WPID = "wpid_test"
+
+
+@dataclass
+class FakeExecutor(AsyncExecutor):
+    database: AgentDB
+    executed: list[str] = field(default_factory=list)
+    submitted: list[str] = field(default_factory=list)
+    before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_task(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_task_v2(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_script(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
+        self.executed.append(workflow_run_id)
+        if self.before_queue is not None:
+            await self.before_queue(workflow_run_id)
+        if await self.database.workflow_runs.update_workflow_run_if_not_final(
+            workflow_run_id, WorkflowRunStatus.queued
+        ):
+            self.submitted.append(workflow_run_id)
+
+
+@dataclass
+class RecordingRateLimiter:
+    calls: list[str] = field(default_factory=list)
+
+    async def rate_limit_submit_run(self, organization_id: str) -> None:
+        self.calls.append(organization_id)
+
+
+@dataclass
+class GroupEnv:
+    database: AgentDB
+    executor: FakeExecutor
+    organization: Organization
+    spawned: list[Coroutine[Any, Any, None]]
+    limiter: RecordingRateLimiter
+
+
+def run_group_definition(*blocks: BlockTypeVar) -> dict[str, Any]:
+    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
+
+
+def run_group_task_block() -> TaskBlock:
+    return TaskBlock(label="login", url="https://example.com", output_parameter=make_block_output_parameter("login"))
+
+
+async def count_rows(env: GroupEnv, model: type[Base]) -> int:
+    async with env.database.Session() as session:
+        return int(await session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+@pytest_asyncio.fixture
+async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> AsyncIterator[GroupEnv]:
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    organization = await database.organizations.create_organization("Test", organization_id=RUN_GROUP_ORG)
+    await database.organizations.create_organization("Other", organization_id=RUN_GROUP_OTHER_ORG)
+    async with database.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_1",
+                workflow_permanent_id=RUN_GROUP_WPID,
+                organization_id=RUN_GROUP_ORG,
+                title="Workflow",
+                version=1,
+                workflow_definition=run_group_definition(run_group_task_block()),
+            )
+        )
+        session.add_all(
+            CredentialModel(
+                credential_id=credential_id,
+                organization_id=org_id,
+                name="Login",
+                credential_type="password",
+                item_id=f"item_{credential_id}",
+            )
+            for credential_id, org_id in (
+                ("cred_1", RUN_GROUP_ORG),
+                ("cred_2", RUN_GROUP_ORG),
+                ("cred_foreign", RUN_GROUP_OTHER_ORG),
+            )
+        )
+        await session.commit()
+    await database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID, key="login", default_value=None
+    )
+    service = WorkflowService()
+    executor = FakeExecutor(database)
+    spawned: list[Coroutine[Any, Any, None]] = []
+    limiter = RecordingRateLimiter()
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
+    monkeypatch.setattr(group_service, "_spawn", spawned.append)
+    monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
+    yield GroupEnv(database, executor, organization, spawned, limiter)
+    for coroutine in spawned:
+        coroutine.close()
+    await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)

@@ -38,7 +38,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   terminateCriterion: "",
   errorCodeMapping: "null",
   model: { model_name: "" },
-  engine: RunEngine.SkyvernV1,
+  engine: null,
   maxRetries: null,
   maxStepsOverride: null,
   allowDownloads: false,

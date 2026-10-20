@@ -1,4 +1,4 @@
-from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
+from skyvern.constants import SKYVERN_CLI_USER_AGENT, SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
 from skyvern.forge.sdk.db.enums import (
     WorkflowRunTriggerType,
     is_job_recipe_workflow_run_trigger_type,
@@ -12,6 +12,10 @@ def test_workflow_run_trigger_type_from_user_agent_ui_returns_manual() -> None:
 
 def test_workflow_run_trigger_type_from_user_agent_mcp_returns_mcp() -> None:
     assert workflow_run_trigger_type_from_user_agent(SKYVERN_MCP_USER_AGENT) == WorkflowRunTriggerType.mcp
+
+
+def test_workflow_run_trigger_type_from_user_agent_cli_keeps_mcp_run_treatment() -> None:
+    assert workflow_run_trigger_type_from_user_agent(SKYVERN_CLI_USER_AGENT) == WorkflowRunTriggerType.mcp
 
 
 def test_workflow_run_trigger_type_from_user_agent_none_returns_api() -> None:

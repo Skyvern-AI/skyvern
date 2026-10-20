@@ -1,3 +1,5 @@
+import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
+
 import { cn } from "@/util/utils";
 
 import {
@@ -5,6 +7,10 @@ import {
   hasEvaluations,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import {
+  type ConditionalEvaluationError,
+  getConditionalEvaluationError,
+} from "../workflowTimelineUtils";
 import { JsonExplorer } from "./BlockInspector";
 import { Section } from "./shared";
 
@@ -26,8 +32,9 @@ function tryParseJson(value: string): unknown | null {
  * One branch as a keyword-led rule line: `if` / `else if` / `else` in a muted
  * gutter carries the order, the condition follows in regular type (mono only
  * for a template expression), and the outcome sits at the end — `false` for a
- * condition that did not hold, the destination for the branch that ran. The
- * branch that ran is the one emphasized row; no glyph, no tint.
+ * condition that did not hold, `error` for one that could not be evaluated,
+ * the destination for the branch that ran. The branch that ran is the one
+ * emphasized row; no glyph, no tint.
  */
 function BranchRow({
   keyword,
@@ -45,7 +52,8 @@ function BranchRow({
   mono?: boolean;
   outcome?:
     | { kind: "next"; label: string }
-    | { kind: "result"; value: boolean };
+    | { kind: "result"; value: boolean }
+    | { kind: "error" };
   children?: React.ReactNode;
 }) {
   return (
@@ -82,6 +90,8 @@ function BranchRow({
           <span className="shrink-0 font-mono text-muted-foreground/70">
             {outcome.value ? "true" : "false"}
           </span>
+        ) : outcome?.kind === "error" ? (
+          <span className="shrink-0 font-mono text-warning">error</span>
         ) : null}
       </div>
       {children ? <div className="pl-[3.25rem]">{children}</div> : null}
@@ -97,18 +107,24 @@ function keywordFor(index: number, isDefault: boolean): string {
 function EvaluationRow({
   evaluation,
   index,
+  statedError,
 }: {
   evaluation: BranchEvaluation;
   index: number;
+  // The message the notice above the list already shows in full.
+  statedError: string | null;
 }) {
   const keyword = keywordFor(index, evaluation.is_default);
+  const error = evaluation.error || null;
   const outcome = evaluation.is_matched
     ? evaluation.next_block_label
       ? ({ kind: "next", label: evaluation.next_block_label } as const)
       : undefined
-    : evaluation.result === null
-      ? undefined
-      : ({ kind: "result", value: evaluation.result } as const);
+    : error
+      ? ({ kind: "error" } as const)
+      : evaluation.result === null
+        ? undefined
+        : ({ kind: "result", value: evaluation.result } as const);
   if (evaluation.is_default) {
     return (
       <BranchRow
@@ -150,7 +166,36 @@ function EvaluationRow({
       template={rendered ? original : null}
       mono={mono}
       outcome={outcome}
-    />
+    >
+      {error && !statedError?.includes(error) ? (
+        <p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">
+          {error}
+        </p>
+      ) : null}
+    </BranchRow>
+  );
+}
+
+// Amber, not the red failure box: the block completed, and the status owns red.
+function EvaluationErrorNotice({
+  summary,
+  message,
+}: ConditionalEvaluationError) {
+  return (
+    <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
+      <div className="text-[11px] font-medium uppercase tracking-wide text-warning">
+        Evaluation error
+      </div>
+      <div className="flex items-start gap-2.5 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs leading-relaxed text-foreground dark:bg-warning/10">
+        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+        <div className="min-w-0 flex-1 space-y-1">
+          <p>{summary}</p>
+          <p className="whitespace-pre-wrap break-words text-muted-foreground">
+            {message}
+          </p>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -163,9 +208,11 @@ function BlockDetailConditional({ block }: Props) {
   // resolved a branch. Before that (Created/Queued/Running), claiming a
   // result — especially the "executed default branch" fallback — is wrong.
   const hasExecutedBranch = Boolean(block.executed_branch_id);
+  const evaluationError = getConditionalEvaluationError(block);
 
   return (
     <div className="space-y-4 px-3 py-3 empty:hidden">
+      {evaluationError ? <EvaluationErrorNotice {...evaluationError} /> : null}
       {hasExecutedBranch && evaluations && evaluations.length > 0 ? (
         <Section title="Branches">
           <ul className="divide-y divide-border/50">
@@ -174,6 +221,7 @@ function BlockDetailConditional({ block }: Props) {
                 key={evaluation.branch_id || index}
                 evaluation={evaluation}
                 index={index}
+                statedError={evaluationError?.message ?? null}
               />
             ))}
           </ul>

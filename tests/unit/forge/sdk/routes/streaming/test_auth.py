@@ -49,7 +49,13 @@ async def test_auth_failure_log_level_separates_bad_credentials_from_backend_fau
     websocket = _FakeWebSocket()
 
     with capture_logs() as logs:
-        organization_id = await auth_module.auth(apikey="bad", token=None, websocket=websocket)  # type: ignore[arg-type]
+        organization_id = await auth_module.auth(  # type: ignore[arg-type]
+            apikey="bad",
+            token=None,
+            websocket=websocket,
+            folder_action="workflow_run.read",
+            folder_resource={"workflow_run_id": "wr_1"},
+        )
 
     # Rejection is unconditional; only the level moves.
     assert organization_id is None

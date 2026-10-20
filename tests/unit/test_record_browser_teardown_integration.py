@@ -24,8 +24,11 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltrationChannel,
 )
-from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannelContext
-from skyvern.services.browser_recording.service import Processor
+from skyvern.forge.sdk.routes.streaming.channels.message import (
+    MessageChannelContext,
+    MessageInEndExfiltration,
+    reify_channel_message,
+)
 from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 
 ORG_ID = "org_123"
@@ -126,19 +129,94 @@ async def _assert_closed_target_preserves_drafts(
     await channel.stop()  # message.py:727 — must not raise on a closed target
     drafts = await registry.stop_session(PBS_ID)  # message.py:731 — only reached if stop() didn't crash
 
-    # The drafts survived teardown and convert into real workflow blocks.
+    # The drafts survived teardown for final code synthesis.
     assert drafts, "teardown dropped the recorded drafts"
-    blocks = Processor(PBS_ID, ORG_ID, WP_ID).drafts_to_blocks(drafts)
-    assert blocks, "surviving drafts did not produce workflow blocks"
 
 
 @pytest.mark.asyncio
-async def test_end_exfiltration_on_closed_target_preserves_drafts_into_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_end_exfiltration_on_closed_target_preserves_drafts(monkeypatch: pytest.MonkeyPatch) -> None:
     await _assert_closed_target_preserves_drafts(monkeypatch, _vnc_context())
 
 
 @pytest.mark.asyncio
-async def test_end_exfiltration_without_vnc_on_closed_target_preserves_drafts_into_blocks(
+async def test_end_exfiltration_without_vnc_on_closed_target_preserves_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _assert_closed_target_preserves_drafts(monkeypatch, _message_context())
+
+
+@pytest.mark.asyncio
+async def test_discard_end_exfiltration_does_not_cache_finalized_actions() -> None:
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _update: None,
+        recording_attempt_id="attempt-1",
+    )
+    interpretation_session_id = registry._sessions[PBS_ID].interpretation_session_id
+
+    message = reify_channel_message({"kind": "end-exfiltration", "discard": True})
+    assert isinstance(message, MessageInEndExfiltration)
+    assert message.discard is True
+
+    await registry.stop_session(PBS_ID, retain_finalized_actions=not message.discard)
+
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id=ORG_ID,
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_after_finalization_purges_only_owned_actions() -> None:
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _update: None,
+        recording_attempt_id="attempt-1",
+    )
+    interpretation_session_id = registry._sessions[PBS_ID].interpretation_session_id
+    await registry.stop_session(PBS_ID)
+
+    message = reify_channel_message(
+        {
+            "kind": "end-exfiltration",
+            "discard": True,
+            "interpretation_session_id": interpretation_session_id,
+            "workflow_permanent_id": WP_ID,
+        }
+    )
+    assert isinstance(message, MessageInEndExfiltration)
+    assert message.interpretation_session_id == interpretation_session_id
+    assert message.workflow_permanent_id == WP_ID
+
+    assert not registry.discard_finalized_actions_if_owned(
+        interpretation_session_id=interpretation_session_id,
+        browser_session_id=PBS_ID,
+        organization_id="another-org",
+        workflow_permanent_id=WP_ID,
+    )
+    assert registry.discard_finalized_actions_if_owned(
+        interpretation_session_id=interpretation_session_id,
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+    )
+    assert (
+        registry.get_finalized_actions(
+            interpretation_session_id=interpretation_session_id,
+            browser_session_id=PBS_ID,
+            organization_id=ORG_ID,
+            workflow_permanent_id=WP_ID,
+        )
+        is None
+    )

@@ -1,6 +1,9 @@
 import { describe, test, expect } from "vitest";
-import { areBlocksIdentical } from "./compareBlocks";
+import { diffBlockFields } from "./compareBlocks";
 import { WorkflowBlock } from "../types/workflowTypes";
+
+const areBlocksIdentical = (a: WorkflowBlock, b: WorkflowBlock) =>
+  diffBlockFields(a, b).length === 0;
 
 function makeOutputParameter(id: string) {
   return {
@@ -52,7 +55,7 @@ function makeTaskBlock(overrides: Record<string, unknown> = {}): WorkflowBlock {
   } as unknown as WorkflowBlock;
 }
 
-describe("areBlocksIdentical", () => {
+describe("diffBlockFields", () => {
   test("identical blocks compare equal", () => {
     expect(areBlocksIdentical(makeTaskBlock(), makeTaskBlock())).toBe(true);
   });

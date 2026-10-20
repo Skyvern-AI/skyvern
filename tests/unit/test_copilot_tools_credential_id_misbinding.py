@@ -31,6 +31,7 @@ def test_credential_id_in_navigation_goal_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -165,6 +166,7 @@ def test_credential_parameter_unrelated_field_with_credential_id_is_still_flagge
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
         """
@@ -190,6 +192,7 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [cred_527971855302737592]
         """
@@ -202,6 +205,41 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
             "location": "login_to_portal",
             "field": "parameter_keys",
             "credential_id": "cred_527971855302737592",
+        }
+    ]
+
+
+def test_declared_credential_named_key_is_not_flagged_but_misbound_id_is() -> None:
+    yaml = _yaml(
+        """
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: cred_x
+            parameter_type: workflow
+            workflow_parameter_type: credential_id
+            default_value: cred_527971855302737592
+          blocks:
+          - block_type: http_request
+            label: sign_in
+            method: POST
+            url: https://api.example.test/session
+            body:
+              username: "{{cred_x.username}}"
+            parameter_keys: [cred_x]
+          - block_type: code
+            label: report_done
+            code: print("signed in as cred_927971855302737594")
+        """
+    )
+
+    findings = _credential_id_misbinding_findings(yaml)
+
+    assert findings == [
+        {
+            "location": "report_done",
+            "field": "code",
+            "credential_id": "cred_927971855302737594",
         }
     ]
 
@@ -266,6 +304,7 @@ def test_credential_id_in_block_url_prose_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/?cred_527971855302737592
             navigation_goal: Sign in.
         """
@@ -375,6 +414,7 @@ def _ctx() -> MagicMock:
     ctx.turn_halt = None
     ctx.build_test_outcomes = []
     ctx.latest_recorded_build_test_outcome = None
+    ctx.credential_origin_recovery = None
     return ctx
 
 
@@ -392,6 +432,7 @@ async def test_update_workflow_stages_credential_id_misbinding_without_authoring
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -461,6 +502,7 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in to the portal.

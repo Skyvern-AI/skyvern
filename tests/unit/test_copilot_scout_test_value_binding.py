@@ -2,20 +2,38 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
+import pytest
+
+from skyvern.constants import SCRUBBED_VALUE
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     authored_block_parameter_keys_from_workflow,
     recorded_outcome_from_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _ephemeral_input_values_by_parameter_key,
     _resolve_run_data_and_unbound_keys,
+    _run_blocks_and_collect_debug,
+    finalize_build_test_result,
+    reusable_origin_input_keys,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import _input_binding_violations
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.copilot_test_helpers import (
+    install_run_blocks_harness,
+    make_copilot_ctx,
+    origin_run_input,
+    terminal_extraction_block,
+)
 
 
 def _wp(
@@ -38,32 +56,36 @@ def _wp(
 
 
 def test_model_authored_default_supplies_run_value() -> None:
-    data, unbound = _resolve_run_data_and_unbound_keys([_wp("specialty", default_value="cardiology")], {})
+    data, unbound, reused = _resolve_run_data_and_unbound_keys([_wp("specialty", default_value="cardiology")], {})
     assert data == {"specialty": "cardiology"}
     assert unbound == []
+    assert reused == []
 
 
 def test_explicit_run_parameter_wins_over_model_authored_default() -> None:
-    data, unbound = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
         [_wp("specialty", default_value="cardiology")],
         {"specialty": "neurology"},
     )
     assert data == {"specialty": "neurology"}
     assert unbound == []
+    assert reused == []
 
 
 def test_missing_model_owned_value_is_recorded_unbound() -> None:
-    data, unbound = _resolve_run_data_and_unbound_keys([_wp("specialty")], {})
+    data, unbound, reused = _resolve_run_data_and_unbound_keys([_wp("specialty")], {})
     assert data == {"specialty": ""}
     assert unbound == ["specialty"]
+    assert reused == []
 
 
 def test_at_will_credential_is_omitted_without_placeholder_or_unbound() -> None:
-    data, unbound = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
         [_wp("maybe_cred", ptype=WorkflowParameterType.CREDENTIAL_ID)], {}
     )
     assert "maybe_cred" not in data
     assert unbound == []
+    assert reused == []
 
 
 def test_explicit_same_turn_input_binding_supplies_private_run_value() -> None:
@@ -82,11 +104,220 @@ def test_explicit_same_turn_input_binding_supplies_private_run_value() -> None:
     }
 
     private_values = _ephemeral_input_values_by_parameter_key(metadata, trajectory)
-    data, unbound = _resolve_run_data_and_unbound_keys([_wp("specialty")], {}, ephemeral_input_values=private_values)
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("specialty")], {}, ephemeral_input_values=private_values
+    )
 
     assert data == {"specialty": "cardiology"}
     assert unbound == []
+    assert reused == []
     assert "cardiology" not in repr(metadata)
+
+
+_ORIGIN_FILE = "s3://origin-sentinel-bucket/uploads/resume-sentinel.pdf"
+
+
+def test_origin_run_value_binds_a_required_input_with_no_default() -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
+        {},
+        origin_parameters=[origin_run_input("resume", _ORIGIN_FILE)],
+    )
+    assert data == {"resume": _ORIGIN_FILE}
+    assert unbound == []
+    assert reused == ["resume"]
+
+
+@pytest.mark.parametrize(
+    ("user_params", "ephemeral", "default_value", "expected", "expected_reused"),
+    [
+        ({"resume": "model_file"}, None, None, "model_file", []),
+        ({}, {"resume": "scout_file"}, None, "scout_file", []),
+        ({}, None, "default_file", _ORIGIN_FILE, ["resume"]),
+    ],
+    ids=["model_beats_origin", "ephemeral_beats_origin", "origin_beats_default"],
+)
+def test_origin_run_value_precedence(
+    user_params: dict[str, str],
+    ephemeral: dict[str, str] | None,
+    default_value: str | None,
+    expected: str,
+    expected_reused: list[str],
+) -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("resume", default_value=default_value, ptype=WorkflowParameterType.FILE_URL)],
+        user_params,
+        ephemeral_input_values=ephemeral,
+        origin_parameters=[origin_run_input("resume", _ORIGIN_FILE)],
+    )
+    assert data == {"resume": expected}
+    assert unbound == []
+    assert reused == expected_reused
+
+
+def test_origin_run_value_of_another_type_is_not_reused() -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
+        {},
+        origin_parameters=[origin_run_input("resume", _ORIGIN_FILE, ptype=WorkflowParameterType.STRING)],
+    )
+    assert data == {"resume": ""}
+    assert unbound == ["resume"]
+    assert reused == []
+
+
+@pytest.mark.parametrize(
+    ("origin_is_copilot_run", "expected_unbound", "expected_reused"),
+    [(True, ["attempts"], []), (False, [], ["attempts"])],
+    ids=["copilot_test_run", "user_run"],
+)
+def test_origin_run_placeholder_is_absent_only_when_a_copilot_test_run_stored_it(
+    origin_is_copilot_run: bool, expected_unbound: list[str], expected_reused: list[str]
+) -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("attempts", ptype=WorkflowParameterType.INTEGER)],
+        {},
+        origin_parameters=[origin_run_input("attempts", 0, ptype=WorkflowParameterType.INTEGER)],
+        origin_is_copilot_run=origin_is_copilot_run,
+    )
+    assert data == {"attempts": 0}
+    assert unbound == expected_unbound
+    assert reused == expected_reused
+
+
+def test_scrubbed_origin_file_is_not_reused() -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
+        {},
+        origin_parameters=[origin_run_input("resume", SCRUBBED_VALUE)],
+    )
+    assert data == {"resume": ""}
+    assert unbound == ["resume"]
+    assert reused == []
+
+
+def test_origin_run_credential_is_not_reused() -> None:
+    data, _, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("login", ptype=WorkflowParameterType.CREDENTIAL_ID)],
+        {},
+        origin_parameters=[origin_run_input("login", "cred_origin", ptype=WorkflowParameterType.CREDENTIAL_ID)],
+    )
+    assert "login" not in data
+    assert reused == []
+
+
+def test_origin_run_value_equal_to_its_own_default_is_not_reused() -> None:
+    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+        [_wp("resume", default_value="current_default_file", ptype=WorkflowParameterType.FILE_URL)],
+        {},
+        origin_parameters=[origin_run_input("resume", "origin_default_file", default_value="origin_default_file")],
+    )
+    assert data == {"resume": "current_default_file"}
+    assert unbound == []
+    assert reused == []
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "origin_type", "origin_value", "origin_is_copilot_run", "expected"),
+    [
+        (WorkflowParameterType.FILE_URL, WorkflowParameterType.FILE_URL, _ORIGIN_FILE, False, ["resume"]),
+        (WorkflowParameterType.STRING, WorkflowParameterType.FILE_URL, _ORIGIN_FILE, False, []),
+        (WorkflowParameterType.FILE_URL, WorkflowParameterType.FILE_URL, SCRUBBED_VALUE, False, []),
+        (WorkflowParameterType.INTEGER, WorkflowParameterType.INTEGER, 0, False, ["resume"]),
+        (WorkflowParameterType.INTEGER, WorkflowParameterType.INTEGER, 0, True, []),
+    ],
+    ids=["same_type", "other_type", "scrubbed", "user_run_placeholder", "copilot_run_placeholder"],
+)
+@pytest.mark.asyncio
+async def test_reusable_keys_follow_the_resolver_rule_for_the_current_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    declared_type: WorkflowParameterType,
+    origin_type: WorkflowParameterType,
+    origin_value: str | int,
+    origin_is_copilot_run: bool,
+    expected: list[str],
+) -> None:
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    ctx = make_copilot_ctx()
+    ctx.staged_workflow = await _process_workflow_yaml(
+        settings_fallback_yaml="enable_self_healing: false",
+        workflow_id="w_source",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=_FILE_INPUT_WORKFLOW_YAML.replace("file_url", declared_type.value),
+    )
+    ctx.repair_origin_input_values = (
+        origin_run_input("resume", origin_value, origin_type),
+        origin_run_input("dropped", _ORIGIN_FILE),
+    )
+    ctx.repair_origin_is_copilot_run = origin_is_copilot_run
+
+    assert await reusable_origin_input_keys(ctx) == expected
+
+
+_FILE_INPUT_WORKFLOW_YAML = """
+title: upload a resume
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: file_url
+      key: resume
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+      parameter_keys:
+        - resume
+"""
+
+
+@pytest.mark.asyncio
+async def test_reused_origin_value_is_dispatched_but_only_its_key_reaches_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_FILE_INPUT_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_input_values = (origin_run_input("resume", _ORIGIN_FILE),)
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    finalize_build_test_result(ctx, source_tool="run_blocks_and_collect_debug", result=result)
+    model_visible = json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result))
+
+    dispatched = workflow_service_module.prepare_workflow.call_args.kwargs["workflow_request"].data
+    assert dispatched["resume"] == _ORIGIN_FILE
+    assert ctx.unbound_required_parameter_keys == []
+    assert '"reused_origin_input_keys": ["resume"]' in model_visible
+    assert _ORIGIN_FILE not in model_visible
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_test_runs_stored_placeholder_leaves_the_test_run_input_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_FILE_INPUT_WORKFLOW_YAML.replace("file_url", "integer"),
+        polled_status="failed",
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_input_values = (origin_run_input("resume", 0, WorkflowParameterType.INTEGER),)
+    ctx.repair_origin_is_copilot_run = True
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert ctx.unbound_required_parameter_keys == ["resume"]
+    assert "reused_origin_input_keys" not in result["data"]
 
 
 def test_scout_value_is_not_dispatched_without_explicit_model_binding() -> None:

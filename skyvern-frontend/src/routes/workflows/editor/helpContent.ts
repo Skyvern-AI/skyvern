@@ -14,7 +14,7 @@ export const baseHelpTooltipContent = {
   completeOnDownload:
     "Allow Skyvern to auto-complete the block when it downloads a file.",
   fileSuffix:
-    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name.",
+    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name. Use {{ original_filename }} to keep the name the site gave the file, e.g. {{ fund }}_{{ original_filename }} to prefix it.",
   errorCodeMapping:
     "Knowing about why a block terminated can be important, specify error messages here.",
   totpVerificationUrl:
@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Skyvern 1.0 is the default for new browser tasks. Skyvern 3.0 (Beta) pins this block to the new engine; blocks that rely on download completion fall back to 1.0. Existing V2 blocks remain supported.",
+    "Default lets Skyvern choose the engine. Choosing an engine pins this block to it.",
 } as const;
 
 export const basePlaceholderContent = {
@@ -39,10 +39,15 @@ export const basePlaceholderContent = {
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",
   maxStepsOverride: "Default: 10",
-  downloadSuffix: "Enter the complete filename (without extension)",
+  downloadSuffix:
+    "Enter the complete filename (without extension), or prefix the site's own name with {{ original_filename }}",
   totpVerificationUrl: "Provide your 2FA endpoint",
   totpIdentifier: "Add an ID that links your TOTP to the block",
 };
+
+// The run's browser starts on about:blank, so the first browser block must navigate somewhere.
+export const firstBrowserBlockUrlPlaceholder =
+  "(required) Navigate to this URL: https://...";
 
 export const helpTooltips = {
   task: baseHelpTooltipContent,
@@ -132,6 +137,8 @@ export const helpTooltips = {
     newerThanDays: "Only include emails newer than this many days.",
     maxResults: "Maximum number of emails to return.",
     includeBody: "Include email body text in matching results.",
+    downloadAttachments:
+      "Download non-inline attachments from matched emails for downstream blocks.",
   },
   google_sheets_write: {
     ...baseHelpTooltipContent,
@@ -144,7 +151,7 @@ export const helpTooltips = {
     writeMode:
       "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
     range:
-      "Only used for Update Range. A1 notation (e.g. A2:D5) or a named range. The data shape must match the range dimensions.",
+      "Update Range: the cells to overwrite, in A1 notation (e.g. A2:D5) or a named range; the data shape must match. Append: optional start column (e.g. D:D); rows are added below existing data from that column.",
     values:
       "Jinja2 template that resolves to a JSON array. Arrays of lists write left-to-right; arrays of objects require column mappings below.",
     columnMapping:
@@ -211,6 +218,17 @@ export const helpTooltips = {
       "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
     fileType:
       "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, and file_size. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
+    worksheet:
+      "Excel only: the exact name of the worksheet to read. Leave empty to read the first worksheet. The run fails if the named worksheet is not in the workbook.",
+    forceOcr:
+      "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Skyvern already does this when the text layer is empty or its characters are scrambled; turn this on when a PDF's text layer is unreadable in some other way. OCR is slower, costs more than reading the text layer, and reads at most the first 50 pages, so a longer PDF loses the rest.",
+  },
+  terminate: {
+    ...baseHelpTooltipContent,
+    reason:
+      "Why the run stops here. It is recorded in the run's failure reason. Other parameters and earlier block outputs can be referenced, e.g. {{ account_number }}. Credentials and secrets cannot be referenced; a template that references one is dropped.",
+    errorCode:
+      "Optional. A code recorded with the run, so a retry rule, the run list filter, or a webhook can tell this stop apart. Other parameters and earlier block outputs can be referenced. Credentials and secrets cannot be referenced; a template that references one is dropped. Leave empty for no code.",
   },
   wait: {
     ...baseHelpTooltipContent,
@@ -223,6 +241,13 @@ export const helpTooltips = {
     jsonSchema: "Specify a format for the extracted information from the file",
   },
   url: baseHelpTooltipContent,
+  webSearch: {
+    ...baseHelpTooltipContent,
+    errorCodeMapping:
+      "Describe when each error code applies. After the search, the block checks the results against these descriptions. A match ends the block with that code.",
+    continueOnFailure:
+      "Continue the workflow when this block fails or terminates. The next block can read the error code from the block output.",
+  },
   httpRequest: {
     ...baseHelpTooltipContent,
     url: "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference inputs.",

@@ -7,7 +7,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
 import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
@@ -15,7 +15,6 @@ import {
   isUserWritableTagKey,
   type Tag,
 } from "@/routes/workflows/types/tagTypes";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
 import { cn } from "@/util/utils";
 import { useApplyRunTagsMutation } from "../../hooks/useRunTagMutations";
 import { useRunTagSuggestionsQuery } from "../../hooks/useRunTagSuggestionsQuery";
@@ -28,7 +27,7 @@ type Props = {
 };
 
 function RunTagsEditor({ workflowRunId, className }: Props) {
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
   const { data: runTags = [] } = useRunTagsQuery(workflowRunId, {
     enabled: taggingEnabled,
   });

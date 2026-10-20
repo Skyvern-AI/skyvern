@@ -285,6 +285,12 @@ async def test_designation_probe_returns_every_verified_representation_without_c
             "match_count": 1,
             "position": 0,
         },
+        {
+            "selector": 'section:has(h2:text-is("Visitors")) span.metric-value',
+            "source": "text_anchor",
+            "match_count": 1,
+            "position": 0,
+        },
     ]
 
 

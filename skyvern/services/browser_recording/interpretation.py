@@ -25,6 +25,8 @@ from skyvern.services.browser_recording.service import (
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionDialog,
+    ActionDragDrop,
     ActionInputText,
     ActionKind,
     ActionPressKey,
@@ -50,6 +52,9 @@ SIGNIFICANT_CONSOLE_EVENT_TYPES = {
     "blur",
     "change",
     "click",
+    "dragend",
+    "dragstart",
+    "drop",
     "focus",
     "input",
     "keydown",
@@ -95,7 +100,7 @@ def streaming_events_to_recording_events(
 
 def event_should_trigger_interpretation(event: ExfiltratedEvent) -> bool:
     if isinstance(event, ExfiltratedCdpEvent):
-        return event.event_name.startswith("nav:")
+        return event.event_name.startswith(("dialog:", "nav:"))
 
     return event.params.type in SIGNIFICANT_CONSOLE_EVENT_TYPES
 
@@ -197,6 +202,8 @@ def _action_display_text(action: Action) -> str:
 
 _PLACEHOLDER_VERBS: dict[ActionKind, str] = {
     ActionKind.CLICK: "Click",
+    ActionKind.DIALOG: "Handle",
+    ActionKind.DRAG_DROP: "Drag",
     ActionKind.HOVER: "Hover over",
     ActionKind.INPUT_TEXT: "Fill",
     ActionKind.PRESS_KEY: "Press",
@@ -214,7 +221,12 @@ def _placeholder_step_from_action(
     immediately while LLM enrichment runs in the background.
     """
     step_id = f"{browser_session_id}-recording-step-{action_index}"
-    text = action.key if isinstance(action, ActionPressKey) else _action_display_text(action)
+    if isinstance(action, ActionDialog):
+        text = f"{action.response} {action.dialog_type} dialog"
+    elif isinstance(action, ActionDragDrop):
+        text = f"{_action_display_text(action)} drop target"
+    else:
+        text = action.key if isinstance(action, ActionPressKey) else _action_display_text(action)
     verb = _PLACEHOLDER_VERBS[action.kind]
     title = f"{verb} '{text}'"
 
@@ -288,6 +300,8 @@ class RecordingInterpretationSession:
         self._interpret_lock = asyncio.Lock()
         self._action_machines: list[sm.StateMachine] = [
             sm.Click(),
+            sm.Dialog(),
+            sm.DragDrop(),
             sm.Hover(),
             sm.InputText(),
             sm.Select(),
@@ -295,16 +309,10 @@ class RecordingInterpretationSession:
             # followed by the keypress, not replace it.
             sm.PressKey(),
             sm.UrlChange(),
-            sm.Wait(),
         ]
         self._all_actions: list[Action] = []
         self._processed_event_count = 0
         self._capture_paused = False
-
-    def reset_wait_capture(self) -> None:
-        for machine in self._action_machines:
-            if isinstance(machine, sm.Wait):
-                machine.reset()
 
     def set_deltas_enabled(self, enabled: bool) -> None:
         # Deltas require both the client capability and the server kill switch.
@@ -312,11 +320,9 @@ class RecordingInterpretationSession:
 
     def pause_capture(self) -> None:
         self._capture_paused = True
-        self.reset_wait_capture()
 
     def resume_capture(self) -> None:
         self._capture_paused = False
-        self.reset_wait_capture()
         # Enrichment deltas that landed while paused were dropped client-side, so
         # send an authoritative snapshot to resync on resume.
         if self.session_revision > 0:
@@ -361,6 +367,9 @@ class RecordingInterpretationSession:
         self._cancel_debounce()
         await self._interpret(finalized=True)
         return self.steps
+
+    def recorded_actions(self) -> list[Action]:
+        return list(self._all_actions)
 
     def _cancel_debounce(self) -> None:
         if self._debounce_task and not self._debounce_task.done():
@@ -462,6 +471,15 @@ class RecordingInterpretationSession:
                 action=blockable,
             )
             self._schedule_enrichment(processor, action_index, step, blockable)
+            return step
+
+        if action.kind in (ActionKind.DIALOG, ActionKind.DRAG_DROP):
+            step = _placeholder_step_from_action(
+                browser_session_id=self.browser_session_id,
+                action_index=action_index,
+                action=t.cast(ActionBlockable, action),
+            )
+            step.status = RecordingDraftStepStatus.READY
             return step
 
         if action.kind in (ActionKind.URL_CHANGE, ActionKind.WAIT):

@@ -59,7 +59,6 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
               "pointer-events-none bg-background": thisBlockIsPlaying,
               "outline outline-2 outline-ring": thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader

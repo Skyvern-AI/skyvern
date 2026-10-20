@@ -19,7 +19,7 @@ function MakeACopyButton() {
     if (!workflow) {
       return;
     }
-    createWorkflowMutation.mutate(convert(workflow));
+    createWorkflowMutation.mutate(convert(workflow, { asNewWorkflow: true }));
   };
 
   return (
