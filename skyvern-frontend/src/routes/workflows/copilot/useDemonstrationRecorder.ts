@@ -118,22 +118,6 @@ export function useDemonstrationRecorder({
           setSensitiveField(null);
           return false;
         case "demonstration_sensitive_field":
-          {
-            const seq =
-              Math.max(0, ...actionsRef.current.map((action) => action.seq)) +
-              1;
-            const fieldLabel =
-              frame.field === "other" ? "sensitive field" : frame.field;
-            actionsRef.current = [
-              ...actionsRef.current,
-              {
-                seq,
-                label: `Fill ${fieldLabel} (value not recorded)`,
-              },
-            ];
-            setActions(actionsRef.current);
-            setActionCount((current) => Math.max(current, seq));
-          }
           if (frame.field === "other") {
             setHasSkippedSensitiveField(true);
           }
@@ -333,8 +317,18 @@ export function useDemonstrationRecorder({
     try {
       if (phaseRef.current === "recording") {
         const stopped = await sendControl({ action: "stop" }, id);
-        streamControllerRef.current?.abort();
+        const stream = streamControllerRef.current;
         streamControllerRef.current = null;
+        // The stop flush can stream its last rows after the stop request returns.
+        for (
+          let waited = 0;
+          waited < 20 &&
+          actionsRef.current.length < (stopped?.action_count ?? 0);
+          waited++
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        stream?.abort();
         setSensitiveField(null);
         updatePhase("stopped");
         setHasSkippedSensitiveField(false);
