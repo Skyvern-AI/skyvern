@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     append_omission_notice,
     coerce_block_action_observations,
     coerce_block_end_urls,
+    recorded_failure_observation,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     INTERNAL_VALIDATION_FAILURE_PREFIX,
@@ -355,19 +356,54 @@ def _compacted(
     return values[-limit:] if keep == "last" else values[:limit]
 
 
-def _compacted_newest_labelled(
-    entries: list[tuple[str, _ItemT]], limit: int, *, field_name: str, notices: list[str]
-) -> list[tuple[str, _ItemT]]:
-    """Keeping the newest entries relies on producers inserting labels in execution order. Name the
-    blocks withheld, so a block this bound dropped is not read as one that recorded nothing."""
-    if len(entries) <= limit:
-        return entries
-    named = _bounded_labelled_names([(label, None) for label, _ in entries[:-limit]])
+def _newest_indexes_preferring(preferred: Sequence[bool], limit: int) -> list[int]:
+    """The ``limit`` newest positions, preferred ones first, back in chronological order."""
+    newest_first = range(len(preferred) - 1, -1, -1)
+    ranked = [index for index in newest_first if preferred[index]] + [
+        index for index in newest_first if not preferred[index]
+    ]
+    return sorted(ranked[:limit])
+
+
+def _compacted_failures_first(values: list[str], limit: int, *, field_name: str, notices: list[str]) -> list[str]:
+    """Keep the newest action observations, a recorded code-block failure ahead of any other."""
+    if len(values) <= limit:
+        return values
+    kept = _newest_indexes_preferring([recorded_failure_observation(value) for value in values], limit)
+    which = "oldest " if kept == list(range(len(values) - limit, len(values))) else ""
     append_omission_notice(
         notices,
-        f"{field_name} shortened at the aggregate packet limit: dropped the oldest block(s) {named}.",
+        f"{field_name} shortened at the aggregate packet limit: {len(values) - limit} {which}item(s) omitted, "
+        "recorded code-block failures kept first.",
     )
-    return entries[-limit:]
+    return [values[index] for index in kept]
+
+
+def _compacted_newest_labelled(
+    entries: list[tuple[str, _ItemT]],
+    limit: int,
+    *,
+    field_name: str,
+    notices: list[str],
+    prefer: Callable[[_ItemT], bool] | None = None,
+) -> list[tuple[str, _ItemT]]:
+    """Keeping the newest entries relies on producers inserting labels in execution order; ``prefer`` keeps its
+    entries ahead of newer ones. Name the blocks withheld, so a dropped block is not read as one that recorded
+    nothing."""
+    if len(entries) <= limit:
+        return entries
+    kept = _newest_indexes_preferring([prefer is not None and prefer(value) for _, value in entries], limit)
+    named = _bounded_labelled_names([(label, None) for index, (label, _) in enumerate(entries) if index not in kept])
+    which = "the oldest " if kept == list(range(len(entries) - limit, len(entries))) else ""
+    append_omission_notice(
+        notices,
+        f"{field_name} shortened at the aggregate packet limit: dropped {which}block(s) {named}.",
+    )
+    return [entries[index] for index in kept]
+
+
+def _reports_a_recorded_failure(observations: list[str]) -> bool:
+    return any(recorded_failure_observation(observation) for observation in observations)
 
 
 def screened_recorded_url(url: str) -> tuple[str | None, str | None]:
@@ -854,6 +890,7 @@ def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]
                     2,
                     field_name="per_block_action_observations",
                     notices=notices,
+                    prefer=_reports_a_recorded_failure,
                 )
             ),
             "omission_notices": notices,
@@ -971,8 +1008,8 @@ def _compact_packet_for_aggregate_limit(
             ),
             "action_observations": [
                 value[:117] + "..." if len(value) > 120 else value
-                for value in _compacted(
-                    packet.action_observations, 2, field_name="action_observations", notices=notices, keep="last"
+                for value in _compacted_failures_first(
+                    packet.action_observations, 2, field_name="action_observations", notices=notices
                 )
             ],
             "observed_block_end_urls": dict(
@@ -984,14 +1021,15 @@ def _compact_packet_for_aggregate_limit(
                 )
             ),
             "per_block_action_observations": {
-                label: _compacted(
-                    values, 1, field_name=f"per_block_action_observations[{label}]", notices=notices, keep="last"
+                label: _compacted_failures_first(
+                    values, 1, field_name=f"per_block_action_observations[{label}]", notices=notices
                 )
                 for label, values in _compacted_newest_labelled(
                     list(packet.per_block_action_observations.items()),
                     2,
                     field_name="per_block_action_observations",
                     notices=notices,
+                    prefer=_reports_a_recorded_failure,
                 )
             },
             "failure": failure,

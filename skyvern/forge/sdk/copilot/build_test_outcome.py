@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
 
 LOG = structlog.get_logger()
@@ -606,6 +607,17 @@ _ValueT = TypeVar("_ValueT")
 BLOCK_FACT_MAX_LABELS = 12
 BLOCK_FACT_MAX_OBSERVATIONS = 6
 BLOCK_FACT_MAX_CHARS = 300
+
+
+_RECORDED_FAILURE_OBSERVATION = re.compile(rf"\S+ {ActionStatus.failed.value} code_line=\d+[^:]*: ")
+
+
+def recorded_failure_observation(observation: str) -> bool:
+    """Whether a rendered action observation carries a code-block operation's recorded error, which native task
+    rows never do."""
+    return _RECORDED_FAILURE_OBSERVATION.match(observation) is not None
+
+
 # An over-long URL is refused rather than cut everywhere it is bounded: a cut URL still parses, so
 # it would be reported as a page the run reached while being unresumable.
 BLOCK_FACT_URL_MAX_CHARS = 2000
