@@ -601,6 +601,8 @@ class WorkflowCopilotDemonstrationControlRequest(BaseModel):
     selector: str | None = Field(default=None, max_length=2000)
     credential_id: str | None = Field(default=None, max_length=128)
     field: Literal["password", "totp"] | None = None
+    # A stop the user did not ask for, e.g. a browser restart, so replay reports the recording as interrupted.
+    stop_reason: Literal["browser_gone"] | None = None
 
 
 class WorkflowCopilotDemonstrationControlResult(BaseModel):
