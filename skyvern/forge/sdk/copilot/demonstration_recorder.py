@@ -426,7 +426,7 @@ async def append_demonstration_control(
         if request.action == "stop":
             if record.status == "recording":
                 record.status = "stopping"
-                record.stop_reason = "stopped"
+                record.stop_reason = request.stop_reason or "stopped"
                 await cache.set(record_key, encode_demonstration_record(record), ex=DEMONSTRATION_TTL)
             return 0
         if request.action == "cancel":
