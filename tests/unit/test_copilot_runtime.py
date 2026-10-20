@@ -420,6 +420,7 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
         "timeout_minutes",
         "created_by",
         "session_kind",
+        "created_for_workflow_permanent_id",
     }
     assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
@@ -1000,6 +1001,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         "timeout_minutes": 30,
         "created_by": "copilot",
         "session_kind": BrowserSessionKind.copilot,
+        "created_for_workflow_permanent_id": ctx.workflow_permanent_id,
         "browser_profile_id": "bp_saved",
         "profile_read_only": True,
         "generate_browser_profile": True,
@@ -1052,6 +1054,25 @@ async def test_self_heal_browser_state_adoption_does_not_enter_persistent_resolv
 
     assert result is browser_state
     resolve_self_heal.assert_awaited_once_with(ctx)
+    manager_resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_demonstration_replay_cannot_resolve_a_browser_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs-live"
+    manager_resolve = AsyncMock()
+    monkeypatch.setattr(runtime.app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", manager_resolve)
+    action = runtime.DemonstratedAction(
+        selector="#continue",
+        source_url="https://example.test/start",
+        packet=None,
+        synthesized_result={"ok": True},
+    )
+
+    with runtime.staged_demonstrated_action(action):
+        assert await runtime.resolve_browser_state_for_context(ctx) is None
+
     manager_resolve.assert_not_awaited()
 
 

@@ -12,10 +12,15 @@ import pytest
 from agents import Agent, ModelSettings, RunContextWrapper, SQLiteSession, function_tool
 from agents.exceptions import MaxTurnsExceeded
 from agents.run_config import RunConfig
+from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+from litellm.exceptions import Timeout as LiteLLMTimeout
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
+    FINAL_REPLY_UNAPPLIED_CHANGE_NOTE,
     _build_narrative_payload,
     _build_timeout_exit_result,
     _format_chat_history,
@@ -23,8 +28,11 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionPart, QuestionResponse
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES
+from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    BUDGET_DRAIN_EXCLUDED_TOOLS,
     BUDGET_DRAIN_HEADROOM,
     EXPIRED_TURN_REPLY_SECONDS,
     HARD_BACKSTOP_ALLOWANCE_SECONDS,
@@ -40,14 +48,15 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     hydrate_prior_run_packet,
     recorded_open_step_runs,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import CANCEL_TERMINAL_REASON
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
-from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import (
     HANDBACK_WORKFLOW_YAML,
     OWNED_RUN_ID,
@@ -63,6 +72,7 @@ from tests.unit.copilot_test_helpers import (
     scripted_call,
     scripted_text,
     settle_cancelled_tools,
+    stub_copilot_agent_loop,
     tool_outputs_for,
 )
 
@@ -119,104 +129,13 @@ async def test_timeout_finishes_active_call_then_drains_once_in_same_session(
         "message": (
             "The normal turn budget has expired. headroom is the maximum number of model calls available to finish "
             "this turn, including this call; the hard time limit may stop it sooner. Your session history and any "
-            "staged draft remain available. Choose how to use these calls. New build-test runs cannot be dispatched."
+            "staged draft remain available. Choose how to use these calls. This step offers no tools that change or "
+            "run the workflow."
         ),
     }
     assert ctx.budget_expiry_state.drain_attempted is True
     assert ctx.budget_expiry_state.drain_fingerprint
     assert ctx.budget_expiry_state.report_produced is None
-
-
-@pytest.mark.asyncio
-async def test_drain_denies_new_run_before_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    ctx = make_copilot_ctx()
-    ctx.budget_expiry_state.source = "max_turns"
-    ctx.budget_expiry_state.drain_active = True
-    database_lookup = AsyncMock()
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools.run_execution.app.DATABASE.workflows.get_workflow_by_permanent_id",
-        database_lookup,
-    )
-
-    result = await _run_blocks_and_collect_debug({"block_labels": ["step"]}, ctx)
-
-    assert result == {
-        "ok": False,
-        "data": {
-            "budget_expired": True,
-            "run_dispatched": False,
-            "source": "max_turns",
-        },
-    }
-    database_lookup.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_composite_tool_stages_edit_before_drain_denies_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.workflow_yaml.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id",
-        AsyncMock(return_value=None),
-    )
-    workflow_yaml = """
-title: Drain draft
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: navigation
-      label: staged_step
-      navigation_goal: Open the staged page.
-"""
-    ctx = make_copilot_ctx()
-    ctx.budget_expiry_state.source = "deadline"
-    ctx.budget_expiry_state.drain_active = True
-
-    async def fake_update_workflow(payload: dict[str, Any], copilot_ctx: Any, **_kwargs: Any) -> dict[str, Any]:
-        copilot_ctx.workflow_yaml = payload["workflow_yaml"]
-        workflow = await _process_workflow_yaml(
-            settings_fallback_yaml="",
-            workflow_id=copilot_ctx.workflow_id,
-            workflow_permanent_id=copilot_ctx.workflow_permanent_id,
-            organization_id=copilot_ctx.organization_id,
-            workflow_yaml=payload["workflow_yaml"],
-        )
-        copilot_ctx.staged_workflow = workflow
-        copilot_ctx.staged_workflow_yaml = payload["workflow_yaml"]
-        copilot_ctx.has_staged_proposal = True
-        return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
-
-    monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *_args: False)
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-    monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *_args: (["staged_step"], {}, "staged_step", "initial"),
-    )
-    monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
-    monkeypatch.setattr(tools_module, "_carry_prior_attempt_change_identity_into_result", lambda *_args: None)
-    monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *_args: None)
-    monkeypatch.setattr(tools_module, "finalize_build_test_result", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *_args, **_kwargs: None)
-
-    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps({"workflow": safe_load_no_dates(workflow_yaml), "block_labels": ["staged_step"], "parameters": {}}),
-    )
-
-    assert safe_load_no_dates(ctx.staged_workflow_yaml) == safe_load_no_dates(workflow_yaml)
-    assert ctx.has_staged_proposal is True
-    assert json.loads(result) == {
-        "ok": False,
-        "data": {
-            "budget_expired": True,
-            "run_dispatched": False,
-            "source": "deadline",
-        },
-    }
 
 
 @pytest.mark.parametrize("resolved", [False, True])
@@ -721,6 +640,203 @@ async def test_unknown_tool_recovery_keeps_the_budget_drain_within_its_headroom(
     assert len(model.inputs) == 1 + BUDGET_DRAIN_HEADROOM
 
 
+_REPLACE_WORKFLOW_TEXT = json.dumps(
+    {"type": "REPLACE_WORKFLOW", "user_response": "Saved a new draft.", "workflow_yaml": HANDBACK_WORKFLOW_YAML}
+)
+
+
+_DRAIN_KEPT_NATIVE_TOOLS = {
+    "ask_user",
+    "cancel_account_group",
+    "delete_saved_credentials",
+    "discover_workflow_entrypoint",
+    "extend_browser_session",
+    "fill_credential_field",
+    "get_account_group_status",
+    "get_organization_usage_quota",
+    "get_run_results",
+    "inspect_locator_matches",
+    "inspect_page_for_composition",
+    "list_credentials",
+    "list_integrations",
+    "read_google_sheet",
+    "reply",
+    "request_credential",
+    "run_browser_code",
+    "search_web",
+    "set_work_plan",
+    "solve_page_challenge",
+    "start_fresh_browser",
+    "upload_attached_file",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("staged_before_expiry", "drain_script"),
+    [
+        (False, [scripted_call("update_workflow", {"workflow_yaml": "x"}, "call_stage"), REPLY_ARGUMENTS]),
+        (True, [scripted_call("update_workflow", {"workflow_yaml": "x"}, "call_stage"), REPLY_ARGUMENTS]),
+        (False, [scripted_text(_REPLACE_WORKFLOW_TEXT)]),
+        (True, [scripted_text(_REPLACE_WORKFLOW_TEXT)]),
+    ],
+)
+async def test_budget_drain_offers_no_tool_that_changes_or_runs_the_workflow(
+    staged_before_expiry: bool, drain_script: list[Any]
+) -> None:
+    staged_writes: list[str] = []
+    dispatched: list[list[str]] = []
+
+    @function_tool
+    async def probe() -> str:
+        return json.dumps({"ok": True})
+
+    @function_tool(name_override="update_workflow", strict_mode=False)
+    async def stage_draft(ctx: RunContextWrapper[CopilotContext], workflow_yaml: str) -> str:
+        staged_writes.append(workflow_yaml)
+        ctx.context.staged_workflow = SimpleNamespace(workflow_id="wf_after_expiry")
+        return json.dumps({"ok": True})
+
+    @function_tool(name_override="run_blocks_and_collect_debug", strict_mode=False)
+    async def dispatch_run(block_labels: list[str]) -> str:
+        dispatched.append(block_labels)
+        return json.dumps({"ok": True})
+
+    stubbed = {stage_draft.name, dispatch_run.name, REPLY_TOOL_NAME}
+    native_tools = [tool for tool in tools_module.NATIVE_TOOLS if tool.name not in stubbed]
+    ctx = make_copilot_ctx(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        workflow_id=None,
+        workflow_yaml=None,
+        stream=None,
+        api_key="sk-copilot-org",
+    )
+    staged = SimpleNamespace(workflow_id="wf_draft", workflow_definition=SimpleNamespace(blocks=[]))
+    if staged_before_expiry:
+        ctx.staged_workflow = staged
+    script = [
+        [scripted_call("probe", {}, "call_probe")],
+        *[[scripted_call("reply", item, "call_reply")] if item is REPLY_ARGUMENTS else [item] for item in drain_script],
+    ]
+    model = ScriptedModel(script)
+
+    result, ctx, _stream = await run_scripted_turn(
+        model,
+        tools=[probe, stage_draft, dispatch_run, *native_tools],
+        max_turns=1,
+        ctx=ctx,
+    )
+    translated = await _translate_to_agent_result(result, ctx, None, _chat_request(), "org-1")
+
+    first_call, *drain_calls = model.served_tool_names_by_call
+    assert first_call - drain_calls[0] == first_call & BUDGET_DRAIN_EXCLUDED_TOOLS
+    assert all(served == _DRAIN_KEPT_NATIVE_TOOLS | {"probe"} for served in drain_calls)
+    assert CODE_WRITE_TOOL_NAMES <= BUDGET_DRAIN_EXCLUDED_TOOLS
+    assert len(model.inputs) == len(script)
+    for call_index, step in enumerate(drain_script[:-1], start=2):
+        (not_run,) = tool_outputs_for(model.inputs[call_index], step.call_id)
+        assert json.loads(not_run)["error"].startswith(f"No tool named {step.name} exists")
+    assert staged_writes == []
+    assert dispatched == []
+    assert ctx.staged_workflow is (staged if staged_before_expiry else None)
+    assert ctx.budget_expiry_state.staged_draft_id == ("wf_draft" if staged_before_expiry else None)
+    assert translated.response_type == "REPLY"
+    assert translated.turn_outcome is not None
+    assert translated.turn_outcome.budget_expiry_report_produced is True
+    assert translated.turn_outcome.budget_expiry_staged_draft_id == ("wf_draft" if staged_before_expiry else None)
+    if drain_script[-1] is REPLY_ARGUMENTS:
+        assert translated.user_response == REPLY_ARGUMENTS["user_response"]
+    else:
+        assert translated.updated_workflow is None
+        assert translated.user_response.startswith("Saved a new draft.")
+        assert FINAL_REPLY_UNAPPLIED_CHANGE_NOTE in translated.user_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_error", "fallback_llm_key", "untested_retry"),
+    [
+        pytest.param(
+            LiteLLMRateLimitError(message="rate limit", llm_provider="openai", model="m"),
+            "SECONDARY",
+            False,
+            id="fallback_model",
+        ),
+        pytest.param(
+            LiteLLMNotFoundError(message="missing model", llm_provider="azure", model="m"),
+            None,
+            True,
+            id="model_lookup_retry",
+        ),
+    ],
+)
+async def test_provider_error_inside_the_budget_drain_never_reruns_with_write_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_error: Exception,
+    fallback_llm_key: str | None,
+    untested_retry: bool,
+) -> None:
+    offered: list[tuple[bool, set[str]]] = []
+    contexts: list[CopilotContext] = []
+    models: list[str] = []
+
+    def run_streamed(agent: Agent, **kwargs: Any) -> MagicMock:
+        ctx = kwargs["context"]
+        contexts.append(ctx)
+        models.append(str(agent.model))
+        state = ctx.budget_expiry_state
+        offered.append((state.drain_attempted, {tool.name for tool in agent.tools}))
+        if state.drain_active:
+            raise provider_error
+        if not state.drain_attempted:
+            raise MaxTurnsExceeded("cap")
+        return _result(json.dumps({"type": "REPLY", "user_response": "Nothing was saved or tested this turn."}))
+
+    surface_loop = agent_module._run_agent_loop_with_surface
+
+    async def loop_with_untested_retry(**kwargs: Any) -> Any:
+        return await surface_loop(**{**kwargs, "allow_untested_retry": untested_retry})
+
+    stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
+    monkeypatch.setattr(agent_module, "_run_agent_loop_with_surface", loop_with_untested_retry)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", run_streamed)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", AsyncMock(return_value=None))
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="build it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key=fallback_llm_key),
+    )
+
+    (before_drain, *after_drain) = offered
+    assert before_drain[0] is False and "update_workflow" in before_drain[1]
+    assert after_drain and all(attempted for attempted, _ in after_drain)
+    assert all(not served & {"update_workflow", "run_blocks_and_collect_debug"} for _, served in after_drain)
+    assert after_drain[-1][1] == {REPLY_TOOL_NAME}
+    assert (models[-1] != models[0]) is (fallback_llm_key is not None), models
+    assert contexts[-1].budget_expiry_state.staged_draft_id is None
+    assert result.response_type == "REPLY"
+    assert result.user_response == "Nothing was saved or tested this turn."
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.budget_expired is True
+    assert result.turn_outcome.budget_expiry_staged_draft_id is None
+
+
 async def _build_test_turn(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -781,10 +897,22 @@ def _saved_left_run_ids(ctx: CopilotContext) -> list[str]:
     return payload.get("budgetExpiry", {}).get("leftRunIds", [])
 
 
-def _expire_turn_soon(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0.3)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.1)
+async def _run_build_test_turn_to_hard_backstop(ctx: CopilotContext, model: ScriptedModel, owned: OwnedRunRow) -> None:
+    turn = asyncio.create_task(_run_build_test_turn(ctx, model))
+    polled = asyncio.create_task(owned.polled.wait())
+    done, _ = await asyncio.wait({turn, polled}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+    polled.cancel()
+    await asyncio.wait({polled})
+    if not done:
+        turn.cancel()
+        await asyncio.wait({turn}, timeout=5)
+        await settle_cancelled_tools()
+        pytest.fail("The build test never polled its dispatched run")
+    if not turn.done():
+        assert ctx.model_stream_deadline is not None, "The model stream ended before the hard backstop could be fired"
+        # Fired once the dispatched test polls: a wall-clock backstop can expire before the dispatch on a stalled loop.
+        ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    await turn
 
 
 def _make_prior_run_readable(monkeypatch: pytest.MonkeyPatch, workflow: Workflow) -> None:
@@ -799,10 +927,9 @@ async def test_hard_backstop_leaves_the_active_dispatched_test_to_its_worker(
     monkeypatch: pytest.MonkeyPatch, worker_outcome: str | None
 ) -> None:
     harness, owned, ctx, model = await _build_test_turn(monkeypatch, dispatch_to_worker=True)
-    _expire_turn_soon(monkeypatch)
 
     with pytest.raises(CopilotTotalTimeoutError):
-        await _run_build_test_turn(ctx, model)
+        await _run_build_test_turn_to_hard_backstop(ctx, model, owned)
     left_run_ids = _saved_left_run_ids(ctx)
     reported = await recorded_open_step_runs(ctx)
     await settle_cancelled_tools()
@@ -838,10 +965,9 @@ async def test_hard_backstop_still_cancels_a_test_it_cannot_leave_running(
     )
     if run != "on_chat_browser":
         install_secret_carrying_run_registry(monkeypatch, all_registered=run == "carries_registered_secrets")
-    _expire_turn_soon(monkeypatch)
 
     with pytest.raises(CopilotTotalTimeoutError):
-        await _run_build_test_turn(ctx, model)
+        await _run_build_test_turn_to_hard_backstop(ctx, model, owned)
     left_run_ids = _saved_left_run_ids(ctx)
     reported = await recorded_open_step_runs(ctx)
     await settle_cancelled_tools()
@@ -873,11 +999,73 @@ async def test_stop_still_cancels_the_active_build_test(
     with pytest.raises(asyncio.CancelledError):
         await turn
     left_run_ids = _saved_left_run_ids(ctx)
+    saved = agent_module._build_cancelled_exit_result(ctx, None)
     await settle_cancelled_tools()
 
     assert left_run_ids == []
-    assert ctx.copilot_total_timeout_exceeded is (elapsed_at_stop >= 900)
+    assert saved.cancelled is True
+    assert saved.turn_outcome is not None
+    assert saved.turn_outcome.terminal_reason == CANCEL_TERMINAL_REASON
+    assert not saved.turn_outcome.budget_expired
     assert owned.cancel_writes == [OWNED_RUN_ID]
     assert owned.row.status == "canceled"
     assert harness["executor_cancelled"] is not dispatch_to_worker
     harness["clear"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_at_cut", [300.0, TOTAL_TIMEOUT_SECONDS + 50.0])
+async def test_a_model_call_cut_mid_turn_leaves_the_fallback_on_the_turns_clock(
+    monkeypatch: pytest.MonkeyPatch, seconds_at_cut: float
+) -> None:
+    offset = 0.0
+    attempts: list[dict[str, Any]] = []
+
+    def run_streamed(agent: Agent, **_kwargs: Any) -> MagicMock:
+        attempts.append({"model": str(agent.model), "tools": {tool.name for tool in agent.tools}})
+        return _result(json.dumps({"type": "REPLY", "user_response": "Here is where things stand."}))
+
+    async def stream_to_sse(_result: Any, _stream: Any, ctx: Any) -> None:
+        nonlocal offset
+        attempts[-1]["drained"] = ctx.budget_expiry_state.drain_active
+        attempts[-1]["allowance"] = ctx.model_stream_deadline.when() - asyncio.get_running_loop().time()
+        if len(attempts) == 1:
+            offset = seconds_at_cut
+            raise LiteLLMTimeout("Copilot model stream made no progress", model="m", llm_provider="anthropic")
+
+    stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset)
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", run_streamed)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", stream_to_sse)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="build it",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(fallback_llm_key="SECONDARY"),
+    )
+
+    budget_spent = seconds_at_cut >= TOTAL_TIMEOUT_SECONDS
+    (_, fallback) = attempts
+    assert fallback["model"] == "model-SECONDARY"
+    assert fallback["drained"] is budget_spent
+    assert ("update_workflow" in fallback["tools"]) is not budget_spent
+    assert fallback["allowance"] < TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - seconds_at_cut + 5
+    assert result.user_response == "Here is where things stand."
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.budget_expired is budget_spent

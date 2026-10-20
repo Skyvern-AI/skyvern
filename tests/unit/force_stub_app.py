@@ -68,6 +68,8 @@ def create_forge_stub_app() -> ForgeApp:
     # would otherwise auto-mock it as an (awaitable) AsyncMock, breaking sync callers.
     fake_app_module.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
     fake_app_module.PERSISTENT_SESSIONS_MANAGER = _LazyNamespace()
+    # A synchronous capability check; auto-mocked, its un-awaited coroutine leaks into later tests.
+    fake_app_module.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)
     fake_app_module.ARTIFACT_MANAGER = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
@@ -82,6 +84,11 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.accessible_workflow_folder_ids = base_agent_function.accessible_workflow_folder_ids
+    fake_app_module.AGENT_FUNCTION.hidden_workflow_permanent_ids = base_agent_function.hidden_workflow_permanent_ids
+    fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
+    fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
+    fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
@@ -102,12 +109,16 @@ def create_forge_stub_app() -> ForgeApp:
     # Advisory scanner hook — _LazyNamespace would auto-mock this as an AsyncMock returning a
     # non-iterable MagicMock, silently exercising the fail-open path instead of the OSS no-op.
     fake_app_module.AGENT_FUNCTION.scan_code_block_source = AsyncMock(return_value=[])
+    # An AsyncMock would hand the create route's `async with` a coroutine. Match the OSS no-op.
+    fake_app_module.AGENT_FUNCTION.browser_session_create_admission = MagicMock(return_value=nullcontext())
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.allow_copilot_inline_code_execution = MagicMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy

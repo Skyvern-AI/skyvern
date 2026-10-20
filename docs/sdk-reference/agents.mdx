@@ -55,30 +55,135 @@ skyvern.runWorkflow(request: RunWorkflowOptions): Promise<WorkflowRunResponse>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_id` | `agent_id` | `str` | Yes | — | ID of the agent (`wpid_…`). |
-| `parameters` | `parameters` | `dict[str, Any] \| None` | No | `None` | Parameters to pass to the workflow |
-| `template` | `template` | `bool \| None` | No | `None` |  |
-| `title` | `title` | `str \| None` | No | `None` | The title for this workflow run |
-| `proxy_location` | `proxy_location` | `ProxyLocationInput` | No | `None` | Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
-| `webhook_url` | `webhook_url` | `str \| None` | No | `None` | URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions. |
-| `totp_url` | `totp_url` | `str \| None` | No | `None` | URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details. |
-| `totp_identifier` | `totp_identifier` | `str \| None` | No | `None` | Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details. |
-| `browser_session_id` | `browser_session_id` | `str \| None` | No | `None` | ID of a Skyvern browser session to reuse, having it continue from the current screen state |
-| `max_steps_override` | `x-max-steps-override` | `int \| None` | No | `None` | Override the agent's maximum number of steps for this run. |
-| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
-| `browser_profile_id` | `browser_profile_id` | `str \| None` | No | `None` | ID of a browser profile to reuse for this workflow run |
-| `max_screenshot_scrolls` | `max_screenshot_scrolls` | `int \| None` | No | `None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. |
-| `max_elapsed_time_minutes` | `max_elapsed_time_minutes` | `int \| None` | No | `None` | Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes. |
-| `extra_http_headers` | `extra_http_headers` | `dict[str, str] \| None` | No | `None` | The extra HTTP headers for the requests in browser. |
-| `browser_address` | `browser_address` | `str \| None` | No | `None` | The CDP address for the workflow run. |
-| `ai_fallback` | `ai_fallback` | `bool \| None` | No | `None` | Whether to fallback to AI if the workflow run fails. |
-| `run_with` | `run_with` | `str \| None` | No | `None` | Whether to run the workflow with agent or code. Null inherits from the workflow setting. |
-| `run_metadata` | `run_metadata` | `dict[str, str] \| None` | No | `None` | String key/value metadata to attach to this workflow run for analytics tag filtering. |
-| `wait_for_completion` | `waitForCompletion` | `bool` | No | `False` | Wait for the run to reach a final status before returning. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time to wait for completion, in seconds. |
-| — | `cdp_connect_headers` | `Record<string, string \| undefined>` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites. |
+<ParamField path={"workflow_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `agent_id`
+</ParamField>
+
+<ParamField path={"parameters"} type={"dict[str, Any] | None"}>
+Parameters to pass to the workflow
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"template"} type={"bool | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+The title for this workflow run
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+ID of a Skyvern browser session to reuse, having it continue from the current screen state
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_steps_override"} type={"int | None"}>
+Override the agent's maximum number of steps for this run.
+
+Default: `None` · TypeScript: `x-max-steps-override`
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+User-Agent string the browser sends.
+
+Default: `None` · TypeScript: `x-user-agent`
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+ID of a browser profile to reuse for this workflow run
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolls"} type={"int | None"}>
+The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_elapsed_time_minutes"} type={"int | None"}>
+Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+The extra HTTP headers for the requests in browser.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the workflow run.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"ai_fallback"} type={"bool | None"}>
+Whether to fallback to AI if the workflow run fails.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"run_with"} type={"str | None"}>
+Whether to run the workflow with agent or code. Null inherits from the workflow setting.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"run_metadata"} type={"dict[str, str] | None"}>
+String key/value metadata to attach to this workflow run for analytics tag filtering.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"wait_for_completion"} type={"bool"}>
+Wait for the run to reach a final status before returning.
+
+Default: `False` · TypeScript: `waitForCompletion`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for completion, in seconds.
+
+Default: `1800`
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"Record<string, string | undefined>"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
+
+TypeScript only
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
 
@@ -163,11 +268,23 @@ skyvern.retryWorkflowRun(workflowRunId: string, request?: RetryWorkflowRunReques
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_run_id` | `workflowRunId` | `str` | Yes | — | The id of the workflow run to retry. |
-| `max_steps_override` | `x-max-steps-override` | `int \| None` | No | `None` | Override the agent's maximum number of steps for this run. |
-| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
+<ParamField path={"workflow_run_id"} type={"str"} required>
+The id of the workflow run to retry.
+
+TypeScript: `workflowRunId`
+</ParamField>
+
+<ParamField path={"max_steps_override"} type={"int | None"}>
+Override the agent's maximum number of steps for this run.
+
+Default: `None` · TypeScript: `x-max-steps-override`
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+User-Agent string the browser sends.
+
+Default: `None` · TypeScript: `x-user-agent`
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
 
@@ -252,12 +369,27 @@ skyvern.createWorkflow(request: CreateWorkflowRequest): Promise<Workflow>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `folder_id` | `folder_id` | `str \| None` | No | `None` | Optional folder ID to assign the workflow to |
-| `json_definition` | `body.json_definition` | `WorkflowCreateYamlRequest \| None` | No | — | Workflow definition in JSON format |
-| `yaml_definition` | `body.yaml_definition` | `str \| None` | No | — | Workflow definition in YAML format |
-| — | `body` | `WorkflowRequest` | No | — | TypeScript only. |
+<ParamField path={"folder_id"} type={"str | None"}>
+Optional folder ID to assign the workflow to
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"json_definition"} type={"WorkflowCreateYamlRequest | None"}>
+Workflow definition in JSON format
+
+Sent only when you pass it · TypeScript: `body.json_definition`
+</ParamField>
+
+<ParamField path={"yaml_definition"} type={"str | None"}>
+Workflow definition in YAML format
+
+Sent only when you pass it · TypeScript: `body.yaml_definition`
+</ParamField>
+
+<ParamField path={"body"} type={"WorkflowRequest"} required>
+TypeScript only
+</ParamField>
 
 **Returns** `Workflow` · TypeScript `Promise<Workflow>`
 
@@ -391,11 +523,19 @@ skyvern.getWorkflow(workflowPermanentId: string, request?: GetWorkflowRequest): 
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
-| `version` | `version` | `int \| None` | No | `None` |  |
-| `template` | `template` | `bool \| None` | No | `None` |  |
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"version"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"template"} type={"bool | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `Workflow` · TypeScript `Promise<Workflow>`
 
@@ -512,19 +652,57 @@ skyvern.getWorkflows(request?: GetWorkflowsRequest): Promise<Workflow[]>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | `page` | `int \| None` | No | `None` |  |
-| `page_size` | `page_size` | `int \| None` | No | `None` |  |
-| `only_saved_tasks` | `only_saved_tasks` | `bool \| None` | No | `None` |  |
-| `only_workflows` | `only_workflows` | `bool \| None` | No | `None` |  |
-| `only_templates` | `only_templates` | `bool \| None` | No | `None` |  |
-| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter. |
-| `title` | `title` | `str \| None` | No | `None` | Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided. |
-| `folder_id` | `folder_id` | `str \| None` | No | `None` | Filter workflows by folder ID |
-| `status` | `status` | `WorkflowStatus \| Sequence[WorkflowStatus] \| None` | No | `None` |  |
-| `tags` | `tags` | `str \| Sequence[str] \| None` | No | `None` | Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -&gt; customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`. |
-| `template` | `template` | `bool \| None` | No | `None` |  |
+<ParamField path={"page"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"only_saved_tasks"} type={"bool | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"only_workflows"} type={"bool | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"only_templates"} type={"bool | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"search_key"} type={"str | None"}>
+Case-insensitive substring search across: workflow title, folder name, and parameter metadata (key, description, default_value). A workflow is returned if any of these fields match. Soft-deleted parameter definitions are excluded. Takes precedence over the deprecated `title` parameter.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+Deprecated: use search_key instead. Falls back to title-only search if search_key is not provided.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"folder_id"} type={"str | None"}>
+Filter workflows by folder ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"status"} type={"WorkflowStatus | Sequence[WorkflowStatus] | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"tags"} type={"str | Sequence[str] | None"}>
+Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -&gt; customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"template"} type={"bool | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `list[Workflow]` · TypeScript `Promise<Workflow[]>`
 
@@ -625,10 +803,15 @@ skyvern.getWorkflowVersions(workflowPermanentId: string, request?: GetWorkflowVe
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_permanent_id` | `workflowPermanentId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
-| `template` | `template` | `bool \| None` | No | `None` |  |
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"template"} type={"bool | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `list[Workflow]` · TypeScript `Promise<Workflow[]>`
 
@@ -730,11 +913,23 @@ skyvern.updateWorkflow(workflowId: string, request: WorkflowRequest): Promise<Wo
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_id` | `workflowId` | `str` | Yes | — | The ID of the agent to update. Starts with `wpid_`. |
-| `json_definition` | `json_definition` | `WorkflowCreateYamlRequest \| None` | No | — | Workflow definition in JSON format |
-| `yaml_definition` | `yaml_definition` | `str \| None` | No | — | Workflow definition in YAML format |
+<ParamField path={"workflow_id"} type={"str"} required>
+The ID of the agent to update. Starts with `wpid_`.
+
+TypeScript: `workflowId`
+</ParamField>
+
+<ParamField path={"json_definition"} type={"WorkflowCreateYamlRequest | None"}>
+Workflow definition in JSON format
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"yaml_definition"} type={"str | None"}>
+Workflow definition in YAML format
+
+Sent only when you pass it
+</ParamField>
 
 **Returns** `Workflow` · TypeScript `Promise<Workflow>`
 
@@ -862,11 +1057,13 @@ skyvern.deleteWorkflow(workflowId: string): Promise<unknown>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_id` | `workflowId` | `str` | Yes | — | The ID of the agent to delete. Starts with `wpid_`. |
+<ParamField path={"workflow_id"} type={"str"} required>
+The ID of the agent to delete. Starts with `wpid_`.
 
-**Returns** `Any \| None` · TypeScript `Promise<unknown>`
+TypeScript: `workflowId`
+</ParamField>
+
+**Returns** `Any | None` · TypeScript `Promise<unknown>`
 
 **Example**
 
@@ -947,13 +1144,35 @@ skyvern.getWorkflowRuns(request?: GetWorkflowRunsRequest): Promise<WorkflowRun[]
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | `page` | `int \| None` | No | `None` | Page number for pagination. |
-| `page_size` | `page_size` | `int \| None` | No | `None` | Number of runs to return per page. |
-| `status` | `status` | `WorkflowRunStatus \| Sequence[WorkflowRunStatus] \| None` | No | `None` | Filter by one or more run statuses. |
-| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. |
-| `error_code` | `error_code` | `str \| None` | No | `None` | Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. |
+<ParamField path={"page"} type={"int | None"}>
+Page number for pagination.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Number of runs to return per page.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"status"} type={"WorkflowRunStatus | Sequence[WorkflowRunStatus] | None"}>
+Filter by one or more run statuses.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"search_key"} type={"str | None"}>
+Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code"} type={"str | None"}>
+Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+Default: `None`
+</ParamField>
 
 **Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`
 
@@ -1069,16 +1288,53 @@ skyvern.getWorkflowRunsById(workflowId: string, request?: GetWorkflowRunsByIdReq
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_id` | `workflowId` | `str` | Yes | — | ID of the agent (`wpid_…`). |
-| `page` | `page` | `int \| None` | No | `None` | Page number for pagination. |
-| `page_size` | `page_size` | `int \| None` | No | `None` | Number of runs to return per page. |
-| `status` | `status` | `WorkflowRunStatus \| Sequence[WorkflowRunStatus] \| None` | No | `None` | Filter by one or more run statuses. |
-| `search_key` | `search_key` | `str \| None` | No | `None` | Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. |
-| `error_code` | `error_code` | `str \| None` | No | `None` | Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution. |
-| `created_at_start` | `created_at_start` | `datetime \| None` | No | `None` | Only include runs created at or after this UTC timestamp (ISO 8601). |
-| `created_at_end` | `created_at_end` | `datetime \| None` | No | `None` | Only include runs created strictly before this UTC timestamp (ISO 8601). |
+<ParamField path={"workflow_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowId`
+</ParamField>
+
+<ParamField path={"page"} type={"int | None"}>
+Page number for pagination.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Number of runs to return per page.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"status"} type={"WorkflowRunStatus | Sequence[WorkflowRunStatus] | None"}>
+Filter by one or more run statuses.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"search_key"} type={"str | None"}>
+Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code"} type={"str | None"}>
+Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"created_at_start"} type={"datetime | None"}>
+Only include runs created at or after this UTC timestamp (ISO 8601).
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"created_at_end"} type={"datetime | None"}>
+Only include runs created strictly before this UTC timestamp (ISO 8601).
+
+Default: `None`
+</ParamField>
 
 **Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`
 

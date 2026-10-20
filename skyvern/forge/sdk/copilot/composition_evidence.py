@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
@@ -84,8 +84,9 @@ _MAX_VISIBLE_CONTROLS = 6
 _MAX_CLICKABLE_CONTROLS = 12
 _MAX_DISCLOSURE_CONTROL_ID_CHARS = 120
 _POINTER_AT_CENTER_STATES = frozenset({"reaches_control", "reaches_other_element", "not_measured"})
-_CANDIDATE_COUNT_KEYS: frozenset[str] = frozenset({"match_count", "visible_match_count"})
-_AUTHORING_FACT_KEYS: frozenset[str] = frozenset({"pointer_at_center", "element_at_center", "visible_match_count"})
+CANDIDATE_COUNT_KEYS: frozenset[str] = frozenset({"match_count", "visible_match_count", "first_match_visible"})
+POINTER_FACT_KEYS: frozenset[str] = frozenset({"pointer_at_center", "element_at_center"})
+_AUTHORING_FACT_KEYS: frozenset[str] = POINTER_FACT_KEYS | {"visible_match_count", "first_match_visible"}
 _MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
 _MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
 _RENDERED_STYLE_SNAPSHOT_ATTR = "data-page-evidence-rendered-style"
@@ -2230,30 +2231,31 @@ def _label_anchor_candidate(carrier: Any, label_node: Any, label: str) -> Scoute
     else:
         return None
     base = _shape_selector(anchor)
-    label_shape = _shape_selector(label_node)
     inner = "" if anchor is carrier else _shape_selector(carrier)
-    selector = f'{base}:has({label_shape}:text-is("{_css_attr(label)}"))' + (f" {inner}" if inner else "")
-    if len(selector) > _MAX_SELECTOR_CHARS:
-        return None
     base_ids = {id(node) for node in _selector_matches(carrier, base) or []}
-    anchor_ids = {
-        id(parent)
-        for node in _selector_matches(carrier, label_shape) or []
-        if label in _own_text_runs(node)
-        for parent in node.parents
-        if id(parent) in base_ids
-    }
-    if inner:
-        matched = [
-            node
-            for node in _selector_matches(carrier, inner) or []
-            if any(id(parent) in anchor_ids for parent in node.parents)
-        ]
-    else:
-        matched = [node for node in _selector_matches(carrier, base) or [] if id(node) in anchor_ids]
-    if len(matched) != 1 or matched[0] is not carrier:
-        return None
-    return {"selector": selector, "source": "text_anchor", "match_count": 1}
+    # Mirror of the page side: the label's classes are named only where its bare tag is ambiguous.
+    for label_shape in dict.fromkeys((str(label_node.name or "*").lower(), _shape_selector(label_node))):
+        selector = f'{base}:has({label_shape}:text-is("{_css_attr(label)}"))' + (f" {inner}" if inner else "")
+        if len(selector) > _MAX_SELECTOR_CHARS:
+            continue
+        anchor_ids = {
+            id(parent)
+            for node in _selector_matches(carrier, label_shape) or []
+            if label in _own_text_runs(node)
+            for parent in node.parents
+            if id(parent) in base_ids
+        }
+        if inner:
+            matched = [
+                node
+                for node in _selector_matches(carrier, inner) or []
+                if any(id(parent) in anchor_ids for parent in node.parents)
+            ]
+        else:
+            matched = [node for node in _selector_matches(carrier, base) or [] if id(node) in anchor_ids]
+        if len(matched) == 1 and matched[0] is carrier:
+            return {"selector": selector, "source": "text_anchor", "match_count": 1}
+    return None
 
 
 def _relation_selector_candidates(carrier: Any, key_text: str, label_node: Any) -> list[ScoutedSelectorCandidate]:
@@ -3439,6 +3441,9 @@ def _structured_selector_candidates(value: Any) -> list[ScoutedSelectorCandidate
             and 0 <= visible_count <= match_count
         ):
             candidate["visible_match_count"] = visible_count
+            first_visible = item.get("first_match_visible")
+            if isinstance(first_visible, bool) and match_count > 1:
+                candidate["first_match_visible"] = first_visible
         candidates.append(candidate)
     return candidates
 
@@ -3470,15 +3475,10 @@ def _attach_node_evidence(entry: dict[str, Any], node: dict[str, Any]) -> dict[s
 
 
 def model_visible_composition_evidence(evidence: dict[str, Any], *, authoring_facts: bool = False) -> dict[str, Any]:
-    """Project stored page evidence into factual model input without a preferred locator.
-
-    Capture keeps singular CSS selectors for internal measurement, binding, and execution joins.
-    At this model boundary every singular selector alias and its count are removed, including
-    key/value relations that do not carry candidate packets. Candidate selectors and all unrelated
-    facts retain their original order and values. `authoring_facts` also keeps a control's
-    `pointer_at_center` and `element_at_center` and, on a candidate whose visible matches were measured, `match_count`
-    when it is not 1 and `visible_match_count` when fewer of those matches are visible.
-    """
+    """Capture keeps singular selectors for measurement, binding and execution joins, so this model boundary drops
+    every singular alias and its count while candidate selectors and other facts keep their order and values.
+    `authoring_facts` also keeps pointer facts and a measured candidate's `match_count` when not 1, plus
+    `visible_match_count` and `first_match_visible` when some of its matches are hidden."""
 
     # `expression` embeds a singular selector, its match count and its index in one string, so
     # dropping only the scalar aliases would let the same facts cross as prose.
@@ -3494,7 +3494,7 @@ def model_visible_composition_evidence(evidence: dict[str, Any], *, authoring_fa
     }
 
     def project_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
-        projected = {key: project(value) for key, value in candidate.items() if key not in _CANDIDATE_COUNT_KEYS}
+        projected = {key: project(value) for key, value in candidate.items() if key not in CANDIDATE_COUNT_KEYS}
         match_count = candidate.get("match_count")
         visible_count = candidate.get("visible_match_count")
         # A total without its measured visible count would read as every match being visible.
@@ -3504,6 +3504,8 @@ def model_visible_composition_evidence(evidence: dict[str, Any], *, authoring_fa
             projected["match_count"] = match_count
         if visible_count < match_count:
             projected["visible_match_count"] = visible_count
+            if isinstance(candidate.get("first_match_visible"), bool):
+                projected["first_match_visible"] = candidate["first_match_visible"]
         return projected
 
     def project(value: Any) -> Any:
@@ -3527,17 +3529,52 @@ def model_visible_composition_evidence(evidence: dict[str, Any], *, authoring_fa
     return project(evidence)
 
 
-def without_authoring_facts(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy of stored page evidence with no pointer facts and no candidate `visible_match_count`."""
+def without_authoring_facts(evidence: Mapping[str, Any], keys: frozenset[str] = _AUTHORING_FACT_KEYS) -> dict[str, Any]:
+    """Copy of stored page evidence without `keys`: by default every pointer fact and candidate visibility fact."""
 
     def strip(value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: strip(child) for key, child in value.items() if key not in _AUTHORING_FACT_KEYS}
+            return {key: strip(child) for key, child in value.items() if key not in keys}
         if isinstance(value, list):
             return [strip(child) for child in value]
         return value
 
-    return {key: strip(child) for key, child in evidence.items() if key not in _AUTHORING_FACT_KEYS}
+    return {key: strip(child) for key, child in evidence.items() if key not in keys}
+
+
+def _has_hidden_first_match(value: Any) -> bool:
+    if isinstance(value, dict):
+        return value.get("first_match_visible") is False or any(_has_hidden_first_match(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_hidden_first_match(child) for child in value)
+    return False
+
+
+def _hidden_first_counts_only(value: Any) -> Any:
+    if isinstance(value, dict):
+        keep = value.get("first_match_visible") is False
+        return {
+            key: _hidden_first_counts_only(child)
+            for key, child in value.items()
+            if key not in POINTER_FACT_KEYS and (keep or key not in CANDIDATE_COUNT_KEYS)
+        }
+    if isinstance(value, list):
+        return [_hidden_first_counts_only(child) for child in value]
+    return value
+
+
+def fit_authoring_facts(
+    projected: dict[str, Any], bare: dict[str, Any], fits: Callable[[dict[str, Any]], bool]
+) -> dict[str, Any]:
+    """`projected` if it fits, else `bare` with the counts of each value-relation candidate whose first match is
+    hidden, so a read's own hidden copy stays visible while the rest of the packet is exactly the fallback."""
+    if fits(projected):
+        return projected
+    relations = projected.get("key_value_relations")
+    if not _has_hidden_first_match(relations):
+        return bare
+    read_counts = {**bare, "key_value_relations": _hidden_first_counts_only(relations)}
+    return bare if not fits(read_counts) and fits(bare) else read_counts
 
 
 def _attach_pointer_at_center(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:

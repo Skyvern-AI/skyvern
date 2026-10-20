@@ -205,6 +205,10 @@ See [Anti-bot and CAPTCHA](/developers/production#anti-bot-and-captcha). In shor
 **Fix:** retry after a few seconds. On self-hosted servers, check CPU and memory. If it persists, contact support with the session or run IDs.
 </Accordion>
 
+<Accordion title="429 when creating a browser session">
+**Fix:** your organization has reached its limit on sessions starting at the same time. Wait the number of seconds in the `Retry-After` header, then create again, or spread a large batch over a few minutes. See [Browser sessions](/browsers#browser-sessions).
+</Accordion>
+
 <Accordion title="Webhook never arrived">
 **Fix:** call `get_run`, since the result is stored either way. Then fix the endpoint and call `retry_run_webhook`. See [Retries and replay](/developers/production#retries-and-replay).
 </Accordion>

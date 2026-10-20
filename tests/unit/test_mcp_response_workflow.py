@@ -287,6 +287,73 @@ async def test_workflow_status_full_over_cap_keeps_existing_summary_degradation(
     assert "_truncated" not in result
 
 
+_DOWNLOADED_PDF = {
+    "url": "https://artifacts.skyvern.example/wr_bytes/statement.pdf?signature=abc123",
+    "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "filename": "statement.pdf",
+    "file_size": 102_400,
+}
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_full_over_byte_cap_keeps_the_run_and_its_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Typographic punctuation in extracted prose costs one character and three
+    # UTF-8 bytes, so this run clears the character cap but not the byte cap.
+    run = {
+        "workflow_run_id": "wr_bytes",
+        "workflow_id": "wpid_bytes",
+        "status": "completed",
+        "downloaded_files": [_DOWNLOADED_PDF],
+        "outputs": {"extracted_information": "—" * 60_000},
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=run))
+
+    tool = await mcp.get_tool("skyvern_workflow_status")
+    result = await tool.fn(run_id="wr_bytes", verbosity="full")
+
+    assert result["ok"] is True
+    assert "_truncated" not in result
+    assert result["data"]["run_id"] == "wr_bytes"
+    assert result["data"]["status"] == "completed"
+    assert result["data"]["artifact_summary"]["downloaded_files"] == [
+        {
+            "url": _DOWNLOADED_PDF["url"],
+            "checksum": _DOWNLOADED_PDF["checksum"],
+            "filename": _DOWNLOADED_PDF["filename"],
+        }
+    ]
+    assert any("returning a reduced payload" in warning for warning in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_minimal_fallback_still_reaches_the_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The summary copies failure_reason verbatim, so an oversize reason drops the
+    # response to the last-resort payload.
+    run = {
+        "workflow_run_id": "wr_minimal",
+        "workflow_id": "wpid_minimal",
+        "status": "failed",
+        "failure_reason": "x" * (MCP_MAX_RESPONSE_CHARS + 1_000),
+        "downloaded_files": [_DOWNLOADED_PDF],
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=run))
+
+    tool = await mcp.get_tool("skyvern_workflow_status")
+    result = await tool.fn(run_id="wr_minimal", verbosity="full")
+
+    assert result["ok"] is True
+    assert "_truncated" not in result
+    assert result["data"]["run_id"] == "wr_minimal"
+    assert result["data"]["status"] == "failed"
+    assert result["data"]["artifact_summary"]["downloaded_file_count"] == 1
+    assert result["data"]["artifact_summary"]["downloaded_files"][0]["url"] == _DOWNLOADED_PDF["url"]
+    assert "failure_reason" not in result["data"]
+
+
 @pytest.mark.asyncio
 async def test_workflow_status_default_does_not_expand_backend_output(monkeypatch: pytest.MonkeyPatch) -> None:
     status = AsyncMock(

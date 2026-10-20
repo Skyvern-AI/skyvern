@@ -19,6 +19,9 @@ import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksM
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import {
   requestRecordingStart,
   useIsMountedRef,
@@ -40,6 +43,7 @@ import { SELECTED_RING_CLASSES } from "../selection/selectedRingClasses";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 import { findBranchContextForInsertion } from "../workflowInsertion";
+import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
 
 function EdgeWithAddButton({
   source,
@@ -66,6 +70,11 @@ function EdgeWithAddButton({
   });
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowStatePanel = useWorkflowPanelStore();
   const setRecordedBlocks = useRecordedBlocksStore(
@@ -159,6 +168,21 @@ function EdgeWithAddButton({
 
   const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
@@ -268,6 +292,7 @@ function EdgeWithAddButton({
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       isUploadingSOP={isUploadingSOP}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
     >
       {adder}
     </WorkflowAddMenu>

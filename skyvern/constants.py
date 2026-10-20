@@ -5,9 +5,12 @@ from pathlib import Path
 SKYVERN_ID_ATTR: str = "unique_id"
 
 # Values sent in the x-user-agent header by first-party Skyvern clients. Used to distinguish
-# UI- and MCP-triggered runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
+# UI-, MCP- and CLI-triggered runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
 SKYVERN_UI_USER_AGENT: str = "skyvern-ui"
 SKYVERN_MCP_USER_AGENT: str = "skyvern-mcp"
+SKYVERN_CLI_USER_AGENT: str = "skyvern-cli"
+# The CLI drives the same tools as the MCP server, so it gets the MCP's run treatment; only attribution tells them apart.
+SKYVERN_AGENT_USER_AGENTS: frozenset[str] = frozenset({SKYVERN_MCP_USER_AGENT, SKYVERN_CLI_USER_AGENT})
 
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent

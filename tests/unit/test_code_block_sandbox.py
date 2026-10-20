@@ -258,22 +258,64 @@ def datetime_facade_defects(namespace: SimpleNamespace, sandbox_builtins: Mappin
 # ---------------------------------------------------------------------------
 
 
-class TestIsSafeCodeRejectsImports:
-    def test_import_os(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import os")
+class TestIsSafeCodeImports:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import os",
+            "import subprocess",
+            "from os import system",
+            "import re, os",
+            "import datetime.timezone",
+            "from . import re",
+            "from re import *",
+            "from re import _compile",
+            "import re as __builtins__",
+            "from json import loads as __capture_locals",
+        ],
+    )
+    def test_rejects_imports_beyond_the_sandbox_modules(self, code: str) -> None:
+        with pytest.raises(InsecureCodeDetected, match="import|private"):
+            CodeBlock.is_safe_code(code)
 
-    def test_import_subprocess(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import subprocess")
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import asyncio",
+            "import re",
+            "import json as j",
+            "from datetime import date, timedelta",
+            "from html import escape",
+        ],
+    )
+    def test_admits_imports_of_the_sandbox_modules(self, code: str) -> None:
+        CodeBlock.is_safe_code(code)
 
-    def test_from_import(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("from os import system")
+    @pytest.mark.asyncio
+    async def test_an_admitted_import_binds_the_sandbox_shim(self) -> None:
+        code = """
+import re
+import json as j
+from datetime import date, timedelta
 
-    def test_import_asyncio(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import asyncio")
+def next_day():
+    import datetime
+    return datetime.date(2026, 1, 1) + timedelta(days=1)
+
+return [re.search("b", "abc").group(0), j.dumps([1]), date(2026, 1, 1).isoformat(), next_day().isoformat()]
+"""
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="imports_output",
+            output_parameter_id="op_imports",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="imports", code=code, output_parameter=output_parameter)
+        result = await block.generate_async_user_function(code, MagicMock(), parameters={"datetime": "param"})()
+        assert result == ["b", "[1]", "2026-01-01", "2026-01-02"]
 
 
 class TestIsSafeCodeRejectsDunderAccess:
@@ -3018,6 +3060,11 @@ class TestIsSafeCodeClassStatements:
 
     def test_script_path_keeps_metaclass_support(self) -> None:
         is_safe_script_code("class Weird(metaclass=type):\n    pass")
+
+    @pytest.mark.parametrize("code", ["import sys", "import asyncio\nvalue = asyncio.sys"])
+    def test_script_cannot_access_sys_module(self, code: str) -> None:
+        with pytest.raises(InsecureCodeDetected, match="sys"):
+            is_safe_script_code(code)
 
 
 class TestCodeBlockMagicLink:

@@ -383,7 +383,9 @@ async def fail_run_without_attempt_row(
             workflow_run = None
     if workflow_run is not None and need_call_webhook:
         try:
-            await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, claim_kind=None)
+            await app.WORKFLOW_SERVICE.execute_workflow_webhook(
+                workflow_run, api_key=api_key, claim_kind=None, finalizer="failed_before_execution"
+            )
         except Exception:
             LOG.warning(
                 "Failed to deliver workflow webhook after initialization failure",

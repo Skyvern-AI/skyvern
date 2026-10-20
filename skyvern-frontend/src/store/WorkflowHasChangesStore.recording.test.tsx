@@ -31,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   reflectYamlDraftDirtiness,
+  SaveRefusedError,
   useWorkflowHasChangesStore,
   useWorkflowSave,
   usePendingWorkflowSaveRecovery,
@@ -1642,9 +1643,11 @@ describe("workflow recording attachment", () => {
       }
       const { result } = renderHook(() => useWorkflowSave(), { wrapper });
 
-      await expect(
-        act(async () => result.current.mutateAsync(undefined)),
-      ).rejects.toThrow("Finish the current authoring action before saving");
+      const refused = act(async () => result.current.mutateAsync(undefined));
+      await expect(refused).rejects.toBeInstanceOf(SaveRefusedError);
+      await expect(refused).rejects.toThrow(
+        "Finish the current authoring action before saving",
+      );
       expect(mocks.put).not.toHaveBeenCalled();
       expect(mocks.delete).not.toHaveBeenCalled();
       expect(useWorkflowHasChangesStore.getState()).toMatchObject({

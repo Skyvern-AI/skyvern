@@ -392,6 +392,11 @@ class WorkflowCopilotChatMessage(BaseModel):
     modified_at: datetime = Field(..., description="When the message was last modified")
 
 
+class WorkflowCopilotDemonstrationInsertion(BaseModel):
+    after_label: str | None = Field(default=None, max_length=200)
+    before_label: str | None = Field(default=None, max_length=200)
+
+
 class WorkflowCopilotChatRequest(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
@@ -494,14 +499,20 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording", "demonstrate"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
             "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
-            "'refine_recording' infers a reusable workflow from recording_evidence."
+            "'refine_recording' infers a reusable workflow from recording_evidence. "
+            "'demonstrate' replays a completed browser demonstration before the first model call."
         ),
+    )
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    demonstration_insertion: WorkflowCopilotDemonstrationInsertion | None = Field(
+        None,
+        description="Optional placement bounds for blocks authored after a demonstration.",
     )
     recording_evidence: RecordingEvidencePacket | None = Field(
         None,
@@ -578,6 +589,37 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
         ),
     )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotDemonstrationControlRequest(BaseModel):
+    demonstration_id: str = Field(max_length=64)
+    action: Literal["navigate", "fill_credential", "stop", "cancel"]
+    url: str | None = Field(default=None, max_length=2048)
+    selector: str | None = Field(default=None, max_length=2000)
+    credential_id: str | None = Field(default=None, max_length=128)
+    field: Literal["password", "totp"] | None = None
+
+
+class WorkflowCopilotDemonstrationControlResult(BaseModel):
+    seq: int
+    action_count: int | None = None
+
+
+class WorkflowCopilotDemonstrationRecordRequest(BaseModel):
+    workflow_permanent_id: str = Field(max_length=128)
+    browser_session_id: str = Field(max_length=128)
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
+
+
+class WorkflowCopilotDemonstrationActiveResult(BaseModel):
+    demonstration_id: str
+    status: Literal["recording", "stopping", "stopped"]
+    action_count: int
+    action_labels: list[str]
+    can_fill_credentials: bool
+    can_resume: bool
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
 
 
 class WorkflowCopilotCredentialGenerateRequest(BaseModel):

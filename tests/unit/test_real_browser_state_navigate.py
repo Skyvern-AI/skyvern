@@ -4,6 +4,7 @@ Covers SKY-8818: pages whose subresources never finish loading must still
 succeed if the DOM has parsed, via progressive wait_until degradation.
 """
 
+import asyncio
 import socket
 import threading
 from functools import partial
@@ -17,7 +18,10 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedNavigationDestination, FailedToNavigateToUrl
 from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye import real_browser_state
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.navigation import navigate_with_retry
 from skyvern.webeye.real_browser_state import RealBrowserState, _same_page_ignoring_fragment
 
@@ -43,6 +47,15 @@ def _instant_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+
+def _navigation_interceptor(proxy_auth_configured: bool) -> CDPDownloadInterceptor:
+    return CDPDownloadInterceptor(
+        proxy_username="user" if proxy_auth_configured else None,
+        proxy_password="password" if proxy_auth_configured else None,
+        network_egress_monitor=MagicMock(),
+        redirect_hop_authorizer=MagicMock(),
+    )
 
 
 def test_same_page_ignoring_fragment_matches_fragment_only_differences() -> None:
@@ -388,3 +401,192 @@ async def test_navigate_to_url_succeeds_on_first_try_with_default_load(
     )
 
     assert calls == ["load"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_assigned", "proxy_auth_configured", "challenge_sources", "expected_reports"),
+    [
+        (True, True, None, 1),
+        (True, True, ("Proxy",), 0),
+        (True, True, ("Proxy", "Proxy"), 1),
+        (True, True, ("Proxy", "Server"), 0),
+        (True, True, ("Server",), 0),
+        (True, False, None, 0),
+        (False, True, ("Proxy", "Proxy"), 0),
+    ],
+)
+async def test_navigation_failure_is_reported_only_for_authenticated_server_assigned_address(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+    server_assigned: bool,
+    proxy_auth_configured: bool,
+    challenge_sources: tuple[str, ...] | None,
+    expected_reports: int,
+) -> None:
+    """Count proxy rejections or missing challenges, not successful proxy or target-site auth."""
+    report = AsyncMock()
+    monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "record_server_assigned_address_navigation_failure", report)
+    browser_state._browser_address = "http://10.0.36.234:9225"
+    interceptor = _navigation_interceptor(proxy_auth_configured)
+    browser_state._browser_context = SimpleNamespace(
+        _skyvern_cdp_download_interceptor=interceptor,
+    )
+    browser_state.begin_navigation()
+    if challenge_sources is not None:
+        cdp_session = MagicMock()
+        cdp_session.send = AsyncMock()
+        for source in challenge_sources:
+            await interceptor._handle_auth_required(
+                {
+                    "requestId": f"request-{source}",
+                    "authChallenge": {"source": source},
+                    "request": {"url": "https://example.test/"},
+                },
+                cdp_session,
+            )
+    skyvern_context.set(
+        SkyvernContext(
+            workflow_run_id="wr_1",
+            task_id="task_1",
+            workflow_permanent_id="workflow_1",
+            browser_address_is_server_assigned=server_assigned,
+        ),
+    )
+    try:
+        await browser_state.record_navigation_result(
+            FailedToNavigateToUrl(
+                url="https://example.test/",
+                error_message="Page.goto: net::ERR_INVALID_AUTH_CREDENTIALS at https://example.test/",
+                nav_error_code="net::ERR_INVALID_AUTH_CREDENTIALS",
+            )
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert report.await_count == expected_reports
+    if expected_reports:
+        assert report.await_args.kwargs == {
+            "browser_address": "http://10.0.36.234:9225",
+            "nav_error_code": "net::ERR_INVALID_AUTH_CREDENTIALS",
+            "run_id": "wr_1",
+            "workflow_permanent_id": "workflow_1",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_auth_configured", [True, False])
+async def test_success_clears_strikes_only_for_authenticated_server_assigned_address(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_auth_configured: bool,
+) -> None:
+    report = AsyncMock()
+    monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "record_server_assigned_address_navigation_success", report)
+    browser_state._browser_address = "http://10.0.36.234:9225"
+    interceptor = _navigation_interceptor(proxy_auth_configured)
+    browser_state._browser_context = SimpleNamespace(
+        _skyvern_cdp_download_interceptor=interceptor,
+    )
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_1", browser_address_is_server_assigned=True))
+    try:
+        await browser_state.record_navigation_result(None, url="https://example.test/")
+    finally:
+        skyvern_context.reset()
+
+    if proxy_auth_configured:
+        report.assert_awaited_once_with(browser_address="http://10.0.36.234:9225", run_id="wr_1")
+    else:
+        report.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", ["about:blank", "", "  "])
+async def test_non_network_success_does_not_clear_strikes(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+) -> None:
+    report = AsyncMock()
+    monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "record_server_assigned_address_navigation_success", report)
+    browser_state._browser_address = "http://10.0.36.234:9225"
+    browser_state._browser_context = SimpleNamespace(
+        _skyvern_cdp_download_interceptor=_navigation_interceptor(proxy_auth_configured=True),
+    )
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_1", browser_address_is_server_assigned=True))
+    try:
+        await browser_state.record_navigation_result(None, url=url)
+    finally:
+        skyvern_context.reset()
+
+    report.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_navigation_result_report_is_bounded(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_report(**_: object) -> None:
+        await asyncio.sleep(10)
+
+    report = AsyncMock(side_effect=slow_report)
+    monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "record_server_assigned_address_navigation_success", report)
+    monkeypatch.setattr(real_browser_state, "BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS", 0.01)
+    browser_state._browser_address = "http://10.0.36.234:9225"
+    browser_state._browser_context = SimpleNamespace(
+        _skyvern_cdp_download_interceptor=_navigation_interceptor(proxy_auth_configured=True),
+    )
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_1", browser_address_is_server_assigned=True))
+    try:
+        await browser_state.record_navigation_result(None, url="https://example.test/")
+    finally:
+        skyvern_context.reset()
+
+    report.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deferred_navigation_keeps_server_address_and_workflow_identity(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = MagicMock()
+    monkeypatch.setattr(browser_state, "get_working_page", AsyncMock(return_value=page))
+
+    result = await browser_state.get_or_create_page(
+        browser_address="http://10.0.36.234:9225",
+        task_id="task_1",
+        navigation_run_id="wr_1",
+    )
+
+    assert result is page
+    assert browser_state._browser_address == "http://10.0.36.234:9225"
+    assert browser_state._navigation_run_id == "wr_1"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_report_does_not_change_how_the_run_fails(
+    browser_state: RealBrowserState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module.app.AGENT_FUNCTION,
+        "record_server_assigned_address_navigation_failure",
+        AsyncMock(side_effect=RuntimeError("redis is down")),
+    )
+    browser_state._browser_address = "http://10.0.36.234:9225"
+    browser_state._browser_context = SimpleNamespace(
+        _skyvern_cdp_download_interceptor=_navigation_interceptor(proxy_auth_configured=True),
+    )
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_1", browser_address_is_server_assigned=True))
+    try:
+        await browser_state.record_navigation_result(
+            FailedToNavigateToUrl(
+                url="https://example.test/",
+                error_message="Page.goto: net::ERR_INVALID_AUTH_CREDENTIALS",
+                nav_error_code="net::ERR_INVALID_AUTH_CREDENTIALS",
+            )
+        )
+    finally:
+        skyvern_context.reset()

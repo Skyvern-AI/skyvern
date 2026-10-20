@@ -21,7 +21,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from html import escape as html_escape
 from pathlib import Path
@@ -32,12 +32,12 @@ from urllib.parse import urlparse
 
 import pyotp
 import pytest
-
-# Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
-# delay-specific test can exercise the real function while other upload tests skip the sleep.
+import pytest_asyncio
+from playwright.async_api import Browser, BrowserContext
 from playwright.async_api import Error as _PlaywrightError
-from playwright.async_api import Frame, Page, Route
+from playwright.async_api import Frame, Page, Playwright, Route
 from playwright.async_api import TimeoutError as _PlaywrightTimeout
+from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
@@ -77,6 +77,9 @@ from skyvern.forge.taskv3.loop import (
     _navigate_record_fields,
 )
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
+
+# Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
+# delay-specific test can exercise the real function while other upload tests skip the sleep.
 from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
     _NO_QUESTION_MARKER,
@@ -196,10 +199,91 @@ def _has_playwright_browser() -> bool:
         return False
 
 
+_BROWSER_AVAILABLE = _has_playwright_browser()
+
 _skip_no_browser = pytest.mark.skipif(
-    not _has_playwright_browser(),
+    not _BROWSER_AVAILABLE,
     reason="Requires Playwright browsers installed (run: playwright install chromium)",
 )
+
+
+@pytest.fixture(scope="module")
+def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    # pytest-asyncio < 0.22: Playwright and every test must use this module's loop.
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+_shared_playwright: Playwright | None = None
+_shared_browser: Browser | None = None
+
+
+@pytest_asyncio.fixture(scope="module", autouse=True)
+async def _module_browser() -> AsyncIterator[None]:
+    # Imported by pre_submit_capture as well; pytest gives each module its own lifetime.
+    # Python-only runs still work when Chromium is absent, under the existing skip markers.
+    global _shared_playwright, _shared_browser
+    if not _BROWSER_AVAILABLE:
+        yield
+        return
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
+        _shared_playwright, _shared_browser = playwright, browser
+        try:
+            yield
+        finally:
+            try:
+                assert _shared_browser is not None
+                await _shared_browser.close()
+            finally:
+                _shared_playwright = _shared_browser = None
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _cleanup_test_tasks(_module_browser: None) -> AsyncIterator[None]:
+    # Keep the driver's module tasks, but do not carry a test's detached work into the next test.
+    before = asyncio.all_tasks()
+    try:
+        yield
+    finally:
+        pending = asyncio.all_tasks() - before - {asyncio.current_task()}
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+@contextlib.asynccontextmanager
+async def _page_context(extra_args: list[str] | None = None, **options: Any) -> AsyncIterator[BrowserContext]:
+    global _shared_browser
+    assert _shared_browser is not None and _shared_playwright is not None
+    browser = _shared_browser
+    if extra_args is not None:
+        # Flag-dependent tests get a dedicated browser; direct lifecycle launches stay separate too.
+        browser = await _shared_playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic", *extra_args]
+        )
+    elif not browser.is_connected():
+        # Recover for the next helper call without retrying the test that lost its browser.
+        browser = await _shared_playwright.chromium.launch(
+            headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
+        _shared_browser = browser
+    try:
+        context = await browser.new_context(**options)
+        try:
+            yield context
+        finally:
+            await context.close()
+    finally:
+        if extra_args is not None:
+            await browser.close()
 
 
 class _FakeRequest:
@@ -514,6 +598,13 @@ def short_action_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tools_module, "_ACTION_TIMEOUT_MS", 3000)
 
 
+@pytest.fixture
+def expected_action_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Static hidden/covered targets never become actionable. Only the resulting failure is tested.
+    # Fast-refusal tests keep production timeouts so an accidental wait cannot pass their ceiling.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 500)
+
+
 @pytest.mark.asyncio
 async def test_tool_set_and_no_task_ecosystem_tools() -> None:
     tools = build_browser_tools(_fixed_page_provider(_FakePage()))
@@ -703,9 +794,9 @@ async def test_observe_renders_group_context() -> None:
 
 @pytest.mark.asyncio
 async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)  # the typeahead probe polls; skip real waiting in tests
+    monkeypatch.setattr(
+        taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep)
+    )  # the typeahead probe polls; skip real waiting in tests
     page = _FakePage()
     tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
@@ -723,9 +814,7 @@ async def test_click_surfaces_page_transitioned_when_url_changes(monkeypatch: py
     # the shadow ledger can read a REAL page transition (H1 hard progress) instead of inferring one
     # from an invalid_fields rise. The URL delta is already computed for the tool's own note; this
     # only exposes it — no extra probe.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _FakePage()
 
     async def _click_navigates(selector: str, timeout: int | None = None) -> None:
@@ -744,9 +833,7 @@ async def test_click_reports_no_transition_when_url_unchanged(monkeypatch: pytes
     # A click that does not move the URL reports page_transitioned=False. This is the raw URL-delta
     # signal; only the POSITIVE (True) direction is acted on downstream (a URL change proves a
     # transition), because URL equality does not prove same-page. The tool still surfaces it faithfully.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _FakePage()
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "click").handler({"selector": "#submit"})
@@ -1382,6 +1469,7 @@ async def test_navigate_readiness_probe_cannot_hang_on_a_wedged_renderer(monkeyp
     # a synchronous script never answers it. RED before: the evaluate was unbounded, so this navigate
     # stayed pending past any ceiling it advertised.
     monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 10)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 10)
     page, tools = _readiness_tools(monkeypatch, "loading")
 
     async def _wedged(_js: str) -> str:
@@ -2445,13 +2533,35 @@ async def _instant_sleep(*_a: Any, **_k: Any) -> None:
     return None
 
 
+class _PollClockTime:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+def _advance_poll_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only for synchronous fake-page responses: retain each poll and its deadline accounting.
+    # Rebind tools.time, never time.monotonic or the event loop's clock process-wide.
+    clock = _PollClockTime()
+
+    async def sleep(seconds: float) -> None:
+        clock.now += seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=sleep))
+    monkeypatch.setattr(taskv3_tools, "time", clock)
+
+
 @pytest.mark.asyncio
 async def test_type_auto_commits_reacting_typeahead(monkeypatch: pytest.MonkeyPatch) -> None:
     # A plain `type` into a text field that REACTS with a suggestion list must commit the match itself
     # (the model does not reliably reach for select_combobox) and report the committed value.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text",
         suggestion={"text": "San Francisco, CA, USA", "score": 2},
@@ -2468,9 +2578,7 @@ async def test_type_auto_commits_reacting_typeahead(monkeypatch: pytest.MonkeyPa
 async def test_type_leaves_raw_text_when_no_suggestion_reacts(monkeypatch: pytest.MonkeyPatch) -> None:
     # Text field that does NOT react with a suggestion list is an ordinary field: keep the typed text,
     # do not click anything, do not error.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    _advance_poll_clock(monkeypatch)
     page = _TypeaheadFakePage(field_type="text", suggestion=None)
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#notes", "text": "Springfield"})
@@ -2635,7 +2743,7 @@ async def test_type_date_group_rejected_by_bijection_falls_back_to_todays_path(
 ) -> None:
     # A missing/duplicate/readonly segment must fail the bijection closed: the call falls through to
     # today's single-field path (which still truncates, but that is the existing, unchanged behavior).
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     page = _DateSegmentFakePage(group_probe={"ok": False, "reason": "missing", "targetLabel": "month"})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
@@ -2660,7 +2768,7 @@ class _PartialYearGroupPage(_DateSegmentFakePage):
 @pytest.mark.asyncio
 async def test_a_plain_path_one_segment_date_write_is_marked_on_its_line(monkeypatch: pytest.MonkeyPatch) -> None:
     # The plain path types a one-segment group with no Tab and no settle read-back, so its write line says so.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     page = _PartialYearGroupPage()
     with capture_logs() as logs:
         r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
@@ -2708,7 +2816,7 @@ async def test_type_leaves_the_other_segments_alone_when_one_is_addressed(
 async def test_type_ordinary_text_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
     # The cost invariant that survives admitting single components: the DOM probe runs only once the
     # text could be a date or one of its segments. Text that is neither must never pay for it.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     # The shapes that matter are the ones a date segment SHARES with an age, a quantity or a year in
     # a plain box. Text that could never be a segment proves nothing here -- it is refused by the
     # free regex before any probe is reachable.
@@ -2728,7 +2836,7 @@ async def test_type_segment_value_outside_its_range_falls_through(monkeypatch: p
     # The probe confirms the target is a MONTH segment, so "13" is not a month and nothing here can
     # make it one. Guessing (13 -> a clamped 12, or a reassignment to some other segment) would write
     # a value the caller never asked for, so the call falls through to the plain path untouched.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "13"})
@@ -2742,7 +2850,7 @@ async def test_type_non_ascii_digits_never_reach_a_date_segment(monkeypatch: pyt
     # `\d` matches every Unicode decimal digit and int() accepts them all, so a full-width year would
     # otherwise be typed verbatim and then read back as committed -- an `ok` on characters the form
     # rejects, which is the false-success class this path exists to remove.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     for label, text in (("year", "\uff12\uff10\uff12\uff16"), ("month", "\u0669")):
         page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": label})
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -2795,7 +2903,7 @@ async def test_type_date_single_digit_month_day_zero_pads_correctly(monkeypatch:
 async def test_type_date_separator_less_run_never_probes_date_segment_group(monkeypatch: pytest.MonkeyPatch) -> None:
     # A separator-less digit run can't be resolved to an arrangement at all (09182026 vs. 20260918),
     # so it never even reaches the DOM probe -- exactly like a month name or a single component.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09182026"})
@@ -2817,7 +2925,7 @@ async def test_type_date_out_of_range_after_assignment_still_falls_back(
     # decides whether a leading component over 12 is a bad month or a valid day. With no "order" on
     # the probe result (this fake's default), assignment defaults to month-first, so both of these
     # remain invalid after assignment and fall back to today's single-field path -- probed, not blind.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
+    _advance_poll_clock(monkeypatch)
     page = _DateSegmentFakePage(group_probe={"ok": True, "reason": None, "targetLabel": "month"})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": text})
@@ -2969,9 +3077,7 @@ async def test_type_date_dropped_segment_never_reads_back_as_filled(monkeypatch:
 
 @pytest.mark.asyncio
 async def test_select_combobox_commits_reacting_suggestion(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text", suggestion={"text": "San Francisco, CA, USA", "score": 2}, committed="San Francisco, CA, USA"
     )
@@ -3000,9 +3106,7 @@ async def test_select_combobox_logs_a_long_committed_row_as_the_requested_value(
 @pytest.mark.asyncio
 async def test_select_combobox_fails_loud_when_no_suggestion_reacts(monkeypatch: pytest.MonkeyPatch) -> None:
     # No suggestion overlaps the value => no false "filled": select_combobox must error, never claim success.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    _advance_poll_clock(monkeypatch)
     page = _TypeaheadFakePage(field_type="text", suggestion=None)
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
@@ -3016,9 +3120,7 @@ async def test_type_typeahead_that_remounts_after_commit_is_unverified_not_a_fal
     # INV-1: after the suggestion is clicked the field re-resolves to n!=1 (the widget remounted or
     # removed its input), so there is no stable element to read the commit off. That is ok-unverified —
     # a false "did not commit — NOT filled" would halt the batch on a field that may well have committed.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed=None, match_count=0
     )
@@ -3035,9 +3137,7 @@ async def test_select_combobox_that_remounts_after_commit_is_unverified_not_a_fa
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # INV-1 for the explicit-combobox consumer: same remount, same soft verdict — not a false hard error.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed=None, match_count=0
     )
@@ -3057,9 +3157,7 @@ async def test_type_readable_empty_field_is_a_hard_error_even_inside_a_component
     # so it did-not-commit (hard error), even when the reach probe would soften an UNREADABLE field in the
     # same component. Guards the split — collapsing "read empty" into "unreadable" would soften a rejected
     # required field to ok-unverified and let a batch proceed on an empty field.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=1, reach="component"
     )
@@ -3078,9 +3176,7 @@ async def test_type_readable_empty_field_that_re_resolves_ambiguously_is_still_a
     # A readback that positively reads the field EMPTY outranks INV-1: the field is known unfilled, and
     # only an error halts the rest of a batched turn (a queued submit must not run on it). n != 1 may
     # soften a confident commit to "re-observe", never a did-not-commit to ok.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=2)
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#city", "text": "Lisbon"})
@@ -3095,9 +3191,7 @@ async def test_select_combobox_readable_empty_field_that_re_resolves_ambiguously
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Same fail-closed ranking at the explicit-combobox site branch, which `type` does not exercise.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(field_type="text", suggestion={"text": "Lisbon", "score": 2}, committed="", match_count=2)
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#city", "value": "Lisbon"})
@@ -3111,9 +3205,7 @@ async def test_select_combobox_readable_empty_field_that_re_resolves_ambiguously
 async def test_select_option_diverts_custom_combobox_to_shared_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     # A non-<select> target (nodeName != 'select') must route into the shared commit path — type +
     # click the suggestion — and NOT call page.select_option (which would throw on a custom combobox).
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text",
         node_name="input",
@@ -3133,9 +3225,7 @@ async def test_select_option_refuses_a_set_on_a_custom_combobox(monkeypatch: pyt
     # A custom combobox commits one picked suggestion at a time, so a requested set cannot be
     # honoured here. It must refuse and name the remedy rather than commit element [0] and report
     # success -- the whole point of the set-valued path is that a partial commit never reads as done.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text",
         node_name="input",
@@ -3159,9 +3249,7 @@ async def test_select_option_refuses_a_set_on_a_custom_combobox(monkeypatch: pyt
 @pytest.mark.asyncio
 async def test_select_option_native_select_uses_native_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # A real <select> (nodeName == 'select') keeps the native path — dispatch page.select_option, no typing.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(node_name="select", suggestion={"text": "United States", "score": 2})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
@@ -3174,9 +3262,7 @@ async def test_select_option_native_select_uses_native_path(monkeypatch: pytest.
 async def test_select_option_disabled_custom_combobox_reports_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     # A disabled control is refused with the accurate "is disabled" message BEFORE the custom divert —
     # not the typeable-gate refusal, and nothing is typed.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(
         field_type="text", node_name="input", disabled=True, suggestion={"text": "Analytics", "score": 2}
     )
@@ -3203,17 +3289,8 @@ _FINDER_FIXTURE_HTML = """
 
 @contextlib.asynccontextmanager
 async def _finder_page() -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            await page.set_content(_FINDER_FIXTURE_HTML)
-            yield page
-        finally:
-            await browser.close()
+    async with _content_page(_FINDER_FIXTURE_HTML) as page:
+        yield page
 
 
 async def _snapshot_react_find(page: Any, inject_js: str) -> Any:
@@ -3443,19 +3520,10 @@ _STATUS_PAGE_HTML = """
 
 @contextlib.asynccontextmanager
 async def _content_page(html: str, extra_args: list[str] | None = None) -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True, args=["--use-mock-keychain", "--password-store=basic", *(extra_args or [])]
-        )
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            await page.set_content(html)
-            yield page
-        finally:
-            await browser.close()
+    async with _page_context(extra_args, viewport={"width": 1024, "height": 900}) as context:
+        page = await context.new_page()
+        await page.set_content(html)
+        yield page
 
 
 async def _observe_data(page: Any) -> dict[str, Any]:
@@ -9379,9 +9447,7 @@ async def test_click_option_no_commit_errors_loud(monkeypatch: pytest.MonkeyPatc
     # The click-open-family contract: an option click whose selection did not commit (menu still open
     # even after the settle, option state unchanged, no navigation, no submenu) must error loudly —
     # never a bare ok that fuels a 21-click loop.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9404,9 +9470,7 @@ async def test_click_option_no_commit_errors_loud(monkeypatch: pytest.MonkeyPatc
 async def test_click_option_commit_after_async_close_settles_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     # A healthy commit that closes the menu via a fade or an async server ack must not read as
     # "did not commit" off the instantaneous probe — the settle re-probe accepts the late close.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9429,9 +9493,7 @@ async def test_click_hover_highlight_is_not_commit_evidence(monkeypatch: pytest.
     # Playwright's click hovers first, and menus restyle rows on hover. The pre-click fingerprint
     # ('s0') differs from the hovered one ('hl') — commit must be judged against the POST-hover
     # baseline, so an otherwise no-op click still errors instead of claiming "its state changed".
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9451,9 +9513,7 @@ async def test_click_option_no_commit_error_survives_submenu_probe_crash(monkeyp
     # Once no-commit evidence is established, a crash of the final informational submenu probe must
     # not fall through to the fail-open bare ok — that would be a silent ok on the exact case the
     # feature exists to make loud.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9476,9 +9536,7 @@ async def test_click_option_after_read_exception_is_not_commit_evidence(
     # A post-click read that THROWS for a non-navigation reason (a JS error in the probe, a
     # detached node, a CDP timeout) observed nothing. It must never become "the page navigated"
     # + ok — a confident commit verdict for a click whose effect was never seen.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     boom = RuntimeError("Cannot read properties of null (reading 'innerText')")
     states: list[dict[str, Any] | Exception] = [{"stillOpen": 7, "optState": "s0"}]
     states += [boom] if which == "post-click" else [{"stillOpen": 7, "optState": "s0"}, boom]
@@ -9502,9 +9560,7 @@ async def test_click_option_read_failing_because_the_page_left_is_still_a_commit
     # The real navigation case must not regress. Two positive signals: the token planted on window
     # before the click is gone (the page answers even though the probe's JS blew up), or the page
     # cannot be asked at all and the driver says the context was destroyed.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     if signal == "token-gone":
         err: Exception = RuntimeError("Cannot read properties of null (reading 'innerText')")
         doc_same: bool | None = False
@@ -9530,9 +9586,7 @@ async def test_click_option_pushstate_url_move_with_the_same_document_is_not_a_n
     # A filter menu that syncs its selection into the query string moves the URL without leaving
     # the page. The page's own answer ("same document") outranks the URL, so a failed read here is
     # could-not-verify, not "the page navigated".
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9565,9 +9619,7 @@ async def test_click_option_url_move_before_the_read_defers_to_the_page(
     # throw: with every read succeeding, a moved URL on the same document is judged by the menu
     # (here: still open and unchanged → did not commit), while a moved URL on a new document is the
     # navigation it looks like.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9600,9 +9652,7 @@ async def test_click_option_destroyed_context_wording_is_overruled_by_the_page_s
 ) -> None:
     # The driver rewrites some unrelated protocol errors into its destroyed-context message. When the
     # page can still be asked and says the document never changed, the wording does not win.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     err = RuntimeError("Execution context was destroyed, most likely because of a navigation")
     page = _ClickFakePage(
         menu_open=True,
@@ -9623,9 +9673,7 @@ async def test_click_option_destroyed_context_wording_is_overruled_by_the_page_s
 async def test_click_option_opaque_read_error_with_url_change_is_a_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     # The other positive navigation signal: the page cannot be asked, the error text says nothing,
     # but the URL moved under the click (read from the page, not inferred from the exception).
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9659,9 +9707,7 @@ async def test_click_option_state_hold_read_exception_is_not_held(
     # that re-read is not "it held": with the page still there it is could-not-verify (never the
     # confident "did not commit" either — a change WAS seen), and with the page gone it is the commit
     # leaving the page.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9718,9 +9764,7 @@ async def test_click_option_that_is_marked_and_also_grows_reports_both(monkeypat
     # A branch row can mark itself AND expand. Reporting only the mark hides that more picks are
     # needed; reporting only the child menu hides a mark the page really made. Say both — and drop
     # the "menu stayed open" clause, because the child note has just renumbered the markers.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9751,9 +9795,7 @@ async def test_click_option_that_grows_without_being_marked_reports_only_its_chi
     # Same shape, no selection attribute: the growth is all there is, so calling it a selection
     # would be the false report this exists to prevent. A row that grew only in HEIGHT counts —
     # a wrapper replaced by an expanded one keeps its child count.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9782,9 +9824,7 @@ async def test_click_option_whose_row_grew_on_HOVER_is_not_read_as_expanding(
     # Playwright hovers before it clicks, and list rows routinely reveal an edit/remove pair on
     # hover. That growth is the hover's, not the click's — measured from a pre-hover baseline it
     # would turn an ordinary commit into "this opened a menu", naming hover chrome as options.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     grown = {"stillOpen": 4, "optState": "s1", "optSel": "true|||", "optKids": 2, "optH": 60}
     page = _ClickFakePage(
         menu_open=True,
@@ -9815,9 +9855,7 @@ async def test_click_option_expanding_by_animation_is_judged_on_the_settled_read
     # An expansion driven by a CSS transition has barely started when the first post-click read
     # lands, so judging on that read reports a plain commit and never looks for the child rows.
     # The hold check already pays for a newer read; the verdict is taken from that one.
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9844,9 +9882,7 @@ async def test_click_option_expanding_by_animation_is_judged_on_the_settled_read
 async def test_click_option_opening_submenu_is_not_a_false_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # An option click that spawns a child menu (cascading filter, date-picker) commits nothing yet
     # but is NOT a failure — report the submenu's options instead of a false "did not commit".
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _ClickFakePage(
         menu_open=True,
         is_option=True,
@@ -9974,19 +10010,10 @@ _ROLE_MENU_FIXTURE_HTML = """
 
 @contextlib.asynccontextmanager
 async def _role_menu_page(row_role: str = "radio", *, native_kids: bool = False) -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            await page.set_content(_ROLE_MENU_FIXTURE_HTML)
-            await page.evaluate("(r) => { window.__rowRole = r; }", row_role)
-            await page.evaluate("(n) => { window.__nativeKids = n; }", native_kids)
-            yield page
-        finally:
-            await browser.close()
+    async with _content_page(_ROLE_MENU_FIXTURE_HTML) as page:
+        await page.evaluate("(r) => { window.__rowRole = r; }", row_role)
+        await page.evaluate("(n) => { window.__nativeKids = n; }", native_kids)
+        yield page
 
 
 @_skip_no_browser
@@ -11803,17 +11830,8 @@ _MENU_FIXTURE_HTML = """
 
 @contextlib.asynccontextmanager
 async def _menu_page() -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            await page.set_content(_MENU_FIXTURE_HTML)
-            yield page
-        finally:
-            await browser.close()
+    async with _content_page(_MENU_FIXTURE_HTML) as page:
+        yield page
 
 
 @_skip_no_browser
@@ -12097,7 +12115,8 @@ async def test_observe_tells_row_icons_apart_by_row_text_then_place_and_says_wha
 async def test_observe_lists_each_unnamed_icon_of_a_wrapper_and_never_an_image_name_that_is_a_token() -> None:
     # A wrapper drawing two icons is not one control: its centre is between them. A signed image path is not a name.
     svg = '<svg width="16" height="16"><rect width="16" height="16"/></svg>'
-    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
+    # Joined at runtime so no source line holds a whole JWT for secret scanners to flag.
+    token = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"))
     html = (
         '<!doctype html><html><body><div id="row" style="cursor:pointer;display:inline-flex;gap:8px">'
         f'<span class="copy">{svg}</span><span class="trash">{svg}</span></div>'
@@ -12678,22 +12697,15 @@ sealedRoot.innerHTML = '<div style="width:200px;height:40px">sealed</div><input 
 
 @contextlib.asynccontextmanager
 async def _live_page(html: str, init_script: str | None = None) -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            if init_script is not None:
-                await page.add_init_script(init_script)
-                # add_init_script binds to the NEXT document; set_content reuses the one already
-                # open, so without this navigation the script never runs at all.
-                await page.goto("about:blank")
-            await page.set_content(html)
-            yield page
-        finally:
-            await browser.close()
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        page = await context.new_page()
+        if init_script is not None:
+            await page.add_init_script(init_script)
+            # add_init_script binds to the NEXT document; set_content reuses the one already
+            # open, so without this navigation the script never runs at all.
+            await page.goto("about:blank")
+        await page.set_content(html)
+        yield page
 
 
 # Records every data-tv3 write through primordials captured before any page script runs, so no
@@ -16244,6 +16256,7 @@ async def test_type_waits_out_an_aria_disabled_field_the_page_releases() -> None
         assert await page.eval_on_selector("#soon", "el => el.value") == "Iowa City"
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_type_reports_readonly_when_the_page_locks_the_field_during_the_grace() -> None:
@@ -21929,7 +21942,7 @@ async def test_type_under_a_consent_wall_names_the_layer_and_its_controls() -> N
         assert await page.eval_on_selector("#city", "el => el.value") == ""
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_under_a_consent_wall_returns_a_named_occluder_instead_of_a_raw_timeout() -> None:
@@ -22108,7 +22121,7 @@ _LABEL_STYLED_AS_BACKDROP_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_a_label_styled_as_a_backdrop_is_still_covered() -> None:
@@ -22133,7 +22146,7 @@ _RADIO_LABEL_HIT_IS_A_LINK_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_link_is_not_forced() -> None:
@@ -22165,7 +22178,7 @@ _RADIO_LABEL_HIT_IS_A_FALLBACK_ROLE_SWITCH_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_fallback_role_switch_is_not_forced() -> None:
@@ -22257,7 +22270,7 @@ _HIDDEN_TEXT_UNDER_SIBLING_LABEL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_hidden_text_input_under_its_own_label_is_not_reported_ok() -> None:
@@ -22362,7 +22375,7 @@ _CHECKBOX_UNDER_UNPAINTED_LABEL_WRAPPER_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_labelled_checkbox_inside_an_unpainted_wrapper_is_refused() -> None:
@@ -22387,7 +22400,7 @@ _ABSOLUTE_LABEL_BACKDROP_WITH_SMALL_CHILD_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_an_absolute_label_backdrop_with_a_small_child_at_the_hit_is_still_covered() -> None:
@@ -22413,7 +22426,7 @@ _WALL_NESTED_INSIDE_OWN_LABEL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_through_a_wall_nested_inside_the_own_label_is_still_covered() -> None:
@@ -22490,7 +22503,7 @@ async def _mount_challenge_frame(
         await realm.eval_on_selector(host_selector, _MOUNT_CLOSED_SHADOW_FRAMES_JS, {"srcs": srcs, "style": style})
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_covered_by_a_layer_holding_a_challenge_frame_names_it_and_drops_the_dismissal() -> None:
@@ -22521,7 +22534,7 @@ async def test_type_into_a_field_covered_by_a_challenge_layer_names_the_frame() 
         assert await page.eval_on_selector("#email", "el => el.value") == ""
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -22553,7 +22566,7 @@ _TRANSPARENT_CHALLENGE_WALL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_invisible_wall_holding_a_challenge_frame_is_never_called_a_leftover_backdrop() -> None:
@@ -22570,7 +22583,7 @@ async def test_an_invisible_wall_holding_a_challenge_frame_is_never_called_a_lef
         assert "closes or dismisses" not in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_authored_data_frame_does_not_stand_in_for_the_real_challenge_host() -> None:
@@ -22584,7 +22597,7 @@ async def test_a_page_authored_data_frame_does_not_stand_in_for_the_real_challen
         assert "xxxx" not in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_challenge_frame_the_layer_does_not_render_is_not_reported_as_present() -> None:
@@ -22597,7 +22610,7 @@ async def test_a_challenge_frame_the_layer_does_not_render_is_not_reported_as_pr
         assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("hidden", "reported"), [(None, True), ("middle", False), ("vendor", False)])
@@ -22721,7 +22734,7 @@ _RADIO_LABEL_HIT_IS_A_DETAILS_WIDGET_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_radio_whose_label_hit_is_a_details_widget_is_not_reported_ok() -> None:
@@ -22746,7 +22759,7 @@ _TEXT_LABEL_HIT_IS_A_SCRIPTED_FOCUSABLE_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_text_input_whose_label_hit_is_a_scripted_focusable_is_not_forced() -> None:
@@ -22772,7 +22785,7 @@ _TEXT_LABEL_HIT_IS_AN_EDITABLE_REGION_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_text_input_whose_label_hit_is_an_editable_region_is_not_forced() -> None:
@@ -22846,7 +22859,7 @@ _SPOOFED_LABELS_OVER_WALL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_spoofs_labels_cannot_redirect_a_forced_click() -> None:
@@ -22883,7 +22896,7 @@ _DECOY_STEALS_PROBE_HANDOVER_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_moves_the_probe_handover_onto_a_decoy_cannot_earn_a_forced_click() -> None:
@@ -22972,7 +22985,7 @@ _DUPLICATE_ID_LABEL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_duplicate_id_does_not_lend_an_earlier_controls_label_to_a_later_one() -> None:
@@ -22997,7 +23010,7 @@ _WRAPPING_LABEL_FOR_NAMES_EARLIER_DUPLICATE_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_wrapping_label_whose_for_names_an_earlier_duplicate_is_not_the_later_controls_label() -> None:
@@ -23029,7 +23042,7 @@ _PROTOTYPE_FORGED_LABEL_OVER_COVER_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_replaces_element_prototype_getattribute_cannot_forge_a_label() -> None:
@@ -23040,7 +23053,7 @@ async def test_a_page_that_replaces_element_prototype_getattribute_cannot_forge_
         assert "covered by" in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_own_label_is_not_granted_when_the_probe_cannot_be_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -23111,7 +23124,7 @@ _LABEL_OVER_PLAIN_CUSTOM_ELEMENT_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_over_a_defined_but_not_form_associated_custom_element_is_a_cover() -> None:
@@ -23149,7 +23162,7 @@ _LABEL_HIT_IS_AN_IMAGE_MAP_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_field_whose_label_hit_is_an_image_map_is_not_forced() -> None:
@@ -23174,7 +23187,7 @@ _LABEL_IN_ANOTHER_SHADOW_ROOT_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_in_another_shadow_root_is_not_the_controls_label() -> None:
@@ -23195,7 +23208,7 @@ _ARIA_LABELLEDBY_TARGET_OVER_CONTROL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_aria_labelledby_element_over_a_control_is_not_its_label() -> None:
@@ -23238,7 +23251,7 @@ _LABEL_FOR_NON_LABELABLE_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_label_whose_for_names_a_non_labelable_element_is_not_a_label() -> None:
@@ -23287,7 +23300,7 @@ _SPOOFED_QUERYSELECTORALL_OVER_WALL_HTML = (
 )
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_page_that_spoofs_querySelectorAll_cannot_hide_a_wall() -> None:
@@ -23638,7 +23651,7 @@ async def test_type_into_an_own_popup_that_hosts_a_fullscreen_wall_is_refused() 
         assert await page.eval_on_selector("#v3", "el => el.value") == ""
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_an_open_combobox_covered_by_its_own_listbox_names_the_listbox() -> None:
@@ -24268,7 +24281,7 @@ _UNQUALIFIED_ROW_OVER_A_DIALOG_HTML = """
 _COVER_REMEDY_WORDING = ("dismiss", "closes", "close the layer", "opens", "get_html", "Pick whichever")
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -24394,7 +24407,7 @@ _CONTROL_INSIDE_A_COLLAPSED_SECTION_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_click_on_a_control_clipped_by_its_own_container_names_it_instead_of_asking_for_a_dismissal() -> None:
@@ -25136,7 +25149,7 @@ _ANCESTOR_DRAWS_ITS_OWN_BUSY_VEIL_HTML = """
 """
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_an_ancestor_drawing_its_own_veil_is_not_reported_as_a_clip() -> None:
@@ -33548,9 +33561,7 @@ async def test_select_combobox_commits_when_the_matched_row_is_rerendered_before
 async def test_select_combobox_lone_reacting_row_commits_only_when_it_answers_the_request(
     monkeypatch: pytest.MonkeyPatch, value: str, row: str, commits: bool
 ) -> None:
-    import asyncio as _a
-
-    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
     page = _TypeaheadFakePage(field_type="text", suggestion={"text": row, "score": 2}, committed=row)
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": value})
@@ -34926,17 +34937,8 @@ _MENU_FIXTURE_DECORATIVE_CHECKBOX_HTML = """
 
 @contextlib.asynccontextmanager
 async def _decorative_checkbox_menu_page() -> AsyncIterator[Any]:
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            context = await browser.new_context(viewport={"width": 1024, "height": 900})
-            page = await context.new_page()
-            await page.set_content(_MENU_FIXTURE_DECORATIVE_CHECKBOX_HTML)
-            yield page
-        finally:
-            await browser.close()
+    async with _content_page(_MENU_FIXTURE_DECORATIVE_CHECKBOX_HTML) as page:
+        yield page
 
 
 @_skip_no_browser
@@ -37247,7 +37249,7 @@ async def test_a_hidden_widget_refused_before_dispatch_is_not_sent_looking_for_a
     assert "reveals it" not in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -37279,7 +37281,7 @@ async def test_acting_on_an_inert_template_control_is_not_reported_as_a_blocked_
     assert "resolved to" not in r.content and "Call log" not in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_live_control_that_fails_keeps_its_own_diagnosis() -> None:
@@ -37368,7 +37370,7 @@ async def test_a_page_that_patches_computed_style_cannot_win_the_inert_question(
     assert "Call log" in str(raised.value), "the original driver failure must survive untouched"
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_typeable_combobox_anchor_in_hidden_markup_does_not_leak_the_driver_log() -> None:
@@ -37419,7 +37421,7 @@ async def test_the_diagnosis_probes_the_page_the_action_failed_on_not_a_newer_ta
     assert "Call log" in str(raised.value), "the failure from the acted-on page must survive untouched"
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_rewritten_selector_is_diagnosed_as_the_element_the_driver_waited_on() -> None:
@@ -37447,7 +37449,7 @@ async def test_a_rewritten_selector_is_diagnosed_as_the_element_the_driver_waite
     assert 'input[id="cv"]' in r.content, r.content
 
 
-@pytest.mark.usefixtures("short_action_timeout")
+@pytest.mark.usefixtures("expected_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_selector_rewrite_does_not_outlive_the_call_that_made_it() -> None:

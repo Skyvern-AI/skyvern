@@ -280,6 +280,17 @@ function getResponseDetail(data: unknown): string | undefined {
   return undefined;
 }
 
+function getResponseErrorCode(data: unknown): string | undefined {
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    if (detail && typeof detail === "object" && "error_code" in detail) {
+      const errorCode = (detail as { error_code?: unknown }).error_code;
+      return typeof errorCode === "string" ? errorCode : undefined;
+    }
+  }
+  return undefined;
+}
+
 clients.forEach((instance) => {
   instance.interceptors.response.use(
     (response) => {
@@ -292,9 +303,13 @@ clients.forEach((instance) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
+        const isOrganizationAdminDenial =
+          getResponseErrorCode(error.response?.data) ===
+          "organization_admin_required";
         const retryConfig = error.config as UISessionRetryConfig | undefined;
         if (
-          (statusCode === 401 || statusCode === 403) &&
+          (statusCode === 401 ||
+            (statusCode === 403 && !isOrganizationAdminDenial)) &&
           retryConfig &&
           !retryConfig.uiSessionRetry
         ) {
@@ -309,7 +324,7 @@ clients.forEach((instance) => {
         }
         const isAuthFailure =
           statusCode === 401 ||
-          statusCode === 403 ||
+          (statusCode === 403 && !isOrganizationAdminDenial) ||
           (statusCode === 404 && detail === "Organization not found");
 
         if (statusCode && isAuthFailure) {

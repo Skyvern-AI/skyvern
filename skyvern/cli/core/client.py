@@ -10,11 +10,11 @@ from typing import Any
 import httpx
 import structlog
 
-from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, is_cli_runtime
+from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, is_cli_command, is_cli_runtime
 from skyvern.client import RunSdkActionResponse, SkyvernEnvironment
 from skyvern.client.core.request_options import RequestOptions
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_MCP_USER_AGENT
+from skyvern.constants import SKYVERN_CLI_USER_AGENT, SKYVERN_MCP_USER_AGENT
 from skyvern.library.skyvern import Skyvern
 
 from .api_key_hash import hash_api_key_for_cache
@@ -93,15 +93,16 @@ def _build_cloud_client(api_key: str) -> Skyvern:
     # Generated SDK methods send "x-user-agent": None when no per-call user_agent is given,
     # clobbering constructor-level headers in the merge; httpx client-level defaults survive
     # because None-valued headers are stripped before the request is sent (SKY-13333).
+    user_agent = SKYVERN_CLI_USER_AGENT if is_cli_command() else SKYVERN_MCP_USER_AGENT
     return client_class(
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
         base_url=base_url,
-        headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
+        headers={"x-user-agent": user_agent},
         httpx_client=httpx.AsyncClient(
             timeout=60,
             follow_redirects=True,
-            headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
+            headers={"x-user-agent": user_agent},
         ),
     )
 

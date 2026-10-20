@@ -134,13 +134,25 @@ Use a session when you need a browser right now. Use a profile when you want to 
     | Parameter | Values |
     |---|---|
     | `timeout` | Minutes, 5 to 240. Default 60. Larger values are capped at 240. |
-    | `proxy_location` | A country, such as `RESIDENTIAL` (US). See the [API reference](/api-reference) for the list. |
+    | `proxy_location` | A country, such as `RESIDENTIAL` (US). See [Proxies and geo-targeting](/developers/production#proxies-and-geo-targeting) for the list. |
     | `browser_type` | `chrome`, `msedge` or `stealth-chromium`. If you omit it, Skyvern picks a managed default that may not be Chrome. |
     | `extensions` | `ad-blocker`, `captcha-solver` (Cloud only) |
     | `browser_profile_id` | Start from a saved [profile](#browser-profiles) |
     | `generate_browser_profile` | Save this session's state when it closes, so you can turn it into a profile |
 
     A session's `status` is `running` while it is usable, then `completed` (closed), `timeout` (ran out) or `failed`.
+
+    **Creating many sessions at once.** Each organization has a limit on how many of its sessions can be starting at the same time. A create past that limit returns `429` at once, with `error_code` `too_many_starting_browser_sessions` and a `Retry-After` header giving the number of seconds to wait. Honor `Retry-After`: wait that long, then send the create again. The Python SDK waits and retries for you when you pass `request_options={"max_retries": 3}` to `create_browser_session`.
+
+    **A run sent to a session that has already ended** is refused before the run is created, so it is never billed and never appears in your run history. The response body carries a stable `error_code` to branch on, so a scheduled caller does not have to match on the message text:
+
+    | `error_code` | Status | What to do |
+    |---|---|---|
+    | `browser_session_expired` | `410` | The session ran out its lifetime. Re-sending the same id will always fail. Create a new session and pass the new id, or omit `browser_session_id` to start a fresh browser. |
+    | `browser_session_closed` | `410` | The session ended for another reason, such as being closed. Create a new session. |
+    | `browser_session_startup_timeout` | `504` | The session timed out before starting. Re-sending the same id will fail. Create a new session and pass its id, or omit `browser_session_id` to start a fresh browser. |
+
+    If you pin a session id in a recurring job, treat all three codes as terminal for that session id: create a new session or omit `browser_session_id`, rather than retrying the same id on the next tick.
 
     **Extend a running session.** Each call adds minutes, up to 6 hours in total since the session started. Read the new `timeout` from the response; a retried call adds again. The call returns `409` if the session has ended, has under two minutes left, or is already at 6 hours. The TypeScript SDK has no `extendBrowserSession` method yet; call the REST endpoint.
 

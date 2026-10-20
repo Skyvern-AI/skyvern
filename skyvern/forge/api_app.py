@@ -4,7 +4,6 @@
 # ruff: noqa: E402
 
 import asyncio
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -48,6 +47,7 @@ from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, 
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.executor.run_liveness import start_run_lease_tasks, stop_run_lease_tasks
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
@@ -69,6 +69,7 @@ from skyvern.services.cleanup_service import (
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
 from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
@@ -82,7 +83,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    content: dict[str, str | None] = {"detail": exc.message}
+    if exc.error_code is not None:
+        content["error_code"] = exc.error_code
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
 
 async def db_unavailable_handler(
@@ -151,7 +155,7 @@ def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
         **cors_middleware_kwargs(
-            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor"]
+            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor", "Retry-After"]
         ),
     )
 
@@ -285,6 +289,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
+    ("tasks", "task_queue", "VARCHAR"),
 )
 
 
@@ -432,6 +437,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         if isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
         else None
     )
+    if (
+        isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        and settings.RUN_HEARTBEAT_TIMEOUT_MINUTES > 0
+    ):
+        start_run_lease_tasks(reap_orphaned_runs_once)
     try:
         if mcp_app:
             async with mcp_app.lifespan(mcp_app):
@@ -447,6 +457,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         await asyncio.gather(
             retry_recovery_task, *([group_recovery_task] if group_recovery_task else []), return_exceptions=True
         )
+        await stop_run_lease_tasks()
         # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
         await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 
@@ -492,25 +503,6 @@ def create_api_app() -> FastAPI:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
     forge_app_instance = start_forge_app()
-
-    # Initialize Laminar tracing after ForgeApp so auto-instrumentation works.
-    lmnr_api_key = os.environ.get("LMNR_PROJECT_API_KEY")
-    if lmnr_api_key:
-        try:
-            from lmnr import Laminar  # noqa: PLC0415
-
-            lmnr_base_url = os.environ.get("LMNR_BASE_URL", "http://localhost")
-            lmnr_grpc_port = int(os.environ.get("LMNR_GRPC_PORT", "8001"))
-            lmnr_http_port = int(os.environ.get("LMNR_HTTP_PORT", "8000"))
-            Laminar.initialize(
-                project_api_key=lmnr_api_key,
-                base_url=lmnr_base_url,
-                grpc_port=lmnr_grpc_port,
-                http_port=lmnr_http_port,
-            )
-            LOG.info("Laminar tracing initialized", base_url=lmnr_base_url, grpc_port=lmnr_grpc_port)
-        except Exception as e:
-            LOG.warning("Failed to initialize Laminar tracing", error=str(e))
 
     assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)

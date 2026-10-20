@@ -768,6 +768,8 @@ def convert_to_workflow(
         import_error=workflow_model.import_error,
         created_by=workflow_model.created_by,
         edited_by=workflow_model.edited_by,
+        edited_for=workflow_model.edited_for,
+        build_source=workflow_model.build_source,
     )
 
 
@@ -817,6 +819,7 @@ def convert_to_workflow_run(
         cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        setup_completed=workflow_run_model.setup_completed,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
         sequential_credential_id=workflow_run_model.sequential_credential_id,

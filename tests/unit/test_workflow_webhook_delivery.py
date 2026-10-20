@@ -24,6 +24,7 @@ from skyvern.config import settings
 from skyvern.exceptions import InvalidUrl
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel, WorkflowRunModel
 from skyvern.forge.sdk.db.repositories import workflow_runs as repository_module
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptsRepository
@@ -49,6 +50,7 @@ from skyvern.forge.sdk.workflow.retry_policy import (
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.workflows import WorkflowRetryPolicy
+from skyvern.services import run_service
 from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services import webhook_service as replay_service
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -3257,6 +3259,278 @@ async def test_webhook_projection_is_fenced_to_execution_during_http(
         assert (row.webhook_delivery_finalized_at is not None) is (expected is not None)
         if lifecycle_change != "matching" or delivery_path == "replay":
             assert row.webhook_failure_reason == ""
+
+
+SKIPPED_CLAIMED_WEBHOOK = "Skipping final workflow webhook another finalizer already claimed"
+STALE_SNAPSHOT_CLAIM_MISS = "Final workflow webhook claim missed on a stale snapshot; nobody holds it"
+CLAIM_MISSES = {SKIPPED_CLAIMED_WEBHOOK, STALE_SNAPSHOT_CLAIM_MISS}
+
+
+async def _seed_run(
+    sessions: async_sessionmaker[AsyncSession], run_id: str, *, retry_policy: bool = False, **columns: Any
+) -> None:
+    defaults: dict[str, Any] = {
+        "workflow_id": "w_once",
+        "workflow_permanent_id": "wpid_once",
+        "organization_id": "o_once",
+        "status": "canceled",
+        "finished_at": FINALIZED_AT,
+        "webhook_callback_url": DEFAULT_URL,
+    }
+    async with sessions() as session:
+        session.add(WorkflowRunModel(workflow_run_id=run_id, **(defaults | columns)))
+        if retry_policy:
+            session.add(
+                WorkflowRunAttemptModel(
+                    workflow_run_id=run_id,
+                    organization_id="o_once",
+                    attempt_number=1,
+                    status="canceled",
+                    retry_decision="final",
+                )
+            )
+        await session.commit()
+
+
+def _use_real_run_repositories(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
+) -> tuple[async_sessionmaker[AsyncSession], WorkflowRunsRepository]:
+    sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    runs = WorkflowRunsRepository(sessions)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_runs", runs)
+    monkeypatch.setattr(service_module.app.DATABASE, "workflow_run_attempts", WorkflowRunAttemptsRepository(sessions))
+    monkeypatch.setattr(repository_module, "save_workflow_run_logs", AsyncMock())
+    return sessions, runs
+
+
+@pytest.mark.asyncio
+async def test_concurrent_finalizers_send_a_no_policy_run_final_webhook_once(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A no-policy run has no attempt row to claim, yet API cancel, the run's own cleanup and the
+    # webhook activity can each reach its final send while another is still in flight.
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    await _seed_run(sessions, "wr_once")
+    first_send_in_flight = asyncio.Event()
+    finish_first_send = asyncio.Event()
+
+    async def endpoint(**_kwargs: Any) -> httpx.Response:
+        if not first_send_in_flight.is_set():
+            first_send_in_flight.set()
+            await finish_first_send.wait()
+        return _response(200, "ok")
+
+    deliver = AsyncMock(side_effect=endpoint)
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    run = await runs.get_workflow_run("wr_once")
+    assert run is not None
+
+    async with asyncio.timeout(10):
+        api_cancel = asyncio.create_task(svc.execute_workflow_webhook(run, finalizer="api_cancel"))
+        await first_send_in_flight.wait()
+        with capture_logs() as logs:
+            await svc.execute_workflow_webhook(run, finalizer="worker_cleanup")
+            webhook = await svc.prepare_workflow_webhook(run, require_final=True)
+            assert webhook is not None
+            await svc.deliver_prepared_workflow_webhook(
+                webhook,
+                delivered_projection=DELIVERED,
+                exhausted_projection=EXHAUSTED,
+                finalizer="webhook_activity",
+            )
+        finish_first_send.set()
+        await api_cancel
+
+    deliver.assert_awaited_once()
+    assert [event["finalizer"] for event in logs if event["event"] == SKIPPED_CLAIMED_WEBHOOK] == [
+        "worker_cleanup",
+        "webhook_activity",
+    ]
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_once")
+        assert row is not None
+        assert row.webhook_delivery_status == DELIVERED
+
+    # A later finalizer, such as a cancel on the already-final run, finds the recorded outcome and skips too.
+    await svc.execute_workflow_webhook(run, finalizer="api_cancel")
+    deliver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_missed_on_a_stale_snapshot_reports_that_nobody_holds_it(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A sender whose snapshot no longer matches the row's finished_at misses a claim nobody holds, so the run gets
+    # no webhook; that miss must read differently from one on a claim another sender holds.
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    await _seed_run(sessions, "wr_stale_snapshot")
+    deliver = AsyncMock(return_value=_response(200, "ok"))
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    run = await runs.get_workflow_run("wr_stale_snapshot")
+    assert run is not None
+    stale_snapshot = run.model_copy(update={"finished_at": FINALIZED_AT - timedelta(seconds=1)})
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(stale_snapshot, finalizer="worker_cleanup")
+
+    deliver.assert_not_awaited()
+    assert [event["event"] for event in logs if event["event"] in CLAIM_MISSES] == [STALE_SNAPSHOT_CLAIM_MISS]
+
+
+@pytest.mark.asyncio
+async def test_unrecorded_final_delivery_failure_hands_the_claim_to_the_next_sender(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A one-shot send that leaves the failure to a later sender records no outcome, so it must not keep the claim.
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    await _seed_run(sessions, "wr_handoff")
+    deliver = AsyncMock(side_effect=[_response(503), _response(503), _response(503), _response(200, "ok")])
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    monkeypatch.setattr(webhook_delivery_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    run = await runs.get_workflow_run("wr_handoff")
+    assert run is not None
+    webhook = await svc.prepare_workflow_webhook(run, require_final=True)
+    assert webhook is not None
+
+    assert not await svc.deliver_prepared_workflow_webhook(webhook, delivered_projection=DELIVERED)
+    assert await svc.deliver_prepared_workflow_webhook(
+        webhook, delivered_projection=DELIVERED, exhausted_projection=EXHAUSTED
+    )
+
+    async with sessions() as session:
+        row = await session.get(WorkflowRunModel, "wr_handoff")
+        assert row is not None
+        assert row.webhook_delivery_status == DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_policy_run_final_webhook_is_claimed_by_its_attempt_not_the_run_row(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A replay may record the run's outcome after the final decision but before its release delivers;
+    # the attempt's own claim still decides that release.
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    monkeypatch.setattr(svc, "_workflow_webhook_fallback_is_current", AsyncMock(return_value=True))
+    await _seed_run(
+        sessions,
+        "wr_policy",
+        retry_policy=True,
+        webhook_delivery_status=DELIVERED,
+        webhook_delivery_finalized_at=FINALIZED_AT,
+    )
+    deliver = AsyncMock(return_value=_response(200, "ok"))
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", deliver)
+    run = await runs.get_workflow_run("wr_policy")
+    assert run is not None
+
+    await svc.execute_workflow_webhook(run, claim_kind="final")
+
+    deliver.assert_awaited_once()
+    async with sessions() as session:
+        attempt = await session.get(WorkflowRunAttemptModel, ("wr_policy", 1))
+        assert attempt is not None
+        assert attempt.webhook_sent_at is not None
+
+
+class _DurableFinalizerExecutor(BackgroundTaskExecutor):
+    # An executor that confirms a started run's own finalizer still sends its final webhook after a cancel.
+    async def sends_final_webhook_after_cancel(self, workflow_run: WorkflowRun) -> bool:
+        return True
+
+
+_LIVE_FOR = timedelta(minutes=10)
+_PAST_BOUND = timedelta(hours=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "created_ago", "started_ago", "finishes_before_cancel", "finalizer_durable", "sender"),
+    [
+        # The run's own finalizer sends after teardown, with the files and recording the cancel cannot see yet.
+        pytest.param("running", _LIVE_FOR, _LIVE_FOR, False, True, "finalizer", id="live"),
+        pytest.param("paused", _LIVE_FOR, _LIVE_FOR, False, True, "finalizer", id="paused"),
+        # Time spent queued does not count toward the bound.
+        pytest.param("running", _PAST_BOUND, _LIVE_FOR, False, True, "finalizer", id="queued-long-then-live"),
+        # Past the bound the cancel sends at once, even when the finalizer is still live.
+        pytest.param("running", _PAST_BOUND, _PAST_BOUND, False, True, "cancel", id="live-past-bound"),
+        # A queued run has no execution yet, and one that starts later sees the cancel and sends nothing.
+        pytest.param("queued", timedelta(seconds=1), None, False, True, "cancel", id="queued"),
+        # The run finished on its own first, so the cancel still sends that terminal status as before.
+        pytest.param("running", _LIVE_FOR, _LIVE_FOR, True, True, "cancel", id="finished-before-cancel"),
+        # A retried cancel finds the row already canceled while the run is still live, and must not pre-empt it.
+        pytest.param("canceled", _LIVE_FOR, _LIVE_FOR, False, True, "finalizer", id="retried-cancel-of-live-run"),
+        # A run canceled before it started has no execution to leave a retried cancel's webhook to.
+        pytest.param("canceled", timedelta(seconds=1), None, False, True, "cancel", id="retried-cancel-of-queued-run"),
+        # A self-hosted finalizer dies with its process and no durable sender follows it, so the cancel sends.
+        pytest.param("running", _LIVE_FOR, _LIVE_FOR, False, False, "cancel", id="self-hosted-live"),
+        pytest.param("canceled", _LIVE_FOR, _LIVE_FOR, False, False, "cancel", id="self-hosted-retried-cancel"),
+    ],
+)
+async def test_canceled_run_gets_one_final_webhook_from_a_sender_that_is_sure_to_send(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    sqlite_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    created_ago: timedelta,
+    started_ago: timedelta | None,
+    finishes_before_cancel: bool,
+    finalizer_durable: bool,
+    sender: str,
+) -> None:
+    svc, _build_response, _update_run = webhook_service
+    sessions, runs = _use_real_run_repositories(monkeypatch, sqlite_engine)
+    now = naive_utc_now()
+    await _seed_run(
+        sessions,
+        "wr_cancel",
+        status=status,
+        # A row an earlier cancel already canceled is finished.
+        finished_at=now if status == "canceled" else None,
+        created_at=now - created_ago,
+        started_at=None if started_ago is None else now - started_ago,
+    )
+    phase = "cancel"
+    received: list[str] = []
+
+    async def endpoint(**_kwargs: Any) -> httpx.Response:
+        received.append(phase)
+        return _response(200, "ok")
+
+    monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AsyncMock(side_effect=endpoint))
+
+    async def cancel_row(workflow_run_id: str) -> WorkflowRun:
+        if finishes_before_cancel:
+            await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.completed)
+        canceled = await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.canceled)
+        current = canceled or await runs.get_workflow_run(workflow_run_id)
+        assert current is not None
+        return current
+
+    executor = _DurableFinalizerExecutor() if finalizer_durable else BackgroundTaskExecutor()
+    monkeypatch.setattr(svc, "mark_workflow_run_as_canceled", cancel_row)
+    monkeypatch.setattr(run_service.app, "WORKFLOW_SERVICE", svc)
+    monkeypatch.setattr(run_service.uploaded_file_service, "delete_files_attached_to_run", AsyncMock())
+    monkeypatch.setattr(run_service.AsyncExecutorFactory, "get_executor", lambda: executor)
+
+    await run_service.cancel_workflow_run("wr_cancel", organization_id="o_once")
+    phase = "finalizer"
+    final_run = await runs.get_workflow_run("wr_cancel")
+    assert final_run is not None and final_run.status.is_final()
+    await svc.execute_workflow_webhook(final_run, finalizer="worker_cleanup")
+
+    assert received == [sender]
 
 
 @pytest.mark.asyncio

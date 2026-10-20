@@ -42,6 +42,7 @@ SENSITIVE_HEADERS = {
     "x-marketplace-api-key",
     "x-posthog-attribution",
     "x-copilot-credential-recovery-token",
+    "x-skyvern-signature",
     "stripe-signature",
 }
 

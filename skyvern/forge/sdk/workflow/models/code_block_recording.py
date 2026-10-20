@@ -11,6 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -347,12 +348,15 @@ class CodeBlockActionRecording:
             return
         self._finalized = True
         try:
-            await app.DATABASE.tasks.update_task(
+            status = TaskStatus.completed if success else TaskStatus.failed
+            lease_lost = await run_lease_lost(self._workflow_run_id)
+            task = await app.DATABASE.tasks.update_task(
                 task_id=self._task.task_id,
                 organization_id=self._organization_id,
-                status=TaskStatus.completed if success else TaskStatus.failed,
+                status=status,
+                keep_final_status=lease_lost,
             )
-            if self._step is not None:
+            if self._step is not None and (not lease_lost or task.status == status):
                 await app.DATABASE.tasks.update_step(
                     task_id=self._task.task_id,
                     step_id=self._step.step_id,

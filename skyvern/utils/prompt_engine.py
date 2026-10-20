@@ -2,11 +2,12 @@ from collections.abc import Callable
 from typing import Any
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr, model_validator
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.forge.failure_classifier import partition_failure_categories
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.strings import escape_code_fences
@@ -49,9 +50,24 @@ class MaxStepsReasonResponse(BaseModel):
     reasoning: str
     errors: list[UserDefinedError] = []
     failure_categories: list[dict] = []
+    # Model output must not be able to set or invalidate this derived state.
+    _rejected_failure_categories: list[str] = PrivateAttr(default_factory=list)
     # Explicit provenance for failure_categories. Set by short-circuit paths
     # to avoid the caller inferring "llm" from the presence of categories.
     failure_category_source: str | None = None
+
+    @model_validator(mode="after")
+    def _bound_failure_categories(self) -> "MaxStepsReasonResponse":
+        kept, rejected = partition_failure_categories(self.failure_categories)
+        if rejected:
+            LOG.warning(
+                "Summary model returned failure categories outside the known taxonomy",
+                rejected_category_count=len(rejected),
+                kept_category_count=len(kept),
+            )
+        self.failure_categories = kept
+        self._rejected_failure_categories = rejected
+        return self
 
 
 PROMPT_HARD_CEILING_TOKENS = 180_000

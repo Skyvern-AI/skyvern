@@ -736,6 +736,13 @@ def _extract_text(response: Any) -> str | None:
     return _get(message, "content")
 
 
+def _extract_finish_reason(response: Any) -> str | None:
+    choices = _get(response, "choices") or []
+    if not choices:
+        return None
+    return _get(choices[0], "finish_reason")
+
+
 def _extract_reasoning_summary(response: Any) -> str | None:
     """The provider's reasoning summary (message.reasoning_content), when litellm's chat->responses
     bridge returned one -- surfaces the provider's reasoning summary where available; a tool call
@@ -3159,9 +3166,11 @@ class _PerceptionStore:
         self.entries[index] = entry
         return content
 
-    def compact(self, messages: list[dict[str, Any]]) -> None:
-        """Run before every LLM call. The unread round (after the last assistant message) is never elided
-        and never charged: one batched turn must not evict every earlier read."""
+    def compact(self, messages: list[dict[str, Any]]) -> int | None:
+        """Run before every LLM call; returns the lowest message index it rewrote. The unread round (after the
+        last assistant message) is never elided and never charged: one batched turn must not evict every
+        earlier read."""
+        before = [m.get("content") for m in messages]
         last_assistant_idx = -1
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "assistant":
@@ -3199,6 +3208,7 @@ class _PerceptionStore:
                 charged -= len(messages[i]["content"])
                 self._elide(messages, i)
         self.retained_chars_peak = max(self.retained_chars_peak, charged)
+        return next((i for i, content in enumerate(before) if messages[i].get("content") != content), None)
 
     def _floor(self, read: list[int], newest: dict[tuple[str, str, str], int]) -> set[int]:
         """The newest reads the model has seen, one per key, that an epoch never elides."""
@@ -3478,6 +3488,7 @@ async def run_agent_tool_loop(
     # frame cannot be read: evidence the action did something, for the step-cap completion offer.
     action_effect_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     unseen_text: UnseenPageText | None = None,
+    anthropic_cache_markers: bool = False,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -3821,23 +3832,25 @@ async def run_agent_tool_loop(
         active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
     def _degrade_call_params(exc: BaseException) -> bool:
-        """Drop the optional reasoning-summary dict and report whether the turn is worth re-issuing.
+        """Drop one optional call param (the reasoning-summary dict, then the Claude cache markers for the rest
+        of the run) and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
         on a run that was already failing. A context-window overflow is excluded because dropping a
         parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
         value, so a provider that rejects the dict form cannot end the run on turn 1.
         """
+        nonlocal anthropic_cache_markers
         if isinstance(exc, SkyvernContextWindowExceededError):
             return False
-        if active_call_kwargs.pop("reasoning_effort", None) is not None:
-            LOG.warning(
-                "taskv3 loop retrying without optional call param",
-                dropped="reasoning_effort",
-                turn=st.turns,
-                exc_info=True,
-            )
-            return True
+        for param in ("reasoning_effort", "cache_control_injection_points"):
+            if active_call_kwargs.pop(param, None) is not None:
+                if param == "cache_control_injection_points":
+                    anthropic_cache_markers = False
+                LOG.warning(
+                    "taskv3 loop retrying without optional call param", dropped=param, turn=st.turns, exc_info=True
+                )
+                return True
         return False
 
     # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
@@ -4080,8 +4093,26 @@ async def run_agent_tool_loop(
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
-        st.reads.compact(st.messages)
+        rewritten_at = st.reads.compact(st.messages)
         llm_caller.message_history = list(st.messages)
+        if anthropic_cache_markers:
+            # Not -1: a look image rides after the transcript for this call only. The mark before the newest
+            # observe writes the entry that the call superseding it reads back at the rewrite mark.
+            marked = {0, len(st.messages) - 1}
+            newest_observe = max(
+                (i for i, e in st.reads.entries.items() if e.tool == "observe" and e.shown), default=None
+            )
+            for read_at in (rewritten_at, newest_observe):
+                if read_at is None:
+                    continue
+                # litellm drops a mark placed on an assistant turn with no text.
+                mark_at = read_at - 1
+                while st.messages[mark_at]["role"] == "assistant":
+                    mark_at -= 1
+                marked.add(mark_at)
+            active_call_kwargs["cache_control_injection_points"] = [
+                {"location": "message", "index": i} for i in sorted(marked)
+            ]
         # Consume any pending look image into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
         screenshots_for_call = st.pending_screenshots or None
@@ -4172,7 +4203,9 @@ async def run_agent_tool_loop(
 
         if not tool_calls:
             st.no_tool_call_turns += 1
-            LOG.info("taskv3 loop turn produced no tool call", turn=st.turns)
+            LOG.info(
+                "taskv3 loop turn produced no tool call", turn=st.turns, finish_reason=_extract_finish_reason(response)
+            )
             st.messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
             continue
 

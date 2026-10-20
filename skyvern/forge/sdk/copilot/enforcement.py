@@ -13,7 +13,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import structlog
@@ -23,11 +23,13 @@ from agents.memory.session import Session
 from agents.run import Runner
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
+from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiredReplyObservation,
     BudgetExpirySource,
@@ -65,7 +67,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_TOKEN_BUDGET,
     CopilotConfig,
 )
-from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME
+from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
@@ -107,7 +109,11 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    CarriesPendingScreenshots,
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+)
 from skyvern.forge.sdk.copilot.steer import take_steer_input, watch_for_steer
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -145,6 +151,8 @@ LOG = structlog.get_logger()
 
 TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
+ToolT = TypeVar("ToolT", bound=Tool)
+BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # A turn whose budget is already spent may have no backstop time left for its one final reply, so
 # that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.
@@ -356,21 +364,14 @@ def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
     return now - start_time - pause_seconds - question_seconds - active_wait_seconds
 
 
-def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteration: int) -> None:
-    elapsed = _elapsed_run_seconds(ctx, start_time)
-    if elapsed >= TOTAL_TIMEOUT_SECONDS:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
-
-
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
-    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+    """Record a cancellation raised at a model-call boundary; the turn deadline never arrives as a cancellation.
 
     Synchronous and never raising, so the caller's ``raise`` re-raises the original
     cancellation neither masked nor delayed.
     """
     try:
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
         ctx.copilot_turn_cancelled_iteration = iteration
         LOG.warning(
             "copilot_turn_cancelled",
@@ -481,6 +482,12 @@ def _same_page(left: str | None, right: str | None) -> bool:
     left_path = (left_parsed.path or "/").rstrip("/") or "/"
     right_path = (right_parsed.path or "/").rstrip("/") or "/"
     return left_path == right_path
+
+
+def pending_screenshot_entry(ctx: object) -> ScreenshotEntry | None:
+    if not isinstance(ctx, CarriesPendingScreenshots) or not ctx.pending_screenshots:
+        return None
+    return ctx.pending_screenshots[0]
 
 
 def pending_screenshot_message(ctx: Any, *, sharp: bool = False) -> dict[str, Any] | None:
@@ -1433,18 +1440,15 @@ async def _run_streamed_with_deadline(
     return result
 
 
-async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
-    """Results by call id when the response in progress names a tool the request did not offer, else None.
+def budget_drain_tools(tools: Sequence[ToolT]) -> list[ToolT]:
+    return [tool for tool in tools if tool.name not in BUDGET_DRAIN_EXCLUDED_TOOLS]
+
+
+def unrun_call_outputs(calls: Sequence[ResponseFunctionToolCall], offered: set[str]) -> dict[str, str] | None:
+    """Results by call id when a response names a tool the request did not offer, else None.
     The SDK rejects such a response before running any of its calls, so every call gets a result."""
-    response = ctx.last_model_response
-    if response is None:
+    if all(call.name in offered for call in calls):
         return None
-    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
-    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
-    unknown = sorted({call.name for call in calls if call.name not in offered})
-    if not unknown:
-        return None
-    LOG.warning("copilot_unknown_tool_call", tool_names=unknown, call_count=len(calls))
     return {
         call.call_id: json.dumps(
             {
@@ -1458,6 +1462,22 @@ async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, st
         )
         for call in calls
     }
+
+
+async def _unrun_call_outputs(agent: Agent, ctx: CopilotContext) -> dict[str, str] | None:
+    response = ctx.last_model_response
+    if response is None:
+        return None
+    calls = [item for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+    offered = {tool.name for tool in await agent.get_all_tools(RunContextWrapper(ctx))}
+    outputs = unrun_call_outputs(calls, offered)
+    if outputs is not None:
+        LOG.warning(
+            "copilot_unknown_tool_call",
+            tool_names=sorted({call.name for call in calls if call.name not in offered}),
+            call_count=len(calls),
+        )
+    return outputs
 
 
 async def _save_unrun_call_results(
@@ -1572,7 +1592,7 @@ async def _run_budget_drain(
     )
     try:
         result = await _run_drain(
-            agent,
+            agent.clone(tools=budget_drain_tools(agent.tools)),
             observation,
             ctx,
             session,
@@ -2147,10 +2167,16 @@ async def run_with_enforcement(
     **runner_kwargs: Any,
 ) -> RunResultStreaming:
     """Run agent with enforcement nudges, preserving conversation history."""
+    # A retry after a failed drain would otherwise restart the full tool set.
+    if ctx.budget_expiry_state.drain_attempted:
+        raise MaxTurnsExceeded("Budget drain already attempted")
     session = runner_kwargs.pop("session", None)
     copilot_config = runner_kwargs.pop("copilot_config", None) or CopilotConfig()
+    token_budget = runner_kwargs.pop("token_budget", None) or copilot_config.token_budget or TOKEN_BUDGET
     current_input: str | list = initial_input
-    start_time = time.monotonic()
+    # A fallback or model-lookup retry resumes the turn's clock, so the turn keeps one deadline and one backstop.
+    resumed = ctx.copilot_run_start_monotonic is not None
+    start_time = ctx.copilot_run_start_monotonic if resumed else time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
     install_pending_operation_slot(ctx)
     iteration = 0
@@ -2163,7 +2189,7 @@ async def run_with_enforcement(
         # the agent keeps running so the reply can be persisted to the
         # chat history on the server side (see SKY-8986).
         elapsed = _elapsed_run_seconds(ctx, start_time)
-        if iteration > 0 and elapsed >= TOTAL_TIMEOUT_SECONDS:
+        if (iteration > 0 or resumed) and elapsed >= TOTAL_TIMEOUT_SECONDS:
             _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
             return await _run_budget_drain(
                 agent,
@@ -2182,11 +2208,11 @@ async def run_with_enforcement(
         if isinstance(current_input, list):
             est = estimate_tokens(current_input)
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
-            if est > copilot_config.token_budget:
+            if est > token_budget:
                 LOG.warning(
                     "Token estimate exceeds budget, aggressively pruning",
                     tokens=est,
-                    budget=copilot_config.token_budget,
+                    budget=token_budget,
                 )
                 current_input = aggressive_prune(current_input)
 
@@ -2381,9 +2407,16 @@ async def run_with_enforcement(
 
         # OpenAI rejects images in tool messages, so a queued post-run
         # screenshot rides as its own user message just before the nudge.
+        entry = pending_screenshot_entry(ctx)
         screenshot_msg = _consume_pending_screenshots(ctx)
         if screenshot_msg is not None:
-            LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
+            LOG.info(
+                "Injecting screenshot user message",
+                count=len(screenshot_msg["content"]) - 1,
+                source_tool=entry.provenance.source_tool if entry else None,
+                capture_id=entry.capture_id if entry else None,
+                capture_event_id=entry.capture_event_id if entry else None,
+            )
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
             extra_msgs = _assemble_enforcement_messages(screenshot_msg, decision.message)

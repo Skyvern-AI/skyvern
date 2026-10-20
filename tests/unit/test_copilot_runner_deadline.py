@@ -253,19 +253,21 @@ async def _cancel_at_boundary(
     return logs, stream_calls["n"]
 
 
+@pytest.mark.parametrize("elapsed", [588.0, TOTAL_TIMEOUT_SECONDS + 50.0])
 @pytest.mark.parametrize("boundary", ["first", "overflow", "retry"])
 @pytest.mark.asyncio
-async def test_sub_budget_cancellation_records_once_at_every_model_call_boundary(
+async def test_a_cancellation_records_once_at_every_model_call_boundary_and_never_as_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
+    elapsed: float,
 ) -> None:
     ctx = _cancellation_ctx()
 
-    logs, stream_calls = await _cancel_at_boundary(monkeypatch, boundary=boundary, elapsed=588.0, ctx=ctx)
+    logs, stream_calls = await _cancel_at_boundary(monkeypatch, boundary=boundary, elapsed=elapsed, ctx=ctx)
 
     events = _cancellation_events(logs)
     assert len(events) == 1
-    assert 588.0 <= events[0]["elapsed_seconds"] < TOTAL_TIMEOUT_SECONDS
+    assert events[0]["elapsed_seconds"] >= elapsed
     assert events[0]["iteration"] == 0
     assert events[0]["deadline_exceeded"] is False
     assert _deadline_events(logs) == []
@@ -273,41 +275,6 @@ async def test_sub_budget_cancellation_records_once_at_every_model_call_boundary
     assert ctx.copilot_turn_cancelled_iteration == 0
     if boundary == "retry":
         assert stream_calls == 2, "the retry boundary must run after an overflow recovery"
-
-
-@pytest.mark.asyncio
-async def test_over_budget_cancellation_records_the_deadline_beside_the_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _cancellation_ctx()
-
-    logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=950.0, ctx=ctx)
-
-    events = _cancellation_events(logs)
-    assert len(events) == 1
-    assert events[0]["elapsed_seconds"] >= TOTAL_TIMEOUT_SECONDS
-    assert events[0]["deadline_exceeded"] is True
-    assert len(_deadline_events(logs)) == 1
-    assert ctx.copilot_total_timeout_exceeded is True
-
-
-@pytest.mark.asyncio
-async def test_a_broken_recorder_neither_masks_nor_delays_the_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def exploding_mark(ctx: Any, start_time: float, iteration: int) -> None:
-        raise RuntimeError("recorder is broken")
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.enforcement._mark_copilot_total_timeout_if_elapsed",
-        exploding_mark,
-    )
-    ctx = _cancellation_ctx()
-
-    logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=588.0, ctx=ctx)
-
-    assert _cancellation_events(logs) == []
-    assert any(entry.get("event") == "Failed to record a copilot turn cancellation" for entry in logs)
 
 
 @pytest.mark.asyncio

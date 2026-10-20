@@ -1,10 +1,12 @@
 import type { WorkflowBlock, WorkflowParameter } from "../types/workflowTypes";
 import type { InsertionPoint } from "@/store/RecordedBlocksStore";
+import type { WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
 
 type WorkflowNodeLike = {
   id: string;
   type?: string;
   parentId?: string;
+  data?: { label?: unknown };
 };
 
 type WorkflowEdgeLike = {
@@ -34,6 +36,29 @@ function resolveAppendInsertionPoint(
     parent: undefined,
     connectingEdgeType: "default",
   };
+}
+
+function demonstrationInsertionFromNodes(
+  nodes: Array<WorkflowNodeLike>,
+  insertionPoint: Pick<InsertionPoint, "previous" | "next" | "parent">,
+): WorkflowCopilotDemonstrationInsertion | null {
+  const labelFor = (nodeId: string | null) => {
+    const node = nodes.find((candidate) => candidate.id === nodeId);
+    if (!node || node.type === "start" || node.type === "nodeAdder")
+      return null;
+    const label = node.data?.label;
+    return typeof label === "string" && label.length > 0 ? label : null;
+  };
+  const insertion = {
+    after_label: labelFor(insertionPoint.previous),
+    before_label: labelFor(insertionPoint.next),
+  };
+  const parent =
+    insertionPoint.parent ??
+    nodes.find((node) => node.id === insertionPoint.previous)?.parentId;
+  return parent && !insertion.after_label && !insertion.before_label
+    ? null
+    : insertion;
 }
 
 function applySopResultAtCurrentAppend({
@@ -105,6 +130,7 @@ function resolveWorkspaceAuthoringActionAvailability({
 
 export {
   applySopResultAtCurrentAppend,
+  demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
 };

@@ -40,6 +40,7 @@ from skyvern.forge.sdk.services.credential.bitwarden_credential_service import B
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
+from skyvern.forge.sdk.services.credential.onepassword_credential_vault_service import OnePasswordCredentialVaultService
 from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -109,6 +110,7 @@ class ForgeApp:
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     GCP_CREDENTIAL_VAULT_SERVICE: GcpCredentialVaultService | None
+    ONEPASSWORD_CREDENTIAL_VAULT_SERVICE: OnePasswordCredentialVaultService
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
     scrape_exclude: ScrapeExcludeFunc | None
@@ -289,6 +291,7 @@ def create_forge_app() -> ForgeApp:
         SkyvernCredentialVaultService() if settings.is_local_credential_vault_enabled() else None
     )
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
+    app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE = OnePasswordCredentialVaultService()
 
     # Azure Credential Vault Service
     # If running a workload on Azure and using workload identity (the common case for AKS or Azure VMs),
@@ -339,6 +342,7 @@ def create_forge_app() -> ForgeApp:
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.ONEPASSWORD: app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE,
     }
 
     app.scrape_exclude = None

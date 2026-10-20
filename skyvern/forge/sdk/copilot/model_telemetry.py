@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import json
@@ -31,6 +32,7 @@ from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import Usage as LiteLLMUsage
+from litellm.utils import CustomStreamWrapper
 from openai import AsyncStream, omit
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
@@ -58,6 +60,9 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+# Anthropic sends each tool argument in one piece after a silence as long as its generation, so this must stay
+# above the time to write the largest argument (~29k tokens at the slowest observed Sonnet rate).
+_STREAM_PROGRESS_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,10 +347,73 @@ def _capture_responses_stop_metadata(telemetry: CopilotModelCallTelemetry, respo
         telemetry.content_filter = False
 
 
-class _UsageCapturingStream:
+def _is_stream_progress(chunk: ChatCompletionChunk) -> bool:
+    for choice in chunk.choices:
+        delta = choice.delta
+        if choice.finish_reason or delta.content or delta.tool_calls:
+            return True
+        # Keep-alives arrive as empty deltas, and an empty thinking delta is not output. LiteLLM deletes unset
+        # reasoning fields from its Delta, so they are read with getattr.
+        if getattr(delta, "reasoning_content", None):
+            return True
+        for block in getattr(delta, "thinking_blocks", None) or ():
+            if block.get("thinking") or block.get("signature") or block.get("data"):
+                return True
+    return False
+
+
+class _ProgressGuardedStream:
     def __init__(
         self,
         stream: AsyncStream[ChatCompletionChunk],
+        model: str,
+        telemetry: CopilotModelCallTelemetry | None,
+    ) -> None:
+        self._stream = stream
+        self._iterator = stream.__aiter__()
+        self._model = model
+        self._telemetry = telemetry
+        self._last_progress = asyncio.get_running_loop().time()
+        self._made_progress = False
+        self._chunks_seen = 0
+
+    def __aiter__(self) -> _ProgressGuardedStream:
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        timeout = asyncio.timeout_at(self._last_progress + _STREAM_PROGRESS_TIMEOUT_SECONDS)
+        try:
+            async with timeout:
+                chunk = await self._iterator.__anext__()
+        except TimeoutError:
+            if not timeout.expired():
+                raise
+            served_provider = self._telemetry.served_provider if self._telemetry is not None else None
+            if served_provider is None and isinstance(self._stream, CustomStreamWrapper):
+                served_provider = self._stream.custom_llm_provider
+            LOG.warning(
+                "Copilot model stream made no progress",
+                model=self._model,
+                served_provider=served_provider,
+                made_progress=self._made_progress,
+                chunks_seen=self._chunks_seen,
+            )
+            raise litellm.Timeout(
+                f"Copilot model stream made no progress for {_STREAM_PROGRESS_TIMEOUT_SECONDS:g} s",
+                model=self._model,
+                llm_provider=served_provider or "",
+            ) from None
+        self._chunks_seen += 1
+        if _is_stream_progress(chunk):
+            self._made_progress = True
+            self._last_progress = asyncio.get_running_loop().time()
+        return chunk
+
+
+class _UsageCapturingStream:
+    def __init__(
+        self,
+        stream: AsyncIterator[ChatCompletionChunk],
         telemetry: CopilotModelCallTelemetry,
     ) -> None:
         self._stream = stream
@@ -710,9 +778,10 @@ class CopilotLitellmModel(LitellmModel):
             return result
 
         response, response_stream = result
+        guarded_stream = _ProgressGuardedStream(response_stream, self.model, telemetry)
         if telemetry is None:
-            return result
-        capturing_stream = _UsageCapturingStream(response_stream, telemetry)
+            return response, cast(AsyncStream[ChatCompletionChunk], guarded_stream)
+        capturing_stream = _UsageCapturingStream(guarded_stream, telemetry)
         return response, cast(AsyncStream[ChatCompletionChunk], capturing_stream)
 
     async def _fetch_explicit_responses(

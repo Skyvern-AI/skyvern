@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import threading
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -28,10 +29,12 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 import skyvern._cli_bootstrap as cli_bootstrap
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
@@ -46,6 +49,7 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -67,6 +71,26 @@ from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+LOOPBACK_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# The schema fixture only adds and drops a schema, so it also accepts the compose service name.
+LOCAL_POSTGRES_HOSTS = LOOPBACK_POSTGRES_HOSTS | {"postgres"}
+# Any other query key (host, hostaddr, service, dbname, port, user, options, ...) can change which server or database
+# libpq reaches, so unknown keys are rejected instead of listing the bad ones.
+POSTGRES_NON_ROUTING_QUERY_KEYS = frozenset({"connect_timeout", "application_name", "sslmode"})
+# These env vars redirect a connection even when the URL names its host; PGPORT does so only when the URL has no port.
+POSTGRES_HOST_OVERRIDE_ENV_VARS = ("PGHOSTADDR", "PGSERVICE")
+
+
+def skip_unless_local_postgres(url: URL, hosts: frozenset[str] = LOCAL_POSTGRES_HOSTS) -> None:
+    if url.get_backend_name() != "postgresql" or url.host not in hosts:
+        pytest.skip(f"needs a PostgreSQL on one of: {', '.join(sorted(hosts))}")
+    overrides = sorted(set(url.query) - POSTGRES_NON_ROUTING_QUERY_KEYS)
+    overrides += [name for name in POSTGRES_HOST_OVERRIDE_ENV_VARS if os.environ.get(name)]
+    if url.port is None and os.environ.get("PGPORT"):
+        overrides.append("PGPORT")
+    if overrides:
+        pytest.skip(f"{', '.join(overrides)} could redirect the connection away from the intended local PostgreSQL")
 
 
 def fake_download_registration_app(
@@ -242,14 +266,18 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
 def reset_cli_runtime_entry() -> Iterator[None]:
     """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
 
+    A CLI command also labels the process's API client as the CLI, which must not leak into a later MCP test.
+
     Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
     against the default production URL in any later test that builds a cloud client. The env
     load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
     """
     entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    command_running = cli_bootstrap._CLI_COMMAND_RUNNING
     loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
     yield
     cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    cli_bootstrap._CLI_COMMAND_RUNNING = command_running
     for name, value in loaded.items():
         if value is None:
             os.environ.pop(name, None)
@@ -413,6 +441,34 @@ async def sqlite_engine_factory(
 @pytest_asyncio.fixture
 async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
     return sqlite_engine_factory()
+
+
+@pytest.fixture
+def postgres_scratch_database() -> Iterator[Engine]:
+    url = make_url(str(settings.DATABASE_STRING))
+    # Loopback only: a generic name like postgres could resolve to a shared server, and this drops a database.
+    skip_unless_local_postgres(url, LOOPBACK_POSTGRES_HOSTS)
+    url = url.set(drivername="postgresql+psycopg")
+    # A database, not a schema: CREATE INDEX CONCURRENTLY waits for every older snapshot in its database, so a
+    # transaction another test leaves open in the shared one would stall the build until statement_timeout.
+    database = f"test_scratch_{uuid.uuid4().hex}"
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            if not connection.exec_driver_sql(
+                "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user"
+            ).scalar_one():
+                pytest.skip("needs a PostgreSQL role that can create databases")
+            connection.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        engine = create_engine(url.set(database=database))
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+            with admin.connect() as connection:
+                connection.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        admin.dispose()
 
 
 def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object] | None = None) -> MagicMock:
@@ -1031,11 +1087,20 @@ RUN_GROUP_WPID = "wpid_test"
 
 
 @dataclass
-class FakeExecutor:
+class FakeExecutor(AsyncExecutor):
     database: AgentDB
     executed: list[str] = field(default_factory=list)
     submitted: list[str] = field(default_factory=list)
     before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_task(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_task_v2(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_script(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
 
     async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
         self.executed.append(workflow_run_id)

@@ -557,6 +557,7 @@ class _FakeSequencedDownloadSession:
     def __init__(self, responses: list[_FakeDownloadResponse]) -> None:
         self._responses = list(responses)
         self.requested_urls: list[str] = []
+        self.cookie_jar = aiohttp.CookieJar()
 
     def get(
         self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True

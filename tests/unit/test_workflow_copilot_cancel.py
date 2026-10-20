@@ -61,6 +61,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotPendingTurn,
     WorkflowCopilotCancelRequest,
     WorkflowCopilotChat,
     WorkflowCopilotChatRequest,
@@ -279,6 +280,7 @@ async def _drive_cancel_route(
     agent_result: SimpleNamespace,
     keep_pending_proposal: bool = False,
     user_cancel: bool = True,
+    cancel_token: str = "tok_abc",
 ) -> tuple[AsyncMock, SimpleNamespace, list[Any]]:
     """Run a single chat-post + handler turn and return (restore_mock, workflow_params, sent_payloads)."""
     captured = install_fake_create(monkeypatch)
@@ -295,7 +297,9 @@ async def _drive_cancel_route(
     organization = SimpleNamespace(organization_id="org-1")
 
     response = await workflow_copilot_chat_post(
-        request, _make_chat_request(keep_pending_proposal=keep_pending_proposal), organization
+        request,
+        _make_chat_request(cancel_token=cancel_token, keep_pending_proposal=keep_pending_proposal),
+        organization,
     )
     assert response is captured["sentinel"]
 
@@ -1282,6 +1286,33 @@ async def test_watcher_reports_the_gesture_the_cancel_named() -> None:
     assert handler_task.cancelled() or handler_task.cancelling()
 
 
+@pytest.mark.asyncio
+async def test_a_new_turn_stops_the_turn_still_running_in_its_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.routes.workflow_copilot.COPILOT_CANCEL_POLL_SECONDS", 0.01)
+    cache = _FakeCache()
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+    chat = _make_chat(auto_accept=False)
+    chat.pending_turns = {
+        "turn-a": CopilotPendingTurn(turn_id="turn-a", started_at=datetime.now(timezone.utc), cancel_token="tok-a")
+    }
+    older_handler = asyncio.create_task(asyncio.sleep(60))
+    observed: list[bool] = [False]
+    older_watcher = asyncio.create_task(_watch_for_cancel(cache, "org-1", "tok-a", older_handler, observed))
+    agent_result = AgentResult(
+        user_response="Done.", updated_workflow=None, global_llm_context=None, workflow_yaml=None, turn_outcome=None
+    )
+
+    await _drive_cancel_route(
+        monkeypatch, chat, _make_original_workflow(), agent_result, user_cancel=False, cancel_token="tok-b"
+    )
+
+    await asyncio.wait_for(older_watcher, timeout=2.0)
+    with pytest.raises(asyncio.CancelledError):
+        await older_handler
+    assert observed[0] is True
+    assert _copilot_cancel_key("org-1", "tok-b") not in cache.store
+
+
 # ---------------------------------------------------------------------------
 # Operational cancel disambiguation
 # ---------------------------------------------------------------------------
@@ -1300,6 +1331,7 @@ async def test_a_cancel_after_the_agent_built_its_context_writes_one_row_with_it
         organization_id="org-1",
         proposed_workflow=None,
         auto_accept=False,
+        pending_turns={},
     )
     original_workflow = fake_workflow(
         workflow_id="wf-canonical",

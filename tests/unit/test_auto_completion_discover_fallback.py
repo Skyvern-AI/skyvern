@@ -13,10 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import NoIncrementalElementFoundForAutoCompletion, NoSuitableAutoCompleteOption
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
     AutoCompletionResult,
+    choose_auto_completion_dropdown,
     discover_and_select_from_full_dropdown,
     input_or_auto_complete_input,
 )
@@ -560,14 +562,17 @@ async def test_discover_fallback_rescrape_diff_no_new_elements() -> None:
 async def test_input_or_auto_complete_calls_discover_fallback_on_failure() -> None:
     """When all auto-completion attempts fail, the discover fallback is called."""
     skyvern_el = _mock_skyvern_element()
+    probe = AsyncMock(
+        return_value=AutoCompletionResult(
+            incremental_elements=DROPDOWN_OPTIONS,
+            action_result=ActionFailure(
+                exception=NoSuitableAutoCompleteOption(reasoning=None, target_value="Decline to Self Identify")
+            ),
+        )
+    )
 
     with (
-        patch(
-            "skyvern.webeye.actions.handler.choose_auto_completion_dropdown",
-            new=AsyncMock(
-                return_value=AutoCompletionResult(action_result=ActionFailure(exception=Exception("no match")))
-            ),
-        ),
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=probe),
         patch("skyvern.webeye.actions.handler.app") as mock_app,
         patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
         patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
@@ -580,6 +585,7 @@ async def test_input_or_auto_complete_calls_discover_fallback_on_failure() -> No
             return_value={
                 "potential_values": [
                     {"value": "I prefer not to answer", "relevance_float": 0.9, "reasoning": "synonym"},
+                    {"value": "Prefer not to say", "relevance_float": 0.8, "reasoning": "synonym"},
                 ]
             }
         )
@@ -599,7 +605,292 @@ async def test_input_or_auto_complete_calls_discover_fallback_on_failure() -> No
         )
 
         assert isinstance(result, ActionSuccess)
+        assert [attempt.kwargs["text"] for attempt in probe.await_args_list] == [
+            "Decline to Self Identify",
+            "I prefer not to answer",
+            "Prefer not to say",
+        ]
         mock_discover.assert_awaited_once()
+        mock_app.SECONDARY_LLM_API_HANDLER.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attributes", "tag_name", "is_location_input"),
+    [
+        ({"role": "combobox", "aria-autocomplete": "list"}, "input", False),
+        ({"data-x-bind": "someAutocomplete"}, "input", False),
+        ({"class": "autocomplete-input"}, "input", False),
+        ({"class": "skillset tagsinput"}, "input", False),
+        ({}, "input", True),
+    ],
+)
+async def test_input_or_auto_complete_retries_candidate_for_query_only_typeahead(
+    attributes: dict[str, str], tag_name: str, is_location_input: bool
+) -> None:
+    """Regression pin: query-only inputs can return California for CA despite no initial options."""
+    skyvern_el = _mock_skyvern_element()
+    skyvern_el.get_attributes.return_value = attributes
+    skyvern_el.get_tag_name.return_value = tag_name
+    probe = AsyncMock(
+        side_effect=[
+            AutoCompletionResult(
+                action_result=ActionFailure(
+                    exception=NoIncrementalElementFoundForAutoCompletion(element_id="elem-sex", text="CA")
+                )
+            ),
+            AutoCompletionResult(action_result=ActionSuccess()),
+        ]
+    )
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=probe),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=ActionSuccess()),
+        ) as mock_discover,
+    ):
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(
+            return_value={"potential_values": [{"value": "California", "relevance_float": 0.9}]}
+        )
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(field="State", is_location_input=is_location_input),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="CA",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            is_secret_value=False,
+        )
+
+        assert isinstance(result, ActionSuccess)
+        assert [attempt.kwargs["text"] for attempt in probe.await_args_list] == ["CA", "California"]
+        assert probe.await_args_list[1].kwargs["allow_full_page_rescrape"] is False
+        mock_app.SECONDARY_LLM_API_HANDLER.assert_awaited_once()
+        mock_discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_input_or_auto_complete_retries_remaining_candidates_after_empty_probe() -> None:
+    """Keep trying generated queries until a query-only typeahead returns options."""
+    skyvern_el = _mock_skyvern_element()
+    probe = AsyncMock(
+        side_effect=[
+            AutoCompletionResult(
+                action_result=ActionFailure(
+                    exception=NoIncrementalElementFoundForAutoCompletion(element_id="elem-sex", text="Barnstable")
+                )
+            ),
+            AutoCompletionResult(
+                action_result=ActionFailure(
+                    exception=NoIncrementalElementFoundForAutoCompletion(
+                        element_id="elem-sex", text="Barnstable County"
+                    )
+                )
+            ),
+            AutoCompletionResult(action_result=ActionSuccess()),
+        ]
+    )
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=probe),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=ActionSuccess()),
+        ) as mock_discover,
+    ):
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(
+            return_value={
+                "potential_values": [
+                    {"value": "Barnstable County", "relevance_float": 0.9},
+                    {"value": "Barnstable Massachusetts", "relevance_float": 0.8},
+                ]
+            }
+        )
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(field="County"),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="Barnstable",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            is_secret_value=False,
+        )
+
+        assert isinstance(result, ActionSuccess)
+        assert [attempt.kwargs["text"] for attempt in probe.await_args_list] == [
+            "Barnstable",
+            "Barnstable County",
+            "Barnstable Massachusetts",
+        ]
+        assert all(attempt.kwargs["allow_full_page_rescrape"] is False for attempt in probe.await_args_list[1:])
+        mock_app.SECONDARY_LLM_API_HANDLER.assert_awaited_once()
+        mock_discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_input_or_auto_complete_continues_after_unmatched_candidate_options() -> None:
+    skyvern_el = _mock_skyvern_element()
+    no_options = AutoCompletionResult(
+        action_result=ActionFailure(
+            exception=NoIncrementalElementFoundForAutoCompletion(element_id="elem-sex", text="Barnstable")
+        )
+    )
+    unmatched_options = AutoCompletionResult(
+        incremental_elements=DROPDOWN_OPTIONS,
+        action_result=ActionFailure(
+            exception=NoSuitableAutoCompleteOption(reasoning=None, target_value="Barnstable County")
+        ),
+    )
+    probe = AsyncMock(side_effect=[no_options, unmatched_options, AutoCompletionResult(action_result=ActionSuccess())])
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=probe),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=ActionSuccess()),
+        ) as mock_discover,
+    ):
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(
+            return_value={
+                "potential_values": [
+                    {"value": "Barnstable County", "relevance_float": 0.9},
+                    {"value": "Barnstable Massachusetts", "relevance_float": 0.8},
+                ]
+            }
+        )
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(field="County"),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="Barnstable",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            is_secret_value=False,
+        )
+
+        assert isinstance(result, ActionSuccess)
+        assert [attempt.kwargs["text"] for attempt in probe.await_args_list] == [
+            "Barnstable",
+            "Barnstable County",
+            "Barnstable Massachusetts",
+        ]
+        assert all(attempt.kwargs["allow_full_page_rescrape"] is False for attempt in probe.await_args_list[1:])
+        mock_discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_input_or_auto_complete_uses_one_fallback_after_empty_candidate_probes() -> None:
+    skyvern_el = _mock_skyvern_element()
+    no_options = AutoCompletionResult(
+        action_result=ActionFailure(
+            exception=NoIncrementalElementFoundForAutoCompletion(element_id="elem-sex", text="")
+        )
+    )
+    probe = AsyncMock(side_effect=[no_options, no_options, no_options])
+
+    with (
+        patch("skyvern.webeye.actions.handler.choose_auto_completion_dropdown", new=probe),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.discover_and_select_from_full_dropdown",
+            new=AsyncMock(return_value=ActionSuccess()),
+        ) as mock_discover,
+    ):
+        mock_app.SECONDARY_LLM_API_HANDLER = AsyncMock(
+            return_value={"potential_values": [{"value": "Barnstable County"}, {"value": "Barnstable MA"}]}
+        )
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+
+        result = await input_or_auto_complete_input(
+            input_or_select_context=_make_context(field="County"),
+            scraped_page=MagicMock(),
+            page=MagicMock(),
+            dom=MagicMock(),
+            text="Barnstable",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            is_secret_value=False,
+        )
+
+        assert isinstance(result, ActionSuccess)
+        assert [attempt.kwargs["text"] for attempt in probe.await_args_list] == [
+            "Barnstable",
+            "Barnstable County",
+            "Barnstable MA",
+        ]
+        assert all(attempt.kwargs["allow_full_page_rescrape"] is False for attempt in probe.await_args_list[1:])
+        mock_app.SECONDARY_LLM_API_HANDLER.assert_awaited_once()
+        mock_discover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_candidate_probe_uses_one_fill_without_full_rescrape_or_selection_llm() -> None:
+    skyvern_el = _mock_skyvern_element()
+    scraped_page = MagicMock()
+    scraped_page.generate_scraped_page_without_screenshots = AsyncMock()
+    incremental_scrape = _mock_incremental_scrape([])
+    skyvern_frame = MagicMock(safe_wait_for_animation_end=AsyncMock())
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=incremental_scrape),
+        patch("skyvern.webeye.actions.handler.resolve_engine_selection_for_task", return_value=None),
+        patch("skyvern.webeye.actions.handler.app") as mock_app,
+    ):
+        mock_app.AGENT_FUNCTION = MagicMock()
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
+
+        result = await choose_auto_completion_dropdown(
+            context=_make_context(),
+            page=MagicMock(),
+            scraped_page=scraped_page,
+            dom=MagicMock(),
+            text="Barnstable County",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+            allow_full_page_rescrape=False,
+            is_secret_value=False,
+        )
+
+        assert isinstance(result.action_result, ActionFailure)
+        assert result.action_result.exception_type == NoIncrementalElementFoundForAutoCompletion.__name__
+        skyvern_el.press_fill.assert_awaited_once_with("Barnstable County")
+        incremental_scrape.get_incremental_element_tree.assert_awaited_once()
+        scraped_page.generate_scraped_page_without_screenshots.assert_not_awaited()
+        mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_not_awaited()
 
 
 @pytest.mark.asyncio

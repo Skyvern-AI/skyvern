@@ -68,7 +68,7 @@ export function CopilotActiveDot() {
   const label = attention
     ? COPILOT_ATTENTION_DOT[attention]
     : recording
-      ? "Copilot recording active"
+      ? "Copilot demonstration active"
       : "Copilot session active";
   return (
     <span
@@ -98,7 +98,7 @@ export function CopilotPaneStatus() {
         )}
         aria-hidden="true"
       />
-      {finishing ? "Finishing" : "Recording"}
+      {finishing ? "Finishing" : "Demonstrating"}
     </span>
   );
 }

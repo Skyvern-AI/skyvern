@@ -413,9 +413,10 @@ def _code_block_runtime_topic() -> dict[str, str]:
     safe_vars = CodeBlock.build_safe_vars()
     builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
     shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
-    helpers = sorted(name for name in safe_vars if name != "__builtins__" and name not in shims)
+    helpers = sorted(name for name in safe_vars if not name.startswith("__") and name not in shims)
     lines = [
-        "Names a code block's Python may use. Imports are blocked; the runtime binds everything listed here.",
+        "Names a code block's Python may use. The runtime binds everything listed here. The only importable "
+        "modules are the shims below; `import re` binds the shim, and any other import is rejected.",
         "",
         "Builtins: " + ", ".join(builtin_names),
         "",

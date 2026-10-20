@@ -32,6 +32,7 @@ from skyvern.forge.validation_evidence_router import (
     ValidationRouterResult,
 )
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils.strings import UNTRUSTED_WEB_PAGE_DATA_BEGIN
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -167,6 +168,11 @@ async def test_extract_action_prompt_uses_resolved_anthropic_handler(
 
     assert (context.cached_static_prompt is not None) is uses_anthropic_cache
     assert result.use_caching is uses_anthropic_cache
+    if uses_anthropic_cache:
+        assert context.cached_static_prompt is not None and context.cached_task_prompt
+        assert result.prompt.startswith(
+            f"{context.cached_static_prompt.rstrip()}\n\n{context.cached_task_prompt}{UNTRUSTED_WEB_PAGE_DATA_BEGIN}"
+        )
 
 
 @pytest.mark.asyncio

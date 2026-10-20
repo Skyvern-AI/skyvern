@@ -32,11 +32,23 @@ await page.frame_switch(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `selector` | — | `str \| None` | No | `None` | CSS selector for the iframe element (uses content_frame()). |
-| `name` | — | `str \| None` | No | `None` | Frame name attribute. |
-| `index` | — | `int \| None` | No | `None` | Frame index in page.frames list (0 = main frame). |
+<ParamField path={"selector"} type={"str | None"}>
+CSS selector for the iframe element (uses content_frame()).
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"name"} type={"str | None"}>
+Frame name attribute.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"index"} type={"int | None"}>
+Frame index in page.frames list (0 = main frame).
+
+Default: `None`
+</ParamField>
 
 **Returns** `dict[str, Any]` — Dict with frame name, url, and the parameter used to switch.
 

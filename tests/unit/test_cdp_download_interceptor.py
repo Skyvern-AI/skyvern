@@ -1472,6 +1472,7 @@ class TestCDPDownloadInterceptorProxyAuth:
                 },
             },
         )
+        assert interceptor.consume_navigation_auth_challenges() == (False, True)
 
     @pytest.mark.asyncio
     async def test_non_proxy_auth_cancels(self) -> None:
@@ -1494,6 +1495,7 @@ class TestCDPDownloadInterceptorProxyAuth:
                 "authChallengeResponse": {"response": "CancelAuth"},
             },
         )
+        assert interceptor.consume_navigation_auth_challenges() == (False, True)
 
     @pytest.mark.asyncio
     async def test_no_credentials_cancels_proxy_auth(self) -> None:
@@ -2271,6 +2273,8 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
+        assert interceptor.consume_navigation_auth_challenges() == (True, True)
+        assert interceptor.consume_navigation_auth_challenges() == (False, False)
 
     @pytest.mark.asyncio
     async def test_proxy_auth_success_log_redacts_url_and_credentials(self) -> None:

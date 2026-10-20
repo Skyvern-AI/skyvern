@@ -22,3 +22,8 @@ async def test_default_credential_write_lock_is_a_noop() -> None:
         credential_id="cred_test",
     ):
         pass
+
+
+@pytest.mark.asyncio
+async def test_default_organization_credential_secret_policy_is_a_noop() -> None:
+    assert await AgentFunction().should_redact_organization_credential_secrets(None, "org_test") is False

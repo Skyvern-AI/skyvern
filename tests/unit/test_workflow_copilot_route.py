@@ -51,6 +51,12 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     TurnNarrativePayload,
 )
+from skyvern.forge.sdk.copilot.demonstration_recorder import (
+    DemonstrationRecord,
+    DemonstrationRejection,
+    demonstration_record_key,
+    encode_demonstration_record,
+)
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.interruption import (
     DRAFT_AVAILABLE,
@@ -90,6 +96,8 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_chat_audio,
     workflow_copilot_chat_history,
     workflow_copilot_chat_post,
+    workflow_copilot_demonstration_control,
+    workflow_copilot_demonstration_record,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -108,6 +116,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotClearProposedWorkflowRequest,
     WorkflowCopilotCredentialRegistration,
+    WorkflowCopilotDemonstrationControlRequest,
+    WorkflowCopilotDemonstrationRecordRequest,
     WorkflowCopilotDisableAutoAcceptRequest,
     WorkflowCopilotMessageFeedbackRequest,
     WorkflowCopilotStreamErrorUpdate,
@@ -180,6 +190,7 @@ def _make_chat_request(
     recording_evidence: RecordingEvidencePacket | None = None,
     recording_in_progress: bool = False,
     browser_session_id: str | None = None,
+    demonstration_id: str | None = None,
 ) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
@@ -197,7 +208,177 @@ def _make_chat_request(
         recording_evidence=recording_evidence,
         recording_in_progress=recording_in_progress,
         browser_session_id=browser_session_id,
+        demonstration_id=demonstration_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_demonstration_flag_off_refuses_record_control_and_done(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=False))
+
+    calls = (
+        workflow_copilot_demonstration_record(
+            api_key_request,
+            WorkflowCopilotDemonstrationRecordRequest(
+                workflow_permanent_id="wpid-1",
+                browser_session_id="pbs-live",
+            ),
+            organization,
+        ),
+        workflow_copilot_demonstration_control(
+            WorkflowCopilotDemonstrationControlRequest(
+                demonstration_id="demo-1",
+                action="stop",
+            ),
+            organization,
+        ),
+        workflow_copilot_chat_post(
+            api_key_request,
+            _make_chat_request(product_action="demonstrate", demonstration_id="demo-1"),
+            organization,
+        ),
+    )
+    for call in calls:
+        with pytest.raises(HTTPException) as exc_info:
+            await call
+        assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_demonstration_control_checks_the_demonstrations_workflow_before_appending(
+    monkeypatch: pytest.MonkeyPatch,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        workflow_copilot_route,
+        "load_demonstration_record",
+        AsyncMock(return_value=SimpleNamespace(workflow_permanent_id="wpid-hidden")),
+    )
+    append = AsyncMock(return_value=1)
+    monkeypatch.setattr(workflow_copilot_route, "append_demonstration_control", append)
+    enforce = AsyncMock(side_effect=HTTPException(status_code=403))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_folder_access", enforce)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_demonstration_control(
+            WorkflowCopilotDemonstrationControlRequest(demonstration_id="demo-1", action="cancel"),
+            organization,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert enforce.await_args.args[2] == {"workflow_permanent_id": "wpid-hidden"}
+    append.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_demonstration_done_requires_demonstration_id(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_post(
+            api_key_request,
+            _make_chat_request(product_action="demonstrate"),
+            organization,
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_seam", ["api_key", "config", "browser_session", "workflow", None])
+async def test_demonstration_record_resolves_fallible_setup_before_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
+    failure_seam: str | None,
+) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "_demonstration_cache", AsyncMock(return_value=_FakeCache()))
+    resolve_api_key = AsyncMock(return_value="sk-test")
+    get_config = AsyncMock(return_value=None)
+    if failure_seam == "api_key":
+        resolve_api_key.side_effect = RuntimeError("api key failed")
+    elif failure_seam == "config":
+        get_config.side_effect = RuntimeError("config failed")
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_persistent_browser_session",
+        AsyncMock(return_value=None if failure_seam == "browser_session" else SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.workflows,
+        "get_workflow_by_permanent_id",
+        AsyncMock(return_value=None if failure_seam == "workflow" else SimpleNamespace()),
+    )
+    claim = AsyncMock()
+    monkeypatch.setattr(workflow_copilot_route, "_resolve_copilot_api_key", resolve_api_key)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_copilot_config_for_request", get_config)
+    monkeypatch.setattr(workflow_copilot_route, "claim_demonstration_recording", claim)
+
+    record_request = WorkflowCopilotDemonstrationRecordRequest(
+        workflow_permanent_id="wpid-1",
+        browser_session_id="pbs-live",
+    )
+    if failure_seam is None:
+        await workflow_copilot_demonstration_record(api_key_request, record_request, organization)
+        claim.assert_awaited_once()
+        return
+
+    with pytest.raises((RuntimeError, HTTPException)) as exc_info:
+        await workflow_copilot_demonstration_record(api_key_request, record_request, organization)
+
+    if isinstance(exc_info.value, HTTPException):
+        assert failure_seam in {"browser_session", "workflow"} and exc_info.value.status_code == 404
+    claim.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_permanent_id", "record_status", "expected_status"),
+    [("wpid-1", "recording", 409), ("wpid-1", "consumed", 409), ("wpid-other", "stopped", 404)],
+)
+async def test_demonstration_done_rejects_unfinished_consumed_or_other_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
+    workflow_permanent_id: str,
+    record_status: str,
+    expected_status: int,
+) -> None:
+    cache = _FakeCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id=workflow_permanent_id,
+            browser_session_id="pbs-live",
+            status=record_status,  # type: ignore[arg-type]
+            event_count=1,
+            owner="owner-1" if record_status == "recording" else None,
+            owner_seen_at=datetime.now(UTC) if record_status == "recording" else None,
+            final_url="https://example.test/done",
+        )
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_post(
+            api_key_request,
+            _make_chat_request(product_action="demonstrate", demonstration_id="demo-1"),
+            organization,
+        )
+
+    assert exc_info.value.status_code == expected_status
 
 
 @pytest.mark.asyncio
@@ -652,9 +833,17 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
     assert persisted_payload["proposalDisposition"] == "auto_applicable"
 
 
+@pytest.mark.parametrize(
+    ("refusal", "reason"),
+    [
+        (WorkflowPinnedByRunGroup("wf-canonical"), "_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP"),
+        # A folder check refuses before any write, so the draft must stay reviewable rather than fail the turn.
+        (HTTPException(status_code=403, detail="folder"), "_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception, reason: str
 ) -> None:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -680,7 +869,7 @@ async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
     monkeypatch.setattr(
         workflow_copilot_route,
         "_commit_staged_workflow",
-        AsyncMock(side_effect=WorkflowPinnedByRunGroup("wf-canonical")),
+        AsyncMock(side_effect=refusal),
     )
     stream = MagicMock(send=AsyncMock(return_value=True))
 
@@ -696,7 +885,7 @@ async def test_auto_accept_refused_by_a_running_group_leaves_the_draft_pending(
     response_frame = stream.send.await_args.args[0]
     assert response_frame.workflow_applied is False
     assert response_frame.proposal_disposition == "review_tested"
-    assert workflow_copilot_route._AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP in response_frame.message
+    assert getattr(workflow_copilot_route, reason) in response_frame.message
     restore.assert_not_awaited()
     publication = workflow_params.publish_workflow_copilot_candidate.await_args
     assert publication is not None
@@ -6963,6 +7152,85 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_demonstration_replay_claim_finalizes_the_losing_turn(
+    monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, copilot_stream: MagicMock
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    cache = _FakeCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id="wpid-1",
+            browser_session_id="pbs-live",
+            status="stopped",
+            event_count=0,
+            owner=None,
+            owner_seen_at=None,
+            final_url="https://example.test/done",
+        )
+    )
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = AgentResult(
+        user_response="",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        authoring_barred=False,
+        resolved_model=None,
+        turn_outcome=None,
+        cancelled=False,
+        has_staged_proposal=False,
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        agent_module,
+        "_run_copilot_turn_impl",
+        AsyncMock(side_effect=DemonstrationRejection(409, "Replay already claimed")),
+    )
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_module.run_copilot_agent)
+
+    await workflow_copilot_chat_post(
+        api_key_request,
+        _make_chat_request(product_action="demonstrate", demonstration_id="demo-1"),
+        SimpleNamespace(organization_id="org-1"),
+    )
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(copilot_stream)
+
+    assistant_messages = [
+        call.kwargs
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    ]
+    assert len(assistant_messages) == 1
+    turn_outcome = assistant_messages[0]["turn_outcome"]
+    assert turn_outcome is not None
+    assert turn_outcome.response_kind == "recover"
+    assert turn_outcome.terminal_reason == workflow_copilot_route.COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    app.DATABASE.workflow_params.claim_pending_copilot_turn_for_finalisation.assert_awaited_once()
+    app.DATABASE.workflow_params.clear_pending_copilot_turn.assert_awaited_once()
+    frames = [call.args[0] for call in copilot_stream.send.await_args_list if call.args]
+    assert any(isinstance(frame, WorkflowCopilotStreamResponseUpdate) for frame in frames)
+    assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["finished", "cancelled", "errored"])
 async def test_a_turn_reconcile_claimed_leaves_canonical_and_its_row_alone(
     monkeypatch: pytest.MonkeyPatch, api_key_request: MagicMock, copilot_stream: MagicMock, ending: str
@@ -8266,6 +8534,20 @@ async def test_refine_recording_forces_code_only_mode_when_the_composer_toggle_i
 
 
 @pytest.mark.asyncio
+async def test_demonstration_turn_follows_the_authoring_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_config = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_copilot_config_for_request", get_config)
+
+    await workflow_copilot_route._resolve_copilot_request_config(
+        "org-1", _make_chat_request(product_action="demonstrate", code_block=None)
+    )
+
+    get_config.assert_awaited_once_with("org-1", code_block_mode=None)
+
+
+@pytest.mark.asyncio
 async def test_refine_recording_seeds_the_receipt_before_a_pre_callback_exception(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
@@ -8754,6 +9036,8 @@ async def test_restore_records_only_a_rollback_that_landed(
         sequential_key=None,
         created_by=None,
         edited_by=None,
+        edited_for=None,
+        build_source=None,
     )
     update = AsyncMock(side_effect=RuntimeError("canonical write failed") if update_fails else None)
     monkeypatch.setattr(

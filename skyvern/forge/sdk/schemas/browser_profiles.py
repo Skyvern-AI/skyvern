@@ -23,8 +23,8 @@ class BrowserProfile(BaseModel):
     modified_at: datetime
     deleted_at: datetime | None = None
     last_verified_login_at: datetime | None = None
-    # Populated by the list endpoint (batched) so the UI can show the credential-login role + freshness on
-    # rows without a per-row usage fetch. None on single-get and for profiles no credential links.
+    # Populated on list and single-get responses so the UI can show the linked credential when visible.
+    linked_credential_id: str | None = None
     linked_credential_name: str | None = None
 
     @field_validator("proxy_location", mode="before")

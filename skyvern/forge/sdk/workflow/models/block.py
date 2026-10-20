@@ -184,6 +184,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -225,6 +226,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
+from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
 from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -1149,6 +1151,8 @@ class Block(BaseModel, abc.ABC):
             value=value,
         )
         self._output_recorded_this_execution = True
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -1220,22 +1224,7 @@ class Block(BaseModel, abc.ABC):
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
         # to workflow_run_blocks.failure_reason and lifted onto the run, neither redacted downstream.
-        if failure_reason:
-            # Best-effort: this builder runs for every block result, including on paths that never
-            # start a ForgeApp, and a secret lookup must never be what turns a block result into a
-            # failure. Degrades to the unredacted reason, which is the pre-existing behaviour.
-            try:
-                context = skyvern_context.current()
-                block_run_id = context.workflow_run_id if context is not None else None
-                block_run_secrets = (
-                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(block_run_id)
-                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(block_run_id)
-                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-                )
-                if block_run_secrets:
-                    failure_reason = redact_secrets_from_text(failure_reason, block_run_secrets)
-            except Exception:
-                LOG.warning("failed to redact a block failure reason", exc_info=True)
+        failure_reason = _redact_run_secrets(failure_reason)
 
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -5076,11 +5065,12 @@ class _StagedFrame(NamedTuple):
 
 @dataclass
 class _HealAttemptTrace:
-    """Carries the recovery task id and pinned credential key back to the episode writer, which runs
-    after the attempt returns."""
+    """Carries the recovery task id, pinned credential key and the recovery's own failure sentence back to
+    the episode writer, which runs after the attempt returns."""
 
     escalation_task_id: str | None = None
     credential_parameter_key: str | None = None
+    recovery_failure_reason: str | None = None
 
 
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
@@ -5401,6 +5391,26 @@ def _context_navigation_output(
         return {}
     context = replace(receipt, relation="context")
     return {"associated_navigation": associated_navigation_output(context, workflow_run_context, parameters)}
+
+
+def _redact_run_secrets(text: str | None) -> str | None:
+    if not text:
+        return text
+    # Best-effort: every block result passes through here, including on paths that never start a ForgeApp,
+    # and a secret lookup must never be what turns a block result into a failure. Degrades to the
+    # unredacted text, which is the pre-existing behaviour.
+    try:
+        context = skyvern_context.current()
+        run_id = context.workflow_run_id if context is not None else None
+        run_secrets = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(run_id)
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(run_id)
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+        )
+        return redact_secrets_from_text(text, run_secrets) if run_secrets else text
+    except Exception:
+        LOG.warning("failed to redact a block failure reason", exc_info=True)
+        return text
 
 
 def _redact_codeblock_failure_text(
@@ -6787,6 +6797,7 @@ class CodeBlock(Block):
     def build_safe_vars() -> dict[str, Any]:
         # Builtins live under __builtins__ rather than as globals so a workflow parameter can shadow
         # a builtin name by normal scoping, matching codeblock_runtime.build_safe_vars.
+        shims = module_shims()
         return {
             "__builtins__": {
                 **safe_builtins(),
@@ -6796,7 +6807,8 @@ class CodeBlock(Block):
             },
             "print": print,
             "sleep": asyncio.sleep,
-            **module_shims(),
+            **shims,
+            SANDBOX_MODULES_GLOBAL: shims,
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
             "solve_captcha": _bind_code_block_solve_captcha(None, None),
@@ -6941,12 +6953,25 @@ class CodeBlock(Block):
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return {{key: value for key, value in __capture_locals().items() if key not in __param_defaults}}
+    return {{
+        key: value
+        for key, value in __capture_locals().items()
+        if key not in __param_defaults and not __codeblock_sandbox_binding(key, value)
+    }}
 """
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
+        # A name an import bound would otherwise reach the output as an unserializable placeholder.
+        sandbox_binding_ids = {
+            id(member) for shim in safe_vars[SANDBOX_MODULES_GLOBAL].values() for member in (shim, *vars(shim).values())
+        }
+        import_binder = BindSandboxModuleImports()
+        safe_vars["__codeblock_sandbox_binding"] = lambda key, value: (
+            key in import_binder.bound_names and id(value) in sandbox_binding_ids
+        )
         # Compile under a recognizable filename so tracebacks map back to user code lines.
-        compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        tree = import_binder.visit(ast.parse(full_code, filename=CODE_BLOCK_FILENAME))
+        compiled_code = compile(ast.fix_missing_locations(tree), CODE_BLOCK_FILENAME, "exec")
         inline_exec_context = skyvern_context.current()
         LOG.info(
             "codeblock.inline_exec_entered",
@@ -7874,7 +7899,23 @@ async def wrapper({default_args}):
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
-        return workflow is not None and await code_block_ai_fallback_flag_enabled(workflow.organization_id)
+        if workflow is None or not await code_block_ai_fallback_flag_enabled(workflow.organization_id):
+            return False
+        try:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_context.workflow_run_id,
+                organization_id=workflow.organization_id,
+            )
+        except Exception:  # noqa: BLE001 - preserve the block failure if run settings are unavailable.
+            LOG.warning(
+                "AI fallback run-configuration lookup failed; failing closed",
+                workflow_run_id=workflow_run_context.workflow_run_id,
+            )
+            return False
+        ai_fallback = workflow_run.ai_fallback if workflow_run is not None else None
+        if ai_fallback is None:
+            ai_fallback = workflow.ai_fallback
+        return ai_fallback is not False
 
     async def _is_authoring_run(self, workflow_run_id: str, organization_id: str) -> bool | None:
         """Whether this run or an ancestor run is a Copilot build test or an editor block run; None when the
@@ -7998,11 +8039,21 @@ async def wrapper({default_args}):
         trace: _HealAttemptTrace | None = None,
         failed_nav_error_code: str | None = None,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         resolved_redaction_parameters = redaction_parameters or {}
+
+        def block_failure_reason(recovery_reason: str | None) -> str | None:
+            if trace is not None:
+                trace.recovery_failure_reason = recovery_reason
+            if not code_failure_reason:
+                return recovery_reason
+            code_reason = workflow_run_context.mask_secrets_in_data(code_failure_reason)
+            return f"{code_reason}\nAI fallback: {recovery_reason}" if recovery_reason else code_reason
+
         if not await self._ai_fallback_enabled(workflow_run_context):
             return None
         effective_classification = classification
@@ -8182,11 +8233,16 @@ async def wrapper({default_args}):
                 await record_task_nav_error_code(escalation_task.task_id, escalation_nav_error, escalation_url)
             elif failed_nav_error_code and not escalation_navigated:
                 skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
-            escalation_task = await app.DATABASE.tasks.update_task(
-                task_id=escalation_task.task_id,
-                organization_id=organization_id,
-                status=TaskStatus.running,
-            )
+            if await run_lease_lost(workflow_run_id):
+                escalation_task = (
+                    await app.DATABASE.tasks.get_task(escalation_task.task_id, organization_id) or escalation_task
+                )
+            else:
+                escalation_task = await app.DATABASE.tasks.update_task(
+                    task_id=escalation_task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.running,
+                )
             escalation_step = await app.DATABASE.tasks.create_step(
                 escalation_task.task_id,
                 order=0,
@@ -8252,9 +8308,11 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=_redact_codeblock_failure_text(
-                        f"Self-heal escalation did not reach a final status for block {self.label}",
-                        resolved_redaction_parameters,
+                    failure_reason=block_failure_reason(
+                        _redact_codeblock_failure_text(
+                            f"Self-heal escalation did not reach a final status for block {self.label}",
+                            resolved_redaction_parameters,
+                        )
                     ),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
@@ -8286,7 +8344,7 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=unsatisfied_reason,
+                    failure_reason=block_failure_reason(unsatisfied_reason),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
@@ -8314,9 +8372,13 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
             recovery_status = TASK_TO_BLOCK_STATUS.get(updated_task.status, BlockStatus.failed)
-            recovery_failure_reason = _redact_codeblock_failure_text(
-                updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
-                resolved_redaction_parameters,
+            # Redacted here, not only by build_block_result, because the child row and the heal episode
+            # also persist this sentence.
+            recovery_failure_reason = _redact_run_secrets(
+                _redact_codeblock_failure_text(
+                    updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
+                    resolved_redaction_parameters,
+                )
             )
             # Driver codes ride behind the recovery's own codes because its sentence cannot name them. The
             # recovery block repeats this failure_reason and is newer, so readers attribute codes from it.
@@ -8329,7 +8391,7 @@ async def wrapper({default_args}):
             )
             return await self.build_block_result(
                 success=False,
-                failure_reason=recovery_failure_reason,
+                failure_reason=block_failure_reason(recovery_failure_reason),
                 output_parameter_value=None,
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8933,6 +8995,7 @@ async def wrapper({default_args}):
         # Read by the caller before this runs, since AI fallback can navigate away from the failing tab.
         sign_in_form_visible: bool = False,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9186,6 +9249,7 @@ async def wrapper({default_args}):
                 trace=trace,
                 failed_nav_error_code=failed_nav_error_code,
                 authored_code=authored_code,
+                code_failure_reason=code_failure_reason,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -9203,7 +9267,9 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
                 failure_message=scrub_failure_value(
-                    recovery_result.failure_reason if recovery_result is not None else "floor_no_result"
+                    "floor_no_result"
+                    if recovery_result is None
+                    else trace.recovery_failure_reason or recovery_result.failure_reason
                 ),
                 wall_clock_ms=recovery_wall_clock_ms,
                 action_count=await _recovery_action_count(trace.escalation_task_id),
@@ -9722,6 +9788,12 @@ async def wrapper({default_args}):
                         if recovery_nav_code and is_registered_secret(recovery_nav_code, workflow_run_context):
                             recovery_nav_code = None
 
+                        # The runner already scrubbed this text against the same serialized
+                        # parameters and guarded the fail-closed case, so re-scrubbing can only
+                        # no-op or empty it; fall back to what the runner reported.
+                        runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
+                        secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
@@ -9746,11 +9818,6 @@ async def wrapper({default_args}):
                                     organization_id=organization_id,
                                 )
                                 return engine_block_result
-                            # The runner already scrubbed this text against the same serialized
-                            # parameters and guarded the fail-closed case, so re-scrubbing can only
-                            # no-op or empty it; fall back to what the runner reported.
-                            runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
-                            secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             if secure_failure.nav_error_code and not is_registered_secret(
@@ -9798,6 +9865,7 @@ async def wrapper({default_args}):
                             secure_sign_in_form_visible = await page_shows_sign_in_form(page)
                         return await self._resolve_failure_with_heal(
                             authored_code=authored_code,
+                            code_failure_reason=secure_failure_reason,
                             exception=None,
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
@@ -10186,6 +10254,7 @@ async def wrapper({default_args}):
 
                 return await self._resolve_failure_with_heal(
                     authored_code=authored_code,
+                    code_failure_reason=None,
                     exception=e,
                     failing_line=failing_line,
                     build_failure_result=build_declared_failure_result,
@@ -10381,6 +10450,7 @@ async def wrapper({default_args}):
 
             return await self._resolve_failure_with_heal(
                 authored_code=authored_code,
+                code_failure_reason=failure_reason,
                 exception=e,
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,
@@ -15541,6 +15611,15 @@ class HumanInteractionBlock(BaseTaskBlock):
             browser_session_id=browser_session_id,
         )
 
+        if await run_lease_lost(workflow_run_id):
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Another server already finalized this run",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.paused,

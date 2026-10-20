@@ -31,7 +31,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
@@ -69,16 +69,16 @@ from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3 import provider_downloads as taskv3_provider_downloads
 from skyvern.forge.taskv3 import tools as taskv3_tools
 from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
-from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS, run_task_v3_agent_loop
-from skyvern.forge.taskv3.goal_check import BLOCK_COMPLETION_CHECK_PROMPT_NAME
+from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION_STEPS
+from skyvern.forge.taskv3.goal_check import (
+    BLOCK_COMPLETION_CHECK_PROMPT_NAME,
+)
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
-    COMPLETION_GATE_REFUSAL,
     NAV_DEAD_END_GUARD,
-    TOKEN_BUDGET_EXTENDED_EVENT,
     LoopOutcome,
     RoundAction,
     ToolSpec,
@@ -90,6 +90,7 @@ from skyvern.forge.taskv3.run_arms import (
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
+from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -113,11 +114,14 @@ from tests.unit._download_provider_fakes import (
     _secret_bearing_validation_error,
     _StallingActionDownloadObservation,
 )
-from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
+from tests.unit.helpers import (
+    make_action_row,
+    make_browser_state,
+    make_organization,
+    make_step,
+    make_task,
+)
 from tests.unit.scoped_asyncio import ScopedAsyncio
-from tests.unit.test_taskv3_engine import _fixed_read_tool, _ReaskAnsweringCaller
-from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
 
 
 async def _run_execute_task_v3(
@@ -161,8 +165,6 @@ async def _run_execute_task_v3(
     # Called with the loop's kwargs before the loop returns, to drive state the loop's tools own.
     on_loop: Callable[[dict[str, Any]], None] | None = None,
     on_loop_async: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    # Replaces the canned `outcome`: receives the kwargs agent.py built and returns the loop's outcome.
-    loop_body: Callable[[dict[str, Any]], Awaitable[LoopOutcome]] | None = None,
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
     llm_caller_factory: Any = None,
@@ -233,8 +235,6 @@ async def _run_execute_task_v3(
             on_loop(kwargs)
         if on_loop_async is not None:
             await on_loop_async(kwargs)
-        if loop_body is not None:
-            return await loop_body(kwargs)
         if provider_probe_calls:
             provider = kwargs["page_provider"]
             loop_mock.resolved_pages = [await provider() for _ in range(provider_probe_calls)]
@@ -360,6 +360,24 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
         task.workflow_run_id,
         properties={"organization_id": task.organization_id},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model_name", "marks"), [("anthropic/claude-haiku-5-5", True), ("gpt-5.4", False)])
+async def test_execute_task_v3_sends_cache_marks_only_to_claude(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, marks: bool
+) -> None:
+    caller = MagicMock(llm_config=LLMConfig(model_name, [], True, False))
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        llm_caller_factory=MagicMock(return_value=caller),
+    )
+
+    assert loop_mock.call_args.kwargs["anthropic_cache_markers"] is marks
 
 
 @pytest.mark.asyncio
@@ -1214,11 +1232,24 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_resolve_v3_llm_key_ignores_unregistered_flag_value(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("variant", "registered"),
+    [
+        ("TYPO_KEY", {}),
+        # LLMCaller sends a non-router ANTHROPIC key down its native Anthropic path, which cannot run a v3 transcript.
+        (
+            "ANTHROPIC_CLAUDE5_5_HAIKU",
+            {"ANTHROPIC_CLAUDE5_5_HAIKU": LLMConfig("anthropic/claude-haiku-5-5", [], True, False)},
+        ),
+    ],
+)
+async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
+    monkeypatch: pytest.MonkeyPatch, variant: str, registered: dict[str, LLMConfig]
+) -> None:
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value="TYPO_KEY")
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=variant)
     )
-    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: False)
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "_configs", registered)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
@@ -1235,6 +1266,55 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
     assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger_type, expected_key",
+    [
+        (WorkflowRunTriggerType.manual, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.mcp, "STANDARD_ROUTER"),
+        (WorkflowRunTriggerType.api, "FLEX_ROUTER"),
+        (WorkflowRunTriggerType.scheduled, "FLEX_ROUTER"),
+    ],
+)
+async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
+    monkeypatch: pytest.MonkeyPatch,
+    trigger_type: WorkflowRunTriggerType,
+    expected_key: str,
+) -> None:
+    """Task V3 builds its caller from the resolved key rather than the handler factory."""
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "FLEX_ROUTER")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=lambda key: "STANDARD_ROUTER" if key == "FLEX_ROUTER" else None),
+    )
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit task.llm_key is a deliberate caller choice, matching get_override_llm_api_handler."""
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_non_flex_llm_key",
+        MagicMock(side_effect=AssertionError("explicit keys must not be downgraded")),
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+    finally:
+        skyvern_context.reset()
 
 
 @pytest.mark.asyncio
@@ -3077,75 +3157,6 @@ async def test_execute_task_v3_action_block_target_reserve_answers_to_the_run_po
     assert kwargs["target_action_reserve"] == reserve
 
 
-class _AdvancingFormPage(_FakePage):
-    """Every action advances the form, so the next observe is fresh page-change evidence."""
-
-    # Takes the probe's argument, as Playwright's evaluate does, so the real settle sampler reads this page.
-    async def evaluate(self, _js: str, _arg: Any = None) -> str:
-        raw = await super().evaluate(_js)
-        if "document.readyState" in _js:
-            return raw
-        section = sum(1 for name, _args in self.calls if name in ("click", "fill", "type"))
-        data = json.loads(raw)
-        data["title"] = f"Apply, section {section}"
-        data["elements"][0]["label"] = f"Section {section} first name"
-        return json.dumps(data)
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_navigation_block_token_trip_with_progress_is_extended(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A long form resends a growing transcript, so the token backstop trips while most of the step budget is
-    # unspent. Driven through agent.py with the real engine and loop, so the step floor, ceilings and backstops
-    # agent.py configures are the ones the grant must survive. The form is filled one field per round, and each
-    # new field followed by a changed page renews the grant.
-    script: list[list[tuple[str, dict[str, Any]]]] = []
-    for i in range(5):
-        script.append([("observe", {})])
-        script.append([("type", {"selector": f"#field-{i}", "text": f"answer {i}"})])
-    script.append([("observe", {})])
-    script.append([("click", {"selector": "#submit"})])
-    script.append([("finish", {"status": "completed", "reason": "submitted"})])
-    # The first call is the normal-size fixed prompt; the burn after it is the transcript growing.
-    caller = _ScriptedCaller(
-        script,
-        usage_for_call=lambda call: {"prompt_tokens": 15_000 if call == 0 else 200_000, "completion_tokens": 0},
-    )
-    page = _AdvancingFormPage()
-    loop_kwargs: dict[str, Any] = {}
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return await run_task_v3_agent_loop(
-            # The scripted caller takes no step-scoped call kwargs.
-            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
-        )
-
-    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=None))
-    with capture_logs() as logs:
-        _step, task, _loop_mock, _post = await _run_execute_task_v3(
-            monkeypatch,
-            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-            task_block=_make_block(NavigationBlock, navigation_goal="Fill and submit the application"),
-            workflow_run_id="wr_long_form",
-            max_steps_per_run=10,
-            data_extraction_goal=None,
-            extracted_information_schema=None,
-            loop_body=_real_loop,
-            working_page=page,
-        )
-    assert loop_kwargs["max_action_steps"] == MIN_ACTION_STEPS
-    granted = [entry for entry in logs if entry["event"] == TOKEN_BUDGET_EXTENDED_EVENT]
-    assert [(entry["guard"], entry["original_max_tokens"]) for entry in granted] == [
-        ("max_tokens", loop_kwargs["max_tokens"]),
-        ("max_tokens", granted[0]["max_tokens"]),
-    ]
-    assert granted[0]["action_steps"] < MIN_ACTION_STEPS
-    assert caller.calls == len(script)
-    assert task.status == TaskStatus.completed
-
-
 @pytest.mark.asyncio
 async def test_execute_task_v3_no_workflow_ceiling_without_a_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     # No org pool -> no hard ceiling: the loop's extension is bounded only by its own gate.
@@ -4128,97 +4139,6 @@ async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdic
 
     assert task.status == TaskStatus.terminated
     assert task.failure_reason == "the site offers no way to continue"
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_gate_veto_is_refused_in_loop_and_the_approved_retry_skips_the_post_loop_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    block = _make_block(NavigationBlock, navigation_goal="Submit the application")
-    page = _AdvancingFormPage()
-    caller = _ScriptedCaller(
-        [
-            [("finish", {"status": "completed", "reason": "looks done"})],
-            [("observe", {})],
-            [("finish", {"status": "completed", "reason": "confirmed"})],
-        ]
-    )
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        return await run_task_v3_agent_loop(
-            **{**kwargs, "page_provider": _fixed_page_provider(page), "llm_caller": caller, "step": None}
-        )
-
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-        task_block=block,
-        loop_body=_real_loop,
-        working_page=page,
-        # A post-loop consult would draw the trailing veto and fail the task.
-        completion_gate_raises=[False, True, False],
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert task.status == TaskStatus.completed
-    assert loop_mock.completion_gate.await_args.kwargs["task_block"] is block
-    assert sum(COMPLETION_GATE_REFUSAL in str(m.get("content")) for m in caller.message_history) == 1
-
-
-@pytest.mark.asyncio
-async def test_execute_task_v3_a_vetoed_reask_conversion_restores_the_models_verdict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The model terminated; the re-ask converted it; the deployment gate rejects the completion. The task must
-    # end as the model's own terminated verdict, not as a failed completion the model never claimed.
-    page = _FakePage()
-    outcome = await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(page),
-        llm_caller=_ReaskAnsweringCaller(
-            [
-                [("type", {"selector": "#email", "text": "applicant@example.com"})],
-                [("click", {"selector": "#create"})],
-                [("read_fixture", {})],
-                [("observe", {})],
-                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
-            ],
-            answer={
-                "verdict": "completed",
-                "terminate_criterion_holds": False,
-                "skipped_screen": "the PIN screen",
-                "quote": "Email: applicant@example.com",
-                "evidence": "The next form carries the account's email.",
-            },
-        ),
-        goal="Create the account.",
-        parameters={"email": "applicant@example.com"},
-        extra_tools=[
-            _fixed_read_tool(
-                "Application\nEmail: applicant@example.com", page=page, lands_at="https://example.test/apply/section/1"
-            )
-        ],
-        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
-    )
-    assert outcome.status == "completed" and outcome.converted_from == "terminated"
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        task_block=_make_block(NavigationBlock, navigation_goal="Create the account"),
-        completion_gate_vetoes=True,
-        complete_criterion="a PIN screen is shown",
-        terminate_criterion="the create-account submission fails",
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-
-    assert loop_mock.await_args is not None
-    assert loop_mock.await_args.kwargs["unlisted_reask_criteria"] == (
-        "a PIN screen is shown",
-        "the create-account submission fails",
-    )
-    assert task.status == TaskStatus.terminated
-    assert task.failure_reason == "The PIN screen was never shown."
 
 
 @pytest.mark.asyncio
@@ -6568,55 +6488,6 @@ async def test_execute_task_v3_reads_a_blocks_caller_urls_from_its_unrendered_de
         "https://jobs.example.test/c/9",
     }
     assert off_the_page in kwargs["goal"]  # nosemgrep: incomplete-url-substring-sanitization
-
-
-@pytest.mark.parametrize("initial", [False, True])
-@pytest.mark.asyncio
-async def test_execute_task_v3_logs_a_dead_task_url_with_a_query_as_task_supplied(
-    monkeypatch: pytest.MonkeyPatch, initial: bool
-) -> None:
-    # agent.py's task-target set and requested start URL, through the real engine and navigate tool: a
-    # task URL whose query names the page is the task's own target, whether the in-loop navigate or the
-    # setup navigation (redirected first) is the one that 404s.
-    import skyvern.utils.url_validators as urlv
-
-    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
-    task_url = "https://jobs.example.test/portal.action?page=apply&id=42"
-    page = _FakePage()
-
-    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
-        page.url = url
-        return SimpleNamespace(status=404, url=url)
-
-    page.goto = _goto  # type: ignore[method-assign]
-    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
-
-    async def _real_loop(kwargs: dict[str, Any]) -> LoopOutcome:
-        return await run_task_v3_agent_loop(
-            **{
-                **kwargs,
-                "page_provider": _fixed_page_provider(page),
-                "llm_caller": _ScriptedCaller(script),
-                "step": None,
-            }
-        )
-
-    with capture_logs() as logs:
-        await _run_execute_task_v3(
-            monkeypatch,
-            LoopOutcome(status="failed", reason="the canned outcome must not be used"),
-            url=task_url,
-            navigation_goal="Apply.",
-            navigation_status=404 if initial else None,
-            landed_url="https://jobs.example.test/expired" if initial else None,
-            data_extraction_goal=None,
-            extracted_information_schema=None,
-            loop_body=_real_loop,
-            working_page=page,
-        )
-
-    event = "taskv3 loop initial navigation dead end" if initial else "taskv3 loop navigation dead end"
-    assert [entry["provenance"] for entry in logs if entry["event"] == event] == ["task_supplied"]
 
 
 @pytest.mark.asyncio

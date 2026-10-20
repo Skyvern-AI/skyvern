@@ -17,8 +17,6 @@ from jinja2 import Template
 from jinja2 import meta as jinja2_meta
 from jinja2.sandbox import SandboxedEnvironment
 from onepassword import ItemFieldType
-from onepassword.client import Client as OnePasswordClient
-from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, SCRUBBED_VALUE
@@ -31,10 +29,6 @@ from skyvern.exceptions import (
     CredentialVaultNotConfiguredError,
     ImaginarySecretValue,
     InvalidCredentialId,
-    OnePasswordGetItemError,
-    OnePasswordRateLimitError,
-    OnePasswordServiceUnavailableError,
-    OnePasswordSessionExpiredError,
     RuntimeSequentialCredentialUnsupported,
     SkyvernException,
     WorkflowRunContextNotInitialized,
@@ -53,7 +47,8 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenSe
 from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
     OnePasswordConstants,
-    extract_onepassword_upstream_5xx_status,
+    fetch_onepassword_item,
+    format_resolved_lookup_context,
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
@@ -1296,6 +1291,11 @@ class WorkflowRunContext:
         organization: Organization,
         fetch: CredentialFetch,
     ) -> None:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            organization.organization_id,
+            credential_id,
+            workflow_run_id=self.workflow_run_id,
+        )
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=organization.organization_id
         )
@@ -1515,31 +1515,7 @@ class WorkflowRunContext:
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
         lookup_context = self._format_resolved_lookup_context("1Password", vault_id=vault_id, item_id=item_id)
-        try:
-            client = await OnePasswordClient.authenticate(
-                auth=token,
-                integration_name="Skyvern",
-                integration_version="v1.0.0",
-            )
-            item = await client.items.get(vault_id, item_id)
-        except RateLimitExceededException as e:
-            raise OnePasswordRateLimitError(f"{str(e)} {lookup_context}") from e
-        except DesktopSessionExpiredException as e:
-            raise OnePasswordSessionExpiredError(f"{str(e)} {lookup_context}") from e
-        except Exception as e:
-            raw = str(e)
-            upstream_status = extract_onepassword_upstream_5xx_status(raw)
-            if upstream_status is not None:
-                raise OnePasswordServiceUnavailableError(
-                    status_code=upstream_status,
-                    lookup_context=lookup_context,
-                ) from e
-            raise OnePasswordGetItemError(f"{raw} {lookup_context}") from e
-
-        # Check if item is None
-        if item is None:
-            LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
-            raise CredentialItemNotFoundError(f"1Password item not found. {lookup_context}")
+        item = await fetch_onepassword_item(token, vault_id, item_id, lookup_context)
         if parameter.totp_identifier:
             normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
             if normalized_totp_identifier is not None:
@@ -2311,11 +2287,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def _format_resolved_lookup_context(provider: str, **identifiers: str | None) -> str:
-        resolved_identifiers = ", ".join(
-            f"{key}={sanitize_credential_for_error(value) if value else '<not provided>'}"
-            for key, value in identifiers.items()
-        )
-        return f"Resolved {provider} credential identifiers: {resolved_identifiers}."
+        return format_resolved_lookup_context(provider, **identifiers)
 
     @staticmethod
     def _append_lookup_context_to_exception(error: SkyvernException, lookup_context: str) -> None:

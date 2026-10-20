@@ -37,7 +37,7 @@ export function RecordingFeedbackPrompt({
   return (
     <div
       role="group"
-      aria-label="Recording feedback"
+      aria-label="Demonstration feedback"
       className="flex items-start justify-between gap-2 rounded-lg border border-border bg-slate-elevation2 px-3 py-2"
       data-testid="recording-feedback-prompt"
     >
@@ -62,13 +62,13 @@ export function RecordingFeedbackPrompt({
           }
           rate(target, rating, reasonCode, options);
         }}
-        prompt="Were these recorded steps helpful?"
+        prompt="Were the steps from your demonstration helpful?"
         reasonOptions={REASON_OPTIONS}
         className="min-w-0 flex-1"
       />
       <button
         type="button"
-        aria-label="Dismiss recording feedback"
+        aria-label="Dismiss demonstration feedback"
         onClick={dismiss}
         className="ml-1 inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
       >

@@ -42,12 +42,10 @@ from skyvern.forge.sdk.db.models import (
     TaskRunModel,
     TaskV2Model,
     WorkflowModel,
-    WorkflowParameterModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
     WorkflowRunModel,
-    WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
 from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
@@ -56,13 +54,17 @@ from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsReposito
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.sdk.workflow.retry_policy import (
+    LEASE_TAKEOVER_SECONDS,
+    WEBHOOK_FALLBACK_GRACE_SECONDS,
+    is_retry_eligible_run,
+)
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
-from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowRetryPolicy
+from skyvern.schemas.workflows import WorkflowRetryPolicy
 from tests.unit.statement_timeout_fakes import FakeQueryCanceled
 
 
@@ -4434,206 +4436,6 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
 
 
 @pytest.mark.asyncio
-async def test_credential_login_history_matches_the_same_parameter_key_and_uses_one_query(
-    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
-) -> None:
-    now = datetime.now(UTC).replace(tzinfo=None)
-    async with sqlite_db.Session() as session:
-        session.add_all(
-            [
-                _workflow_run_model(workflow_run_id="current", queued_at=now),
-                _workflow_run_model(workflow_run_id="wrong_key", queued_at=now - timedelta(hours=1)),
-                _workflow_run_model(workflow_run_id="wrong_value", queued_at=now - timedelta(hours=2)),
-                WorkflowParameterModel(
-                    workflow_parameter_id="login_parameter",
-                    workflow_id="wf_test",
-                    key="login",
-                    workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID.value,
-                ),
-                WorkflowParameterModel(
-                    workflow_parameter_id="backup_parameter",
-                    workflow_id="wf_test",
-                    key="backup",
-                    workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID.value,
-                ),
-                WorkflowRunParameterModel(
-                    workflow_run_id="current", workflow_parameter_id="login_parameter", value="credential-a"
-                ),
-                WorkflowRunParameterModel(
-                    workflow_run_id="wrong_key", workflow_parameter_id="backup_parameter", value="credential-a"
-                ),
-                WorkflowRunParameterModel(
-                    workflow_run_id="wrong_value", workflow_parameter_id="login_parameter", value="credential-b"
-                ),
-            ]
-        )
-        await session.commit()
-
-    statements: list[str] = []
-
-    def record_statement(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement)
-
-    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
-    try:
-        no_match = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
-            organization_id="org_test",
-            workflow_run_id="current",
-            since=now - timedelta(days=1),
-            credential_parameter_keys={"login"},
-        )
-    finally:
-        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
-
-    assert no_match.credential_known is True
-    assert no_match.logged_in_at is None
-    assert len(statements) == 1
-
-    expected_time = now - timedelta(hours=3)
-    async with sqlite_db.Session() as session:
-        session.add_all(
-            [
-                _workflow_run_model(workflow_run_id="matching", queued_at=expected_time),
-                WorkflowRunParameterModel(
-                    workflow_run_id="matching", workflow_parameter_id="login_parameter", value="credential-a"
-                ),
-                WorkflowRunBlockModel(
-                    workflow_run_id="matching",
-                    organization_id="org_test",
-                    block_type=BlockType.LOGIN.value,
-                    status=BlockStatus.completed.value,
-                ),
-            ]
-        )
-        await session.commit()
-
-    statements.clear()
-    event.listen(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
-    try:
-        match = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
-            organization_id="org_test",
-            workflow_run_id="current",
-            since=now - timedelta(days=1),
-            credential_parameter_keys={"login"},
-        )
-    finally:
-        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", record_statement)
-
-    assert match.credential_known is True
-    assert match.logged_in_at == expected_time
-    assert len(statements) == 1
-
-
-@pytest.mark.asyncio
-async def test_credential_login_history_includes_static_and_selected_credentials(sqlite_db: AgentDB) -> None:
-    now = datetime.now(UTC).replace(tzinfo=None)
-    previous_login = now - timedelta(hours=2)
-    async with sqlite_db.Session() as session:
-        session.add_all(
-            [
-                _workflow_run_model(workflow_run_id="current", workflow_id="wf_current", queued_at=now),
-                _workflow_run_model(workflow_run_id="previous", workflow_id="wf_previous", queued_at=previous_login),
-                CredentialParameterModel(
-                    workflow_id="wf_current",
-                    key="static_login",
-                    credential_id="credential-static",
-                    credential_ids=None,
-                ),
-                CredentialParameterModel(
-                    workflow_id="wf_previous",
-                    key="static_login",
-                    credential_id="credential-other",
-                    credential_ids=None,
-                ),
-                CredentialParameterModel(
-                    workflow_id="wf_current",
-                    key="rotated_login",
-                    credential_id="credential-default",
-                    credential_ids=["credential-a", "credential-b"],
-                ),
-                CredentialParameterModel(
-                    workflow_id="wf_previous",
-                    key="rotated_login",
-                    credential_id="credential-default",
-                    credential_ids=["credential-a", "credential-b"],
-                ),
-                WorkflowRunCredentialSelectionModel(
-                    organization_id="org_test",
-                    workflow_run_id="current",
-                    workflow_permanent_id="wpid_test",
-                    parameter_key="rotated_login",
-                    credential_id="credential-a",
-                ),
-                WorkflowRunCredentialSelectionModel(
-                    organization_id="org_test",
-                    workflow_run_id="previous",
-                    workflow_permanent_id="wpid_test",
-                    parameter_key="rotated_login",
-                    credential_id="credential-a",
-                ),
-                WorkflowRunBlockModel(
-                    workflow_run_id="previous",
-                    organization_id="org_test",
-                    block_type=BlockType.LOGIN.value,
-                    status=BlockStatus.completed.value,
-                ),
-            ]
-        )
-        await session.commit()
-
-    recent = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
-        organization_id="org_test",
-        workflow_run_id="current",
-        since=now - timedelta(days=1),
-        credential_parameter_keys={"static_login", "rotated_login"},
-    )
-
-    assert recent.credential_known is True
-    assert recent.logged_in_at == previous_login
-
-    async with sqlite_db.Session() as session:
-        session.add_all(
-            [
-                _workflow_run_model(workflow_run_id="static_current", workflow_id="wf_static_current", queued_at=now),
-                _workflow_run_model(
-                    workflow_run_id="static_previous",
-                    workflow_id="wf_static_previous",
-                    queued_at=previous_login,
-                ),
-                CredentialParameterModel(
-                    workflow_id="wf_static_current",
-                    key="static_login",
-                    credential_id="credential-shared",
-                    credential_ids=None,
-                ),
-                CredentialParameterModel(
-                    workflow_id="wf_static_previous",
-                    key="static_login",
-                    credential_id="credential-shared",
-                    credential_ids=None,
-                ),
-                WorkflowRunBlockModel(
-                    workflow_run_id="static_previous",
-                    organization_id="org_test",
-                    block_type=BlockType.LOGIN.value,
-                    status=BlockStatus.completed.value,
-                ),
-            ]
-        )
-        await session.commit()
-
-    static_recent = await sqlite_db.workflow_runs.get_recent_completed_login_for_run_credentials(
-        organization_id="org_test",
-        workflow_run_id="static_current",
-        since=now - timedelta(days=1),
-        credential_parameter_keys={"static_login"},
-    )
-
-    assert static_recent.credential_known is True
-    assert static_recent.logged_in_at == previous_login
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(("search_seconds", "expected_fallback_seconds"), [(12, 18), (30, 0.25)])
 async def test_get_all_runs_v2_splits_one_timeout_budget_across_both_search_statements(
     monkeypatch: pytest.MonkeyPatch,
@@ -4851,3 +4653,96 @@ async def test_get_all_runs_v2_hides_search_parameters_on_timeout_before_retry_l
     assert exc_info.value.hide_parameters is True
     assert search_key not in repr(logs)
     assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+def _final_webhook_claim_stale_before() -> datetime:
+    return naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS)
+
+
+async def _seed_canceled_runs(db: AgentDB, organization_id: str, finished_at: datetime, **runs: dict[str, Any]) -> None:
+    async with db.Session() as session:
+        for workflow_run_id, columns in runs.items():
+            run = _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=finished_at,
+                status=WorkflowRunStatus.canceled.value,
+                organization_id=organization_id,
+            )
+            run.finished_at = finished_at
+            for column, value in columns.items():
+                setattr(run, column, value)
+            session.add(run)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_has_one_winner_per_terminal_execution(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_canceled_runs(db, organization_id, finished_at, wr_claim_race={}, wr_claim_refinished={})
+
+    claims = await asyncio.gather(
+        *(
+            db.workflow_runs.claim_final_webhook_delivery(
+                "wr_claim_race",
+                expected_status=WorkflowRunStatus.canceled,
+                expected_finished_at=finished_at,
+                stale_before=_final_webhook_claim_stale_before(),
+            )
+            for _ in range(5)
+        )
+    )
+    stale_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.canceled,
+        expected_finished_at=finished_at - timedelta(seconds=1),
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+    other_status_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.completed,
+        expected_finished_at=finished_at,
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+    assert stale_claim is None
+    assert other_status_claim is None
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_takes_over_only_an_unrecorded_claim_past_the_delivery_bound(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # A sender that died mid-delivery leaves a claim with no outcome; once it outlives any bounded delivery,
+    # the next sender takes it rather than leaving the run's final webhook unsent forever.
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    abandoned_at = naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS + 1)
+    await _seed_canceled_runs(
+        db,
+        organization_id,
+        finished_at,
+        wr_claim_abandoned={"webhook_delivery_finalized_at": abandoned_at},
+        wr_claim_in_flight={"webhook_delivery_finalized_at": naive_utc_now()},
+        wr_claim_recorded={"webhook_delivery_finalized_at": abandoned_at, "webhook_delivery_status": "delivered"},
+    )
+
+    async def claim(workflow_run_id: str) -> datetime | None:
+        return await db.workflow_runs.claim_final_webhook_delivery(
+            workflow_run_id,
+            expected_status=WorkflowRunStatus.canceled,
+            expected_finished_at=finished_at,
+            stale_before=_final_webhook_claim_stale_before(),
+        )
+
+    taken_over = await claim("wr_claim_abandoned")
+    # The abandoned sender's late release names its own claim, so it cannot free the claim that replaced it.
+    await db.workflow_runs.release_final_webhook_delivery_claim("wr_claim_abandoned", claimed_at=abandoned_at)
+
+    assert taken_over is not None
+    assert await claim("wr_claim_abandoned") is None
+    assert await claim("wr_claim_in_flight") is None
+    assert await claim("wr_claim_recorded") is None

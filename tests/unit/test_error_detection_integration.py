@@ -4,14 +4,14 @@ Integration tests for error detection across different failure scenarios.
 Tests the complete flow from task failure to error detection and storage.
 """
 
-from datetime import datetime, timezone
-from types import SimpleNamespace
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.errors.errors import LoginUnconfirmedError, ReachMaxRetriesError, UserDefinedError
+from skyvern.errors.errors import ReachMaxRetriesError, UserDefinedError
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.failure_classifier import FailureCategory
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
@@ -375,95 +375,6 @@ async def test_max_retries_recovers_mapped_code_misfiled_as_failure_category(age
 
 
 @pytest.mark.asyncio
-async def test_max_retries_gates_mapped_credential_categories_before_returning_them(agent):
-    now = datetime.now()
-    organization = make_organization(now)
-    task = make_task(
-        now,
-        organization,
-        error_code_mapping={"invalid_credentials": "Submitted credentials were rejected"},
-    )
-    step = make_step(
-        now, task, step_id="step-credential", status=StepStatus.failed, order=1, retry_index=5, output=None
-    )
-    response = {
-        "page_info": "",
-        "reasoning": "The model classified the failure as invalid_credentials.",
-        "errors": [],
-        "failure_categories": [
-            {
-                "category": "invalid_credentials",
-                "confidence_float": 0.9,
-                "reasoning": "Login failed",
-            }
-        ],
-    }
-    summary_llm = AsyncMock(return_value=response)
-
-    async def gate_errors(*, task, step, errors, credential_context=None):
-        assert [error.error_code for error in errors] == ["invalid_credentials"]
-        return [LoginUnconfirmedError().to_user_defined_error()]
-
-    with (
-        patch("skyvern.forge.agent.app") as mock_app,
-        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=SimpleNamespace(tz_info=timezone.utc)),
-        patch(
-            "skyvern.forge.agent.get_org_aware_secondary_llm_api_handler",
-            return_value=summary_llm,
-        ),
-        patch.object(agent, "_filter_response_errors", side_effect=gate_errors),
-    ):
-        mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[])
-        summarized = await agent.summary_failure_reason_for_max_retries(
-            organization=organization,
-            task=task,
-            step=step,
-            page=None,
-            max_retries=5,
-            engine_selection=None,
-        )
-
-    assert [error.error_code for error in summarized.errors] == ["CREDENTIAL_LOGIN_UNCONFIRMED"]
-
-
-@pytest.mark.asyncio
-async def test_max_retries_does_not_reappend_gated_credential_category(agent):
-    now = datetime.now()
-    organization = make_organization(now)
-    task = make_task(
-        now,
-        organization,
-        error_code_mapping={"invalid_credentials": "Submitted credentials were rejected"},
-    )
-    step = make_step(
-        now, task, step_id="step-credential", status=StepStatus.failed, order=1, retry_index=5, output=None
-    )
-    summary = MaxStepsReasonResponse(
-        page_info="",
-        reasoning="The model could not confirm the rejection.",
-        errors=[LoginUnconfirmedError().to_user_defined_error()],
-        failure_categories=[{"category": "invalid_credentials", "confidence_float": 0.9, "reasoning": "Login failed"}],
-    )
-    captured = {}
-
-    async def update_task(*args, **kwargs):
-        captured.update(kwargs)
-        return task
-
-    with (
-        patch("skyvern.forge.agent.app") as mock_app,
-        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=SimpleNamespace(tz_info=timezone.utc)),
-        patch.object(agent, "summary_failure_reason_for_max_retries", new=AsyncMock(return_value=summary)),
-        patch.object(agent, "update_task", side_effect=update_task),
-    ):
-        mock_app.BROWSER_MANAGER.get_for_task.return_value = None
-        mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[])
-        await agent.handle_failed_step(organization, task, step)
-
-    assert [error["error_code"] for error in captured["errors"]] == ["CREDENTIAL_LOGIN_UNCONFIRMED"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "summary",
     [
@@ -487,6 +398,46 @@ async def test_max_retries_without_mapped_code_still_fails_with_reach_max_retrie
 
     assert captured["status"] == TaskStatus.failed
     assert [error["error_code"] for error in captured["errors"]] == [ReachMaxRetriesError().error_code]
+    # Whatever is persisted is a category every reader can match, even when the model named none.
+    assert all(entry["category"] in FailureCategory.__members__ for entry in captured["failure_category"])
+
+
+@pytest.mark.asyncio
+async def test_max_retries_does_not_map_case_variant_of_builtin_category(agent, mock_browser_state):
+    summary = MaxStepsReasonResponse(
+        page_info="",
+        reasoning="The agent could not find the login form",
+        errors=[],
+        failure_categories=[{"category": "element_not_found", "confidence_float": 0.9, "reasoning": "No form"}],
+    )
+
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["status"] == TaskStatus.failed
+    assert [error["error_code"] for error in captured["errors"]] == [ReachMaxRetriesError().error_code]
+    assert captured["failure_category"][0]["category"] == FailureCategory.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_max_retries_does_not_persist_a_failure_category_the_model_invented(agent, mock_browser_state):
+    """SKY-17368: every reader of failure_category matches the literal exactly, so an invented
+    name is a classification nothing can read. Known categories are persisted untouched."""
+    known = {"category": "ELEMENT_NOT_FOUND", "confidence_float": 0.8, "reasoning": "No login form"}
+    summary = MaxStepsReasonResponse.model_validate(
+        {
+            "page_info": "",
+            "reasoning": "The agent could not find the login form",
+            "errors": [],
+            "failure_categories": [
+                {"category": "LOGIN_FORM_MISSING", "confidence_float": 0.9, "reasoning": "Invented by the model"},
+                known,
+            ],
+        }
+    )
+
+    captured = await _run_max_retries(agent, mock_browser_state, summary)
+
+    assert captured["failure_category"] == [known]
 
 
 @pytest.mark.asyncio
@@ -643,8 +594,7 @@ async def test_error_detection_with_workflow_task(agent, mock_browser_state):
                     assert "workflow_run_id" not in call_kwargs
 
 
-@pytest.mark.asyncio
-async def test_response_error_filter_drops_hallucinated_failure_category_codes(agent):
+def test_response_error_filter_drops_hallucinated_failure_category_codes(agent):
     """SKY-9425: LLM summarization can mix failure_categories codes (LLM_REASONING_ERROR)
     into the user-defined errors array. _filter_response_errors must drop any code that
     isn't a key in error_code_mapping so only customer-declared codes leak to the user.
@@ -673,20 +623,19 @@ async def test_response_error_filter_drops_hallucinated_failure_category_codes(a
         ),
     ]
 
-    kept = await agent._filter_response_errors(task=task, step=step, errors=hallucinated)
+    kept = agent._filter_response_errors(task=task, step=step, errors=hallucinated)
 
     assert [e.error_code for e in kept] == ["DATA_UNAVAILABLE"]
 
 
-@pytest.mark.asyncio
-async def test_response_error_filter_keeps_case_variant_under_the_mapping_key(agent):
+def test_response_error_filter_keeps_case_variant_under_the_mapping_key(agent):
     # The max-retries status is chosen from these kept errors, so a dropped variant ends the task failed.
     now = datetime.now()
     task = make_task(now, make_organization(now), error_code_mapping={"website_down": "The site is down"})
     step = make_step(now, task, step_id="step-1", status=StepStatus.failed, order=1, output=None)
     errors = [UserDefinedError(error_code="WEBSITE_DOWN", reasoning="Maintenance page", confidence_float=0.9)]
 
-    kept = await agent._filter_response_errors(task=task, step=step, errors=errors)
+    kept = agent._filter_response_errors(task=task, step=step, errors=errors)
 
     assert [e.error_code for e in kept] == ["website_down"]
 

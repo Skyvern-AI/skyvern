@@ -221,6 +221,7 @@ class PersistentSessionsManager(Protocol):
         expected_browser_session_id: str | None = None,
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

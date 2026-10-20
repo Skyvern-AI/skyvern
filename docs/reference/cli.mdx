@@ -135,22 +135,60 @@ skyvern workflow update --id wpid_xxx --definition @updated.json
 skyvern workflow delete --id wpid_xxx --force       # --force confirms the permanent delete
 skyvern workflow run --id wpid_xxx                  # Execute a workflow
 skyvern workflow run --id wpid_xxx --params '{"url": "https://example.com"}'
+skyvern workflow runs --id wpid_xxx                 # List runs of a workflow (--status, --search-key, --error-code, --page, --page-size)
 skyvern workflow status --run-id wr_xxx              # Check run status
 skyvern workflow cancel --run-id wr_xxx              # Cancel a running workflow
+skyvern workflow retry --run-id wr_xxx               # Retry a finished workflow run
 ```
+
+### Schedules
+
+```bash
+skyvern schedule list                                # List all schedules (--status active|paused, --search, --page, --page-size)
+skyvern schedule list --workflow-id wpid_xxx         # List the schedules of one workflow
+skyvern schedule get --workflow-id wpid_xxx --id wfs_xxx
+skyvern schedule create --workflow-id wpid_xxx --cron "0 9 * * *" --timezone America/New_York
+skyvern schedule create --workflow-id wpid_xxx --interval-seconds 259200  # Every 72 hours (minimum 300)
+skyvern schedule update --workflow-id wpid_xxx --id wfs_xxx --cron "0 10 * * *"
+skyvern schedule enable --workflow-id wpid_xxx --id wfs_xxx
+skyvern schedule disable --workflow-id wpid_xxx --id wfs_xxx
+skyvern schedule delete --workflow-id wpid_xxx --id wfs_xxx --yes  # --yes is required
+```
+
+`schedule create` also takes `--parameters` (JSON object), `--name`, `--description`, `--first-fire-at` and `--disabled`. The default timezone is `UTC`.
+
+### Organization settings
+
+```bash
+skyvern config show                          # Show all organization settings
+skyvern config get max_steps_per_run         # Show one setting
+skyvern config set max_steps_per_run 25      # Change one setting
+```
+
+`config set` accepts `max_steps_per_run`, `max_steps_per_workflow_run`, `max_retries_per_step`, `webhook_callback_url`, `artifact_url_expiry_seconds` (3600 to 604800), `slug`, and the reset flags `clear_max_steps_per_workflow_run` and `clear_artifact_url_expiry_seconds`.
 
 ### Credentials
 
-Credentials are created interactively via stdin so secrets never appear in shell history.
+`skyvern credentials add` prompts for secret values so they never appear in shell history. In scripts or CI, set them as environment variables instead.
 
 ```bash
-skyvern credentials add            # Interactive credential creation (password or credit card)
+skyvern credentials add --name "Vendor portal"                       # Password (default type); prompts for username, password, TOTP
+skyvern credentials add --name "Company card" --type credit_card     # Prompts for card number, CVV, expiry, brand, holder name
+skyvern credentials add --name "Portal API key" --type secret        # Prompts for the secret value and an optional label
 skyvern credential list            # List stored credentials
 skyvern credential get --id cred_xxx
 skyvern credential delete --id cred_xxx
 ```
 
-Note: `credentials` (plural) is used for the interactive `add` command; `credential` (singular) for list/get/delete. Both forms are intentional.
+`--name` is required. `--type` is `password` (default), `credit_card` or `secret`.
+
+| Type | Environment variables |
+|---|---|
+| `password` | `SKYVERN_CRED_USERNAME`, `SKYVERN_CRED_PASSWORD`, `SKYVERN_CRED_TOTP` |
+| `credit_card` | `SKYVERN_CRED_CARD_NUMBER`, `SKYVERN_CRED_CVV`, `SKYVERN_CRED_EXP_MONTH`, `SKYVERN_CRED_EXP_YEAR`, `SKYVERN_CRED_CARD_BRAND`, `SKYVERN_CRED_HOLDER_NAME` |
+| `secret` | `SKYVERN_CRED_SECRET_VALUE`, `SKYVERN_CRED_SECRET_LABEL` |
+
+Note: `credentials` (plural) has `add`, `list`, `get` and `delete`; `credential` (singular) has only `list`, `get` and `delete`, matching the MCP tools. Both forms are intentional.
 
 ### Agent blocks
 
@@ -172,6 +210,7 @@ skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
 skyvern setup openclaw           # Register with OpenClaw
 skyvern setup opencode           # Register with OpenCode (API key auth; avoids OAuth timeouts)
+skyvern setup hermes             # Register with Hermes (all ~/.hermes configs, including profiles)
 skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
 skyvern mcp switch --dry-run          # Preview changes without writing files
 skyvern mcp profile list              # List saved switch sources
@@ -189,6 +228,8 @@ skyvern docs                     # Open documentation in your browser
 skyvern quickstart               # One-command setup + start
 skyvern init                     # Interactive setup without starting services
 skyvern init browser             # Initialize browser configuration only
+skyvern doctor                   # Check the installation (--fix tries to repair what fails)
+skyvern doctor streaming         # Check that local browser streaming works (--base-url, --browser-session-id, --timeout)
 ```
 
 ## CLI vs MCP: when to use which
@@ -279,7 +320,7 @@ OpenClaw's MCP config provides the callable Skyvern tools; the workspace skill i
 
 ## JSON output
 
-All commands support `--json` for structured output, making it easy to compose with `jq` and other tools. The output is an envelope (`ok`, `action`, `data`, `error`, …), and the command's result is under `data`:
+The `browser`, `workflow`, `schedule`, `config`, `credential`, `credentials`, `block`, `tasks`, `status` and `stop` commands, and `doctor streaming`, take `--json` for structured output you can pipe to `jq`. The `skill`, `setup`, `mcp`, `run`, `init`, `quickstart` and `docs` commands, and plain `doctor`, do not. The output is an envelope (`ok`, `action`, `data`, `error`, …), and the command's result is under `data`:
 
 ```bash
 # Extract the session ID from a new session
@@ -319,7 +360,7 @@ echo $SKYVERN_API_KEY
 You can also pass it directly:
 
 ```bash
-skyvern credentials --api-key YOUR_KEY add
+skyvern credentials --api-key YOUR_KEY add --name "Vendor portal"
 ```
 
 Get an API key from [Settings](https://app.skyvern.com/settings/) in the Skyvern dashboard.
