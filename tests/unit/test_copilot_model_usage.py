@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -7,9 +8,15 @@ import pytest
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
+    _emit_copilot_model_usage,
     _emit_direct_copilot_model_usage,
     is_workflow_copilot_prompt_name,
     normalize_gen_ai_provider,
+)
+from skyvern.forge.sdk.copilot.cost_telemetry import (
+    copilot_cost_scope,
+    current_copilot_cost,
+    exclude_workflow_block_cost,
 )
 
 
@@ -114,6 +121,7 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "cache_read_tokens",
         "cache_creation_tokens",
         "cost",
+        "cost_source",
         "prompt_name",
         "model_call_index",
         "cache_mode",
@@ -122,6 +130,114 @@ def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
         "ref_tool_outputs_escaped",
     }
     assert normalize_gen_ai_provider(event.provider_name, event.response_model) == "gcp.vertex_ai"
+
+
+def test_cost_ledger_records_actor_and_safety_cost_without_filling_unknowns() -> None:
+    logger = CapturingLogger()
+    with copilot_cost_scope():
+        _emit_copilot_model_usage(
+            CopilotModelUsageEvent(request_model="model", cost=0.03, cost_source="litellm_estimate"), logger=logger
+        )
+        _emit_direct_copilot_model_usage(
+            CopilotModelUsageEvent(
+                request_model="model",
+                prompt_name="workflow-copilot-raw-secret-safety",
+                cost=0.0,
+                cost_source="provider_reported",
+            ),
+            logger=logger,
+        )
+        _emit_copilot_model_usage(CopilotModelUsageEvent(request_model="model"), logger=logger)
+        snapshot = current_copilot_cost()
+        assert snapshot is not None
+        assert snapshot["known_cost_usd"] == pytest.approx(0.03)
+        assert snapshot["status"] == "partial"
+        assert snapshot["observed_call_count"] == 3
+        assert snapshot["priced_call_count"] == 2
+        assert snapshot["unknown_call_count"] == 1
+        assert snapshot["pricing_sources"] == ["litellm_estimate", "provider_reported"]
+        assert "workflow_replay" in snapshot["excluded"]
+    assert current_copilot_cost() is None
+
+
+@pytest.mark.asyncio
+async def test_cost_ledger_isolates_concurrent_turns_and_closes_inherited_background_scope() -> None:
+    logger = CapturingLogger()
+    background_ready = asyncio.Event()
+    background_release = asyncio.Event()
+
+    async def record_later() -> None:
+        background_ready.set()
+        await background_release.wait()
+        _emit_copilot_model_usage(
+            CopilotModelUsageEvent(request_model="model", cost=10.0, cost_source="litellm_estimate"), logger=logger
+        )
+        assert current_copilot_cost() is None
+
+    async def turn(amount: float) -> dict[str, object] | None:
+        with copilot_cost_scope():
+            _emit_copilot_model_usage(
+                CopilotModelUsageEvent(request_model="model", cost=amount, cost_source="litellm_estimate"),
+                logger=logger,
+            )
+            await asyncio.sleep(0)
+            return current_copilot_cost()
+
+    left, right = await asyncio.gather(turn(0.1), turn(0.2))
+    assert left is not None and left["known_cost_usd"] == pytest.approx(0.1)
+    assert right is not None and right["known_cost_usd"] == pytest.approx(0.2)
+    with copilot_cost_scope() as ledger:
+        task = asyncio.create_task(record_later())
+        await background_ready.wait()
+    background_release.set()
+    await task
+    assert ledger.observed_call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_workflow_block_tasks_cannot_contribute_to_the_parent_copilot_cost() -> None:
+    logger = CapturingLogger()
+
+    async def execute_block() -> None:
+        await asyncio.sleep(0)
+        assert current_copilot_cost() is None
+        _emit_copilot_model_usage(
+            CopilotModelUsageEvent(request_model="model", cost=100.0, cost_source="litellm_estimate"), logger=logger
+        )
+        _emit_direct_copilot_model_usage(
+            CopilotModelUsageEvent(
+                request_model="model",
+                prompt_name="workflow-copilot-raw-secret-safety",
+                cost=20.0,
+                cost_source="litellm_estimate",
+            ),
+            logger=logger,
+        )
+
+    with copilot_cost_scope() as ledger:
+        with exclude_workflow_block_cost():
+            task = asyncio.create_task(execute_block())
+        _emit_direct_copilot_model_usage(
+            CopilotModelUsageEvent(
+                request_model="model",
+                prompt_name="workflow-copilot-raw-secret-safety",
+                cost=0.01,
+                cost_source="litellm_estimate",
+            ),
+            logger=logger,
+        )
+        await task
+        assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.01)
+        assert ledger.snapshot()["observed_call_count"] == 1
+        assert "workflow_block_execution" in ledger.snapshot()["excluded"]
+
+
+@pytest.mark.parametrize("cost", [None, -1.0, float("nan"), float("inf"), True])
+def test_cost_ledger_preserves_invalid_cost_as_unknown(cost: float | None) -> None:
+    with copilot_cost_scope() as ledger:
+        ledger.record(CopilotModelUsageEvent(request_model="model", cost=cost, cost_source="litellm_estimate"))
+        assert ledger.snapshot()["known_cost_usd"] is None
+        assert ledger.snapshot()["unknown_call_count"] == 1
 
 
 def test_event_provider_falls_back_to_qualified_request_model() -> None:

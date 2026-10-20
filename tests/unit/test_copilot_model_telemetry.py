@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
 from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
     SCREENSHOT_SENTINEL,
@@ -642,6 +643,7 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
         output_tokens=7,
         cache_read_tokens=31,
         cache_write_tokens=47,
+        service_tier="default",
     )
 
     assert model_telemetry_module._model_call_cost(telemetry, "gpt-5.6-sol") == pytest.approx(0.15)
@@ -652,7 +654,131 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
         "cache_read_input_tokens": 31,
         "cache_creation_input_tokens": 47,
         "call_type": "aresponses",
+        "service_tier": "default",
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "input_tokens", "reported_cost", "expected_cost"),
+    [
+        ("anthropic/claude-haiku-5-5", 100_000, None, 0.15),
+        ("anthropic/claude-haiku-5-5", 100_001, None, 0.75),
+        ("bedrock/us.anthropic.claude-haiku-5-5", 100_001, None, 0.75),
+        ("anthropic/claude-haiku-5-5-2026-10-01", 100_001, None, 0.75),
+        ("anthropic/claude-sonnet-4-6", 100_001, None, 0.15),
+        ("anthropic/claude-haiku-5-5", 100_001, 0.2, 0.2),
+    ],
+)
+def test_model_call_cost_applies_shared_long_prompt_correction(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    input_tokens: int,
+    reported_cost: float | None,
+    expected_cost: float,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(
+        model_call_index=1,
+        input_tokens=input_tokens,
+        output_tokens=7,
+        cache_read_tokens=90_000,
+        cache_write_tokens=5_000,
+        reported_cost=reported_cost,
+    )
+
+    assert model_telemetry_module._model_call_cost(telemetry, model) == pytest.approx(expected_cost)
+    if reported_cost is None:
+        # Input tokens already include cache reads/writes; they select the long-prompt rate once.
+        assert price.call_args.kwargs["prompt_tokens"] == input_tokens
+        assert price.call_args.kwargs["cache_read_input_tokens"] == 90_000
+        assert price.call_args.kwargs["cache_creation_input_tokens"] == 5_000
+    else:
+        price.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("response_model", "served_model", "served_provider", "pricing_model", "expected_cost"),
+    [
+        (
+            "claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            0.75,
+        ),
+        ("us.anthropic.claude-haiku-5-5", None, "bedrock", "us.anthropic.claude-haiku-5-5", 0.75),
+        (
+            "global.anthropic.claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock",
+            "global.anthropic.claude-haiku-5-5",
+            0.75,
+        ),
+        (
+            "claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            "bedrock",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            0.15,
+        ),
+        ("claude-haiku-5-5", None, "bedrock", None, None),
+        ("claude-haiku-5-5", "bedrock/us.anthropic.claude-haiku-5-5", "anthropic", "claude-haiku-5-5", 0.75),
+    ],
+)
+def test_model_call_cost_preserves_actual_bedrock_profile_and_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    response_model: str,
+    served_model: str | None,
+    served_provider: str,
+    pricing_model: str | None,
+    expected_cost: float | None,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(
+        model_call_index=1, input_tokens=100_001, output_tokens=10
+    )
+    model_telemetry_module._capture_served_provider(
+        telemetry,
+        SimpleNamespace(_hidden_params={"custom_llm_provider": served_provider, "litellm_model_name": served_model}),
+    )
+
+    cost = model_telemetry_module._model_call_cost(telemetry, response_model)
+    if expected_cost is None:
+        assert cost is None
+        price.assert_not_called()
+    else:
+        assert cost == pytest.approx(expected_cost)
+        assert price.call_args.kwargs["model"] == pricing_model
+        assert price.call_args.kwargs.get("custom_llm_provider") == (
+            "bedrock" if served_provider == "bedrock" else None
+        )
+
+
+@pytest.mark.asyncio
+async def test_stream_cost_uses_bedrock_chunk_profile_without_hidden_model_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    chunks = _stream_chunks()
+    for chunk in chunks:
+        chunk.model = "us.anthropic.claude-haiku-5-5"
+        chunk._hidden_params = {"custom_llm_provider": "bedrock"}
+    chunks[-1].usage = Usage(prompt_tokens=100_001, completion_tokens=7, total_tokens=100_008)
+
+    with (
+        copilot_cost_scope() as ledger,
+        _model_call_telemetry_scope(1, model="anthropic/claude-haiku-5-5") as telemetry,
+    ):
+        stream = model_telemetry_module._UsageCapturingStream(_ChunkStream(chunks), telemetry)
+        received = [chunk async for chunk in stream]
+
+    assert received == chunks
+    assert price.call_args.kwargs["model"] == "us.anthropic.claude-haiku-5-5"
+    assert price.call_args.kwargs["custom_llm_provider"] == "bedrock"
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.75)
 
 
 def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -669,6 +795,7 @@ def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pyte
         output_tokens=500,
         cache_read_tokens=0,
         cache_write_tokens=35_000,
+        service_tier="default",
     )
 
     dated_cost = model_telemetry_module._model_call_cost(
@@ -680,6 +807,46 @@ def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pyte
     assert dated_cost is not None
     assert dated_cost == pytest.approx(base_cost)
     assert priced_models == ["gpt-5.6-sol", "gpt-5.6-sol"]
+
+
+@pytest.mark.parametrize(
+    ("reported_tier", "recovered_tier", "priced_tier"),
+    [("flex", "default", "flex"), ("default", "flex", "default"), (None, "flex", "flex"), (None, None, None)],
+)
+def test_actor_cost_uses_actual_or_recovered_served_tier_and_preserves_missing_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_tier: str | None,
+    recovered_tier: str | None,
+    priced_tier: str | None,
+) -> None:
+    priced: list[str | None] = []
+
+    def price(**kwargs: Any) -> tuple[float, float]:
+        priced.append(kwargs["service_tier"])
+        return (0.005 if kwargs["service_tier"] == "flex" else 0.01), 0.0
+
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+        telemetry.capture({"input_tokens": 100, "output_tokens": 10})
+        model_telemetry_module._capture_served_provider(
+            telemetry,
+            SimpleNamespace(
+                service_tier=reported_tier,
+                _hidden_params={"skyvern_served_service_tier": recovered_tier},
+            ),
+        )
+    assert priced == ([priced_tier] if priced_tier is not None else [])
+    assert ledger.snapshot()["known_cost_usd"] == (
+        pytest.approx(0.005 if priced_tier == "flex" else 0.01) if priced_tier is not None else None
+    )
+    assert ledger.snapshot()["unknown_call_count"] == (0 if priced_tier is not None else 1)
+
+
+def test_reported_cost_remains_usable_without_a_served_tier() -> None:
+    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+        telemetry.capture({"input_tokens": 100, "output_tokens": 10, "cost": 0.02})
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.02)
+    assert ledger.snapshot()["pricing_sources"] == ["provider_reported"]
 
 
 def test_completed_model_call_emits_datadog_usage_with_explicit_zeroes(
@@ -821,6 +988,27 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
         pass
 
     assert events == []
+
+
+def test_turn_cost_ledger_uses_provider_cost_then_estimate_and_preserves_unpriced_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", lambda **kwargs: (0.01, 0.02))
+    with copilot_cost_scope():
+        with _model_call_telemetry_scope(1, model="model") as telemetry:
+            telemetry.capture({"input_tokens": 10, "output_tokens": 3, "cost": 0.125})
+        with _model_call_telemetry_scope(2, model="model") as telemetry:
+            telemetry.capture({"input_tokens": 10, "output_tokens": 3})
+        with _model_call_telemetry_scope(3, model="model"):
+            pass
+        result = current_copilot_cost()
+    assert result is not None
+    assert result["known_cost_usd"] == pytest.approx(0.155)
+    assert result["observed_call_count"] == 3
+    assert result["priced_call_count"] == 2
+    assert result["unknown_call_count"] == 1
+    assert result["pricing_sources"] == ["litellm_estimate", "provider_reported"]
+    assert result["status"] == "partial"
 
 
 def test_datadog_logging_failure_does_not_escape_or_leak_context(
