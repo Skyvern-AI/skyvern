@@ -564,6 +564,7 @@ async def install_run_blocks_harness(
     database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+    database.self_heal.get_heal_episodes_for_run = AsyncMock(return_value=[])
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
     database.workflow_runs.get_workflow_run_output_parameters = AsyncMock(return_value=[])
     database.workflow_runs.get_workflow_runs_for_workflow_permanent_id = AsyncMock(return_value=[])

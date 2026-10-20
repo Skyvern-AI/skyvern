@@ -1,0 +1,536 @@
+{
+  "schema": "generated-code-exception-packet-v1",
+  "provenance": "a fixed caught-click draft run by tests/browser_e2e/test_workflow_copilot_code_first_failure_attribution.py against a live Chromium page, with its recorded rows projected by the run tool's own attachment; no model was called",
+  "label": "read_order_documents",
+  "context_slug": "caught-intercepted-click",
+  "system": "You are authoring the browser automation code block for the user's request. If a test run of your block is reported, submit the block that should be saved: the same block if that run satisfied the request, otherwise a repaired one. Return only the Python statements of the block body, with no markdown fence and no commentary; `page` is already in scope and the body must return a dict with a 'documents' key.",
+  "ask": "Open https://documents.fixture.test/orders?intercepted_toggle=1 and return every row of the order documents table under the documents key.",
+  "captured_turn": 0,
+  "routes": {
+    "GET /orders": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n    <title>Order Documents Portal</title>\n    <style>\n      :root {\n        color-scheme: light;\n        --ink: #18212f;\n        --muted: #657187;\n        --line: #d7dce5;\n        --panel: #f5f7fb;\n        --accent: #0f766e;\n        --paper: #ffffff;\n      }\n\n      * {\n        box-sizing: border-box;\n      }\n\n      body {\n        margin: 0;\n        min-height: 100vh;\n        font-family: Inter, ui-sans-serif, system-ui, -apple-system, \"Segoe UI\", sans-serif;\n        color: var(--ink);\n        background: var(--panel);\n      }\n\n      header {\n        display: flex;\n        align-items: center;\n        min-height: 64px;\n        padding: 0 32px;\n        border-bottom: 1px solid var(--line);\n        background: var(--paper);\n        font-weight: 700;\n      }\n\n      main {\n        max-width: 860px;\n        margin: 32px auto;\n        padding: 0 16px;\n      }\n\n      .card {\n        background: var(--paper);\n        border: 1px solid var(--line);\n        border-radius: 10px;\n        padding: 24px;\n        margin-bottom: 20px;\n      }\n\n      .check-status {\n        display: flex;\n        align-items: center;\n        gap: 10px;\n        font-weight: 600;\n      }\n\n      .check-status .ok {\n        color: var(--accent);\n      }\n\n      table {\n        width: 100%;\n        border-collapse: collapse;\n      }\n\n      th,\n      td {\n        text-align: left;\n        padding: 10px 12px;\n        border-bottom: 1px solid var(--line);\n      }\n\n      .overlay {\n        position: fixed;\n        inset: 0;\n        background: rgba(24, 33, 47, 0.55);\n        display: flex;\n        align-items: center;\n        justify-content: center;\n        z-index: 60;\n      }\n\n      .modal {\n        background: var(--paper);\n        border-radius: 12px;\n        max-width: 460px;\n        width: calc(100% - 32px);\n        padding: 28px;\n        box-shadow: 0 18px 44px rgba(24, 33, 47, 0.28);\n      }\n\n      .modal h2 {\n        margin-top: 0;\n        font-size: 19px;\n      }\n\n      .modal p {\n        color: var(--muted);\n        font-size: 14px;\n        line-height: 1.5;\n      }\n\n      .consent-row {\n        display: flex;\n        gap: 10px;\n        align-items: flex-start;\n        position: relative;\n        margin: 18px 0;\n        font-size: 14px;\n      }\n\n      .partial-coverer {\n        position: absolute;\n        top: -5px;\n        left: -5px;\n        z-index: 2;\n        width: 30px;\n        height: 30px;\n        border: 1px solid #b45309;\n        border-radius: 6px;\n        background: #fbbf24;\n        cursor: pointer;\n      }\n\n      .pref-toggle {\n        position: relative;\n        display: block;\n        min-width: 260px;\n        margin-top: 16px;\n        padding: 10px 14px;\n        border: 1px solid var(--line);\n        border-radius: 18px;\n        cursor: pointer;\n        font-size: 14px;\n      }\n\n      .pref-toggle-heading {\n        position: absolute;\n        inset: 0;\n        display: flex;\n        align-items: center;\n        justify-content: flex-end;\n        padding-right: 14px;\n        color: var(--muted);\n      }\n\n      button[type=\"submit\"] {\n        width: 100%;\n        padding: 11px 16px;\n        font-size: 15px;\n        font-weight: 600;\n        color: white;\n        background: var(--accent);\n        border: 0;\n        border-radius: 8px;\n        cursor: pointer;\n      }\n\n      button[type=\"submit\"]:disabled {\n        background: #9db4b1;\n        cursor: not-allowed;\n      }\n\n      [hidden] {\n        display: none !important;\n      }\n    </style>\n  </head>\n  <body>\n    <header>Order Documents Portal</header>\n    <main>\n      <section class=\"card\" id=\"bot-check-card\">\n        <div class=\"check-status\" id=\"bot-check-status\">\n          <span aria-hidden=\"true\">&#9203;</span>\n          <span>Checking your browser before granting access&hellip;</span>\n        </div>\n        <div class=\"check-status\" id=\"bot-check-passed\" hidden>\n          <span class=\"ok\" aria-hidden=\"true\">&#10003;</span>\n          <span class=\"ok\">Success! Browser check passed.</span>\n        </div>\n        <div id=\"verification-widget-wrapper\" hidden>\n          <div id=\"verification-widget\" class=\"challenge-widget human-verification\" data-state=\"solved\"></div>\n        </div>\n      </section>\n\n      <section class=\"card\" id=\"documents-card\" hidden>\n        <h1>Your order documents</h1>\n        <table id=\"order-documents\">\n          <thead>\n            <tr>\n              <th>Document ID</th>\n              <th>Title</th>\n              <th>Order date</th>\n              <th>Status</th>\n            </tr>\n          </thead>\n          <tbody>\n            <tr>\n              <td>DOC-58231</td>\n              <td>Purchase confirmation</td>\n              <td>2026-06-02</td>\n              <td>Available</td>\n            </tr>\n            <tr>\n              <td>DOC-58232</td>\n              <td>Shipping manifest</td>\n              <td>2026-06-05</td>\n              <td>Available</td>\n            </tr>\n            <tr>\n              <td>DOC-58233</td>\n              <td>Warranty certificate</td>\n              <td>2026-06-11</td>\n              <td>Processing</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <div class=\"overlay\" id=\"terms-overlay\" hidden>\n      <form class=\"modal\" id=\"terms-modal\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"terms-title\">\n        <h2 id=\"terms-title\">Terms of Service &amp; Privacy</h2>\n        <p>\n          Before viewing your order documents, please review and accept our Terms of Service and Privacy Policy.\n          We process personal data in accordance with GDPR; see the privacy policy for details on cookies and\n          data retention.\n        </p>\n        <label class=\"consent-row\">\n          <input type=\"checkbox\" id=\"accept-terms\" name=\"accept_terms\" />\n          <span>I have read and agree to the Terms of Service and the Privacy Policy.</span>\n        </label>\n        <button type=\"submit\" id=\"btn-continue\" disabled>Continue</button>\n        <div class=\"pref-toggle\" id=\"reject-toggle\" role=\"switch\" aria-checked=\"false\" hidden>\n          <span class=\"pref-toggle-label\">Reject All</span>\n          <span class=\"pref-toggle-heading\">Optional cookies</span>\n        </div>\n      </form>\n    </div>\n\n    <script>\n      (function () {\n        var acceptTerms = document.getElementById(\"accept-terms\");\n        var btnContinue = document.getElementById(\"btn-continue\");\n        var query = new URLSearchParams(window.location.search);\n        var partialCover = query.get(\"partial_cover\") === \"1\";\n\n        // The heading span lies over its sibling label, so a click aimed at the label lands on the heading.\n        // A script-dispatched click is not trusted, so the page records whether a pointer made the choice.\n        if (query.get(\"intercepted_toggle\") === \"1\") {\n          var toggle = document.getElementById(\"reject-toggle\");\n          document.getElementById(\"terms-title\").textContent = \"Cookie preferences\";\n          document.querySelector(\"#terms-modal p\").textContent =\n            \"We use optional cookies for analytics. Make your choice to continue to your order documents.\";\n          acceptTerms.parentElement.remove();\n          btnContinue.remove();\n          toggle.hidden = false;\n          toggle.addEventListener(\"click\", function (event) {\n            sessionStorage.setItem(\n              \"cookie_choice_click\",\n              JSON.stringify({ trusted: event.isTrusted, receiver: event.currentTarget.id }),\n            );\n            toggle.setAttribute(\"aria-checked\", \"true\");\n            document.getElementById(\"terms-overlay\").hidden = true;\n            document.getElementById(\"documents-card\").hidden = false;\n          });\n        }\n\n        setTimeout(function () {\n          document.getElementById(\"bot-check-status\").hidden = true;\n          document.getElementById(\"bot-check-passed\").hidden = false;\n          document.getElementById(\"terms-overlay\").hidden = false;\n          if (partialCover) {\n            var coverer = document.createElement(\"div\");\n            coverer.id = \"target-coverer\";\n            coverer.className = \"partial-coverer\";\n            coverer.tabIndex = 0;\n            coverer.setAttribute(\"role\", \"button\");\n            coverer.setAttribute(\"aria-label\", \"Dismiss target cover\");\n            var dismissCoverer = function (event) {\n              event.preventDefault();\n              event.stopPropagation();\n              coverer.remove();\n            };\n            coverer.addEventListener(\"click\", dismissCoverer);\n            coverer.addEventListener(\"keydown\", function (event) {\n              if (event.key === \"Enter\" || event.key === \" \") {\n                dismissCoverer(event);\n              }\n            });\n            acceptTerms.parentElement.appendChild(coverer);\n          }\n        }, 1200);\n\n        acceptTerms.addEventListener(\"change\", function () {\n          btnContinue.disabled = !acceptTerms.checked;\n        });\n\n        document.getElementById(\"terms-modal\").addEventListener(\"submit\", function (event) {\n          event.preventDefault();\n          if (!acceptTerms.checked) {\n            return;\n          }\n          document.getElementById(\"terms-overlay\").hidden = true;\n          document.getElementById(\"documents-card\").hidden = false;\n        });\n      })();\n    </script>\n  </body>\n</html>\n"
+  },
+  "start_state": {
+    "cookies": [],
+    "origins": []
+  },
+  "state_reader": "() => {\n  let choice = null;\n  try {\n    choice = JSON.parse(sessionStorage.getItem('cookie_choice_click') || 'null');\n  } catch (error) {}\n  return {\n    cover_present: !document.getElementById('terms-overlay').hidden,\n    documents_visible: !document.getElementById('documents-card').hidden,\n    dismissed_by_trusted_click: !!choice && choice.trusted === true,\n  };\n}",
+  "expected_state": {
+    "cover_present": false,
+    "documents_visible": true,
+    "dismissed_by_trusted_click": true
+  },
+  "expected_repair_facts": [
+    {
+      "name": "caught_click.intercepting_element",
+      "text": "<span class=\"pref-toggle-heading\">Optional cookies</span> intercepts pointer events",
+      "baseline": "absent"
+    }
+  ],
+  "turns": [
+    {
+      "turn": 0,
+      "kind": "repair",
+      "model": null,
+      "user": "CURRENT WORKFLOW YAML:\n\n\nThe user's current workflow definition is:\n\n```\nworkflow_definition:\n  parameters: []\n  blocks:\n  - block_type: code\n    label: read_order_documents\n    code: |\n      await page.goto(\"https://documents.fixture.test/orders?intercepted_toggle=1\")\n      reject = page.get_by_text(\"Reject All\")\n      try:\n          await reject.wait_for(state=\"visible\", timeout=5000)\n          await reject.click(timeout=3000)\n      except Exception:\n          pass\n      rows = page.locator(\"#order-documents tbody tr\")\n      return {\"documents\": await rows.all_text_contents()}\n\n```\n\n\n\nWorkflow block summary:\n\n```\n- read_order_documents (code)\n```\n\nUse this summary as a block-label index, then inspect the full workflow definition above for exact block details.\n\n\n\n\n\n\n\n\n\n\n\n\nPREVIOUS CONTEXT:\n\n\n\n\n\n\n\n\nNo previous context available.\n\n\nDEBUGGER RUN INFORMATION:\n\n\nThe user has run the workflow in the debugger. Here's the most recent block execution information:\n\n```\n{\n  \"data\": {\n    \"build_test_packet\": {\n      \"contract_version\": \"build_test_evidence_packet_v1\",\n      \"workflow_permanent_id\": \"wpid-caught-intercepted-click\",\n      \"canonical_workflow_yaml\": \"workflow_definition:\\n  parameters: []\\n  blocks:\\n  - block_type: code\\n    label: read_order_documents\\n    code: |\\n      await page.goto(\\\"https://documents.fixture.test/orders?intercepted_toggle=1\\\")\\n      reject = page.get_by_text(\\\"Reject All\\\")\\n      try:\\n          await reject.wait_for(state=\\\"visible\\\", timeout=5000)\\n          await reject.click(timeout=3000)\\n      except Exception:\\n          pass\\n      rows = page.locator(\\\"#order-documents tbody tr\\\")\\n      return {\\\"documents\\\": await rows.all_text_contents()}\\n\",\n      \"canonical_workflow_source\": \"turn_start_persisted_readback\",\n      \"canonical_workflow_yaml_complete\": true,\n      \"attempted_block_labels\": [\n        \"read_order_documents\"\n      ],\n      \"executed_block_labels\": [\n        \"read_order_documents\"\n      ],\n      \"run\": {\n        \"workflow_run_id\": \"wr_caught_intercepted_click\",\n        \"browser_session_id\": \"pbs_caught_intercepted_click\",\n        \"status\": \"completed\"\n      },\n      \"action_observations\": [\n        \"goto_url completed\",\n        \"click failed code_line=5\"\n      ],\n      \"observed_block_end_urls\": {},\n      \"per_block_action_observations\": {\n        \"read_order_documents\": [\n          \"goto_url completed\",\n          \"click failed code_line=5\"\n        ]\n      },\n      \"page_state\": {\n        \"current_origin\": \"https://documents.fixture.test\",\n        \"current_url\": \"https://documents.fixture.test/orders\",\n        \"title\": \"Order Documents Portal\",\n        \"evidence_source\": \"inspect_page_for_composition\",\n        \"observed_after_workflow_run\": true,\n        \"rendered_value_excerpt\": \"Order Documents Portal \\u2713 Success! Browser check passed. Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies\",\n        \"form_summaries\": [],\n        \"value_bindings\": [\n          \"Reject All=Optional cookies\"\n        ],\n        \"result_summaries\": [\n          \"DOC-58231 Purchase confirmation 2026-06-02 Available\",\n          \"DOC-58232 Shipping manifest 2026-06-05 Available\",\n          \"DOC-58233 Warranty certificate 2026-06-11 Processing\"\n        ],\n        \"action_summaries\": [],\n        \"challenge_summaries\": [],\n        \"obstruction_summaries\": [\n          \"modal_overlay Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies obstruction present, no dismiss control found in page evidence\"\n        ],\n        \"obstructions\": [\n          {\n            \"kind\": \"modal_overlay\",\n            \"source\": \"dom_html\",\n            \"selector_candidates\": [\n              {\n                \"selector\": \"#terms-modal\",\n                \"source\": \"id\"\n              },\n              {\n                \"selector\": \"form.modal\",\n                \"source\": \"class\"\n              },\n              {\n                \"selector\": \"form.modal:has-text(\\\"Cookie preferences\\\")\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"form.modal:has-text(\\\"Reject All\\\")\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"form.modal:has-text(\\\"Optional cookies\\\")\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"div.overlay:has-text(\\\"Cookie preferences\\\") form.modal\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"div.overlay:has-text(\\\"Reject All\\\") form.modal\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"div.overlay:has-text(\\\"Optional cookies\\\") form.modal\",\n                \"source\": \"text_anchor\"\n              },\n              {\n                \"selector\": \"#terms-overlay > form:nth-of-type(1)\",\n                \"source\": \"structural\"\n              }\n            ],\n            \"identity\": {\n              \"tag\": \"form\",\n              \"role\": \"dialog\",\n              \"label_context\": \"Cookie preferences\"\n            },\n            \"text\": \"Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies\",\n            \"visible_controls\": []\n          }\n        ]\n      },\n      \"page_capture\": {\n        \"status\": \"captured\"\n      },\n      \"requested_outputs\": [],\n      \"registered_outputs\": [\n        {\n          \"label\": \"read_order_documents\",\n          \"status\": \"completed\",\n          \"output\": {\n            \"documents\": [\n              \"\\n              DOC-58231\\n              Purchase confirmation\\n              2026-06-02\\n              Available\\n            \",\n              \"\\n              DOC-58232\\n              Shipping manifest\\n              2026-06-05\\n              Available\\n            \",\n              \"\\n              DOC-58233\\n              Warranty certificate\\n              2026-06-11\\n              Processing\\n            \"\n            ]\n          },\n          \"value_complete\": true\n        }\n      ],\n      \"downloads\": [],\n      \"screenshot\": {\n        \"present\": false\n      },\n      \"unfinished_items\": [],\n      \"omission_notices\": [\n        \"failure omitted: no failed run or failed block was recorded.\",\n        \"downloads empty: no registered download artifact was recorded.\",\n        \"screenshot omitted: no final or failed-block screenshot was recorded.\",\n        \"unfinished_items empty: recorded outcome and workflow evidence identify none.\",\n        \"observed_block_end_urls empty: no per-block end URL was recorded for this run.\"\n      ],\n      \"levers\": [],\n      \"challenge_notices\": []\n    },\n    \"workflow_run_id\": \"wr_caught_intercepted_click\",\n    \"browser_session_id\": \"pbs_caught_intercepted_click\",\n    \"overall_status\": \"completed\",\n    \"requested_block_labels\": [\n      \"read_order_documents\"\n    ],\n    \"executed_block_labels\": [\n      \"read_order_documents\"\n    ],\n    \"post_run_page_evidence\": {\n      \"inspected_url\": \"https://documents.fixture.test/orders?intercepted_toggle=1\",\n      \"current_url\": \"https://documents.fixture.test/orders?intercepted_toggle=1\",\n      \"page_title\": \"Order Documents Portal\",\n      \"forms\": [\n        {\n          \"id\": \"terms-modal\",\n          \"name\": \"\",\n          \"action\": \"\",\n          \"method\": \"\",\n          \"fields\": [],\n          \"submit_controls\": []\n        }\n      ],\n      \"navigation_targets_truncated\": false,\n      \"navigation_targets\": [],\n      \"result_containers\": [\n        {\n          \"tag\": \"table\",\n          \"id\": \"order-documents\",\n          \"visible\": false,\n          \"headers\": [\n            {\n              \"text\": \"Document ID\",\n              \"column_index\": 0\n            },\n            {\n              \"text\": \"Title\",\n              \"column_index\": 1\n            },\n            {\n              \"text\": \"Order date\",\n              \"column_index\": 2\n            },\n            {\n              \"text\": \"Status\",\n              \"column_index\": 3\n            }\n          ],\n          \"row_count\": 3,\n          \"rows_truncated\": false,\n          \"span_free\": true,\n          \"nested_table_free\": true,\n          \"rows\": [\n            {\n              \"row_index\": 0,\n              \"visible\": false,\n              \"has_row_header\": false,\n              \"cells\": [\n                {\n                  \"column_index\": 0,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"DOC-58231\"\n                },\n                {\n                  \"column_index\": 1,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Purchase confirmation\"\n                },\n                {\n                  \"column_index\": 2,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"2026-06-02\"\n                },\n                {\n                  \"column_index\": 3,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Available\"\n                }\n              ]\n            },\n            {\n              \"row_index\": 1,\n              \"visible\": false,\n              \"has_row_header\": false,\n              \"cells\": [\n                {\n                  \"column_index\": 0,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"DOC-58232\"\n                },\n                {\n                  \"column_index\": 1,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Shipping manifest\"\n                },\n                {\n                  \"column_index\": 2,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"2026-06-05\"\n                },\n                {\n                  \"column_index\": 3,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Available\"\n                }\n              ]\n            },\n            {\n              \"row_index\": 2,\n              \"visible\": false,\n              \"has_row_header\": false,\n              \"cells\": [\n                {\n                  \"column_index\": 0,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"DOC-58233\"\n                },\n                {\n                  \"column_index\": 1,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Warranty certificate\"\n                },\n                {\n                  \"column_index\": 2,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"2026-06-11\"\n                },\n                {\n                  \"column_index\": 3,\n                  \"visible\": false,\n                  \"has_text\": true,\n                  \"text\": \"Processing\"\n                }\n              ]\n            }\n          ],\n          \"sample_rows\": [\n            \"DOC-58231 Purchase confirmation 2026-06-02 Available\",\n            \"DOC-58232 Shipping manifest 2026-06-05 Available\",\n            \"DOC-58233 Warranty certificate 2026-06-11 Processing\"\n          ],\n          \"selector_candidates\": [\n            {\n              \"selector\": \"#order-documents\",\n              \"source\": \"id\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"table:has-text(\\\"Document ID\\\")\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"table:has-text(\\\"Title\\\")\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"table:has-text(\\\"Order date\\\")\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"table:has-text(\\\"Status\\\")\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"section.card:has-text(\\\"Your order documents\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"section.card:has-text(\\\"Document ID\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"section.card:has-text(\\\"Title\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"section.card:has-text(\\\"Order date\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"main:has-text(\\\"Checking your browser before granting access\\u2026\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"main:has-text(\\\"Success! Browser check passed.\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"main:has-text(\\\"Your order documents\\\") table\",\n              \"source\": \"text_anchor\",\n              \"visible_match_count\": 0\n            },\n            {\n              \"selector\": \"#documents-card > table:nth-of-type(1)\",\n              \"source\": \"structural\",\n              \"visible_match_count\": 0\n            }\n          ],\n          \"identity\": {\n            \"tag\": \"table\",\n            \"role\": \"\",\n            \"label_context\": \"Your order documents\"\n          }\n        }\n      ],\n      \"result_containers_truncated\": false,\n      \"key_value_relations\": [\n        {\n          \"key_text\": \"Reject All\",\n          \"value_text\": \"Optional cookies\",\n          \"container_position\": 0,\n          \"value_child_index\": 1,\n          \"direct_child_count\": 2,\n          \"visible\": true,\n          \"value_visible\": true,\n          \"key_text_walked_count\": 1,\n          \"value_text_walked_count\": 1,\n          \"selector_candidates\": [\n            {\n              \"selector\": \"#reject-toggle\",\n              \"source\": \"id\"\n            },\n            {\n              \"selector\": \"div.pref-toggle\",\n              \"source\": \"class\"\n            },\n            {\n              \"selector\": \"div.pref-toggle:has-text(\\\"Reject All\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.pref-toggle:has-text(\\\"Optional cookies\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Cookie preferences\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Reject All\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Optional cookies\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Cookie preferences\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Reject All\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Optional cookies\\\") div.pref-toggle\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"#terms-modal > div:nth-of-type(1)\",\n              \"source\": \"structural\"\n            }\n          ],\n          \"identity\": {\n            \"tag\": \"div\",\n            \"role\": \"switch\",\n            \"label_context\": \"Reject All\"\n          }\n        }\n      ],\n      \"key_value_relations_truncated\": false,\n      \"clickable_controls\": [],\n      \"visible_text_excerpt\": \"Order Documents Portal \\u2713 Success! Browser check passed. Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies\",\n      \"anti_bot_indicators\": [\n        \"challenge\",\n        \"human-verification\"\n      ],\n      \"challenge_controls\": [],\n      \"modal_overlays\": [\n        {\n          \"role\": \"dialog\",\n          \"aria_modal\": true,\n          \"id\": \"terms-modal\",\n          \"class\": \"modal\",\n          \"text\": \"Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies\",\n          \"dismiss_controls\": [],\n          \"selector_candidates\": [\n            {\n              \"selector\": \"#terms-modal\",\n              \"source\": \"id\"\n            },\n            {\n              \"selector\": \"form.modal\",\n              \"source\": \"class\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Cookie preferences\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Reject All\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Optional cookies\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Cookie preferences\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Reject All\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Optional cookies\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"#terms-overlay > form:nth-of-type(1)\",\n              \"source\": \"structural\"\n            }\n          ],\n          \"identity\": {\n            \"tag\": \"form\",\n            \"role\": \"dialog\",\n            \"label_context\": \"Cookie preferences\"\n          }\n        }\n      ],\n      \"page_obstructions\": [\n        {\n          \"kind\": \"modal_overlay\",\n          \"source\": \"dom_html\",\n          \"selector_candidates\": [\n            {\n              \"selector\": \"#terms-modal\",\n              \"source\": \"id\"\n            },\n            {\n              \"selector\": \"form.modal\",\n              \"source\": \"class\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Cookie preferences\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Reject All\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"form.modal:has-text(\\\"Optional cookies\\\")\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Cookie preferences\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Reject All\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"div.overlay:has-text(\\\"Optional cookies\\\") form.modal\",\n              \"source\": \"text_anchor\"\n            },\n            {\n              \"selector\": \"#terms-overlay > form:nth-of-type(1)\",\n              \"source\": \"structural\"\n            }\n          ],\n          \"identity\": {\n            \"tag\": \"form\",\n            \"role\": \"dialog\",\n            \"label_context\": \"Cookie preferences\"\n          },\n          \"text\": \"Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies\",\n          \"visible_controls\": []\n        }\n      ],\n      \"visual_obstruction_candidates\": [\n        {\n          \"source\": \"computed_style\",\n          \"position\": \"fixed\",\n          \"coverage\": \"viewport\",\n          \"has_visible_controls\": false\n        }\n      ],\n      \"schema_empty_page\": false,\n      \"observed_empty_page\": false,\n      \"empty_page_visual_state\": null,\n      \"evidence_confidence\": 0.3,\n      \"source_tool\": \"inspect_page_for_composition\",\n      \"evidence_sources\": [\n        \"dom_html\"\n      ],\n      \"screenshot_used\": false,\n      \"visual_evidence_summary\": \"\",\n      \"visual_evidence_omissions\": [],\n      \"inspection_warnings\": [],\n      \"challenge_state\": {\n        \"detected\": true,\n        \"kind\": \"captcha\",\n        \"source\": \"dom_html\",\n        \"indicators\": [\n          \"challenge\",\n          \"human-verification\"\n        ],\n        \"requires_human_verification\": false,\n        \"visual_location\": \"\",\n        \"gates_submit_controls\": false,\n        \"gated_submit_controls\": []\n      },\n      \"workflow_run_id\": \"wr_caught_intercepted_click\",\n      \"source_browser_session_id\": \"pbs_caught_intercepted_click\",\n      \"observed_after_workflow_run\": true\n    },\n    \"blocks\": [\n      {\n        \"workflow_run_block_id\": \"wrb_wr_caught_intercepted_click\",\n        \"label\": \"read_order_documents\",\n        \"block_type\": \"CODE\",\n        \"status\": \"completed\",\n        \"task_id\": \"tsk_caught_intercepted_click\"\n      }\n    ]\n  },\n  \"ok\": true\n}\n```\n\nUse this information to help diagnose issues, suggest fixes, or explain what might be going wrong.\nIf there's a failure, analyze the failure reason, the error code and the failing line to provide specific guidance. Look at the page with a tool if you need to see it.\n\n\n\nUSER MESSAGE:\n\nThe user says:\n\n```\nOpen https://documents.fixture.test/orders?intercepted_toggle=1 and return every row of the order documents table under the documents key.\n```\n",
+      "inputs": {
+        "kind": "repair",
+        "page_raw": {
+          "page_title": "Order Documents Portal",
+          "forms": [
+            {
+              "id": "terms-modal",
+              "name": "",
+              "action": "",
+              "method": "",
+              "fields": [],
+              "submit_controls": []
+            }
+          ],
+          "navigation_targets_truncated": false,
+          "navigation_targets": [],
+          "result_containers": [
+            {
+              "tag": "table",
+              "id": "order-documents",
+              "selector": "#order-documents",
+              "selector_candidates": [
+                {
+                  "selector": "#order-documents",
+                  "source": "id",
+                  "match_count": 1,
+                  "visible_match_count": 0,
+                  "first_match_visible": false
+                },
+                {
+                  "selector": "table:has-text(\"Document ID\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "table:has-text(\"Title\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "table:has-text(\"Order date\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "table:has-text(\"Status\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "section.card:has-text(\"Your order documents\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "section.card:has-text(\"Document ID\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "section.card:has-text(\"Title\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "section.card:has-text(\"Order date\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "main:has-text(\"Checking your browser before granting access\u2026\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "main:has-text(\"Success! Browser check passed.\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "main:has-text(\"Your order documents\") table",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 0
+                },
+                {
+                  "selector": "#documents-card > table:nth-of-type(1)",
+                  "source": "structural",
+                  "match_count": 1,
+                  "visible_match_count": 0,
+                  "first_match_visible": false
+                }
+              ],
+              "identity": {
+                "tag": "table",
+                "role": "",
+                "label_context": "Your order documents"
+              },
+              "selector_match_count": 1,
+              "visible": false,
+              "is_table": true,
+              "row_count": 3,
+              "rows_truncated": false,
+              "headers": [
+                {
+                  "text": "Document ID",
+                  "column_index": 0
+                },
+                {
+                  "text": "Title",
+                  "column_index": 1
+                },
+                {
+                  "text": "Order date",
+                  "column_index": 2
+                },
+                {
+                  "text": "Status",
+                  "column_index": 3
+                }
+              ],
+              "span_free": true,
+              "nested_table_free": true,
+              "row_selector": "#order-documents > tbody > tr",
+              "rows": [
+                {
+                  "row_index": 0,
+                  "visible": false,
+                  "has_row_header": false,
+                  "cells": [
+                    {
+                      "column_index": 0,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "DOC-58231"
+                    },
+                    {
+                      "column_index": 1,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Purchase confirmation"
+                    },
+                    {
+                      "column_index": 2,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "2026-06-02"
+                    },
+                    {
+                      "column_index": 3,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Available"
+                    }
+                  ]
+                },
+                {
+                  "row_index": 1,
+                  "visible": false,
+                  "has_row_header": false,
+                  "cells": [
+                    {
+                      "column_index": 0,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "DOC-58232"
+                    },
+                    {
+                      "column_index": 1,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Shipping manifest"
+                    },
+                    {
+                      "column_index": 2,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "2026-06-05"
+                    },
+                    {
+                      "column_index": 3,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Available"
+                    }
+                  ]
+                },
+                {
+                  "row_index": 2,
+                  "visible": false,
+                  "has_row_header": false,
+                  "cells": [
+                    {
+                      "column_index": 0,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "DOC-58233"
+                    },
+                    {
+                      "column_index": 1,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Warranty certificate"
+                    },
+                    {
+                      "column_index": 2,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "2026-06-11"
+                    },
+                    {
+                      "column_index": 3,
+                      "visible": false,
+                      "has_text": true,
+                      "text": "Processing"
+                    }
+                  ]
+                }
+              ],
+              "sample_rows": [
+                "DOC-58231 Purchase confirmation 2026-06-02 Available",
+                "DOC-58232 Shipping manifest 2026-06-05 Available",
+                "DOC-58233 Warranty certificate 2026-06-11 Processing"
+              ]
+            }
+          ],
+          "result_containers_truncated": false,
+          "key_value_relations": [
+            {
+              "key_text": "Reject All",
+              "selector_candidates": [
+                {
+                  "selector": "#reject-toggle",
+                  "source": "id",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.pref-toggle",
+                  "source": "class",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.pref-toggle:has-text(\"Reject All\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.pref-toggle:has-text(\"Optional cookies\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Cookie preferences\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Reject All\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Optional cookies\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Cookie preferences\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Reject All\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Optional cookies\") div.pref-toggle",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "#terms-modal > div:nth-of-type(1)",
+                  "source": "structural",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                }
+              ],
+              "identity": {
+                "tag": "div",
+                "role": "switch",
+                "label_context": "Reject All"
+              },
+              "value_text": "Optional cookies",
+              "container_selector": "#reject-toggle",
+              "container_match_count": 1,
+              "container_position": 0,
+              "value_child_index": 1,
+              "direct_child_count": 2,
+              "visible": true,
+              "value_visible": true,
+              "key_text_walked_count": 1,
+              "value_text_walked_count": 1
+            }
+          ],
+          "key_value_relations_truncated": false,
+          "reveal_relations_truncated": false,
+          "clickable_controls": [],
+          "challenge_controls": [],
+          "modal_overlays": [
+            {
+              "role": "dialog",
+              "aria_modal": true,
+              "id": "terms-modal",
+              "class": [
+                "modal"
+              ],
+              "selector": "#terms-modal",
+              "selector_candidates": [
+                {
+                  "selector": "#terms-modal",
+                  "source": "id",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal",
+                  "source": "class",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Cookie preferences\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Reject All\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "form.modal:has-text(\"Optional cookies\")",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Cookie preferences\") form.modal",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Reject All\") form.modal",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "div.overlay:has-text(\"Optional cookies\") form.modal",
+                  "source": "text_anchor",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                },
+                {
+                  "selector": "#terms-overlay > form:nth-of-type(1)",
+                  "source": "structural",
+                  "match_count": 1,
+                  "visible_match_count": 1
+                }
+              ],
+              "identity": {
+                "tag": "form",
+                "role": "dialog",
+                "label_context": "Cookie preferences"
+              },
+              "text": "Cookie preferences We use optional cookies for analytics. Make your choice to continue to your order documents. Reject All Optional cookies",
+              "dismiss_controls": []
+            }
+          ],
+          "page_obstructions": [],
+          "visual_obstruction_candidates": [
+            {
+              "source": "computed_style",
+              "position": "fixed",
+              "coverage": "viewport",
+              "has_visible_controls": false
+            }
+          ],
+          "visible_text_excerpt": "Order Documents Portal\n\u2713\nSuccess! Browser check passed.\nCookie preferences\n\nWe use optional cookies for analytics. Make your choice to continue to your order documents.\n\nReject All\nOptional cookies",
+          "body_has_markup": true,
+          "anti_bot_indicators": [
+            "challenge",
+            "human-verification"
+          ],
+          "workflow_run_id": "wr_caught_intercepted_click",
+          "source_browser_session_id": "pbs_caught_intercepted_click",
+          "source_tool": "inspect_page_for_composition",
+          "observed_after_workflow_run": true,
+          "current_url": "https://documents.fixture.test/orders?intercepted_toggle=1"
+        },
+        "page_state": {
+          "url": "https://documents.fixture.test/orders?intercepted_toggle=1",
+          "storage_state": {
+            "cookies": [],
+            "origins": []
+          },
+          "content": "<!DOCTYPE html><html lang=\"en\"><head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n    <title>Order Documents Portal</title>\n    <style>\n      :root {\n        color-scheme: light;\n        --ink: #18212f;\n        --muted: #657187;\n        --line: #d7dce5;\n        --panel: #f5f7fb;\n        --accent: #0f766e;\n        --paper: #ffffff;\n      }\n\n      * {\n        box-sizing: border-box;\n      }\n\n      body {\n        margin: 0;\n        min-height: 100vh;\n        font-family: Inter, ui-sans-serif, system-ui, -apple-system, \"Segoe UI\", sans-serif;\n        color: var(--ink);\n        background: var(--panel);\n      }\n\n      header {\n        display: flex;\n        align-items: center;\n        min-height: 64px;\n        padding: 0 32px;\n        border-bottom: 1px solid var(--line);\n        background: var(--paper);\n        font-weight: 700;\n      }\n\n      main {\n        max-width: 860px;\n        margin: 32px auto;\n        padding: 0 16px;\n      }\n\n      .card {\n        background: var(--paper);\n        border: 1px solid var(--line);\n        border-radius: 10px;\n        padding: 24px;\n        margin-bottom: 20px;\n      }\n\n      .check-status {\n        display: flex;\n        align-items: center;\n        gap: 10px;\n        font-weight: 600;\n      }\n\n      .check-status .ok {\n        color: var(--accent);\n      }\n\n      table {\n        width: 100%;\n        border-collapse: collapse;\n      }\n\n      th,\n      td {\n        text-align: left;\n        padding: 10px 12px;\n        border-bottom: 1px solid var(--line);\n      }\n\n      .overlay {\n        position: fixed;\n        inset: 0;\n        background: rgba(24, 33, 47, 0.55);\n        display: flex;\n        align-items: center;\n        justify-content: center;\n        z-index: 60;\n      }\n\n      .modal {\n        background: var(--paper);\n        border-radius: 12px;\n        max-width: 460px;\n        width: calc(100% - 32px);\n        padding: 28px;\n        box-shadow: 0 18px 44px rgba(24, 33, 47, 0.28);\n      }\n\n      .modal h2 {\n        margin-top: 0;\n        font-size: 19px;\n      }\n\n      .modal p {\n        color: var(--muted);\n        font-size: 14px;\n        line-height: 1.5;\n      }\n\n      .consent-row {\n        display: flex;\n        gap: 10px;\n        align-items: flex-start;\n        position: relative;\n        margin: 18px 0;\n        font-size: 14px;\n      }\n\n      .partial-coverer {\n        position: absolute;\n        top: -5px;\n        left: -5px;\n        z-index: 2;\n        width: 30px;\n        height: 30px;\n        border: 1px solid #b45309;\n        border-radius: 6px;\n        background: #fbbf24;\n        cursor: pointer;\n      }\n\n      .pref-toggle {\n        position: relative;\n        display: block;\n        min-width: 260px;\n        margin-top: 16px;\n        padding: 10px 14px;\n        border: 1px solid var(--line);\n        border-radius: 18px;\n        cursor: pointer;\n        font-size: 14px;\n      }\n\n      .pref-toggle-heading {\n        position: absolute;\n        inset: 0;\n        display: flex;\n        align-items: center;\n        justify-content: flex-end;\n        padding-right: 14px;\n        color: var(--muted);\n      }\n\n      button[type=\"submit\"] {\n        width: 100%;\n        padding: 11px 16px;\n        font-size: 15px;\n        font-weight: 600;\n        color: white;\n        background: var(--accent);\n        border: 0;\n        border-radius: 8px;\n        cursor: pointer;\n      }\n\n      button[type=\"submit\"]:disabled {\n        background: #9db4b1;\n        cursor: not-allowed;\n      }\n\n      [hidden] {\n        display: none !important;\n      }\n    </style>\n  </head>\n  <body>\n    <header>Order Documents Portal</header>\n    <main>\n      <section class=\"card\" id=\"bot-check-card\">\n        <div class=\"check-status\" id=\"bot-check-status\" hidden=\"\">\n          <span aria-hidden=\"true\">\u23f3</span>\n          <span>Checking your browser before granting access\u2026</span>\n        </div>\n        <div class=\"check-status\" id=\"bot-check-passed\">\n          <span class=\"ok\" aria-hidden=\"true\">\u2713</span>\n          <span class=\"ok\">Success! Browser check passed.</span>\n        </div>\n        <div id=\"verification-widget-wrapper\" hidden=\"\">\n          <div id=\"verification-widget\" class=\"challenge-widget human-verification\" data-state=\"solved\"></div>\n        </div>\n      </section>\n\n      <section class=\"card\" id=\"documents-card\" hidden=\"\">\n        <h1>Your order documents</h1>\n        <table id=\"order-documents\">\n          <thead>\n            <tr>\n              <th>Document ID</th>\n              <th>Title</th>\n              <th>Order date</th>\n              <th>Status</th>\n            </tr>\n          </thead>\n          <tbody>\n            <tr>\n              <td>DOC-58231</td>\n              <td>Purchase confirmation</td>\n              <td>2026-06-02</td>\n              <td>Available</td>\n            </tr>\n            <tr>\n              <td>DOC-58232</td>\n              <td>Shipping manifest</td>\n              <td>2026-06-05</td>\n              <td>Available</td>\n            </tr>\n            <tr>\n              <td>DOC-58233</td>\n              <td>Warranty certificate</td>\n              <td>2026-06-11</td>\n              <td>Processing</td>\n            </tr>\n          </tbody>\n        </table>\n      </section>\n    </main>\n\n    <div class=\"overlay\" id=\"terms-overlay\">\n      <form class=\"modal\" id=\"terms-modal\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"terms-title\">\n        <h2 id=\"terms-title\">Cookie preferences</h2>\n        <p>We use optional cookies for analytics. Make your choice to continue to your order documents.</p>\n        \n        \n        <div class=\"pref-toggle\" id=\"reject-toggle\" role=\"switch\" aria-checked=\"false\">\n          <span class=\"pref-toggle-label\">Reject All</span>\n          <span class=\"pref-toggle-heading\">Optional cookies</span>\n        </div>\n      </form>\n    </div>\n\n    <script>\n      (function () {\n        var acceptTerms = document.getElementById(\"accept-terms\");\n        var btnContinue = document.getElementById(\"btn-continue\");\n        var query = new URLSearchParams(window.location.search);\n        var partialCover = query.get(\"partial_cover\") === \"1\";\n\n        // The heading span lies over its sibling label, so a click aimed at the label lands on the heading.\n        // A script-dispatched click is not trusted, so the page records whether a pointer made the choice.\n        if (query.get(\"intercepted_toggle\") === \"1\") {\n          var toggle = document.getElementById(\"reject-toggle\");\n          document.getElementById(\"terms-title\").textContent = \"Cookie preferences\";\n          document.querySelector(\"#terms-modal p\").textContent =\n            \"We use optional cookies for analytics. Make your choice to continue to your order documents.\";\n          acceptTerms.parentElement.remove();\n          btnContinue.remove();\n          toggle.hidden = false;\n          toggle.addEventListener(\"click\", function (event) {\n            sessionStorage.setItem(\n              \"cookie_choice_click\",\n              JSON.stringify({ trusted: event.isTrusted, receiver: event.currentTarget.id }),\n            );\n            toggle.setAttribute(\"aria-checked\", \"true\");\n            document.getElementById(\"terms-overlay\").hidden = true;\n            document.getElementById(\"documents-card\").hidden = false;\n          });\n        }\n\n        setTimeout(function () {\n          document.getElementById(\"bot-check-status\").hidden = true;\n          document.getElementById(\"bot-check-passed\").hidden = false;\n          document.getElementById(\"terms-overlay\").hidden = false;\n          if (partialCover) {\n            var coverer = document.createElement(\"div\");\n            coverer.id = \"target-coverer\";\n            coverer.className = \"partial-coverer\";\n            coverer.tabIndex = 0;\n            coverer.setAttribute(\"role\", \"button\");\n            coverer.setAttribute(\"aria-label\", \"Dismiss target cover\");\n            var dismissCoverer = function (event) {\n              event.preventDefault();\n              event.stopPropagation();\n              coverer.remove();\n            };\n            coverer.addEventListener(\"click\", dismissCoverer);\n            coverer.addEventListener(\"keydown\", function (event) {\n              if (event.key === \"Enter\" || event.key === \" \") {\n                dismissCoverer(event);\n              }\n            });\n            acceptTerms.parentElement.appendChild(coverer);\n          }\n        }, 1200);\n\n        acceptTerms.addEventListener(\"change\", function () {\n          btnContinue.disabled = !acceptTerms.checked;\n        });\n\n        document.getElementById(\"terms-modal\").addEventListener(\"submit\", function (event) {\n          event.preventDefault();\n          if (!acceptTerms.checked) {\n            return;\n          }\n          document.getElementById(\"terms-overlay\").hidden = true;\n          document.getElementById(\"documents-card\").hidden = false;\n        });\n      })();\n    </script>\n  \n\n</body></html>"
+        },
+        "code": "await page.goto(\"https://documents.fixture.test/orders?intercepted_toggle=1\")\nreject = page.get_by_text(\"Reject All\")\ntry:\n    await reject.wait_for(state=\"visible\", timeout=5000)\n    await reject.click(timeout=3000)\nexcept Exception:\n    pass\nrows = page.locator(\"#order-documents tbody tr\")\nreturn {\"documents\": await rows.all_text_contents()}\n",
+        "result": {
+          "ok": true,
+          "data": {
+            "workflow_run_id": "wr_caught_intercepted_click",
+            "browser_session_id": "pbs_caught_intercepted_click",
+            "overall_status": "completed",
+            "requested_block_labels": [
+              "read_order_documents"
+            ],
+            "executed_block_labels": [
+              "read_order_documents"
+            ],
+            "post_run_page_evidence": {},
+            "blocks": [
+              {
+                "workflow_run_block_id": "wrb_wr_caught_intercepted_click",
+                "label": "read_order_documents",
+                "block_type": "CODE",
+                "status": "completed",
+                "extracted_data": {
+                  "documents": [
+                    "\n              DOC-58231\n              Purchase confirmation\n              2026-06-02\n              Available\n            ",
+                    "\n              DOC-58232\n              Shipping manifest\n              2026-06-05\n              Available\n            ",
+                    "\n              DOC-58233\n              Warranty certificate\n              2026-06-11\n              Processing\n            "
+                  ]
+                },
+                "output": {
+                  "documents": [
+                    "\n              DOC-58231\n              Purchase confirmation\n              2026-06-02\n              Available\n            ",
+                    "\n              DOC-58232\n              Shipping manifest\n              2026-06-05\n              Available\n            ",
+                    "\n              DOC-58233\n              Warranty certificate\n              2026-06-11\n              Processing\n            "
+                  ]
+                },
+                "task_id": "tsk_caught_intercepted_click",
+                "action_trace": [
+                  {
+                    "action": "click",
+                    "status": "failed",
+                    "reasoning": null,
+                    "element": "get_by_text(Reject All)",
+                    "code_line": 5,
+                    "response": "Locator.click: Timeout 3000ms exceeded.\nCall log:\nwaiting for get_by_text(\"Reject All\")\n  -   locator resolved to <span class=\"pref-toggle-label\">Reject All</span>\n  - attempting click action\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <span class=\"pref-toggle-heading\">Optional cookies</span> intercepts pointer events\n  - retrying click action, attempt #1\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <span class=\"pref-toggle-heading\">Optional cookies</span> intercepts pointer events\n  - retrying click action, attempt #2\n  -   waiting 20ms\n  -   waiting for element to be visible, enabled and stable\n  -   element is visible, enabled and stable\n  -   scrolling into view if needed\n  -   done scrolling\n  -   <span class=\"pref-toggle-heading\">Optiona"
+                  },
+                  {
+                    "action": "goto_url",
+                    "status": "completed",
+                    "reasoning": null,
+                    "element": null
+                  }
+                ]
+              }
+            ],
+            "action_observations": [
+              "goto_url completed",
+              "click failed code_line=5"
+            ],
+            "per_block_action_observations": {
+              "read_order_documents": [
+                "goto_url completed",
+                "click failed code_line=5"
+              ]
+            }
+          }
+        }
+      },
+      "submission": "await page.goto(\"https://documents.fixture.test/orders?intercepted_toggle=1\")\nreject = page.get_by_text(\"Reject All\")\ntry:\n    await reject.wait_for(state=\"visible\", timeout=5000)\n    await reject.click(timeout=3000)\nexcept Exception:\n    pass\nrows = page.locator(\"#order-documents tbody tr\")\nreturn {\"documents\": await rows.all_text_contents()}\n"
+    }
+  ]
+}

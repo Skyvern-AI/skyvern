@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -57,6 +58,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_OBSERVATIONS_EMPTY,
     ACTION_TRACE_PER_TASK_LIMIT,
+    BLOCK_FACT_MAX_CHARS,
     INFRASTRUCTURE_RUNNER_ERROR_CODES,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -645,6 +647,75 @@ def _reconcile_narrative_block_attempts(ctx: CopilotContext, blocks: list[Workfl
             attempt["startedAt"], attempt["endedAt"] = started_at, ended_at
 
 
+# Playwright 1.46 writes `  -   fill("…")`; 1.58 indents it and may prefix a repeat count, `    2 × fill("…")`.
+# Either echoes the typed text raw, newlines included, so no line can be shown to end it. After an echo only whole
+# lines matching a message Playwright's dom.js logs (same in 1.46 and 1.58) are kept, with their numbers masked.
+_TYPED_INPUT_ECHO = re.compile(r'^\s*(?:-\s*)?(?:\d+ × )?(?:elementHandle\.)?(?:fill|type)\("')
+_PLAYWRIGHT_ACTION = r"(?:click|dblclick|hover|tap|fill|select option|scroll into view)"
+_CALL_LOG_STEP = re.compile(
+    r"^\s*(?:-\s*)?(?:\d+ × )?(?:"
+    rf"(?:attempting|retrying|performing) {_PLAYWRIGHT_ACTION} action(?: \(trial run\))?(?:, attempt #\d+)?"
+    rf"|(?:trial )?{_PLAYWRIGHT_ACTION} action done|forcing action|waiting \d+ms|done scrolling"
+    r"|scrolling into view if needed"
+    r"|waiting for element to be (?:visible, enabled and (?:editable|stable)|visible and (?:stable|enabled)"
+    r"|stable|visible)"
+    r"|element is (?:not (?:visible|enabled|editable|stable|attached)|visible, enabled and stable"
+    r"|visible and stable|outside of the viewport)"
+    r"|waiting for scheduled navigations to finish|navigations have finished"
+    r")\s*$"
+)
+# An element preview cuts a long attribute with "…" and no closing quote.
+_VALUE_ATTRIBUTE = re.compile(r'\svalue="[^"\n]*"?')
+
+
+def _without_typed_input(text: str) -> str:
+    """Playwright's call log echoes the text a fill or type call entered, and its element previews carry an input's
+    value. Persistence masks only registered secrets and parameters, not a value the block obtained at runtime."""
+    kept: list[str] = []
+    after_echo = False
+    for line in text.split("\n"):
+        if _TYPED_INPUT_ECHO.match(line):
+            after_echo = True
+        elif not after_echo:
+            kept.append(line)
+        elif _CALL_LOG_STEP.match(line):
+            kept.append(re.sub(r"\d+", "N", line))
+    return _VALUE_ATTRIBUTE.sub(' value="[omitted]"', "\n".join(kept))
+
+
+def _screened_failure_output(output: Any) -> Any:
+    """A failed block's output repeats its failure text as ``failure_reason`` and as each error's ``reasoning``."""
+    if not isinstance(output, dict) or output.get("status") != BlockStatus.failed.value:
+        return output
+    screened = dict(output)
+    if isinstance(screened.get("failure_reason"), str):
+        screened["failure_reason"] = _without_typed_input(screened["failure_reason"])
+    if isinstance(screened.get("errors"), list):
+        screened["errors"] = [
+            {**error, "reasoning": _without_typed_input(error["reasoning"])}
+            if isinstance(error, dict) and isinstance(error.get("reasoning"), str)
+            else error
+            for error in screened["errors"]
+        ]
+    return screened
+
+
+# An apostrophe is legal in a URL, credentials included; Playwright quotes the URLs it logs with double quotes.
+_RECORDED_URL = re.compile(r"https?://[^\s\"<>]+")
+
+
+def _screened_recorded_url_text(match: re.Match[str]) -> str:
+    url, _ = screened_recorded_url(match.group())
+    return url or "[URL withheld]"
+
+
+def _screened_recorded_failure(response: str) -> str:
+    """Playwright repeats a navigation's whole target URL, credentials and query included, so each URL gets the
+    recorded-URL screen."""
+    text = _RECORDED_URL.sub(_screened_recorded_url_text, _without_typed_input(response))
+    return redact_raw_secrets_for_prompt(text)[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+
+
 async def _attach_action_traces(
     blocks: list[WorkflowRunBlock],
     results: list[dict[str, Any]],
@@ -726,11 +797,7 @@ async def _attach_action_traces(
                 # response, which is user data and must not reach the packet.
                 entry["code_line"] = code_line
                 if action.response:
-                    # Persistence masks registered secrets and parameters; a token the block
-                    # obtained at runtime is in neither registry, so screen it here too.
-                    entry["response"] = redact_raw_secrets_for_prompt(action.response)[
-                        :RECORDED_FAILURE_RESPONSE_MAX_CHARS
-                    ]
+                    entry["response"] = _screened_recorded_failure(action.response)
             action_trace.append(entry)
         block_result["action_trace"] = action_trace
     return actions_by_task
@@ -766,7 +833,7 @@ def _code_failure_text(task_actions: Sequence[Action]) -> str | None:
     if not failure_rows:
         return None
     response = max(failure_rows, key=lambda action: action.action_order or 0).response
-    return redact_raw_secrets_for_prompt(response)[:RECORDED_FAILURE_RESPONSE_MAX_CHARS] if response else None
+    return _screened_recorded_failure(response) if response else None
 
 
 async def _attach_ai_fallback_facts(
@@ -781,6 +848,7 @@ async def _attach_ai_fallback_facts(
     code_block_labels = {
         block.workflow_run_block_id: block.label for block in blocks if block.block_type == BlockType.CODE
     }
+    results_by_block_id = {block.workflow_run_block_id: result for block, result in zip(blocks, results)}
     for block, result in zip(blocks, results):
         if parent_label := code_block_labels.get(block.parent_workflow_run_block_id or ""):
             result["parent_block_label"] = parent_label
@@ -792,6 +860,8 @@ async def _attach_ai_fallback_facts(
         LOG.warning(
             "Failed to read AI fallback episodes for run results", workflow_run_id=workflow_run_id, exc_info=True
         )
+        for block_id in code_block_labels:
+            results_by_block_id[block_id]["ai_fallback_unread"] = True
         return
     fired: dict[str, HealEpisodeDetail] = {}
     for episode in episodes:
@@ -806,6 +876,8 @@ async def _attach_ai_fallback_facts(
                 workflow_run_block_id=episode.workflow_run_block_id,
                 exc_info=True,
             )
+            if (unread := results_by_block_id.get(episode.workflow_run_block_id)) is not None:
+                unread["ai_fallback_unread"] = True
     for block, result in zip(blocks, results):
         detail = fired.get(block.workflow_run_block_id)
         if detail is None:
@@ -834,12 +906,12 @@ def _recorded_run_block_result(block: WorkflowRunBlock) -> dict[str, Any]:
     if block.task_id:
         result["task_id"] = block.task_id
     if block.failure_reason:
-        result["failure_reason"] = redact_totp_runtime_values(block.failure_reason)
+        result["failure_reason"] = redact_totp_runtime_values(_without_typed_input(block.failure_reason))
     if block.error_codes:
         result["error_codes"] = list(block.error_codes)
     # The persisted row owns null too. Keeping the key distinguishes an explicit null from an
     # older result that carried no block-output fact at all.
-    result["output"] = redact_totp_runtime_values(block.output)
+    result["output"] = redact_totp_runtime_values(_screened_failure_output(block.output))
     return result
 
 
@@ -991,7 +1063,11 @@ async def recorded_open_step_runs(ctx: CopilotContext) -> list[RecordedRunState]
             )
             rows = []
         blocks = [
-            RecordedBlockState(label=row.label, status=row.status, failure_reason=row.failure_reason)
+            RecordedBlockState(
+                label=row.label,
+                status=row.status,
+                failure_reason=_without_typed_input(row.failure_reason) if row.failure_reason else None,
+            )
             for row in rows
             if row.label and row.status
         ]
@@ -999,7 +1075,7 @@ async def recorded_open_step_runs(ctx: CopilotContext) -> list[RecordedRunState]
         state = RecordedRunState(
             workflow_run_id=workflow_run_id,
             status=str(run.status) if run is not None else None,
-            failure_reason=run.failure_reason if run is not None else None,
+            failure_reason=_without_typed_input(run.failure_reason) if run is not None and run.failure_reason else None,
             blocks=shown,
             earlier_blocks_not_shown=len(blocks) - len(shown),
             left_running=ctx.budget_expiry_state.hard_backstop_reached
@@ -1213,7 +1289,23 @@ def _result_current_url(result: Mapping[str, Any] | None) -> str | None:
     return str(url) if isinstance(url, str) and url.strip() else None
 
 
-def _action_observation(entry: Mapping[str, Any]) -> str | None:
+def _recorded_error_digest(response: str) -> str:
+    """Playwright's call log repeats every retry's steps after a one-line header. Drop the repeats and lead with the
+    steps stating why the action could not proceed, so the cause survives the per-observation cut."""
+    header, _, call_log = response.partition("Call log:")
+    steps = list(dict.fromkeys(step for line in call_log.splitlines() if (step := line.strip().lstrip("- ").strip())))
+    causes = [
+        step
+        for step in steps
+        if "intercepts pointer events" in step
+        or "intercepted by another element" in step
+        or step.startswith(("element is not ", "element is outside"))
+    ]
+    parts = [*causes, " ".join(header.split()), *(step for step in steps if step not in causes)]
+    return "; ".join(part for part in parts if part)
+
+
+def _action_observation(entry: Mapping[str, Any], *, block_continued: bool) -> str | None:
     raw_action = entry.get("action")
     raw_status = entry.get("status")
     if not isinstance(raw_action, str) or not isinstance(raw_status, str):
@@ -1225,9 +1317,36 @@ def _action_observation(entry: Mapping[str, Any]) -> str | None:
         return None
     observation = f"{action.value} {status.value}"
     code_line = entry.get("code_line")
-    if type(code_line) is int:
-        observation += f" code_line={code_line}"
-    return observation
+    if type(code_line) is not int:
+        return observation
+    observation += f" code_line={code_line}"
+    if status != ActionStatus.failed:
+        return observation
+    if block_continued:
+        observation += " (block continued)"
+    # Only the code-block recorder's own failed rows carry code_line and a response, already screened on attach.
+    response = entry.get("response")
+    if isinstance(response, str) and response:
+        observation = f"{observation}: {_recorded_error_digest(response)}"
+    return observation if len(observation) <= BLOCK_FACT_MAX_CHARS else observation[: BLOCK_FACT_MAX_CHARS - 3] + "..."
+
+
+def _block_continued(block_result: Mapping[str, Any]) -> bool:
+    """The block finished on its own code: completed, and not by an AI fallback taking over after the code raised."""
+    return (
+        block_result.get("status") == BlockStatus.completed.value
+        and "ai_fallback" not in block_result
+        and not block_result.get("ai_fallback_unread")
+    )
+
+
+def _recorded_code_failure(entry: Mapping[str, Any]) -> bool:
+    return (
+        entry.get("status") == ActionStatus.failed.value
+        and type(entry.get("code_line")) is int
+        and isinstance(entry.get("response"), str)
+        and bool(entry["response"])
+    )
 
 
 class _ActionObservationSelection(NamedTuple):
@@ -1238,9 +1357,8 @@ class _ActionObservationSelection(NamedTuple):
 def _selected_action_observations(results: Sequence[Mapping[str, Any]]) -> _ActionObservationSelection:
     """Pick the retained action facts chronologically as (block index, observation) pairs, plus the
     predecessor blocks the budget left with no entry at all.
-    ``results`` is chronological and each ``action_trace`` is newest-first, so a block's terminal
-    action is entry 0; the budget reserves one such entry for each of the newest predecessor blocks
-    and the newest block fills the rest."""
+    Recorded code-block failures go first, then each newest unreported predecessor's terminal entry (entry 0 of its
+    newest-first ``action_trace``), then the newest block fills the rest."""
     traces: list[list[Mapping[str, Any]]] = []
     for block_result in results:
         action_trace = block_result.get("action_trace")
@@ -1249,12 +1367,26 @@ def _selected_action_observations(results: Sequence[Mapping[str, Any]]) -> _Acti
         )
 
     newest_block_index = len(traces) - 1
+    newest_trace = traces[newest_block_index] if traces else []
+    # An older block's failures must not take every slot from a newest block that recorded none of its own.
+    failure_budget = _ACTION_OBSERVATION_BUDGET - (
+        1 if newest_trace and not any(_recorded_code_failure(entry) for entry in newest_trace) else 0
+    )
     selected: set[tuple[int, int]] = set()
+    # A program retrying one call in a loop records the same failure each time; only the newest copy takes a slot.
+    seen_failures: set[tuple[int, Any, Any]] = set()
+    for block_index in range(newest_block_index, -1, -1):
+        for entry_index, entry in enumerate(traces[block_index]):
+            failure_key = (block_index, entry.get("code_line"), entry.get("response"))
+            if len(selected) < failure_budget and _recorded_code_failure(entry) and failure_key not in seen_failures:
+                seen_failures.add(failure_key)
+                selected.add((block_index, entry_index))
+    newest_block_slot = 0 if any(block_index == newest_block_index for block_index, _ in selected) else 1
     unreserved: list[int] = []
     for block_index in range(newest_block_index - 1, -1, -1):
-        if not traces[block_index]:
+        if not traces[block_index] or any(selected_block == block_index for selected_block, _ in selected):
             continue
-        if len(selected) >= _ACTION_OBSERVATION_BUDGET - 1:
+        if len(selected) >= _ACTION_OBSERVATION_BUDGET - newest_block_slot:
             unreserved.append(block_index)
             continue
         selected.add((block_index, 0))
@@ -1268,10 +1400,11 @@ def _selected_action_observations(results: Sequence[Mapping[str, Any]]) -> _Acti
 
     retained: list[tuple[int, str]] = []
     for block_index in range(len(traces)):
+        block_continued = _block_continued(results[block_index])
         for entry_index in range(len(traces[block_index]) - 1, -1, -1):
             if (block_index, entry_index) not in selected:
                 continue
-            observation = _action_observation(traces[block_index][entry_index])
+            observation = _action_observation(traces[block_index][entry_index], block_continued=block_continued)
             if observation is not None:
                 retained.append((block_index, observation))
     reported = {block_index for block_index, _ in retained}
@@ -2312,7 +2445,7 @@ async def _attach_registered_output_parameter_values(
             block_info.update(index_by_key.get(output_parameter_key, {}))
         if block_info.get("block_label") in excluded_block_labels:
             continue
-        value = without_output_only_labels(getattr(row, "value", None))
+        value = _screened_failure_output(without_output_only_labels(getattr(row, "value", None)))
         item = {
             "workflow_run_id": workflow_run_id,
             "output_parameter_id": output_parameter_id,
@@ -5110,7 +5243,7 @@ async def _run_blocks_and_collect_debug(
         for block in blocks:
             block_result = _recorded_run_block_result(block)
             if hasattr(block, "output") and block.output:
-                block_result["extracted_data"] = block.output
+                block_result["extracted_data"] = redact_totp_runtime_values(_screened_failure_output(block.output))
                 if block.label is not None:
                     block_outputs_by_label[block.label] = block.output
             results.append(block_result)
@@ -5121,7 +5254,14 @@ async def _run_blocks_and_collect_debug(
         )
         ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
-        await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
+        actions_by_task = await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
+        await _attach_ai_fallback_facts(
+            blocks,
+            results,
+            actions_by_task,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=ctx.organization_id,
+        )
         origin_registry = (
             await _complete_origin_run_redaction_registry_from_runtime(
                 ctx, workflow_run.workflow_run_id, origin_registry
@@ -5176,7 +5316,7 @@ async def _run_blocks_and_collect_debug(
             result_data["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
         _attach_reused_origin_outputs(result_data, execution)
         if not run_ok and run and run.failure_reason:
-            result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
+            result_data["failure_reason"] = redact_totp_runtime_values(_without_typed_input(run.failure_reason))
         if not run_ok and run and run.failure_category:
             failure_category = without_output_only_categories(run.failure_category)
             if failure_category:
@@ -5597,7 +5737,7 @@ async def _get_run_results(
     if dispatch_to_worker and dispatched_end_url is None and not secrets_unscrubbable:
         result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
-        result_data["failure_reason"] = redact_totp_runtime_values(run.failure_reason)
+        result_data["failure_reason"] = redact_totp_runtime_values(_without_typed_input(run.failure_reason))
     await _halt_turn_if_superseded(
         ctx,
         run,
