@@ -5,9 +5,7 @@ import {
   cleanup,
   fireEvent,
   render,
-  renderHook,
   screen,
-  waitFor,
 } from "@testing-library/react";
 import type { ReactNode } from "react";
 import type { Edge, NodeProps } from "@xyflow/react";
@@ -15,12 +13,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import type { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
-import {
-  useWorkflowHasChangesStore,
-  useWorkflowSave,
-  type WorkflowSaveData,
-} from "@/store/WorkflowHasChangesStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
   beginCopilotAcceptance,
   finishCopilotAcceptance,
@@ -83,15 +78,6 @@ vi.mock("@/routes/browserSessions/hooks/useProcessRecordingMutation", () => ({
   },
 }));
 
-const uploadMocks = vi.hoisted(() => ({
-  getClient: vi.fn(),
-  post: vi.fn(),
-  put: vi.fn(),
-}));
-vi.mock("@/api/AxiosClient", () => ({ getClient: uploadMocks.getClient }));
-vi.mock("@/hooks/useCredentialGetter", () => ({
-  useCredentialGetter: () => vi.fn(),
-}));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
@@ -140,10 +126,6 @@ describe("NodeAdderNode", () => {
     useWorkflowHasChangesStore.setState(
       useWorkflowHasChangesStore.getInitialState(),
     );
-    uploadMocks.getClient.mockResolvedValue({
-      post: uploadMocks.post,
-      put: uploadMocks.put,
-    });
     useSettingsStore.setState(initialSettings, true);
     useRecordingStore.setState(initialRecording, true);
     useWorkflowSettingsStore.setState(initialWorkflowSettings, true);
@@ -164,6 +146,7 @@ describe("NodeAdderNode", () => {
 
   afterEach(() => {
     cleanup();
+    useCopilotActionStore.setState({ stageAttachment: null });
     useRecordedBlocksStore.getState().clearRecordedBlocks();
     useRecordingStore.setState(initialRecording, true);
     useWorkflowYamlEditorStore.setState(
@@ -272,141 +255,30 @@ describe("NodeAdderNode", () => {
     expect(useRecordingStore.getState().isRecording).toBe(false);
   });
 
-  it.each(["copilot", "yaml"])(
-    "refuses a canvas upload while %s owns the editor",
-    async (lock) => {
-      useEdgesMock.mockReturnValue([
-        { id: "edge", source: "start", target: "adder" },
-      ]);
-      useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
-      const owner = createYamlCommitOwner("wpid_test");
-      const token = lock === "copilot" ? beginCopilotAcceptance() : null;
-      if (lock === "yaml") expect(beginYamlCommit(owner)).toBe(true);
-      const { container } = renderNodeAdder({});
-      const input =
-        container.querySelector<HTMLInputElement>('input[type="file"]')!;
-      await act(async () =>
-        fireEvent.change(input, {
-          target: {
-            files: [
-              new File(["pdf"], "steps.pdf", { type: "application/pdf" }),
-            ],
-          },
-        }),
-      );
-      expect(uploadMocks.getClient).not.toHaveBeenCalled();
-      expect(uploadMocks.post).not.toHaveBeenCalled();
-      expect(useRecordedBlocksStore.getState().blocks).toBeNull();
-      if (token) finishCopilotAcceptance(token);
-      else finishYamlCommit(owner);
-    },
-  );
-
-  it("holds authoring through upload settlement until generated blocks are applied", async () => {
+  it("stages a picked PDF in Copilot with a draft naming the block before it", () => {
     useEdgesMock.mockReturnValue([
-      { id: "edge", source: "start", target: "adder" },
+      { id: "edge", source: "login", target: "adder" },
     ]);
-    useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
-    let resolveUpload!: (value: unknown) => void;
-    uploadMocks.post.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveUpload = resolve;
-        }),
-    );
-    const { container } = renderNodeAdder({});
-    const input =
-      container.querySelector<HTMLInputElement>('input[type="file"]')!;
-    fireEvent.change(input, {
-      target: { files: [new File(["pdf"], "steps.pdf")] },
-    });
-    expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-      true,
-    );
-    expect(beginCopilotAcceptance()).toBeNull();
-    expect(beginYamlCommit(createYamlCommitOwner("wpid_test"))).toBe(false);
-    await waitFor(() => expect(uploadMocks.post).toHaveBeenCalledTimes(1));
-    await act(async () =>
-      resolveUpload({
-        data: {
-          blocks: [
-            {
-              block_type: "goto_url",
-              label: "uploaded",
-              url: "https://example.com",
-            },
-          ],
-          parameters: [],
-        },
-      }),
-    );
-    expect(useRecordedBlocksStore.getState().blocks).toHaveLength(1);
-    expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-      true,
-    );
-    act(() => useRecordedBlocksStore.getState().clearRecordedBlocks());
-    expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-      false,
-    );
-    const token = beginCopilotAcceptance();
-    expect(token).not.toBeNull();
-    finishCopilotAcceptance(token!);
-  });
+    useNodesMock.mockReturnValue([
+      { id: "login", type: "task", data: { label: "login" } },
+    ]);
+    const { container } = renderNodeAdder({}, { debug: true });
+    const uploadItem = () =>
+      screen.getByText("Upload SOP").parentElement!.querySelector("button")!;
+    expect(uploadItem().disabled).toBe(true);
 
-  it("releases authoring after two immediate upload failures and permits Save", async () => {
-    useEdgesMock.mockReturnValue([
-      { id: "edge", source: "start", target: "adder" },
-    ]);
-    useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
-    uploadMocks.getClient.mockRejectedValue(
-      new Error("credentials unavailable"),
+    const stage = vi.fn();
+    act(() => useCopilotActionStore.setState({ stageAttachment: stage }));
+    expect(uploadItem().disabled).toBe(false);
+    const file = new File(["pdf"], "steps.pdf", { type: "application/pdf" });
+    fireEvent.change(
+      container.querySelector<HTMLInputElement>('input[type="file"]')!,
+      { target: { files: [file] } },
     );
-    const { container } = renderNodeAdder({});
-    const input =
-      container.querySelector<HTMLInputElement>('input[type="file"]')!;
-    const file = new File(["pdf"], "steps.pdf");
-    await act(async () => {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        fireEvent.change(input, { target: { files: [file] } });
-        expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-          true,
-        );
-        await vi.waitFor(() => {
-          expect(uploadMocks.getClient).toHaveBeenCalledTimes(attempt);
-          expect(
-            useWorkflowYamlEditorStore.getState().authoringInProgress,
-          ).toBe(false);
-        });
-      }
-    });
-    expect(uploadMocks.post).not.toHaveBeenCalled();
-    uploadMocks.getClient.mockResolvedValue({ put: uploadMocks.put });
-    const saveData = {
-      title: "Draft",
-      description: null,
-      blocks: [],
-      parameters: [],
-      workflowDefinitionVersion: 1,
-      settings: { proxyLocation: "RESIDENTIAL", runWith: "agent" },
-      workflow: {
-        workflow_permanent_id: "wpid_test",
-        workflow_definition: { version: 1, blocks: [], parameters: [] },
-      },
-    } as unknown as WorkflowSaveData;
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () => saveData,
-      hasChanges: true,
-    });
-    uploadMocks.put.mockResolvedValue({
-      data: { ...saveData.workflow, title: "Draft", description: null },
-    });
-    registerEditorOwner(createYamlCommitOwner("wpid_test"));
-    const { result } = renderHook(() => useWorkflowSave(), {
-      wrapper: queryWrapper,
-    });
-    await act(async () => result.current.mutateAsync(undefined));
-    expect(uploadMocks.put).toHaveBeenCalledTimes(1);
-    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(stage).toHaveBeenCalledWith(
+      file,
+      "Add the steps from the attached SOP after the login block.",
+    );
   });
 
   it("keeps the loop as parent without branch context when adding the first block in a nested loop", () => {

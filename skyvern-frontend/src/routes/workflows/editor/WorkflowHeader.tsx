@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import {
   CalendarIcon,
@@ -350,6 +351,7 @@ function TitleSection() {
 }
 
 function WorkflowHeader() {
+  const workflowTitle = useWorkflowTitleStore((state) => state.title);
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -384,7 +386,16 @@ function WorkflowHeader() {
         aria-hidden={collapsed}
         {...(collapsed ? { inert: "" } : {})}
       >
-        <TitleSection />
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <TitleSection />
+          {!isGlobalWorkflow && !workflow?.deleted_at && workflowPermanentId ? (
+            <WorkflowFindingsButton
+              workflowPermanentId={workflowPermanentId}
+              title={workflowTitle}
+              surface="editor"
+            />
+          ) : null}
+        </div>
         <div className="flex h-full shrink-0 items-center justify-end gap-4">
           {isGeneratingCode && <GeneratingCodeButton />}
           {isGlobalWorkflow ? <MakeACopyButton /> : <EditorActionToolbar />}

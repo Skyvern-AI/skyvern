@@ -459,6 +459,8 @@ export interface TurnNarrativeState {
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
   } | null;
+  // Every pick card's credentialPause, oldest first; the backend sends it only when more than one settled.
+  credentialPauses: NonNullable<TurnNarrativeState["credentialPause"]>[];
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
@@ -484,12 +486,22 @@ export interface TurnScreenshot {
   toolCallId: string | null;
 }
 
+export type GoogleSetupScopeProfile = "gmail" | "google_sheets";
+
 export interface GoogleConnectionNotice {
   provider: "google";
   connectionId: string | null;
   displayName: string | null;
   condition: "missing" | "unusable" | "unbound";
+  scopeProfile: GoogleSetupScopeProfile;
+  origin: "setup" | "workflow";
   choices?: ConnectedAccountChoice[];
+}
+
+export function googleConnectionNoticeKey(
+  notice: GoogleConnectionNotice,
+): string {
+  return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -515,6 +527,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialPauses: [],
   credentialAutoBound: null,
   connectedAccountChoices: [],
   outputFiles: [],
@@ -603,6 +616,18 @@ export function parseCredentialPause(
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
     anchorToolCallId,
   };
+}
+
+export function parseCredentialPauses(
+  value: unknown,
+): TurnNarrativeState["credentialPauses"] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(parseCredentialPause)
+    .filter(
+      (pause): pause is NonNullable<TurnNarrativeState["credentialPause"]> =>
+        pause !== null,
+    );
 }
 
 export interface TurnWorkPlan {
@@ -707,7 +732,7 @@ export function parseGoogleConnectionNotices(
 ): GoogleConnectionNotice[] {
   if (!Array.isArray(value)) return [];
   const notices: GoogleConnectionNotice[] = [];
-  const seen = new Set<string | null>();
+  const seen = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
@@ -719,26 +744,32 @@ export function parseGoogleConnectionNotices(
           row.connectionId.length === 0) ||
       (row.condition !== "missing" &&
         row.condition !== "unusable" &&
-        row.condition !== "unbound")
+        row.condition !== "unbound") ||
+      (row.scopeProfile !== undefined &&
+        row.scopeProfile !== "gmail" &&
+        row.scopeProfile !== "google_sheets")
     ) {
       continue;
     }
-    const connectionId =
-      row.condition === "unbound" ? null : (row.connectionId as string);
-    if (seen.has(connectionId)) continue;
-    seen.add(connectionId);
-    notices.push({
+    const notice: GoogleConnectionNotice = {
       provider: "google",
-      connectionId,
+      connectionId:
+        row.condition === "unbound" ? null : (row.connectionId as string),
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
+      scopeProfile: row.scopeProfile === "gmail" ? "gmail" : "google_sheets",
+      origin: row.origin === "setup" ? "setup" : "workflow",
       ...(row.condition === "unbound"
         ? { choices: parseConnectedAccountChoices(row.choices) }
         : {}),
-    });
+    };
+    const key = googleConnectionNoticeKey(notice);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push(notice);
   }
   return notices;
 }
@@ -853,7 +884,9 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
+  request_google_connection: "other",
   read_google_sheet: "other",
+  read_attached_pdf: "other",
   get_organization_usage_quota: "other",
   extend_browser_session: "other",
   search_web: "other",
@@ -2053,6 +2086,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialPauses: parseCredentialPauses(payload.credentialPauses),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
     workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(

@@ -120,6 +120,10 @@ class BrowserArtifacts(BaseModel):
     # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
     _seed_capture_failed: bool = PrivateAttr(default=False)
     _action_download_source: ActionDownloadSource | None = PrivateAttr(default=None)
+    # The GL flags (--use-gl / --use-angle) a local creator handed the driver, for launch telemetry; no other arg.
+    _requested_graphics_flags: tuple[str, ...] | None = PrivateAttr(default=None)
+    # Whether the creator started this browser's process on this host itself, rather than dialing one.
+    _spawned_local_browser: bool = PrivateAttr(default=False)
 
     def local_paths(self) -> list[str]:
         """Files and folders on this host that the browser writes to: recordings, HAR, traces, profile, console log."""
@@ -130,6 +134,24 @@ class BrowserArtifacts(BaseModel):
             if path
         ]
         return paths
+
+    def note_requested_launch_args(self, args: object) -> None:
+        # Args a creator could not see stay unrecorded, which telemetry reads as unknown.
+        if isinstance(args, list):
+            self._requested_graphics_flags = tuple(
+                arg for arg in args if isinstance(arg, str) and arg.split("=", 1)[0] in ("--use-gl", "--use-angle")
+            )
+
+    @property
+    def requested_graphics_flags(self) -> tuple[str, ...] | None:
+        return self._requested_graphics_flags
+
+    def note_spawned_local_browser(self) -> None:
+        self._spawned_local_browser = True
+
+    @property
+    def spawned_local_browser(self) -> bool:
+        return self._spawned_local_browser
 
     def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
         self._action_download_source = source

@@ -24,7 +24,17 @@ from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import BrowserContext, Download, FileChooser, Frame, Locator, Page, Request, Response
+from playwright.async_api import (
+    BrowserContext,
+    Download,
+    ElementHandle,
+    FileChooser,
+    Frame,
+    Locator,
+    Page,
+    Request,
+    Response,
+)
 from pydantic import BaseModel, field_validator
 
 from skyvern.config import settings
@@ -265,6 +275,7 @@ from skyvern.webeye.utils.dom import (
     is_post_dispatch_click_timeout,
     resolve_locator,
 )
+from skyvern.webeye.utils.flutter_semantics import FLUTTER_TEXT_FIELD_JS, FRAME_SETTLE_TIMEOUT_SECONDS, TWO_FRAMES_JS
 from skyvern.webeye.utils.page import (
     SkyvernFrame,
     _all_page_frames,
@@ -3539,11 +3550,67 @@ def _secret_readback_matches(expected: str, actual_value: str | None) -> bool:
 def _is_navigation_teardown_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
     # A read-back that races a form auto-submit sees the execution context torn down by navigation; the value
     # was accepted and submitted, so the caller treats it as success rather than a mismatch. Only THIS run's
-    # engine errors qualify, and the message set matches the incremental handler's navigation tolerance.
+    # engine errors qualify; recovery can also report that the old element's context no longer exists.
     if not _is_selected_engine_error(exc, engine_selection):
         return False
     message = str(exc).lower()
-    return "execution context was destroyed" in message or "navigation" in message or "target closed" in message
+    return any(
+        marker in message
+        for marker in ("execution context was destroyed", "cannot find context", "navigation", "target closed")
+    )
+
+
+async def _is_flutter_text_field(
+    skyvern_element: SkyvernElement, engine_selection: BrowserEngineSelection | None
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + 2
+    try:
+        return (
+            await SkyvernFrame.evaluate(
+                frame=skyvern_element.get_frame(),
+                expression=FLUTTER_TEXT_FIELD_JS,
+                arg=await skyvern_element.get_element_handler(timeout=2000),
+                engine_selection=engine_selection,
+                deadline=deadline,
+            )
+            is True
+        )
+    except Exception:
+        return False
+
+
+async def _two_frames_passed(
+    skyvern_element: SkyvernElement,
+    engine_selection: BrowserEngineSelection | None,
+    element_handle: ElementHandle | None = None,
+) -> bool:
+    # A supplied handle keeps the wait in the document that accepted the write, even if the locator now resolves anew.
+    deadline = asyncio.get_running_loop().time() + FRAME_SETTLE_TIMEOUT_SECONDS
+    try:
+        frames = await SkyvernFrame.evaluate(
+            frame=skyvern_element.get_frame(),
+            expression=TWO_FRAMES_JS,
+            arg=element_handle
+            if element_handle is not None
+            else await skyvern_element.get_element_handler(timeout=FRAME_SETTLE_TIMEOUT_SECONDS * 1000),
+            engine_selection=engine_selection,
+            deadline=deadline,
+        )
+    except SkyvernPageAnalysisTimeout as error:
+        # Recovery may exhaust its deadline after the document disappeared. Preserve the selected engine's
+        # teardown error so the post-write caller can distinguish a submission from a same-document no-frame wait.
+        cause = error.__context__
+        while cause is not None:
+            if _is_navigation_teardown_error(cause, engine_selection):
+                raise cause
+            cause = cause.__context__
+        return False
+    except Exception as error:
+        # The field did not resolve within the bound.
+        if _is_selected_engine_timeout(error, engine_selection):
+            return False
+        raise
+    return frames is True
 
 
 async def _fill_secret_with_readback(
@@ -3578,6 +3645,23 @@ async def _fill_secret_with_readback(
     readback_expected = text
     date_recovered = False
     await skyvern_element.refresh_locator_if_stale()
+    deferred_editing = await _is_flutter_text_field(skyvern_element, engine_selection)
+    if deferred_editing:
+        # The field starts editing in the first frame after it is focused and writes its own copy of the value over
+        # the input then, so the write waits for that frame.
+        await skyvern_element.focus()
+        if not await _two_frames_passed(skyvern_element, engine_selection):
+            LOG.warning(
+                "Credential field drew no frame after it was focused; nothing was entered",
+                element_id=skyvern_element.get_id(),
+            )
+            return ActionFailure(SecretInputMismatch())
+    # Keep the original document's handle: a locator can resolve into a replacement, even at the same URL.
+    written_element = (
+        await skyvern_element.get_element_handler(timeout=FRAME_SETTLE_TIMEOUT_SECONDS * 1000)
+        if deferred_editing
+        else None
+    )
     if sequential_first:
         await skyvern_element.input_sequentially(text=text)
     else:
@@ -3606,6 +3690,11 @@ async def _fill_secret_with_readback(
         # Returns (value, navigated). A read-back that races a form auto-submit sees the context torn down;
         # navigated=True means the value was submitted, so the caller stops and treats it as success.
         try:
+            # The field's next frame can still overwrite the write, so a value read before it confirms nothing.
+            if written_element is not None and not await _two_frames_passed(
+                skyvern_element, engine_selection, written_element
+            ):
+                return None, False
             value = await get_input_value(
                 tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
             )

@@ -251,6 +251,7 @@ export interface WorkflowCopilotChatRequest {
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
   supports_credential_delete_card?: boolean;
+  supports_google_setup_card?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";

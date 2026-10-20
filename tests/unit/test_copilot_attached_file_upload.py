@@ -4,7 +4,7 @@ import hashlib
 import json
 import struct
 import zlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -12,11 +12,12 @@ from typing import Any
 
 import pytest
 from playwright.async_api import Page, Route, async_playwright
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.tools import _shared, attached_file_upload
+from skyvern.forge.sdk.copilot.tools import _shared, attached_file_upload, read_attached_pdf_tool
 from skyvern.forge.sdk.copilot.turn_context import AttachedFileContext, TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.services import uploaded_file_service
@@ -404,3 +405,192 @@ async def test_a_browser_that_cannot_be_reached_reports_no_endpoint_text(
     assert result["ok"] is False
     assert expected_detail in result["error"]
     assert "10.1.2.3" not in json.dumps(result)
+
+
+def _pdf(pages: list[list[str]]) -> bytes:
+    def text(line: str) -> str:
+        return line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    objects = ["<< /Type /Catalog /Pages 2 0 R >>", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    kids = []
+    for lines in pages:
+        stream = "BT /F1 9 Tf 11 TL 36 800 Td " + " ".join(f"({text(line)}) Tj T*" for line in lines) + " ET"
+        objects.append(f"<< /Length {len(stream.encode('latin-1'))} >>\nstream\n{stream}\nendstream")
+        objects.append(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {len(objects)} 0 R >>"
+        )
+        kids.append(len(objects))
+    objects[1] = f"<< /Type /Pages /Kids [{' '.join(f'{kid} 0 R' for kid in kids)}] /Count {len(kids)} >>"
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return out
+
+
+SEMANTIC_SECRET = "Zq8!vL3#pR2w"
+ScreenHandler = Callable[..., Awaitable[dict[str, Any]]] | None
+
+
+async def _citing_screen(prompt: str, prompt_name: str) -> dict[str, Any]:
+    cited = [SEMANTIC_SECRET] if SEMANTIC_SECRET in prompt else []
+    return {"version": "1", "state": "detected" if cited else "clean", "citations": cited}
+
+
+async def _read(ctx: CopilotContext, file_id: str, offset: int = 0) -> tuple[str, dict[str, Any]]:
+    output = await read_attached_pdf_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name=attached_file_upload.READ_PDF_TOOL_NAME),
+        json.dumps({"file_id": file_id, "offset": offset}),
+    )
+    return output, json.loads(output)
+
+
+@pytest.mark.asyncio
+async def test_reading_an_attached_pdf_returns_every_line_once_with_secrets_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    # Accents and quotes make the serialized text longer than the raw text, which is what the window is sized on.
+    lines = [f'Étape {n}: vérifiez "Détails", réservé à l\'élève, ligne {n} terminée.' for n in range(1, 1601)]
+    lines[2] = "Sign in with Password: Spring2026!"
+    lines[700] = "The vault answer is RegisteredValue77"
+    lines[1400] = f"Backup portal code {SEMANTIC_SECRET} when the first one fails"
+    attached = _attach(repo, storage, "procedure.pdf", _pdf([lines[i : i + 60] for i in range(0, len(lines), 60)]))
+    ctx = _chat(monkeypatch, None, [attached])
+    ctx.secret_scrub_values = ["RegisteredValue77"]
+
+    async def _handler(_workflow_permanent_id: str | None, _organization_id: str | None) -> ScreenHandler:
+        return _citing_screen
+
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _handler)
+
+    windows: list[str] = []
+    offset: int | None = 0
+    while offset is not None:
+        output, result = await _read(ctx, attached.file_id, offset)
+        assert result["ok"] is True
+        assert result["offset"] == offset
+        assert len(output) <= 50_000
+        assert len(json.dumps(result["text"], ensure_ascii=False)) <= attached_file_upload._READ_WINDOW_SERIALIZED_CHARS
+        windows.append(result["text"])
+        offset = result["next_offset"]
+
+    text = "".join(windows)
+    assert len(windows) > 1
+    assert all(window.endswith("\n") for window in windows[:-1])
+    assert [n for n in range(1, 1601) if n not in (3, 701, 1401) and text.count(f" ligne {n} ") != 1] == []
+    assert "Spring2026!" not in text
+    assert "RegisteredValue77" not in text
+    assert SEMANTIC_SECRET not in text
+    assert text.count("[REDACTED_SECRET]") == 3
+
+
+PASSPHRASE = "orchard apple moon"
+PASSPHRASE_LABEL = "The account password is a phrase"
+
+
+async def _label_aware_screen(prompt: str, prompt_name: str) -> dict[str, Any]:
+    # Like the real screen, a bare phrase is only a secret when its label is in view.
+    cited = [PASSPHRASE] if PASSPHRASE_LABEL in prompt and PASSPHRASE in prompt else []
+    return {"version": "1", "state": "detected" if cited else "clean", "citations": cited}
+
+
+async def _label_aware_handler(_workflow_permanent_id: str | None, _organization_id: str | None) -> ScreenHandler:
+    return _label_aware_screen
+
+
+@pytest.mark.asyncio
+async def test_a_read_cannot_start_inside_a_line_and_cut_a_secret_away_from_its_label(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    attached = _attach(
+        repo, storage, "procedure.pdf", _pdf([["Open the portal.", f"{PASSPHRASE_LABEL}: {PASSPHRASE}.", "Submit."]])
+    )
+    ctx = _chat(monkeypatch, None, [attached])
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _label_aware_handler)
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id, offset=40)
+
+    assert result["ok"] is True
+    assert result["offset"] == 0
+    assert PASSPHRASE not in result["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_secret_shaped_attachment_name_stays_out_of_the_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    token = "aB3dE9fG2hJ7kL1mN5pQ8rS4"
+    attached = _attach(repo, storage, f"vault_{token}.pdf", _pdf([["Open the claims form."]]))
+    ctx = _chat(monkeypatch, None, [attached])
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _label_aware_handler)
+
+    with capture_logs() as logs:
+        result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is True
+    assert logs
+    assert token not in json.dumps(logs, default=str)
+    assert token not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_each_window_is_screened_with_the_text_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    lines = [f"Step {n}: copy row {n} from the export into the matching form field." for n in range(1, 1201)]
+    attached = _attach(repo, storage, "procedure.pdf", _pdf([lines[i : i + 60] for i in range(0, len(lines), 60)]))
+    ctx = _chat(monkeypatch, None, [attached])
+    prompts: list[str] = []
+
+    async def _recording_screen(prompt: str, prompt_name: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"version": "1", "state": "clean", "citations": []}
+
+    async def _handler(_workflow_permanent_id: str | None, _organization_id: str | None) -> ScreenHandler:
+        return _recording_screen
+
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _handler)
+
+    first = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+    second = await attached_file_upload.read_attached_pdf(ctx, attached.file_id, first["next_offset"])
+
+    assert first["text"].rstrip().splitlines()[-1] in prompts[1]
+    assert first["text"].rstrip().splitlines()[-1] not in second["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["not_in_this_chat", "not_a_pdf", "no_text_layer", "screen_unavailable"])
+async def test_an_attached_pdf_that_cannot_be_read_safely_returns_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+    case: str,
+) -> None:
+    data = {"not_a_pdf": _png(), "no_text_layer": _pdf([[]])}.get(case, _pdf([["Open the claims form."]]))
+    attached = _attach(repo, storage, "procedure.pdf", data)
+    ctx = _chat(monkeypatch, None, [] if case == "not_in_this_chat" else [attached])
+
+    async def _handler(_workflow_permanent_id: str | None, _organization_id: str | None) -> ScreenHandler:
+        return None if case == "screen_unavailable" else _citing_screen
+
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _handler)
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is False
+    assert result["error"]
+    assert "text" not in result

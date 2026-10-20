@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -576,6 +577,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 }
 
 export function StudioTopBar() {
+  const workflowPermanentId = useWorkflowPermanentId();
+  const workflowTitle = useWorkflowTitleStore((state) => state.title);
   const { workflowTriggersPanel } = usePageSlots();
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
@@ -600,6 +603,13 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow && !workflowDeletedAt} />
+      {!isGlobalWorkflow && !workflowDeletedAt && workflowPermanentId ? (
+        <WorkflowFindingsButton
+          workflowPermanentId={workflowPermanentId}
+          title={workflowTitle}
+          surface="editor"
+        />
+      ) : null}
       <PaneHeaderDivider />
       <StudioPaneToggles />
       <div className="min-w-3 flex-1" />

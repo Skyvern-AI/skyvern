@@ -139,13 +139,33 @@ async def test_clear_onepassword_without_existing_token_does_not_capture_success
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
 
     response = await routes.clear_org_auth_credential("onepassword", _org())
 
     assert response.success is True
     capture.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_onepassword_denial_stops_before_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    enforce_request_authorization = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
+    monkeypatch.setattr(
+        routes.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(enforce_request_authorization=enforce_request_authorization),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await routes.clear_org_auth_credential("onepassword", _org())
+
+    assert exc_info.value.status_code == 403
+    enforce_request_authorization.assert_awaited_once()
+    assert fake_organizations.invalidate_calls == []
 
 
 @pytest.mark.asyncio
@@ -158,7 +178,7 @@ async def test_onepassword_token_mutations_capture_safe_success_events(
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
     monkeypatch.setattr(routes, "record_request_audit_event", AsyncMock())
     monkeypatch.setattr(routes, "_validate_onepassword_service_account_token", AsyncMock())
@@ -191,7 +211,7 @@ async def test_onepassword_token_mutation_failures_capture_only_error_class(
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
     monkeypatch.setattr(routes, "record_request_audit_event", AsyncMock())
     monkeypatch.setattr(routes, "_validate_onepassword_service_account_token", AsyncMock())

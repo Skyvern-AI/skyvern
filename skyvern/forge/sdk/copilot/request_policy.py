@@ -81,6 +81,9 @@ def _parse_final_response(raw: str) -> dict[str, Any]:
 
 
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
+_SELECTABLE_GOOGLE_DATA_SCOPES = frozenset(
+    {google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE}
+)
 _AUTHORING_INTENTS = {"author_now", "defer_authoring"}
 DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
@@ -246,6 +249,11 @@ _RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES = "=?&#"
 _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES = "&#"
 _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION = ".,;:!?"
 _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES = ")]\"}'"
+_RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES = "([{\"'"
+# Only for redacting copies of a citation already verified at the boundaries above: a curly quote or colon can sit
+# inside a secret (Hunter2’Portal!, Hunter2:Portal!), but a verified value's “quoted” or PIN:1234 copy must still go.
+_RAW_SECRET_REDACTION_OPENING_BOUNDARIES = _RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES + "“‘:"
+_RAW_SECRET_REDACTION_CLOSING_BOUNDARIES = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES + "”’"
 
 
 def _redact_raw_secrets_outside_url_candidates(message: str) -> str:
@@ -312,20 +320,30 @@ def _raw_secret_evidence_is_url_userinfo_password(
     return False
 
 
-def _raw_secret_evidence_after_is_boundary(evidence: str, message: str, end: int) -> bool:
+def _raw_secret_evidence_after_is_boundary(
+    evidence: str,
+    message: str,
+    end: int,
+    closing_boundaries: str = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES,
+) -> bool:
     if end >= len(message):
         return True
     after = message[end]
-    if after.isspace() or after in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+    if after.isspace() or after in closing_boundaries:
         return True
     if after in _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION:
         following = message[end + 1] if end + 1 < len(message) else ""
-        if not following or following.isspace() or following in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+        if not following or following.isspace() or following in closing_boundaries:
             return True
     return not evidence[-1].isalnum() and after in ".,;:?"
 
 
-def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[tuple[int, int]]:
+def _raw_secret_evidence_spans(
+    evidence: str | None,
+    user_message: str,
+    opening_boundaries: str = _RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES,
+    closing_boundaries: str = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES,
+) -> list[tuple[int, int]]:
     if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
         return []
     message = user_message or ""
@@ -350,7 +368,7 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
         before_is_boundary = (
             not before
             or before.isspace()
-            or before in "([{\"'"
+            or before in opening_boundaries
             or uri_candidate_end is not None
             or is_userinfo_password
         )
@@ -358,17 +376,30 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
             uri_candidate_end is not None
             and (end == uri_candidate_end or message[end] in _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES)
         )
-        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(evidence, message, end)
+        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(
+            evidence, message, end, closing_boundaries
+        )
         if before_is_boundary and after_is_boundary:
             spans.append((index, end))
         start = index + 1
 
 
 def _redact_cited_secrets(message: str, citations: list[str]) -> str:
-    spans = sorted(
-        (span for citation in citations for span in _raw_secret_evidence_spans(citation, message)),
-        key=lambda span: (span[0], span[1]),
-    )
+    spans: list[tuple[int, int]] = []
+    for citation in citations:
+        strict = set(_raw_secret_evidence_spans(citation, message))
+        for start, end in _raw_secret_evidence_spans(
+            citation, message, _RAW_SECRET_REDACTION_OPENING_BOUNDARIES, _RAW_SECRET_REDACTION_CLOSING_BOUNDARIES
+        ):
+            if (start, end) not in strict:
+                # Matched only beside a curly quote or colon, so it may be the end of a longer secret
+                # (Hunter2:Portal!); redacting the whole space-delimited token leaves no part of either.
+                while start > 0 and not message[start - 1].isspace():
+                    start -= 1
+                while end < len(message) and not message[end].isspace():
+                    end += 1
+            spans.append((start, end))
+    spans.sort()
     merged: list[tuple[int, int]] = []
     for start, end in spans:
         if merged and start <= merged[-1][1]:
@@ -994,6 +1025,9 @@ class RequestPolicy:
     # seed this turn's test runs before Accept saves it as the workflow's pick.
     credential_pause_signed_in_profile_id: str | None = None
     credential_pause_signed_in_site: str | None = None
+    # Every login a credential card or a demonstrated fill connected on this turn; each stays the user's own pick
+    # after a later one.
+    credential_pause_connected_credential_ids: set[str] = field(default_factory=set)
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
@@ -1002,6 +1036,10 @@ class RequestPolicy:
     # seam may separately admit a selected native Sheets citation for that dispatch only when it
     # is backed by this turn's server-owned list_integrations result.
     selected_connected_account_id: str | None = None
+    # Any validated Google pick, reported to the model as a fact. Only a Sheets pick also becomes
+    # selected_connected_account_id; a Gmail pick never widens run authority.
+    picked_connected_account_id: str | None = None
+    picked_connected_account_scopes: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -1046,6 +1084,7 @@ class RequestPolicy:
         # only cited does not, because naming a different login declines it.
         settled = (
             self.current_turn_named_credential_ids
+            | self.credential_pause_connected_credential_ids
             | self.prior_approved_credential_ids
             | set(self.persisted_workflow_credential_ids)
         )
@@ -4788,6 +4827,8 @@ async def _build_request_policy_bootstrap(
     }
     google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
     policy.selected_connected_account_id = None
+    policy.picked_connected_account_id = None
+    policy.picked_connected_account_scopes = []
     if google_connection_candidates or selected_connected_account_id is not None:
         try:
             active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
@@ -4808,13 +4849,16 @@ async def _build_request_policy_bootstrap(
                     if connection.id == selected_connected_account_id
                     and connection.organization_id == organization_id
                     and connection.state == STATE_ACTIVE
-                    and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+                    and not _SELECTABLE_GOOGLE_DATA_SCOPES.isdisjoint(connection.scopes_granted)
                 ),
                 None,
             )
             if selected is not None:
-                policy.selected_connected_account_id = selected.id
-                google_connection_candidates.add(selected.id)
+                policy.picked_connected_account_id = selected.id
+                policy.picked_connected_account_scopes = list(selected.scopes_granted)
+                if google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in selected.scopes_granted:
+                    policy.selected_connected_account_id = selected.id
+                    google_connection_candidates.add(selected.id)
             policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:

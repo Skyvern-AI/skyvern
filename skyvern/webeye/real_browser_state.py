@@ -7,11 +7,11 @@ import weakref
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, TypedDict, TypeGuard
+from typing import Any, Literal, Protocol, TypedDict, TypeGuard, runtime_checkable
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, Request, Response, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -191,6 +191,160 @@ def _chain_browser_cleanups(first: BrowserCleanupFunc, second: BrowserCleanupFun
     return _both
 
 
+# These terminal responses leave the current document in place; ordinary responses still need to commit.
+_NO_DOCUMENT_STATUSES = frozenset({204, 205, 304})
+
+
+@runtime_checkable
+class _FrameIdentified(Protocol):
+    """Raw-CDP requests and frames expose their CDP frame id; Playwright's do not."""
+
+    @property
+    def frame_id(self) -> str | None: ...
+
+
+class _MainFrameNavigation:
+    """A page's in-flight main-frame document navigation, observed only through browser events.
+
+    While such a navigation is pending, evaluate calls against the page are deferred until it commits,
+    so the page's own scripts cannot report it.
+    """
+
+    def __init__(self, page: Page) -> None:
+        # Weak, so the browser state's per-page registry does not keep a closed page alive.
+        self._page_ref = weakref.ref(page)
+        self._request: Request | None = None
+        self.started_at: float | None = None
+        self.closed = False
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._commit_emitter_ref: weakref.ReferenceType[Any] | None = None
+        self._handlers: dict[str, Any] = {
+            "request": self._on_request,
+            "response": self._on_response,
+            "requestfailed": self._on_request_failed,
+            "close": self._on_gone,
+            "crash": self._on_gone,
+        }
+        attached: list[str] = []
+        try:
+            if isinstance(page.main_frame, _FrameIdentified):
+                # The raw-CDP facade emits this only for Page.frameNavigated (document commits),
+                # unlike Playwright's public event, which also includes same-document URL changes.
+                self._handlers["framenavigated"] = self._on_cdp_frame_navigated
+            else:
+                # The same event used by expect_navigation(wait_until="commit") carries the
+                # committed request identity. Headers and same-document events cannot prove commit.
+                emitter = page.main_frame._impl_obj._event_emitter
+                self._commit_emitter_ref = weakref.ref(emitter)
+                emitter.on("navigated", self._on_document_navigated)
+            for event, handler in self._handlers.items():
+                page.on(event, handler)  # type: ignore[call-overload]
+                attached.append(event)
+        except Exception:
+            self._handlers = {event: self._handlers[event] for event in attached}
+            self.detach()
+            raise
+
+    @property
+    def is_pending(self) -> bool:
+        return self._request is not None and not self.closed
+
+    async def wait(self, deadline: float) -> None:
+        """Return once nothing is pending or the monotonic ``deadline`` passes."""
+        while self.is_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._idle.wait()
+            except TimeoutError:
+                return
+
+    def detach(self) -> None:
+        handlers, self._handlers = self._handlers, {}
+        # A detached observer can no longer see the navigation; wake any waiter as closed.
+        self.closed = True
+        self._settle()
+        emitter_ref, self._commit_emitter_ref = self._commit_emitter_ref, None
+        if emitter_ref is not None and (emitter := emitter_ref()) is not None:
+            emitter.remove_listener("navigated", self._on_document_navigated)
+        page = self._page_ref()
+        if page is None:
+            return
+        for event, handler in handlers.items():
+            try:
+                page.remove_listener(event, handler)  # type: ignore[call-overload]
+            except Exception:
+                LOG.debug("Failed to remove main-frame navigation listener", page_event=event, exc_info=True)
+
+    def _is_main_frame_document(self, request: Request) -> bool:
+        if not request.is_navigation_request():
+            return False
+        page = self._page_ref()
+        frame = request.frame
+        if page is None or frame is not page.main_frame:
+            return False
+        # The raw-CDP engine's request.frame falls back to the main frame for a frame id it does not know.
+        if isinstance(request, _FrameIdentified) and isinstance(frame, _FrameIdentified):
+            return frame.frame_id == request.frame_id
+        return True
+
+    def _on_request(self, request: Request) -> None:
+        try:
+            if not self._is_main_frame_document(request):
+                return
+        except Exception:
+            return
+        if self._request is not None and request.redirected_from is self._request:
+            self._request = request
+            return
+        self._request = request
+        self.started_at = time.monotonic()
+        # A fresh event rather than clear(): the browser-API census counts every .clear() call site as a page
+        # sink. Only an idle event is replaced, so a waiter never holds a superseded one.
+        if self._idle.is_set():
+            self._idle = asyncio.Event()
+
+    def _on_response(self, response: Response) -> None:
+        if self._request is not None and response.request is self._request and response.status in _NO_DOCUMENT_STATUSES:
+            self._settle()
+
+    def _on_document_navigated(self, event: dict[str, Any]) -> None:
+        document = event.get("newDocument")
+        if (
+            self._request is not None
+            and "error" not in event
+            and document is not None
+            and document.get("request") is self._request._impl_obj._channel
+        ):
+            self._settle()
+
+    def _on_cdp_frame_navigated(self, frame: Any) -> None:
+        page = self._page_ref()
+        if (
+            page is not None
+            and frame is page.main_frame
+            and self._request is not None
+            and frame.url.split("#", 1)[0] == self._request.url.split("#", 1)[0]
+        ):
+            self._settle()
+
+    def _on_request_failed(self, request: Request) -> None:
+        # Identity-keyed: a superseded navigation's late failure must not settle its replacement.
+        if self._request is not None and request is self._request:
+            self._settle()
+
+    def _on_gone(self, _page: Page) -> None:
+        self.detach()
+
+    def _settle(self) -> None:
+        self._request = None
+        self.started_at = None
+        self._idle.set()
+
+
 class RealBrowserState(BrowserState):
     def __init__(
         self,
@@ -232,6 +386,9 @@ class RealBrowserState(BrowserState):
         self._disconnect_listener_browser: Browser | None = None
         self._disconnect_listener_browser_context: BrowserContext | None = None
         self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._main_frame_navigations: weakref.WeakKeyDictionary[Page, _MainFrameNavigation] = (
+            weakref.WeakKeyDictionary()
+        )
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_targets_closing: weakref.WeakSet[Page] = weakref.WeakSet()
         # Cleared while a recovery is producing the working page (opening it, closing crashed targets,
@@ -323,6 +480,7 @@ class RealBrowserState(BrowserState):
 
     def mark_run_released(self) -> None:
         self._run_released = True
+        app.AGENT_FUNCTION.on_browser_run_released(self.browser_context or self.browser_artifacts)
 
     @property
     def _run_phase(self) -> RunPhase:
@@ -565,6 +723,7 @@ class RealBrowserState(BrowserState):
             # A replacement can run elsewhere than the browser it replaces (a vendor creator degrading to a
             # local launch), so restamp from what its creator records instead of keeping the old runtime.
             sample_token = None if current_browser_acquisition_sample() else begin_browser_acquisition_sample()
+            app.AGENT_FUNCTION.note_browser_relaunch(self, "relaunch")
             try:
                 (
                     browser_context,
@@ -1026,13 +1185,40 @@ class RealBrowserState(BrowserState):
             LOG.debug("Failed to register browser disconnect listener", exc_info=True)
 
     def _watch_page_for_crash(self, page: Page) -> None:
-        if page in self._crash_listener_pages:
+        if page not in self._crash_listener_pages:
+            try:
+                page.on("crash", self._on_page_crashed)
+                self._crash_listener_pages.add(page)
+            except Exception:
+                LOG.debug("Failed to register page crash listener", exc_info=True)
+        self._observe_main_frame_navigation(page)
+
+    def _observe_main_frame_navigation(self, page: Page) -> None:
+        if page in self._main_frame_navigations:
             return
         try:
-            page.on("crash", self._on_page_crashed)
-            self._crash_listener_pages.add(page)
+            self._main_frame_navigations[page] = _MainFrameNavigation(page)
         except Exception:
-            LOG.debug("Failed to register page crash listener", exc_info=True)
+            LOG.debug("Failed to observe main-frame navigation", exc_info=True)
+
+    def _release_main_frame_navigations(self) -> None:
+        navigations = list(self._main_frame_navigations.values())
+        self._main_frame_navigations = weakref.WeakKeyDictionary()
+        for navigation in navigations:
+            navigation.detach()
+
+    async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
+        navigation = self._main_frame_navigations.get(page)
+        if navigation is None or navigation.started_at is None or not navigation.is_pending:
+            return
+        # The navigation's own loading budget also caps the wait, so a later scrape cannot restart it.
+        waited_from = time.monotonic()
+        await navigation.wait(min(deadline, navigation.started_at + settings.BROWSER_LOADING_TIMEOUT_MS / 1000))
+        LOG.info(
+            "Waited for an in-flight page navigation before scraping",
+            settled=not navigation.is_pending and not navigation.closed,
+            waited_ms=int((time.monotonic() - waited_from) * 1000),
+        )
 
     def _on_page_crashed(self, page: Page) -> None:
         # A crashed tab stays in context.pages and keeps winning get_working_page, so later operations
@@ -1782,6 +1968,7 @@ class RealBrowserState(BrowserState):
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
         allow_transient_ui_suppression: bool = False,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage:
         page = await self.get_working_page()
         if page is not None:
@@ -1802,10 +1989,14 @@ class RealBrowserState(BrowserState):
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
         if self.external_browser:
+            # A keep-alive close (both controls off) leaves the pages to a later run, which still needs them tracked.
+            if close_browser_on_completion or release_driver is not False:
+                self._release_main_frame_navigations()
             if close_browser_on_completion:
                 await self._run_on_close_callbacks()
             if release_driver is not False:
@@ -1824,6 +2015,8 @@ class RealBrowserState(BrowserState):
         # ``release_driver_on_close`` marker.
         if release_driver is None:
             release_driver = close_browser_on_completion or self.release_driver_on_close
+        if close_browser_on_completion or release_driver:
+            self._release_main_frame_navigations()
         LOG.info("Closing browser state", sampling=True)
 
         # Each teardown phase runs in its OWN bounded region so a phase that hangs — a

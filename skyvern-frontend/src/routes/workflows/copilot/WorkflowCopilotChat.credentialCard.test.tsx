@@ -786,6 +786,170 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     expect(precedes(row("tc-1"), unfolded)).toBe(true);
     expect(precedes(unfolded, row("tc-2"))).toBe(true);
   });
+
+  it("keeps every card's receipt when the model asks again in the same turn, live and once the turn ends", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    const test = {
+      tool_name: "run_blocks_and_collect_debug",
+      display_label: "Testing",
+      iteration: 1,
+      tool_call_id: "tc-2",
+    };
+    const resolved = (resume_token: string, outcome: string) => ({
+      type: "credential_pause_resolved",
+      turn_id: "turn-1",
+      workflow_copilot_chat_id: "chat-1",
+      resume_token,
+      outcome,
+      credential_id: outcome === "connected" ? "cred-hn" : null,
+      name: outcome === "connected" ? "HN Login" : null,
+      timestamp: new Date().toISOString(),
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+      streamCalls[0]!.onMessage(resolved("rt-abc", "connected"));
+      streamCalls[0]!.onMessage({ type: "tool_call", tool_input: {}, ...test });
+      streamCalls[0]!.onMessage({
+        type: "tool_result",
+        success: false,
+        summary: "The test stopped on the sign-in page",
+        ...test,
+      });
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          anchor_tool_call_id: "tc-2",
+          resume_token: "rt-def",
+        }),
+      );
+      streamCalls[0]!.onMessage(resolved("rt-def", "skipped"));
+    });
+    const row = (id: string) =>
+      document.querySelector(`[data-activity-row-id="${id}"]`)!;
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const liveConnected = await screen.findByText(
+      "Credential 'HN Login' added",
+    );
+    const liveSkipped = screen.getByText("Sign-in skipped");
+    expect(precedes(row("tc-1"), liveConnected)).toBe(true);
+    expect(precedes(liveConnected, row("tc-2"))).toBe(true);
+    expect(precedes(row("tc-2"), liveSkipped)).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "The test still stops at the sign-in page.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: { blockCount: 1, blockLabels: ["sign_in"] },
+          terminal: "response",
+          terminalMessage: "The test still stops at the sign-in page.",
+          narrativeSummary: "The test still stops at the sign-in page.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          designActivity: [
+            {
+              ...scoutResult(),
+              kind: "tool_result",
+              id: "tr-tc-1",
+              text: "Opened the sign-in page",
+              toolName: "navigate_browser",
+            },
+            {
+              kind: "tool_result",
+              id: "tr-tc-2",
+              text: "The test stopped on the sign-in page",
+              toolName: "run_blocks_and_collect_debug",
+              iteration: 1,
+              success: false,
+            },
+          ],
+          credentialPause: { outcome: "skipped", anchorToolCallId: "tc-2" },
+          credentialPauses: [
+            {
+              outcome: "connected",
+              credentialId: "cred-hn",
+              anchorToolCallId: "tc-1",
+            },
+            { outcome: "skipped", anchorToolCallId: "tc-2" },
+          ],
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    await screen.findByText("The test still stops at the sign-in page.");
+    expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
+    expect(screen.getAllByText("Sign-in skipped")).toHaveLength(1);
+    fireEvent.click(
+      document.querySelector<HTMLButtonElement>("[data-activity-fold]")!,
+    );
+    const savedConnected = screen.getByText("Credential 'HN Login' added");
+    const savedSkipped = screen.getByText("Sign-in skipped");
+    expect(precedes(row("tc-1"), savedConnected)).toBe(true);
+    expect(precedes(savedConnected, row("tc-2"))).toBe(true);
+    expect(precedes(row("tc-2"), savedSkipped)).toBe(true);
+  });
+
+  it("keeps an earlier card's saved receipt when the turn's last card was never shown", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "The second sign-in request could not be shown.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          terminal: "response",
+          terminalMessage: "The second sign-in request could not be shown.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          designActivity: [
+            {
+              ...scoutResult(),
+              kind: "tool_result",
+              id: "tr-tc-1",
+              text: "Opened the sign-in page",
+              toolName: "navigate_browser",
+            },
+          ],
+          credentialPause: { outcome: "declined" },
+          credentialPauses: [
+            {
+              outcome: "connected",
+              credentialId: "cred-hn",
+              anchorToolCallId: "tc-1",
+            },
+            { outcome: "declined" },
+          ],
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    await screen.findByText("The second sign-in request could not be shown.");
+    // A saved receipt carries no name; only a tab that saw the live answer can name it.
+    expect(screen.getAllByText("Credential added")).toHaveLength(1);
+  });
 });
 
 describe("WorkflowCopilotChat — question receipt placement", () => {

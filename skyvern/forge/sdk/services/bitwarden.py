@@ -52,13 +52,26 @@ from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
 BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
-_RETRY_BACKOFF_BASE_SECONDS = 5.0
+# Sized so the default three attempts span a batch burst rather than landing inside it: at 5s the first
+# two backoffs were only U(0,5) and U(0,10), so every attempt retried into the same congestion that
+# failed the first one and the cap below was unreachable.
+_RETRY_BACKOFF_BASE_SECONDS = 20.0
 _RETRY_BACKOFF_CAP_SECONDS = 60.0
 
 
 def _retry_backoff_seconds(attempt: int) -> float:
     # Full jitter: a batch of runs that failed together retries spread out instead of re-aligned.
     return random.uniform(0, min(_RETRY_BACKOFF_CAP_SECONDS, _RETRY_BACKOFF_BASE_SECONDS * (2**attempt)))
+
+
+def _login_timeout_seconds(timeout: int) -> int:
+    """The budget for a cold `bw login`, never below the budget its caller gave the reads behind it."""
+    return max(timeout, settings.BITWARDEN_LOGIN_TIMEOUT_SECONDS)
+
+
+def _attempt_deadline_seconds(timeout: int) -> int:
+    """One attempt is a login plus the reads behind it, so it gets both budgets rather than twice one."""
+    return _login_timeout_seconds(timeout) + timeout
 
 
 # The CLI keeps its login state, tokens and encrypted vault copy in one data directory. Pointing each
@@ -777,6 +790,7 @@ class BitwardenService:
     async def _establish_cli_session(
         session: _CliSession,
         timeout: int,
+        login_timeout: int | None = None,
         verify_sync: bool = False,
         trust_login_key: bool = True,
     ) -> None:
@@ -791,7 +805,7 @@ class BitwardenService:
                 identity.client_secret,
                 email=identity.email,
                 master_password=identity.master_password,
-                timeout=timeout,
+                timeout=login_timeout or timeout,
                 appdata_dir=session.appdata_dir,
             )
         finally:
@@ -814,6 +828,7 @@ class BitwardenService:
     async def _prepare_cli_session(
         session: _CliSession,
         timeout: int,
+        login_timeout: int | None = None,
         force_sync: bool = False,
         verify_sync: bool = False,
         trust_login_key: bool = True,
@@ -828,7 +843,11 @@ class BitwardenService:
                 usage.lock_wait_seconds = (usage.lock_wait_seconds or 0.0) + time.monotonic() - queued_at
             if session.session_key is None:
                 await BitwardenService._establish_cli_session(
-                    session, timeout=timeout, verify_sync=verify_sync, trust_login_key=trust_login_key
+                    session,
+                    timeout=timeout,
+                    login_timeout=login_timeout,
+                    verify_sync=verify_sync,
+                    trust_login_key=trust_login_key,
                 )
                 return
 
@@ -862,6 +881,7 @@ class BitwardenService:
         timeout: int,
         run: Callable[[_CliSession], Awaitable[T]],
         force_sync: bool = False,
+        login_timeout: int | None = None,
     ) -> T:
         """Run `run` against a live CLI session, repairing a stale session once before giving up.
         `force_sync` demands a `bw sync` that reports failure even after a fresh login; a repair only resyncs."""
@@ -875,6 +895,7 @@ class BitwardenService:
                     await BitwardenService._prepare_cli_session(
                         session,
                         timeout=timeout,
+                        login_timeout=login_timeout,
                         force_sync=resync,
                         verify_sync=force_sync,
                         # A login key that unlocks nothing makes the read fail with "Vault is locked.";
@@ -1125,11 +1146,13 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
         await BitwardenService._apply_jitter()
+        login_timeout = _login_timeout_seconds(timeout)
         for attempt in range(max_retries):
             try:
-                # Every CLI command gets `timeout`; the attempt as a whole gets twice that, so one slow step
-                # cannot consume the others' budget and a dead vault still fails in bounded time.
-                async with asyncio.timeout(2 * timeout):
+                # A cold login gets `login_timeout` and every other CLI command gets `timeout`; the attempt
+                # as a whole gets both, so one slow step cannot consume the other's budget and a dead vault
+                # still fails in bounded time.
+                async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
                     return await BitwardenService._get_secret_value_from_url(
                         client_id=client_id,
                         client_secret=client_secret,
@@ -1141,6 +1164,7 @@ class BitwardenService:
                         item_id=item_id,
                         timeout=timeout,
                         email=email,
+                        login_timeout=login_timeout,
                     )
             except BitwardenAccessDeniedError as e:
                 raise e
@@ -1194,6 +1218,7 @@ class BitwardenService:
         item_id: str | None = None,
         timeout: int = 60,
         email: str | None = None,
+        login_timeout: int | None = None,
     ) -> dict[str, str]:
         """
         Get the secret value from the Bitwarden CLI.
@@ -1304,7 +1329,9 @@ class BitwardenService:
             return bitwarden_result[0].credential
 
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
-        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
+        return await BitwardenService._with_cli_session(
+            identity, timeout=timeout, run=fetch, login_timeout=login_timeout
+        )
 
     @staticmethod
     async def get_sensitive_information_from_identity(
@@ -1329,7 +1356,7 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
                 return await BitwardenService._get_sensitive_information_from_identity(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1341,6 +1368,7 @@ class BitwardenService:
                     identity_fields=identity_fields,
                     email=email,
                     timeout=timeout,
+                    login_timeout=_login_timeout_seconds(timeout),
                 )
         except BitwardenAccessDeniedError as e:
             raise e
@@ -1381,6 +1409,7 @@ class BitwardenService:
         bw_collection_ids: list[str] | None,
         email: str | None = None,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        login_timeout: int | None = None,
     ) -> dict[str, str]:
         """
         Get the sensitive information from the Bitwarden CLI.
@@ -1440,7 +1469,9 @@ class BitwardenService:
             return sensitive_information
 
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
-        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
+        return await BitwardenService._with_cli_session(
+            identity, timeout=timeout, run=fetch, login_timeout=login_timeout
+        )
 
     @staticmethod
     async def login(
@@ -1558,6 +1589,7 @@ class BitwardenService:
         item_id: str,
         email: str | None = None,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+        login_timeout: int | None = None,
     ) -> dict[str, str]:
         """
         Get the credit card data from the Bitwarden CLI.
@@ -1614,7 +1646,9 @@ class BitwardenService:
             return mapped_credit_card_data
 
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
-        return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
+        return await BitwardenService._with_cli_session(
+            identity, timeout=timeout, run=fetch, login_timeout=login_timeout
+        )
 
     @staticmethod
     async def get_credit_card_data(
@@ -1638,7 +1672,7 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(settings.BITWARDEN_TIMEOUT_SECONDS):
+            async with asyncio.timeout(_attempt_deadline_seconds(settings.BITWARDEN_TIMEOUT_SECONDS)):
                 return await BitwardenService._get_credit_card_data(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1648,6 +1682,7 @@ class BitwardenService:
                     collection_id=collection_id,
                     item_id=item_id,
                     email=email,
+                    login_timeout=_login_timeout_seconds(settings.BITWARDEN_TIMEOUT_SECONDS),
                 )
         except BitwardenAccessDeniedError as e:
             raise e

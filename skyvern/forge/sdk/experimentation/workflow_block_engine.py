@@ -203,8 +203,8 @@ def _is_kept_workflow_run(workflow_status: WorkflowStatus, trigger_type: Workflo
     # test-login and SDK endpoints mint and run in one request, and enrolling those would move standing
     # API traffic rather than the workflows a customer keeps; the birth version's status would be the
     # wrong test, because the prompt box writes version 1 as auto_generated and the editor save that
-    # keeps it writes the next as published. The job-recipe endpoints are per-call too but build a
-    # published definition, so only their trigger kind excludes them.
+    # keeps it writes the next as published. The job-recipe endpoints are per-call too; their trigger
+    # kind also excludes recipe workflows created as published before recipes switched to auto_generated.
     return workflow_status != WorkflowStatus.auto_generated and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
 
 
@@ -309,9 +309,9 @@ async def resolve_workflow_block_engine_arm(
 
     ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
     the run was launched. Together they are what separates a workflow a customer keeps from the
-    per-call throwaways several endpoints mint and run in one request: most of those run while still
-    auto_generated, and the job-recipe endpoints build a published definition, so neither test alone
-    covers them.
+    per-call throwaways several endpoints mint and run in one request: those run while still
+    auto_generated, except job-recipe workflows created as published before recipes switched to
+    auto_generated, which only the trigger kind covers.
 
     ``pinned_v1_blocks`` counts blocks a person pinned to skyvern-1.0 (see ``pinned_v1_block_count``);
     eligibility already keeps such a run out of the A/B, and this labels it ``pinned_v1_engine``.

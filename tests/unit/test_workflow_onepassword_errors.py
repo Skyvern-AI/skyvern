@@ -77,6 +77,7 @@ def mocked_app_database():
     original = getattr(forge_app, "DATABASE", None)
     forge_app.DATABASE = MagicMock()
     forge_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=None)
+    forge_app.DATABASE.credentials.get_onepassword_credentials = AsyncMock(return_value=[])
     yield forge_app.DATABASE
     if original is None:
         del forge_app.DATABASE
@@ -463,6 +464,8 @@ async def test_list_onepassword_items_captures_count_without_item_metadata(
         SimpleNamespace(
             capture_onepassword_telemetry=capture,
             onepassword_instance_default_policy_mode=lambda: "unrestricted",
+            credential_folders_restricted=AsyncMock(return_value=False),
+            accessible_credential_ids=AsyncMock(return_value=set()),
         ),
     )
     item = SimpleNamespace(
@@ -471,9 +474,18 @@ async def test_list_onepassword_items_captures_count_without_item_metadata(
         category=SimpleNamespace(value="LOGIN"),
         websites=[SimpleNamespace(url="https://example.invalid")],
     )
+    other_categories = [
+        SimpleNamespace(
+            id=category.lower(),
+            title=category,
+            category=SimpleNamespace(value=category),
+            websites=[],
+        )
+        for category in ("CREDIT_CARD", "PASSWORD", "DOCUMENT")
+    ]
     client = MagicMock()
     client.vaults.list = AsyncMock(return_value=[SimpleNamespace(id="vault-id", title="Sensitive Vault Name")])
-    client.items.list = AsyncMock(return_value=[item])
+    client.items.list = AsyncMock(return_value=[item, *other_categories])
 
     with patch(
         "skyvern.forge.sdk.routes.credentials.OnePasswordClient.authenticate",
@@ -482,12 +494,12 @@ async def test_list_onepassword_items_captures_count_without_item_metadata(
     ):
         response = await list_onepassword_items(_make_organization())
 
-    assert len(response.items) == 1
+    assert [item.importable for item in response.items] == [True, True, False, False]
     capture.assert_called_once_with(
         organization_id="o_test",
         event="onepassword.items_loaded",
         success=True,
-        item_count=1,
+        item_count=4,
     )
     assert "Sensitive Item Title" not in repr(capture.call_args)
     assert "Sensitive Vault Name" not in repr(capture.call_args)

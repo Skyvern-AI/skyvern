@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.output_utils import _BUILD_TEST_WORKFLOW_MAX_CHARS, INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    code_captures_download,
     code_uses_download_claim,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -3663,12 +3664,14 @@ def _artifact_declares_registration_keys(artifact: Mapping[str, Any]) -> bool:
 
 def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
     """Disjoint from extraction-intent (`goal_value_paths` on non-registration keys):
-    a block is download-intent when it claims a download, self-asserts a registration key in a
-    top-level dict, or declares a registration key as a goal path."""
+    a block is download-intent when it claims a download, captures one in a `with` block
+    (`page.expect_download()` or an `expect_event("download")` capture), self-asserts a registration
+    key in a top-level dict, or declares a registration key as a goal path."""
     if not code.strip():
         return False
     return (
         code_uses_download_claim(code)
+        or code_captures_download(code)
         or _code_returns_registration_keys(code)
         or _artifact_declares_registration_keys(artifact)
     )

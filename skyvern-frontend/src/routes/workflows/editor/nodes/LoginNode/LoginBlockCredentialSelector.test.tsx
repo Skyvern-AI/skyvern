@@ -677,6 +677,7 @@ describe("LoginBlockCredentialSelector 1Password items", () => {
     vault_id: "op_vault_1",
     vault_name: "Engineering",
     category: "LOGIN",
+    importable: true,
     url: "https://portal.example.invalid/signin",
   };
   const cardItem: OnePasswordItemApiResponse = {
@@ -685,6 +686,7 @@ describe("LoginBlockCredentialSelector 1Password items", () => {
     vault_id: "op_vault_1",
     vault_name: "Engineering",
     category: "CREDIT_CARD",
+    importable: true,
     url: null,
   };
 

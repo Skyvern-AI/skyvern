@@ -70,6 +70,7 @@ function mockNonPasswordItems() {
         vault_id: "vault-1",
         vault_name: "Example vault",
         category: "CREDIT_CARD",
+        importable: true,
       },
     ],
   });
@@ -176,6 +177,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     });
@@ -201,6 +203,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "CREDIT_CARD",
+          importable: true,
         },
       ],
     });
@@ -210,6 +213,51 @@ describe("OnePasswordCredentialsList empty states", () => {
     expect(
       screen.getByText(/no login or password items were returned/i),
     ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Import from 1Password" }),
+    ).toBeTruthy();
+  });
+
+  it("does not offer import when the only item category is unsupported", () => {
+    mockItems({
+      configured: true,
+      source: "organization",
+      items: [
+        {
+          item_id: "item-1",
+          title: "Standalone password",
+          vault_id: "vault-1",
+          vault_name: "Example vault",
+          category: "PASSWORD",
+          importable: false,
+        },
+      ],
+    });
+
+    renderList();
+
+    expect(
+      screen.queryByRole("button", { name: "Import from 1Password" }),
+    ).toBeNull();
+  });
+
+  it("keeps import available when the API omits importability during rollout", () => {
+    mockItems({
+      configured: true,
+      source: "organization",
+      items: [
+        {
+          item_id: "legacy-item",
+          title: "Legacy card",
+          vault_id: "vault-1",
+          vault_name: "Example vault",
+          category: "CREDIT_CARD",
+        },
+      ],
+    });
+
+    renderList();
+
     expect(
       screen.getByRole("button", { name: "Import from 1Password" }),
     ).toBeTruthy();
@@ -226,6 +274,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "CREDIT_CARD",
+          importable: true,
         },
         {
           item_id: "item-new",
@@ -233,6 +282,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "CREDIT_CARD",
+          importable: true,
         },
       ],
     });
@@ -282,6 +332,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     });
@@ -332,6 +383,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     });
@@ -379,6 +431,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     });
@@ -431,6 +484,7 @@ describe("OnePasswordCredentialsList empty states", () => {
           vault_id: "vault-1",
           vault_name: "Example vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     });

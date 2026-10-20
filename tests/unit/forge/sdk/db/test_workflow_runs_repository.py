@@ -4746,3 +4746,143 @@ async def test_final_webhook_claim_takes_over_only_an_unrecorded_claim_past_the_
     assert await claim("wr_claim_abandoned") is None
     assert await claim("wr_claim_in_flight") is None
     assert await claim("wr_claim_recorded") is None
+
+
+_WINDOW_START = datetime(2026, 7, 20, 12, 0, 0)
+_WINDOW_END = datetime(2026, 7, 30, 12, 0, 0)
+
+
+def _window_run_names(runs: list[Any], organization_id: str) -> list[str]:
+    return [run.workflow_run_id.removesuffix(f"_{organization_id}") for run in runs]
+
+
+async def _seed_created_at_window_runs(db: AgentDB, organization_id: str) -> None:
+    # The PostgreSQL leg shares one scratch schema across tests, so primary keys are scoped to the organization.
+    workflow_id = f"wf_window_{organization_id}"
+    workflow_permanent_id = f"wpid_window_{organization_id}"
+    created = {
+        "wr_window_before": _WINDOW_START - timedelta(seconds=1),
+        "wr_window_at_start": _WINDOW_START,
+        "wr_window_inside": datetime(2026, 7, 25, 8, 0, 0),
+        "wr_window_inside_other": datetime(2026, 7, 26, 8, 0, 0),
+        "wr_window_at_end": _WINDOW_END,
+        "wr_window_after": _WINDOW_END + timedelta(seconds=1),
+    }
+    async with db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                title="created_at window fixture",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        await session.flush()
+        for workflow_run_id, created_at in created.items():
+            session.add(
+                _workflow_run_model(
+                    workflow_run_id=f"{workflow_run_id}_{organization_id}",
+                    queued_at=created_at,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    status=(
+                        WorkflowRunStatus.failed.value
+                        if workflow_run_id == "wr_window_inside_other"
+                        else WorkflowRunStatus.completed.value
+                    ),
+                    webhook_callback_url=(
+                        None
+                        if workflow_run_id == "wr_window_inside_other"
+                        else "https://hooks.example.test/window-term"
+                    ),
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at_start", "created_at_end", "expected_run_ids"),
+    [
+        # Inclusive start, exclusive end, on the naive UTC column.
+        (_WINDOW_START, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"]),
+        (
+            _WINDOW_START,
+            None,
+            [
+                "wr_window_after",
+                "wr_window_at_end",
+                "wr_window_inside_other",
+                "wr_window_inside",
+                "wr_window_at_start",
+            ],
+        ),
+        (None, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start", "wr_window_before"]),
+        # Aware bounds name the same instants in other offsets and must be normalized to naive UTC.
+        (
+            datetime(2026, 7, 20, 14, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            datetime(2026, 7, 30, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5))),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+        (
+            datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC),
+            datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+    ],
+)
+async def test_get_workflow_runs_filters_by_explicit_created_at_bounds(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+    created_at_start: datetime | None,
+    created_at_end: datetime | None,
+    expected_run_ids: list[str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    runs = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page_size=20,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
+    )
+
+    assert _window_run_names(runs, organization_id) == expected_run_ids
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_never_defaults_a_window_and_combines_bounds_with_other_filters(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    # The repository applies only the bounds it is given; the default window is the route's policy.
+    unbounded = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id, page_size=20, search_key="window-term"
+    )
+    windowed_page = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page=2,
+        page_size=1,
+        status=[WorkflowRunStatus.completed],
+        search_key="window-term",
+        created_at_start=_WINDOW_START,
+        created_at_end=_WINDOW_END,
+    )
+    other_org = await db.workflow_runs.get_workflow_runs(
+        organization_id="o_someone_else", page_size=20, created_at_start=_WINDOW_START
+    )
+
+    assert set(_window_run_names(unbounded, organization_id)) == {
+        "wr_window_before",
+        "wr_window_at_start",
+        "wr_window_inside",
+        "wr_window_at_end",
+        "wr_window_after",
+    }
+    assert _window_run_names(windowed_page, organization_id) == ["wr_window_at_start"]
+    assert other_org == []

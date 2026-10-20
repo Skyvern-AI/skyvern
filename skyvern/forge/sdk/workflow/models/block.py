@@ -385,6 +385,7 @@ from skyvern.webeye.utils.captcha_solver import (
     resolve_captcha_image,
     solve_challenge,
 )
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
@@ -5231,22 +5232,53 @@ async def _code_block_solve_captcha_builtin(
 
     async def solve() -> bool:
         if image is not None and input is not None:
-            return await _fill_image_captcha_text(page, image, input, organization_id=organization_id)
-        outcome = await solve_challenge(
-            page,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            browser_session_id=browser_session_id,
-            probe_child_frames=True,
-        )
-        recorded_output["challenge"] = outcome.receipt()
-        if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        return outcome.status is ChallengeStatus.SOLVED
+            return await _fill_image_captcha_text(
+                page,
+                image,
+                input,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+        with _code_block_solve_record(page, organization_id, workflow_run_id, browser_session_id) as record:
+            outcome = await solve_challenge(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                probe_child_frames=True,
+            )
+            record.challenge = outcome
+            recorded_output["challenge"] = outcome.receipt()
+            if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            return outcome.status is ChallengeStatus.SOLVED
 
     if isinstance(page, RecordingPage):
         return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id, extra_output=recorded_output)
     return await solve()
+
+
+@contextlib.contextmanager
+def _code_block_solve_record(
+    page: Page | RecordingPage,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    browser_session_id: str | None,
+) -> Iterator[ChallengeSolveRecord]:
+    with app.AGENT_FUNCTION.challenge_solve_recording(
+        "code_block",
+        page=page,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        browser_session_id=browser_session_id,
+    ) as record:
+        try:
+            yield record
+        except CodeBlockCaptchaError:
+            # The builtin reports an unsolved or unreadable CAPTCHA by raising; the call itself completed.
+            record.unsolved = True
+            raise
 
 
 async def _fill_image_captcha_text(
@@ -5255,22 +5287,27 @@ async def _fill_image_captcha_text(
     input_selector: str,
     *,
     organization_id: str | None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
 ) -> bool:
     # Checked before the screenshot so an organization with OCR turned off never captures the element.
     if not await app.AGENT_FUNCTION.image_captcha_ocr_enabled(organization_id=organization_id, url=page.url):
         raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-    try:
-        # Any other element would ship an arbitrary region of the page to the OCR vendor.
-        image = await resolve_captcha_image(page.locator(image_selector))
-        if image is None:
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        png = await image.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
-        text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
-        if not text or not text.strip():
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        await page.locator(input_selector).fill(text.strip(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-    except PlaywrightError as exc:
-        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+    with _code_block_solve_record(page, organization_id, workflow_run_id, browser_session_id) as record:
+        try:
+            # Any other element would ship an arbitrary region of the page to the OCR vendor.
+            image = await resolve_captcha_image(page.locator(image_selector))
+            if image is None:
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            png = await image.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
+            if not text or not text.strip():
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            record.image_text_read = True
+            await page.locator(input_selector).fill(text.strip(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            record.image_text_delivered = True
+        except PlaywrightError as exc:
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
     return True
 
 
@@ -5295,6 +5332,7 @@ class CodeBlockSolveCaptcha(Protocol):
 def _bind_code_block_solve_captcha(
     organization_id: str | None,
     workflow_run_id: str | None,
+    browser_session_id: str | None = None,
 ) -> CodeBlockSolveCaptcha:
     image_reads = 0
 
@@ -5313,6 +5351,7 @@ def _bind_code_block_solve_captcha(
             page,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
             image=image,
             input=input,
         )
@@ -6843,6 +6882,7 @@ class CodeBlock(Block):
         registered_downloads: RegisteredDownloadSource | None = None,
         opened_pages: list[Page | RecordingPage] | None = None,
         browser_state: BrowserState | None = None,
+        browser_session_id: str | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -6873,7 +6913,9 @@ class CodeBlock(Block):
             parameters=app.AGENT_FUNCTION.serialize_codeblock_parameters(parameters or {}),
         )
         safe_vars["__builtins__"]["print"] = safe_vars["print"]
-        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(organization_id, workflow_run_id)
+        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(
+            organization_id, workflow_run_id, browser_session_id
+        )
         safe_vars["otp"] = partial(
             _code_block_otp_builtin,
             organization_id=organization_id,
@@ -10083,6 +10125,7 @@ async def wrapper({default_args}):
                     registered_downloads=registered_downloads,
                     opened_pages=opened_pages,
                     browser_state=browser_state,
+                    browser_session_id=browser_session_id,
                 )
             except BaseException:
                 download_log.close()

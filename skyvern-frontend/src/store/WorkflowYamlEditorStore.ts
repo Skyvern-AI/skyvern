@@ -682,7 +682,7 @@ export function refuseMutationDuringYamlCommit(): boolean {
   return true;
 }
 
-export function refuseMutationDuringAuthoring(): boolean {
+function refuseMutationDuringAuthoring(): boolean {
   if (!useWorkflowYamlEditorStore.getState().authoringInProgress) return false;
   toast({
     title: "Finish the current authoring action first",

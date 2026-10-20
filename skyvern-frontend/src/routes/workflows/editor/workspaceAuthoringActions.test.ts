@@ -1,41 +1,27 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
-  applySopResultAtCurrentAppend,
+  blockLabelFor,
   demonstrationInsertionFromNodes,
+  resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
+  sopAttachmentDraft,
 } from "./workspaceAuthoringActions";
 
 describe("workspace authoring actions", () => {
-  it("applies an SOP at the current workflow tail when conversion finishes", () => {
-    let nodes = [
+  it("appends after the last top-level block, not inside a container", () => {
+    const nodes = [
       { id: "a", type: "task" },
-      { id: "adder", type: "nodeAdder" },
-    ];
-    let edges = [{ source: "a", target: "adder" }];
-    const setRecordedBlocks = vi.fn();
-    const result = { blocks: [], parameters: [] };
-
-    const applyResult = () =>
-      applySopResultAtCurrentAppend({
-        result,
-        getNodes: () => nodes,
-        getEdges: () => edges,
-        setRecordedBlocks,
-      });
-
-    nodes = [
-      { id: "a", type: "task" },
+      { id: "loop-adder", type: "nodeAdder", parentId: "loop" },
       { id: "b", type: "task" },
       { id: "adder", type: "nodeAdder" },
     ];
-    edges = [
+    const edges = [
       { source: "a", target: "b" },
       { source: "b", target: "adder" },
     ];
-    applyResult();
 
-    expect(setRecordedBlocks).toHaveBeenCalledWith(result, {
+    expect(resolveAppendInsertionPoint(nodes, edges)).toEqual({
       previous: "b",
       next: "adder",
       parent: undefined,
@@ -43,21 +29,7 @@ describe("workspace authoring actions", () => {
     });
   });
 
-  it("makes SOP upload and task demonstration mutually exclusive", () => {
-    expect(
-      resolveWorkspaceAuthoringActionAvailability({
-        browserReady: true,
-        isGlobalWorkflow: false,
-        isWorkflowDeleted: false,
-        hasActiveRun: false,
-        isComparing: false,
-        isEditingYaml: false,
-        hasFinallyBlock: false,
-        isRecording: false,
-        isUploadingSOP: true,
-      }),
-    ).toMatchObject({ canUploadSOP: false, canRecordTask: false });
-
+  it("blocks task demonstration while a recording is in progress", () => {
     expect(
       resolveWorkspaceAuthoringActionAvailability({
         browserReady: true,
@@ -68,9 +40,8 @@ describe("workspace authoring actions", () => {
         isEditingYaml: false,
         hasFinallyBlock: false,
         isRecording: true,
-        isUploadingSOP: false,
       }),
-    ).toMatchObject({ canUploadSOP: false, canRecordTask: false });
+    ).toMatchObject({ canRecordTask: false });
   });
 
   it("blocks append-only actions on global workflows and after a finally block", () => {
@@ -81,7 +52,6 @@ describe("workspace authoring actions", () => {
       isComparing: false,
       isEditingYaml: false,
       isRecording: false,
-      isUploadingSOP: false,
     };
 
     expect(
@@ -91,7 +61,6 @@ describe("workspace authoring actions", () => {
         hasFinallyBlock: false,
       }),
     ).toMatchObject({
-      canUploadSOP: false,
       canRecordTask: false,
       unavailableReason: "Make a copy to edit this agent",
     });
@@ -103,7 +72,6 @@ describe("workspace authoring actions", () => {
         hasFinallyBlock: true,
       }),
     ).toMatchObject({
-      canUploadSOP: false,
       canRecordTask: false,
       unavailableReason:
         "The finally block must remain last. Add steps above it in the editor.",
@@ -118,7 +86,6 @@ describe("workspace authoring actions", () => {
       isComparing: false,
       isEditingYaml: false,
       isRecording: false,
-      isUploadingSOP: false,
     };
 
     expect(
@@ -128,7 +95,6 @@ describe("workspace authoring actions", () => {
         hasActiveRun: false,
       }),
     ).toEqual({
-      canUploadSOP: false,
       canRecordTask: false,
       unavailableReason: "This agent is deleted and view-only",
     });
@@ -140,7 +106,6 @@ describe("workspace authoring actions", () => {
         hasActiveRun: true,
       }),
     ).toEqual({
-      canUploadSOP: true,
       canRecordTask: false,
       unavailableReason: "Stop the active run before recording a task",
     });
@@ -153,7 +118,6 @@ describe("workspace authoring actions", () => {
         isComparing: true,
       }),
     ).toEqual({
-      canUploadSOP: false,
       canRecordTask: false,
       unavailableReason: "Exit history comparison to edit this agent",
     });
@@ -167,7 +131,6 @@ describe("workspace authoring actions", () => {
         isEditingYaml: true,
       }),
     ).toEqual({
-      canUploadSOP: false,
       canRecordTask: false,
       unavailableReason: "Switch to Visual mode before adding workflow steps",
     });
@@ -206,5 +169,25 @@ describe("demonstrationInsertionFromNodes", () => {
         parent: "loop",
       }),
     ).toBeNull();
+  });
+});
+
+describe("sopAttachmentDraft", () => {
+  it("names the container for an SOP added inside an empty loop", () => {
+    const nodes = [
+      { id: "loop", type: "loop", data: { label: "each_invoice" } },
+      { id: "start", type: "start", parentId: "loop" },
+      { id: "adder", type: "nodeAdder", parentId: "loop" },
+    ];
+    const insertionPoint = { previous: "start", next: "adder", parent: "loop" };
+
+    expect(
+      sopAttachmentDraft(
+        demonstrationInsertionFromNodes(nodes, insertionPoint),
+        blockLabelFor(nodes, insertionPoint.parent),
+      ),
+    ).toBe(
+      "Add the steps from the attached SOP inside the each_invoice block.",
+    );
   });
 });

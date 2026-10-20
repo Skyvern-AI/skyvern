@@ -149,9 +149,6 @@ class PDFImportService:
                 if blk.get("url") is None:
                     blk["url"] = ""
 
-            # Note: parameter_keys is kept in backend format for WorkflowCreateYAMLRequest validation
-            # The sop-to-blocks endpoint transforms to frontend format separately
-
         return raw
 
     def extract_text_from_pdf(self, file_contents: bytes, file_name: str) -> str:

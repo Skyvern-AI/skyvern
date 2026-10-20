@@ -74,6 +74,7 @@ describe("ImportOnePasswordDialog", () => {
           vault_id: "vault-1",
           vault_name: "Team vault",
           category: "LOGIN",
+          importable: true,
         },
         {
           item_id: "item-new",
@@ -81,6 +82,7 @@ describe("ImportOnePasswordDialog", () => {
           vault_id: "vault-1",
           vault_name: "Team vault",
           category: "LOGIN",
+          importable: true,
         },
         {
           item_id: "item-unsupported",
@@ -88,6 +90,7 @@ describe("ImportOnePasswordDialog", () => {
           vault_id: "vault-2",
           vault_name: "Archive vault",
           category: "DOCUMENT",
+          importable: false,
         },
       ],
     };
@@ -134,12 +137,6 @@ describe("ImportOnePasswordDialog", () => {
             status: "imported",
             reason: null,
           },
-          {
-            vault_id: "vault-2",
-            item_id: "item-unsupported",
-            status: "skipped",
-            reason: "Unsupported 1Password category: DOCUMENT",
-          },
         ],
       },
     });
@@ -164,9 +161,9 @@ describe("ImportOnePasswordDialog", () => {
     fireEvent.click(
       screen.getByRole("checkbox", { name: "Select all in Team vault" }),
     );
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: "Select Unsupported item" }),
-    );
+    expect(
+      screen.queryByRole("checkbox", { name: "Select Unsupported item" }),
+    ).toBeNull();
     expect(screen.getByRole("button", { name: "No folder" })).toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: "Import selected items" }),
@@ -174,17 +171,11 @@ describe("ImportOnePasswordDialog", () => {
 
     await waitFor(() => {
       expect(post).toHaveBeenCalledWith("/credentials/onepassword/import", {
-        items: [
-          { vault_id: "vault-1", item_id: "item-new" },
-          { vault_id: "vault-2", item_id: "item-unsupported" },
-        ],
+        items: [{ vault_id: "vault-1", item_id: "item-new" }],
       });
     });
     expect(await screen.findByText("Imported")).toBeTruthy();
-    expect(screen.getByText("Skipped")).toBeTruthy();
-    expect(
-      screen.getByText("Unsupported 1Password category: DOCUMENT"),
-    ).toBeTruthy();
+    expect(screen.queryByText("Skipped")).toBeNull();
     expect(screen.getAllByText("New login").length).toBeGreaterThan(1);
   });
 
@@ -199,6 +190,7 @@ describe("ImportOnePasswordDialog", () => {
           vault_id: "vault-1",
           vault_name: "Team vault",
           category: "LOGIN",
+          importable: true,
         },
         {
           item_id: "item-new",
@@ -206,6 +198,7 @@ describe("ImportOnePasswordDialog", () => {
           vault_id: "vault-1",
           vault_name: "Team vault",
           category: "LOGIN",
+          importable: true,
         },
       ],
     };
@@ -293,6 +286,7 @@ describe("ImportOnePasswordDialog", () => {
                 vault_id: "vault-1",
                 vault_name: "Team vault",
                 category: "LOGIN",
+                importable: true,
               },
             ],
           },
@@ -335,5 +329,85 @@ describe("ImportOnePasswordDialog", () => {
       items: [{ vault_id: "vault-1", item_id: "item-1" }],
     });
     expect(screen.queryByText("Import results")).toBeNull();
+  });
+});
+
+describe("SKY-18379 QA R1 repro: ImportOnePasswordDialog", () => {
+  function mockItems(
+    items: OnePasswordItemsApiResponse["items"],
+    post: ReturnType<typeof vi.fn>,
+  ) {
+    const get = vi.fn(async (path: string) => {
+      if (path === "/credentials/onepassword/items") {
+        return { data: { configured: true, source: "organization", items } };
+      }
+      if (path === "/credentials") return { data: [] };
+      if (path === "/credential_folders") {
+        return {
+          data: [
+            {
+              folder_id: "folder-readonly",
+              organization_id: "org-1",
+              title: "Read-only folder",
+              description: null,
+              credential_count: 0,
+              created_at: "2026-10-18T00:00:00Z",
+              modified_at: "2026-10-18T00:00:00Z",
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+    mockedGetClient.mockResolvedValue({ get, post } as never);
+  }
+
+  function login(index: number, category = "LOGIN") {
+    return {
+      item_id: `item-${index}`,
+      title: `Login ${index}`,
+      vault_id: "vault-1",
+      vault_name: "Team vault",
+      category,
+      importable: category === "LOGIN",
+    };
+  }
+
+  async function openDialog() {
+    fireEvent.click(
+      screen.getByRole("button", { name: "Import from 1Password" }),
+    );
+    await screen.findByRole("checkbox", { name: "Select all in Team vault" });
+  }
+
+  it("QA1-U2: does not offer Password-category items that import always skips", async () => {
+    mockItems([login(0), login(1, "PASSWORD")], vi.fn());
+    renderDialog();
+    await openDialog();
+
+    expect(
+      screen.queryByRole("checkbox", { name: "Select Login 1" }),
+    ).toBeNull();
+  });
+
+  it("keeps legacy items when the API omits importability during rollout", async () => {
+    mockItems(
+      [
+        {
+          item_id: "legacy-login",
+          title: "Legacy login",
+          vault_id: "vault-1",
+          vault_name: "Team vault",
+          category: "LOGIN",
+        },
+      ],
+      vi.fn(),
+    );
+    renderDialog();
+    await openDialog();
+
+    expect(
+      screen.getByRole("checkbox", { name: "Select Legacy login" }),
+    ).toBeTruthy();
   });
 });

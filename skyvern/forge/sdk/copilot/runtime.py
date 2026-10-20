@@ -456,8 +456,8 @@ class AgentContext:
     # The self-heal turn advertises its own browser-only surface rather than resolving one, so it
     # names no projection; the shared agent loop still reads this to decide dispatch enforcement.
     tool_surface_identity: CopilotToolSurfaceIdentity | None = None
-    # True only while a card is on screen. credential_pause_used stays true for the rest of the
-    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
+    # True only while a card is on screen; it alone keeps a second card from opening alongside it.
+    # credential_pause_used records that a pick card was raised this turn, so the run-derived ask opens no other.
     credential_ask_in_flight: bool = False
     credential_pause_used: bool = False
     # The deadline the current model stream runs under, published by the enforcement loop so a tool
@@ -811,8 +811,9 @@ class AgentContext:
     # The origin a credential fill was refused on, and how far the ask for a login there has got.
     # It steers the model and the card; it withdraws no tool.
     credential_origin_recovery: CredentialOriginRecovery | None = None
-    # Recovery origins that already had their card this turn; each gets the one-card budget back once.
-    credential_origin_recovery_carded: set[str] = field(default_factory=set)
+    # Every (origin, credential id) a fill refused this turn. A later pick ask on such a site gets a recovery card,
+    # and its admission check excludes every login refused anywhere on that site.
+    credential_origin_refusals: set[tuple[str, str]] = field(default_factory=set)
 
     @property
     def authoring_capability(self) -> AuthoringCapability:

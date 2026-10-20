@@ -31,12 +31,14 @@ LOG = structlog.get_logger(__name__)
 _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page, Request
+    from playwright.async_api import Frame, Page, Playwright, Request
 
     from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
     from skyvern.webeye.browser_engine import EngineFrame
+
+    from .hosted_driver import HostedDriver
 
 
 @dataclass
@@ -156,9 +158,22 @@ class SessionState:
         return self._body_store.get(request_id)
 
 
+class StatelessCallEndedError(RuntimeError):
+    """A task that outlived its stateless MCP tool call asked for a browser driver."""
+
+
+@dataclass(eq=False)
+class _CallConnections:
+    """What one stateless tool call holds: the CDP connections it opened and its leases on shared drivers."""
+
+    browsers: list[SkyvernBrowser] = field(default_factory=list)
+    leases: list[HostedDriver] = field(default_factory=list)
+    ended: bool = False
+
+
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _current_organization_id: ContextVar[str | None] = ContextVar("mcp_session_organization_id", default=None)
-_call_connections: ContextVar[list[SkyvernBrowser] | None] = ContextVar("mcp_call_connections", default=None)
+_call_connections: ContextVar[_CallConnections | None] = ContextVar("mcp_call_connections", default=None)
 _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS = 5
 _CALL_CONNECTION_DISCONNECTS: set[asyncio.Task[None]] = set()
 _global_session: SessionState | None = None
@@ -549,32 +564,57 @@ async def scoped_session(state: SessionState) -> AsyncIterator[None]:
 
 @asynccontextmanager
 async def stateless_call_connection_scope() -> AsyncIterator[None]:
-    """Disconnect the CDP connections a stateless tool call opened when the call ends."""
+    """Disconnect the CDP connections a stateless tool call opened, then release its driver leases, when it ends."""
     # The call's SessionState lives only in its own ContextVar, so nothing else can close them; an open
     # connection keeps receiving and buffering the remote browser's events until that cloud session ends.
     if not _stateless_http_mode:
         yield
         return
-    connections: list[SkyvernBrowser] = []
-    token = _call_connections.set(connections)
+    owned = _CallConnections()
+    token = _call_connections.set(owned)
     try:
         yield
     finally:
         _call_connections.reset(token)
-        if connections:
-            # Shielded so a cancelled call still disconnects; the timeout only stops a hung close
-            # handshake from holding the response, and the close itself finishes in the background.
-            disconnect = asyncio.create_task(_disconnect_call_connections(connections))
-            _CALL_CONNECTION_DISCONNECTS.add(disconnect)
-            disconnect.add_done_callback(_CALL_CONNECTION_DISCONNECTS.discard)
+        owned.ended = True
+        if owned.browsers or owned.leases:
+            # Shielded so a cancelled call still cleans up. The release keeps itself within the same budget;
+            # the timeout only stops it from holding the response if that ever fails.
+            release = asyncio.create_task(_release_call_connections(owned))
+            _retain_call_cleanup(release)
             with suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(disconnect), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+                await asyncio.wait_for(asyncio.shield(release), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
 
 
 def _own_call_connection(browser: SkyvernBrowser) -> None:
-    connections = _call_connections.get()
-    if connections is not None:
-        connections.append(browser)
+    owned = _call_connections.get()
+    if owned is not None:
+        owned.browsers.append(browser)
+
+
+async def stateless_call_playwright(driver: HostedDriver) -> Playwright:
+    """``driver``'s Playwright, leased by the current stateless tool call until its connections are released."""
+    owned = _call_connections.get()
+    if owned is not None:
+        # Tasks the call spawned still see this object in their copied context after the scope resets the
+        # ContextVar, so this flag is what keeps them from using a driver no lease protects.
+        if owned.ended:
+            raise StatelessCallEndedError("This MCP tool call has already ended")
+        if driver not in owned.leases:
+            driver.acquire()
+            owned.leases.append(driver)
+    return await driver.playwright()
+
+
+def _retain_call_cleanup(task: asyncio.Task[None]) -> None:
+    _CALL_CONNECTION_DISCONNECTS.add(task)
+    task.add_done_callback(_finish_call_cleanup)
+
+
+def _finish_call_cleanup(task: asyncio.Task[None]) -> None:
+    _CALL_CONNECTION_DISCONNECTS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        LOG.warning("Stateless MCP call cleanup failed", error_type=type(task.exception()).__name__)
 
 
 async def _disconnect_browser(browser: SkyvernBrowser) -> None:
@@ -585,12 +625,26 @@ async def _disconnect_browser(browser: SkyvernBrowser) -> None:
         await playwright_browser.close()
 
 
-async def _disconnect_call_connections(connections: list[SkyvernBrowser]) -> None:
-    for browser in connections:
-        try:
-            await _disconnect_browser(browser)
-        except Exception:
-            LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+async def _disconnect_call_connection(browser: SkyvernBrowser) -> None:
+    try:
+        await _disconnect_browser(browser)
+    except Exception:
+        LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+
+
+async def _release_call_connections(owned: _CallConnections) -> None:
+    try:
+        if owned.browsers:
+            disconnects = [asyncio.create_task(_disconnect_call_connection(browser)) for browser in owned.browsers]
+            _, pending = await asyncio.wait(disconnects, timeout=_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+            if pending:
+                # A hung close must not pin the shared driver; the idle sweep's driver stop also ends these.
+                LOG.warning("Stateless MCP browser connections did not disconnect in time", pending=len(pending))
+                for disconnect in pending:
+                    _retain_call_cleanup(disconnect)
+    finally:
+        for driver in owned.leases:
+            driver.release()
 
 
 def set_stateless_http_mode(enabled: bool) -> None:

@@ -78,7 +78,10 @@ function ImportOnePasswordDialog({ trigger }: Props) {
     [importedCredentialsQuery.data],
   );
   const items = useMemo(
-    () => itemsQuery.data?.items ?? [],
+    () =>
+      (itemsQuery.data?.items ?? []).filter(
+        (item) => item.importable !== false,
+      ),
     [itemsQuery.data?.items],
   );
   const groups = useMemo(() => {

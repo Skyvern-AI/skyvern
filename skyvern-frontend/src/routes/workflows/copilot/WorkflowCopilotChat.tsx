@@ -245,6 +245,7 @@ import {
 import {
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
+  googleConnectionNoticeKey,
   NarrativeEvent,
   RecordedActionSummary,
   TurnNarrativeState,
@@ -279,6 +280,10 @@ import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 import { RecordingFeedbackPrompt } from "@/routes/workflows/editor/recording/RecordingFeedbackPrompt";
+import {
+  sopAttachmentDraft,
+  stageSopFile,
+} from "@/routes/workflows/editor/workspaceAuthoringActions";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -782,8 +787,8 @@ const ATTACHMENT_EXTENSIONS = [
   ...VIDEO_ATTACHMENT_EXTENSIONS,
 ] as const;
 const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.join(",");
-const ATTACHMENT_SIZE_LIMIT_BYTES = 10 * 1024 * 1024;
-const VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES = 30 * 1024 * 1024;
+// Mirrors the server's MAX_UPLOAD_FILE_SIZE.
+const ATTACHMENT_SIZE_LIMIT_BYTES = 30 * 1024 * 1024;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the chat request.
 const ATTACHMENT_COUNT_LIMIT = 20;
 
@@ -799,12 +804,6 @@ function isVideoAttachment(file: File): boolean {
   return VIDEO_ATTACHMENT_EXTENSIONS.some((extension) =>
     filename.endsWith(extension),
   );
-}
-
-function attachmentSizeLimit(file: File): number {
-  return isVideoAttachment(file)
-    ? VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES
-    : ATTACHMENT_SIZE_LIMIT_BYTES;
 }
 
 function normalizeHttpUrl(value: string): string | null {
@@ -913,6 +912,14 @@ function connectedAccountSelectionReceipt(
     if (selected) {
       return `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`;
     }
+  }
+  // A Google card can list a connection made after its turn ended, which no stored choice set holds.
+  const fromGoogleCard = prior.narrative.googleConnectionNotices.some(
+    (notice) =>
+      notice.condition === "unbound" || notice.connectionId === message.content,
+  );
+  if (fromGoogleCard && /^goac_\w+$/.test(message.content)) {
+    return `Selected Google connection …${message.content.slice(-8)}`;
   }
   return null;
 }
@@ -1118,6 +1125,11 @@ function credentialCardFrameFor(
   return null;
 }
 
+const EARLIER_PICK_CARD_FRAME: CredentialRequiredFrame = {
+  type: "credential_required",
+  reason: "workflow_credential_inputs_unbound",
+};
+
 // A co-occurring credential ask/pause owns this turn's credential UI and its
 // credentialResolutions[turnId] entry; the auto-bind receipt would double up and
 // mis-adopt that ask's resolution, so it defers whenever a card frame exists.
@@ -1132,10 +1144,9 @@ function autoBoundReceiptFor(
 // The persisted credentialPause carries no name, so a tab that received the live
 // credential_pause_resolved frame names the receipt from it.
 function historicalCredentialOutcome(
-  turn: TurnNarrativeState,
+  pause: TurnNarrativeState["credentialPause"],
   pauseCardResolutions: Record<string, CredentialPauseHistorical>,
 ): CredentialPauseHistorical | undefined {
-  const pause = turn.credentialPause;
   if (!pause || pause.outcome === "declined") return undefined;
   const credentialId = pause.credentialId ?? undefined;
   const name = credentialId
@@ -1177,8 +1188,10 @@ function terminalCredentialAskFor(
   // The persisted pause verdict outranks the optimistic click, so a pick the server did not admit
   // never reads as connected; the click's name survives via pauseCardResolutions.
   const resolvedOutcome =
-    historicalCredentialOutcome(message.narrative, pauseCardResolutions) ??
-    localResolution;
+    historicalCredentialOutcome(
+      message.narrative.credentialPause,
+      pauseCardResolutions,
+    ) ?? localResolution;
   const canContinue =
     isLastMessage || strandedTerminalContinuations.has(turnId);
   if (!resolvedOutcome && !canContinue) return null;
@@ -1473,9 +1486,7 @@ interface WorkflowCopilotChatProps {
   initialAttachments?: Array<CopilotAttachedFile>;
   initialAction?: CopilotProductAction;
   onInitialMessageConsumed?: () => void;
-  onUploadSOP?: (file: File) => void;
-  canUploadSOP?: boolean;
-  isUploadingSOP?: boolean;
+  onRequestOpen?: () => void;
   onRecordTask?: () => void;
   canRecordTask?: boolean;
   authoringUnavailableReason?: string | null;
@@ -1718,9 +1729,7 @@ export function WorkflowCopilotChat({
   initialAttachments,
   initialAction,
   onInitialMessageConsumed,
-  onUploadSOP,
-  canUploadSOP = true,
-  isUploadingSOP = false,
+  onRequestOpen,
   onRecordTask,
   canRecordTask = false,
   authoringUnavailableReason,
@@ -1746,6 +1755,8 @@ export function WorkflowCopilotChat({
       ?.unattributedClaim === true;
   const initialHandoffMessageId = `initial-copilot-message-${workflowPermanentId ?? "pending"}`;
   const sopFileInputRef = useRef<HTMLInputElement>(null);
+  // Set when a file is staged while the composer is hidden or not yet mounted.
+  const focusComposerWhenShownRef = useRef(false);
   const recordingAuthoringActive = useRecordingStore(
     (state) => state.isRecording || state.finishRequested || state.isCommitting,
   );
@@ -1754,8 +1765,8 @@ export function WorkflowCopilotChat({
   );
   // Recording is deliberately conversational: the live chapter owns capture,
   // while the existing composer remains available for instructions and
-  // clarifications. SOP upload and finishing a recording own it exclusively.
-  const authoringInProgress = isUploadingSOP || recordingIsFinishing;
+  // clarifications. Finishing a recording owns it exclusively.
+  const authoringInProgress = recordingIsFinishing;
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     ...(templateGuidance
       ? [
@@ -2007,6 +2018,10 @@ export function WorkflowCopilotChat({
   // turn_start and at every terminal so a dead resume_token can never render.
   const [livePauseFrame, setLivePauseFrame] =
     useState<WorkflowCopilotCredentialRequiredUpdate | null>(null);
+  // Every card the live turn raised; only one is open at a time, so the earlier ones render as receipts.
+  const [livePauseFrameHistory, setLivePauseFrameHistory] = useState<
+    WorkflowCopilotCredentialRequiredUpdate[]
+  >([]);
   const [recoveredPauseFrames, setRecoveredPauseFrames] = useState<
     WorkflowCopilotCredentialRequiredUpdate[]
   >([]);
@@ -3349,6 +3364,10 @@ export function WorkflowCopilotChat({
   const setTextareaRef = useCallback(
     (node: HTMLTextAreaElement | null) => {
       textareaRef.current = node;
+      if (node && focusComposerWhenShownRef.current) {
+        focusComposerWhenShownRef.current = false;
+        node.focus();
+      }
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
       if (!node || typeof ResizeObserver === "undefined") return;
@@ -6234,13 +6253,13 @@ export function WorkflowCopilotChat({
 
   const uploadAttachment = useCallback(
     async (file: File) => {
-      if (file.size > attachmentSizeLimit(file)) {
+      if (file.size > ATTACHMENT_SIZE_LIMIT_BYTES) {
         toast({
           variant: "destructive",
           title: "File too large",
           description: isVideoAttachment(file)
             ? `${file.name} exceeds the 30MB limit. Shorten or compress the clip, or attach ordered screenshots.`
-            : `${file.name} exceeds the 10MB limit.`,
+            : `${file.name} exceeds the 30MB limit.`,
         });
         setPendingAttachments((prev) => [
           ...prev,
@@ -6248,7 +6267,7 @@ export function WorkflowCopilotChat({
             localId: crypto.randomUUID(),
             filename: file.name,
             status: "error",
-            error: isVideoAttachment(file) ? "over 30MB" : "over 10MB",
+            error: "over 30MB",
           },
         ]);
         return;
@@ -7827,10 +7846,10 @@ export function WorkflowCopilotChat({
         (file) => !isSupportedAttachment(file),
       );
       const oversizedFiles = supportedFiles.filter(
-        (file) => file.size > attachmentSizeLimit(file),
+        (file) => file.size > ATTACHMENT_SIZE_LIMIT_BYTES,
       );
       const uploadableFiles = supportedFiles.filter(
-        (file) => file.size <= attachmentSizeLimit(file),
+        (file) => file.size <= ATTACHMENT_SIZE_LIMIT_BYTES,
       );
       if (unsupportedFiles.length > 0) {
         toast({
@@ -8875,6 +8894,7 @@ export function WorkflowCopilotChat({
           // Turn is terminal — the in-flight pause card (if any) unmounts with
           // the live bubble; drop its now-dead resume_token too.
           setLivePauseFrame(null);
+          setLivePauseFrameHistory([]);
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
           setQuestionCancelToken(null);
           if (response.work_plan) {
@@ -9120,6 +9140,7 @@ export function WorkflowCopilotChat({
           // A terminal error carries no credentialPause payload, so the dead
           // frame must be cleared explicitly or its card would stay actionable.
           setLivePauseFrame(null);
+          setLivePauseFrameHistory([]);
           const liveNarrative = errorNarrative ?? narrativeRef.current;
           const frozenNarrative: TurnNarrativeState | undefined =
             liveNarrative.turnId !== null
@@ -9266,6 +9287,7 @@ export function WorkflowCopilotChat({
             supports_question_tool: true,
             supports_account_group_card: true,
             supports_credential_delete_card: true,
+            supports_google_setup_card: true,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -9361,6 +9383,12 @@ export function WorkflowCopilotChat({
               case "credential_required":
                 sawCredentialPause = true;
                 setLivePauseFrame(payload);
+                setLivePauseFrameHistory((frames) => [
+                  ...frames.filter(
+                    (frame) => frame.turn_id === payload.turn_id,
+                  ),
+                  payload,
+                ]);
                 return false;
               case "credential_pause_resolved": {
                 const pause = parseCredentialPause({
@@ -9401,6 +9429,7 @@ export function WorkflowCopilotChat({
                 }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
+                setLivePauseFrameHistory([]);
                 turnChatIdRef.current =
                   payload.workflow_copilot_chat_id ??
                   workflowCopilotChatIdRef.current;
@@ -9584,6 +9613,7 @@ export function WorkflowCopilotChat({
         // bubble or its Working/elapsed indicator would tick forever.
         setNarrative(EMPTY_NARRATIVE);
         setLivePauseFrame(null);
+        setLivePauseFrameHistory([]);
         return false;
       } finally {
         retainUnconfirmedOutcome();
@@ -9819,6 +9849,43 @@ export function WorkflowCopilotChat({
     setStartDemonstration,
     workflowPermanentId,
   ]);
+  // An answer to a pending question is sent through the question flow, which carries no files, so
+  // the composer offers no attachment then.
+  const attachDisabledReason = isDemonstrating
+    ? demonstrationRecorder.phase === "recording"
+      ? "Use Done before attaching a file"
+      : "Use Build before attaching a file"
+    : authoringInProgress
+      ? "Finish the current authoring action before attaching a file"
+      : hasPendingQuestion
+        ? "Answer the pending question before attaching a file"
+        : null;
+  const stageComposerAttachment = useCallback(
+    (file: File, draft: string) => {
+      onRequestOpen?.();
+      void uploadAttachment(file);
+      if (!isSpeechListening)
+        setInputValue((current) => (current.trim() ? current : draft));
+      if (isOpen && textareaRef.current) textareaRef.current.focus();
+      else focusComposerWhenShownRef.current = true;
+    },
+    [isOpen, isSpeechListening, onRequestOpen, uploadAttachment],
+  );
+  useEffect(() => {
+    if (!isOpen || !focusComposerWhenShownRef.current || !textareaRef.current)
+      return;
+    focusComposerWhenShownRef.current = false;
+    textareaRef.current.focus();
+  }, [isOpen]);
+  const setStageAttachment = useCopilotActionStore(
+    (state) => state.setStageAttachment,
+  );
+  useEffect(() => {
+    setStageAttachment(
+      attachDisabledReason === null ? stageComposerAttachment : null,
+    );
+    return () => setStageAttachment(null);
+  }, [attachDisabledReason, setStageAttachment, stageComposerAttachment]);
 
   const handleConnectedAccountChoice = useCallback(
     (turnId: string, connectionId: string) => {
@@ -10481,6 +10548,24 @@ export function WorkflowCopilotChat({
       ),
     });
   }
+  if (!isLoadingHistory) {
+    for (const frame of livePauseFrameHistory) {
+      if (
+        frame.turn_id !== narrative.turnId ||
+        frame.resume_token === livePauseFrame?.resume_token
+      ) {
+        continue;
+      }
+      liveAnchored.push({
+        key: `credential-${frame.resume_token}`,
+        toolCallId: credentialAnchorToolCallId(
+          narrative,
+          frame.anchor_tool_call_id,
+        ),
+        node: pauseCredentialCard(frame),
+      });
+    }
+  }
   if (
     !isLoadingHistory &&
     livePauseFrame &&
@@ -10909,8 +10994,7 @@ export function WorkflowCopilotChat({
     }
   };
 
-  const uploadSOPDisabled = !onUploadSOP || !canUploadSOP || isUploadingSOP;
-  const recordTaskDisabled = !onRecordTask || !canRecordTask || isUploadingSOP;
+  const recordTaskDisabled = !onRecordTask || !canRecordTask;
   const recordingChapterController = recordingAuthoringActive ? (
     <RecordingPanel
       key="live-recording-chapter"
@@ -11079,12 +11163,10 @@ export function WorkflowCopilotChat({
                     <TooltipProvider>
                       <ControlTooltip
                         content={
-                          uploadSOPDisabled
-                            ? (authoringUnavailableReason ??
-                              "SOP upload is not available right now")
-                            : "Upload a procedure as a PDF"
+                          attachDisabledReason ??
+                          "Attach a procedure PDF for Copilot to build from"
                         }
-                        blocked={uploadSOPDisabled}
+                        blocked={attachDisabledReason !== null}
                         side="top"
                         wrapperClassName="min-w-0 w-full"
                       >
@@ -11092,20 +11174,15 @@ export function WorkflowCopilotChat({
                           type="button"
                           aria-label="Upload an SOP"
                           className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={uploadSOPDisabled}
-                          onClick={() => {
-                            if (refuseMutationDuringYamlCommit()) return;
-                            sopFileInputRef.current?.click();
-                          }}
+                          disabled={attachDisabledReason !== null}
+                          onClick={() => sopFileInputRef.current?.click()}
                         >
                           <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
                             <UploadIcon className="h-4 w-4" />
                           </span>
                           <span className="min-w-0">
                             <span className="block font-medium text-foreground">
-                              {isUploadingSOP
-                                ? "Uploading SOP…"
-                                : "Upload an SOP"}
+                              Upload an SOP
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
                               A PDF of the procedure
@@ -11144,7 +11221,7 @@ export function WorkflowCopilotChat({
                               Demonstrate task
                             </span>
                             <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                              Do it once in the browser
+                              Show Copilot how in the browser
                             </span>
                           </span>
                         </button>
@@ -11354,6 +11431,36 @@ export function WorkflowCopilotChat({
                       ),
                     });
                   }
+                  if (!isLoadingHistory) {
+                    // credentialPause is the last card; credentialPauses adds the turn's earlier ones.
+                    const receiptTurn = message.narrative;
+                    receiptTurn.credentialPauses
+                      .slice(0, -1)
+                      .forEach((pause, receiptIndex) => {
+                        const resolvedOutcome = historicalCredentialOutcome(
+                          pause,
+                          pauseCardResolutions,
+                        );
+                        if (!resolvedOutcome) return;
+                        anchored.push({
+                          key: `credential-${receiptIndex}`,
+                          toolCallId: credentialAnchorToolCallId(
+                            receiptTurn,
+                            pause.anchorToolCallId,
+                          ),
+                          node: (
+                            <CredentialCard
+                              frame={EARLIER_PICK_CARD_FRAME}
+                              mode="terminal"
+                              reloadKey={credentialsReloadKey}
+                              resolvedOutcome={resolvedOutcome}
+                              onConnect={() => {}}
+                              onSkip={() => {}}
+                            />
+                          ),
+                        });
+                      });
+                  }
                   if (credentialCard && credentialCardMidTurn) {
                     anchored.push({
                       key: "credential",
@@ -11437,7 +11544,7 @@ export function WorkflowCopilotChat({
                       {message.narrative.googleConnectionNotices.map(
                         (notice) => (
                           <GoogleReconnectCard
-                            key={notice.connectionId ?? "unbound"}
+                            key={googleConnectionNoticeKey(notice)}
                             notice={notice}
                             selectedConnectionId={
                               adjacentMessage?.sender === "user"
@@ -12314,19 +12421,8 @@ export function WorkflowCopilotChat({
               className="hidden"
               onChange={(event) => {
                 const file = event.target.files?.[0];
-                if (!file) return;
                 event.target.value = "";
-                if (refuseMutationDuringYamlCommit() || uploadSOPDisabled)
-                  return;
-                if (!file.name.toLowerCase().endsWith(".pdf")) {
-                  toast({
-                    variant: "destructive",
-                    title: "Invalid file type",
-                    description: "Please select a PDF file",
-                  });
-                  return;
-                }
-                onUploadSOP?.(file);
+                if (file) stageSopFile(file, sopAttachmentDraft());
               }}
             />
             {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}
@@ -12334,22 +12430,8 @@ export function WorkflowCopilotChat({
               <button
                 type="button"
                 onClick={() => attachmentInputRef.current?.click()}
-                // An answer to a pending question is sent through the question flow, which carries
-                // no files, so offering the control here would stage a file nothing can send.
-                disabled={
-                  hasPendingQuestion || authoringInProgress || isDemonstrating
-                }
-                title={
-                  isDemonstrating
-                    ? demonstrationRecorder.phase === "recording"
-                      ? "Use Done before attaching a file"
-                      : "Use Build before attaching a file"
-                    : authoringInProgress
-                      ? "Finish the current authoring action before attaching a file"
-                      : hasPendingQuestion
-                        ? "Answer the pending question before attaching a file"
-                        : "Attach a file"
-                }
+                disabled={attachDisabledReason !== null}
+                title={attachDisabledReason ?? "Attach a file"}
                 aria-label="Attach a file"
                 className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
               >

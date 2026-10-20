@@ -2271,16 +2271,21 @@ def test_crash_listener_registers_once_for_pre_existing_and_later_pages() -> Non
     context = MagicMock(pages=[existing])
     state = RealBrowserState(pw=MagicMock(), browser_context=context)
 
-    assert existing.on.call_args_list == [call("crash", state._on_page_crashed)]
+    # Other page listeners (the main-frame navigation observer) register after the crash listener.
+    assert existing.on.call_args_list[0] == call("crash", state._on_page_crashed)
+    assert existing.on.call_args_list.count(call("crash", state._on_page_crashed)) == 1
     assert call("page", state._watch_page_for_crash) in context.on.call_args_list
+    registered_on_existing = existing.on.call_count
 
     later = _crashable_page()
     state._watch_page_for_crash(later)
+    registered_on_later = later.on.call_count
     state._watch_page_for_crash(later)
     state._register_disconnect_listeners(context)
 
-    assert existing.on.call_count == 1
-    assert later.on.call_count == 1
+    assert existing.on.call_count == registered_on_existing
+    assert later.on.call_count == registered_on_later
+    assert later.on.call_args_list.count(call("crash", state._on_page_crashed)) == 1
 
 
 def test_a_context_attached_from_outside_the_class_is_armed_for_crash_reaping() -> None:
@@ -2290,7 +2295,8 @@ def test_a_context_attached_from_outside_the_class_is_armed_for_crash_reaping() 
 
     state.browser_context = replacement
 
-    assert existing.on.call_args_list == [call("crash", state._on_page_crashed)]
+    assert existing.on.call_args_list[0] == call("crash", state._on_page_crashed)
+    assert existing.on.call_args_list.count(call("crash", state._on_page_crashed)) == 1
 
 
 @pytest.mark.asyncio

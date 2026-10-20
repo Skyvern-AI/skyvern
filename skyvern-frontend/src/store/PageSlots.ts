@@ -47,6 +47,19 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  workflowFindingsScope?: React.ComponentType<
+    Readonly<{
+      workflowPermanentIds: readonly string[];
+      children: React.ReactNode;
+    }>
+  >;
+  workflowFindingsTrigger?: React.ComponentType<
+    Readonly<{
+      workflowPermanentId: string;
+      title?: string;
+      surface: "list" | "editor";
+    }>
+  >;
   workflowCuratorSettings?: React.ComponentType<
     Readonly<{ workflowPermanentId: string; readOnly: boolean }>
   >;

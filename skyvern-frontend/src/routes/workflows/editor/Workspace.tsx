@@ -92,7 +92,6 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -260,9 +259,7 @@ import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
-import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
 import {
-  applySopResultAtCurrentAppend,
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
@@ -864,6 +861,11 @@ function Workspace({
       setIsCopilotOpen(true);
     }
   }, [initialCopilotAction]);
+  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Copilot.
+  const openCopilot = useCallback(() => {
+    if (!embedded) setIsCopilotOpen(true);
+    else openStudioPane("copilot", { state: location.state });
+  }, [embedded, openStudioPane, location.state]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
@@ -1793,24 +1795,12 @@ function Workspace({
   // Stable action ref (vs the whole-store `recordingStore` object, which gets a
   // new reference on every store write and would re-register the launcher).
   const setIsRecording = useRecordingStore((s) => s.setIsRecording);
-  const setRecordedBlocks = useRecordedBlocksStore((s) => s.setRecordedBlocks);
   const getAppendInsertionPoint = useCallback(() => {
     return resolveAppendInsertionPoint(
       getNodes() as Array<AppNode>,
       getEdges(),
     );
   }, [getEdges, getNodes]);
-  const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result, owner) => {
-      applySopResultAtCurrentAppend({
-        result,
-        getNodes: () => getNodes() as Array<AppNode>,
-        getEdges,
-        setRecordedBlocks: (blocks, insertionPoint) =>
-          setRecordedBlocks(blocks, insertionPoint, owner),
-      });
-    },
-  });
   const authoringActionAvailability =
     resolveWorkspaceAuthoringActionAvailability({
       browserReady: copilotLiveBrowserReady,
@@ -1824,7 +1814,6 @@ function Workspace({
         recordingStore.isRecording ||
         recordingStore.finishRequested ||
         recordingStore.isCommitting,
-      isUploadingSOP: sopToBlocksMutation.isPending,
     });
   // A deferred start runs after a save; the browser may have stopped being ready.
   const canRecordTaskRef = useRef(authoringActionAvailability.canRecordTask);
@@ -1907,15 +1896,6 @@ function Workspace({
     startDemonstration,
     getNodes,
   ]);
-  const uploadSOPAtEnd = useCallback(
-    (file: File) => {
-      if (!authoringActionAvailability.canUploadSOP) return;
-      void runWorkflowAuthoringAction(() =>
-        sopToBlocksMutation.mutateAsync(file),
-      );
-    },
-    [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
-  );
   // `/discover`'s "Demonstrate task" lands here with ?record=1; start once the browser is ready.
   useEffect(() => {
     if (
@@ -3599,9 +3579,7 @@ function Workspace({
           initialAttachments={routeInitialCopilotAttachments}
           initialAction={initialCopilotAction ?? undefined}
           onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
-          onUploadSOP={uploadSOPAtEnd}
-          canUploadSOP={authoringActionAvailability.canUploadSOP}
-          isUploadingSOP={sopToBlocksMutation.isPending}
+          onRequestOpen={openCopilot}
           onRecordTask={startRecordingAtEnd}
           canRecordTask={authoringActionAvailability.canRecordTask}
           authoringUnavailableReason={

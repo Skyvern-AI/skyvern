@@ -56,6 +56,13 @@ FLUTTER_STATE_JS = f"""(() => {{
 
 _STATE_FN_JS = f"() => {FLUTTER_STATE_JS}"
 
+# A text field of the app's accessibility tree. The engine starts editing it in the first frame after it is focused and
+# then writes the framework's own copy of the value over the input, so text put there earlier is lost.
+FLUTTER_TEXT_FIELD_JS = "(el) => !!el.closest('flt-semantics-host, [data-semantics-role=text-field]')"
+# Resolves in the second frame from now, so the frame that handles an earlier focus or write has already run.
+TWO_FRAMES_JS = "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done(true))))"
+FRAME_SETTLE_TIMEOUT_SECONDS = 5.0
+
 # One click per placeholder element: the engine listens for it from the moment it creates the placeholder, and a
 # framework that starts later still picks up the enabled state, so an ignored click is not one that came too early. A
 # rebuilt placeholder or a reload brings a new element to try, and the mobile engine deletes its placeholder after

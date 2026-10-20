@@ -353,6 +353,7 @@ class OnePasswordItemOverview(BaseModel):
     vault_id: str = Field(..., description="The ID of the vault containing the item")
     vault_name: str = Field(..., description="The name of the vault containing the item")
     category: str = Field(..., description="The 1Password item category")
+    importable: bool = Field(..., description="Whether this item can be imported as a credential")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
 
 

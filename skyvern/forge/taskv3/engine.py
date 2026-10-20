@@ -65,9 +65,9 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_RETAIN_CHARS_HIGH,
     ActionRoundSink,
     ActivityRecency,
-    CompletionBlocker,
     CompletionGate,
-    CompletionProbe,
+    DownloadSettle,
+    DownloadWait,
     LoopOutcome,
     SemanticCommitStats,
     SubmitWatch,
@@ -80,6 +80,7 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
+    DownloadFailureWatch,
     PageProvider,
     TotpPlaceholderResolver,
     apply_blank_page_guard,
@@ -155,13 +156,6 @@ Rules:
 OPAQUE_URL_GUIDANCE = """
 
 Some URLs in your instructions or the data provided are shown as `opaque_url_xxxxxxxx` instead of the real URL: these are references to URLs from the task, resolved to their real value backend-side. Pass one verbatim - unchanged, unshortened, never invented - as the `file` argument of `file_upload`, the `url` argument of `navigate`, the `value` argument of `select_combobox`, or as text to `type`."""
-DOWNLOAD_COMPLETION_GUIDANCE = """
-
-This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
-
-DOWNLOAD_REQUIRED_GUIDANCE = """
-
-This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish and say why, choosing the status by the finish tool's own rule."""
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, int]:
@@ -285,8 +279,8 @@ async def run_task_v3_agent_loop(
     action_effect_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
-    completion_probe: CompletionProbe | None = None,
-    completion_blocker: CompletionBlocker | None = None,
+    download_wait: DownloadWait | None = None,
+    download_settle: DownloadSettle | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
@@ -421,6 +415,7 @@ async def run_task_v3_agent_loop(
         )
     )
     unseen_text = None if page_free else UnseenPageText()
+    failure_watch = None if page_free or download_settle is None else DownloadFailureWatch(page_provider, refs)
     browser_tools = (
         []
         if page_free
@@ -435,6 +430,8 @@ async def run_task_v3_agent_loop(
             vision_enabled=vision_enabled,
             semantic_commit_stats=semantic_commit_stats,
             unseen_text=unseen_text,
+            download_failures=failure_watch,
+            download_wait=download_wait,
         )
     )
 
@@ -450,11 +447,9 @@ async def run_task_v3_agent_loop(
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
     submit_watch = SubmitWatch()
-    # A page-free run has no tool that could trigger a download, so a blocker would refuse every
-    # completed verdict forever; it has nothing to type a verification code into either.
+    # A page-free run has no tool that could trigger a download, nor anything to type a verification code into.
     if page_free:
-        completion_probe = None
-        completion_blocker = None
+        download_settle = None
         verification_blocker = None
     refuse_input_entry = block_type == BlockType.EXTRACTION
     refuse_navigation = block_type == BlockType.VALIDATION
@@ -462,7 +457,7 @@ async def run_task_v3_agent_loop(
     # A block with its own completion verifier is left to it by every completion judge; the terminate check is not one.
     judge_eligible = goal_check_eligible(
         page_free=page_free,
-        completion_blocker_present=completion_blocker is not None,
+        download_gated=download_settle is not None,
         extraction_requested=extraction_requested,
     )
     reask_on = unlisted_reask_criteria is not None and bool(unlisted_reask_criteria[0]) and judge_eligible
@@ -611,25 +606,20 @@ async def run_task_v3_agent_loop(
         should_cancel=should_cancel,
         deadline_at=deadline_at,
         activity=activity,
-        completion_blocker=completion_blocker,
+        download_settle=download_settle,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
         unlisted_reask=_unlisted_reask if reask_on else None,
         terminate_premise=_terminate_premise if premise_on else None,
         document_identity=None if page_free else document_identity,
         completion_gate=None if page_free else completion_gate,
+        download_facts=failure_watch.facts if failure_watch is not None else None,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
-    # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
-    # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
-    if completion_blocker is not None and completion_probe is not None:
-        extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
-    elif completion_blocker is not None and completion_probe is None:
-        extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
     system_prompt = base_system_prompt + extra_system_guidance
     system_prompt += datetime.now(ctx.tz_info if ctx and ctx.tz_info else UTC).strftime(
         "\n\nToday's date is %Y-%m-%d (%A), %Z."
@@ -705,7 +695,6 @@ async def run_task_v3_agent_loop(
             on_llm_call_exhausted=lambda error: llm_caller.emit_retry_chain_exhausted(error, prompt_name),
             activity=activity,
             submit_watch=None if page_free else submit_watch,
-            completion_probe=completion_probe,
             verification_blocker=verification_blocker,
             staged_downloads=staged_downloads,
             initial_navigation_status=initial_navigation_status,
@@ -732,6 +721,8 @@ async def run_task_v3_agent_loop(
             anthropic_cache_markers=anthropic_cache_markers,
         )
     finally:
+        if failure_watch is not None:
+            failure_watch.close()
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
         # on the next block's first action.
         _exit_ctx = skyvern_context.current()

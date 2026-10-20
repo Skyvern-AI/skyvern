@@ -9,6 +9,7 @@ import pytest
 
 from skyvern.cli.mcp_tools import mcp as skyvern_mcp
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent import _make_agent_result, _reshow_unselected_google_setup
 from skyvern.forge.sdk.copilot.browser_ablation import (
     REPAIR_PROBE_MODES,
     CopilotBrowserCodeMode,
@@ -25,12 +26,22 @@ from skyvern.forge.sdk.copilot.tools import (
     get_skyvern_mcp_alias_map,
     list_integrations_tool,
 )
-from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations, _read_google_sheet, _serialize
+from skyvern.forge.sdk.copilot.tools.integrations import (
+    _list_integrations,
+    _read_google_sheet,
+    _request_google_connection,
+    _serialize,
+)
+from skyvern.forge.sdk.copilot.turn_outcome import connected_account_choice_context
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 ORGANIZATION_ID = "o_test_org"
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 TOKEN_FIELD_NAMES = (
     "access_token",
@@ -490,3 +501,211 @@ def test_read_google_sheet_description_states_facts_without_steering() -> None:
         assert status in description
     for steering in ("ask the user", "reconnect", "instead of", "prefer", "do not", "must call", "browser ui"):
         assert steering not in description
+
+
+def _setup_rows() -> list[GoogleOAuthCredentialBase]:
+    return [
+        _google(id="goac_sheets_a", credential_name="Sheets A"),
+        _google(id="goac_sheets_b", credential_name="Sheets B"),
+        _google(id="goac_sheets_expired", credential_name="Sheets expired", state="error"),
+        _google(
+            id="goac_mail_expired",
+            credential_name="Mail expired",
+            state="error",
+            scopes_requested=[GMAIL_READ_SCOPE],
+            scopes_granted=[GMAIL_READ_SCOPE],
+        ),
+        _google(
+            id="goac_send_only",
+            credential_name="Send only",
+            scopes_requested=[GMAIL_SEND_SCOPE],
+            scopes_granted=[GMAIL_SEND_SCOPE],
+        ),
+        _google(
+            id="goac_mail_sheets_reauth_cancelled",
+            credential_name="Mail, Sheets reconnect cancelled",
+            scopes_requested=[SHEETS_SCOPE],
+            scopes_granted=[GMAIL_READ_SCOPE],
+        ),
+        _google(
+            id="goac_drive_sheets_reauth_cancelled",
+            credential_name="Drive, Sheets reconnect cancelled",
+            scopes_requested=[SHEETS_SCOPE],
+            scopes_granted=["https://www.googleapis.com/auth/drive"],
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_google_connection_offers_one_unbound_card_per_profile_without_touching_the_workflow(
+    patched_services,
+) -> None:
+    patched_services([], [])
+    ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID, workflow_yaml="title: untouched\n")
+
+    gmail = await _request_google_connection("gmail", None, ctx)
+    sheets = await _request_google_connection("google_sheets", None, ctx)
+    await _request_google_connection("gmail", None, ctx)
+
+    assert gmail == {
+        "ok": True,
+        "data": {"status": "offered", "scope_profile": "gmail", "card": "connect", "compatible_connections": []},
+    }
+    assert sheets["data"]["scope_profile"] == "google_sheets"
+    assert [(notice.scopeProfile, notice.origin, notice.condition) for notice in ctx.google_setup_notices] == [
+        ("google_sheets", "setup", "unbound"),
+        ("gmail", "setup", "unbound"),
+    ]
+    assert ctx.google_connection_notices == []
+    assert ctx.workflow_yaml == "title: untouched\n"
+    assert not ctx.update_workflow_called
+    payloads = ctx.google_connection_notice_payloads()
+    assert {(payload["scopeProfile"], payload["connectionId"]) for payload in payloads} == {
+        ("gmail", None),
+        ("google_sheets", None),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_profile", "connection_id", "card", "reconnect_id", "ignored_id", "choice_ids"),
+    [
+        ("google_sheets", None, "connect", None, None, ["goac_sheets_a", "goac_sheets_b"]),
+        ("google_sheets", "goac_sheets_expired", "reconnect", "goac_sheets_expired", None, None),
+        ("gmail", "goac_mail_expired", "reconnect", "goac_mail_expired", None, None),
+        ("gmail", "goac_sheets_expired", "connect", None, "goac_sheets_expired", ["goac_mail_sheets_reauth_cancelled"]),
+        ("google_sheets", "goac_mail_expired", "connect", None, "goac_mail_expired", None),
+        ("gmail", "goac_send_only", "connect", None, "goac_send_only", ["goac_mail_sheets_reauth_cancelled"]),
+        (
+            "google_sheets",
+            "goac_mail_sheets_reauth_cancelled",
+            "connect",
+            None,
+            "goac_mail_sheets_reauth_cancelled",
+            ["goac_sheets_a", "goac_sheets_b"],
+        ),
+        (
+            "google_sheets",
+            "goac_drive_sheets_reauth_cancelled",
+            "connect",
+            None,
+            "goac_drive_sheets_reauth_cancelled",
+            ["goac_sheets_a", "goac_sheets_b"],
+        ),
+        (
+            "gmail",
+            "goac_other_org_or_deleted",
+            "connect",
+            None,
+            "goac_other_org_or_deleted",
+            ["goac_mail_sheets_reauth_cancelled"],
+        ),
+        ("google_sheets", "goac_sheets_a", "connect", None, "goac_sheets_a", None),
+    ],
+)
+async def test_request_google_connection_reconnects_only_a_same_profile_row(
+    patched_services,
+    scope_profile: str,
+    connection_id: str | None,
+    card: str,
+    reconnect_id: str | None,
+    ignored_id: str | None,
+    choice_ids: list[str] | None,
+) -> None:
+    patched_services(_setup_rows(), [])
+    ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+
+    result = await _request_google_connection(scope_profile, connection_id, ctx)
+
+    data = result["data"]
+    (notice,) = ctx.google_setup_notices
+    assert data["card"] == card
+    assert data.get("reconnect_connection_id") == reconnect_id
+    assert data.get("ignored_connection_id") == ignored_id
+    assert notice.connectionId == reconnect_id
+    assert notice.scopeProfile == scope_profile
+    expected_ready = {
+        "gmail": ["goac_mail_sheets_reauth_cancelled"],
+        "google_sheets": ["goac_sheets_a", "goac_sheets_b"],
+    }[scope_profile]
+    assert [row["connection_id"] for row in data["compatible_connections"]] == expected_ready
+    if choice_ids is not None:
+        assert [choice.connection_id for choice in notice.choices] == choice_ids
+    serialized = json.dumps(result)
+    for name in TOKEN_FIELD_NAMES:
+        assert f'"{name}"' not in serialized
+
+
+@pytest.mark.parametrize("supports_google_setup_card", [False, True])
+def test_request_google_connection_is_offered_only_to_a_client_that_renders_the_card(
+    supports_google_setup_card: bool,
+) -> None:
+    names = {
+        tool.name
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=False,
+            run_tools_available=True,
+            supports_google_setup_card=supports_google_setup_card,
+        )
+    }
+
+    assert ("request_google_connection" in names) is supports_google_setup_card
+
+
+def _persisted_offer_turn(ctx: CopilotContext) -> TurnOutcome:
+    result = _make_agent_result(
+        ctx,
+        user_response="ok",
+        updated_workflow=None,
+        global_llm_context=None,
+        narrative_payload={"turnId": "turn-1", "terminal": "response"},
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.ANSWER),
+    )
+    assert result.turn_outcome is not None
+    return TurnOutcome.model_validate_json(result.turn_outcome.model_dump_json())
+
+
+@pytest.mark.asyncio
+async def test_picking_one_setup_card_offers_its_unpicked_sibling_again_on_the_selection_turn(
+    patched_services,
+) -> None:
+    gmail_row = _google(
+        id="goac_mail", credential_name="Mail", scopes_requested=[GMAIL_READ_SCOPE], scopes_granted=[GMAIL_READ_SCOPE]
+    )
+    patched_services([gmail_row, _google(id="goac_sheets")], [])
+    offer_ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+    await _request_google_connection("gmail", None, offer_ctx)
+    await _request_google_connection("google_sheets", None, offer_ctx)
+    offer_turn = _persisted_offer_turn(offer_ctx)
+
+    selection_ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+    gmail_pick = RequestPolicy(
+        picked_connected_account_id="goac_mail", picked_connected_account_scopes=[GMAIL_READ_SCOPE]
+    )
+    reshown = await _reshow_unselected_google_setup(selection_ctx, offer_turn, gmail_pick)
+    facts = json.loads(
+        connected_account_choice_context(
+            offer_turn,
+            explicit_selected_connection_id="goac_mail",
+            explicit_selected_connection_scopes=[GMAIL_READ_SCOPE],
+            reshown_setup_profiles=reshown,
+        )
+    )
+
+    assert [
+        (notice.scopeProfile, notice.condition, [choice.connection_id for choice in notice.choices])
+        for notice in selection_ctx.google_setup_notices
+    ] == [("google_sheets", "unbound", ["goac_sheets"])]
+    assert facts["unselected_setup_cards_shown_again"] == ["google_sheets"]
+
+    free_text_ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+    assert await _reshow_unselected_google_setup(free_text_ctx, offer_turn, RequestPolicy()) == []
+    assert free_text_ctx.google_setup_notices == []
+
+    sheets_pick = RequestPolicy(
+        picked_connected_account_id="goac_sheets", picked_connected_account_scopes=[SHEETS_SCOPE]
+    )
+    done_ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
+    assert await _reshow_unselected_google_setup(done_ctx, _persisted_offer_turn(selection_ctx), sheets_pick) == []
+    assert done_ctx.google_setup_notices == []

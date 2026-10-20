@@ -614,17 +614,17 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(ta.closest("[class*='focus-within']")).not.toBeNull();
   });
 
-  it("starts SOP upload and task demonstration from the empty state", async () => {
-    const onUploadSOP = vi.fn();
+  it("stages an SOP as an editable draft with its PDF attached and starts task demonstration from the empty state", async () => {
+    cancelPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/upload_file" ? { data: { file_id: "file_sop" } } : {},
+      ),
+    );
     const onRecordTask = vi.fn();
 
     render(
       <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          onRecordTask={onRecordTask}
-          canRecordTask
-        />
+        <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
       </FeatureFlagContext.Provider>,
     );
 
@@ -640,80 +640,43 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(actionLayout?.className).toContain(
       "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
     );
-    const file = new File(["procedure"], "procedure.pdf", {
-      type: "application/pdf",
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+        target: {
+          files: [
+            new File(["procedure"], "procedure.pdf", {
+              type: "application/pdf",
+            }),
+          ],
+        },
+      });
     });
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-      target: { files: [file] },
-    });
-    expect(onUploadSOP).toHaveBeenCalledWith(file);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove procedure.pdf" }),
+      ).toBeTruthy(),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/upload_file",
+      expect.any(FormData),
+      expect.anything(),
+    );
+    expect(textarea().value).toBe(
+      "Add the steps from the attached SOP to this agent.",
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
-  it("does not allow SOP upload and task demonstration at the same time", async () => {
-    const onUploadSOP = vi.fn();
-    const onRecordTask = vi.fn();
-    const { rerender } = render(
-      <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          canUploadSOP
-          onRecordTask={onRecordTask}
-          canRecordTask
-          isUploadingSOP
-        />
-      </FeatureFlagContext.Provider>,
-    );
-
-    await waitFor(() =>
-      expect(screen.getByText("Uploading SOP…")).toBeTruthy(),
-    );
-    const recordTaskButton = screen.getByRole("button", {
-      name: "Demonstrate task",
-    });
-    expect(recordTaskButton.hasAttribute("disabled")).toBe(true);
-    expect(recordTaskButton.parentElement?.getAttribute("tabindex")).toBe("0");
-    expect((textarea() as HTMLTextAreaElement).disabled).toBe(true);
-    expect(
-      (
-        screen.getByRole("button", {
-          name: "Send disabled — finish the current authoring action",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          canUploadSOP={false}
-          onRecordTask={onRecordTask}
-          canRecordTask
-        />
-      </FeatureFlagContext.Provider>,
-    );
-
-    const uploadSOPButton = screen.getByRole("button", {
-      name: "Upload an SOP",
-    });
-    expect(uploadSOPButton.hasAttribute("disabled")).toBe(true);
-    expect(uploadSOPButton.parentElement?.getAttribute("tabindex")).toBe("0");
-  });
-
   it.each(["yaml", "copilot"])(
-    "refuses authoring launches when a %s transaction starts after the file picker opens",
+    "stages an SOP but refuses Record when a %s transaction starts after the file picker opens",
     async (owner) => {
-      const onUploadSOP = vi.fn();
       const onRecordTask = vi.fn();
       render(
         <FeatureFlagContext.Provider value={() => false}>
-          <WorkflowCopilotChat
-            onUploadSOP={onUploadSOP}
-            onRecordTask={onRecordTask}
-            canRecordTask
-          />
+          <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
         </FeatureFlagContext.Provider>,
       );
       await waitFor(() =>
@@ -726,17 +689,23 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
           copilotAcceptance: owner === "copilot" ? Symbol("turn") : null,
         });
       });
-      fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-        target: {
-          files: [
-            new File(["procedure"], "procedure.pdf", {
-              type: "application/pdf",
-            }),
-          ],
-        },
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+          target: {
+            files: [
+              new File(["procedure"], "procedure.pdf", {
+                type: "application/pdf",
+              }),
+            ],
+          },
+        });
       });
       fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
-      expect(onUploadSOP).not.toHaveBeenCalled();
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/upload_file",
+        expect.any(FormData),
+        expect.anything(),
+      );
       expect(onRecordTask).not.toHaveBeenCalled();
     },
   );
@@ -888,6 +857,13 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(screen.getByTestId("recording-inline")).toBeTruthy();
     // A finishing recording refuses sends, so the composer must not offer one.
     expect(textarea().disabled).toBe(true);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Send disabled — finish the current authoring action",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     expect(
       screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
     ).toBe(mountId);

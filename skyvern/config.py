@@ -468,6 +468,10 @@ class Settings(BaseSettings):
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
+    # A cold `bw login` downloads and decrypts the whole vault, so it is categorically slower than the
+    # reads behind it and needs its own budget. Runs arriving as a batch each start on their own pod and
+    # pay that login concurrently, which pushes it well past a budget sized for a read.
+    BITWARDEN_LOGIN_TIMEOUT_SECONDS: int = 180
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
     # A logged-in CLI session is kept per vault identity and reused across runs, so a batch of
@@ -587,8 +591,8 @@ class Settings(BaseSettings):
     # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default), as does having no flag
     # provider; DISABLE_TASK_V3 still wins over it. A naive value is read as UTC. Per-call platform
     # workflows are excluded twice over -- by an auto_generated executing version, which covers the
-    # login, download_files, credential test-login and SDK endpoints, and by a per-call trigger kind,
-    # which covers the job recipe endpoints because those build a published definition. Enrolled runs
+    # login, download_files, credential test-login, SDK and job recipe endpoints, and by a per-call trigger
+    # kind, which also covers older job recipe workflows created as published. Enrolled runs
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
     # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
@@ -989,6 +993,10 @@ class Settings(BaseSettings):
     """Interval in minutes for the cleanup cron job."""
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+    HOSTED_MCP_DRIVER_IDLE_SECONDS: float = 600.0
+    """Stop a hosted MCP API key's shared Playwright driver after no tool call has used it this long; <=0 disables."""
+    HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS: float = 300.0
+    """How often the API checks hosted MCP drivers for idleness; <=0 disables the sweep."""
 
     TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
     """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on

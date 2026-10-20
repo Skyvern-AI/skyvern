@@ -13,7 +13,7 @@ type WorkflowAddMenuProps = {
   radius?: string;
   rotateText?: boolean;
   startAt?: number;
-  isUploadingSOP?: boolean;
+  canUploadSOP?: boolean;
   canRecordTask?: boolean;
   //   --
   onAdd: () => void;
@@ -29,7 +29,7 @@ function WorkflowAddMenu({
   radius = "80px",
   rotateText = true,
   startAt = 90,
-  isUploadingSOP = false,
+  canUploadSOP = true,
   canRecordTask = true,
   //   --
   onAdd,
@@ -71,12 +71,11 @@ function WorkflowAddMenu({
       });
     }
 
-    // Always show Upload SOP option
     menuItems.push({
       id: "3",
       icon: <UploadIcon className={buttonSize ? "h-3 w-3" : undefined} />,
       text: "Upload SOP",
-      enabled: !isUploadingSOP,
+      enabled: canUploadSOP,
       onClick: () => {
         onUploadSOP();
       },
@@ -92,7 +91,7 @@ function WorkflowAddMenu({
     recordingStore.isRecording,
     settingsStore.isUsingABrowser,
     settingsStore.isLoadingABrowser,
-    isUploadingSOP,
+    canUploadSOP,
   ]);
 
   // The studio editor (/studio, blockRunsEnabled) surfaces these actions too;

@@ -1006,6 +1006,7 @@ class RealBrowserManager(BrowserManager):
                 # An application-level retry across engines: the eventual success is not a first-try one.
                 note_fallback_target(FALLBACK_TARGET_CLASSICAL_ENGINE)
                 self._repin_engine_selection(run_key, boot_fallback)
+                app.AGENT_FUNCTION.note_browser_relaunch(None, "engine_fallback")
                 return await _start(boot_fallback)
             if boot_fallback is not None:
                 # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run

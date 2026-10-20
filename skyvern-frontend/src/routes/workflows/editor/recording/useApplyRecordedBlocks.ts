@@ -78,7 +78,7 @@ function useApplyRecordedBlocks({
       return;
     }
 
-    // A remounted workflow has new canvas IDs. Its upload can still append,
+    // A remounted workflow has new canvas IDs. Recorded blocks can still append,
     // but must not create edges pointing to the disposed canvas.
     const insertionPoint =
       (!recordedInsertionPoint.previous && !recordedInsertionPoint.next) ||

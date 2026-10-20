@@ -85,8 +85,11 @@ def test_backfill_tolerates_turn_outcome_none() -> None:
     assert "responseKind" not in result.narrative_payload
 
 
-def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
+def test_backfill_adds_setup_and_binding_google_connection_notices_to_terminal_payload() -> None:
     ctx = _ctx()
+    ctx.google_setup_notices = [
+        GoogleConnectionNotice(connectionId=None, condition="unbound", scopeProfile="gmail", origin="setup")
+    ]
     ctx.google_connection_notices = [
         GoogleConnectionNotice(
             connectionId="goac_needs_reconnect",
@@ -101,10 +104,21 @@ def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
     assert result.narrative_payload["googleConnectionNotices"] == [
         {
             "provider": "google",
+            "connectionId": None,
+            "displayName": None,
+            "condition": "unbound",
+            "scopeProfile": "gmail",
+            "origin": "setup",
+            "choices": [],
+        },
+        {
+            "provider": "google",
             "connectionId": "goac_needs_reconnect",
             "displayName": "Sheets account",
             "condition": "unusable",
-        }
+            "scopeProfile": "google_sheets",
+            "origin": "workflow",
+        },
     ]
 
 

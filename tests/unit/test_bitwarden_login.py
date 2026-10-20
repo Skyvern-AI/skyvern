@@ -674,8 +674,58 @@ def test_retry_backoff_is_full_jitter_with_doubling_cap(monkeypatch: pytest.Monk
 
     delays = [bitwarden_module._retry_backoff_seconds(attempt) for attempt in range(5)]
 
-    assert seen == [(0, 5.0), (0, 10.0), (0, 20.0), (0, 40.0), (0, 60.0)]
-    assert delays == [5.0, 10.0, 20.0, 40.0, 60.0]
+    assert seen == [(0, 20.0), (0, 40.0), (0, 60.0), (0, 60.0), (0, 60.0)]
+    assert delays == [20.0, 40.0, 60.0, 60.0, 60.0]
+
+
+@pytest.mark.asyncio
+async def test_cold_login_gets_its_own_budget_beyond_the_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cold `bw login` downloads the whole vault, so it outlives the budget sized for the reads
+    behind it. Under a batch it regularly needs more than that, and killing it there fails the run
+    before it starts (SKY-18666)."""
+    read_timeout = 0.2
+    login_seconds = 0.6
+    monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_LOGIN_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0.0)
+    await bitwarden_module._cli_sessions.clear()
+
+    budgets: dict[str, float] = {}
+
+    async def fake_run_command(
+        command: list[str], additional_env: dict | None = None, timeout: float = 60
+    ) -> RunCommandResult:
+        step = command[1]
+        budgets[step] = timeout
+        if step == "login":
+            await asyncio.sleep(login_seconds)
+            if timeout < login_seconds:
+                raise asyncio.TimeoutError
+            return RunCommandResult(stdout="You are logged in!", stderr="", returncode=0)
+        if step == "unlock":
+            return RunCommandResult(
+                stdout='Your vault is now unlocked!\nBW_SESSION="session-key"', stderr="", returncode=0
+            )
+        return RunCommandResult(stdout=json.dumps(_cli_item()), stderr="", returncode=0)
+
+    monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
+
+    try:
+        credential = await BitwardenService.get_secret_value_from_url(
+            client_id="client-id",
+            client_secret="client-secret",
+            master_password="master-password",
+            bw_organization_id="org-id",
+            bw_collection_ids=None,
+            item_id="11111111-1111-1111-1111-111111111111",
+            timeout=read_timeout,
+        )
+    finally:
+        await bitwarden_module._cli_sessions.clear()
+
+    assert credential["BW_PASSWORD"] == "example-password"
+    # The login outlives the read budget; the reads keep theirs so a hung read still fails fast.
+    assert budgets["login"] == 5.0
+    assert budgets["get"] == read_timeout
 
 
 @pytest.mark.asyncio

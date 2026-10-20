@@ -19,7 +19,6 @@ import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
 
@@ -32,7 +31,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
-from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
+from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
@@ -48,6 +47,8 @@ from skyvern.forge.taskv3.loop import (
     CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
     COMPLETION_GATE_REFUSAL,
+    DOWNLOAD_FAILURE_MAX_LINES,
+    DOWNLOAD_NO_FILE_FACT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -76,6 +77,7 @@ from skyvern.forge.taskv3.loop import (
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     ActivityRecency,
+    DownloadFailureFacts,
     LoopOutcome,
     RoundAction,
     SemanticCommitStats,
@@ -106,7 +108,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
-from tests.unit.helpers import make_organization, make_task
 
 
 class _ScriptedCaller:
@@ -8541,202 +8542,103 @@ def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> No
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
-    # A billable action's own result can carry the download-completion signal; the probe ends the
-    # run right there, no finish tool call needed, and the rest of the batch never dispatches.
-    clicks: list[tuple[str, dict[str, Any]]] = []
+@pytest.mark.parametrize("settle_outcome", ["no_file", "landed", "raises_once", "canceled"])
+async def test_download_settle_accepts_a_completed_finish_it_could_record(settle_outcome: str) -> None:
+    canceled = False
+    raised = False
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal canceled, raised
+        if settle_outcome == "raises_once" and not raised:
+            raised = True
+            raise RuntimeError("storage unavailable")
+        canceled = settle_outcome == "canceled"
+        return "Downloaded report.csv" if settle_outcome == "landed" else None
 
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
-    recorded_rounds: list[list[RoundAction]] = []
+    async def should_cancel() -> bool:
+        return canceled
 
-    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
-        recorded_rounds.append(round_actions)
-
-    outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert len(clicks) == 1  # the second batched click never ran
-    assert outcome.tool_calls == 1
-    # The click that produced the download must be billed and persisted, not lost because the
-    # probe fired before the recording step that appends it.
-    assert outcome.billable_actions == ["click"]
-    assert recorded_rounds == [[RoundAction("click", {"selector": "#a"}, True, billable=True)]]
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_is_refused_while_verification_never_delivered() -> None:
-    # The probe is a second path to `completed` that never reaches the finish tool, so it needs the
-    # same verification gate: a file landing after the code source gave up must not read as success.
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), totp_verification_url="https://example.com/otp")
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    gave_up = VerificationState(task=task)
-    gave_up.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
-    outcome, caller = await _run(
-        [
-            [("click", {"selector": "#a"})],
-            [("finish", {"status": "failed", "reason": "the verification step never completed"})],
-        ],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=gave_up.block_finish,
-    )
-    assert outcome.status == "failed", outcome.reason
-    # The refusal has to REACH the model. DOWNLOAD_COMPLETION_GUIDANCE tells it the run ends on its
-    # own and not to call finish(completed), so a silent refusal would leave it acting until a stall
-    # guard terminated the run instead of finishing failed with the verification reason.
-    assert _COMPLETION_BLOCKED in json.dumps(caller.message_history, default=str)
-
-    # Control: the identical landed download still completes when the source never failed, so the
-    # refusal above is the gate firing and not the probe being disabled.
-    healthy = VerificationState(task=task)
-    ok_outcome, _ = await _run(
-        [[("click", {"selector": "#a"})]],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=healthy.block_finish,
-    )
-    assert ok_outcome.status == "completed"
-    assert ok_outcome.reason == "a file finished downloading"
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_ignores_staged_download_unless_download_notice_too() -> None:
-    # file_upload stages an http(s) source file into the same downloads dir and marks it via
-    # staged_download; that must not read as the run's own landed download.
-    probe_calls = 0
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return "a file finished downloading"
-
-    async def staged_only_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf"})
-
-    staged_only_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_only_handler,
-        billable=True,
-    )
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/collect returned HTTP 404", repeat=True)
+    finish = ("finish", {"status": "completed", "reason": "the account shows 0 records"})
     outcome, _ = await _run(
-        [[("file_upload", {})], [("finish", {"status": "completed", "reason": "done"})]],
-        [staged_only_tool, make_finish_tool()],
-        completion_probe=probe,
+        [[finish], [finish]],
+        [make_finish_tool(download_settle=settle, should_cancel=should_cancel, download_facts=facts)],
+        should_cancel=should_cancel,
     )
-    assert outcome.status == "completed"
-    assert outcome.reason == "done"  # not the probe's reason -- it was never consulted
-    assert probe_calls == 0
 
-    async def staged_and_landed_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf", "download_notice": True})
-
-    staged_and_landed_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_and_landed_handler,
-        billable=True,
-    )
-    outcome2, _ = await _run(
-        [[("file_upload", {})]],
-        [staged_and_landed_tool, make_finish_tool()],
-        completion_probe=probe,
-    )
-    assert outcome2.status == "completed"
-    assert outcome2.reason == "a file finished downloading"
-    assert probe_calls == 1
+    if settle_outcome == "canceled":
+        assert outcome.status == "canceled"
+        return
+    assert (outcome.status, outcome.reason) == ("completed", "the account shows 0 records")
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    # A settle that raised could not record the block's files, so that finish is refused and the retry ends it.
+    assert len(finishes) == (2 if settle_outcome == "raises_once" else 1), finishes
+    assert "POST /api/collect returned HTTP 404" in finishes[-1]
+    assert (DOWNLOAD_NO_FILE_FACT in finishes[-1]) is (settle_outcome != "landed"), finishes
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_gated_on_billable_or_download_notice() -> None:
-    probe_calls = 0
+async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/export returned HTTP 503", repeat=True)
+    holds = iter(["the verification code never arrived"])
+    landed = ["guide.txt"]
+    recorded: list[list[str]] = []
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return None
+    async def verification_blocker(_status: str) -> str | None:
+        return next(holds, None)
 
-    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("observed")
+    async def settle(_staged: frozenset[str]) -> str | None:
+        recorded.append(list(landed))
+        return f"download completed ({len(landed)} new file(s))"
 
-    observe_tool = ToolSpec(
-        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe_handler
+    async def click(_args: dict[str, Any]) -> ToolResult:
+        landed.append("invoice.txt")
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
+    )
+    finish = ("finish", {"status": "completed", "reason": "done"})
+    outcome, _ = await _run(
+        [[finish], [("click", {})], [finish]],
+        [
+            click_tool,
+            make_finish_tool(verification_blocker=verification_blocker, download_facts=facts, download_settle=settle),
+        ],
     )
 
-    async def check_download_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("download seen", data={"download_notice": True})
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(finishes) == 2
+    assert "HTTP 503" not in finishes[0] and "HTTP 503" in finishes[1]
+    # The settle finalizes the block's files, so it runs once, for the finish that ends the block.
+    assert recorded == [["guide.txt", "invoice.txt"]]
 
-    download_tool = ToolSpec(
-        name="check_download",
-        description="check_download",
-        parameters={"type": "object", "properties": {}},
-        handler=check_download_handler,
+
+@pytest.mark.asyncio
+async def test_finish_shows_at_most_the_capped_download_failures() -> None:
+    facts = DownloadFailureFacts()
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        # The last failure past the cap repeats; it is still one failure.
+        for i in [*range(DOWNLOAD_FAILURE_MAX_LINES + 2), DOWNLOAD_FAILURE_MAX_LINES + 1]:
+            facts.add(f"Request failed: GET /api/{args['batch']}{i} returned HTTP 503", repeat=True)
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
     )
-
     script = [
-        [("observe", {})],  # non-billable, no download_notice -> probe not consulted
-        [("check_download", {})],  # non-billable but download_notice -> probe consulted
+        [("click", {"batch": "a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, [observe_tool, download_tool, make_finish_tool()], completion_probe=probe)
+    outcome, _ = await _run(script, [click_tool, make_finish_tool(download_facts=facts)])
 
-    assert outcome.status == "completed"
-    assert probe_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_exception_is_logged_and_treated_as_none() -> None:
-    async def probe(_staged: frozenset[str]) -> str | None:
-        raise RuntimeError("boom")
-
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"})], [("finish", {"status": "completed", "reason": "done normally"})]]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "done normally"
-    assert any(log["log_level"] == "warning" for log in logs)
-
-
-@pytest.mark.asyncio
-async def test_completion_blocker_gates_completed_status_only() -> None:
-    # completed: blocked once, then allowed once the blocker clears.
-    responses = iter(["wait: the download has not started yet", None])
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return next(responses)
-
-    tools = [make_finish_tool(completion_blocker=blocker)]
-    script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "completed", "reason": "second attempt"})],
-    ]
-    outcome, caller = await _run(script, tools)
-    assert outcome.status == "completed"
-    assert outcome.reason == "second attempt"
-    assert caller.calls == 2  # the first finish was rejected, forcing a second turn
-
-    # failed: the blocker is never consulted, even though it would block if asked.
-    async def always_blocks(_staged: frozenset[str]) -> str | None:
-        return "should never be read"
-
-    tools2 = [make_finish_tool(completion_blocker=always_blocks)]
-    outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
-    assert outcome2.status == "failed"
-    assert outcome2.reason == "blocked reason"
+    assert (outcome.status, outcome.reason) == ("completed", "done")
+    [finished] = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert finished.count("Request failed:") == DOWNLOAD_FAILURE_MAX_LINES and "+2 more failures" in finished
+    assert not facts.undelivered
 
 
 def _gate_refusals(outcome: LoopOutcome) -> int:
@@ -8881,78 +8783,27 @@ async def test_completion_gate_never_holds_a_non_completed_finish(status: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "finish_kwargs, held_with",
-    [
-        (
-            {"completion_blocker": lambda _downloads: _async_value("the download has not landed")},
-            "the download has not landed",
-        ),
-        (
-            {"page_fingerprint": lambda: _async_value(str(time.monotonic_ns())), "settle_wait_seconds": 0},
-            "still rendering",
-        ),
-    ],
-    ids=["completion_blocker", "unsettled_page"],
-)
-async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent(
-    finish_kwargs: dict[str, Any], held_with: str
-) -> None:
+async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent() -> None:
     gate = _CountingGate()
-    outcome, _ = await _run(
-        [[("finish", {"status": "completed", "reason": "done"})]],
-        [make_finish_tool(completion_gate=gate, **finish_kwargs)],
+    finish = make_finish_tool(
+        completion_gate=gate, page_fingerprint=lambda: _async_value(str(time.monotonic_ns())), settle_wait_seconds=0
     )
+    outcome, _ = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
 
     first_finish_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
-    assert held_with in first_finish_result
+    assert "still rendering" in first_finish_result
     assert gate.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_completion_blocker_exception_fails_closed() -> None:
-    # A transient storage error checking for a landed download is evidence of nothing -- it must
-    # not let a download-gated task complete with no file. finish(failed) is unaffected.
-    calls = 0
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("boom")
-
-    tools = [make_finish_tool(completion_blocker=blocker)]
-    script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "failed", "reason": "give up"})],
-    ]
-    with capture_logs() as logs:
-        outcome, caller = await _run(script, tools)
-
-    assert outcome.status == "failed"
-    assert outcome.reason == "give up"
-    assert caller.calls == 2  # the completed attempt was rejected, forcing a second turn
-    assert calls == 1  # a failed verdict never consults the blocker
-    assert any(log["log_level"] == "warning" for log in logs)
-    rejected_tool_messages = [
-        m for m in outcome.messages if m.get("role") == "tool" and "Could not verify" in m.get("content", "")
-    ]
-    assert len(rejected_tool_messages) == 1
-
-
-@pytest.mark.asyncio
 async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
-    # file_upload's staged http(s) source fetch must not be treated as a landed download by any
-    # LATER probe/blocker call this run -- not just skipped for the tool call that staged it.
+    # file_upload's staged http(s) source fetch must not be treated as a landed download by a
+    # LATER settle this run -- not just skipped for the tool call that staged it.
     staged_downloads: set[str] = set()
-    probe_seen: list[frozenset[str]] = []
-    blocker_seen: list[frozenset[str]] = []
+    settle_seen: list[frozenset[str]] = []
 
-    async def probe(staged: frozenset[str]) -> str | None:
-        probe_seen.append(staged)
-        return None
-
-    async def blocker(staged: frozenset[str]) -> str | None:
-        blocker_seen.append(staged)
+    async def settle(staged: frozenset[str]) -> str | None:
+        settle_seen.append(staged)
         return None
 
     async def stage_handler(_args: dict[str, Any]) -> ToolResult:
@@ -8969,20 +8820,17 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
     tools = [
         stage_tool,
         _billable_tool("click", click_calls),
-        make_finish_tool(completion_blocker=blocker, staged_downloads=staged_downloads),
+        make_finish_tool(download_settle=settle, staged_downloads=staged_downloads),
     ]
     script = [
         [("file_upload", {})],
         [("click", {"selector": "#a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, tools, completion_probe=probe, staged_downloads=staged_downloads)
+    outcome, _ = await _run(script, tools, staged_downloads=staged_downloads)
 
     assert outcome.status == "completed"
-    # The staging call itself never consults the probe (no download_notice); the next billable
-    # call's probe already carries the name it staged.
-    assert probe_seen == [frozenset({"in.pdf"})]
-    assert blocker_seen == [frozenset({"in.pdf"})]
+    assert settle_seen == [frozenset({"in.pdf"})]
 
 
 # --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
@@ -10833,45 +10681,6 @@ async def test_canonical_loop_not_masked_by_replayed_download_notice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canonical_loop_suppressed_when_completion_probe_fires_on_the_rung_touch() -> None:
-    # complete_on_download: the file can land while the probe waits, AFTER the tool result returned
-    # without download_new. The probe's outcome skips the end-of-batch detector, but the pending
-    # rung minted by that same touch must not be emitted — the run completed on real progress.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    calls = {"n": 0}
-
-    async def handler(args: dict[str, Any]) -> ToolResult:
-        calls["n"] += 1
-        return ToolResult.error("click refused") if calls["n"] < 3 else ToolResult.ok("clicked")
-
-    click = ToolSpec(
-        name="click",
-        description="click",
-        parameters={"type": "object", "properties": {}},
-        handler=handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if calls["n"] >= 3 else None
-
-    script = [
-        [("click", {"selector": "#dl", "note": "a"})],
-        [("click", {"selector": "#dl", "note": "b"})],
-        [("click", {"selector": "#dl", "note": "c"})],
-        [("finish", {"status": "failed", "reason": "unreached"})],
-    ]
-    with capture_logs() as logs:
-        outcome, _ = await _run(
-            script, [click, make_finish_tool()], completion_probe=probe, max_turns=50, max_tool_calls=100
-        )
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
 async def test_canonical_loop_not_masked_by_missing_probe_samples() -> None:
     # A missing probe sample around a failed dispatch is not evidence of a page change: intermittent
     # probe timeouts must not keep clearing the ring and permanently mask a genuine loop.
@@ -11072,41 +10881,6 @@ async def test_canonical_loop_clears_on_new_low_even_under_a_replayed_notice() -
     assert outcome.status == "failed"
     assert len(touches) == 4
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_spares_a_sibling_targets_rung() -> None:
-    # Blocker 2 (AronPerez round 10): the probe firing is progress for the COMPLETING touch only.
-    # A five-error streak on one selector minted a genuine rung 6 the same batch a download on a
-    # DIFFERENT selector completed the run — that sibling rung is real data and must survive.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    touches: list[tuple[str, dict[str, Any]]] = []
-    fetched = {"done": False}
-
-    async def fetch_handler(_args: dict[str, Any]) -> ToolResult:
-        fetched["done"] = True
-        return ToolResult.ok("fetch dispatched")
-
-    fetch = ToolSpec(
-        name="fetch",
-        description="fetch",
-        parameters={"type": "object", "properties": {}},
-        handler=fetch_handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if fetched["done"] else None
-
-    script = [[("click", {"selector": "#stuck", "note": str(i)})] for i in range(5)]
-    script.append([("click", {"selector": "#stuck", "note": "sixth"}), ("fetch", {"selector": "#other"})])
-    tools = [_error_billable_tool("click", touches), fetch, make_finish_tool()]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe, max_turns=50, max_tool_calls=100)
-    assert outcome.status == "completed"
-    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
-    assert [e["repeat_count"] for e in fires] == [3, 4, 6]
 
 
 @pytest.mark.asyncio
@@ -11336,7 +11110,6 @@ async def test_a_renumbered_mark_does_not_alias_with_its_pre_renumber_history() 
 def _awaiting_verification_state(*, spent: float = 120.0, budget: float = 900.0) -> Any:
     """A VerificationState in the exact shape the bug produces: a healthy source that answered "not
     yet" one 120s slice ago, with most of the 900s budget still unspent."""
-    from skyvern.forge.taskv3.auth_tools import VerificationState
 
     state = VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
@@ -11484,7 +11257,6 @@ async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_w
     # terminally-failed source returns None from `block_giveup` by construction: giving up IS the
     # correct answer once the source has been judged. Asserted against the real VerificationState,
     # not a mock that cannot disagree with the gate it is standing in for.
-    from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 
     state = VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
@@ -12790,6 +12562,26 @@ async def test_loop_reads_that_differ_only_in_their_delta_get_the_marker_and_kee
     assert reads[0].startswith("[superseded get_html(selector=#a)")
 
 
+@pytest.mark.asyncio
+async def test_a_re_read_that_differs_only_by_a_download_failure_gets_the_marker_and_keeps_the_failure() -> None:
+    body = "<form #a>" + "y" * 2_000
+    failure = "Request failed: POST /api/export returned HTTP 503"
+    results = [ToolResult.ok(body), ToolResult.ok(f"{body}\n{failure}", data={"download_failure_at": len(body)})]
+
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        return results.pop(0)
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script = [[("get_html", {"selector": "#a"})], [("get_html", {"selector": "#a"})]]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [reader, make_finish_tool()])
+
+    reread = _tool_contents(outcome, "get_html")[1]
+    assert reread.startswith("[get_html(selector=#a) returned the same "), reread[:120]
+    assert reread.endswith(f"\n{failure}")
+
+
 def test_perception_store_does_not_charge_the_unread_round() -> None:
     # SKY-16330. The prompt asks the model to batch, so one turn routinely lands several large reads.
     # Charging that unread round against the budget would let one batch evict every earlier read — and
@@ -13963,17 +13755,17 @@ async def test_a_mutation_batched_behind_an_accepted_verdict_never_dispatches() 
 
 @pytest.mark.asyncio
 async def test_hold_gate_snapshot_records_the_verdict_after_a_refused_completion() -> None:
-    # A zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
+    # A zero-action finish(completed) refused by a gate above -- here the verification blocker -- is
     # followed by finish(failed); the snapshot records that failed verdict, not the refused completion.
     activity = ActivityRecency()
     fingerprint, _ = _fingerprint_seq(["fp"])
 
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return "wait: the download has not started yet"
+    async def verification_blocker(status: str) -> str | None:
+        return "the verification code was never entered" if status == "completed" else None
 
     tools = [
         _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, completion_blocker=blocker),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, verification_blocker=verification_blocker),
     ]
     script = [
         [("observe", {})],
