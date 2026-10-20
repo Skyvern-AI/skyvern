@@ -9,16 +9,20 @@ import {
   CustomCredentialServiceConfig,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useHasCapability } from "@/store/PageSlots";
 import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useCustomCredentialServiceConfig() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canReadConfig = useHasCapability("vault_provider.read");
+  const canUpdateConfig = useHasCapability("vault_provider.update");
 
-  const { data: customCredentialServiceAuthToken, isLoading } =
+  const { data: storedCustomCredentialServiceAuthToken, isLoading } =
     useQuery<CustomCredentialServiceOrganizationAuthToken | null>({
       queryKey: ["customCredentialServiceAuthToken"],
+      enabled: canReadConfig,
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
         return await client
@@ -38,6 +42,17 @@ export function useCustomCredentialServiceConfig() {
           });
       },
     });
+  // Member-readable and secret-free, so credential flows can offer the service without vault_provider.read.
+  const { data: status } = useQuery<{ configured: boolean }>({
+    queryKey: ["customCredentialServiceAuthToken", "status"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return (await client.get("/credentials/custom_credential/status")).data;
+    },
+  });
+  const customCredentialServiceAuthToken = canReadConfig
+    ? storedCustomCredentialServiceAuthToken
+    : undefined;
 
   // Parse the configuration from the stored token
   const parsedConfig: CustomCredentialServiceConfig | null = useMemo(() => {
@@ -52,6 +67,11 @@ export function useCustomCredentialServiceConfig() {
 
   const createOrUpdateConfigMutation = useMutation({
     mutationFn: async (data: CreateCustomCredentialServiceConfigRequest) => {
+      if (!canUpdateConfig) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter, "sans-api-v1");
       return await client
         .post("/credentials/custom_credential/create", data)
@@ -93,6 +113,11 @@ export function useCustomCredentialServiceConfig() {
 
   const testConnectionMutation = useMutation({
     mutationFn: async (data: CreateCustomCredentialServiceConfigRequest) => {
+      if (!canUpdateConfig) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter, "sans-api-v1");
       return await client
         .post("/credentials/custom_credential/test_connection", data)
@@ -128,7 +153,9 @@ export function useCustomCredentialServiceConfig() {
   return {
     customCredentialServiceAuthToken,
     parsedConfig,
-    isLoading,
+    isConfigured: status?.configured ?? parsedConfig !== null,
+    isLoading: canReadConfig && isLoading,
+    canReadConfig,
     createOrUpdateConfig: createOrUpdateConfigMutation.mutate,
     isUpdating: createOrUpdateConfigMutation.isPending,
     clearConfig: clearConfigMutation.mutate,

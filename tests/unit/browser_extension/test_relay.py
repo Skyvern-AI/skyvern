@@ -544,9 +544,9 @@ async def test_wrong_proof_is_closed_with_4403(relay_harness: RelayHarness) -> N
     "client_nonce",
     [
         "short",
-        secrets.token_urlsafe(31),
-        secrets.token_urlsafe(32) + "=",
-        secrets.token_urlsafe(33),
+        pytest.param(secrets.token_urlsafe(31), id="31-bytes"),
+        pytest.param(secrets.token_urlsafe(32) + "=", id="padded-32-bytes"),
+        pytest.param(secrets.token_urlsafe(33), id="33-bytes"),
         "!" * 43,
         base64.urlsafe_b64encode(b"\0" * 32).rstrip(b"=").decode("ascii")[:-1] + "B",
     ],

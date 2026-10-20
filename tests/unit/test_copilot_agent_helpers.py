@@ -98,7 +98,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import AgentResult, CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    EDIT_BLOCK_TOOL_NAME,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+    AgentResult,
+    CodeAuthoringRepairContext,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -148,10 +154,6 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTIO
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.copilot.tools._shared import (
-    EDIT_BLOCK_TOOL_NAME,
-    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
-)
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _completion_verification_criteria,
@@ -649,6 +651,43 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     assert build_context.call_args.kwargs["debug_run_info_text"] == (
         '{"reusable_origin_inputs":{"workflow_run_id":"wr_recorded","input_keys":["resume"]}}'
     )
+
+
+@pytest.mark.asyncio
+async def test_demonstrate_product_action_triggers_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", AsyncMock(return_value=SimpleNamespace(finished=True)))
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", AsyncMock(return_value=None))
+    replay = AsyncMock(return_value=[])
+    monkeypatch.setattr(agent_module, "replay_demonstration", replay)
+    stub_copilot_agent_loop(
+        monkeypatch, AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"}))
+    )
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="I've shown you the task in the browser. Build a workflow that does it.",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+            product_action="demonstrate",
+            demonstration_id="demo-1",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == "ok"
+    replay.assert_awaited_once()
 
 
 class TestFailedTestResponseNormalization:
@@ -5728,7 +5767,12 @@ workflow_definition:
         assert "cred_missing" in error
         assert "not found in this organization" in error
         assert "Stop before creating, updating, or running the workflow" in error
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid", "cred_missing"],
+            organization_id="org-1",
+            allowed_folder_ids=None,
+            include_deleted=False,
+        )
 
     @pytest.mark.asyncio
     async def test_valid_tool_credential_reference_allows_tool_path(self, monkeypatch) -> None:
@@ -5744,7 +5788,9 @@ workflow_definition:
         error = await _credential_reference_validation_error({"credential_id": "cred_valid"}, _ctx())
 
         assert error is None
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
 
     @pytest.mark.asyncio
     async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
@@ -6393,7 +6439,9 @@ class TestRunBlocksCredentialApproval:
 
         assert result["ok"] is False
         assert result["error"] == "Organization not found"
-        database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_resolved"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
     @pytest.mark.asyncio
@@ -6986,7 +7034,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "unapproved_credential_reference" not in (result.get("error") or "")
         assert result["error"] == "Organization not found"
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
     @pytest.mark.asyncio
@@ -7128,7 +7176,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "not found in this organization" in result["error"]
         assert self.CREDENTIAL_ID in result["error"]
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
 
@@ -7688,7 +7736,6 @@ class TestCopilotConfig:
             pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
             pytest.param(RuntimeError("provider unavailable"), id="failed"),
             pytest.param(CopilotTotalTimeoutError(), id="reply_timed_out"),
-            pytest.param(asyncio.CancelledError(), id="user_stopped_during_reply"),
         ],
     )
     async def test_budget_expiry_reply_that_fails_keeps_the_typed_no_report_fact(
@@ -7709,6 +7756,26 @@ class TestCopilotConfig:
         assert outcome.terminal_reason == "timeout"
         assert outcome.budget_expiry_report_produced is False
         assert outcome.tool_calls == ["update_and_run_blocks"]
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_budget_expiry_reply_is_saved_as_a_stop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._record_run_still_going(monkeypatch)
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            asyncio.CancelledError(),
+            attempts=(_EnforcementAttempt(error=CopilotTotalTimeoutError()),),
+            during_attempt=self._hit_hard_backstop,
+        )
+
+        assert run.result.cancelled is True
+        assert run.result.user_response == ""
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expired is True
+        assert outcome.budget_expiry_report_produced is None
 
     @staticmethod
     def _withheld_reply(*reason_codes: OutputPolicyReason, user_response: str = "") -> OutputGuardrailTripwireTriggered:

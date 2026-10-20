@@ -166,6 +166,7 @@ async def test_attempt_self_heal_default_classification_uses_pinned_engine(
 
     result = await block._attempt_self_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=exception,
         failing_line=None,
         recording_page=_recording_page(None),

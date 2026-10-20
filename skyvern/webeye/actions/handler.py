@@ -153,11 +153,6 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.credential_verdict_service import (
-    CredentialVerdictContext,
-    confirm_credential_verdicts,
-    needs_credential_confirmation,
-)
 from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date as _canonical_iso_date
@@ -10946,11 +10941,7 @@ async def handle_terminate_action(
         skyvern_errors = [error for error in action.errors if error.is_skyvern_defined]
         try:
             extracted_errors = await extract_user_defined_errors(
-                task=task,
-                step=step,
-                scraped_page=scraped_page,
-                reasoning=action.reasoning,
-                confirm_credentials=False,
+                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
         except Exception:
             LOG.warning(
@@ -10965,20 +10956,6 @@ async def handle_terminate_action(
             action.errors = skyvern_errors + [
                 error for error in extracted_errors if error.error_code not in skyvern_codes
             ]
-    # Gate the merged set once: a system-attached verdict and the extraction pass can describe the same
-    # rejection, but must not independently reach the model or leave conflicting outcomes.
-    if any(needs_credential_confirmation(error) for error in action.errors):
-        action.errors = await confirm_credential_verdicts(
-            task=task,
-            step=step,
-            errors=action.errors,
-            context=CredentialVerdictContext(
-                current_url=scraped_page.url,
-                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
-                screenshots=scraped_page.screenshots,
-                agent_reasoning=action.reasoning,
-            ),
-        )
     return [ActionSuccess()]
 
 
@@ -10995,21 +10972,6 @@ async def handle_complete_action(
     # attribution (periodic vs handler-forced) lives on the child
     # complete_verify span as `verification.trigger`.
     _span = otel_trace.get_current_span()
-    if action.errors:
-        credential_context = None
-        if any(needs_credential_confirmation(error) for error in action.errors):
-            credential_context = CredentialVerdictContext(
-                current_url=scraped_page.url,
-                elements=scraped_page.build_element_tree(fmt=ElementTreeFormat.HTML),
-                screenshots=scraped_page.screenshots,
-                agent_reasoning=action.reasoning,
-            )
-        action.errors = await confirm_credential_verdicts(
-            task=task,
-            step=step,
-            errors=action.errors,
-            context=credential_context,
-        )
     if action.verified or not task.navigation_goal:
         _span.set_attribute("verification_path", "already_verified")
         return [ActionSuccess()]
@@ -12344,6 +12306,7 @@ async def choose_auto_completion_dropdown(
     is_location_input: bool = False,
     collapse_autocomplete_fanout_enabled: bool = False,
     action: InputTextAction | None = None,
+    allow_full_page_rescrape: bool = True,
     *,
     is_secret_value: bool,
 ) -> AutoCompletionResult:
@@ -12567,6 +12530,9 @@ async def choose_auto_completion_dropdown(
             if not html:
                 html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         else:
+            if not allow_full_page_rescrape:
+                raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+
             scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
             new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(
                 scraped_page.id_to_css_dict.keys()
@@ -12791,6 +12757,10 @@ async def input_or_auto_complete_input(
             )
             return None
 
+        initial_probe_found_no_options = (
+            isinstance(result.action_result, ActionFailure)
+            and result.action_result.exception_type == NoIncrementalElementFoundForAutoCompletion.__name__
+        )
         tried_values.append(current_value)
         whole_new_elements.extend(result.incremental_elements)
 
@@ -12800,6 +12770,7 @@ async def input_or_auto_complete_input(
             else input_or_select_context.intention
         )
 
+        values: list[dict] = []
         prompt = prompt_engine.load_prompt(
             "auto-completion-potential-answers",
             potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
@@ -12820,7 +12791,7 @@ async def input_or_auto_complete_input(
         json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
         )
-        values: list[dict] = json_respone.get("potential_values", [])
+        values = json_respone.get("potential_values", [])
 
         for each_value in values:
             value: str = each_value.get("value", "")
@@ -12848,6 +12819,7 @@ async def input_or_auto_complete_input(
                 is_location_input=is_location,
                 collapse_autocomplete_fanout_enabled=collapse_autocomplete_fanout_enabled,
                 action=action,
+                allow_full_page_rescrape=not initial_probe_found_no_options,
                 is_secret_value=is_secret_value,
             )
             if isinstance(result.action_result, ActionSuccess):
@@ -16646,21 +16618,15 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
 
 
 async def extract_user_defined_errors(
-    task: Task,
-    step: Step,
-    scraped_page: ScrapedPage,
-    reasoning: str | None = None,
-    *,
-    confirm_credentials: bool = True,
+    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
 ) -> list[UserDefinedError]:
     action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
-    elements = scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML)
     prompt = prompt_engine.load_prompt(
         "surface-user-defined-errors",
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
-        elements=elements,
+        elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
         current_url=scraped_page_refreshed.url,
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
@@ -16684,18 +16650,5 @@ async def extract_user_defined_errors(
             allowed_codes=sorted((task.error_code_mapping or {}).keys()),
         )
     if not kept and reasoning:
-        kept = _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
-    if not confirm_credentials:
-        return kept
-    return await confirm_credential_verdicts(
-        task=task,
-        step=step,
-        errors=kept,
-        context=CredentialVerdictContext(
-            current_url=scraped_page_refreshed.url,
-            elements=elements,
-            screenshots=scraped_page_refreshed.screenshots,
-            action_history=json.dumps(action_history),
-            agent_reasoning=reasoning,
-        ),
-    )
+        return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)
+    return kept

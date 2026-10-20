@@ -91,6 +91,8 @@ class _OAuthResolution:
 
     api_key: str
     validation: MCPAPIKeyValidation
+    api_key_token_id: str | None = None
+    user_id: str | None = None
 
 
 class MissingOrgContextError(HTTPException):
@@ -98,6 +100,13 @@ class MissingOrgContextError(HTTPException):
 
     def __init__(self) -> None:
         super().__init__(status_code=401, detail=_OAUTH_MISSING_ORG_CONTEXT_MSG)
+
+
+class MCPOrgRoleRequiredError(HTTPException):
+    """Raised when an organization session has no supported MCP sign-in role."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=403, detail="MCP sign-in requires an organization Admin or Member role.")
 
 
 def _canonical_mcp_url(base_url: str | None = None) -> str:
@@ -334,6 +343,15 @@ async def _resolve_oauth_subject_to_org(
         raise HTTPException(status_code=401, detail="No organization found for this user")
 
     org_id = org_entities[0].organization_id
+    # Check the sign-in role before looking up or provisioning an org-wide key.
+    member_api_key = await app.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key(org_id, payload)
+    if member_api_key is not None:
+        api_key_token_id, api_key = member_api_key
+        validation = MCPAPIKeyValidation(organization_id=org_id, token_type=OrganizationAuthTokenType.api)
+        return _OAuthResolution(
+            api_key=api_key, validation=validation, api_key_token_id=api_key_token_id, user_id=subject
+        )
+
     api_token = await get_auth_token(org_id, OrganizationAuthTokenType.api)
     if not api_token:
         from skyvern.forge.sdk.services import org_auth_token_service  # noqa: PLC0415
@@ -348,7 +366,9 @@ async def _resolve_oauth_subject_to_org(
         )
 
     validation = MCPAPIKeyValidation(organization_id=org_id, token_type=OrganizationAuthTokenType.api)
-    return _OAuthResolution(api_key=api_token.token, validation=validation)
+    return _OAuthResolution(
+        api_key=api_token.token, validation=validation, api_key_token_id=api_token.id, user_id=subject
+    )
 
 
 def _resolve_api_key_cache_ttl_seconds() -> float:
@@ -583,7 +603,7 @@ async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
 
         resolution = await _resolve_oauth_subject_to_org(payload, db)
     except HTTPException as exc:
-        if exc.status_code in {401, 403}:
+        if exc.status_code in {401, 403} and not isinstance(exc, MCPOrgRoleRequiredError):
             _cache_negative_oauth(key)
         raise
 
@@ -777,6 +797,13 @@ class MCPAPIKeyMiddleware:
                 organization_id=resolution.validation.organization_id,
                 api_key=resolution.api_key,
             )
+            return
+        except MCPOrgRoleRequiredError as e:
+            response = JSONResponse(
+                {"error": {"code": "FORBIDDEN", "message": e.detail}},
+                status_code=403,
+            )
+            await response(scope, receive, send)
             return
         except HTTPException as e:
             if e.status_code == 503:

@@ -673,7 +673,7 @@ async def test_track_a_registry_refuses_credential_run_even_when_scout_values_ar
         run_execution_module,
         "app",
         SimpleNamespace(
-            AGENT_FUNCTION=SimpleNamespace(serialize_codeblock_parameters=dict),
+            AGENT_FUNCTION=SimpleNamespace(enforce_credential_use=AsyncMock(), serialize_codeblock_parameters=dict),
             DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=None))),
         ),
     )
@@ -722,6 +722,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
         "app",
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
                 serialize_codeblock_parameters=lambda values: values,
                 process_registered_credential_item=process,
             ),
@@ -768,6 +769,7 @@ async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dyna
         "app",
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
                 serialize_codeblock_parameters=lambda values: values,
                 process_registered_credential_item=AsyncMock(return_value=credential_item),
             ),

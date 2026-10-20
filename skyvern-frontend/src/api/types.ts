@@ -280,6 +280,38 @@ export type OnePasswordItemsApiResponse = {
   items: Array<OnePasswordItemApiResponse>;
 };
 
+export const ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500;
+
+export type OnePasswordCredentialImportRequest = {
+  folder_id?: string;
+  items: Array<{ vault_id: string; item_id: string }>;
+};
+
+export type OnePasswordCredentialImportResult = {
+  vault_id: string;
+  item_id: string;
+  status: "imported" | "updated" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialImportResponse = {
+  results: Array<OnePasswordCredentialImportResult>;
+};
+
+export type OnePasswordCredentialRefreshResult = {
+  vault_id: string;
+  item_id: string;
+  status: "refreshed" | "stale" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialRefreshResponse = {
+  refreshed: number;
+  stale: number;
+  skipped: number;
+  results: Array<OnePasswordCredentialRefreshResult>;
+};
+
 export type BitwardenItemApiResponse = {
   item_id: string;
   title: string;
@@ -1125,6 +1157,17 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  vault_type?:
+    | "skyvern"
+    | "bitwarden"
+    | "azure_vault"
+    | "gcp"
+    | "custom"
+    | "onepassword"
+    | null;
+  vault_id?: string | null;
+  item_id?: string | null;
+  upstream_missing_at?: string | null;
   browser_profile_id?: string | null;
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;

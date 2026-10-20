@@ -446,7 +446,9 @@ function PromptBoxImpl(
   const recordTaskMutation = useMutation({
     mutationFn: async () => {
       const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(buildBlankWorkflowRequest("Recorded Agent"));
+      const yaml = convertToYAML(
+        buildBlankWorkflowRequest("Demonstrated Agent"),
+      );
       const result = await client.post<string, AxiosResponse<unknown>>(
         "/workflows",
         yaml,
@@ -471,7 +473,7 @@ function PromptBoxImpl(
       );
     },
     onError: (error: AxiosError) => {
-      showCreateErrorToast("Could not start recording", error);
+      showCreateErrorToast("Could not start demonstration", error);
     },
   });
 
@@ -829,7 +831,7 @@ function PromptBoxImpl(
           }}
         >
           <VideoIcon className="mr-2 size-4" />
-          Record task
+          Demonstrate task
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

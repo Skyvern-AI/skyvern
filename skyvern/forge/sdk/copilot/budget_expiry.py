@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Literal, TypedDict
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -42,7 +42,8 @@ class BudgetExpiryObservation(BaseModel):
     message: str = (
         "The normal turn budget has expired. headroom is the maximum number of model calls available to finish "
         "this turn, including this call; the hard time limit may stop it sooner. Your session history and any "
-        "staged draft remain available. Choose how to use these calls. New build-test runs cannot be dispatched."
+        "staged draft remain available. Choose how to use these calls. This step offers no tools that change or "
+        "run the workflow."
     )
 
 
@@ -86,17 +87,6 @@ class BudgetExpiredReplyObservation(BaseModel):
     )
 
 
-class BudgetRunDenialData(TypedDict):
-    budget_expired: Literal[True]
-    run_dispatched: Literal[False]
-    source: BudgetExpirySource | None
-
-
-class BudgetRunDenial(TypedDict):
-    ok: Literal[False]
-    data: BudgetRunDenialData
-
-
 def serialize_budget_expiry_observation(*, source: BudgetExpirySource, headroom: int, staged_draft: str | None) -> str:
     return BudgetExpiryObservation(
         source=source,
@@ -118,14 +108,3 @@ def serialize_prior_budget_expiry(outcome: TurnOutcome | None) -> str | None:
         },
         separators=(",", ":"),
     )
-
-
-def budget_run_denial(state: BudgetExpiryState) -> BudgetRunDenial:
-    return {
-        "ok": False,
-        "data": {
-            "budget_expired": True,
-            "run_dispatched": False,
-            "source": state.source,
-        },
-    }

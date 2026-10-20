@@ -40,13 +40,35 @@ skyvern.launchCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLo
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `timeout` | `timeout` | `int \| None` | No | `None` | Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. |
-| `proxy_location` | `proxyLocation` | `ProxyLocationInput` | No | `None` | Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud. |
-| `extensions` | — | `list[Extensions] \| None` | No | `None` | Browser extensions to install in the session. |
-| `browser_profile_id` | — | `str \| None` | No | `None` | Browser profile ID to load into the session. |
-| `browser_type` | — | `PersistentBrowserType \| None` | No | `None` | Browser engine for the session (msedge, chrome, or stealth-chromium). |
+<ParamField path={"timeout"} type={"int | None"}>
+Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+Default: `None` · TypeScript: `proxyLocation`
+</ParamField>
+
+<ParamField path={"extensions"} type={"list[Extensions] | None"}>
+Browser extensions to install in the session.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+Browser profile ID to load into the session.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"browser_type"} type={"PersistentBrowserType | None"}>
+Browser engine for the session (msedge, chrome, or stealth-chromium).
+
+Default: `None` · Python only
+</ParamField>
 
 **Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the new cloud session.
 
@@ -103,10 +125,17 @@ skyvern.useCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLocat
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `timeout` | `timeout` | `int \| None` | No | `None` | Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. Only used when creating a new session. |
-| `proxy_location` | `proxyLocation` | `ProxyLocationInput` | No | `None` | Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud. Only used when creating a new session. |
+<ParamField path={"timeout"} type={"int | None"}>
+Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. Only used when creating a new session.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Geographic proxy location to route the browser traffic through. This is only available in Skyvern Cloud. Only used when creating a new session.
+
+Default: `None` · TypeScript: `proxyLocation`
+</ParamField>
 
 **Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to an existing or new cloud session.
 
@@ -157,9 +186,11 @@ skyvern.connectToCloudBrowserSession(browserSessionId: string): Promise<SkyvernB
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `browser_session_id` | `browserSessionId` | `str` | Yes | — | The ID of the cloud browser session to connect to. |
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the cloud browser session to connect to.
+
+TypeScript: `browserSessionId`
+</ParamField>
 
 **Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the cloud session.
 
@@ -211,9 +242,11 @@ skyvern.connectToBrowserOverCdp(cdpUrl: string): Promise<SkyvernBrowser>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `cdp_url` | `cdpUrl` | `str` | Yes | — | The CDP WebSocket URL (e.g., "http://localhost:9222"). |
+<ParamField path={"cdp_url"} type={"str"} required>
+The CDP WebSocket URL (e.g., "http://localhost:9222").
+
+TypeScript: `cdpUrl`
+</ParamField>
 
 **Returns** `SkyvernBrowser` · TypeScript `Promise<SkyvernBrowser>` — A browser instance connected to the existing browser.
 
@@ -269,12 +302,27 @@ await skyvern.launch_local_browser(
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `headless` | — | `bool` | No | `False` | Whether to run the browser in headless mode. Defaults to False. |
-| `port` | — | `int \| None` | No | `None` | The port number for the CDP endpoint. Anonymous launches use an OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT. |
-| `args` | — | `list[str] \| None` | No | `None` | Additional command-line arguments to pass to Chromium. Defaults to None. Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"] |
-| `user_data_dir` | — | `str \| None` | No | `None` |  |
+<ParamField path={"headless"} type={"bool"}>
+Whether to run the browser in headless mode. Defaults to False.
+
+Default: `False`
+</ParamField>
+
+<ParamField path={"port"} type={"int | None"}>
+The port number for the CDP endpoint. Anonymous launches use an OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"args"} type={"list[str] | None"}>
+Additional command-line arguments to pass to Chromium. Defaults to None. Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"user_data_dir"} type={"str | None"}>
+Default: `None`
+</ParamField>
 
 **Returns** `SkyvernBrowser` — A browser instance with Skyvern capabilities.
 
@@ -464,9 +512,8 @@ await browser.get_page_for(page: Page) -> SkyvernBrowserPage
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `page` | — | `Page` | Yes | — |  |
+<ParamField path={"page"} type={"Page"} required>
+</ParamField>
 
 **Returns** `SkyvernBrowserPage`
 
@@ -513,9 +560,11 @@ browser.close(): Promise<void>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `**kwargs` | — | `Any` | No | — | Arguments passed to the underlying BrowserContext.close() method. |
+<ParamField path={"**kwargs"} type={"Any"}>
+Arguments passed to the underlying BrowserContext.close() method.
+
+Sent only when you pass it · Python only
+</ParamField>
 
 **Returns** `None` · TypeScript `Promise<void>`
 

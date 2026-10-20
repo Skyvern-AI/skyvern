@@ -44,21 +44,81 @@ page.agent.runTask(prompt: string, options?: { engine?: RunEngine; model?: Recor
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | Natural language description of the task to perform. |
-| `engine` | `engine` | `RunEngine` | No | `RunEngine.skyvern_v1` | The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted. |
-| `model` | `model` | `dict[str, Any] \| None` | No | `None` | LLM model configuration options. |
-| `url` | `url` | `str \| None` | No | `None` | URL to navigate to. If not provided, uses the current page URL. |
-| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about task progress. |
-| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP (Time-based One-Time Password) authentication. |
-| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
-| `title` | `title` | `str \| None` | No | `None` | Human-readable title for this task run. |
-| `error_code_mapping` | `errorCodeMapping` | `dict[str, str] \| None` | No | `None` | Mapping of error codes to custom error messages. |
-| `data_extraction_schema` | `dataExtractionSchema` | `dict[str, Any] \| str \| None` | No | `None` | Schema defining what data to extract from the page. |
-| `max_steps` | `maxSteps` | `int \| None` | No | `None` | Maximum number of steps the agent can take. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for task completion. |
-| `user_agent` | — | `str \| None` | No | `None` | Custom user agent string to use. |
+<ParamField path={"prompt"} type={"str"} required>
+Natural language description of the task to perform.
+</ParamField>
+
+<ParamField path={"engine"} type={"RunEngine"}>
+The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted.
+
+Default: `RunEngine.skyvern_v1`
+</ParamField>
+
+<ParamField path={"model"} type={"dict[str, Any] | None"}>
+LLM model configuration options.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+URL to navigate to. If not provided, uses the current page URL.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+URL to receive webhook notifications about task progress.
+
+Default: `None` · TypeScript: `webhookUrl`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP (Time-based One-Time Password) authentication.
+
+Default: `None` · TypeScript: `totpIdentifier`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from.
+
+Default: `None` · TypeScript: `totpUrl`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+Human-readable title for this task run.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"error_code_mapping"} type={"dict[str, str] | None"}>
+Mapping of error codes to custom error messages.
+
+Default: `None` · TypeScript: `errorCodeMapping`
+</ParamField>
+
+<ParamField path={"data_extraction_schema"} type={"dict[str, Any] | str | None"}>
+Schema defining what data to extract from the page.
+
+Default: `None` · TypeScript: `dataExtractionSchema`
+</ParamField>
+
+<ParamField path={"max_steps"} type={"int | None"}>
+Maximum number of steps the agent can take.
+
+Default: `None` · TypeScript: `maxSteps`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time in seconds to wait for task completion.
+
+Default: `1800`
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+Custom user agent string to use.
+
+Default: `None` · Python only
+</ParamField>
 
 **Returns** `TaskRunResponse` · TypeScript `Promise<TaskRunResponse>` — TaskRunResponse containing the task execution results.
 
@@ -200,25 +260,107 @@ page.agent.login(credentialType: "azure_vault", options: { azureVaultName: strin
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `credential_type` | `credentialType` | `CredentialType \| str` | No | `CredentialType.skyvern` | Type of credential store to use. Defaults to CredentialType.skyvern. |
-| `url` | `url` | `str \| None` | No | `None` | URL to navigate to for login. If not provided, uses the current page URL. |
-| `credential_id` | `credentialId` | `str \| None` | No | `None` | ID of the Skyvern credential to use (required for skyvern credential_type). |
-| `bitwarden_collection_id` | `bitwardenCollectionId` | `str \| None` | No | `None` | Bitwarden collection ID (optional for bitwarden credential_type). |
-| `bitwarden_item_id` | `bitwardenItemId` | `str \| None` | No | `None` | Bitwarden item ID (required for bitwarden credential_type). |
-| `onepassword_vault_id` | `onepasswordVaultId` | `str \| None` | No | `None` | 1Password vault ID (required for onepassword credential_type). |
-| `onepassword_item_id` | `onepasswordItemId` | `str \| None` | No | `None` | 1Password item ID (required for onepassword credential_type). |
-| `azure_vault_name` | `azureVaultName` | `str \| None` | No | `None` | Azure Vault name (required for azure_vault credential_type). |
-| `azure_vault_username_key` | `azureVaultUsernameKey` | `str \| None` | No | `None` | Azure Vault username key (required for azure_vault credential_type). |
-| `azure_vault_password_key` | `azureVaultPasswordKey` | `str \| None` | No | `None` | Azure Vault password key (required for azure_vault credential_type). |
-| `azure_vault_totp_secret_key` | `azureVaultTotpSecretKey` | `str \| None` | No | `None` | Azure Vault TOTP secret key (optional for azure_vault credential_type). |
-| `prompt` | `prompt` | `str \| None` | No | `None` | Additional instructions for the login process. |
-| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about login progress. |
-| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
-| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
-| `extra_http_headers` | `extraHttpHeaders` | `dict[str, str] \| None` | No | `None` | Additional HTTP headers to include in requests. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for login completion. |
+<ParamField path={"credential_type"} type={"CredentialType | str"}>
+Type of credential store to use. Defaults to CredentialType.skyvern.
+
+Default: `CredentialType.skyvern` · TypeScript: `credentialType` (required)
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+URL to navigate to for login. If not provided, uses the current page URL.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"credential_id"} type={"str | None"}>
+ID of the Skyvern credential to use (required for skyvern credential_type).
+
+Default: `None` · TypeScript: `credentialId`
+</ParamField>
+
+<ParamField path={"bitwarden_collection_id"} type={"str | None"}>
+Bitwarden collection ID (optional for bitwarden credential_type).
+
+Default: `None` · TypeScript: `bitwardenCollectionId`
+</ParamField>
+
+<ParamField path={"bitwarden_item_id"} type={"str | None"}>
+Bitwarden item ID (required for bitwarden credential_type).
+
+Default: `None` · TypeScript: `bitwardenItemId`
+</ParamField>
+
+<ParamField path={"onepassword_vault_id"} type={"str | None"}>
+1Password vault ID (required for onepassword credential_type).
+
+Default: `None` · TypeScript: `onepasswordVaultId`
+</ParamField>
+
+<ParamField path={"onepassword_item_id"} type={"str | None"}>
+1Password item ID (required for onepassword credential_type).
+
+Default: `None` · TypeScript: `onepasswordItemId`
+</ParamField>
+
+<ParamField path={"azure_vault_name"} type={"str | None"}>
+Azure Vault name (required for azure_vault credential_type).
+
+Default: `None` · TypeScript: `azureVaultName`
+</ParamField>
+
+<ParamField path={"azure_vault_username_key"} type={"str | None"}>
+Azure Vault username key (required for azure_vault credential_type).
+
+Default: `None` · TypeScript: `azureVaultUsernameKey`
+</ParamField>
+
+<ParamField path={"azure_vault_password_key"} type={"str | None"}>
+Azure Vault password key (required for azure_vault credential_type).
+
+Default: `None` · TypeScript: `azureVaultPasswordKey`
+</ParamField>
+
+<ParamField path={"azure_vault_totp_secret_key"} type={"str | None"}>
+Azure Vault TOTP secret key (optional for azure_vault credential_type).
+
+Default: `None` · TypeScript: `azureVaultTotpSecretKey`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Additional instructions for the login process.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+URL to receive webhook notifications about login progress.
+
+Default: `None` · TypeScript: `webhookUrl`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP authentication.
+
+Default: `None` · TypeScript: `totpIdentifier`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from.
+
+Default: `None` · TypeScript: `totpUrl`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+Additional HTTP headers to include in requests.
+
+Default: `None` · TypeScript: `extraHttpHeaders`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time in seconds to wait for login completion.
+
+Default: `1800`
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the login workflow execution results.
 
@@ -321,18 +463,63 @@ page.agent.downloadFiles(prompt: string, options?: { url?: string; downloadSuffi
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `prompt` | `prompt` | `str` | Yes | — | Instructions for navigating to and downloading the file. |
-| `url` | `url` | `str \| None` | No | `None` | URL to navigate to for file download. If not provided, uses the current page URL. |
-| `download_suffix` | `downloadSuffix` | `str \| None` | No | `None` | Complete filename for the downloaded file. Supports \{\{ original_filename \}\} to keep the name the site gave the file. |
-| `download_timeout` | `downloadTimeout` | `float \| None` | No | `None` | Timeout in seconds for the download operation. |
-| `max_steps_per_run` | `maxStepsPerRun` | `int \| None` | No | `None` | Maximum number of steps to execute. |
-| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about download progress. |
-| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
-| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
-| `extra_http_headers` | `extraHttpHeaders` | `dict[str, str] \| None` | No | `None` | Additional HTTP headers to include in requests. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for download completion. |
+<ParamField path={"prompt"} type={"str"} required>
+Instructions for navigating to and downloading the file.
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+URL to navigate to for file download. If not provided, uses the current page URL.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"download_suffix"} type={"str | None"}>
+Complete filename for the downloaded file. Supports \{\{ original_filename \}\} to keep the name the site gave the file.
+
+Default: `None` · TypeScript: `downloadSuffix`
+</ParamField>
+
+<ParamField path={"download_timeout"} type={"float | None"}>
+Timeout in seconds for the download operation.
+
+Default: `None` · TypeScript: `downloadTimeout`
+</ParamField>
+
+<ParamField path={"max_steps_per_run"} type={"int | None"}>
+Maximum number of steps to execute.
+
+Default: `None` · TypeScript: `maxStepsPerRun`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+URL to receive webhook notifications about download progress.
+
+Default: `None` · TypeScript: `webhookUrl`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP authentication.
+
+Default: `None` · TypeScript: `totpIdentifier`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from.
+
+Default: `None` · TypeScript: `totpUrl`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+Additional HTTP headers to include in requests.
+
+Default: `None` · TypeScript: `extraHttpHeaders`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time in seconds to wait for download completion.
+
+Default: `1800`
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the file download workflow execution results.
 
@@ -431,18 +618,65 @@ page.agent.runWorkflow(workflowId: string, options?: { parameters?: Record<strin
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `workflow_id` | `workflowId` | `str` | Yes | — | ID of the workflow to execute. |
-| `parameters` | `parameters` | `dict[str, Any] \| None` | No | `None` | Dictionary of parameters to pass to the workflow. |
-| `template` | `template` | `bool \| None` | No | `None` | Whether this is a workflow template. |
-| `title` | `title` | `str \| None` | No | `None` | Human-readable title for this workflow run. |
-| `webhook_url` | `webhookUrl` | `str \| None` | No | `None` | URL to receive webhook notifications about workflow progress. |
-| `totp_url` | `totpUrl` | `str \| None` | No | `None` | URL to fetch TOTP codes from. |
-| `totp_identifier` | `totpIdentifier` | `str \| None` | No | `None` | Identifier for TOTP authentication. |
-| `max_elapsed_time_minutes` | — | `int \| None` | No | `None` | Timeout this workflow run after the configured elapsed runtime in minutes. |
-| `run_metadata` | — | `dict[str, str] \| None` | No | `None` | String key/value metadata to attach to this workflow run. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time in seconds to wait for workflow completion. |
+<ParamField path={"workflow_id"} type={"str"} required>
+ID of the workflow to execute.
+
+TypeScript: `workflowId`
+</ParamField>
+
+<ParamField path={"parameters"} type={"dict[str, Any] | None"}>
+Dictionary of parameters to pass to the workflow.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"template"} type={"bool | None"}>
+Whether this is a workflow template.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"title"} type={"str | None"}>
+Human-readable title for this workflow run.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+URL to receive webhook notifications about workflow progress.
+
+Default: `None` · TypeScript: `webhookUrl`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+URL to fetch TOTP codes from.
+
+Default: `None` · TypeScript: `totpUrl`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP authentication.
+
+Default: `None` · TypeScript: `totpIdentifier`
+</ParamField>
+
+<ParamField path={"max_elapsed_time_minutes"} type={"int | None"}>
+Timeout this workflow run after the configured elapsed runtime in minutes.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"run_metadata"} type={"dict[str, str] | None"}>
+String key/value metadata to attach to this workflow run.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time in seconds to wait for workflow completion.
+
+Default: `1800`
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>` — WorkflowRunResponse containing the workflow execution results.
 

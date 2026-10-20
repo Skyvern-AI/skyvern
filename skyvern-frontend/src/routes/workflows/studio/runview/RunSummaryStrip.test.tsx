@@ -253,4 +253,46 @@ describe("RunSummaryStrip failure category", () => {
       expect(screen.queryByRole("link")).toBeNull();
     }
   });
+
+  test("a saved run whose pinned browser session ended before its lease links to browser sessions", () => {
+    const leaseFailure = (reason_code: string) =>
+      makeRun({
+        status: Status.Failed,
+        failure_category: [
+          {
+            category:
+              reason_code === "browser_session_expired_before_run"
+                ? "BROWSER_SESSION_EXPIRED"
+                : "BROWSER_ERROR",
+            confidence_float: 1.0,
+            reasoning: "the session had already closed",
+            reason_code,
+          },
+        ],
+      });
+
+    renderStrip(leaseFailure("browser_session_expired_before_run"));
+    expect(
+      screen
+        .getByRole("link", { name: "Review browser sessions" })
+        .getAttribute("href"),
+    ).toBe("/browser-sessions");
+
+    for (const reasonCode of [
+      "browser_session_closed",
+      "browser_session_startup_timeout",
+    ]) {
+      cleanup();
+      renderStrip(leaseFailure(reasonCode));
+      expect(
+        screen
+          .getByRole("link", { name: "Review browser sessions" })
+          .getAttribute("href"),
+      ).toBe("/browser-sessions");
+    }
+
+    cleanup();
+    renderStrip(leaseFailure("unrelated_failure"));
+    expect(screen.queryByRole("link")).toBeNull();
+  });
 });

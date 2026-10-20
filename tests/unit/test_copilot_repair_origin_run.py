@@ -1093,7 +1093,9 @@ _WORKFLOW_FIELDS_NOT_COMPARED = frozenset(
         "import_error",
         "created_by",
         "edited_by",
+        "edited_for",
         "copilot_authored",
+        "build_source",
         # Filled only by the workflow detail endpoint; never read at run time.
         "effective_default_engine",
         "original_created_by",

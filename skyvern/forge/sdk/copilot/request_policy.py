@@ -14,7 +14,6 @@ import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -138,9 +137,6 @@ RawSecretSafetyFailureKind = Literal[
     "invalid_citation",
 ]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
-# The value-over-label sentence released labelled passwords on other model settings, so it is
-# served only where it was measured; add a key here only with a replay of the secret controls.
-_VALUE_OVER_LABEL_WORDING_LLM_KEYS = frozenset({"AZURE_OPENAI_GPT6_LUNA_WITH_OPENAI_FALLBACK"})
 _RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 
@@ -217,10 +213,7 @@ async def _saved_credential_ids(citations: list[str], organization_id: str) -> s
     connection_ids = {citation for citation in citations if citation.startswith("goac_")}
     verified_ids: set[str] = set()
     if credential_ids:
-        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=organization_id,
-        )
+        credentials = await _load_credentials(organization_id, credential_ids=credential_ids)
         verified_ids.update(credential.credential_id for credential in credentials)
     if connection_ids:
         connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
@@ -392,7 +385,7 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
-async def _screen_raw_secret_safety(
+async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
     *,
@@ -405,7 +398,6 @@ async def _screen_raw_secret_safety(
         prompt = prompt_engine.load_prompt(
             template=_RAW_SECRET_SAFETY_PROMPT_NAME,
             user_message=escape_code_fences(deterministic_safe_message),
-            read_value_not_label=getattr(handler, "llm_key", None) in _VALUE_OVER_LABEL_WORDING_LLM_KEYS,
         )
     except Exception:
         return _screen_unavailable("malformed_output")
@@ -897,7 +889,17 @@ class SteerMessageSiteURLSource:
     kind: Literal["steer_message"] = field(default="steer_message", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
+@dataclass(frozen=True)
+class DemonstrationNavigationSiteURLSource:
+    kind: Literal["demonstration_navigation"] = field(default="demonstration_navigation", init=False)
+
+
+SiteURLSource = (
+    UserMessageSiteURLSource
+    | QuestionResponseSiteURLSource
+    | SteerMessageSiteURLSource
+    | DemonstrationNavigationSiteURLSource
+)
 
 
 @dataclass(frozen=True)
@@ -1024,6 +1026,13 @@ class RequestPolicy:
             self.apply_raw_secret_redacted_draft()
             return
         _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
+
+    def project_demonstration_navigation(self, url: str) -> None:
+        _project_user_provided_sites(
+            self,
+            [_SiteURLText(text=url, source=DemonstrationNavigationSiteURLSource())],
+            reset=False,
+        )
 
     @property
     def raw_secret_redacted_draft(self) -> bool:
@@ -4350,10 +4359,7 @@ async def _seed_prior_approved_credentials(
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        missing_ids,
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4378,10 +4384,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [seed.credential_id],
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4901,7 +4904,7 @@ async def build_request_policy_trust_floor(
     selected_connected_account_id: str | None = None,
 ) -> RequestPolicy:
     del config
-    safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
+    safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
     # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it

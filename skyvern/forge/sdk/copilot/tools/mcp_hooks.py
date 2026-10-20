@@ -68,6 +68,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     browser_valid_tab_count,
+    current_demonstrated_action,
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
@@ -770,6 +771,7 @@ async def _get_workflow_knowledge_post_hook(
 
 _MODEL_SCOUT_FACT_KEYS = (
     "tool_name",
+    "actor",
     "executed_selector",
     "selector_candidates",
     "role",
@@ -1566,7 +1568,13 @@ async def _type_text_post_hook(
         has_landing_probe = (
             isinstance(selector, str) and bool(selector.strip()) and isinstance(typed_length, int) and typed_length > 0
         )
-        field_value = await _read_scout_field_value(ctx, selector) if has_landing_probe else None
+        demonstrated_action = current_demonstrated_action()
+        if demonstrated_action is not None:
+            field_value = demonstrated_action.readback
+        elif has_landing_probe:
+            field_value = await _read_scout_field_value(ctx, selector)
+        else:
+            field_value = None
         control_readonly, control_disabled = (
             await _probe_scout_control_state(ctx, selector) if has_landing_probe else (None, None)
         )

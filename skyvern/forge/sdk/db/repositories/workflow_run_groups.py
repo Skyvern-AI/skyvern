@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunGroupItemModel,
     WorkflowRunGroupModel,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal, trigger_owner_id
 from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
     IN_FLIGHT_ITEM_STATES,
@@ -158,6 +159,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 submission_key=submission_key,
                 input_fingerprint=input_fingerprint,
                 status=WorkflowRunGroupStatus.active.value,
+                created_by=trigger_owner_id(get_request_principal(), organization_id),
             )
             session.add(group)
             await session.flush()

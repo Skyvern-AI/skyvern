@@ -93,7 +93,12 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
-from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason, is_captcha_solve_failure
+from skyvern.forge.failure_classifier import (
+    FailureCategory,
+    bounded_failure_categories,
+    classify_from_failure_reason,
+    is_captcha_solve_failure,
+)
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -157,6 +162,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.executor.run_liveness import note_run_finalized, run_lease_lost
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -224,11 +230,6 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
-from skyvern.services.credential_verdict_service import (
-    CredentialVerdictContext,
-    confirm_credential_verdicts,
-    is_credential_rejection_code,
-)
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
     OTPValue,
@@ -271,6 +272,7 @@ from skyvern.utils.stall_watch import (
     log_if_stalled,
     wait_for_task,
 )
+from skyvern.utils.strings import UNTRUSTED_WEB_PAGE_DATA_BEGIN
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.action_deadline import cancellation_pending
@@ -731,11 +733,15 @@ def _llm_error_category(reasoning: str) -> list[dict]:
 
 
 def _append_mapped_category_errors(
-    errors: list[UserDefinedError], categories: list[dict[str, Any]], error_code_mapping: dict[str, str] | None
+    errors: list[UserDefinedError],
+    categories: list[dict[str, Any]],
+    error_code_mapping: dict[str, str] | None,
+    rejected_category_names: list[str],
 ) -> None:
     error_codes = {error.error_code for error in errors}
-    for category in categories:
-        category_name = category.get("category")
+    category_names = [category.get("category") for category in categories]
+    category_names.extend(rejected_category_names)
+    for category_name in category_names:
         if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
             continue
         error_code = resolve_error_code_mapping_key(category_name, error_code_mapping)
@@ -944,9 +950,18 @@ def _mask_multi_field_totp_rejection_digits(value: str | None) -> str:
     return re.sub(r"[0-9]", "*", value or "")
 
 
+def _planner_confirmed_verification_code_intent(json_response: dict[str, Any]) -> bool:
+    return (
+        json_response.get("place_to_enter_verification_code") is True
+        and json_response.get("should_enter_verification_code") is True
+    )
+
+
 def _multi_field_totp_action_indices(
     actions: Sequence[Action | dict[str, Any]],
     attempt: MultiFieldTotpAttempt,
+    *,
+    allow_partial: bool = False,
 ) -> set[int]:
     expected_value = attempt.hint_code
     if not expected_value or not expected_value.isdigit() or len(expected_value) != attempt.expected_digits:
@@ -967,15 +982,20 @@ def _multi_field_totp_action_indices(
         if isinstance(element_id, str) and element_id in box_indices:
             group_actions.append((box_indices[element_id], action_index, text if isinstance(text, str) else ""))
 
+    if not group_actions:
+        return set()
     if not all(
         text == expected_value or (box_index < len(expected_value) and text == expected_value[box_index])
         for box_index, _, text in group_actions
     ):
         return set()
-    if any(text == expected_value for _, _, text in group_actions) or sorted(
-        box_index for box_index, _, _ in group_actions
-    ) == list(range(attempt.expected_digits)):
+    if (
+        allow_partial
+        or any(text == expected_value for _, _, text in group_actions)
+        or sorted(box_index for box_index, _, _ in group_actions) == list(range(attempt.expected_digits))
+    ):
         return {action_index for _, action_index, _ in group_actions}
+    # Without explicit verification intent, a matching digit in one box could arm a PIN entry.
     return set()
 
 
@@ -1111,12 +1131,13 @@ def _first_plan_carries_consumable_totp(
     attempt: MultiFieldTotpAttempt,
     *,
     task_id: str | None = None,
+    allow_partial: bool = False,
 ) -> bool:
     """Whether the first plan contains a consumable action for the armed OTP group."""
     return (
         multi_field_source_ready
         and not skyvern_context.multi_field_totp_retry_budget_exhausted(task_id)
-        and bool(_multi_field_totp_action_indices(actions, attempt))
+        and bool(_multi_field_totp_action_indices(actions, attempt, allow_partial=allow_partial))
     )
 
 
@@ -1407,26 +1428,28 @@ async def _read_task_v3_llm_name_override(
         return None
     # get_config synthesizes a config for unknown keys, so require an explicitly registered,
     # non-custom (not org-owned BYO) llm_key.
-    if is_custom_llm_key(variant) or not LLMConfigRegistry.is_registered(variant):
+    # A non-router ANTHROPIC key takes LLMCaller's native Anthropic message path, which cannot build a Task V3
+    # transcript.
+    if (
+        is_custom_llm_key(variant)
+        or not LLMConfigRegistry.is_registered(variant)
+        or (not LLMConfigRegistry.is_router_config(variant) and "ANTHROPIC" in variant)
+    ):
         LOG.warning("TASK_V3_LLM_NAME is not a usable registered llm_key; ignoring", variant=variant)
         return None
     return variant
 
 
 async def _resolve_task_v3_llm_key(task: Task) -> str:
-    """Choose the LLM the native Task V3 engine runs on.
-
-    Order: explicit task.llm_key -> TASK_V3_LLM_NAME PostHog flag (per-task runtime override, so the
-    model can change without a redeploy, like LLM_NAME) -> TASK_V3_LLM_KEY setting -> LLM_KEY setting.
-    LLMCaller now dispatches router/flex keys too, so any of these may be a router group.
-    """
+    """Resolve Task V3's LLM key, preserving explicit task keys and downgrading UI defaults."""
     if task.llm_key:
         return task.llm_key
     # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
     context = skyvern_context.current()
     workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
-    return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
+    resolved = override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
+    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved
 
 
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
@@ -2192,11 +2215,14 @@ class ForgeAgent:
             task_retry=task_retry,
         )
         # Update task status to running
-        task = await app.DATABASE.tasks.update_task(
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-            status=TaskStatus.running,
-        )
+        if await run_lease_lost(workflow_run.workflow_run_id):
+            task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
+        else:
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                status=TaskStatus.running,
+            )
 
         step = await app.DATABASE.tasks.create_step(
             task.task_id,
@@ -2237,11 +2263,14 @@ class ForgeAgent:
                 order=task_order,
                 retry=task_retry,
             )
-            task = await app.DATABASE.tasks.update_task(
-                task_id=task.task_id,
-                organization_id=organization_id,
-                status=TaskStatus.running,
-            )
+            if await run_lease_lost(workflow_run_id):
+                task = await app.DATABASE.tasks.get_task(task.task_id, organization_id) or task
+            else:
+                task = await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.running,
+                )
             step = await app.DATABASE.tasks.create_step(
                 task.task_id,
                 order=0,
@@ -2270,7 +2299,9 @@ class ForgeAgent:
             )
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
-            unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+            unusable = unusable_browser_session_error(
+                browser_session, refused_at_submission=True, submission_path="task_v1"
+            )
             if unusable is not None:
                 raise unusable
 
@@ -3327,6 +3358,7 @@ class ForgeAgent:
                 target_action_reserve=target_action_reserve,
                 block_completion_judge=block_completion_judge,
                 code_typed_values=recovery_code_progress.typed_values if recovery_code_progress else (),
+                anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config),
             )
         finally:
             input_dispatch.end_login_pace()
@@ -5068,7 +5100,12 @@ class ForgeAgent:
 
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
-            actions, pdf_auto_download_src, pdf_auto_download_used_bytes = await self._generate_step_actions(
+            (
+                actions,
+                pdf_auto_download_src,
+                pdf_auto_download_used_bytes,
+                allow_partial_multi_field_totp_plan,
+            ) = await self._generate_step_actions(
                 task=task,
                 step=step,
                 browser_state=browser_state,
@@ -5120,6 +5157,7 @@ class ForgeAgent:
                 file_download_false_click_eligible=isinstance(task_block, FileDownloadBlock),
                 _step_span=_step_span,
                 artifact_tracker=artifact_tracker,
+                allow_partial_multi_field_totp_plan=allow_partial_multi_field_totp_plan,
             )
             if early_return is not None:
                 return early_return
@@ -5222,6 +5260,7 @@ class ForgeAgent:
         file_download_false_click_eligible: bool,
         _step_span: otel_trace.Span,
         artifact_tracker: _BackgroundArtifactTaskTracker,
+        allow_partial_multi_field_totp_plan: bool = False,
     ) -> tuple[list[Action], tuple[Step, DetailedAgentStepOutput] | None]:
         # Execute the actions
         action_results: list[ActionResult] = []
@@ -5271,7 +5310,11 @@ class ForgeAgent:
         totp_group_filled = False
         context = skyvern_context.ensure_context()
         attempt = context.multi_field_totp.get(task.task_id)
-        totp_action_indices = _multi_field_totp_action_indices(actions, attempt) if attempt is not None else set()
+        totp_action_indices = (
+            _multi_field_totp_action_indices(actions, attempt, allow_partial=allow_partial_multi_field_totp_plan)
+            if attempt is not None
+            else set()
+        )
         first_totp_action_index = min(totp_action_indices, default=None)
         totp_dispatch_page = scraped_page
         for action_idx, action in enumerate(actions):
@@ -5785,9 +5828,10 @@ class ForgeAgent:
         speculative_llm_metadata: SpeculativeLLMMetadata | None,
         context: SkyvernContext | None,
         allowed_credential_parameter_keys: Sequence[str] | None = None,
-    ) -> tuple[list[Action], str | None, bool]:
+    ) -> tuple[list[Action], str | None, bool, bool]:
         pdf_auto_download_src: str | None = None
         pdf_auto_download_used_bytes = False
+        allow_partial_multi_field_totp_plan = False
         actions: list[Action]
         # Provenance is opt-in per branch, so a branch added later is unstamped until someone
         # decides it was derived from the scrape. A blanket stamp at the end of this method had the
@@ -5971,6 +6015,9 @@ class ForgeAgent:
                             allowed_credential_parameter_keys=allowed_credential_parameter_keys,
                         )
                         otp_json_response, otp_actions = otp_result
+                        allow_partial_multi_field_totp_plan = _planner_confirmed_verification_code_intent(
+                            otp_json_response
+                        )
                         if isinstance(otp_result, ReplacedOTPPlan) or otp_actions:
                             detailed_agent_step_output.llm_response = otp_json_response
                             actions = otp_actions
@@ -6052,7 +6099,7 @@ class ForgeAgent:
             # actions injected before the scrape ran, a magic-link navigation aimed at a page nobody
             # scraped, a TOTP timeout terminate — stays unstamped and is judged on that.
             stamp_parsed_actions(actions)
-        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes
+        return actions, pdf_auto_download_src, pdf_auto_download_used_bytes, allow_partial_multi_field_totp_plan
 
     async def _generate_cua_actions(
         self,
@@ -8246,6 +8293,7 @@ class ForgeAgent:
         # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
         # This prevents extract-action cache from being attached to other prompts (e.g. validation).
         context.cached_static_prompt = None
+        context.cached_task_prompt = None
         context.vertex_cache_name = None
 
         # Check if prompt caching is enabled for extract-action
@@ -8267,8 +8315,6 @@ class ForgeAgent:
             or prompt_caching_settings.get(EXTRACT_ACTION_TEMPLATE)
             or (template == EXTRACT_ACTION_TEMPLATE and uses_anthropic_handler)
         )
-        if cache_enabled and uses_anthropic_handler and await self._is_anthropic_prompt_caching_disabled(context):
-            cache_enabled = False
         LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
@@ -8418,6 +8464,10 @@ class ForgeAgent:
                 # first call succeeds even if the cache is cold. The cached reference simply lets the service
                 # reuse the static portion internally.
                 context.cached_static_prompt = static_prompt
+                task_prompt, page_data_marker, _ = dynamic_prompt.lstrip().partition(UNTRUSTED_WEB_PAGE_DATA_BEGIN)
+                # Not redacted here: the LLM handler redacts it with the prompt's secret set, so it stays a prefix
+                # of the text sent (the run's full set here also covers runtime OTPs the prompt keeps).
+                context.cached_task_prompt = task_prompt if page_data_marker and task_prompt else None
                 context.use_prompt_caching = True
                 use_caching = True
 
@@ -8575,26 +8625,6 @@ class ForgeAgent:
             )
 
         return context.prompt_caching_settings
-
-    async def _is_anthropic_prompt_caching_disabled(self, context: SkyvernContext) -> bool:
-        distinct_id = context.run_id or context.workflow_run_id or context.task_id
-        organization_id = context.organization_id
-        if not distinct_id or not organization_id:
-            return False
-        try:
-            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "DISABLE_ANTHROPIC_PROMPT_CACHING",
-                distinct_id,
-                properties={"organization_id": organization_id},
-            )
-        except Exception as exc:
-            LOG.warning(
-                "Failed to evaluate Anthropic prompt caching kill switch; leaving caching on",
-                distinct_id=distinct_id,
-                organization_id=organization_id,
-                error=str(exc),
-            )
-            return False
 
     async def _is_multi_tab_control_enabled(self, context: SkyvernContext) -> bool:
         distinct_id = context.run_id or context.workflow_run_id or context.task_id
@@ -9829,11 +9859,21 @@ class ForgeAgent:
             diff=skyvern_context.mask_multi_field_totp_data(update_comparison, task_id=task.task_id),
             sampling=True,
         )
+        registered_run_id = task.workflow_run_id or task.task_id
+        lease_lost = await run_lease_lost(registered_run_id)
+        if lease_lost and not status.is_final():
+            return await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id) or task
         updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
             task.task_id,
             organization_id=task.organization_id,
+            keep_final_status=lease_lost,
             **updates,
         )
+        if lease_lost and updated_task.status != status:
+            note_run_finalized(task.task_id)
+            return updated_task
+        if status.is_final():
+            note_run_finalized(task.task_id)
         # Minutes emit only when THIS write atomically flipped finished_at from NULL
         # -- the shared claim every task_v1 finalizer rides -- so a concurrent
         # finalizer (the stuck-task sweep's CAS, the temporal timeout activity, a
@@ -10344,7 +10384,9 @@ class ForgeAgent:
                 )
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
-                failure_category = persisted_action.failure_categories or classify_from_failure_reason(failure_reason)
+                failure_category = bounded_failure_categories(persisted_action.failure_categories) or (
+                    classify_from_failure_reason(failure_reason)
+                )
                 LOG.info(
                     "Task failure classified",
                     task_id=task.task_id,
@@ -10609,18 +10651,12 @@ class ForgeAgent:
             )
 
             user_errors = list(failure_response.errors)
-            # Keep legacy mapping support for non-credential categories; credential verdicts must have passed
-            # through summary_failure_reason_for_max_retries' confirmation gate.
-            for category in failure_response.failure_categories:
-                category_name = category.get("category")
-                if not isinstance(category_name, str) or category_name.upper() in FailureCategory.__members__:
+            # Preserve mapped error recovery without treating taxonomy case variants as customer codes.
+            for category_name in failure_response._rejected_failure_categories:
+                if category_name.upper() in FailureCategory.__members__:
                     continue
                 error_code = resolve_error_code_mapping_key(category_name, task.error_code_mapping)
-                if (
-                    error_code
-                    and not is_credential_rejection_code(error_code)
-                    and error_code not in {error.error_code for error in user_errors}
-                ):
+                if error_code and error_code not in {error.error_code for error in user_errors}:
                     user_errors.append(
                         UserDefinedError(
                             error_code=error_code,
@@ -10692,14 +10728,7 @@ class ForgeAgent:
             )
             return next_step
 
-    async def _filter_response_errors(
-        self,
-        task: Task,
-        step: Step,
-        errors: list[UserDefinedError],
-        *,
-        credential_context: CredentialVerdictContext | None = None,
-    ) -> list[UserDefinedError]:
+    def _filter_response_errors(self, task: Task, step: Step, errors: list[UserDefinedError]) -> list[UserDefinedError]:
         canonical = [
             error.model_copy(update={"error_code": key})
             if (key := resolve_error_code_mapping_key(error.error_code, task.error_code_mapping))
@@ -10715,7 +10744,7 @@ class ForgeAgent:
                 dropped_codes=dropped,
                 allowed_codes=sorted((task.error_code_mapping or {}).keys()),
             )
-        return await confirm_credential_verdicts(task=task, step=step, errors=kept, context=credential_context)
+        return kept
 
     async def summary_failure_reason_for_max_steps(
         self,
@@ -10815,17 +10844,13 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
-            response.errors = await self._filter_response_errors(
-                task=task,
-                step=step,
-                errors=response.errors,
-                credential_context=CredentialVerdictContext(
-                    current_url=page.url if page is not None else None,
-                    screenshots=screenshots,
-                    agent_reasoning=response.reasoning,
-                ),
+            _append_mapped_category_errors(
+                response.errors,
+                response.failure_categories,
+                task.error_code_mapping,
+                response._rejected_failure_categories,
             )
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:
             LOG.warning("Failed to summary the failure reason")
@@ -10979,19 +11004,13 @@ class ForgeAgent:
                 system_prompt=task.workflow_system_prompt,
             )
             response = MaxStepsReasonResponse.model_validate(json_response)
-            # A category-only credential verdict must reach this same gate before it is returned.
-            _append_mapped_category_errors(response.errors, response.failure_categories, task.error_code_mapping)
-            response.errors = await self._filter_response_errors(
-                task=task,
-                step=step,
-                errors=response.errors,
-                credential_context=CredentialVerdictContext(
-                    current_url=page.url if page is not None else None,
-                    elements=html or None,
-                    screenshots=screenshots,
-                    agent_reasoning=response.reasoning,
-                ),
+            _append_mapped_category_errors(
+                response.errors,
+                response.failure_categories,
+                task.error_code_mapping,
+                response._rejected_failure_categories,
             )
+            response.errors = self._filter_response_errors(task=task, step=step, errors=response.errors)
             return response
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
@@ -11474,6 +11493,7 @@ class ForgeAgent:
                 multi_field_source_ready,
                 multi_field_attempt,
                 task_id=task.task_id,
+                allow_partial=_planner_confirmed_verification_code_intent(json_response),
             )
             and (
                 multi_field_attempt.code_source == "external"

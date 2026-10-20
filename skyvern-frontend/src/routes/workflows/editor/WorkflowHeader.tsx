@@ -39,6 +39,11 @@ import {
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { ControlTooltip } from "../studio/ControlTooltip";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { cn } from "@/util/utils";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
@@ -110,6 +115,7 @@ function BrowserModeButton() {
 function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
   const isRecording = useRecordingStore().isRecording;
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const onSave = useSaveWorkflow();
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -131,30 +137,31 @@ function SaveButton() {
 
   return (
     <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            size="icon"
-            variant="tertiary"
-            className="size-10 min-w-[2.5rem]"
-            disabled={isGlobalWorkflow || isRecording}
-            onClick={() => {
-              if (pendingGoalChangeCount > 0) {
-                setGoalDialogOpen(true);
-                return;
-              }
-              save();
-            }}
-          >
-            {saving ? (
-              <ReloadIcon className="size-6 animate-spin" />
-            ) : (
-              <SaveIcon className="size-6" />
-            )}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>Save</TooltipContent>
-      </Tooltip>
+      <ControlTooltip
+        content="Save"
+        reason={saveLockReason}
+        blocked={saveLockReason !== null}
+      >
+        <Button
+          size="icon"
+          variant="tertiary"
+          className="size-10 min-w-[2.5rem] disabled:pointer-events-none"
+          disabled={isGlobalWorkflow || isRecording || saveLockReason !== null}
+          onClick={() => {
+            if (pendingGoalChangeCount > 0) {
+              setGoalDialogOpen(true);
+              return;
+            }
+            save();
+          }}
+        >
+          {saving ? (
+            <ReloadIcon className="size-6 animate-spin" />
+          ) : (
+            <SaveIcon className="size-6" />
+          )}
+        </Button>
+      </ControlTooltip>
       <PendingGoalChangesDialog
         open={goalDialogOpen}
         onOpenChange={setGoalDialogOpen}

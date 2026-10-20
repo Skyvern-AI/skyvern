@@ -179,12 +179,13 @@ async def test_skyvern_login_success_returns_run_data(monkeypatch: pytest.Monkey
 
     result = await mcp_browser.skyvern_login(
         credential_type="skyvern",
-        credential_id="cred_123",
+        credential_id="cred_onepassword_imported",
     )
 
     assert result["ok"] is True
     assert result["data"]["run_id"] == "wr_123"
     assert result["data"]["status"] == "completed"
+    assert page.agent.login.await_args.kwargs["credential_id"] == "cred_onepassword_imported"
 
 
 @pytest.mark.asyncio

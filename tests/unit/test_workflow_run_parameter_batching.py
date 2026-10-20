@@ -32,6 +32,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.api_app import handle_skyvern_http_exception
+from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -48,7 +49,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.tags import (
+    INTEGRATION_PLATFORM_RUN_TAG_KEY,
+    CallerType,
+    TagSource,
+    TagWriteContext,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
@@ -260,6 +266,47 @@ async def test_setup_workflow_run_writes_create_time_system_tags() -> None:
         },
         caller_id="system:creation-tagging",
     )
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_defers_integration_platform_tag_to_post_dispatch() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+    post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.resolve_target_domain_for_run_provenance",
+            return_value=None,
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            return_value=None,
+        ),
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            integration_platform="zapier",
+            post_dispatch_effects=post_dispatch_effects,
+        )
+        assert result is workflow_run
+        mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_not_awaited()
+        assert len(post_dispatch_effects) == 1
+        await post_dispatch_effects[0]()
+        mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once_with(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization.organization_id,
+            sets={"skyvern.trigger": "api", INTEGRATION_PLATFORM_RUN_TAG_KEY: "zapier"},
+            caller_id="system:creation-tagging",
+        )
 
 
 @pytest.mark.asyncio
@@ -596,6 +643,7 @@ async def test_setup_workflow_run_still_validates_provided_credential_for_at_wil
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -625,6 +673,7 @@ async def test_setup_workflow_run_credential_with_default_uses_default() -> None
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_id_0")]
@@ -849,7 +898,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
                 organization=organization,
             )
 
-    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
+    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization, workflow_run_id="wr_test")
     service._resolve_and_stamp_run_seed.assert_not_awaited()
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
@@ -874,6 +923,7 @@ async def test_setup_workflow_run_batches_credential_validation() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id=f"cred_id_{i}") for i in range(3)]
@@ -935,6 +985,7 @@ async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> No
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -968,6 +1019,7 @@ async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         # Only cred_id_0 exists; cred_id_1 and cred_id_2 are missing.
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
@@ -1007,6 +1059,7 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_shared")]
@@ -1568,15 +1621,21 @@ async def test_setup_rejects_composite_template_item_id_with_known_parameters() 
 class RunSubmissionLab:
     client: httpx.AsyncClient
     database: AgentDB
+    workflow_service: WorkflowService
     workflow_permanent_id: str
     execute_workflow: AsyncMock
 
-    async def submit(self, route: str, parameters: dict[str, object]) -> httpx.Response:
+    async def submit(self, route: str, parameters: dict[str, object], *, user_agent: str = "") -> httpx.Response:
+        headers = {"user-agent": user_agent}
         if route == "run":
             return await self.client.post(
-                "/v1/run/workflows", json={"workflow_id": self.workflow_permanent_id, "parameters": parameters}
+                "/v1/run/workflows",
+                json={"workflow_id": self.workflow_permanent_id, "parameters": parameters},
+                headers=headers,
             )
-        return await self.client.post(f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters})
+        return await self.client.post(
+            f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters}, headers=headers
+        )
 
     async def run_rows(self) -> list[WorkflowRunModel]:
         async with self.database.Session() as session:
@@ -1663,6 +1722,7 @@ async def run_submission_lab(
     )
 
     fastapi_app = FastAPI()
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
     fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: CallerContext(
         organization=organization, caller_id="u_test", caller_type=CallerType.USER
     )
@@ -1684,9 +1744,38 @@ async def run_submission_lab(
         yield RunSubmissionLab(
             client=client,
             database=database,
+            workflow_service=workflow_service,
             workflow_permanent_id=workflow.workflow_permanent_id,
             execute_workflow=execute_workflow,
         )
+
+
+@pytest.mark.asyncio
+async def test_run_submission_carries_user_agent_platform_through_real_prepare_and_post_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+) -> None:
+    async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        apply_system_tags = AsyncMock()
+        monkeypatch.setattr(lab.database.tags, "apply_system_run_tag_changes", apply_system_tags)
+        setup_workflow_run = AsyncMock(wraps=lab.workflow_service.setup_workflow_run)
+        monkeypatch.setattr(lab.workflow_service, "setup_workflow_run", setup_workflow_run)
+
+        async def check_tag_is_deferred(*args: object, **kwargs: object) -> None:
+            apply_system_tags.assert_not_awaited()
+
+        lab.execute_workflow.side_effect = check_tag_is_deferred
+        response = await lab.submit(
+            "run",
+            {"login": "cred_live", "email": "a@example.com"},
+            user_agent="Make/production",
+        )
+
+        assert response.status_code == 200
+        setup_workflow_run.assert_awaited_once()
+        assert setup_workflow_run.await_args.kwargs["integration_platform"] == "make"
+        apply_system_tags.assert_awaited_once()
+        assert apply_system_tags.await_args.kwargs["sets"][INTEGRATION_PLATFORM_RUN_TAG_KEY] == "make"
 
 
 @pytest.mark.asyncio

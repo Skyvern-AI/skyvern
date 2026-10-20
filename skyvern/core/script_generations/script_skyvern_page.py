@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import os
 import re
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -82,6 +83,16 @@ LOG = structlog.get_logger()
 
 action_wrap = SkyvernPage.action_wrap
 
+_SCRIPT_SCRAPED_PAGES: weakref.WeakKeyDictionary[object, ScrapedPage] = weakref.WeakKeyDictionary()
+
+
+def _get_scraped_page(page: object) -> ScrapedPage:
+    return _SCRIPT_SCRAPED_PAGES[page]
+
+
+def _set_scraped_page(page: object, scraped_page: ScrapedPage) -> None:
+    _SCRIPT_SCRAPED_PAGES[page] = scraped_page
+
 
 def _redact_termination_payload(
     reason: str, errors: list[UserDefinedError] | None = None
@@ -130,6 +141,7 @@ class ScriptSkyvernPage(SkyvernPage):
     ) -> None:
         super().__init__(page=page, ai=ai, engine_selection=engine_selection)
         self.scraped_page = scraped_page
+        _set_scraped_page(self, scraped_page)
         self._record = recorder or (lambda ac: None)
 
     @classmethod
@@ -1100,9 +1112,11 @@ class ScriptSkyvernPage(SkyvernPage):
 
         # Retry logic matching agent mode (real_browser_state.navigate_to_url)
         last_error: Exception | None = None
+        _get_scraped_page(self)._browser_state.begin_navigation()
         for attempt in range(max_retries):
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
+                await _get_scraped_page(self)._browser_state.record_navigation_result(None, url=url)
                 if is_script_mode:
                     LOG.debug("Page loaded")
                 return
@@ -1121,6 +1135,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         if last_error is None:
             raise RuntimeError("Navigation failed but no error was captured")
+        await _get_scraped_page(self)._browser_state.record_navigation_result(last_error)
         raise last_error
 
     async def magic_link(

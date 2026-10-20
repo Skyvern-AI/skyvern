@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,8 +12,10 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.api_app import handle_skyvern_http_exception
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
@@ -20,6 +23,7 @@ from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _commit_staged_workflow,
+    _restore_workflow_definition,
     workflow_copilot_apply_proposed_workflow,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -140,6 +144,7 @@ async def idempotency_lab(
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
     fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
     fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/v1")
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     transport = httpx.ASGITransport(app=fastapi_app)
     try:
@@ -356,7 +361,7 @@ async def test_create_workflow_honors_idempotency_key(
                 )
             assert active_row_count == 2
 
-            await workflow_service.delete_workflow_by_permanent_id(
+            await workflow_service.soft_delete_workflow_by_permanent_id(
                 original.json()["workflow_permanent_id"],
                 organization.organization_id,
             )
@@ -427,35 +432,25 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
 async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-database-timeout.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    organization = await database.organizations.create_organization(
-        organization_name="Test",
-        organization_id="o_test",
-    )
+    async with idempotency_lab(monkeypatch, tmp_path / "idempotency-database-timeout.db") as lab:
 
-    @asynccontextmanager
-    async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
-        raise TimeoutError("database timed out")
-        yield
+        @asynccontextmanager
+        async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
+            raise TimeoutError("database timed out")
+            yield
 
-    monkeypatch.setattr(database.workflows, "_workflow_creation_transaction", database_timeout)
-    monkeypatch.setattr(app, "DATABASE", database)
-    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+        monkeypatch.setattr(lab.database.workflows, "_workflow_creation_transaction", database_timeout)
 
-    try:
-        with pytest.raises(FailedToCreateWorkflow, match="database timed out"):
-            await agent_protocol.create_workflow(
-                data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
-                folder_id=None,
-                current_org=organization,
-                user_id="u_test",
-                idempotency_key="database-timeout-key",
-            )
-    finally:
-        await database.engine.dispose()
+        with caplog.at_level(logging.ERROR):
+            response = await lab.create("database-timeout-key")
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Failed to create workflow. Error: An unexpected error occurred"}
+        assert "database timed out" in caplog.text
+        assert "database timed out" not in response.text
+        assert await lab.count_workflows() == 0
 
 
 @pytest.mark.asyncio
@@ -502,7 +497,7 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
     monkeypatch.setattr(workflow_service, "maybe_delete_cached_code", fail_cache_invalidation)
 
     try:
-        with pytest.raises(FailedToCreateWorkflow, match="cache invalidation failed"):
+        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
             await agent_protocol.create_workflow(
                 data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
                 folder_id=None,
@@ -510,6 +505,8 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
                 user_id="u_test",
                 idempotency_key="rollback-key",
             )
+        assert "cache invalidation failed" not in str(raised.value)
+        assert "cache invalidation failed" in str(raised.value.__cause__)
 
         assert first_save_at is not None
         async with database.Session() as session:
@@ -697,7 +694,7 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
     try:
-        with pytest.raises(FailedToCreateWorkflow, match="definition write failed"):
+        with pytest.raises(FailedToCreateWorkflow, match="An unexpected error occurred") as raised:
             await agent_protocol.create_workflow(
                 data=WorkflowRequest.model_validate(WORKFLOW_CREATE_PAYLOAD),
                 folder_id=None,
@@ -705,6 +702,8 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
                 user_id="u_test",
                 idempotency_key="write-rollback-key",
             )
+        assert "definition write failed" not in str(raised.value)
+        assert "definition write failed" in str(raised.value.__cause__)
 
         async with database.Session() as session:
             workflow_count = await session.scalar(select(func.count()).select_from(WorkflowModel))
@@ -1059,3 +1058,61 @@ async def test_workflow_setting_presence_preserves_persisted_values(
         )
         assert persisted is not None
         assert getattr(persisted, field_name) == expected
+
+
+@pytest.mark.asyncio
+async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "build-source.db") as lab:
+
+        async def build_source_of(workflow_id: str) -> str | None:
+            persisted = await lab.database.workflows.get_workflow(
+                workflow_id=workflow_id, organization_id=lab.organization.organization_id
+            )
+            assert persisted is not None
+            return persisted.build_source
+
+        created = await lab.client.post(
+            "/v1/agents", headers={"x-user-agent": "skyvern-mcp"}, json=WORKFLOW_CREATE_PAYLOAD
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["build_source"] == "mcp"
+        workflow_permanent_id = created.json()["workflow_permanent_id"]
+
+        definition = WORKFLOW_CREATE_PAYLOAD["json_definition"]
+        ui_save = await lab.client.put(
+            f"/v1/workflows/{workflow_permanent_id}",
+            content=yaml.safe_dump(definition),
+            headers={"Content-Type": "application/x-yaml", "x-user-agent": "skyvern-ui"},
+        )
+        cli_save = await lab.client.post(
+            f"/v1/workflows/{workflow_permanent_id}",
+            headers={"x-user-agent": "skyvern-cli"},
+            json={"json_definition": definition},
+        )
+        api_save = await lab.client.post(f"/v1/workflows/{workflow_permanent_id}", json={"json_definition": definition})
+        assert ui_save.status_code == 200 and cli_save.status_code == 200 and api_save.status_code == 200
+        assert await build_source_of(ui_save.json()["workflow_id"]) == "ui"
+        assert await build_source_of(cli_save.json()["workflow_id"]) == "cli"
+        api_version = Workflow.model_validate(api_save.json())
+        assert await build_source_of(api_version.workflow_id) == "api"
+
+        staged = await _process_workflow_yaml(
+            workflow_id=api_version.workflow_id,
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=lab.organization.organization_id,
+            workflow_yaml=yaml.safe_dump(definition),
+        )
+        await _commit_staged_workflow(
+            organization_id=lab.organization.organization_id,
+            workflow_id=api_version.workflow_id,
+            workflow_permanent_id=workflow_permanent_id,
+            staged_workflow=staged,
+        )
+        assert await build_source_of(api_version.workflow_id) == "copilot"
+
+        # A rolled-back copilot turn must not leave its stamp on the version the API caller wrote.
+        await _restore_workflow_definition(api_version, lab.organization.organization_id)
+        assert await build_source_of(api_version.workflow_id) == "api"

@@ -925,6 +925,8 @@ class CDPDownloadInterceptor:
         # Track auth attempts per requestId to prevent infinite retry loops
         # when proxy credentials are rejected (407 → ProvideCredentials → 407 → …)
         self._auth_attempts: dict[str, int] = {}
+        self._auth_challenge_seen = False
+        self._proxy_auth_rejection_seen = False
         # Track URLs already downloaded (dedup between Fetch interception and browser download monitor)
         self._downloaded_urls: set[str] = set()
         self._artifact_scope_lock = threading.Lock()
@@ -1252,6 +1254,12 @@ class CDPDownloadInterceptor:
         if self._proxy_username and self._proxy_password:
             return self._proxy_username, self._proxy_password
         return None
+
+    def consume_navigation_auth_challenges(self) -> tuple[bool, bool]:
+        challenges = (self._proxy_auth_rejection_seen, self._auth_challenge_seen)
+        self._proxy_auth_rejection_seen = False
+        self._auth_challenge_seen = False
+        return challenges
 
     def rebind_download_scope(
         self,
@@ -2525,6 +2533,7 @@ class CDPDownloadInterceptor:
         request_id = event.get("requestId")
         source = ""
         request_origin = "<unknown>"
+        self._auth_challenge_seen = True
 
         try:
             # Reduce a present request URL to its origin first: a malformed ``authChallenge`` (null) raises
@@ -2561,6 +2570,8 @@ class CDPDownloadInterceptor:
             else:
                 # Clean up attempt tracking for this request
                 self._auth_attempts.pop(request_id, None)
+                if source == "Proxy" and self._proxy_username and self._proxy_password and attempts >= 1:
+                    self._proxy_auth_rejection_seen = True
                 if attempts >= 1:
                     LOG.warning(
                         "CDP proxy auth credentials rejected, cancelling to prevent retry loop",

@@ -34,6 +34,8 @@ from skyvern.forge.sdk.schemas.sms import (
     TwilioPhoneNumberInfo,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.services.twilio_service import (
     TwilioApiError,
     build_client_from_credential,
@@ -422,6 +424,9 @@ async def _enable_twilio_phone_number_locked(
     organization_id: str,
 ) -> OrganizationPhoneNumber:
     if request.credential_id is not None:
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(), "credential.use", {("credential_id", request.credential_id)}
+        )
         bound_credential = await app.DATABASE.credentials.get_credential(
             request.credential_id, organization_id=organization_id
         )
@@ -445,6 +450,14 @@ async def _enable_twilio_phone_number_locked(
             raise HTTPException(status_code=409, detail="Phone number changed during lifecycle operation")
         registered = await _get_registered_phone_number(phone_number, organization_id)
         _require_twilio_provider(registered)
+        if (
+            registered is not None
+            and registered.credential_id is not None
+            and registered.credential_id != request.credential_id
+        ):
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.use", {("credential_id", registered.credential_id)}
+            )
         connected_config = await app.DATABASE.sms.get_connected_sms_config(organization_id)
         if connected_config is None:
             connected_config = await app.DATABASE.sms.create_sms_config(
@@ -667,6 +680,7 @@ async def get_twilio_credential(
 )
 async def delete_twilio_credential(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"credential.delete"}))),
 ) -> dict[str, bool]:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id
@@ -702,7 +716,16 @@ async def list_registered_phone_numbers(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> list[OrganizationPhoneNumber]:
     _require_twilio_sms_enabled()
-    return await app.DATABASE.sms.list_phone_numbers(current_org.organization_id)
+    phone_numbers = await app.DATABASE.sms.list_phone_numbers(current_org.organization_id)
+    credential_ids = {phone.credential_id for phone in phone_numbers if phone.credential_id is not None}
+    if credential_ids and await app.AGENT_FUNCTION.credential_folders_restricted(current_org.organization_id):
+        accessible_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            get_request_principal(), "credential.read", credential_ids
+        )
+        for phone in phone_numbers:
+            if phone.credential_id not in accessible_credential_ids:
+                phone.credential_id = None
+    return phone_numbers
 
 
 @twilio_integration_router.get(
@@ -791,6 +814,10 @@ async def _disable_twilio_phone_number_locked(
         if registered is None:
             raise HTTPException(status_code=404, detail="Phone number not found")
         _require_twilio_provider(registered)
+        if registered.credential_id is not None:
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.use", {("credential_id", registered.credential_id)}
+            )
         was_quarantined = registered.status == "quarantined"
         client: Any | None = None
         if registered.provider_number_sid:
@@ -881,6 +908,15 @@ async def _disable_twilio_phone_number_locked(
             phone_number.phone_number_id,
             changed_fields=("status",),
         )
+        if (
+            phone_number.credential_id is not None
+            and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+            and phone_number.credential_id
+            not in await app.AGENT_FUNCTION.accessible_credential_ids(
+                get_request_principal(), "credential.read", {phone_number.credential_id}
+            )
+        ):
+            phone_number.credential_id = None
         return phone_number
 
 

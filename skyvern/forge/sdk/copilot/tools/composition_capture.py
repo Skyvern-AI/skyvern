@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_KEY_VALUE_RELATIONS,
     CONSENT_OBSTRUCTION_KIND,
+    fit_authoring_facts,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
@@ -168,11 +169,17 @@ def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentCo
     shaped = copy.deepcopy(result)
     data = shaped.get("data")
     if isinstance(data, dict):
-        for authoring_facts in (True, False):
-            shaped["data"] = model_visible_composition_evidence(data, authoring_facts=authoring_facts)
-            _attach_field_upload_routes(shaped["data"], upload_routes_for(copilot_ctx))
-            if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS:
-                break
+        upload_routes = upload_routes_for(copilot_ctx)
+        projected, bare = (model_visible_composition_evidence(data, authoring_facts=facts) for facts in (True, False))
+        for packet in (projected, bare):
+            _attach_field_upload_routes(packet, upload_routes)
+
+        def fits(packet: dict[str, Any]) -> bool:
+            return (
+                len(json.dumps({**shaped, "data": packet})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS
+            )
+
+        shaped["data"] = fit_authoring_facts(projected, bare, fits)
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")

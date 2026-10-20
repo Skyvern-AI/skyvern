@@ -294,6 +294,10 @@ class CustomCredentialServiceConfig(BaseModel):
     )
 
 
+class CustomCredentialServiceStatusResponse(BaseModel):
+    configured: bool
+
+
 class CustomCredentialServiceConfigResponse(BaseModel):
     """Response model for custom credential service operations."""
 

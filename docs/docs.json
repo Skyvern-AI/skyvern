@@ -70,6 +70,7 @@
               "developers/getting-started/mcp",
               "developers/browser-automation",
               "developers/production",
+              "developers/event-triggers",
               "developers/troubleshooting",
               "developers/self-hosted/overview"
             ]
@@ -653,7 +654,7 @@
     },
     {
       "source": "/debugging/observability-with-laminar",
-      "destination": "/developers/production#observability"
+      "destination": "/developers/troubleshooting#use-artifacts"
     },
     {
       "source": "/debugging/troubleshooting-guide",
@@ -1025,7 +1026,7 @@
     },
     {
       "source": "/developers/debugging/observability-with-laminar",
-      "destination": "/developers/production#observability"
+      "destination": "/developers/troubleshooting#use-artifacts"
     },
     {
       "source": "/developers/debugging/using-artifacts",

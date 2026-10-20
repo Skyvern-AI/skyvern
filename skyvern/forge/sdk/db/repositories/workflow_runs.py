@@ -12,7 +12,6 @@ from typing import cast as typing_cast
 import structlog
 from pydantic import ValidationError
 from sqlalchemy import (
-    JSON,
     ColumnElement,
     Integer,
     Label,
@@ -45,6 +44,7 @@ from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import CompoundSelect, Join
 
 from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.forge import app
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -96,6 +96,7 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log_attempt
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.services.request_principal import api_key_actor_id, get_request_principal
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -118,24 +119,9 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
-from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.schemas.workflows import BlockStatus
 
 LOG = structlog.get_logger()
-
-# Values a credential parameter holds once its content has been dropped. Equality on them would match
-# unrelated runs, so they are not a credential identity.
-_REDACTED_PARAMETER_VALUES = frozenset({"[removed]", "null", "None"})
-
-
-@dataclass(frozen=True)
-class RecentCredentialLogin:
-    """Whether a credential this run used already logged in on the same workflow inside the window.
-    ``credential_known`` is False when the run exposes no credential parameter to compare, which is a
-    different answer from "it never logged in"."""
-
-    credential_known: bool
-    logged_in_at: datetime | None = None
-
 
 # Well under the connection's own DATABASE_STATEMENT_TIMEOUT_MS, so an unanswerable free-text search
 # hands the connection back rather than holding it until that expires. Budget for the whole read, not
@@ -434,6 +420,33 @@ async def _first_queued_at(
             session, organization_id=workflow_run.organization_id, workflow_run_id=workflow_run.workflow_run_id
         )
     return naive_utc_now()
+
+
+async def _hidden_workflow_ids(organization_id: str) -> frozenset[str] | None:
+    """Workflows in folders the caller cannot see, resolved once per request; await it before opening a session."""
+    return await app.AGENT_FUNCTION.hidden_workflow_permanent_ids(get_request_principal(), organization_id)
+
+
+async def _folder_access_filter(
+    organization_id: str, workflow_permanent_id: ColumnElement[str | None]
+) -> ColumnElement[bool] | None:
+    hidden = await _hidden_workflow_ids(organization_id)
+    if not hidden:
+        return None
+    # Runs with no workflow (standalone tasks) stay org-wide, as before folder ACLs.
+    return or_(workflow_permanent_id.is_(None), workflow_permanent_id.not_in(hidden))
+
+
+def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
+    # The claim is a finalized_at with no status yet: recording the outcome completes it, and a reset clears both.
+    # An unrecorded claim older than stale_before outlived any bounded delivery, so its sender is gone.
+    return and_(
+        WorkflowRunModel.webhook_delivery_status.is_(None),
+        or_(
+            WorkflowRunModel.webhook_delivery_finalized_at.is_(None),
+            WorkflowRunModel.webhook_delivery_finalized_at < stale_before,
+        ),
+    )
 
 
 class WorkflowRunsRepository(BaseRepository):
@@ -919,6 +932,7 @@ class WorkflowRunsRepository(BaseRepository):
         copilot_session_id: str | None = None,
         start_fresh_browser: bool | None = None,
         created_by: str | None = None,
+        requested_by: str | None = None,
         workflow_definition_sha256: str | None = None,
         browser_settings: BrowserSettings | None = None,
     ) -> WorkflowRun:
@@ -926,6 +940,18 @@ class WorkflowRunsRepository(BaseRepository):
             kwargs: dict[str, Any] = {}
             if workflow_run_id is not None:
                 kwargs["workflow_run_id"] = workflow_run_id
+            if retried_from_workflow_run_id is not None and created_by is None and requested_by is None:
+                # A retry is started outside the request, so it runs as whoever started the run it retries.
+                source = (
+                    await session.execute(
+                        select(WorkflowRunModel.created_by, WorkflowRunModel.requested_by).where(
+                            WorkflowRunModel.workflow_run_id == retried_from_workflow_run_id,
+                            WorkflowRunModel.organization_id == organization_id,
+                        )
+                    )
+                ).first()
+                if source is not None:
+                    created_by, requested_by = source
             if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             workflow_run = WorkflowRunModel(
@@ -940,6 +966,7 @@ class WorkflowRunsRepository(BaseRepository):
                 workflow_definition_sha256=workflow_definition_sha256,
                 proxy_location=serialize_proxy_location(proxy_location),
                 status="created",
+                setup_completed=trigger_type != WorkflowRunTriggerType.event,
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
@@ -963,6 +990,8 @@ class WorkflowRunsRepository(BaseRepository):
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=copilot_session_id,
                 created_by=created_by,
+                # created_by names who to show; run start judges the actor that authorized the request instead.
+                requested_by=requested_by or api_key_actor_id(organization_id),
                 **kwargs,
             )
             session.add(workflow_run)
@@ -1015,6 +1044,56 @@ class WorkflowRunsRepository(BaseRepository):
                     target_cluster=target_cluster,
                     modified_at=WorkflowRunModel.modified_at,
                 )
+            )
+            await session.commit()
+
+    @db_operation("claim_final_webhook_delivery")
+    async def claim_final_webhook_delivery(
+        self,
+        workflow_run_id: str,
+        *,
+        expected_status: WorkflowRunStatus,
+        expected_finished_at: datetime,
+        stale_before: datetime,
+    ) -> datetime | None:
+        """Claim this terminal execution's one final webhook send; None means another sender holds it."""
+        claimed_at = naive_utc_now()
+        async with self.Session() as session:
+            result = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.status == expected_status,
+                    WorkflowRunModel.finished_at == to_naive_utc(expected_finished_at),
+                    _final_webhook_claim_is_free(stale_before),
+                )
+                .values(webhook_delivery_finalized_at=claimed_at, modified_at=WorkflowRunModel.modified_at)
+            )
+            await session.commit()
+        return claimed_at if result.rowcount == 1 else None
+
+    @db_operation("final_webhook_delivery_claim_is_free")
+    async def final_webhook_delivery_claim_is_free(self, workflow_run_id: str, *, stale_before: datetime) -> bool:
+        async with self.Session() as session:
+            free_run_id = await session.scalar(
+                select(WorkflowRunModel.workflow_run_id).where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    _final_webhook_claim_is_free(stale_before),
+                )
+            )
+        return free_run_id is not None
+
+    @db_operation("release_final_webhook_delivery_claim")
+    async def release_final_webhook_delivery_claim(self, workflow_run_id: str, *, claimed_at: datetime) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunModel.webhook_delivery_status.is_(None),
+                    WorkflowRunModel.webhook_delivery_finalized_at == claimed_at,
+                )
+                .values(webhook_delivery_finalized_at=None, modified_at=WorkflowRunModel.modified_at)
             )
             await session.commit()
 
@@ -1093,6 +1172,7 @@ class WorkflowRunsRepository(BaseRepository):
         started_at: datetime | None | object = _UNSET,
         queued_at: datetime | None | object = _UNSET,
         finished_at: datetime | None | object = _UNSET,
+        setup_completed: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
@@ -1101,6 +1181,8 @@ class WorkflowRunsRepository(BaseRepository):
                 query = query.with_for_update().execution_options(populate_existing=True)
             workflow_run = (await session.scalars(query)).first()
             if workflow_run:
+                if setup_completed is not None:
+                    workflow_run.setup_completed = setup_completed
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
@@ -1303,6 +1385,7 @@ class WorkflowRunsRepository(BaseRepository):
         job_id: str | None = None,
         depends_on_workflow_run_id: str | None = None,
         workflow_definition_sha256: str | None = None,
+        require_latest_attempt_number: int | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
@@ -1361,9 +1444,16 @@ class WorkflowRunsRepository(BaseRepository):
                     values["queued_at"] = func.coalesce(
                         WorkflowRunModel.queued_at, await _first_queued_at(session, workflow_run)
                     )
+            statement = update(WorkflowRunModel)
+            if require_latest_attempt_number is not None:
+                statement = statement.where(
+                    ~exists().where(
+                        WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                        WorkflowRunAttemptModel.attempt_number > require_latest_attempt_number,
+                    )
+                )
             result = await session.execute(
-                update(WorkflowRunModel)
-                .where(
+                statement.where(
                     WorkflowRunModel.workflow_run_id == workflow_run_id,
                     WorkflowRunModel.status.in_(non_terminal),
                 )
@@ -1570,6 +1660,7 @@ class WorkflowRunsRepository(BaseRepository):
         include_debugger_runs: bool = False,
         search_key: str | None = None,
     ) -> list[WorkflowRun | Task]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             # temporary limit to 10 pages
             if page > 10:
@@ -1584,6 +1675,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                workflow_run_query = workflow_run_query.where(folder_access_filter)
 
             if not include_debugger_runs:
                 workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
@@ -1663,6 +1757,7 @@ class WorkflowRunsRepository(BaseRepository):
         run_tags: Sequence[tuple[str | None, str | None]] | None = None,
         failure_category: str | None = None,
     ) -> list[dict[str, Any]]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
 
             async def execute_list_query(query: Select[Any]) -> Any:
@@ -1753,6 +1848,20 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(TaskRunModel.debug_session_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
+            task_v2_wpid = (
+                select(task_v2_workflow_run.workflow_permanent_id)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
+                .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
+                .scalar_subquery()
+            )
+            folder_access_filter = await _folder_access_filter(
+                organization_id,
+                func.coalesce(effective_wpid, case((TaskRunModel.task_run_type == RunType.task_v2, task_v2_wpid))),
+            )
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
 
             if status:
                 query = query.filter(effective_status.in_(status))
@@ -1841,6 +1950,10 @@ class WorkflowRunsRepository(BaseRepository):
                         .filter(WorkflowRunModel.copilot_session_id.is_(None))
                         .filter(~task_run_exists)
                     )
+                    if folder_access_filter is not None:
+                        fallback_query = fallback_query.filter(
+                            await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+                        )
                     if search_key:
                         fallback_query = self._apply_workflow_run_search_key_filter(fallback_query, search_key)
                     if status:
@@ -2447,12 +2560,19 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_permanent_id: str | None = None,
         organization_id: str | None = None,
     ) -> list[WorkflowRun]:
+        if organization_id:
+            await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             query = select(WorkflowRunModel).filter(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
             if workflow_permanent_id:
                 query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
             if organization_id:
                 query = query.filter_by(organization_id=organization_id)
+                folder_access_filter = await _folder_access_filter(
+                    organization_id, WorkflowRunModel.workflow_permanent_id
+                )
+                if folder_access_filter is not None:
+                    query = query.where(folder_access_filter)
             workflow_runs = (await session.scalars(query)).all()
             return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
 
@@ -3021,7 +3141,7 @@ class WorkflowRunsRepository(BaseRepository):
             )
         return query.where(or_(error_code_in_tasks, error_code_in_blocks))
 
-    @db_operation("get_workflow_runs")
+    @db_operation("get_workflow_runs", expected_errors=(RunsListSearchCanceled,))
     async def get_workflow_runs(
         self,
         organization_id: str,
@@ -3032,7 +3152,14 @@ class WorkflowRunsRepository(BaseRepository):
         search_key: str | None = None,
         error_code: str | None = None,
     ) -> list[WorkflowRun]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
+            statement_timeout_seconds: float | None = None
+            if _is_bounded_runs_list_read(session, search_key):
+                # Start after checkout so pool wait does not consume the connection-hold budget.
+                await session.connection()
+                statement_timeout_seconds = RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+                await apply_statement_timeout(session, statement_timeout_seconds)
             db_page = page - 1  # offset logic is 0 based
 
             query = (
@@ -3042,6 +3169,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
 
             query = self._apply_workflow_run_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code, organization_id)
@@ -3070,7 +3200,16 @@ class WorkflowRunsRepository(BaseRepository):
 
             query = query.limit(page_size).offset(db_page * page_size)
 
-            workflow_runs = (await session.execute(query)).all()
+            try:
+                workflow_runs = (await session.execute(query)).all()
+            except StatementError as exc:
+                if not search_key or not is_statement_timeout(exc):
+                    raise
+                exc.hide_parameters = True
+                raise RunsListSearchCanceled(
+                    indexed_search=is_indexed_runs_list_search_key(search_key),
+                    statement_timeout_seconds=statement_timeout_seconds,
+                ) from exc
 
             return [
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
@@ -3083,12 +3222,16 @@ class WorkflowRunsRepository(BaseRepository):
         organization_id: str,
         status: list[WorkflowRunStatus] | None = None,
     ) -> int:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             count_query = (
                 select(func.count())
                 .select_from(WorkflowRunModel)
                 .filter(WorkflowRunModel.organization_id == organization_id)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                count_query = count_query.where(folder_access_filter)
             if status:
                 count_query = count_query.filter(WorkflowRunModel.status.in_(status))
             return (await session.execute(count_query)).scalar_one()
@@ -3155,6 +3298,7 @@ class WorkflowRunsRepository(BaseRepository):
         Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
         and complete browser or credential identifiers.
         """
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             statement_timeout_seconds: float | None = None
             if _is_bounded_runs_list_read(session, search_key):
@@ -3170,6 +3314,9 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
             if exclude_child_runs:
                 query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
             query = self._apply_workflow_run_search_key_filter(query, search_key)
@@ -3209,6 +3356,7 @@ class WorkflowRunsRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
     ) -> list[WorkflowRun]:
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             db_page = page - 1
             query = (
@@ -3218,15 +3366,61 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
-                .order_by(WorkflowRunModel.created_at.desc())
-                .limit(page_size)
-                .offset(db_page * page_size)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.where(folder_access_filter)
+            query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
             workflow_runs_and_titles_tuples = (await session.execute(query)).all()
             return [
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                 for run, title in workflow_runs_and_titles_tuples
             ]
+
+    @db_operation("get_workflow_run_ids_by_browser_session_ids")
+    async def get_workflow_run_ids_by_browser_session_ids(
+        self, browser_session_ids: Collection[str], organization_id: str
+    ) -> dict[str, set[str]]:
+        """Return every run associated with each session, without applying caller visibility filters."""
+        if not browser_session_ids:
+            return {}
+
+        associations = union_all(
+            select(WorkflowRunModel.browser_session_id, WorkflowRunModel.workflow_run_id).where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.browser_session_id.in_(browser_session_ids),
+            ),
+            select(TaskModel.browser_session_id, TaskModel.workflow_run_id).where(
+                TaskModel.organization_id == organization_id,
+                TaskModel.browser_session_id.in_(browser_session_ids),
+                TaskModel.workflow_run_id.is_not(None),
+            ),
+            select(TaskV2Model.browser_session_id, TaskV2Model.workflow_run_id).where(
+                TaskV2Model.organization_id == organization_id,
+                TaskV2Model.browser_session_id.in_(browser_session_ids),
+                TaskV2Model.workflow_run_id.is_not(None),
+            ),
+            select(WorkflowRunAttemptModel.pinned_browser_session_id, WorkflowRunAttemptModel.workflow_run_id).where(
+                WorkflowRunAttemptModel.organization_id == organization_id,
+                WorkflowRunAttemptModel.pinned_browser_session_id.in_(browser_session_ids),
+            ),
+            select(
+                PersistentBrowserSessionModel.persistent_browser_session_id,
+                PersistentBrowserSessionModel.created_for_workflow_run_id,
+            ).where(
+                PersistentBrowserSessionModel.organization_id == organization_id,
+                PersistentBrowserSessionModel.persistent_browser_session_id.in_(browser_session_ids),
+                PersistentBrowserSessionModel.created_for_workflow_run_id.is_not(None),
+            ),
+        )
+        async with self.Session() as session:
+            rows = (await session.execute(associations)).all()
+
+        runs_by_session: dict[str, set[str]] = {}
+        for browser_session_id, workflow_run_id in rows:
+            if browser_session_id and workflow_run_id:
+                runs_by_session.setdefault(browser_session_id, set()).add(workflow_run_id)
+        return runs_by_session
 
     @db_operation("get_workflow_metadata_for_browser_session")
     async def get_workflow_metadata_for_browser_session(
@@ -3239,6 +3433,7 @@ class WorkflowRunsRepository(BaseRepository):
             WorkflowRunAttemptModel.organization_id == organization_id,
             WorkflowRunAttemptModel.pinned_browser_session_id == browser_session_id,
         )
+        await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
             query = (
                 select(
@@ -3261,8 +3456,11 @@ class WorkflowRunsRepository(BaseRepository):
                     )
                 )
                 .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
-                .limit(101)
             )
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
+            if folder_access_filter is not None:
+                query = query.where(folder_access_filter)
+            query = query.limit(101)
             result = await session.execute(query)
             return [
                 {**dict(row), "association_browser_session_id": browser_session_id} for row in result.mappings().all()
@@ -3413,185 +3611,6 @@ class WorkflowRunsRepository(BaseRepository):
             result = convert_to_workflow_run_output_parameter(workflow_run_output_parameter, self.debug_enabled)
             await session.commit()
             return result
-
-    @db_operation("get_recent_completed_login_for_run_credentials")
-    @read_retry()
-    async def get_recent_completed_login_for_run_credentials(
-        self,
-        *,
-        organization_id: str,
-        workflow_run_id: str,
-        since: datetime,
-        credential_parameter_keys: Collection[str],
-    ) -> RecentCredentialLogin:
-        """The most recent run on the same workflow that completed a login block with a credential this
-        run also used, no earlier than ``since``.
-
-        A credential is identified by the stored parameter value compared against other runs' values of
-        that same login-block parameter, so nothing in the vault is read.
-        """
-        keys = sorted(set(credential_parameter_keys))
-        if not keys:
-            return RecentCredentialLogin(credential_known=False)
-
-        current_run = aliased(WorkflowRunModel)
-        current_identity = (
-            select(current_run.workflow_id, current_run.workflow_permanent_id)
-            .where(current_run.workflow_run_id == workflow_run_id)
-            .where(current_run.organization_id == organization_id)
-            .cte("current_run")
-        )
-        current_run_parameter = aliased(WorkflowRunParameterModel)
-        current_parameter = aliased(WorkflowParameterModel)
-        current_selection = aliased(WorkflowRunCredentialSelectionModel)
-        current_static_credential = aliased(CredentialParameterModel)
-        current_credentials = union_all(
-            select(
-                current_parameter.key.label("parameter_key"),
-                current_run_parameter.value.label("credential_id"),
-            )
-            .select_from(current_run_parameter)
-            .join(
-                current_parameter,
-                and_(
-                    current_parameter.workflow_parameter_id == current_run_parameter.workflow_parameter_id,
-                    current_parameter.deleted_at.is_(None),
-                    current_parameter.key.in_(keys),
-                ),
-            )
-            .where(current_run_parameter.workflow_run_id == workflow_run_id)
-            .where(current_run_parameter.value.is_not(None))
-            .where(current_run_parameter.value.not_in(_REDACTED_PARAMETER_VALUES)),
-            select(current_selection.parameter_key, current_selection.credential_id)
-            .where(current_selection.workflow_run_id == workflow_run_id)
-            .where(current_selection.organization_id == organization_id)
-            .where(current_selection.parameter_key.in_(keys)),
-            select(current_static_credential.key, current_static_credential.credential_id)
-            .select_from(current_static_credential)
-            .join(current_identity, current_static_credential.workflow_id == current_identity.c.workflow_id)
-            .where(current_static_credential.deleted_at.is_(None))
-            .where(current_static_credential.key.in_(keys))
-            .where(
-                or_(
-                    current_static_credential.credential_ids.is_(None),
-                    current_static_credential.credential_ids == JSON.NULL,
-                )
-            )
-            .where(
-                ~exists(
-                    select(literal(1))
-                    .select_from(current_selection)
-                    .where(current_selection.workflow_run_id == workflow_run_id)
-                    .where(current_selection.parameter_key == current_static_credential.key)
-                )
-            ),
-        ).cte("current_credentials")
-
-        prior_run = aliased(WorkflowRunModel)
-        prior_block = aliased(WorkflowRunBlockModel)
-        prior_runs = (
-            select(
-                prior_run.workflow_run_id.label("workflow_run_id"),
-                prior_run.workflow_id.label("workflow_id"),
-                prior_run.created_at.label("created_at"),
-            )
-            .select_from(prior_run)
-            .join(current_identity, prior_run.workflow_permanent_id == current_identity.c.workflow_permanent_id)
-            .where(prior_run.organization_id == organization_id)
-            .where(prior_run.created_at >= to_naive_utc(since))
-            .where(prior_run.workflow_run_id != workflow_run_id)
-            .where(
-                exists(
-                    select(literal(1))
-                    .select_from(prior_block)
-                    .where(prior_block.workflow_run_id == prior_run.workflow_run_id)
-                    .where(prior_block.organization_id == organization_id)
-                    .where(prior_block.block_type == BlockType.LOGIN.value)
-                    .where(prior_block.status == BlockStatus.completed.value)
-                )
-            )
-            .distinct()
-            .cte("prior_runs")
-        )
-        prior_run_parameter = aliased(WorkflowRunParameterModel)
-        prior_parameter = aliased(WorkflowParameterModel)
-        prior_selection = aliased(WorkflowRunCredentialSelectionModel)
-        prior_static_credential = aliased(CredentialParameterModel)
-        prior_credentials = union_all(
-            select(
-                prior_run_parameter.workflow_run_id.label("workflow_run_id"),
-                prior_parameter.key.label("parameter_key"),
-                prior_run_parameter.value.label("credential_id"),
-            )
-            .select_from(prior_run_parameter)
-            .join(prior_runs, prior_runs.c.workflow_run_id == prior_run_parameter.workflow_run_id)
-            .join(
-                prior_parameter,
-                and_(
-                    prior_parameter.workflow_parameter_id == prior_run_parameter.workflow_parameter_id,
-                    prior_parameter.deleted_at.is_(None),
-                    prior_parameter.key.in_(keys),
-                ),
-            )
-            .where(prior_run_parameter.value.is_not(None))
-            .where(prior_run_parameter.value.not_in(_REDACTED_PARAMETER_VALUES)),
-            select(
-                prior_selection.workflow_run_id.label("workflow_run_id"),
-                prior_selection.parameter_key.label("parameter_key"),
-                prior_selection.credential_id.label("credential_id"),
-            )
-            .select_from(prior_selection)
-            .join(prior_runs, prior_runs.c.workflow_run_id == prior_selection.workflow_run_id)
-            .where(prior_selection.organization_id == organization_id)
-            .where(prior_selection.parameter_key.in_(keys)),
-            select(
-                prior_runs.c.workflow_run_id,
-                prior_static_credential.key.label("parameter_key"),
-                prior_static_credential.credential_id.label("credential_id"),
-            )
-            .select_from(prior_static_credential)
-            .join(prior_runs, prior_runs.c.workflow_id == prior_static_credential.workflow_id)
-            .where(prior_static_credential.deleted_at.is_(None))
-            .where(prior_static_credential.key.in_(keys))
-            .where(
-                or_(
-                    prior_static_credential.credential_ids.is_(None),
-                    prior_static_credential.credential_ids == JSON.NULL,
-                )
-            )
-            .where(
-                ~exists(
-                    select(literal(1))
-                    .select_from(prior_selection)
-                    .where(prior_selection.workflow_run_id == prior_runs.c.workflow_run_id)
-                    .where(prior_selection.parameter_key == prior_static_credential.key)
-                )
-            ),
-        ).cte("prior_credentials")
-        logged_in_at = (
-            select(prior_runs.c.created_at)
-            .select_from(prior_runs)
-            .join(prior_credentials, prior_credentials.c.workflow_run_id == prior_runs.c.workflow_run_id)
-            .join(
-                current_credentials,
-                and_(
-                    current_credentials.c.parameter_key == prior_credentials.c.parameter_key,
-                    current_credentials.c.credential_id == prior_credentials.c.credential_id,
-                ),
-            )
-            .order_by(prior_runs.c.created_at.desc())
-            .limit(1)
-            .scalar_subquery()
-        )
-        async with self.Session() as session:
-            result = await session.execute(
-                select(
-                    exists(select(literal(1)).select_from(current_credentials)).label("credential_known"),
-                    logged_in_at.label("logged_in_at"),
-                )
-            )
-            row = result.one()
-            return RecentCredentialLogin(credential_known=row.credential_known, logged_in_at=row.logged_in_at)
 
     @db_operation("create_workflow_run_parameter")
     async def create_workflow_run_parameter(

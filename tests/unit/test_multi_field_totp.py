@@ -12,6 +12,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -2477,6 +2478,19 @@ def test_context_clear_and_pop_keep_only_scoped_strings() -> None:
     assert context.multi_field_totp[task_id].credential_placeholders == frozenset()
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"place_to_enter_verification_code": True, "should_enter_verification_code": True}, True),
+        ({"place_to_enter_verification_code": True, "should_enter_verification_code": False}, False),
+        ({"place_to_enter_verification_code": False, "should_enter_verification_code": True}, False),
+        ({"place_to_enter_verification_code": "true", "should_enter_verification_code": True}, False),
+    ],
+)
+def test_partial_totp_plan_requires_explicit_planner_intent(response: dict[str, Any], expected: bool) -> None:
+    assert agent_module._planner_confirmed_verification_code_intent(response) is expected
+
+
 @pytest.mark.parametrize("filled", [False, True])
 @pytest.mark.parametrize(
     "plan_kind",
@@ -2517,6 +2531,8 @@ async def test_execute_step_rebound_group_requires_expected_value(
     task_id = "task-rebind"
     monkeypatch.setattr(agent_module, "_generate_multi_field_totp_hint", lambda digits: _HINT)
     state = _attempt()
+    if plan_kind == "pin-digit":
+        state.hint_code = "107182"
     state.code_source = code_source
     if filled:
         state.filled_code_hash = hashlib.sha256(_CODE.encode()).hexdigest()
@@ -2630,7 +2646,7 @@ async def test_execute_step_rebound_group_requires_expected_value(
     )
     original_snapshot = deepcopy(scraped_page.id_to_element_dict)
     original_css = dict(scraped_page.id_to_css_dict)
-    accepted = plan_kind in {"hint", "mixed"} or leading
+    accepted = plan_kind in {"hint", "mixed", "decoy-digit"} or leading
     value = "123456" if plan_kind in {"pin", "pin-digit"} else _HINT
     # Incoming cache identities were computed before autofill; never replace them with live-value hashes.
     planning_hashes = []
@@ -2783,7 +2799,9 @@ async def test_execute_step_rebound_group_requires_expected_value(
     agent._build_extract_action_prompt = AsyncMock(
         return_value=agent_module.PromptBuildResult("prompt", False, "extract-action", False)
     )
-    agent._generate_step_actions = AsyncMock(side_effect=[(actions, None, False), ([], None, False)])
+    agent._generate_step_actions = AsyncMock(
+        side_effect=[(actions, None, False, plan_kind == "decoy-digit"), ([], None, False, False)]
+    )
     finalize = AsyncMock(wraps=agent._finalize_step_execution)
     agent._finalize_step_execution = finalize
     monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "prepare_step_execution", AsyncMock(return_value=None))
@@ -2822,7 +2840,21 @@ async def test_execute_step_rebound_group_requires_expected_value(
         )
         assert _CODE not in json.dumps(payload)
         assert state.box_element_ids == [f"fixture-box-{index}" for index in range(6)]
-        assert _first_plan_carries_consumable_totp([action.model_dump() for action in actions], True, state) is accepted
+        if plan_kind == "pin-digit":
+            assert actions[0].text == state.hint_code[0]
+        planner_response = {
+            "place_to_enter_verification_code": plan_kind == "decoy-digit",
+            "should_enter_verification_code": plan_kind == "decoy-digit",
+        }
+        allow_partial = agent_module._planner_confirmed_verification_code_intent(planner_response)
+        assert (
+            _first_plan_carries_consumable_totp(
+                [action.model_dump() for action in actions], True, state, allow_partial=allow_partial
+            )
+            is accepted
+        )
+        if allow_partial:
+            assert not _first_plan_carries_consumable_totp([action.model_dump() for action in actions], True, state)
         before_dispatch = deepcopy(state)
         step, detailed = await agent.agent_step(
             task=task,
@@ -2897,8 +2929,10 @@ async def test_execute_step_rebound_group_requires_expected_value(
     if accepted:
         otp_actions = [action for action in actions if isinstance(action, InputTextAction)]
         assert all(action.totp_timing_info for action in otp_actions)
-        otp_results = [{"totp_group_filled": True}, *[{"totp_group_prefilled": True}] * 5]
+        otp_results = [{"totp_group_filled": True}, *[{"totp_group_prefilled": True}] * (len(otp_actions) - 1)]
         assert results == ([None, *otp_results, None] if leading else [*otp_results, None])
+        # Nothing the planner wrote may reach an armed box verbatim: its text is the decoy.
+        assert not delivered
         if leading:
             current_page.keyboard.type.assert_awaited_once_with(_CODE)
             assert [action.element_id for action in otp_actions] == first_ids
@@ -6138,7 +6172,7 @@ async def test_submitted_retry_budget_blocks_further_code_entry(
                 "get_override_llm_api_handler",
                 lambda *a, **kw: AsyncMock(side_effect=AssertionError("Must reuse the existing plan")),
             )
-            generated, _, _ = await ForgeAgent()._generate_step_actions(
+            generated, _, _, allow_partial = await ForgeAgent()._generate_step_actions(
                 task=task,
                 step=step,
                 browser_state=SimpleNamespace(),
@@ -6171,6 +6205,7 @@ async def test_submitted_retry_budget_blocks_further_code_entry(
                 assert generated[0].reasoning == "The second code was rejected."
             else:
                 assert generated == []
+            assert allow_partial
         elif entry == "plan":
             returned, parsed = await ForgeAgent().handle_potential_OTP_actions(
                 task, step, snapshot, SimpleNamespace(), response

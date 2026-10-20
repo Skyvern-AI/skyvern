@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import structlog
 import yaml
 from agents.items import ToolCallItem
+from agents.run_config import RunConfig
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -95,8 +96,10 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
+    EDIT_BLOCK_TOOL_NAME,
     REPLY_TOOL_NAME,
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
     AgentResult,
     CodeAuthoringRepairContext,
     CopilotContext,
@@ -125,6 +128,8 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, credential_recovery_token_digest
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
+from skyvern.forge.sdk.copilot.demonstration_recorder import DemonstrationRejection
+from skyvern.forge.sdk.copilot.demonstration_replay import replay_demonstration
 from skyvern.forge.sdk.copilot.enforcement import (
     FINAL_REPLY_OBSERVATION,
     CopilotNonRetriableNavError,
@@ -145,7 +150,7 @@ from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
-from skyvern.forge.sdk.copilot.model_resolver import router_fallback_llm_key
+from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget, router_fallback_llm_key
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
@@ -234,10 +239,6 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tools import reply_ends_turn
-from skyvern.forge.sdk.copilot.tools._shared import (
-    EDIT_BLOCK_TOOL_NAME,
-    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
-)
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credential_fill import raw_secret_connected_credential
@@ -2271,6 +2272,8 @@ def _build_narrative_payload(
         }
     if ctx.google_connection_notices:
         payload["googleConnectionNotices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
+    if ctx.demonstration_items:
+        payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
         review = build_review_projection(
             ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
@@ -3315,11 +3318,7 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
 
 
 def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    if ctx.copilot_total_timeout_exceeded:
-        LOG.info("Copilot cancellation resolved as total timeout")
-        result = _build_timeout_exit_result(ctx, global_llm_context)
-    else:
-        result = _build_cancel_exit_result(ctx, global_llm_context)
+    result = _build_cancel_exit_result(ctx, global_llm_context)
     result.cancellation_iteration = ctx.copilot_turn_cancelled_iteration
     outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
     recorded = outcome if isinstance(outcome, RecordedBuildTestOutcome) else None
@@ -3622,7 +3621,7 @@ async def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
-    if resp_type == "REPLACE_WORKFLOW" and final_reply:
+    if resp_type == "REPLACE_WORKFLOW" and (final_reply or budget_drain):
         LOG.warning("copilot final reply suppressed inline workflow replacement")
         user_response = _with_inline_reject_note(user_response, FINAL_REPLY_UNAPPLIED_CHANGE_NOTE)
         resp_type = "REPLY"
@@ -4261,12 +4260,20 @@ async def _run_agent_loop_with_surface(
     if session is None:
         session = create_copilot_session(chat_id)
     model_token = _copilot_model_name.set(model_name)
-    tool_call_count_start = ctx.tool_calls_this_turn
     try:
         with model_attempt_telemetry_scope() as attempt_telemetry:
             try:
                 async with MCPServerManager([mcp_server]) as manager:
                     agent.mcp_servers = list(manager.active_servers)
+                    if ctx.demonstration_requested and not ctx.demonstration_ran and not final_reply:
+                        ctx.demonstration_ran = True
+                        demonstration_items = await replay_demonstration(ctx, mcp_server)
+                        initial_input = (
+                            [{"role": "user", "content": initial_input}]
+                            if isinstance(initial_input, str)
+                            else list(initial_input)
+                        ) + demonstration_items
+                    tool_call_count_start = ctx.tool_calls_this_turn
                     if ctx.eval_mode is not None:
                         advertised_mcp_tools = await mcp_server.list_tools()
                         ctx.eval_tool_surface_sha256 = CopilotToolSurface(
@@ -4304,6 +4311,7 @@ async def _run_agent_loop_with_surface(
                                     run_config=run_config,
                                     session=session,
                                     copilot_config=copilot_config,
+                                    token_budget=copilot_token_budget(copilot_config, llm_key),
                                 )
                             break
                         except Exception as exc:
@@ -4342,6 +4350,8 @@ async def _run_agent_loop_with_surface(
                     )
                 if empty_error is not None:
                     raise empty_error
+            except DemonstrationRejection:
+                raise
             except Exception as exc:
                 stop_metadata = (
                     exc.stop_metadata
@@ -4970,6 +4980,8 @@ async def run_copilot_agent(
                     private_workflow_settings=private_workflow_settings,
                 )
                 return result
+            except DemonstrationRejection:
+                raise
             except Exception as exc:
                 LOG.error(
                     "Copilot turn unhandled error",
@@ -5029,6 +5041,8 @@ async def run_copilot_agent(
             browser_session_id = ctx_sink[0].browser_session_id
             if browser_session_id:
                 await asyncio.shield(close_browser_session_quietly(organization_id, browser_session_id))
+        raise
+    except DemonstrationRejection:
         raise
     except Exception as exc:
         LOG.error(
@@ -5185,6 +5199,13 @@ async def _run_copilot_turn_impl(
         credential_recovery_token_digest=credential_recovery_token_digest(
             chat_request.credential_recovery_token.get_secret_value()
             if chat_request.credential_recovery_token
+            else None
+        ),
+        demonstration_requested=chat_request.product_action == "demonstrate",
+        demonstration_id=chat_request.demonstration_id,
+        demonstration_insertion=(
+            chat_request.demonstration_insertion.model_dump()
+            if chat_request.product_action != "demonstrate" and chat_request.demonstration_insertion is not None
             else None
         ),
         executed_block_fingerprints={
@@ -5753,11 +5774,12 @@ async def _run_copilot_turn_impl(
         try:
             state = ctx.budget_expiry_state
             runs_not_in_history = await recorded_open_step_runs(ctx) if state.hard_backstop_reached else []
+            turn_model_name, turn_run_config, turn_llm_key, turn_is_fallback = turn_model
             reply = await _run_attempt(
-                model_name,
-                run_config,
-                llm_key,
-                is_fallback=False,
+                turn_model_name,
+                turn_run_config,
+                turn_llm_key,
+                is_fallback=turn_is_fallback,
                 final_reply=True,
                 final_reply_observation=budget_expired_reply_observation(
                     _budget_expiry_state_with_staged_draft(ctx), runs_not_in_history
@@ -5779,6 +5801,10 @@ async def _run_copilot_turn_impl(
         except Exception as reply_error:
             LOG.warning("copilot_budget_expiry_reply_failed", error_type=type(reply_error).__name__)
             return _build_budget_expiry_exit_result(ctx, global_llm_context)
+
+    # The model the turn is running on; a budget-expiry reply after a fallback must not go back to the
+    # primary model that just failed.
+    turn_model: tuple[str, RunConfig, str, bool] = (model_name, run_config, llm_key, False)
 
     try:
         from skyvern.forge.sdk.copilot.session_factory import create_copilot_session
@@ -5807,6 +5833,7 @@ async def _run_copilot_turn_impl(
                         )
                     )
                     ctx.supports_vision = fallback_supports_vision
+                    turn_model = (fallback_model_name, fallback_run_config, fallback_resolved_key, True)
                     result = await _run_attempt(
                         fallback_model_name,
                         fallback_run_config,
@@ -5932,6 +5959,8 @@ async def _run_copilot_turn_impl(
                     organization_id=organization_id,
                 )
                 return _build_non_retriable_nav_exit_result(ctx, global_llm_context, exc)
+    except DemonstrationRejection:
+        raise
     except Exception as e:
         try:
             # Terminal-path gate-decision record; the per-tool hook records the

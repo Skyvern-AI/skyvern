@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -10,7 +12,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agents.tool_context import ToolContext
+from PIL import Image
 from playwright.async_api import Page
+from structlog.testing import capture_logs
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -29,10 +34,17 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
     BrowserCodeSessionUnavailableError,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import pending_screenshot_message
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserGenerationRetired,
     browser_session_recovery,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    PendingFrameLease,
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    resize_screenshot_b64,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import (
@@ -135,6 +147,7 @@ class _LeaseProbeSession:
         self._denials_sink = denials_sink
         self.session_id = "bcs_probe"
         self.page = SimpleNamespace(url="https://example.com/")
+        self.confirmed_page: SimpleNamespace | None = None
         self.closed = False
 
     async def rebind(self, page: Page) -> None:
@@ -437,6 +450,7 @@ async def test_a_replaced_browser_session_reopens_the_interpreter_rather_than_re
         def __init__(self) -> None:
             self.session_id = "bcs_probe"
             self.page = SimpleNamespace(url="https://example.com/")
+            self.confirmed_page = None
             self.closed = False
 
         async def rebind(self, page: Page) -> None:
@@ -1246,7 +1260,9 @@ async def test_run_browser_code_preserves_opaque_source_reference_during_secret_
         "get_page",
         AsyncMock(return_value=(SimpleNamespace(page=object()), None)),
     )
-    monkeypatch.setattr(browser_code_module, "_session_for_page", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        browser_code_module, "_session_for_page", AsyncMock(return_value=SimpleNamespace(confirmed_page=None))
+    )
     monkeypatch.setattr(
         browser_code_module,
         "_run_cell",
@@ -1877,3 +1893,389 @@ async def test_a_browser_code_result_the_scrub_cannot_redact_is_withheld_and_car
     reported = ["page_request_failures"] if failures_redactable else []
     assert list(result) == ["page_state", *reported, "ok", "error", "data"]
     assert logged_request_failures(log) == ([] if failures_redactable else [failure])
+
+
+def _frame_png() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 6), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _ended_cell(*, ok: bool, url: str, session_alive: bool = True) -> BrowserCodeCellResult:
+    return replace(_cell(ok=ok), current_url=url, session_alive=session_alive)
+
+
+def _ended_on(url: str) -> SimpleNamespace:
+    return SimpleNamespace(url=url, screenshot=AsyncMock(return_value=_frame_png()))
+
+
+class _FramedSession(_LeaseProbeSession):
+    def __init__(
+        self,
+        cells: list[BrowserCodeCellResult],
+        ended_on: list[SimpleNamespace | None],
+        during_cell: Callable[[], None] = lambda: None,
+    ) -> None:
+        super().__init__()
+        self._cells = cells
+        self._ended_on = ended_on
+        self._during_cell = during_cell
+
+    async def run_cell(self, code: str, *, timeout_seconds: float, deny_pixels: bool = False) -> BrowserCodeCellResult:
+        self._during_cell()
+        self.confirmed_page = self._ended_on.pop(0)
+        return self._cells.pop(0)
+
+
+def _patch_framed_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    session: _FramedSession,
+    *,
+    retire_lease: int | None = None,
+    replace_browser_lease: int | None = None,
+) -> None:
+    leases = 0
+    browser_replaced = False
+
+    @asynccontextmanager
+    async def lease(_ctx: object, **_kwargs: object) -> AsyncIterator[None]:
+        nonlocal leases, browser_replaced
+        leases += 1
+        if leases == retire_lease:
+            raise CopilotBrowserGenerationRetired("pbs_1", BrowserRetirementReason.session_ending)
+        browser_replaced = browser_replaced or leases == replace_browser_lease
+        yield
+
+    async def current_page(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
+        return SimpleNamespace(page=session.page), None
+
+    async def admitted_browser(session_id: str | None = None) -> tuple[SimpleNamespace, None]:
+        return SimpleNamespace(pages=[] if browser_replaced else [session.confirmed_page]), None
+
+    async def open_session(**_kwargs: object) -> BrowserCodeSession:
+        return session
+
+    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
+        return None, None, None
+
+    monkeypatch.setattr(browser_code_module, "mcp_browser_context", lease)
+    monkeypatch.setattr(browser_code_module, "get_page", current_page)
+    monkeypatch.setattr(browser_code_module, "resolve_browser", admitted_browser)
+    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "open_copilot_browser_code_session", open_session)
+
+
+def _stale_frame(ctx: CopilotContext) -> None:
+    ctx.pending_screenshots.append(
+        resize_screenshot_b64(
+            base64.b64encode(_frame_png()).decode("ascii"),
+            provenance=ScreenshotProvenance.unknown(source_tool="get_browser_screenshot"),
+            captured_at=0.0,
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ok", "session_alive"),
+    [(True, True), (False, True), (False, False)],
+    ids=["ok-cell", "failed-cell", "timed-out-cell"],
+)
+async def test_a_finished_cell_replaces_the_stale_frame_with_one_of_the_page_it_ended_on(
+    monkeypatch: pytest.MonkeyPatch, ok: bool, session_alive: bool
+) -> None:
+    ended_on = _ended_on("https://fixture.test/checkout")
+    session = _FramedSession(
+        [_ended_cell(ok=ok, url="https://fixture.test/checkout", session_alive=session_alive)], [ended_on]
+    )
+    _patch_framed_runtime(monkeypatch, session)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    _stale_frame(ctx)
+
+    result = await browser_code_module.run_browser_code(ctx, "1")
+
+    assert result["ok"] is ok
+    assert len(ctx.pending_screenshots) == 1
+    provenance = ctx.pending_screenshots[0].provenance
+    assert provenance.source_tool == "run_browser_code"
+    assert provenance.action_relation is ScreenshotActionRelation.AFTER_SOURCE_ACTION
+    assert provenance.dispatch_url == "https://fixture.test/checkout"
+    assert provenance.captured_url == "https://fixture.test/checkout"
+
+
+@pytest.mark.asyncio
+async def test_a_cell_frame_scrubs_its_urls_like_the_cell_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "tok-5f1e9a"
+    url = f"https://fixture.test/callback?code={secret}"
+    _patch_framed_runtime(monkeypatch, _FramedSession([_ended_cell(ok=True, url=url)], [_ended_on(url)]))
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    register_secret_scrub_value(ctx, secret)
+    try:
+        result = await browser_code_module.run_browser_code(ctx, "1")
+    finally:
+        clear_session_scrub_values(ctx.browser_session_id)
+
+    provenance = ctx.pending_screenshots[0].provenance
+    assert provenance.dispatch_url == provenance.captured_url == result["current_url"]
+    assert secret not in str(pending_screenshot_message(ctx))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withheld_by", ["secret-run", "self-heal", "non-vision", "unconfirmed-tab"])
+async def test_a_cell_frame_is_withheld_by_the_trust_floor_or_an_unconfirmed_page(
+    monkeypatch: pytest.MonkeyPatch, withheld_by: str
+) -> None:
+    ended_on = _ended_on("https://fixture.test/account")
+    cell = _ended_cell(ok=True, url="https://fixture.test/account")
+    session = _FramedSession([cell], [None if withheld_by == "unconfirmed-tab" else ended_on])
+    _patch_framed_runtime(monkeypatch, session)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    if withheld_by == "secret-run":
+        ctx.secret_run_browser_session_ids = {"pbs_1"}
+    elif withheld_by == "self-heal":
+        ctx.codeblock_redaction_parameters = {"password": "hunter2"}
+    elif withheld_by == "non-vision":
+        ctx.supports_vision = False
+
+    await browser_code_module.run_browser_code(ctx, "1")
+
+    assert ctx.pending_screenshots == []
+    ended_on.screenshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_secret_that_reaches_the_browser_during_the_cell_withholds_its_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    ended_on = _ended_on("https://fixture.test/account")
+    session = _FramedSession(
+        [_ended_cell(ok=True, url="https://fixture.test/account")],
+        [ended_on],
+        during_cell=lambda: ctx.secret_run_browser_session_ids.add("pbs_1"),
+    )
+    _patch_framed_runtime(monkeypatch, session)
+
+    await browser_code_module.run_browser_code(ctx, "1")
+
+    assert ctx.pending_screenshots == []
+    ended_on.screenshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_ends_on", "reason"),
+    [("unconfirmed-tab", "tab_unconfirmed"), ("failed-screenshot", "screenshot_failed")],
+)
+async def test_a_cell_that_stages_no_frame_withdraws_the_earlier_cell_frame(
+    monkeypatch: pytest.MonkeyPatch, second_ends_on: str, reason: str
+) -> None:
+    url = "https://fixture.test/listing"
+    second = _ended_on(url)
+    second.screenshot = AsyncMock(side_effect=RuntimeError("Target closed"))
+    session = _FramedSession(
+        [_ended_cell(ok=True, url=url), _ended_cell(ok=True, url=url)],
+        [_ended_on(url), None if second_ends_on == "unconfirmed-tab" else second],
+    )
+    _patch_framed_runtime(monkeypatch, session)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+
+    await browser_code_module.run_browser_code(ctx, "1")
+    first_frame = ctx.pending_screenshots[0]
+    ctx.pending_frame_lease = PendingFrameLease(
+        capture_event_id=first_frame.capture_event_id, capture_id=first_frame.capture_id, input_fingerprint="f"
+    )
+    with capture_logs() as logs:
+        result = await browser_code_module.run_browser_code(ctx, "2")
+
+    assert result["ok"] is True and result["value"] == {"observed": True}
+    assert pending_screenshot_message(ctx) is None
+    assert ctx.pending_frame_lease is None
+    [line] = [line for line in logs if line["event"] == "copilot_browser_code_cell_frame"]
+    assert (line["reason"], line["withdrawn_capture_id"]) == (reason, first_frame.capture_id)
+
+
+@pytest.mark.asyncio
+async def test_a_frame_captured_after_the_cell_started_is_kept_when_the_cell_stages_no_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    _stale_frame(ctx)
+
+    def hook_frame_during_cell() -> None:
+        ctx.pending_screenshots.clear()
+        ctx.pending_screenshots.append(
+            resize_screenshot_b64(
+                base64.b64encode(_frame_png()).decode("ascii"),
+                provenance=ScreenshotProvenance.unknown(source_tool="click"),
+            )
+        )
+
+    session = _FramedSession(
+        [_ended_cell(ok=True, url="https://fixture.test/x")], [None], during_cell=hook_frame_during_cell
+    )
+    _patch_framed_runtime(monkeypatch, session)
+
+    await browser_code_module.run_browser_code(ctx, "1")
+
+    assert [entry.provenance.source_tool for entry in ctx.pending_screenshots] == ["click"]
+
+
+@pytest.mark.asyncio
+async def test_a_frame_staged_while_the_cell_waits_for_the_browser_is_withdrawn_when_the_cell_stages_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_framed_runtime(monkeypatch, _FramedSession([_ended_cell(ok=True, url="https://fixture.test/x")], [None]))
+    waiting = asyncio.Event()
+
+    async def prepared(*_args: object, **_kwargs: object) -> tuple[None, None, None]:
+        waiting.set()
+        return None, None, None
+
+    monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+
+    async with ctx.credential_fill_lock:
+        call = asyncio.create_task(browser_code_module.run_browser_code(ctx, "1"))
+        await waiting.wait()
+        sibling = resize_screenshot_b64(
+            base64.b64encode(_frame_png()).decode("ascii"),
+            provenance=ScreenshotProvenance.unknown(source_tool="click"),
+        )
+        ctx.pending_screenshots.append(sibling)
+        ctx.pending_frame_lease = PendingFrameLease(
+            capture_event_id=sibling.capture_event_id, capture_id=sibling.capture_id, input_fingerprint="f"
+        )
+    await call
+
+    assert pending_screenshot_message(ctx) is None
+    assert ctx.pending_frame_lease is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled_in", ["frame-capture", "ended-session-close"])
+async def test_a_cancel_in_the_cell_frame_or_session_close_reports_the_finished_cell_on_the_next_call(
+    monkeypatch: pytest.MonkeyPatch, cancelled_in: str
+) -> None:
+    first_url = "https://fixture.test/first"
+    first_ends_on = _ended_on(first_url)
+    first_cell = replace(
+        _ended_cell(ok=False, url=first_url, session_alive=cancelled_in == "frame-capture"),
+        actions=(BrowserCodeOperation(operation="click", selector="#pay", succeeded=True),),
+    )
+    if cancelled_in == "frame-capture":
+        first_ends_on.screenshot = AsyncMock(side_effect=asyncio.CancelledError)
+    session = _FramedSession(
+        [first_cell, _ended_cell(ok=True, url="https://fixture.test/2")],
+        [first_ends_on, _ended_on("https://fixture.test/2")],
+    )
+    if cancelled_in == "ended-session-close":
+        monkeypatch.setattr(session, "close", AsyncMock(side_effect=[asyncio.CancelledError, None]))
+    _patch_framed_runtime(monkeypatch, session)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    _stale_frame(ctx)
+
+    with pytest.raises(asyncio.CancelledError):
+        await browser_code_module.run_browser_code(ctx, "1")
+    expected_frames = [] if cancelled_in == "frame-capture" else [first_url]
+    assert [entry.provenance.dispatch_url for entry in ctx.pending_screenshots] == expected_frames
+    assert [(item["tool_name"], item["selector"]) for item in ctx.scouted_interactions] == [
+        ("run_browser_code.click", "#pay")
+    ]
+    result = await browser_code_module.run_browser_code(ctx, "2")
+
+    completed = result["previous_call_completed"]
+    assert (completed["ok"], completed["error_code"], completed["current_url"]) == (False, "user_code_error", first_url)
+    assert completed["operations"] == []
+    assert "previous_call_interrupted" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_cell_frame_stages_under_its_tool_call_on_the_add_mode_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = resolve_copilot_tool_surface(
+        mode=None,
+        native_tools=copilot_native_tools(
+            supports_question_tool=True, browser_code_available=True, run_tools_available=True
+        ),
+        alias_map=get_skyvern_mcp_alias_map(),
+        overlays=_build_skyvern_mcp_overlays(),
+        browser_code_mode=CopilotBrowserCodeMode.ADD,
+    )
+    tool = next(tool for tool in surface.native_tools if tool.name == "run_browser_code")
+    ended_on = _ended_on("https://fixture.test/listing")
+    _patch_framed_runtime(
+        monkeypatch, _FramedSession([_ended_cell(ok=True, url="https://fixture.test/listing")], [ended_on])
+    )
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    arguments = json.dumps({"code": "1", "user_facing_reason": "look"})
+
+    await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call_cell", tool_arguments=arguments), arguments
+    )
+
+    assert "click" in surface.ordered_mcp_names
+    assert [entry.provenance.source_tool for entry in ctx.pending_screenshots] == ["run_browser_code"]
+    assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call_cell"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lost_before_capture", [{"retire_lease": 2}, {"replace_browser_lease": 2}], ids=["retired", "replaced"]
+)
+async def test_a_browser_retired_before_the_cell_frame_returns_the_result_without_a_frame(
+    monkeypatch: pytest.MonkeyPatch, lost_before_capture: dict[str, int]
+) -> None:
+    ended_on = _ended_on("https://fixture.test/done")
+    session = _FramedSession([_ended_cell(ok=True, url="https://fixture.test/done")], [ended_on])
+    _patch_framed_runtime(monkeypatch, session, **lost_before_capture)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+
+    result = await browser_code_module.run_browser_code(ctx, "1")
+
+    assert result["ok"] is True and result["value"] == {"observed": True}
+    assert ctx.pending_screenshots == []
+    ended_on.screenshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        BrowserCodeSessionUnavailableError(
+            "The code session's relay could not be reached.", error_code="relay_unavailable", session_ended=True
+        ),
+        CopilotBrowserGenerationRetired("pbs_1", BrowserRetirementReason.session_ending),
+    ],
+    ids=["relay-unavailable", "browser-retired"],
+)
+async def test_a_cell_that_loses_its_browser_withdraws_the_frame_from_before_it(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def lose_browser() -> None:
+        raise error
+
+    async def loss_disposition(*_args: object, **_kwargs: object) -> str:
+        return "failed"
+
+    _patch_framed_runtime(monkeypatch, _FramedSession([], [], during_cell=lose_browser))
+    monkeypatch.setattr(browser_code_module, "_browser_session_error_disposition", loss_disposition)
+    ctx = make_copilot_context()
+    ctx.browser_session_id = "pbs_1"
+    _stale_frame(ctx)
+
+    result = await browser_code_module.run_browser_code(ctx, "1")
+
+    assert result["ok"] is False
+    assert pending_screenshot_message(ctx) is None

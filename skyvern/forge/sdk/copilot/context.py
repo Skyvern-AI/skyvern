@@ -73,6 +73,25 @@ class NarrativeDraft(TypedDict):
 
 
 REPLY_TOOL_NAME = "reply"
+EDIT_BLOCK_TOOL_NAME = "edit_block"
+EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
+UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
+UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
+RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
+BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+BLOCK_RUNNING_TOOLS = frozenset(
+    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
+)
+WORKFLOW_MUTATION_TOOLS = frozenset(
+    {
+        UPDATE_WORKFLOW_TOOL_NAME,
+        UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+        EDIT_BLOCK_TOOL_NAME,
+        EDIT_BLOCK_AND_RUN_TOOL_NAME,
+        "add_block",
+        "delete_block",
+    }
+)
 USER_FACING_REASON_PARAM = "user_facing_reason"
 USER_FACING_REASON_SCHEMA = {
     "type": ["string", "null"],
@@ -304,6 +323,7 @@ class TurnNarrativePayload(TypedDict):
     testedBlockFingerprints: NotRequired[dict[str, list[str]]]
     budgetExpiry: NotRequired[NarrativeBudgetExpiry]
     turnFacts: NotRequired[NarrativeTurnFacts]
+    demonstrationItems: NotRequired[list[str]]
 
 
 if TYPE_CHECKING:
@@ -1310,6 +1330,11 @@ class CopilotContext(AgentContext):
     credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
+    demonstration_requested: bool = False
+    demonstration_ran: bool = False
+    demonstration_id: str | None = None
+    demonstration_insertion: dict[str, str | None] | None = None
+    demonstration_items: list[str] = field(default_factory=list)
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None

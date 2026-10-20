@@ -49,6 +49,7 @@ from skyvern.webeye.browser_runtime_events import (
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 from skyvern.webeye.navigation import redact_url_secrets
+from skyvern.webeye.utils.flutter_semantics import FLUTTER_STATE_JS, FlutterSemanticsState
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
@@ -1467,6 +1468,20 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
     return merged_img
 
 
+# The browser driver's per-call stack capture can leave caller frames (and the screenshot bytes they hold) in a
+# reference cycle until a full collection. That collection pauses the whole event loop, so rate-limit it.
+_last_stitch_gc_at = float("-inf")
+
+
+def _collect_after_stitch() -> None:
+    global _last_stitch_gc_at
+    now = time.monotonic()
+    if now - _last_stitch_gc_at < SettingsManager.get_settings().SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS:
+        return
+    _last_stitch_gc_at = now
+    gc.collect()
+
+
 def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -> bytes:
     images: list[Image.Image] = []
     merged_img: Image.Image | None = None
@@ -1484,12 +1499,9 @@ def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -
         buffer.seek(0)
         return buffer.read()
     finally:
-        # The decoded images, stitched image, and PNG buffer land in reference cycles that
-        # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
-        # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
         _close_screenshot_stitch_resources(images, merged_img, buffer)
         if len(images) > 1:
-            gc.collect()
+            _collect_after_stitch()
 
 
 def _stitch_partial_frames(partial_frames: list[tuple[bytes, int]]) -> bytes | None:
@@ -2928,6 +2940,8 @@ class SkyvernFrame:
         frame_index: int,
         must_included_tags: list[str] | None = None,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+        *,
+        flutter_state: FlutterSemanticsState | None = None,
     ) -> tuple[list[dict], list[dict], dict[str, dict]]:
         must_included_tags = must_included_tags or []
         # Capture is flag-gated so a disabled-mode build does no destination-fact work on any page
@@ -2936,10 +2950,22 @@ class SkyvernFrame:
         # unconditional: it is protection against a hostile wrapper injecting the key, not capture
         # cost.
         capture_destination_facts = policy_observation_enabled()
+        build_call = "await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
+        if flutter_state is not None:
+            # Read in the same evaluate as the tree, so knowing whether the page is a Flutter app costs no round trip.
+            build_call = (
+                f"((tree) => Array.isArray(tree) ? [tree[0], tree[1], {FLUTTER_STATE_JS}] : tree)({build_call})"
+            )
         js_script = with_dom_utils(
-            "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)",
+            f"async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => {build_call}",
             ("buildTreeFromBody",),
         )
+
+        def split_flutter_state(result: Any) -> Any:
+            if flutter_state is not None and isinstance(result, (list, tuple)) and len(result) == 3:
+                flutter_state.record(result[2])
+                return result[:2]
+            return result
 
         # One monotonic budget across the flag write, both build attempts and the re-injection
         # between them -- as _evaluate_with_navigation_recovery does -- so the retry cannot double
@@ -2962,7 +2988,7 @@ class SkyvernFrame:
                 deadline=deadline,
             )
 
-        tree = _as_element_tree_pair(await build())
+        tree = _as_element_tree_pair(split_flutter_state(await build()))
         if tree is None:
             # Re-bootstrap once for a malformed tree result; missing helpers are prepared before build().
             LOG.warning(
@@ -2976,7 +3002,7 @@ class SkyvernFrame:
                 timeout_ms=remaining_ms(),
                 deadline=deadline,
             )
-            retried = await build()
+            retried = split_flutter_state(await build())
             tree = _as_element_tree_pair(retried)
             if tree is None:
                 raise ElementTreeBuildFailed(returned=_describe_non_pair(retried))

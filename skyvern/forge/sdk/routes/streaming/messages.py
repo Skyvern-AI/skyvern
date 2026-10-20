@@ -60,7 +60,14 @@ async def messages(
     client_id: str | None = None,
     token: str | None = None,
 ) -> None:
-    organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
+    organization_id = await auth(
+        apikey=apikey,
+        token=token,
+        websocket=websocket,
+        # The message loop navigates, pastes and clears cookies, so it needs execute, not read.
+        folder_action="workflow_run.execute",
+        folder_resource={"browser_session_id": browser_session_id, "workflow_run_id": workflow_run_id},
+    )
 
     if not organization_id:
         LOG.warning(

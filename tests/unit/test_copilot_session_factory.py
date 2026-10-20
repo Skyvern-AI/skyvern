@@ -19,8 +19,8 @@ from skyvern.forge.sdk.copilot.ask_user import (
     QuestionPart,
     QuestionResponse,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import estimate_tokens, pending_screenshot_message
+from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, estimate_tokens, pending_screenshot_message
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -775,13 +775,54 @@ class TestStagedScreenshotBinding:
         assert not any(_image_parts(item) for item in result.input)
         assert not any(log["event"] == "Injecting screenshot user message" for log in logs)
 
-    def test_aggressive_prune_drops_the_bound_frame_like_any_other_screenshot(self) -> None:
-        ctx = _ctx_with_staged_frame()
-        items: list[dict[str, Any]] = [{"role": "user", "content": "build me a workflow"}]
+    def test_last_resort_prune_keeps_the_bound_frame_and_asks_for_a_retake_only_without_one(self) -> None:
+        retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
+        frame_older_than_the_kept_steps = pending_screenshot_message(
+            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        )
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "build me a workflow"},
+            frame_older_than_the_kept_steps,
+        ]
         for i in range(12):
             items.append({"type": "function_call", "call_id": f"call-{i}", "name": "observe", "arguments": "{}"})
             items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": "y" * 4000})
+        retake_note_from_an_earlier_recovery = [*items[:-2], {"role": "user", "content": retake_note}, *items[-2:]]
+        over_budget_after_every_trim = make_copilot_call_model_input_filter(1)
 
-        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=ctx))
+        with_frame = over_budget_after_every_trim(
+            _mk_input_data(retake_note_from_an_earlier_recovery, context=_ctx_with_staged_frame())
+        )
+        without_frame = over_budget_after_every_trim(
+            _mk_input_data(items, context=SimpleNamespace(pending_screenshots=[]))
+        )
 
-        assert not any(_image_parts(item) for item in result.input)
+        assert [len(_image_parts(item)) for item in with_frame.input if _image_parts(item)] == [1]
+        assert len(_image_parts(with_frame.input[-1])) == 1
+        assert not any(item.get("content") == retake_note for item in with_frame.input)
+        assert not any(_image_parts(item) for item in without_frame.input)
+        assert [item.get("content") for item in without_frame.input].count(retake_note) == 1
+
+    def test_aggressive_prune_reports_omitted_demonstration_fact_packets(self) -> None:
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build the demonstrated workflow"}]
+        for i in range(12):
+            call_id = f"call_demo_turn-1_{i}"
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "click",
+                    "arguments": json.dumps({"selector": "x" * 4000}),
+                }
+            )
+            items.append({"type": "function_call_output", "call_id": call_id, "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items))
+
+        notices = [
+            item["content"]
+            for item in result.input
+            if item.get("role") == "user" and "demonstrated step fact packet" in item.get("content", "")
+        ]
+        assert len(notices) == 1
+        assert notices[0].startswith("[copilot:nudge] ")

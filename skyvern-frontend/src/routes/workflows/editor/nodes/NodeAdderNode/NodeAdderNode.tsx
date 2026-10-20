@@ -13,6 +13,9 @@ import {
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import {
   requestRecordingStart,
   useIsMountedRef,
@@ -38,6 +41,7 @@ import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
+import { demonstrationInsertionFromNodes } from "../../workspaceAuthoringActions";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const workflowPermanentId = useWorkflowPermanentId();
@@ -45,6 +49,11 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const nodes = useNodes();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
@@ -188,6 +197,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: previous ?? null,
+        next: id,
+        parent: parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
@@ -328,6 +352,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       isUploadingSOP={isUploadingSOP}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
       onPinnedChange={setMenuPinned}
     >
       {adder}

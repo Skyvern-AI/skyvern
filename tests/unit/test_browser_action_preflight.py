@@ -818,7 +818,7 @@ class TestStampingHappensAtTheParsePoint:
                 side_effect=resolve_override,
             ),
         ):
-            actions, _, _ = await ForgeAgent._generate_step_actions(
+            actions, _, _, _ = await ForgeAgent._generate_step_actions(
                 agent,
                 task=task,
                 step=MagicMock(step_id="stp", order=0),

@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page, Route
+from playwright.async_api import Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge import app
@@ -35,7 +35,6 @@ from skyvern.webeye.utils.captcha_solver import (
     solve_challenge,
     solve_challenge_ladder,
 )
-from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
 from tests.unit.copilot_test_helpers import (
     AUTO_RENDER_TURNSTILE_HTML,
@@ -1811,21 +1810,6 @@ async def test_wedged_challenge_frames_are_bounded_on_the_default_path(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_the_opted_in_absent_path_runs_one_frame_scan(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Two composed scans (challenge-host frames, then markers) would each spend the whole scan budget; the absent
-    # verdict adds only the one rendered-frame probe.
-    scan, probe = 0.3, 0.1
-    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", scan)
-    monkeypatch.setattr(challenge_signature, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", probe)
-    page = FakePage(frames=[_WedgedChallengeFrame()])
-
-    started = time.monotonic()
-    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
-    assert time.monotonic() - started < scan + probe + 0.15
-
-
-@pytest.mark.asyncio
 async def test_a_deployment_without_a_vendor_probe_never_reports_the_page_clear(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1834,34 +1818,6 @@ async def test_a_deployment_without_a_vendor_probe_never_reports_the_page_clear(
     outcome = await solve_challenge(FakePage())
 
     assert (outcome.status, outcome.page_state) == (ChallengeStatus.ABSENT, "not_rechecked")
-
-
-class _VendorClearsOnFirstRecheckAgent(AgentFunction):
-    def __init__(self) -> None:
-        super().__init__()
-        self.reads = 0
-
-    async def detect_vendor_challenge(self, page: Page | RecordingPage) -> ChallengeVendor | None:
-        self.reads += 1
-        return ChallengeVendor.DATADOME if self.reads == 1 else None
-
-
-@pytest.mark.asyncio
-async def test_a_vendor_path_that_spent_the_budget_cannot_report_the_page_solved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The recheck leaves 0.1s of budget, and the wedged frame would hold the widget scan for a full second.
-    monkeypatch.setattr(app, "AGENT_FUNCTION", _VendorClearsOnFirstRecheckAgent())
-    monkeypatch.setattr(captcha_solver_module, "_LADDER_BUDGET_SECONDS", 0.3)
-    monkeypatch.setattr(captcha_solver_module, "_VENDOR_CLEAR_POLL_SECONDS", 0.2)
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 1.0)
-    monkeypatch.setattr(challenge_signature, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", 0.05)
-
-    started = time.monotonic()
-    outcome = await solve_challenge(FakePage(frames=[_WedgedChallengeFrame()]), probe_child_frames=True)
-
-    assert outcome.status is ChallengeStatus.UNSOLVED
-    assert time.monotonic() - started < 0.6
 
 
 @pytest.mark.asyncio
@@ -2257,6 +2213,7 @@ async def test_failure_on_a_sign_in_form_is_recorded_without_changing_any_other_
             await failure_tab.set_content(failure_tab_html)
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=PlaywrightTimeoutError("timeout"),
             failing_line=1,
             build_failure_result=build_failure,

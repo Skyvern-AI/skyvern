@@ -40,7 +40,7 @@ def pause_human_input(ctx: CopilotContext, kind: Literal["question", "credential
             elapsed = time.monotonic() - wait.started_at
             if wait.owner == "question":
                 ctx.copilot_question_pause_seconds += elapsed
-            else:
+            elif wait.owner == "credential":
                 ctx.copilot_credential_pause_seconds += elapsed
             deadline = ctx.model_stream_deadline
             if deadline is not None and wait.deadline_when is not None and not deadline.expired():

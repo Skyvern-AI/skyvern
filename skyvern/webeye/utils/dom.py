@@ -22,6 +22,7 @@ from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
+    FrameChainLoop,
     InteractWithDisabledElement,
     InvalidElementForTextInput,
     MissingElement,
@@ -52,6 +53,8 @@ from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
+# A generous iframe nesting bound; real nesting depth is not measured.
+MAX_FRAME_CHAIN_DEPTH = 32
 
 
 def is_incompatible_text_input_error(exc: BaseException) -> bool:
@@ -166,6 +169,16 @@ async def resolve_locator(
     iframe_path: list[str] = []
 
     while frame != "main.frame":
+        # Element ids are reused across frames, so a later frame's copy can overwrite an iframe's entry and
+        # point the chain back at itself. This loop never awaits, so a cycle would block the event loop.
+        if frame in iframe_path or len(iframe_path) >= MAX_FRAME_CHAIN_DEPTH:
+            LOG.warning(
+                "Frame chain of the scraped element loops or exceeds the depth cap",
+                frame_chain=[*iframe_path, frame],
+                repeated_frame=frame in iframe_path,
+                max_depth=MAX_FRAME_CHAIN_DEPTH,
+            )
+            raise FrameChainLoop(frame_id=frame)
         iframe_path.append(frame)
 
         frame_element = scrape_page.id_to_element_dict.get(frame)

@@ -80,6 +80,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import { useHasCapability, usePageSlots } from "@/store/PageSlots";
 import { getAuthenticatorKeyError } from "./credentialTotpValidation";
 import {
   getAuthenticatorSaveError,
@@ -321,9 +322,52 @@ function CredentialsModal({
     type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
-  const { parsedConfig: customCredentialServiceConfig } =
+  const { isConfigured: hasCustomCredentialService } =
     useCustomCredentialServiceConfig();
-  const hasCustomCredentialService = !!customCredentialServiceConfig;
+  const canDeleteCredentials = useHasCapability("credential.delete");
+  const { permissions } = usePageSlots();
+  const useTemporaryCredentialCleanup =
+    permissions?.status === "ready" && !canDeleteCredentials;
+  const retryTemporaryCleanupAfterForbidden =
+    permissions?.status === "loading" || permissions?.status === "error";
+  const cleanupTestCredential = useCallback(
+    async (credentialId: string) => {
+      const client = await getClient(credentialGetter);
+      try {
+        await client.delete(
+          `/credentials/${credentialId}${useTemporaryCredentialCleanup ? "/temporary" : ""}`,
+        );
+      } catch (error) {
+        let cleanupError = error;
+        if (
+          retryTemporaryCleanupAfterForbidden &&
+          error instanceof AxiosError &&
+          error.response?.status === 403
+        ) {
+          try {
+            await client.delete(`/credentials/${credentialId}/temporary`);
+            return;
+          } catch (fallbackError) {
+            cleanupError = fallbackError;
+          }
+        }
+        if (
+          cleanupError instanceof AxiosError &&
+          cleanupError.response?.status === 404
+        ) {
+          console.warn(
+            "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
+          );
+        }
+        throw cleanupError;
+      }
+    },
+    [
+      credentialGetter,
+      retryTemporaryCleanupAfterForbidden,
+      useTemporaryCredentialCleanup,
+    ],
+  );
   const [vaultType, setVaultType] = useState<"default" | "custom">("default");
   const { additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
@@ -633,17 +677,15 @@ function CredentialsModal({
     if (testStatus === "completed" || testStatus === "profile_failed") {
       const staleCredId = testCredentialIdRef.current;
       if (staleCredId) {
-        getClient(credentialGetter)
-          .then((client) => client.delete(`/credentials/${staleCredId}`))
-          .catch(() => {
-            // Best-effort cleanup
-          });
+        cleanupTestCredential(staleCredId).catch(() => {
+          // Best-effort cleanup
+        });
       }
       setTestStatus("idle");
       setTestCredentialId(null);
       testCredentialIdRef.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to login-affecting field changes, not testStatus, name, or userContext (context is cosmetic, not credential identity)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- permission changes update the route, not credential identity; only login changes invalidate a completed test
   }, [
     passwordCredentialValues.username,
     passwordCredentialValues.password,
@@ -1037,8 +1079,7 @@ function CredentialsModal({
         // The 2FA type is already persisted; roll the credential back rather than strand a passkey with no material.
         let rollbackSucceeded = true;
         try {
-          const client = await getClient(credentialGetter);
-          await client.delete(`/credentials/${data.credential_id}`);
+          await cleanupTestCredential(data.credential_id);
         } catch {
           rollbackSucceeded = false;
         }
@@ -1473,11 +1514,9 @@ function CredentialsModal({
       // the secret it holds) whenever the box was unchecked before saving.
       if (testCredentialId) {
         const tempCredentialId = testCredentialId;
-        getClient(credentialGetter)
-          .then((client) => client.delete(`/credentials/${tempCredentialId}`))
-          .catch(() => {
-            // Best-effort cleanup
-          });
+        cleanupTestCredential(tempCredentialId).catch(() => {
+          // Best-effort cleanup
+        });
       }
 
       // Capture intent before mutation — state will be reset in onSuccess
@@ -2281,9 +2320,7 @@ function CredentialsModal({
                 });
             } else if (credId && !isTestInProgress) {
               // Test completed but user closed without saving — delete orphaned temp credential
-              getClient(credentialGetter)
-                .then((client) => client.delete(`/credentials/${credId}`))
-                .catch(() => {});
+              cleanupTestCredential(credId).catch(() => {});
             }
             testCredentialIdRef.current = null;
             testWorkflowRunIdRef.current = null;

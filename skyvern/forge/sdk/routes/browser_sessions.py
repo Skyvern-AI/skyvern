@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern.exceptions import (
+    TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE,
     BrowserSessionExtensionUnconfirmed,
     BrowserSessionNotExtendable,
     ExternalBrowserUnavailable,
@@ -36,11 +37,13 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     API_BROWSER_SESSION_CREATED_BY,
+    PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     is_external_cdp_session,
     is_final_status,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
     ACTION_LOG_DEFAULT_PAGE_SIZE,
@@ -93,6 +96,54 @@ _ACTION_LOG_MAX_CURSOR_LENGTH = 256
 
 def _browser_session_not_found() -> HTTPException:
     return HTTPException(status_code=404, detail={"code": "browser_session_not_found"})
+
+
+async def _filter_credential_inaccessible_sessions(
+    sessions: list[PersistentBrowserSession], organization_id: str
+) -> list[PersistentBrowserSession]:
+    if not sessions:
+        return []
+    principal = get_request_principal()
+    profile_ids = {session.browser_profile_id for session in sessions if session.browser_profile_id}
+    try:
+        profile_accessible_ids = {session.persistent_browser_session_id for session in sessions}
+        if principal is None:
+            profile_accessible_ids = {
+                session.persistent_browser_session_id for session in sessions if not session.browser_profile_id
+            }
+        elif profile_ids and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id):
+            links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+                profile_ids, organization_id
+            )
+            credential_ids = {credential_id for links in links_by_profile.values() for credential_id, _ in links}
+            accessible_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+                principal, "credential.use", credential_ids
+            )
+            profile_accessible_ids = {
+                session.persistent_browser_session_id
+                for session in sessions
+                if not session.browser_profile_id
+                or {credential_id for credential_id, _ in links_by_profile.get(session.browser_profile_id, [])}
+                <= accessible_credential_ids
+            }
+        run_credential_accessible_ids = await app.AGENT_FUNCTION.accessible_browser_session_ids(
+            principal,
+            organization_id,
+            {session.persistent_browser_session_id for session in sessions},
+        )
+    except Exception:
+        LOG.warning(
+            "Browser session credential authorization failed; denying",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return []
+    return [
+        session
+        for session in sessions
+        if session.persistent_browser_session_id in profile_accessible_ids
+        and session.persistent_browser_session_id in run_credential_accessible_ids
+    ]
 
 
 async def _read_action_log_body(request: Request) -> bytes:
@@ -165,6 +216,7 @@ async def get_browser_sessions_all(
         page=page,
         page_size=page_size,
     )
+    browser_sessions = await _filter_credential_inaccessible_sessions(browser_sessions, current_org.organization_id)
 
     responses = await asyncio.gather(
         *[
@@ -229,6 +281,22 @@ async def get_browser_session_metadata(
         400: {"description": "Invalid request"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
         404: {"description": "Browser profile not found"},
+        429: {
+            "description": "Too many browser sessions are starting for this organization at once. "
+            "Retry after the number of seconds in the Retry-After header.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail", "error_code"],
+                        "properties": {
+                            "detail": {"type": "string"},
+                            "error_code": {"type": "string", "enum": [TOO_MANY_STARTING_BROWSER_SESSIONS_ERROR_CODE]},
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.post(
@@ -284,21 +352,22 @@ async def create_browser_session(
         organization_id=current_org.organization_id,
         feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
     )
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-        organization_id=current_org.organization_id,
-        url=browser_session_request.url,
-        timeout_minutes=timeout_minutes,
-        proxy_location=proxy_location,
-        proxy_session_id=proxy_session_id,
-        extensions=browser_session_request.extensions,
-        browser_type=browser_session_request.browser_type,
-        browser_profile_id=browser_session_request.browser_profile_id,
-        generate_browser_profile=browser_session_request.generate_browser_profile,
-        needs_live_view=browser_session_request.needs_live_view,
-        created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
-        session_kind=BrowserSessionKind.api,
-        browser_settings=browser_session_request.browser_settings,
-    )
+    async with app.AGENT_FUNCTION.browser_session_create_admission(organization_id=current_org.organization_id):
+        browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            organization_id=current_org.organization_id,
+            url=browser_session_request.url,
+            timeout_minutes=timeout_minutes,
+            proxy_location=proxy_location,
+            proxy_session_id=proxy_session_id,
+            extensions=browser_session_request.extensions,
+            browser_type=browser_session_request.browser_type,
+            browser_profile_id=browser_session_request.browser_profile_id,
+            generate_browser_profile=browser_session_request.generate_browser_profile,
+            needs_live_view=browser_session_request.needs_live_view,
+            created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
+            session_kind=BrowserSessionKind.api,
+            browser_settings=browser_session_request.browser_settings,
+        )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
     return response
@@ -704,10 +773,20 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
+    visible_ids = await app.DATABASE.browser_sessions.get_folder_visible_browser_session_ids(
+        current_org.organization_id,
+        [browser_session.persistent_browser_session_id for browser_session in browser_sessions],
+    )
+    visible_sessions = [
+        browser_session
+        for browser_session in browser_sessions
+        if browser_session.persistent_browser_session_id in visible_ids
+    ]
+    visible_sessions = await _filter_credential_inaccessible_sessions(visible_sessions, current_org.organization_id)
     return await asyncio.gather(
         *[
             BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
-            for browser_session in browser_sessions
+            for browser_session in visible_sessions
         ]
     )
 

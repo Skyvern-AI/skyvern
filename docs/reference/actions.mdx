@@ -82,12 +82,12 @@ If you're building automations visually instead, see [blocks reference](/referen
 Perform any action described in natural language.
 
 <CodeGroup>
-```python
+```python Python
 await page.act("Click the login button")
 await page.act("Scroll down to the pricing section")
 ```
 
-```typescript
+```typescript TypeScript
 await page.act("Click the login button")
 await page.act("Scroll down to the pricing section")
 ```
@@ -110,7 +110,7 @@ await page.act("Scroll down to the pricing section")
 Pull structured data from the visible page.
 
 <CodeGroup>
-```python
+```python Python
 data = await page.extract(
     "Extract all product names and prices",
     schema={
@@ -126,7 +126,7 @@ data = await page.extract(
 )
 ```
 
-```typescript
+```typescript TypeScript
 const data = await page.extract({
     prompt: "Extract all product names and prices",
     schema: {
@@ -160,11 +160,11 @@ const data = await page.extract({
 Assert a condition about the current page state.
 
 <CodeGroup>
-```python
+```python Python
 is_logged_in = await page.validate("The user is logged in")
 ```
 
-```typescript
+```typescript TypeScript
 const isLoggedIn = await page.validate("The user is logged in")
 ```
 </CodeGroup>
@@ -185,14 +185,14 @@ const isLoggedIn = await page.validate("The user is logged in")
 Ask the LLM a question about the current page.
 
 <CodeGroup>
-```python
+```python Python
 result = await page.prompt(
     "How many items are in the navigation menu?",
     schema={"type": "object", "properties": {"count": {"type": "integer"}}}
 )
 ```
 
-```typescript
+```typescript TypeScript
 const result = await page.prompt(
     "How many items are in the navigation menu?",
     { schema: { type: "object", properties: { count: { type: "integer" } } } }
@@ -217,13 +217,13 @@ const result = await page.prompt(
 Click an element using a selector, AI prompt, or both.
 
 <CodeGroup>
-```python
+```python Python
 await page.click("#submit-button")                                       # selector
 await page.click(prompt="Click the 'Submit' button")                     # AI
 await page.click("#submit-button", prompt="Click the 'Submit' button")   # both
 ```
 
-```typescript
+```typescript TypeScript
 await page.click("#submit-button")                                       // selector
 await page.click({ prompt: "Click the 'Submit' button" })                // AI
 await page.click("#submit-button", { prompt: "Click the 'Submit' button" })  // both
@@ -236,7 +236,7 @@ await page.click("#submit-button", { prompt: "Click the 'Submit' button" })  // 
 | `prompt` | `str` | No | AI prompt (fallback or primary) |
 | `ai` | `str` | No | AI mode: `"fallback"` (default) or `None` |
 
-**Returns:** `str \| None` (resolved selector)
+**Returns:** `str | None` (resolved selector)
 
 **SDK reference:** [click](/sdk-reference/browser-automation/page#page-click)
 
@@ -247,13 +247,13 @@ await page.click("#submit-button", { prompt: "Click the 'Submit' button" })  // 
 Fill an input field using a selector, AI prompt, or both.
 
 <CodeGroup>
-```python
+```python Python
 await page.fill("#email", value="user@example.com")                         # selector
 await page.fill(prompt="Fill 'user@example.com' in the email field")         # AI
 await page.fill("#email", value="user@example.com", prompt="Fill email")     # both
 ```
 
-```typescript
+```typescript TypeScript
 await page.fill("#email", "user@example.com")                               // selector
 await page.fill({ prompt: "Fill 'user@example.com' in the email field" })    // AI
 await page.fill("#email", "user@example.com", { prompt: "Fill email" })      // both
@@ -280,13 +280,13 @@ await page.fill("#email", "user@example.com", { prompt: "Fill email" })      // 
 Select a dropdown option using a selector, AI prompt, or both.
 
 <CodeGroup>
-```python
+```python Python
 await page.select_option("#country", value="us")                                       # selector
 await page.select_option(prompt="Select 'United States' from the country dropdown")    # AI
 await page.select_option("#country", value="us", prompt="Select United States")         # both
 ```
 
-```typescript
+```typescript TypeScript
 await page.selectOption("#country", { value: "us" })                                       // selector
 await page.selectOption({ prompt: "Select 'United States' from the country dropdown" })    // AI
 await page.selectOption("#country", { value: "us", prompt: "Select United States" })        // both
@@ -480,14 +480,14 @@ All agent methods return either a [`TaskRunResponse`](/sdk-reference/runs#run_ta
 Authenticate with stored credentials. Handles multi-page login flows, CAPTCHAs, and 2FA.
 
 <CodeGroup>
-```python
+```python Python
 await page.agent.login(
     credential_type="skyvern",
     credential_id="cred_123"
 )
 ```
 
-```typescript
+```typescript TypeScript
 await page.agent.login("skyvern", {
     credentialId: "cred_123"
 })
@@ -516,7 +516,7 @@ await page.agent.login("skyvern", {
 Run a multi-step AI task on the current page.
 
 <CodeGroup>
-```python
+```python Python
 result = await page.agent.run_task(
     "Go to the billing page and download the latest invoice",
     data_extraction_schema={
@@ -530,7 +530,7 @@ result = await page.agent.run_task(
 print(result.output)
 ```
 
-```typescript
+```typescript TypeScript
 const result = await page.agent.runTask(
     "Go to the billing page and download the latest invoice",
     {
@@ -552,7 +552,7 @@ console.log(result.output)
 | `prompt` | `str` | Yes | Multi-step goal description |
 | `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/developers/browser-automation#extract-structured-data). |
 | `max_steps` | `int` | No | Cap AI steps. The run ends with status `failed` ("Reached the maximum steps") if hit. Controls cost; each step is one AI decision + action cycle. |
-| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0` in the SDK and Cloud UI. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. Other options: `skyvern-3.0`, `openai-cua`, `anthropic-cua`, `ui-tars`, `yutori-navigator`. |
+| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0`. In the app, blocks with no engine set run on Skyvern 3.0 in agents created since October 1, 2026, and the engine selector labels `skyvern-3.0` Recommended. `skyvern-2.0` remains available for existing Skyvern 2.0 agents and explicitly requested Skyvern 2.0 task runs. Other options: `skyvern-3.0`, `openai-cua`, `anthropic-cua`, `ui-tars`, `yutori-navigator`. |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
 | `url` | `str` / `string` | No | URL to navigate to (defaults to current page URL) |
 | `webhook_url` | `str` / `string` | No | Callback URL. Skyvern POSTs the full run result on completion or failure. See [Webhooks](/developers/production#webhooks). |
@@ -574,7 +574,7 @@ console.log(result.output)
 Navigate and download files from the current page.
 
 <CodeGroup>
-```python
+```python Python
 result = await page.agent.download_files(
     "Download the latest invoice PDF",
     download_suffix="invoice",
@@ -582,7 +582,7 @@ result = await page.agent.download_files(
 )
 ```
 
-```typescript
+```typescript TypeScript
 const result = await page.agent.downloadFiles(
     "Download the latest invoice PDF",
     {
@@ -612,14 +612,14 @@ const result = await page.agent.downloadFiles(
 Run a Cloud UI workflow on the current page.
 
 <CodeGroup>
-```python
+```python Python
 result = await page.agent.run_workflow(
     "wpid_monthly_report",
     parameters={"month": "2025-03"}
 )
 ```
 
-```typescript
+```typescript TypeScript
 const result = await page.agent.runWorkflow(
     "wpid_monthly_report",
     { parameters: { month: "2025-03" } }

@@ -1576,6 +1576,7 @@ class TestPollOtpValueRetry:
         mock_sleep: AsyncMock,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_url.return_value = otp
@@ -1612,6 +1613,7 @@ class TestPollOtpValueRetry:
         mock_sleep: AsyncMock,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
         otp = OTPValue(value="123456", type=OTPType.TOTP)
@@ -1652,6 +1654,7 @@ class TestPollOtpValueRetry:
         start = datetime(2026, 1, 1, 12, 0, 0)
         mock_datetime.utcnow.return_value = start
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
         mock_email.return_value = None
@@ -1725,6 +1728,7 @@ class TestPollOtpValueRetry:
         ):
             mock_datetime.utcnow.side_effect = utcnow_returns
             mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
             mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
             raw_identifier = "otp@example.com"
             raw_url = "https://example.com/mfa?token=secret"
@@ -1855,6 +1859,7 @@ class TestPollOtpValueRetry:
         raw_identifier = "otp@example.com"
         raw_url = "https://example.com/mfa"
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_fetch.return_value = OTPValue(value=raw, type=OTPType.TOTP)
 

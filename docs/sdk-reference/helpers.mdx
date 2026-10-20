@@ -55,32 +55,147 @@ skyvern.login(request: LoginOptions): Promise<WorkflowRunResponse>
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `credential_type` | `credential_type` | `CredentialType` | Yes | — | Where to get the credential from |
-| `url` | `url` | `str \| None` | No | `None` | Website URL |
-| `credential_id` | `credential_id` | `str \| None` | No | `None` | ID of the Skyvern credential to use for login. |
-| `bitwarden_collection_id` | `bitwarden_collection_id` | `str \| None` | No | `None` | Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items` |
-| `bitwarden_item_id` | `bitwarden_item_id` | `str \| None` | No | `None` | Bitwarden item ID |
-| `onepassword_vault_id` | `onepassword_vault_id` | `str \| None` | No | `None` | 1Password vault ID |
-| `onepassword_item_id` | `onepassword_item_id` | `str \| None` | No | `None` | 1Password item ID |
-| `prompt` | `prompt` | `str \| None` | No | `None` | Login instructions. Skyvern has default prompt/instruction for login if this field is not provided. |
-| `webhook_url` | `webhook_url` | `str \| None` | No | `None` | Webhook URL to send status updates |
-| `proxy_location` | `proxy_location` | `ProxyLocationInput` | No | `None` | Proxy location to use |
-| `totp_identifier` | `totp_identifier` | `str \| None` | No | `None` | Identifier for TOTP (Time-based One-Time Password) if required |
-| `totp_url` | `totp_url` | `str \| None` | No | `None` | TOTP URL to fetch one-time passwords |
-| `browser_session_id` | `browser_session_id` | `str \| None` | No | `None` | ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456` |
-| `browser_address` | `browser_address` | `str \| None` | No | `None` | The CDP address for the task. |
-| `extra_http_headers` | `extra_http_headers` | `dict[str, str] \| None` | No | `None` | Additional HTTP headers to include in requests |
-| `max_screenshot_scrolling_times` | `max_screenshot_scrolling_times` | `int \| None` | No | `None` | Maximum number of times to scroll for screenshots |
-| `azure_vault_name` | `azure_vault_name` | `str \| None` | No | `None` | Azure Vault Name |
-| `azure_vault_username_key` | `azure_vault_username_key` | `str \| None` | No | `None` | Azure Vault username key |
-| `azure_vault_password_key` | `azure_vault_password_key` | `str \| None` | No | `None` | Azure Vault password key |
-| `azure_vault_totp_secret_key` | `azure_vault_totp_secret_key` | `str \| None` | No | `None` | Azure Vault TOTP secret key |
-| `wait_for_completion` | `waitForCompletion` | `bool` | No | `False` | Wait for the run to reach a final status before returning. |
-| `timeout` | `timeout` | `float` | No | `1800` | Maximum time to wait for completion, in seconds. |
-| — | `browser_profile_id` | `string` | No | — | ID of a browser profile to reuse for this run |
-| — | `cdp_connect_headers` | `Record<string, string \| undefined>` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites. |
+<ParamField path={"credential_type"} type={"CredentialType"} required>
+Where to get the credential from
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+Website URL
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"credential_id"} type={"str | None"}>
+ID of the Skyvern credential to use for login.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"bitwarden_collection_id"} type={"str | None"}>
+Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items`
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"bitwarden_item_id"} type={"str | None"}>
+Bitwarden item ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"onepassword_vault_id"} type={"str | None"}>
+1Password vault ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"onepassword_item_id"} type={"str | None"}>
+1Password item ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+Webhook URL to send status updates
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Proxy location to use
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP (Time-based One-Time Password) if required
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+TOTP URL to fetch one-time passwords
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the task.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+Additional HTTP headers to include in requests
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolling_times"} type={"int | None"}>
+Maximum number of times to scroll for screenshots
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_name"} type={"str | None"}>
+Azure Vault Name
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_username_key"} type={"str | None"}>
+Azure Vault username key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_password_key"} type={"str | None"}>
+Azure Vault password key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_totp_secret_key"} type={"str | None"}>
+Azure Vault TOTP secret key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"wait_for_completion"} type={"bool"}>
+Wait for the run to reach a final status before returning.
+
+Default: `False` · TypeScript: `waitForCompletion`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for completion, in seconds.
+
+Default: `1800`
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"string"}>
+ID of a browser profile to reuse for this run
+
+TypeScript only
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"Record<string, string | undefined>"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
+
+TypeScript only
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
 
@@ -187,26 +302,107 @@ skyvern.downloadFiles(request: DownloadFilesOptions): Promise<WorkflowRunRespons
 
 **Parameters**
 
-| Parameter | TypeScript | Type | Required | Default | Description |
-|---|---|---|---|---|---|
-| `navigation_goal` | `navigation_goal` | `str` | Yes | — | Instructions for navigating to and downloading the file |
-| `user_agent` | `x-user-agent` | `str \| None` | No | `None` | User-Agent string the browser sends. |
-| `url` | `url` | `str \| None` | No | — | Website URL |
-| `webhook_url` | `webhook_url` | `str \| None` | No | — | Webhook URL to send status updates |
-| `proxy_location` | `proxy_location` | `ProxyLocation \| None` | No | — | Proxy location to use |
-| `totp_identifier` | `totp_identifier` | `str \| None` | No | — | Identifier for TOTP (Time-based One-Time Password) if required |
-| `totp_url` | `totp_url` | `str \| None` | No | — | TOTP URL to fetch one-time passwords |
-| `browser_session_id` | `browser_session_id` | `str \| None` | No | — | ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456` |
-| `browser_profile_id` | `browser_profile_id` | `str \| None` | No | — | ID of a browser profile to reuse for this run |
-| `browser_address` | `browser_address` | `str \| None` | No | — | The CDP address for the task. |
-| `extra_http_headers` | `extra_http_headers` | `dict[str, str \| None] \| None` | No | — | Additional HTTP headers to include in requests |
-| `cdp_connect_headers` | `cdp_connect_headers` | `dict[str, str \| None] \| None` | No | — | HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites. |
-| `max_screenshot_scrolling_times` | `max_screenshot_scrolling_times` | `int \| None` | No | — | Maximum number of times to scroll for screenshots |
-| `download_suffix` | `download_suffix` | `str \| None` | No | — | Suffix or complete filename for the downloaded file |
-| `download_timeout` | `download_timeout` | `float \| None` | No | — | Timeout in seconds for the download operation |
-| `max_steps_per_run` | `max_steps_per_run` | `int \| None` | No | — | Maximum number of steps to execute |
-| — | `waitForCompletion` | `boolean` | No | — | TypeScript only. |
-| — | `timeout` | `number` | No | — | TypeScript only. |
+<ParamField path={"navigation_goal"} type={"str"} required>
+Instructions for navigating to and downloading the file
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+User-Agent string the browser sends.
+
+Default: `None` · TypeScript: `x-user-agent`
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+Website URL
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+Webhook URL to send status updates
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocation | None"}>
+Proxy location to use
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP (Time-based One-Time Password) if required
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+TOTP URL to fetch one-time passwords
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+ID of a browser profile to reuse for this run
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the task.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str | None] | None"}>
+Additional HTTP headers to include in requests
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"dict[str, str | None] | None"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolling_times"} type={"int | None"}>
+Maximum number of times to scroll for screenshots
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"download_suffix"} type={"str | None"}>
+Suffix or complete filename for the downloaded file
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"download_timeout"} type={"float | None"}>
+Timeout in seconds for the download operation
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"max_steps_per_run"} type={"int | None"}>
+Maximum number of steps to execute
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"waitForCompletion"} type={"boolean"}>
+TypeScript only
+</ParamField>
+
+<ParamField path={"timeout"} type={"number"}>
+TypeScript only
+</ParamField>
 
 **Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
 

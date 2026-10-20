@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from time import time as current_time
 from types import SimpleNamespace
 from typing import Annotated
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import jwt
@@ -113,6 +113,17 @@ def test_debug_fields_report_no_shadow_decode_for_unchanged_value() -> None:
     assert debug_fields["normalized_api_key_decodes"] is None
     assert debug_fields["normalized_api_key_would_be_expired"] is None
     assert debug_fields["normalized_api_key_error_type"] is None
+
+
+def test_keys_minted_for_one_org_with_the_same_expiry_are_distinct() -> None:
+    first = create_access_token("o_test", expires_delta=timedelta(hours=1))
+    second = create_access_token("o_test", expires_delta=timedelta(hours=1))
+    claims = [
+        jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.SIGNATURE_ALGORITHM]) for token in (first, second)
+    ]
+
+    assert first != second
+    assert claims[0]["sub"] == claims[1]["sub"] == "o_test"
 
 
 def test_debug_fields_show_when_normalized_token_would_decode(monkeypatch) -> None:
@@ -301,6 +312,32 @@ async def test_get_current_org_cached_rejects_rotated_key_after_invalidation() -
 
 
 @pytest.mark.asyncio
+async def test_get_current_org_cached_preserves_token_id_on_cache_miss_and_hit(monkeypatch) -> None:
+    api_key = create_access_token("org-a", expires_delta=timedelta(hours=1))
+    organizations = _RotatingAuthOrganizations({api_key: True})
+    db = _AuthDatabase(organizations)
+    agent_function = AgentFunction()
+    profile_lookup = AsyncMock(return_value=("full_org", None, True))
+    monkeypatch.setattr(agent_function, "resolve_api_key_profile", profile_lookup)
+    monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", agent_function)
+    request_principal._request_principal.set(None)
+
+    await org_auth_service.get_current_org_cached(api_key, db)
+    principal_on_miss = get_request_principal()
+    assert principal_on_miss is not None
+    assert principal_on_miss.api_key_token_id == "oat_test"
+
+    request_principal._request_principal.set(None)
+    await org_auth_service.get_current_org_cached(api_key, db)
+    principal_on_hit = get_request_principal()
+
+    assert principal_on_hit is not None
+    assert principal_on_hit.api_key_token_id == "oat_test"
+    assert organizations.validate_calls == 1
+    profile_lookup.assert_awaited_once_with("org-a", "oat_test")
+
+
+@pytest.mark.asyncio
 async def test_get_current_org_cached_coalesces_concurrent_cache_misses(monkeypatch) -> None:
     cache = org_auth_service._current_org_cache
     cache.clear()
@@ -314,7 +351,7 @@ async def test_get_current_org_cached_coalesces_concurrent_cache_misses(monkeypa
         resolve_calls += 1
         validation_started.set()
         await release_validation.wait()
-        return SimpleNamespace(organization=organization)
+        return SimpleNamespace(organization=organization, token=_make_auth_token(_api_key, valid=True))
 
     monkeypatch.setattr(org_auth_service, "resolve_org_from_api_key", resolve_api_key)
     db = object()
@@ -348,7 +385,7 @@ async def test_get_current_org_cached_does_not_recache_after_invalidation_during
         if resolve_calls == 1:
             validation_started.set()
             await release_validation.wait()
-        return SimpleNamespace(organization=organization)
+        return SimpleNamespace(organization=organization, token=_make_auth_token(_api_key, valid=True))
 
     monkeypatch.setattr(org_auth_service, "resolve_org_from_api_key", resolve_api_key)
     db = object()
@@ -369,9 +406,9 @@ def test_invalidate_cached_org_drops_only_matching_entries() -> None:
     cache.clear()
     org_a = _make_org("org-a")
     org_b = _make_org("org-b")
-    cache[("api-key-a", "db")] = org_a
-    cache[("api-key-a-rotated", "db")] = org_a
-    cache[("api-key-b", "db")] = org_b
+    cache[("api-key-a", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a")
+    cache[("api-key-a-rotated", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a-rotated")
+    cache[("api-key-b", "db")] = org_auth_service._CachedOrganizationAuth(org_b, "token-b")
 
     org_auth_service.invalidate_cached_org("org-a")
 
@@ -385,7 +422,7 @@ def test_invalidate_cached_org_is_noop_when_id_absent() -> None:
     cache = org_auth_service._current_org_cache
     cache.clear()
     org = _make_org("org-a")
-    cache[("api-key", "db")] = org
+    cache[("api-key", "db")] = org_auth_service._CachedOrganizationAuth(org, "token-a")
 
     org_auth_service.invalidate_cached_org("never-seen")
 
@@ -1155,7 +1192,9 @@ def _principal_app() -> FastAPI:
 
     def principal() -> dict[str, object] | None:
         resolved = get_request_principal()
-        return asdict(resolved) if resolved else None
+        return (
+            {key: value for key, value in asdict(resolved).items() if key != "api_key_token_id"} if resolved else None
+        )
 
     @fastapi_app.post("/org")
     async def org(_: Organization = Depends(org_auth_service.get_current_org)) -> dict[str, object] | None:
@@ -1211,7 +1250,9 @@ def _principal_app() -> FastAPI:
 
     @fastapi_app.websocket("/stream")
     async def stream(websocket: WebSocket, apikey: str | None = None, token: str | None = None) -> None:
-        await streaming_auth(apikey, token, websocket)
+        await streaming_auth(
+            apikey, token, websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"}
+        )
         await websocket.send_json(principal())
         await websocket.close()
 
@@ -1508,7 +1549,10 @@ async def test_concurrent_principal_resolutions_keep_one_canonical_result(
         await asyncio.sleep(0)
         release_first_lookup.set()
         first, second = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1)
-        return [asdict(first), asdict(second)]
+        return [
+            {key: value for key, value in asdict(principal).items() if key != "api_key_token_id"}
+            for principal in (first, second)
+        ]
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         response = await client.post("/concurrent-principals")

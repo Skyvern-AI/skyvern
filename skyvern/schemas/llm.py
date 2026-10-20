@@ -96,9 +96,9 @@ class LLMConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
     reasoning_effort: str | None = None
-    # When True, reasoning_effort is a deliberate per-config pin that the
-    # thinking-budget optimization leaves alone. Only honored on the generic branch;
-    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # When True, reasoning_effort is a deliberate per-config pin that the thinking-budget
+    # optimization leaves alone. Adaptive Claude honors it as its effort; Gemini and
+    # budget-based Anthropic still apply their own thinking budgets.
     pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
@@ -155,9 +155,9 @@ class LLMRouterConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     reasoning_effort: str | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
-    # When True, reasoning_effort is a deliberate per-config pin that the
-    # thinking-budget optimization leaves alone. Only honored on the generic branch;
-    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # When True, reasoning_effort is a deliberate per-config pin that the thinking-budget
+    # optimization leaves alone. Adaptive Claude honors it as its effort; Gemini and
+    # budget-based Anthropic still apply their own thinking budgets.
     # Appended last so no existing field's positional slot shifts.
     pin_reasoning_effort: bool = False
     # A model group that only the handler's Gemini content-filter escape hatch dispatches to.
