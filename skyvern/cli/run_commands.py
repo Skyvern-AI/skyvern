@@ -623,7 +623,18 @@ def run_dev() -> None:
 
 
 class _ServerCardMiddleware:
-    """Serve /.well-known/mcp/server-card.json for HTTP MCP transports."""
+    """Serve /.well-known/mcp/server-card.json for HTTP MCP transports.
+
+    The card advertises the endpoint clients should connect to. By default that is derived from
+    the local bind -- ``http://<host>:<port><mcp_path>``, with ``0.0.0.0`` and ``::`` rewritten to
+    ``localhost`` -- which is right only when the address the server binds is also the address
+    clients reach.
+
+    Set ``SKYVERN_MCP_PUBLIC_URL`` to the externally reachable URL when it is not: behind a reverse
+    proxy, with a container port mapped to a different host port, or where TLS terminates upstream
+    and the public URL is ``https://``. Nothing validates the derived value, so without this the
+    card is served successfully and simply points somewhere the client cannot use.
+    """
 
     def __init__(self, app: ASGIApp, transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
         from skyvern.cli.core.server_card import build_server_card  # noqa: PLC0415
