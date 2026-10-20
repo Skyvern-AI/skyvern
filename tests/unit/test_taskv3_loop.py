@@ -26,7 +26,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
@@ -5231,15 +5231,25 @@ async def test_no_tool_call_turn_is_counted_and_nudged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_overflow() -> None:
-    # Dropping a parameter cannot shrink a transcript, so re-issuing would burn a second oversized
-    # request and mislabel the failure.
-    class _OverflowingCaller(_ScriptedCaller):
+@pytest.mark.parametrize(
+    ("exc", "reason_fragment"),
+    [
+        (SkyvernContextWindowExceededError(model="test-model"), "context window exceeded"),
+        (LLMContentFilteredError("TEST_KEY", ["primary", "fallback"]), "refused"),
+    ],
+    ids=["context_window", "refusal"],
+)
+async def test_loop_does_not_blame_an_optional_call_param_for_an_unfixable_call_failure(
+    exc: Exception, reason_fragment: str
+) -> None:
+    # Dropping a parameter cannot shrink a transcript or change a refusal, so re-issuing would burn
+    # a second request and mislabel the failure.
+    class _FailingCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             self.calls += 1
-            raise SkyvernContextWindowExceededError(model="test-model")
+            raise exc
 
-    caller = _OverflowingCaller([])
+    caller = _FailingCaller([])
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
         system_prompt="sys",
@@ -5248,10 +5258,13 @@ async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_o
         max_turns=5,
         max_tool_calls=10,
         call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        call_retry_base_delay=0.0,
     )
 
     assert outcome.status == "loop_error"
     assert caller.calls == 1
+    assert reason_fragment in outcome.reason
 
 
 @pytest.mark.asyncio

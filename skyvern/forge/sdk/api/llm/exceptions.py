@@ -83,6 +83,18 @@ class LLMOutputTruncatedError(InvalidLLMResponseFormat):
         self.reasoning_tokens = reasoning_tokens
 
 
+# A response-shape error rather than a provider error: the model answered, so callers that hold or re-ask on an
+# unusable reply keep doing that instead of treating the model as unreachable.
+class LLMContentFilteredError(InvalidLLMResponseFormat):
+    def __init__(self, llm_key: str, models: list[str]) -> None:
+        SkyvernException.__init__(
+            self,
+            f"The model refused or its content filter blocked the response on {', then '.join(models)} "
+            f"(LLM key {llm_key})",
+        )
+        self.llm_key = llm_key
+
+
 class NoProviderEnabledError(BaseLLMError):
     def __init__(self) -> None:
         super().__init__(

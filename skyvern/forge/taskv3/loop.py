@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 import structlog
 
 from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
+from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
@@ -3837,12 +3838,12 @@ async def run_agent_tool_loop(
         of the run) and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
-        on a run that was already failing. A context-window overflow is excluded because dropping a
-        parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
+        on a run that was already failing. A context-window overflow or a refusal is excluded because
+        dropping a parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
         value, so a provider that rejects the dict form cannot end the run on turn 1.
         """
         nonlocal anthropic_cache_markers
-        if isinstance(exc, SkyvernContextWindowExceededError):
+        if isinstance(exc, (SkyvernContextWindowExceededError, LLMContentFilteredError)):
             return False
         for param in ("reasoning_effort", "cache_control_injection_points"):
             if active_call_kwargs.pop(param, None) is not None:
