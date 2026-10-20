@@ -129,6 +129,14 @@ class _FakeTap:
     async def frame_path(self, event: TapEvent) -> list[dict[str, str]] | None:
         return [] if event.is_main_frame else [{"name": event.frame_name}] if event.frame_name else None
 
+    async def call_on_file_input(self, event: TapEvent, declaration: str, *args: Any) -> Any:
+        if "selectorFor" in declaration:
+            return {"selector": "#resume", "label": "Resume"}
+        type(self).attached_files.append(args[:2])
+        return 1
+
+    attached_files: ClassVar[list[tuple[Any, ...]]] = []
+
     def begin_control_navigation(self) -> None:
         return None
 
@@ -273,6 +281,23 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
                 "credential_field": "password",
             },
         },
+        {
+            "kind": "upload",
+            "selector": "#resume",
+            "file_id": "file-1",
+            "filename": "resume.pdf",
+            "size_bytes": 4,
+            "field_label": "Resume",
+            "source_url": "https://example.test/done",
+            "frame": {"is_main": True, "name": ""},
+        },
+        {
+            "kind": "upload",
+            "selector": "#cover",
+            "field_label": "Cover letter",
+            "source_url": "https://example.test/done",
+            "frame": {"is_main": True, "name": ""},
+        },
     ]
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
         DemonstrationRecord(
@@ -327,7 +352,9 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
         "type_text",
         "type_text",
         "fill_credential_field",
+        "upload_attached_file",
     ]
+    assert json.loads(calls[-1]["arguments"]) == {"file_id": "file-1", "selector": "#resume"}
     serialized = json.dumps(history)
     assert "Acme Corp" in serialized
     assert token not in serialized
@@ -335,6 +362,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     assert "<value not recorded>" in serialized
     assert any("file chooser" in str(item.get("content")) for item in history if item.get("role") == "user")
     assert any("disconnected" in str(item.get("content")) for item in history if item.get("role") == "user")
+    assert any("#cover" in str(item.get("content")) and "no file" in str(item.get("content")) for item in history)
     gap_index = next(index for index, item in enumerate(history) if "file chooser" in str(item.get("content")))
     first_type_index = next(index for index, item in enumerate(history) if item.get("name") == "type_text")
     assert gap_index < first_type_index
@@ -481,9 +509,22 @@ async def test_recorder_persists_tap_actions_controls_and_stops(monkeypatch: pyt
         [
             {"seq": 1, "action": "navigate", "url": "http://127.0.0.1/private"},
             {"seq": 2, "action": "navigate", "url": "https://example.test/next"},
+            {"seq": 3, "action": "upload_file", "file_id": "file-1"},
         ]
     )
     await cache.set(demonstration_browser_key("org-1", "pbs-1"), demonstration_id, ex=timedelta(minutes=1))
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(
+            uploaded_files=SimpleNamespace(
+                get_uploaded_file=AsyncMock(
+                    return_value=SimpleNamespace(storage_uri="s3://bucket/org-1/resume.pdf", filename="resume.pdf")
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(download_managed_file=AsyncMock(return_value=b"%PDF")))
     page = SimpleNamespace(url="https://example.test/start", goto=AsyncMock(), is_closed=lambda: False)
     click = TapEvent(
         page=page,
@@ -535,14 +576,31 @@ async def test_recorder_persists_tap_actions_controls_and_stops(monkeypatch: pyt
         frame_name="",
         payload={"kind": "file_click", "ts": 3, "url": page.url, "selector": "#upload"},
     )
+    file_chooser = TapEvent(
+        page=page,
+        session_key="tap-1",
+        frame_id="main",
+        is_main_frame=True,
+        frame_name="",
+        payload={"kind": "file_chooser", "ts": 3.1, "backend_node_id": 7},
+    )
+    unanswered_chooser = TapEvent(
+        page=page,
+        session_key="tap-1",
+        frame_id="main",
+        is_main_frame=True,
+        frame_name="",
+        payload={"kind": "file_chooser", "ts": 3.2, "backend_node_id": 8},
+    )
 
     browser_context = SimpleNamespace(pages=[page])
     browser_state = SimpleNamespace(
         browser_context=browser_context,
         get_working_page=AsyncMock(return_value=page),
     )
-    _FakeTap.events = [click, password_focus, password, file_click]
+    _FakeTap.events = [click, password_focus, password, file_click, file_chooser, unanswered_chooser]
     _FakeTap.flush_events = []
+    _FakeTap.attached_files = []
     monkeypatch.setattr(recorder_module, "PageTap", _FakeTap)
     monkeypatch.setattr(recorder_module, "resolve_persistent_browser_state", AsyncMock(return_value=browser_state))
 
@@ -574,18 +632,27 @@ async def test_recorder_persists_tap_actions_controls_and_stops(monkeypatch: pyt
     assert [first["kind"], second["kind"], third["kind"], fourth["kind"]] == [
         "click",
         "secret",
-        "gap",
         "navigate",
+        "upload",
     ]
-    assert third["reason"] == "file_chooser"
+    assert {key: fourth[key] for key in ("selector", "file_id", "filename", "size_bytes")} == {
+        "selector": "#resume",
+        "file_id": "file-1",
+        "filename": "resume.pdf",
+        "size_bytes": 4,
+    }
+    assert _FakeTap.attached_files == [("resume.pdf", "application/pdf")]
+    assert {"type": "demonstration_file_requested", "label": "Resume"} in stream.frames
+    unanswered = json.loads(cache.store[demonstration_event_key("org-1", demonstration_id, 5)])
+    assert unanswered["kind"] == "upload" and "file_id" not in unanswered
     assert page.goto.await_args.args == ("https://example.test/next",)
     assert any(frame.get("type") == "demonstration_notice" and frame.get("level") == "error" for frame in stream.frames)
     action_frames = [frame for frame in stream.frames if frame.get("type") == "demonstration_action"]
     assert [(frame["seq"], frame["tool_name"]) for frame in action_frames] == [
         (1, "click"),
         (2, "type_text"),
-        (3, "gap"),
-        (4, "navigate_browser"),
+        (3, "navigate_browser"),
+        (4, "upload_attached_file"),
     ]
     assert action_frames[1]["label"] == second["label"] == "Fill password (value not recorded)"
     sensitive_frame = next(frame for frame in stream.frames if frame.get("type") == "demonstration_sensitive_field")
@@ -596,13 +663,13 @@ async def test_recorder_persists_tap_actions_controls_and_stops(monkeypatch: pyt
         "url": "https://example.test/start",
     }
     stopped = decode_demonstration_record(cache.store[demonstration_record_key("org-1", demonstration_id)])
-    assert stopped is not None and stopped.status == "stopped" and stopped.event_count == 4
+    assert stopped is not None and stopped.status == "stopped" and stopped.event_count == 5
     assert stopped.stop_reason == "disconnected"
     assert stream.frames[-1] == {
         "type": "demonstration_stopped",
         "demonstration_id": "demo-1",
         "reason": "disconnected",
-        "action_count": 4,
+        "action_count": 5,
     }
     assert cache.expirations[demonstration_browser_key("org-1", "pbs-1")] == recorder_module.DEMONSTRATION_TTL
 
@@ -939,6 +1006,37 @@ async def test_discard_after_resume_commits_cancelled_even_when_the_stream_drops
         browser_session_id="pbs-1",
     )
     assert active is None
+
+
+@pytest.mark.asyncio
+async def test_client_upload_control_cannot_name_a_file() -> None:
+    cache = _SharedCache()
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id="wfp-1",
+            browser_session_id="pbs-1",
+            status="recording",
+            event_count=0,
+            owner="owner-1",
+            owner_seen_at=datetime.now(UTC),
+            final_url=None,
+        )
+    )
+    cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
+    crafted = WorkflowCopilotDemonstrationControlRequest.model_validate(
+        {"demonstration_id": "demo-1", "action": "upload_file", "file_id": "file-from-elsewhere"}
+    )
+
+    await append_demonstration_control(cache, organization_id="org-1", request=crafted)  # type: ignore[arg-type]
+    await append_demonstration_control(
+        cache,  # type: ignore[arg-type]
+        organization_id="org-1",
+        request=WorkflowCopilotDemonstrationControlRequest(demonstration_id="demo-1", action="upload_file"),
+        file_id="file-stored-for-demo",
+    )
+
+    controls = json.loads(cache.store[demonstration_controls_key("org-1", "demo-1")])
+    assert [control.get("file_id") for control in controls] == [None, "file-stored-for-demo"]
 
 
 @pytest.mark.asyncio
