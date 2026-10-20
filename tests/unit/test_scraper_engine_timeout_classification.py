@@ -118,6 +118,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
             "wait_seconds": 1.25,
             "must_included_tags": ["button"],
             "allow_transient_ui_suppression": True,
+            "navigation_deadline": 123.5,
         }
         return SimpleNamespace(
             browser_state=browser_state,

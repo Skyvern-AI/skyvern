@@ -53,6 +53,7 @@ from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services import run_service
 from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services import webhook_service as replay_service
+from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 pytestmark = pytest.mark.usefixtures("public_dns")
@@ -168,16 +169,16 @@ def webhook_service(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowService, A
         final_exhausted_projection: WebhookDeliveryStatus | None = None,
         expected_status: str | None = None,
         expected_finished_at: datetime | None = None,
-    ) -> int | None:
+    ) -> tuple[int | None, bool]:
         rows = await service_module.app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
         row = next((row for row in rows if row.attempt_number == attempt_number), None)
         if row is None or getattr(row, "side_effects_released_at", None) != expected_claim_at:
-            return None
+            return None, False
         checkpoint = getattr(row, f"{kind}_side_effects_progress", None) or {}
         attempts = checkpoint.get("webhook_delivery_attempts", 0) + 1
         assert attempts <= max_attempts
         setattr(row, f"{kind}_side_effects_progress", {**checkpoint, "webhook_delivery_attempts": attempts})
-        return attempts
+        return attempts, False
 
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
@@ -2277,7 +2278,7 @@ async def test_interim_delivery_does_not_project_final_status(
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
         "reserve_attempt_webhook_delivery",
-        AsyncMock(return_value=1),
+        AsyncMock(return_value=(1, False)),
     )
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts, "claim_attempt_webhook", AsyncMock(return_value=True)
@@ -2460,7 +2461,7 @@ async def test_transient_final_failure_before_exhaustion_projects_no_status(
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
         "reserve_attempt_webhook_delivery",
-        AsyncMock(return_value=1),
+        AsyncMock(return_value=(1, False)),
     )
     monkeypatch.setattr(service_module, "deliver_webhook_with_retries", AsyncMock(return_value=_response(503)))
 
@@ -2487,7 +2488,7 @@ async def test_final_outer_exhaustion_projects_exhausted_status(
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
         "reserve_attempt_webhook_delivery",
-        AsyncMock(return_value=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS),
+        AsyncMock(return_value=(WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS, False)),
     )
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts, "claim_attempt_webhook", AsyncMock(return_value=True)
@@ -2599,6 +2600,15 @@ async def test_webhook_reservation_recovery_projects_only_final_exhaustion(
     svc, _build_response, _update_run = webhook_service
     run = _workflow_run()
     run.webhook_callback_url = callback_url
+    monkeypatch.setattr(
+        service_module.app.DATABASE.organizations,
+        "get_organization",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                organization_name="Recovery org", created_at=datetime.now(UTC) - timedelta(days=5)
+            )
+        ),
+    )
     sessions = async_sessionmaker(sqlite_engine, expire_on_commit=False)
     runs = WorkflowRunsRepository(sessions)
     attempts = WorkflowRunAttemptsRepository(sessions)
@@ -2637,13 +2647,13 @@ async def test_webhook_reservation_recovery_projects_only_final_exhaustion(
         )
         await session.commit()
 
-    reservations: list[int | None] = []
+    reservations: list[tuple[int | None, bool]] = []
     reserve = attempts.reserve_attempt_webhook_delivery
     expected = current if execution_change == "matching" else None
     if kind == "final" and current is None and not stale_claim and execution_change == "matching":
         expected = EXHAUSTED if callback_url == DEFAULT_URL else WebhookDeliveryStatus.exhausted_customer_config
 
-    async def record_reservation(*args: Any, **kwargs: Any) -> int | None:
+    async def record_reservation(*args: Any, **kwargs: Any) -> tuple[int | None, bool]:
         result = await reserve(*args, **kwargs)
         # A worker can stop here, before the service executes another statement.
         async with sessions() as session:
@@ -2654,15 +2664,32 @@ async def test_webhook_reservation_recovery_projects_only_final_exhaustion(
         return result
 
     monkeypatch.setattr(attempts, "reserve_attempt_webhook_delivery", record_reservation)
-    await svc.execute_workflow_webhook(
-        run,
-        claim_kind=kind,
-        attempt_number=1,
-        side_effects_claim_at=FINALIZED_AT if stale_claim else None,
-        skip_side_effects_lease_check=stale_claim,
-    )
+    with capture_runtime_logs() as logs:
+        await svc.execute_workflow_webhook(
+            run,
+            claim_kind=kind,
+            attempt_number=1,
+            side_effects_claim_at=FINALIZED_AT if stale_claim else None,
+            skip_side_effects_lease_check=stale_claim,
+        )
 
-    assert reservations == [None if stale_claim else 0]
+    finalized_events = [event for event in logs if event["msg"].startswith("Workflow webhook delivery finalized")]
+    projection_written = kind == "final" and current is None and not stale_claim and execution_change == "matching"
+    assert reservations == [(None if stale_claim else 0, projection_written)]
+    assert len(finalized_events) == int(projection_written)
+    if projection_written:
+        event = finalized_events[0]
+        assert event["delivery_outcome"] == (
+            EXHAUSTED.value if callback_url == DEFAULT_URL else WebhookDeliveryStatus.exhausted_customer_config.value
+        )
+        assert event["http_status_class"] == "no_response"
+        assert event["attempts"] == 0
+        assert event["replay"] is False
+        assert event["workflow_run_id"] == run.workflow_run_id
+        assert event["delivery_seconds"] is not None
+        assert event["organization_id"] == run.organization_id
+        assert event["organization_name"] == "Recovery org"
+        assert event["org_age"] == 5
     deliver.assert_not_awaited()
     attempt = (await attempts.get_attempts(run.workflow_run_id))[0]
     recorded_progress = (
@@ -2887,7 +2914,7 @@ async def test_reservation_recovery_exhaustion_projection_is_atomic_with_marker(
         assert attempt.webhook_sent_at is None
         assert attempt.final_side_effects_progress == progress
 
-    result = await WorkflowRunAttemptsRepository(seed).reserve_attempt_webhook_delivery(
+    result, projection_written = await WorkflowRunAttemptsRepository(seed).reserve_attempt_webhook_delivery(
         "wr_atomic",
         1,
         kind="final",
@@ -2898,6 +2925,7 @@ async def test_reservation_recovery_exhaustion_projection_is_atomic_with_marker(
         expected_finished_at=FINALIZED_AT,
     )
     assert result == 0
+    assert projection_written is True
     async with seed() as session:
         run = await session.get(WorkflowRunModel, "wr_atomic")
         attempt = await session.get(WorkflowRunAttemptModel, ("wr_atomic", 1))
@@ -2959,7 +2987,7 @@ async def test_reservation_recovery_refreshes_a_stale_bound_session(
         )
         assert stale.webhook_delivery_status == current
         monkeypatch.setattr(attempts, "Session", lambda: nullcontext(stale_session))
-        result = await attempts.reserve_attempt_webhook_delivery(
+        result, projection_written = await attempts.reserve_attempt_webhook_delivery(
             "wr_stale_recovery",
             1,
             kind="final",
@@ -2971,6 +2999,7 @@ async def test_reservation_recovery_refreshes_a_stale_bound_session(
         )
 
     assert result == 0
+    assert projection_written is False
     locked_tables = [statement.split("FROM ", 1)[1].split()[0] for statement in statements if "FOR UPDATE" in statement]
     assert locked_tables == ["workflow_runs", "workflow_run_attempts"]
     run_queries = [statement for statement in statements if "FROM workflow_runs" in statement]

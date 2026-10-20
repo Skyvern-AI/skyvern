@@ -362,9 +362,9 @@ def _policy_ctx(
     selected_connected_account_id: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        credential_pause_connected_credential_id=None,
         request_policy=SimpleNamespace(
             resolved_credentials=resolved,
+            credential_pause_connected_credential_ids=set(),
             credential_input_kind=credential_input_kind,
             live_page_admitted_urls={},
             seeded_proposal_credential_ids=set(),

@@ -301,6 +301,7 @@ async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatc
 
     persisted = promote_pending_to_active.await_args.kwargs
     assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
+    assert persisted["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
     assert (
         await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
             persisted["encrypted_refresh_token"],
@@ -309,6 +310,26 @@ async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatc
         )
         == "rt-new"
     )
+
+
+@pytest.mark.asyncio
+async def test_promote_pending_credential_fails_closed_without_gcm_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "", raising=False)
+    promote_pending_to_active = AsyncMock()
+    repository = SimpleNamespace(promote_pending_to_active=promote_pending_to_active)
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+
+    with pytest.raises(microsoft_oauth_service.EncryptionNotConfiguredError):
+        await microsoft_oauth_service.promote_pending_credential(
+            organization_id="org-1",
+            state="state",
+            initiator_id="user-1",
+            refresh_token="rt-new",
+            scopes_granted=["Mail.Read"],
+        )
+
+    promote_pending_to_active.assert_not_awaited()
 
 
 @pytest.mark.asyncio

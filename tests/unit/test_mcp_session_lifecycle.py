@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterator
+import time
+from collections.abc import Awaitable, Callable, Iterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -12,8 +14,10 @@ import pytest
 from fastmcp import Client
 from fastmcp.server.middleware import MiddlewareContext
 from playwright.async_api import Page
+from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_mod
+from skyvern.cli.core import hosted_driver
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.result import BrowserContext
@@ -22,11 +26,15 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.cli.mcp_tools.telemetry import MCPTelemetryMiddleware
+from skyvern.client.types.browser_session_response import BrowserSessionResponse
 from skyvern.client.types.extensions import Extensions
+from skyvern.config import settings
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
+from skyvern.library.skyvern import Skyvern
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
+from skyvern.services import cleanup_service
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
@@ -40,6 +48,8 @@ def _clear_singletons() -> None:
     client_mod._api_key_override.set(None)
     client_mod._global_skyvern_instance = None
     client_mod._api_key_clients.clear()
+    client_mod._closing_clients.clear()
+    hosted_driver._OWNERS.clear()
 
     session_manager._current_session.set(None)
     session_manager._current_organization_id.set(None)
@@ -700,6 +710,727 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
         assert opened[0].browser.connected
     assert copilot_browser.browser.connected
     assert not any(browser.session_closed for browser in [*opened, copilot_browser])
+
+
+class _FakeDriverProcess:
+    def __init__(self) -> None:
+        self.pid = 4242
+        self.returncode: int | None = None
+        self.kills = 0
+        self.killed = asyncio.Event()
+
+    def kill(self) -> None:
+        self.kills += 1
+        self.returncode = -9
+        self.killed.set()
+
+
+class _FakeDriverConnection:
+    """One CDP connection a fake driver opened; close() drops only this connection."""
+
+    def __init__(self, driver: _FakeDriver) -> None:
+        self.driver = driver
+        self.connected = True
+        self.contexts = [
+            SimpleNamespace(_loop=asyncio.get_running_loop(), pages=[], on=lambda *_args: None, browser=self)
+        ]
+
+    async def new_browser_cdp_session(self) -> SimpleNamespace:
+        return SimpleNamespace(send=AsyncMock())
+
+    async def close(self) -> None:
+        if self.driver.close_hangs:
+            await asyncio.Event().wait()
+        self.connected = False
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+class _FakeDriver:
+    """A started Playwright driver whose process runs until stop() returns or it is killed."""
+
+    def __init__(self, *, close_hangs: bool = False, stop_hangs: bool = False, stop_raises: bool = False) -> None:
+        self.close_hangs = close_hangs
+        self.stop_hangs = stop_hangs
+        self.stop_raises = stop_raises
+        self.process = _FakeDriverProcess()
+        self.transport_lost: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.closed_reasons: list[str] = []
+        connection = SimpleNamespace(
+            _transport=SimpleNamespace(on_error_future=self.transport_lost, _proc=self.process), _closed_error=None
+        )
+
+        def cleanup(reason: str) -> None:
+            # Playwright's Connection.cleanup latches the error that fails every later call on this driver.
+            self.closed_reasons.append(reason)
+            connection._closed_error = reason
+
+        connection.cleanup = cleanup
+        self._impl_obj = SimpleNamespace(_connection=connection)
+        self.chromium = SimpleNamespace(connect_over_cdp=self._connect_over_cdp)
+        self.connections: list[_FakeDriverConnection] = []
+
+    async def _connect_over_cdp(self, _endpoint: str, **_kwargs: object) -> _FakeDriverConnection:
+        self.connections.append(_FakeDriverConnection(self))
+        return self.connections[-1]
+
+    async def stop(self) -> None:
+        if self.stop_hangs:
+            await asyncio.Event().wait()
+        if self.stop_raises:
+            raise RuntimeError("driver pipe already closed")  # the process itself keeps running
+        self.process.returncode = 0
+
+    @property
+    def alive(self) -> bool:
+        return self.process.returncode is None
+
+
+class _FakePlaywright:
+    """Stands in for ``async_playwright``: each start() spawns one _FakeDriver."""
+
+    def __init__(self) -> None:
+        self.drivers: list[_FakeDriver] = []
+        self.start_gate: asyncio.Event | None = None
+        # While closed, the spawned driver exists but its manager has not published the process handle yet.
+        self.publish_gate: asyncio.Event | None = None
+        self.next_driver: dict[str, bool] = {}
+        self.failing_starts = 0
+
+    def __call__(self) -> SimpleNamespace:
+        manager = SimpleNamespace(_connection=None)
+        manager.start = lambda: self._start(manager)
+        return manager
+
+    async def _start(self, manager: SimpleNamespace) -> _FakeDriver:
+        if self.failing_starts:
+            self.failing_starts -= 1
+            raise RuntimeError("Playwright driver failed to start")
+        # Like a real spawn, the process exists from the moment start() begins.
+        driver = _FakeDriver(**self.next_driver)
+        self.drivers.append(driver)
+        if self.publish_gate is not None:
+            await self.publish_gate.wait()
+        manager._connection = driver._impl_obj._connection
+        if self.start_gate is not None:
+            gate = asyncio.ensure_future(self.start_gate.wait())
+            killed = asyncio.ensure_future(driver.process.killed.wait())
+            await asyncio.wait({gate, killed}, return_when=asyncio.FIRST_COMPLETED)
+            gate.cancel()
+            killed.cancel()
+            if driver.process.killed.is_set():
+                # Like Playwright, a driver killed before initialize answers fails the pending start.
+                raise ConnectionError("Connection closed while reading from the driver")
+        return driver
+
+    def live(self) -> list[_FakeDriver]:
+        return [driver for driver in self.drivers if driver.alive]
+
+
+@pytest.fixture
+def fake_playwright(monkeypatch: pytest.MonkeyPatch) -> _FakePlaywright:
+    factory = _FakePlaywright()
+    monkeypatch.setattr("playwright.async_api.async_playwright", factory)
+    return factory
+
+
+@pytest.fixture
+def hosted_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hosted stateless MCP with the real client factory; only the browser-session lookup is stubbed."""
+
+    async def get_browser_session(_self: Skyvern, browser_session_id: str, **_kwargs: object) -> BrowserSessionResponse:
+        now = datetime.now(UTC)
+        return BrowserSessionResponse(
+            browser_session_id=browser_session_id,
+            organization_id="org_1",
+            status="running",
+            browser_address=f"ws://127.0.0.1:9222/{browser_session_id}",
+            created_at=now,
+            modified_at=now,
+        )
+
+    monkeypatch.setattr(Skyvern, "get_browser_session", get_browser_session)
+    session_manager.set_stateless_http_mode(True)
+
+
+def _connection_of(browser: SkyvernBrowser) -> _FakeDriverConnection:
+    return cast(_FakeDriverConnection, browser.browser)
+
+
+def _cached_client(api_key: str) -> Skyvern:
+    return client_mod._api_key_clients[client_mod._cache_key(api_key)]
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    for _ in range(1000):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never held")
+
+
+async def _settle_call_cleanups() -> None:
+    pending = set(session_manager._CALL_CONNECTION_DISCONNECTS)
+    if pending:
+        await asyncio.wait(pending, timeout=2)
+
+
+async def _sweep_after_idle() -> int:
+    """One sweep run as if every released driver had been idle past the threshold."""
+    return await client_mod.sweep_idle_hosted_drivers(
+        now=time.monotonic() + settings.HOSTED_MCP_DRIVER_IDLE_SECONDS + 1
+    )
+
+
+async def _hosted_call(
+    api_key: str,
+    session_id: str,
+    body: Callable[[SkyvernBrowser], Awaitable[None]] | None = None,
+) -> SkyvernBrowser:
+    """One hosted tool call: the auth middleware's key and organization scope around the MCP call scope."""
+    token = client_mod.set_api_key_override(api_key)
+    try:
+        with session_manager.request_session_scope("org_1"):
+            async with session_manager.stateless_call_connection_scope():
+                browser, _ = await session_manager.resolve_browser(session_id=session_id)
+                if body is not None:
+                    await body(browser)
+                return browser
+    finally:
+        client_mod.reset_api_key_override(token)
+
+
+def _held(
+    browsers: dict[str, SkyvernBrowser], releases: dict[str, asyncio.Event], name: str
+) -> Callable[[SkyvernBrowser], Awaitable[None]]:
+    releases[name] = asyncio.Event()
+
+    async def body(browser: SkyvernBrowser) -> None:
+        browsers[name] = browser
+        await releases[name].wait()
+
+    return body
+
+
+@pytest.mark.asyncio
+async def test_hosted_tool_calls_share_one_driver_per_key_until_the_idle_sweep(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    for api_key, session_ids in (("sk_key_a", ("pbs_1", "pbs_1")), ("sk_key_b", ("pbs_2",))):
+        token = client_mod.set_api_key_override(api_key)
+        try:
+            with session_manager.request_session_scope("org_1"):
+                async with Client(mcp) as client:
+                    for session_id in session_ids:
+                        result = await client.call_tool("skyvern_tab_list", {"session_id": session_id})
+                        assert result.structured_content is not None
+                        assert result.structured_content["ok"] is True
+        finally:
+            client_mod.reset_api_key_override(token)
+
+    # One driver per key, reused by its sequential calls; each call still dropped its own CDP connection.
+    assert len(fake_playwright.drivers) == 2
+    assert fake_playwright.live() == fake_playwright.drivers
+    assert not any(connection.connected for driver in fake_playwright.drivers for connection in driver.connections)
+
+    assert await client_mod.sweep_idle_hosted_drivers() == 0
+    assert fake_playwright.live() == fake_playwright.drivers
+
+    assert await _sweep_after_idle() == 2
+    assert fake_playwright.live() == []
+    assert hosted_driver.owners() == []
+    # The per-key HTTP clients stay cached for the next call.
+    assert list(client_mod._api_key_clients) == [client_mod._cache_key("sk_key_a"), client_mod._cache_key("sk_key_b")]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_same_key_calls_share_a_driver_the_sweep_spares_while_any_call_runs(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    browsers: dict[str, SkyvernBrowser] = {}
+    releases: dict[str, asyncio.Event] = {}
+    first = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1", _held(browsers, releases, "first")))
+    second = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1", _held(browsers, releases, "second")))
+    await _until(lambda: len(browsers) == 2)
+    [driver] = fake_playwright.drivers
+    assert _connection_of(browsers["first"]).driver is driver
+    assert _connection_of(browsers["second"]).driver is driver
+
+    releases["first"].set()
+    await first
+    assert not _connection_of(browsers["first"]).connected
+    assert await _sweep_after_idle() == 0
+    assert driver.alive
+    assert _connection_of(browsers["second"]).connected
+
+    releases["second"].set()
+    await second
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_first_use_of_a_key_starts_exactly_one_driver(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.start_gate = asyncio.Event()
+    calls = [asyncio.create_task(_hosted_call("sk_key_a", f"pbs_{index}")) for index in range(3)]
+    await _until(lambda: len(fake_playwright.drivers) >= 1)
+    for _ in range(20):
+        await asyncio.sleep(0)  # every call is now waiting on the key's driver
+    fake_playwright.start_gate.set()
+    browsers = await asyncio.gather(*calls)
+
+    assert len(fake_playwright.drivers) == 1
+    assert {_connection_of(browser).driver for browser in browsers} == set(fake_playwright.drivers)
+
+
+@pytest.mark.asyncio
+async def test_sibling_attaches_in_one_call_share_one_driver_start(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.start_gate = asyncio.Event()
+    token = client_mod.set_api_key_override("sk_key_a")
+    try:
+        with session_manager.request_session_scope("org_1"):
+            async with session_manager.stateless_call_connection_scope():
+                siblings = asyncio.gather(
+                    session_manager.resolve_browser(session_id="pbs_1"),
+                    session_manager.resolve_browser(session_id="pbs_2"),
+                )
+                await _until(lambda: len(fake_playwright.drivers) >= 1)
+                for _ in range(10):
+                    await asyncio.sleep(0)  # both siblings are now waiting for the driver
+                fake_playwright.start_gate.set()
+                (first, _), (second, _) = await siblings
+                assert _connection_of(first).driver is _connection_of(second).driver
+    finally:
+        client_mod.reset_api_key_override(token)
+
+    assert len(fake_playwright.drivers) == 1
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_waiter_does_not_cancel_the_shared_start(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.start_gate = asyncio.Event()
+    cancelled = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1"))
+    browsers: dict[str, SkyvernBrowser] = {}
+    releases: dict[str, asyncio.Event] = {}
+    survivor = asyncio.create_task(_hosted_call("sk_key_a", "pbs_2", _held(browsers, releases, "survivor")))
+    await _until(lambda: len(fake_playwright.drivers) == 1)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    await _settle_call_cleanups()
+
+    fake_playwright.start_gate.set()
+    await _until(lambda: "survivor" in browsers)
+    [driver] = fake_playwright.drivers
+    assert _connection_of(browsers["survivor"]).driver is driver
+    assert _connection_of(browsers["survivor"]).connected
+
+    releases["survivor"].set()
+    await survivor
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_start_whose_caller_was_cancelled_stays_owned_until_its_handle_can_be_reclaimed(
+    fake_playwright: _FakePlaywright, hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_manager, "_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS", 0.2)
+    fake_playwright.publish_gate = asyncio.Event()
+    call = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1"))
+    await _until(lambda: len(fake_playwright.drivers) == 1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await _settle_call_cleanups()
+    [driver] = fake_playwright.drivers
+
+    # The handle is not published yet, so nothing can reach the child; the owner must keep it rather than forget it.
+    assert await _sweep_after_idle() == 0
+    assert driver.alive
+    assert _cached_client("sk_key_a")._hosted_driver.owns_driver
+
+    fake_playwright.publish_gate.set()
+    await _until(lambda: _cached_client("sk_key_a")._hosted_driver.started)
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+    assert not _cached_client("sk_key_a")._hosted_driver.owns_driver
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_is_retried_by_the_next_attach_in_the_same_call(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.failing_starts = 1
+    token = client_mod.set_api_key_override("sk_key_a")
+    try:
+        with session_manager.request_session_scope("org_1"):
+            async with session_manager.stateless_call_connection_scope():
+                with pytest.raises(Exception, match="failed to start"):
+                    await session_manager.resolve_browser(session_id="pbs_1")
+                browser, _ = await session_manager.resolve_browser(session_id="pbs_1")
+                assert _connection_of(browser).connected
+    finally:
+        client_mod.reset_api_key_override(token)
+
+    assert len(fake_playwright.drivers) == 1
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_outlives_its_call_cannot_use_a_driver(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    call_over = asyncio.Event()
+    late: list[asyncio.Task[object]] = []
+
+    async def late_attach() -> object:
+        await call_over.wait()
+        return await session_manager.resolve_browser(session_id="pbs_2")
+
+    async def body(_browser: SkyvernBrowser) -> None:
+        late.append(asyncio.create_task(late_attach()))  # inherits this call's context
+
+    await _hosted_call("sk_key_a", "pbs_1", body)
+    call_over.set()
+    with pytest.raises(session_manager.StatelessCallEndedError):
+        await late[0]
+
+    [driver] = fake_playwright.drivers
+    assert len(driver.connections) == 1
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_call_still_disconnects_and_releases_its_driver(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    async def body(_browser: SkyvernBrowser) -> None:
+        raise RuntimeError("tool failed")
+
+    with pytest.raises(RuntimeError, match="tool failed"):
+        await _hosted_call("sk_key_a", "pbs_1", body)
+
+    [driver] = fake_playwright.drivers
+    assert not driver.connections[0].connected
+    assert await _sweep_after_idle() == 1
+    assert not driver.alive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reported"),
+    [
+        pytest.param({"close_hangs": True, "stop_hangs": True}, {"pending": 1}, id="close-and-stop-hang"),
+        pytest.param({"stop_raises": True}, {"error_type": "RuntimeError"}, id="stop-raises"),
+    ],
+)
+async def test_the_sweep_kills_a_driver_that_will_not_stop_without_touching_a_busy_peer(
+    fake_playwright: _FakePlaywright,
+    hosted_mcp: None,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: dict[str, bool],
+    reported: dict[str, object],
+) -> None:
+    monkeypatch.setattr(session_manager, "_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("skyvern.cli.core.hosted_driver.DRIVER_STOP_TIMEOUT_SECONDS", 0.2)
+    browsers: dict[str, SkyvernBrowser] = {}
+    releases: dict[str, asyncio.Event] = {}
+    peer = asyncio.create_task(_hosted_call("sk_key_b", "pbs_2", _held(browsers, releases, "peer")))
+    await _until(lambda: "peer" in browsers)
+    fake_playwright.next_driver = failure
+
+    with capture_logs() as logs:
+        await _hosted_call("sk_key_a", "pbs_1")
+        await _settle_call_cleanups()
+        assert await _sweep_after_idle() == 1
+
+    peer_driver, failed_driver = fake_playwright.drivers
+    assert failed_driver.process.kills == 1
+    assert not failed_driver.alive
+    # The kill must not hide why the driver failed to stop.
+    assert any(reported.items() <= log.items() for log in logs if log["log_level"] == "warning")
+    assert peer_driver.process.kills == 0
+    assert peer_driver.alive
+    assert _connection_of(browsers["peer"]).connected
+
+    releases["peer"].set()
+    await peer
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_driver_started_after_its_client_was_evicted_is_still_swept(
+    fake_playwright: _FakePlaywright, hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_mod, "_API_KEY_CLIENT_CACHE_MAX", 1)
+    lookup_gate = asyncio.Event()
+    lookup = Skyvern.get_browser_session
+
+    async def gated_lookup(self: Skyvern, browser_session_id: str, **kwargs: object) -> BrowserSessionResponse:
+        if browser_session_id == "pbs_gated":
+            await lookup_gate.wait()
+        return await lookup(self, browser_session_id, **kwargs)
+
+    monkeypatch.setattr(Skyvern, "get_browser_session", gated_lookup)
+    late = asyncio.create_task(_hosted_call("sk_key_a", "pbs_gated"))
+    await _until(lambda: client_mod._cache_key("sk_key_a") in client_mod._api_key_clients)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await _hosted_call("sk_key_b", "pbs_2")  # evicts sk_key_a's client before its call has attached
+    await asyncio.sleep(0)
+
+    lookup_gate.set()
+    await late
+    assert len(fake_playwright.live()) == 2
+    assert await _sweep_after_idle() == 2
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_client_whose_start_is_still_pending_keeps_its_driver_reachable(
+    fake_playwright: _FakePlaywright, hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_mod, "_API_KEY_CLIENT_CACHE_MAX", 1)
+    monkeypatch.setattr(session_manager, "_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("skyvern.cli.core.hosted_driver.DRIVER_STOP_TIMEOUT_SECONDS", 0.1)
+    publish = fake_playwright.publish_gate = asyncio.Event()
+    call = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1"))
+    await _until(lambda: len(fake_playwright.drivers) == 1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await _settle_call_cleanups()
+    [pending] = fake_playwright.drivers
+
+    fake_playwright.publish_gate = None
+    await _hosted_call("sk_key_b", "pbs_2")  # evicts sk_key_a's client while its start is still pending
+    await asyncio.sleep(0.3)  # the evicted client's close gives up waiting on the unpublished start
+    assert pending.alive
+
+    assert await _sweep_after_idle() == 1  # sk_key_b's driver; the pending one has no handle to kill yet
+    assert pending.alive and pending.process.kills == 0
+
+    publish.set()  # the handle is published and the start completes after the client was closed
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_hung_start_is_killed_even_while_calls_wait_on_it_and_the_next_attach_recovers(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.start_gate = asyncio.Event()
+    waiters = [asyncio.create_task(_hosted_call("sk_key_a", f"pbs_{index}")) for index in range(2)]
+    await _until(lambda: len(fake_playwright.drivers) == 1)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    [hung] = fake_playwright.drivers
+
+    # The waiters keep refreshing use, but a start older than the threshold has no usable driver to protect.
+    assert await _sweep_after_idle() == 0
+    assert hung.process.kills == 1
+    for waiter in waiters:
+        with pytest.raises(session_manager.BrowserSessionConnectionError):
+            await waiter
+
+    fake_playwright.start_gate = None
+    recovered = await _hosted_call("sk_key_a", "pbs_1")
+    assert _connection_of(recovered).driver is not hung
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_sweep_during_a_hung_stop_still_kills_that_driver(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    fake_playwright.next_driver = {"stop_hangs": True}
+    await _hosted_call("sk_key_a", "pbs_1")
+    [driver] = fake_playwright.drivers
+
+    sweep = asyncio.create_task(_sweep_after_idle())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    sweep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sweep
+
+    assert driver.process.kills == 1
+    assert not driver.alive
+    await client_mod.shutdown_hosted_drivers()
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_stopping_the_sweep_propagates_the_callers_cancellation_after_stopping_drivers(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    await _hosted_call("sk_key_a", "pbs_1")
+    assert cleanup_service.start_hosted_driver_sweep() is not None
+    stopper = asyncio.create_task(cleanup_service.stop_hosted_driver_sweep())
+    await asyncio.sleep(0)
+    stopper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopper
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_lru_eviction_never_stops_a_driver_a_call_still_uses(
+    fake_playwright: _FakePlaywright, hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(client_mod, "_API_KEY_CLIENT_CACHE_MAX", 1)
+    browsers: dict[str, SkyvernBrowser] = {}
+    releases: dict[str, asyncio.Event] = {}
+    busy = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1", _held(browsers, releases, "busy")))
+    await _until(lambda: "busy" in browsers)
+
+    await _hosted_call("sk_key_b", "pbs_2")  # evicts sk_key_a's client while its call is still running
+    await asyncio.sleep(0)
+    busy_driver, other_driver = fake_playwright.drivers
+    assert client_mod._cache_key("sk_key_a") not in client_mod._api_key_clients
+    assert busy_driver.alive
+    assert _connection_of(browsers["busy"]).connected
+    assert await _sweep_after_idle() == 1  # only the idle driver of the cached client
+    assert busy_driver.alive and not other_driver.alive
+
+    releases["busy"].set()
+    await busy
+    assert await _sweep_after_idle() == 1  # the evicted client's driver once its last call ended
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_dead_driver_is_replaced_on_the_next_attach(fake_playwright: _FakePlaywright, hosted_mcp: None) -> None:
+    first = await _hosted_call("sk_key_a", "pbs_1")
+    dead = _connection_of(first).driver
+    dead.process.returncode = 1
+    dead.transport_lost.set_exception(ConnectionResetError("driver exited"))
+    await asyncio.sleep(0)
+
+    second = await _hosted_call("sk_key_a", "pbs_1")
+    replacement = _connection_of(second).driver
+    assert replacement is not dead
+    assert await _sweep_after_idle() == 1
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_stopping_the_hosted_driver_sweep_stops_every_driver_at_shutdown(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    browsers: dict[str, SkyvernBrowser] = {}
+    releases: dict[str, asyncio.Event] = {}
+    busy = asyncio.create_task(_hosted_call("sk_key_a", "pbs_1", _held(browsers, releases, "busy")))
+    await _until(lambda: "busy" in browsers)
+    await _hosted_call("sk_key_b", "pbs_2")
+    assert len(fake_playwright.live()) == 2
+
+    assert cleanup_service.start_hosted_driver_sweep() is not None
+    await cleanup_service.stop_hosted_driver_sweep()
+    assert fake_playwright.live() == []
+
+    releases["busy"].set()
+    await busy
+
+
+@pytest.mark.asyncio
+async def test_hosted_driver_sweep_runs_only_for_the_hosted_stateless_server(
+    hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_manager.set_stateless_http_mode(False)
+    assert cleanup_service.start_hosted_driver_sweep() is None
+
+    session_manager.set_stateless_http_mode(True)
+    monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS", 0.0)
+    assert cleanup_service.start_hosted_driver_sweep() is None
+    monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS", 300.0)
+    monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_IDLE_SECONDS", 0.0)
+    assert cleanup_service.start_hosted_driver_sweep() is None
+
+    monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_IDLE_SECONDS", 600.0)
+    task = cleanup_service.start_hosted_driver_sweep()
+    assert task is not None and cleanup_service.start_hosted_driver_sweep() is task
+    await cleanup_service.stop_hosted_driver_sweep()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_outside_a_call_scope_the_loopback_client_reuses_its_driver_until_closed(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    token = client_mod.set_api_key_override("sk_key_a")
+    try:
+        loopback = client_mod.get_skyvern()
+    finally:
+        client_mod.reset_api_key_override(token)
+
+    first = await loopback._get_playwright()
+    second = await loopback._get_playwright()
+    assert first is second
+    assert fake_playwright.live() == [first]
+
+    await loopback.aclose()
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_stateful_transport_keeps_one_driver_for_its_session(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    session_manager.set_stateless_http_mode(False)
+
+    first = await _hosted_call("sk_key_a", "pbs_1")
+    second = await _hosted_call("sk_key_a", "pbs_1")
+
+    assert first is second
+    assert fake_playwright.live() == fake_playwright.drivers
+    assert len(fake_playwright.drivers) == 1
+    assert _connection_of(first).connected
+
+    await client_mod.close_skyvern()
+    assert fake_playwright.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_registered_copilot_browser_is_borrowed_not_owned(
+    fake_playwright: _FakePlaywright, hosted_mcp: None
+) -> None:
+    copilot_browser = _FakeCloudBrowser()
+    session_manager.register_copilot_session(
+        "pbs_copilot",
+        session_manager.SessionState(
+            browser=cast(SkyvernBrowser, copilot_browser),
+            context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
+            api_key_hash=session_manager._api_key_hash("sk_key_a"),
+        ),
+        organization_id="org_1",
+    )
+
+    browser = await _hosted_call("sk_key_a", "pbs_copilot")
+
+    assert browser is cast(SkyvernBrowser, copilot_browser)
+    assert fake_playwright.drivers == []
+    assert copilot_browser.browser.connected
+    assert not copilot_browser.session_closed
+    assert await _sweep_after_idle() == 0
 
 
 @pytest.mark.asyncio

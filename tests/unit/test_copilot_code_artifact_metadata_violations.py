@@ -5,20 +5,29 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 
 from __future__ import annotations
 
+import json
 import re
 import textwrap
+from collections.abc import Callable
+from typing import Any
+
+import pytest
 
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_code_artifact_violations,
 )
 from skyvern.forge.sdk.copilot.output_utils import _sanitize_failure_text
+from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_artifact_metadata_shape_errors,
     _code_block_returns_flat_string,
     _code_block_returns_uninvoked_structured_function,
     _download_descriptor_leak_finding,
+    _extraction_return_shape_error,
+    _extraction_schema_conformance_error,
+    _extraction_schema_incompatibility,
     _is_download_intent,
     _normalize_code_artifact_metadata_detailed,
 )
@@ -689,42 +698,63 @@ def _download_intent_metadata(label: str) -> dict:
     return metadata
 
 
-class TestDownloadIntentTerminals:
-    """Which engine will run a block is unknown when it is authored, and `click_and_claim_download`
-    is the only download terminal that registers on both, so it is the only one this gate credits.
-    A block relying on the `page.expect_download` idiom therefore loses the download exemption and
-    is held to the extraction-shape checks."""
+_CLAIM_TERMINAL = 'saved_as = await click_and_claim_download(page, "a#statement-pdf")\n'
+_FRAME_EVENT_TERMINAL = (
+    "async with page.expect_download() as download_info:\n"
+    '    await page.frame_locator("iframe#viewer").locator("a#statement-pdf").click()\n'
+    "saved_as = (await download_info.value).suggested_filename\n"
+)
+_NO_TERMINAL = 'saved_as = await page.inner_text("#statement-name")\n'
 
-    def test_expect_download_alone_is_not_download_intent(self) -> None:
-        code = textwrap.dedent(
-            """
-            async with page.expect_download(timeout=30000) as download_event:
-                await page.click("a#statement-pdf")
-            """
-        )
-        assert _is_download_intent({}, code) is False
+
+def _schema_extraction_metadata(label: str) -> dict[str, Any]:
+    metadata = _extraction_metadata(label, ["records[].number"])
+    metadata["claimed_outcomes"][0]["extraction_schema"] = json.dumps(
+        {"type": "object", "properties": {"invoice_total": {"type": "string"}}, "required": ["invoice_total"]}
+    )
+    return metadata
+
+
+class TestDownloadIntentTerminals:
+    """Which engine will run a block is unknown when it is authored. Both the claim helper and a
+    `page.expect_download()` capture register on both saved-block engines, so both are download terminals."""
+
+    def test_expect_download_is_download_intent(self) -> None:
+        assert _is_download_intent({}, _FRAME_EVENT_TERMINAL) is True
 
     def test_download_claim_is_download_intent(self) -> None:
-        code = 'saved = await click_and_claim_download(page, "a#statement-pdf")\nreturn {"saved_as": saved}'
-        assert _is_download_intent({}, code) is True
+        assert _is_download_intent({}, _CLAIM_TERMINAL) is True
 
     def test_declared_registration_key_still_carries_download_intent(self) -> None:
-        code = "async with page.expect_download() as download_event:\n    await page.click('a#statement-pdf')"
+        code = "await page.click('a#statement-pdf')"
         assert _is_download_intent(_download_intent_metadata("dl_block"), code) is True
 
-    def test_expect_download_no_longer_exempts_a_block_from_the_extraction_validators(self) -> None:
-        code = """
-        async with page.expect_download() as dl_info:
-            await page.click("a#statement-pdf")
-        return page.inner_text("#results")
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_extraction_metadata("my_block", ["records[].number"])],
-            _extraction_code_block_yaml("my_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "flat text blob" in error
+    @pytest.mark.parametrize(
+        ("terminal", "exempt"),
+        [(_CLAIM_TERMINAL, True), (_FRAME_EVENT_TERMINAL, True), (_NO_TERMINAL, False)],
+        ids=["claim_helper", "expect_download", "no_download"],
+    )
+    @pytest.mark.parametrize(
+        ("check", "returned"),
+        [
+            (lambda code, artifact: _extraction_return_shape_error("b", artifact, code), 'f"saved {saved_as}"'),
+            (
+                lambda code, artifact: _extraction_schema_conformance_error("b", artifact, code),
+                '{"saved_as": saved_as}',
+            ),
+            (lambda code, artifact: _extraction_schema_incompatibility("b", artifact, code), '{"saved_as": saved_as}'),
+        ],
+        ids=["return_shape", "schema_conformance", "schema_incompatibility"],
+    )
+    def test_every_extraction_shape_check_exempts_both_download_terminals(
+        self,
+        check: Callable[[str, dict[str, Any]], str | SchemaIncompatibility | None],
+        returned: str,
+        terminal: str,
+        exempt: bool,
+    ) -> None:
+        finding = check(f"{terminal}return {returned}", _schema_extraction_metadata("b"))
+        assert (finding is None) is exempt
 
 
 class TestDownloadDescriptorLeak:
@@ -746,9 +776,7 @@ class TestDownloadDescriptorLeak:
 
 class TestDownloadShapesThatMustNotBeFlagged:
     """Negative space for the surviving descriptor-leak arm: a clean descriptor, an extraction
-    block, and a non-download block must all normalize without a violation. The first arm passes
-    because its artifact declares a registration key, not because the `expect_download` idiom is
-    read as a download terminal."""
+    block, and a non-download block must all normalize without a violation."""
 
     def test_expect_download_idiom_with_descriptor_passes(self) -> None:
         code = """

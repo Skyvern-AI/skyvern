@@ -27,7 +27,7 @@ from html import escape as html_escape
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pyotp
@@ -42,6 +42,7 @@ from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
+import skyvern.webeye.cdp_download_interceptor as cdp_download_interceptor
 import skyvern.webeye.navigation as navigation_module
 from skyvern.config import settings
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
@@ -76,6 +77,7 @@ from skyvern.forge.taskv3.loop import (
     UnseenPageText,
     _navigate_record_fields,
 )
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
@@ -87,6 +89,8 @@ from skyvern.forge.taskv3.tools import (
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
     _TYPING_REACH_PROBE_JS,
+    DOWNLOAD_NO_FILE_THIS_ACTION,
+    DOWNLOAD_NO_SESSION_FILE_YET,
     NAVIGATION_DEAD_END_STATUSES,
     OBSERVE_DISPLAY_WIDTHS,
     OBSERVE_POINTER_ROOT_CAP,
@@ -94,6 +98,7 @@ from skyvern.forge.taskv3.tools import (
     OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
+    DownloadFailureWatch,
     _annotate_screenshot,
     _exact_tier_key,
     _invalid_selector_result,
@@ -108,6 +113,7 @@ from skyvern.forge.taskv3.tools import (
     pending_marker,
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -297,6 +303,7 @@ class _FakeRequest:
         self.resource_type = resource_type
         self.url = url
         self.post_data: str | None = None
+        self.failure: str | None = None
 
 
 class _FakeObserveElementProperty:
@@ -8956,6 +8963,113 @@ async def _prime(tools: list[Any]) -> None:
     await _tool(tools, "wait").handler({"time_ms": 1})
 
 
+class _GeneratedNameDownloadPage(_DownloadFakePage):
+    """A browser that owns its downloads: the file lands under a generated id while the page named it."""
+
+    def __init__(self, downloads_dir: Path) -> None:
+        super().__init__(downloads_dir)
+        self._download_listeners: list[Any] = []
+        self.context = MagicMock(spec=BrowserContext)
+
+    def on(self, event: str, callback: Any) -> None:
+        if event == "download":
+            self._download_listeners.append(callback)
+        super().on(event, callback)
+
+    def remove_listener(self, event: str, callback: Any) -> None:
+        if event == "download":
+            self._download_listeners.remove(callback)
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        download = SimpleNamespace(
+            suggested_filename="dl1_receipt.txt", path=AsyncMock(return_value=str(self._downloads_dir / "c5cf4832"))
+        )
+        for listener in self._download_listeners:
+            listener(download)
+        (self._downloads_dir / "c5cf4832.txt").write_bytes(b"x" * 46)
+        await super().click(selector, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_a_download_saved_under_a_generated_id_is_reported_by_the_pages_name(tmp_path: Path) -> None:
+    page = _GeneratedNameDownloadPage(tmp_path)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+    result = await _tool(tools, "click").handler({"selector": "#dl"})
+    watch.close()
+
+    assert "Downloaded: dl1_receipt.txt (46 B)" in result.content, result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block", ["complete_on_download", "download_timeout_only"])
+async def test_a_download_stored_only_in_the_browser_session_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block: str
+) -> None:
+    earlier = "s3://bucket/o_1/pbs_1/earlier.pdf"
+    listings = [[earlier], [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"]]
+    listing = AsyncMock(side_effect=lambda **_kwargs: listings.pop(0) if len(listings) > 1 else listings[0])
+    monkeypatch.setattr("skyvern.forge.taskv3.tools.app.STORAGE.list_downloaded_files_in_browser_session", listing)
+    page = _DownloadFakePage(tmp_path)
+
+    async def download_wait() -> None:
+        return None
+
+    # A download_timeout-only block waits on downloads but has no failure watch.
+    watch = DownloadFailureWatch(_fixed_page_provider(page)) if block == "complete_on_download" else None
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        result = await _tool(tools, "click").handler({"selector": "#dl"})
+    if watch is not None:
+        watch.close()
+
+    assert "Downloaded: statement.pdf (in the browser session's storage)" in result.content, result.content
+    assert "earlier.pdf" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_after_a_read_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    earlier = "s3://bucket/o_1/pbs_1/earlier.pdf"
+    listings: list[list[str] | Exception] = [
+        TimeoutError(),
+        [earlier],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+    ]
+
+    async def listing(**_kwargs: str) -> list[str]:
+        item = listings.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def download_wait() -> None:
+        return None
+
+    monkeypatch.setattr("skyvern.forge.taskv3.tools.app.STORAGE.list_downloaded_files_in_browser_session", listing)
+    page = _DownloadFakePage(tmp_path)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        first = await _tool(tools, "click").handler({"selector": "#go"})
+        second = await _tool(tools, "click").handler({"selector": "#dl"})
+        third = await _tool(tools, "click").handler({"selector": "#again"})
+    watch.close()
+
+    assert "earlier.pdf" not in first.content + second.content
+    # The first click's listing only set the baseline, so what is missing is unknown and nothing is said.
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in first.content and DOWNLOAD_NO_SESSION_FILE_YET not in first.content
+    assert "Downloaded: statement.pdf (in the browser session's storage)" in second.content, second.content
+    # A session's storage can get a file after the call returns, so its absence is stated as "yet".
+    assert DOWNLOAD_NO_SESSION_FILE_YET in third.content and DOWNLOAD_NO_FILE_THIS_ACTION not in third.content
+
+
 @pytest.mark.asyncio
 async def test_download_signal_reports_completed_download_then_is_absent(tmp_path: Path) -> None:
     page = _DownloadFakePage(tmp_path)
@@ -9045,6 +9159,29 @@ async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_pat
     (tmp_path / ("export." + "f" * 32 + ".crdownload")).write_bytes(b"partial")
     r6 = await _tool(tools, "wait").handler({"time_ms": 1})
     assert "Download started: export (in progress — not yet complete)" in r6.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_fails", [False, True])
+async def test_a_click_result_reports_the_download_its_wait_saw_finish(tmp_path: Path, wait_fails: bool) -> None:
+    temp_name = "report.pdf." + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" + ".crdownload"
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = temp_name
+
+    async def download_wait() -> None:
+        if wait_fails:
+            raise RuntimeError("download wait broke")
+        if (tmp_path / temp_name).exists():
+            (tmp_path / temp_name).rename(tmp_path / "report.pdf")
+
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_wait=download_wait)
+    await _prime(tools)
+    result = await _tool(tools, "click").handler({"selector": "#dl"})
+
+    if wait_fails:
+        assert "Download started: report.pdf (in progress — not yet complete)" in result.content
+    else:
+        assert "Downloaded: report.pdf" in result.content and "Download started" not in result.content
 
 
 @pytest.mark.asyncio
@@ -9185,6 +9322,241 @@ async def test_download_signal_survives_compaction_end_to_end_through_loop(tmp_p
     elided = [m for m in observe_msgs if m["content"].startswith("[superseded ")]
     assert len(elided) >= 1  # compaction actually ran on an earlier observe
     assert any("Downloaded: report.pdf" in m["content"] for m in observe_msgs)  # notice survives on a live message
+
+
+_SIGNED_EXPORT_URL = (
+    "https://files.example.test/exports/tok-9f8e7d6c5b4a3f2e/report.csv"
+    "?X-Amz-Signature=3f9a1c7e5b2d8f4a6c0e9b1d3f5a7c9e&X-Amz-Expires=300"
+)
+_EXPORT_PAGE = f"""<!doctype html><html><body>
+<button id="export" type="button" onclick="fetch('/api/export', {{method: 'POST'}}).catch(() => {{}})">Export</button>
+<button id="burst" type="button" onclick="['a', 'b', 'c', 'd'].forEach((p) => fetch('/api/' + p).catch(() => {{}}))">Burst</button>
+<a id="report" href="/report">Report</a>
+<a id="download" href="/download">Download</a>
+<a id="signed" href="{_SIGNED_EXPORT_URL}">Signed report</a>
+<a id="wrapped" href="/report?src={_SIGNED_EXPORT_URL}">Wrapped report</a>
+<button id="hang" type="button" onclick="fetch('/api/hang').catch(() => {{}})">Hang</button>
+<button id="noop" type="button">Noop</button>
+<ul id="rows"></ul>
+</body></html>"""
+
+
+async def _serve_export(route: Route) -> None:
+    path = urlparse(route.request.url).path
+    if path == "/":
+        await route.fulfill(status=200, content_type="text/html", body=_EXPORT_PAGE)
+        return
+    if path == "/download":
+        await route.fulfill(
+            status=200, headers={"content-disposition": "attachment; filename=report.csv"}, body="a,b\n"
+        )
+        return
+    if path == "/api/export":
+        # Answers well after the click's own handler returns.
+        await asyncio.sleep(1.2)
+    await route.fulfill(status=503, body="unavailable")
+
+
+@contextlib.asynccontextmanager
+async def _export_page() -> AsyncIterator[Page]:
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        await context.route("**/*", _serve_export)
+        page = await context.new_page()
+        await page.goto("http://app.example.test/")
+        yield page
+
+
+def _failure_tail(result: ToolResult) -> str:
+    return result.content[(result.data or {})["download_failure_at"] :]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["click", "press_key"])
+async def test_a_download_action_whose_request_fails_late_reports_the_status(tmp_path: Path, action: str) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        if action == "press_key":
+            await page.focus("#export")
+            result = await _tool(tools, "press_key").handler({"key": "Enter"})
+        else:
+            result = await _tool(tools, "click").handler({"selector": "#export"})
+        watch.close()
+
+    tail = _failure_tail(result)
+    assert "Request failed: POST /api/export returned HTTP 503" in tail, result.content
+    assert tail.endswith(DOWNLOAD_NO_FILE_THIS_ACTION), tail
+    assert not (result.data or {}).get("download_notice") and not (result.data or {}).get("download_new")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["report", "signed", "wrapped"])
+async def test_a_link_click_to_a_failing_document_reports_only_its_path(tmp_path: Path, link: str) -> None:
+    refs = mask_opaque_urls({"export": _SIGNED_EXPORT_URL})
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page), refs)
+        tools = build_browser_tools(
+            _fixed_page_provider(page), downloads_dir=str(tmp_path), opaque_refs=refs, download_failures=watch
+        )
+        result = await _tool(tools, "click").handler({"selector": f"#{link}"})
+        watch.close()
+
+    tail = _failure_tail(result)
+    if link == "signed":
+        assert f"Request failed: GET {refs.mask(_SIGNED_EXPORT_URL)} returned HTTP 503" in tail, result.content
+    else:
+        assert "Request failed: GET /report returned HTTP 503" in tail, result.content
+    assert "tok-9f8e7d6c5b4a3f2e" not in tail and "example.test" not in tail and "src=" not in tail
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_healthy_download_link_reports_no_failure(tmp_path: Path) -> None:
+    # The browser aborts a navigation it turns into a download after the response arrived.
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        result = await _tool(tools, "click").handler({"selector": "#download"})
+        await _tool(tools, "wait").handler({"time_ms": 500})
+        watch.close()
+
+    assert "Request failed" not in result.content, result.content
+    assert watch.facts.delivered == set()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_failures_are_reported_past_a_full_file_notice_and_capped(tmp_path: Path) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        await _prime(tools)
+        for i in range(6):
+            (tmp_path / f"part{i}.csv").write_text("a,b\n")
+        result = await _tool(tools, "click").handler({"selector": "#burst"})
+        watch.close()
+
+    assert "+1 more files downloaded" in result.content
+    tail = _failure_tail(result)
+    assert tail.count("Request failed: GET /api/") == 3 and "+1 more failures" in tail, tail
+    assert (result.data or {}).get("download_new") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_failure_between_calls_reaches_the_next_read_without_changing_its_digest(tmp_path: Path) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        observe = _tool(tools, "observe")
+        await observe.handler({})
+        await page.evaluate(
+            "async () => { const li = document.createElement('li'); li.textContent = 'Export queued';"
+            " document.getElementById('rows').appendChild(li); await fetch('/api/poll'); }"
+        )
+        with_failure = await observe.handler({})
+        without_failure = await observe.handler({})
+        watch.close()
+
+    assert _delta_lines(with_failure) == ["Export queued"], with_failure.content
+    assert "Request failed: GET /api/poll returned HTTP 503" in _failure_tail(with_failure)
+    assert "download_failure_at" not in (without_failure.data or {})
+
+    def digest(r: ToolResult) -> str:
+        data = r.data or {}
+        return taskv3_loop._canonical_perception_content(
+            taskv3_loop.perception_digest_source(r.content, data.get("download_failure_at")),
+            is_observe=True,
+            clip_spans=data.get("clip_spans"),
+            delta_at=data.get("delta_at"),
+            delta_end=data.get("delta_end"),
+        )
+
+    assert digest(with_failure) == digest(without_failure)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_does_not_wait_on_a_request_an_earlier_click_started(tmp_path: Path) -> None:
+    release = asyncio.Event()
+
+    async def hang(route: Route) -> None:
+        await release.wait()
+        await route.fulfill(status=503, body="unavailable")
+
+    async with _export_page() as page:
+        await page.context.route("**/api/hang", hang)
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#hang"})
+        started = time.monotonic()
+        await click.handler({"selector": "#noop"})
+        elapsed = time.monotonic() - started
+        release.set()
+        late = await _tool(tools, "wait").handler({"time_ms": 300})
+        watch.close()
+
+    assert elapsed < 2.0, elapsed
+    assert "Request failed: GET /api/hang returned HTTP 503" in _failure_tail(late), late.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_browser_download_the_interceptor_could_not_save_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    egress = MagicMock()
+    egress.authorize_request.return_value = True
+    interceptor = CDPDownloadInterceptor(network_egress_monitor=egress, redirect_hop_authorizer=AsyncMock())
+    async with _export_page() as page:
+        page.context._skyvern_cdp_download_interceptor = interceptor
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        await _prime(tools)
+        monkeypatch.setattr(cdp_download_interceptor, "MAX_DOWNLOAD_FILES_PER_RUN", 0)
+        assert interceptor._new_download_attempt() is None
+        result = await _tool(tools, "wait").handler({"time_ms": 1})
+        watch.close()
+
+    assert "Browser download not saved (file_count_limit): 1" in _failure_tail(result), result.content
+
+
+@pytest.mark.asyncio
+async def test_the_failure_watch_waits_only_on_its_own_call_and_reports_only_the_path() -> None:
+    refs = mask_opaque_urls({"export": _SIGNED_EXPORT_URL})
+    watch = DownloadFailureWatch(_fixed_page_provider(_FakePage()), refs)
+    on = watch._hooks
+    first = await watch.begin()
+    on["request"](_FakeRequest(method="GET", resource_type="fetch", url="https://app.example.test/api/hang"))
+    assert await watch.settle(first, wait=False) == []
+
+    second = await watch.begin()
+    export = _FakeRequest(resource_type="fetch", url="https://app.example.test/api/export?mode=fail")
+    signed = _FakeRequest(method="GET", resource_type="document", url=_SIGNED_EXPORT_URL)
+    saved = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/download")
+    for request, status in ((export, 503), (signed, 503), (saved, 200)):
+        on["request"](request)
+        on["response"](SimpleNamespace(request=request, status=status))
+    saved.failure = "net::ERR_ABORTED"
+    on["requestfailed"](saved)
+    facts = await asyncio.wait_for(watch.settle(second, wait=True), timeout=1.0)
+
+    assert facts == [
+        "Request failed: POST /api/export returned HTTP 503",
+        f"Request failed: GET {refs.mask(_SIGNED_EXPORT_URL)} returned HTTP 503",
+    ]
+
+    poll = _FakeRequest(method="GET", resource_type="fetch", url="https://app.example.test/api/poll")
+    reports: list[list[str]] = []
+    for _ in range(2):
+        on["request"](poll)
+        on["response"](SimpleNamespace(request=poll, status=503))
+        on["requestfinished"](poll)
+        reports.append(await watch.settle(await watch.begin(), wait=True))
+    assert reports == [["Request failed: GET /api/poll returned HTTP 503"], []]
 
 
 @pytest.mark.asyncio
@@ -43417,6 +43789,126 @@ async def test_type_reads_every_field_back_and_names_what_it_holds(
     assert r.entry_unconfirmed is (ok_class == "held_differs")
     if ok_class in ("held_as", "held_differs"):
         assert f"'{held}'" in r.content, r.content
+
+
+# A text field in a canvas-drawn app's accessibility tree: the app owns the value, starts editing the field on the
+# first animation frame after it gains focus, and then writes its own copy over the input. Text that lands in the
+# input before that frame never reaches the app. Frames are paced slow, as on an app painting in software, so a
+# single fill always lands before that frame. With window.__refuse set, the app also drops every edit it receives.
+_DEFERRED_EDITING_FIELD_HTML = """
+<flt-semantics-host>
+  <flt-semantics data-semantics-role="text-field"><input id="field" type="password" aria-label="Password"></flt-semantics>
+</flt-semantics-host>
+<input id="plain" type="password" aria-label="Other password">
+<script>
+  let frame = [];
+  window.requestAnimationFrame = (callback) => {
+    if (!frame.length) {
+      setTimeout(() => { const run = frame; frame = []; run.forEach((cb) => cb(performance.now())); }, 500);
+    }
+    frame.push(callback);
+    return frame.length;
+  };
+  const field = document.getElementById("field");
+  let held = "";
+  let editing = false;
+  field.addEventListener("focus", () => requestAnimationFrame(() => {
+    editing = true;
+    field.value = held;
+  }));
+  field.addEventListener("blur", () => { editing = false; });
+  field.addEventListener("input", () => {
+    if (!editing) return;
+    held = window.__refuse ? "" : field.value;
+    if (window.__refuse) requestAnimationFrame(() => { field.value = held; });
+  });
+</script>
+"""
+_SYNTHETIC_SECRET = "Zx9-synthetic-pass"
+_NEXT_TWO_FRAMES_JS = "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+_NO_FRAME_JS = "() => new Promise(() => {})"
+
+
+def _deferred_editing_tools(page: Any) -> Any:
+    return build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: _SYNTHETIC_SECRET if text == "placeholder_pw" else text,
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_keeps_a_secret_in_a_field_that_starts_editing_a_frame_after_focus() -> None:
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        await page.evaluate(_NEXT_TWO_FRAMES_JS)
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert (r.status, held) == ("ok", _SYNTHETIC_SECRET), r.content
+    assert _SYNTHETIC_SECRET not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reports_a_secret_a_deferred_editing_field_drops_as_not_held() -> None:
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        await page.evaluate("() => { window.__refuse = true; }")
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), r.content
+    assert _SYNTHETIC_SECRET not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_deferred_editing_field_fails_closed_when_no_frame_comes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 0.2)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        started = time.monotonic()
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        elapsed = time.monotonic() - started
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert (r.status, r.error_class) == ("error", "text_not_held"), r.content
+    assert held == "" and _SYNTHETIC_SECRET not in r.content
+    assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_deferred_editing_field_stops_when_cancelled_while_waiting_for_a_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 60.0)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        typing = asyncio.ensure_future(
+            _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        )
+        for _ in range(200):
+            if await page.evaluate("() => document.activeElement?.id === 'field'"):
+                break
+            await asyncio.sleep(0.05)
+        typing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(typing, timeout=5)
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert held == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_an_ordinary_password_field_does_not_wait_for_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No frame ever comes, so a frame wait here would fail the type: an ordinary input must not take that path.
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 60.0)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        r = await asyncio.wait_for(
+            _tool(_deferred_editing_tools(page), "type").handler({"selector": "#plain", "text": "placeholder_pw"}),
+            timeout=30,
+        )
+        held = await page.eval_on_selector("#plain", "el => el.value")
+    assert (r.status, held) == ("ok", _SYNTHETIC_SECRET), r.content
 
 
 @_skip_no_browser

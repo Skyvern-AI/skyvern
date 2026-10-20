@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from functools import partial
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from urllib.parse import quote
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator, Page, async_playwright
 
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -45,7 +47,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockType
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import make_copilot_ctx, skip_no_browser
 
 STAR_BUTTON = 'button.pill:has-text("Star")'
 STAR_VALUE = 'button.pill:has-text("Star") span.n'
@@ -70,8 +72,17 @@ class _FakeMatch:
     def __init__(self, facts: dict[str, Any]) -> None:
         self._facts = facts
 
+    async def element_handle(self) -> _FakeMatch:
+        return self
+
+    async def is_visible(self) -> bool:
+        return True
+
     async def evaluate(self, _expression: str) -> dict[str, Any]:
         return dict(self._facts)
+
+    async def dispose(self) -> None:
+        return None
 
 
 class _FakePage:
@@ -202,6 +213,116 @@ async def test_the_same_call_twice_returns_byte_identical_output() -> None:
     second = await inspect_locator_matches(page, [STAR_BUTTON, STAR_VALUE])
 
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_each_match_reports_whether_playwright_considers_it_visible() -> None:
+    # A `.first` locator resolves to the hidden responsive copy here; its text and markup match the
+    # visible one, so only the visibility fact separates them.
+    stat = '<span class="stat"><strong>23.2k</strong> stars</span>'
+    body = f'<div style="display:none">{stat}</div><div style="visibility:hidden">{stat}</div>{stat}'
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(f"<html><body>{body}</body></html>")
+            result = await inspect_locator_matches(page, ["span.stat"])
+        finally:
+            await browser.close()
+
+    entry = result["selectors"][0]
+    assert entry["match_count"] == 3
+    assert [match["visible"] for match in entry["matches"]] == [False, False, True]
+    assert {match["text_content"] for match in entry["matches"]} == {"23.2k stars"}
+
+
+class _SwapDuringRead:
+    """A real page that navigates to `next_url` once: before a match is found, after it is found, or after the
+    first read made on the found element."""
+
+    def __init__(self, page: Page, next_url: str, swap_at: str) -> None:
+        self._page = page
+        self._next_url = next_url
+        self._swap_at = swap_at
+        self._swapped = False
+
+    async def _read(self, read: Callable[[], Awaitable[object]], before: bool, after: bool) -> object:
+        swap = not self._swapped and (before or after)
+        if swap:
+            self._swapped = True
+        if swap and before:
+            await self._page.goto(self._next_url)
+        result = await read()
+        if swap and after:
+            await self._page.goto(self._next_url)
+        return result
+
+    def locator(self, selector: str) -> SimpleNamespace:
+        real = self._page.locator(selector)
+        return SimpleNamespace(count=real.count, nth=lambda index: self._match(real.nth(index)))
+
+    def _match(self, real: Locator) -> SimpleNamespace:
+        on_resolve = {"before": self._swap_at == "before_resolve", "after": self._swap_at == "after_resolve"}
+
+        async def element_handle() -> SimpleNamespace:
+            return self._handle(await self._read(real.element_handle, **on_resolve))
+
+        return SimpleNamespace(
+            element_handle=element_handle,
+            is_visible=lambda: self._read(real.is_visible, **on_resolve),
+            evaluate=lambda expression: self._read(lambda: real.evaluate(expression), **on_resolve),
+        )
+
+    def _handle(self, real: Any) -> SimpleNamespace:  # noqa: ANN401 - an ElementHandle or whatever resolve returned
+        after = self._swap_at == "between_handle_reads"
+        return SimpleNamespace(
+            is_visible=lambda: self._read(real.is_visible, before=False, after=after),
+            evaluate=lambda expression: self._read(lambda: real.evaluate(expression), before=False, after=after),
+            dispose=real.dispose,
+        )
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("swap_at", "first_page"),
+    [
+        ("after_resolve", '<div style="display:none"><span class="stat">A stars</span></div>'),
+        ("before_resolve", '<div style="display:none"><span class="stat">A stars</span></div>'),
+        ("between_handle_reads", '<span class="stat">A stars</span>'),
+    ],
+)
+async def test_a_page_swap_never_pairs_one_pages_visibility_with_anothers_facts(swap_at: str, first_page: str) -> None:
+    # Visibility and DOM facts must describe the same element on the same page, or the read must fail. The
+    # last case starts on a visible copy, so a DOM read made before the visibility read would sit beside a
+    # stale False.
+    bodies = {"https://example.test/a": first_page, "https://example.test/b": '<span class="stat">B stars</span>'}
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.route(
+                "**/*",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=f"<html><body>{bodies.get(route.request.url, '')}</body></html>",
+                ),
+            )
+            await page.goto("https://example.test/a")
+            swapping = _SwapDuringRead(page, "https://example.test/b", swap_at)
+            result = await inspect_locator_matches(swapping, ["span.stat"])  # type: ignore[arg-type]
+        finally:
+            await browser.close()
+
+    match = result["selectors"][0]["matches"][0]
+    if swap_at == "before_resolve":
+        assert (match["visible"], match["text_content"]) == (True, "B stars")
+    else:
+        assert "visible" not in match and "error" in match
 
 
 def test_the_advertised_contract_is_the_tested_contract() -> None:

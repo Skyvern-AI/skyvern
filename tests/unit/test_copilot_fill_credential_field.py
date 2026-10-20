@@ -130,6 +130,7 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         signed_out_page_observations=[],
         signed_out_page_observation_attempts=[],
         credential_origin_recovery=None,
+        credential_origin_refusals=set(),
         blocker_signal=None,
         codeblock_redaction_parameters={},
         supports_vision=False,
