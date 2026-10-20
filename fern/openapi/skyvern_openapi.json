@@ -94,7 +94,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    body: {\n        prompt: \"Find the top 3 posts on Hacker News.\"\n    }\n})\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    prompt: \"Find the top 3 posts on Hacker News.\"\n})\n"
               }
             ]
           }
@@ -225,7 +225,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    body: {\n        workflow_id: \"wpid_123\",\n        parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n    }\n});\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    agent_id: \"wpid_123\",\n    parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n});\n"
               }
             ]
           }
@@ -4783,10 +4783,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -7856,6 +7856,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7921,6 +7956,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -8041,6 +8111,31 @@
                     "type": "string",
                     "format": "binary",
                     "title": "Resume File"
+                  },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
                   },
                   "other_information": {
                     "anyOf": [
@@ -11533,6 +11628,28 @@
             ],
             "title": "Warning",
             "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "managed",
+              "external"
+            ],
+            "title": "Source",
+            "description": "\"external\" for a browser the caller registered and runs itself; \"managed\" for one Skyvern runs.",
+            "default": "managed"
+          },
+          "remaining_lifetime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Lifetime Seconds",
+            "description": "Seconds left before a registered external browser's fixed deadline. Null for managed sessions and once the session has ended."
           }
         },
         "type": "object",
@@ -13022,6 +13139,74 @@
           "created_at"
         ],
         "title": "CreateScriptResponse"
+      },
+      "CredentialCheck": {
+        "type": "string",
+        "enum": [
+          "site_rejected_credentials",
+          "no_recent_login_with_same_credential",
+          "login_request_not_5xx_or_429"
+        ],
+        "title": "CredentialCheck",
+        "description": "The confirmations a credential-rejection verdict has to clear before it is returned as one."
+      },
+      "CredentialCheckEvidence": {
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "description": "True only when every credential confirmation check passed. The login-request status check is not available yet, so the organization-scoped confirmation flag must remain disabled until that check is implemented."
+          },
+          "checks_passed": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialCheck"
+            },
+            "type": "array",
+            "title": "Checks Passed"
+          },
+          "checks_failed": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialCheck"
+            },
+            "type": "array",
+            "title": "Checks Failed"
+          },
+          "checks_skipped": {
+            "items": {
+              "$ref": "#/components/schemas/CredentialCheck"
+            },
+            "type": "array",
+            "title": "Checks Skipped"
+          },
+          "site_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site Message"
+          },
+          "login_request_status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Request Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "confirmed"
+        ],
+        "title": "CredentialCheckEvidence",
+        "description": "Why a credential-rejection verdict was or was not confirmed. Reaches the caller on the run\nresponse and the webhook, so a customer can tell a confirmed rejection from an unconfirmed one\nbefore blocking the credential."
       },
       "CredentialParameter": {
         "properties": {
@@ -14786,6 +14971,7 @@
           "download_attachments": {
             "type": "boolean",
             "title": "Download Attachments",
+            "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
           "parameter_keys": {
@@ -14809,6 +14995,14 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -16693,6 +16887,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -16785,6 +16985,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -23775,6 +23981,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -23936,7 +24179,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -23970,12 +24215,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
@@ -25886,7 +26169,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -25903,7 +26186,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -26227,7 +26510,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -26244,7 +26527,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -28458,6 +28741,17 @@
             "const": "USER_DEFINED_ERROR",
             "title": "Error Type",
             "default": "USER_DEFINED_ERROR"
+          },
+          "credential_check": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CredentialCheckEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Confirmation evidence set by Skyvern; request input is ignored. This field remains unconfirmed until all required checks, including login-request status, are available."
           }
         },
         "type": "object",
@@ -32847,7 +33141,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -32862,7 +33156,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -33146,7 +33440,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -33161,7 +33455,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
