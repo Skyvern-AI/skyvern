@@ -6,7 +6,7 @@ import hashlib
 import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
@@ -93,6 +93,7 @@ from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelectio
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.challenge_signature import ChallengeVendor
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -118,7 +119,8 @@ if TYPE_CHECKING:
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
-    from skyvern.webeye.browser_artifacts import DownloadBinding
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
+    from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
 
@@ -1117,7 +1119,9 @@ class AgentFunction:
     ) -> str | None:
         return None
 
-    async def enforce_request_authorization(self, principal: RequestPrincipal | None, action: str) -> None:
+    async def enforce_request_authorization(
+        self, principal: RequestPrincipal | None, action: str, *, always_enforce: bool = False
+    ) -> None:
         return None
 
     async def enforce_request_role(
@@ -1849,6 +1853,25 @@ class AgentFunction:
     ) -> None:
         return
 
+    def note_browser_relaunch(self, browser_state: BrowserState | None, reason: str) -> None:
+        """The next browser creation in this task replaces an earlier one of the same run. OSS no-op."""
+
+    def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
+        """A run released a browser that no other run shares. OSS no-op."""
+
+    async def on_run_har_captured(
+        self,
+        browser_state: BrowserState,
+        har_data: bytes,
+        organization_id: str,
+        workflow_run_id: str | None,
+        task_id: str | None,
+        browser_session_id: str | None,
+        attempt_number: int | None = None,
+    ) -> None:
+        """A finished run's redacted HAR is in hand at cleanup, before it is archived. Cleanup awaits this, so an
+        override should do only bounded work, must not raise, and must let cancellation propagate. OSS no-op."""
+
     async def validate_step_execution(
         self,
         task: Task,
@@ -2248,6 +2271,23 @@ class AgentFunction:
         release it on exit; the OSS base is a no-op so a self-hosted build behaves exactly as before.
         """
         return nullcontext()
+
+    def challenge_solve_recording(
+        self,
+        client: str,
+        *,
+        page: Any = None,
+        task: Any = None,
+        organization_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> AbstractContextManager[ChallengeSolveRecord]:
+        """Synchronous scope around one canonical challenge-solve call, yielding the record the call site fills in.
+
+        A deployment schedules its solve-ledger writes here without awaiting them; the scope must never alter the
+        call's result or exception. OSS records nothing."""
+        return nullcontext(ChallengeSolveRecord())
 
     def resolve_captcha_solver_extension_timeout(self, page: Page | RecordingPage, default_timeout: float) -> float:
         """The wait budget for the direct ladder's solver-extension arm, resolved inside the solver scope.

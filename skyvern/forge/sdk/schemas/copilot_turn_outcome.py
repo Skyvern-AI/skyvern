@@ -39,6 +39,16 @@ class ConnectedAccountChoice(BaseModel):
     email_address: str | None = None
 
 
+GoogleSetupScopeProfile = Literal["gmail", "google_sheets"]
+
+
+class GoogleSetupOffer(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    scope_profile: GoogleSetupScopeProfile
+    connection_id: str | None = None
+
+
 class DeliveredOutputFile(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -97,6 +107,7 @@ class TurnOutcome(BaseModel):
     interrupted_row_final: bool = False
     idempotency_digest: str | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None
+    google_setup_offers: list[GoogleSetupOffer] | None = None
     output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")

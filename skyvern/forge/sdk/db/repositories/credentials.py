@@ -171,6 +171,7 @@ class CredentialRepository(BaseRepository):
         created_by: str | None,
         set_folder_on_update: bool = True,
         authorize_update: Callable[[AsyncSession, str], Awaitable[None]] | None = None,
+        commit: bool = True,
     ) -> tuple[Credential, bool]:
         async with self.Session() as session:
             insert = sqlite_insert if session.get_bind().dialect.name == "sqlite" else pg_insert
@@ -219,12 +220,14 @@ class CredentialRepository(BaseRepository):
             if not created:
                 credential.name = name
                 credential.credential_type = credential_type.value
-                credential.tested_url = tested_url
                 if set_folder_on_update:
                     credential.folder_id = folder_id
                 credential.upstream_missing_at = None
-            await session.commit()
-            await session.refresh(credential)
+            if commit:
+                await session.commit()
+                await session.refresh(credential)
+            else:
+                await session.flush()
             return Credential.model_validate(credential), created
 
     @db_operation("update_onepassword_credential_metadata")
@@ -235,7 +238,6 @@ class CredentialRepository(BaseRepository):
         authorized_folder_id: str | None,
         name: str,
         credential_type: CredentialType,
-        tested_url: str | None,
     ) -> bool:
         async with self.Session() as session:
             result = await session.execute(
@@ -250,7 +252,6 @@ class CredentialRepository(BaseRepository):
                 .values(
                     name=name,
                     credential_type=credential_type.value,
-                    tested_url=tested_url,
                     upstream_missing_at=None,
                     modified_at=naive_utc_now(),
                 )

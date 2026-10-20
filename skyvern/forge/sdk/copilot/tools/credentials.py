@@ -982,8 +982,9 @@ def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Crede
         # resolve exactly one leaves the not-found and ambiguous answers below to report themselves.
         return len(matches) != 1 or matches[0].credential_id == credential.credential_id
 
+    named_this_turn = policy.current_turn_named_credential_ids | policy.credential_pause_connected_credential_ids
     if any(
-        credential.credential_id in policy.current_turn_named_credential_ids
+        credential.credential_id in named_this_turn
         and reference in {credential.credential_id, credential.name}
         and keyed(credential)
         for credential in policy.resolved_credentials

@@ -1000,6 +1000,8 @@ class SkyvernContext:
     # (no solver identity — a pre-entry check can't know it without running the detector); a url
     # change re-opens it. None means not latched. Opaque comparison string only; never log it.
     captcha_solve_latch_key: str | None = None
+    # Challenge-solve calls recorded per run id in this run's context; the solve ledger's attempt number.
+    challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.

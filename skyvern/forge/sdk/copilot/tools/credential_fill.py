@@ -225,6 +225,7 @@ def _credential_origin_recovery_error(recovery: CredentialOriginRecovery) -> str
 
 
 def _start_credential_origin_recovery(copilot_ctx: AgentContext, origin: str, credential_id: str) -> dict[str, Any]:
+    copilot_ctx.credential_origin_refusals.add((origin, credential_id))
     current = copilot_ctx.credential_origin_recovery
     if current is not None and (current.state != "pending" or current.origin != origin):
         return {"ok": False, "error": _credential_origin_recovery_error(current)}
@@ -283,8 +284,14 @@ def _decline_credential_origin_recovery(
 async def _credential_evidence_admits_origin(
     copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
 ) -> bool:
-    """Whether the credential itself places it on the recovery origin, and nowhere else."""
-    if credential.credential_id == recovery.refused_credential_id:
+    """Whether the credential itself places it on the recovery origin, and nowhere else, and no fill on that site
+    refused it this turn."""
+    refused_on_site = {recovery.refused_credential_id} | {
+        refused_id
+        for origin, refused_id in copilot_ctx.credential_origin_refusals
+        if same_release_scope(origin, recovery.origin)
+    }
+    if credential.credential_id in refused_on_site:
         return False
     try:
         vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
@@ -686,16 +693,35 @@ async def _request_credential(
 
     recovery_open = copilot_ctx.credential_origin_recovery
     # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
-    recovery = (
-        recovery_open
-        if not credential_id
-        and recovery_open is not None
-        and recovery_open.state == "pending"
-        and ask_origin.canonical == recovery_open.origin
-        else None
+    # Any pick ask on a site where a fill was refused this turn gets a recovery card, so a plain card cannot bind a
+    # refused login there.
+    on_recovery_site = (
+        None
+        if credential_id
+        else next(
+            (
+                earlier
+                for earlier in (
+                    recovery_open,
+                    *(
+                        CredentialOriginRecovery(origin, "declined", refused_id)
+                        for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
+                    ),
+                )
+                if earlier is not None and same_release_scope(login_page_url, earlier.origin)
+            ),
+            None,
+        )
     )
-    # The spent card, if any, asked for a different site; this ask has a refused fill behind it.
-    handback = recovery is not None and recovery.origin not in copilot_ctx.credential_origin_recovery_carded
+    recovery: CredentialOriginRecovery | None = None
+    if on_recovery_site is not None:
+        if recovery_open is not None and recovery_open.state == "pending" and on_recovery_site is not recovery_open:
+            return {"ok": False, "error": _credential_origin_recovery_error(recovery_open)}
+        recovery = (
+            on_recovery_site
+            if on_recovery_site.state == "pending" and on_recovery_site.origin == ask_origin.canonical
+            else CredentialOriginRecovery(ask_origin.canonical, "pending", on_recovery_site.refused_credential_id)
+        )
 
     update_name: str | None = None
     site_rejected = bool(credential_id) and rejected_by_site
@@ -706,26 +732,17 @@ async def _request_credential(
     update_ask = update_name is not None
 
     # The update ask awaits the vault above, so a card raised meanwhile by a parallel call must still win.
-    already_asked = copilot_ctx.credential_ask_in_flight or (
-        copilot_ctx.credential_totp_update_asked if update_ask else copilot_ctx.credential_pause_used and not handback
-    )
-    if already_asked and (recovery is None or copilot_ctx.credential_ask_in_flight):
-        already: dict[str, Any] = {
+    if copilot_ctx.credential_ask_in_flight:
+        return {
             "ok": True,
             "status": "already_asked",
-            "next": "Continue without re-asking this turn.",
+            "next": "A credential card is already open; its answer returns on the call that opened it.",
         }
-        # The outcome belongs to the pick card; the update card keeps none.
-        if update_name is None:
-            already["outcome"] = copilot_ctx.credential_pause_outcome or "unanswered"
-        return already
+    if update_ask and copilot_ctx.credential_totp_update_asked:
+        return {"ok": True, "status": "already_asked", "next": "Continue without re-asking this turn."}
 
     config = copilot_ctx.copilot_config
-    if config is None or not credential_pause_transport_ready(
-        copilot_ctx, config, allow_second_ask=update_ask or handback
-    ):
-        if recovery is not None and not handback:
-            return _decline_credential_origin_recovery(copilot_ctx, recovery, "already_asked")
+    if config is None or not credential_pause_transport_ready(copilot_ctx, config):
         _log_credential_card_unavailable(copilot_ctx, config)
         if recovery is not None:
             return _decline_credential_origin_recovery(copilot_ctx, recovery, "unavailable")
@@ -746,7 +763,7 @@ async def _request_credential(
     if recovery is not None:
         login_page_url = urlunsplit(urlsplit(login_page_url)._replace(query="", fragment=""))
         copilot_ctx.credential_origin_recovery = replace(recovery, state="asked")
-        copilot_ctx.credential_origin_recovery_carded.add(recovery.origin)
+        copilot_ctx.credential_origin_refusals.add((recovery.origin, recovery.refused_credential_id))
         admit_connected = partial(_credential_evidence_admits_origin, copilot_ctx, recovery)
     named_before_ask = set(policy.current_turn_named_credential_ids)
     if update_name is None:
@@ -761,7 +778,6 @@ async def _request_credential(
             update_credential_id=credential_id if update_name is not None else None,
             update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
             admit_connected=admit_connected,
-            allow_second_ask=handback,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=card_registration,
         )
@@ -794,7 +810,10 @@ async def _request_credential(
         copilot_ctx.credential_origin_recovery = None
         policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
         clear_tool_blocker_signals_for_reason_codes(
-            copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
+            copilot_ctx,
+            frozenset(
+                {CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE, CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE}
+            ),
         )
     registration_outcome = copilot_ctx.credential_registration_outcome if card_registration is not None else None
     registration_note = _REGISTRATION_OUTCOME_NOTES[registration_outcome] if registration_outcome is not None else {}
@@ -807,8 +826,8 @@ async def _request_credential(
         }
         if card_registration is None:
             unanswered["next"] = (
-                "The user did not answer the card. Continue without the credential: keep the credential "
-                "parameter placeholder in the draft and do not ask again this turn."
+                "The user did not answer the card, so no credential was connected. Keep the credential parameter "
+                "placeholder in the draft."
             )
         return unanswered
     if resolution.signed_in is not None:
@@ -827,16 +846,16 @@ async def _request_credential(
             "ok": True,
             "status": "connected_unresolved",
             "next": (
-                "The credential the user connected could not be loaded. Continue without it: keep the credential "
-                "parameter placeholder in the draft and do not ask again this turn."
+                "The credential the user connected could not be loaded, so none was connected. Keep the credential "
+                "parameter placeholder in the draft."
             ),
         }
     if credential is None:
         skipped: dict[str, Any] = {"ok": True, "status": "skipped", **registration_note}
         if card_registration is None:
             skipped["next"] = (
-                "The user chose not to connect a credential now. Keep the credential parameter placeholder "
-                "in the draft, do not ask again this turn, and say a test run may stop at the login step."
+                "The user chose not to connect a credential on this card. Keep the credential parameter placeholder "
+                "in the draft, and say a test run may stop at the login step."
             )
         return skipped
     connected: dict[str, Any] = {
@@ -1023,9 +1042,7 @@ async def _credential_fill_origin_grant(
         return None, _missing_credential_origin_error(
             credential_id,
             page_url or None,
-            # A spent pick card cannot be raised again this turn, so the confirm wording would promise nothing.
-            user_named=policy.current_turn_named_credential_ids == {credential_id}
-            and not copilot_ctx.credential_pause_used,
+            user_named=policy.current_turn_named_credential_ids == {credential_id},
         )
 
     if not isinstance(policy, RequestPolicy):

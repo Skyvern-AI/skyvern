@@ -8,6 +8,12 @@ from typing import Any, Literal
 import structlog
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.google_connection_notice import (
+    GoogleSetupScopeProfile,
+    google_setup_notice,
+    google_setup_ready_connections,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
@@ -74,6 +80,30 @@ async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[
             "count": len(integrations),
         },
     }
+
+
+async def _request_google_connection(
+    scope_profile: GoogleSetupScopeProfile, connection_id: str | None, ctx: CopilotContext
+) -> dict[str, Any]:
+    visible = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
+    notice = google_setup_notice(scope_profile=scope_profile, connection_id=connection_id, visible_credentials=visible)
+    ctx.google_setup_notices = [
+        *(existing for existing in ctx.google_setup_notices if existing.scopeProfile != scope_profile),
+        notice,
+    ]
+    data: dict[str, Any] = {
+        "status": "offered",
+        "scope_profile": scope_profile,
+        "card": "reconnect" if notice.connectionId else "connect",
+        "compatible_connections": [
+            _serialize(credential, "google") for credential in google_setup_ready_connections(scope_profile, visible)
+        ],
+    }
+    if notice.connectionId:
+        data["reconnect_connection_id"] = notice.connectionId
+    elif connection_id:
+        data["ignored_connection_id"] = connection_id
+    return {"ok": True, "data": data}
 
 
 @dataclass(frozen=True)

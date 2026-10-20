@@ -329,6 +329,7 @@ async def scrape_website(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -366,6 +367,7 @@ async def scrape_website(
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
     try:
@@ -439,6 +441,7 @@ async def scrape_website(
             scroll=scroll,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
 
@@ -494,6 +497,30 @@ def _should_use_page_ready_wait() -> bool:
     """Check if the enhanced page-ready wait is enabled via context (set by agent before scraping)."""
     context = skyvern_context.current()
     return bool(context and context.enable_page_ready_wait)
+
+
+async def _prepare_scrape_frame(
+    browser_state: BrowserState, page: Page, navigation_deadline: float | None, support_empty_page: bool
+) -> tuple[SkyvernFrame, str]:
+    """Get the working page ready for scraping and return its frame with the URL of the document being scraped.
+
+    Settles any in-flight navigation, rejects a dead blank page, injects the helpers, then waits for readiness.
+    Injection evaluates in the page, and evaluate calls are deferred while a cross-document navigation is pending,
+    so the navigation wait must come first. Only callers that pass a deadline (the step's scrape ladder) wait for it.
+    """
+    if navigation_deadline is not None:
+        await browser_state.wait_for_main_frame_navigation(page, navigation_deadline)
+    url = page.url
+    if url in BLANK_PAGE_URLS and not support_empty_page:
+        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
+        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
+        # is a dead blank and must fail classification so the caller can recover or fail closed.
+        if not page_has_meaningful_child_frame(page):
+            raise ScrapingFailedBlankPage()
+        LOG.info("blank page has meaningful child frames, proceeding with scraping")
+    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
+    await _wait_for_scrape_ready(skyvern_frame)
+    return skyvern_frame, url
 
 
 async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
@@ -584,6 +611,7 @@ async def scrape_web_unsafe(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -604,17 +632,7 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
-    url = page.url
-    if url in BLANK_PAGE_URLS and not support_empty_page:
-        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
-        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
-        # is a dead blank and must fail classification so the caller can recover or fail closed.
-        if not page_has_meaningful_child_frame(page):
-            raise ScrapingFailedBlankPage()
-        LOG.info("blank page has meaningful child frames, proceeding with scraping")
-
-    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
-    await _wait_for_scrape_ready(skyvern_frame)
+    skyvern_frame, url = await _prepare_scrape_frame(browser_state, page, navigation_deadline, support_empty_page)
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)

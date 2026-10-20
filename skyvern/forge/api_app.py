@@ -65,8 +65,10 @@ from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_D
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
+    start_hosted_driver_sweep,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
+    stop_hosted_driver_sweep,
     stop_temp_artifact_sweep,
 )
 from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
@@ -420,6 +422,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         LOG.info("Cleanup scheduler started")
 
     start_temp_artifact_sweep()
+    start_hosted_driver_sweep()
 
     workflow_schedule_task = start_workflow_schedule_scheduler()
     if workflow_schedule_task:
@@ -465,6 +468,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
+    await stop_hosted_driver_sweep()
     await interpretation_registry.stop_all()
 
     if forge_app.api_app_shutdown_event:

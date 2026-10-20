@@ -24,7 +24,6 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.cancel_workflow_run": "workflow.cancel",
     "skyvern.forge.sdk.routes.agent_protocol.continue_workflow_run": "workflow.continue",
     "skyvern.forge.sdk.routes.agent_protocol.convert_curl_to_http": "utility.convert",
-    "skyvern.forge.sdk.routes.agent_protocol.convert_sop_to_blocks": "workflow.convert",
     "skyvern.forge.sdk.routes.agent_protocol.create_folder": "workflow_folder.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_tag_value": "tag.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_workflow": "workflow.create",
@@ -307,14 +306,17 @@ def _route_action(connection: HTTPConnection) -> tuple[str | None, dict[str, obj
     return action, resource
 
 
-def require_request_actions(actions: frozenset[str]) -> Callable[[], Awaitable[None]]:
+def require_request_actions(actions: frozenset[str], *, always_enforce: bool = False) -> Callable[[], Awaitable[None]]:
     if not actions:
         raise ValueError("require_request_actions needs at least one action")
 
     async def enforce_request_action() -> None:
         principal = get_request_principal()
         for action in actions:
-            await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
+            if always_enforce:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action, always_enforce=True)
+            else:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
 
     return enforce_request_action
 

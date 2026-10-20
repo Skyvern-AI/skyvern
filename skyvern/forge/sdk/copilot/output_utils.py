@@ -2271,6 +2271,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Extended the browser session by {result.get('granted_minutes')} minutes"
     if tool_name == "upload_attached_file":
         return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
+    if tool_name == "read_attached_pdf":
+        end = result.get("next_offset") or result.get("total_chars")
+        return (
+            f"Read characters {result.get('offset')}-{end} of {result.get('total_chars')} from {result.get('filename')}"
+        )
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0

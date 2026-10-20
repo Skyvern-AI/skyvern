@@ -1514,6 +1514,17 @@ class WorkflowRunContext:
 
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
+        imported_credentials = await app.DATABASE.credentials.get_onepassword_credentials(
+            organization.organization_id,
+            item_keys=[(vault_id, item_id)],
+            limit=1,
+        )
+        if imported_credentials:
+            await app.AGENT_FUNCTION.enforce_credential_use(
+                organization.organization_id,
+                imported_credentials[0].credential_id,
+                workflow_run_id=self.workflow_run_id,
+            )
         lookup_context = self._format_resolved_lookup_context("1Password", vault_id=vault_id, item_id=item_id)
         item = await fetch_onepassword_item(token, vault_id, item_id, lookup_context)
         if parameter.totp_identifier:

@@ -3151,6 +3151,8 @@ class WorkflowRunsRepository(BaseRepository):
         ordering: tuple[str, str] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -3178,6 +3180,11 @@ class WorkflowRunsRepository(BaseRepository):
 
             if status:
                 query = query.filter(WorkflowRunModel.status.in_(status))
+            # created_at is naive UTC; an aware bound compared as-is would shift by its offset.
+            if created_at_start is not None:
+                query = query.filter(WorkflowRunModel.created_at >= to_naive_utc(created_at_start))
+            if created_at_end is not None:
+                query = query.filter(WorkflowRunModel.created_at < to_naive_utc(created_at_end))
 
             allowed_ordering_fields = {
                 "created_at": WorkflowRunModel.created_at,

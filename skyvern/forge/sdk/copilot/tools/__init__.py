@@ -9,7 +9,7 @@ import json
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from agents import FunctionTool, function_tool
@@ -145,7 +145,7 @@ from ._shared import _raw_yaml_proxy_location as _raw_yaml_proxy_location
 from ._shared import _same_page_ignoring_fragment as _same_page_ignoring_fragment
 from ._shared import _unverified_current_workflow_labels as _unverified_current_workflow_labels
 from ._shared import admitted_requested_output_reads
-from .attached_file_upload import UPLOAD_TOOL_NAME, upload_attached_file
+from .attached_file_upload import READ_PDF_TOOL_NAME, UPLOAD_TOOL_NAME, read_attached_pdf, upload_attached_file
 from .banned_blocks import _COPILOT_BANNED_BLOCK_TYPES as _COPILOT_BANNED_BLOCK_TYPES
 from .banned_blocks import AUTHORING_FAMILY_GUIDANCE as AUTHORING_FAMILY_GUIDANCE
 from .banned_blocks import CAPTCHA_IMAGE_ELEMENTS
@@ -247,6 +247,7 @@ from .guardrails import (
 from .integrations import (
     _list_integrations,
     _read_google_sheet,
+    _request_google_connection,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
@@ -1302,6 +1303,41 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(sanitized)
 
 
+GOOGLE_SETUP_TOOL_NAME = "request_google_connection"
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=GOOGLE_SETUP_TOOL_NAME)
+async def request_google_connection_tool(
+    ctx: RunContextWrapper,
+    scope_profile: Literal["gmail", "google_sheets"],
+    connection_id: str | None = None,
+) -> str:
+    """Show the user a card in this chat for connecting a Google account under one existing scope
+    profile: `gmail` reads mail (gmail.readonly, no sending) and `google_sheets` reads and writes
+    spreadsheets. The two are separate grants and separate connections, so a workflow that needs
+    both needs one card per profile.
+
+    The card appears with your reply. The user clicks Connect, finishes Google consent in a popup,
+    and then picks the account on the card; that pick reaches you on the next turn as
+    CONNECTED ACCOUNT CHOICE FACTS. This call does not start consent, does not wait for it and does
+    not change the workflow, so nothing is connected when it returns (`status` is `offered`).
+
+    `compatible_connections` lists the active connections that already hold this profile's scope;
+    the card offers them for selection without new consent. With `connection_id`, a connection that
+    was granted for this same profile but is not active gets a reconnect card that keeps its ID
+    (`reconnect_connection_id`); any other ID is not used and comes back as `ignored_connection_id`.
+    """
+    copilot_ctx = ctx.context
+    arguments: dict[str, Any] = {"scope_profile": scope_profile, "connection_id": connection_id}
+    authority_error = _authority_tool_error(copilot_ctx, GOOGLE_SETUP_TOOL_NAME)
+    if authority_error:
+        result: dict[str, Any] = {"ok": False, "error": authority_error}
+    else:
+        result = await _request_google_connection(scope_profile, connection_id, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, GOOGLE_SETUP_TOOL_NAME, arguments, result)
+    return json.dumps(result)
+
+
 @function_tool(failure_error_function=copilot_tool_failure, name_override="read_google_sheet")
 async def read_google_sheet_tool(
     ctx: RunContextWrapper,
@@ -2032,6 +2068,25 @@ async def upload_attached_file_tool(ctx: RunContextWrapper, file_id: str, select
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
+@function_tool(failure_error_function=copilot_tool_failure, name_override=READ_PDF_TOOL_NAME)
+async def read_attached_pdf_tool(ctx: RunContextWrapper, file_id: str, offset: int = 0) -> str:
+    """Return the text of a PDF the user attached to this chat (`file_id` exactly as listed in the attached files),
+    without a browser or a workflow run, and without adding anything to the workflow. Long text comes back in windows:
+    `total_chars` is the length of the whole document's text, and passing `next_offset` as `offset` reads the next
+    window (null when this window reaches the end). Any other `offset` is moved back to the start of the window that
+    contains it. Pages past the first 256,000 tokens of a document's text are not
+    extracted, so `total_chars` stops there. Passwords, keys and other secrets in the text read
+    `[REDACTED_SECRET]`. `text_layer_warning` is present when the PDF's embedded font maps characters wrongly, so
+    letters and digits in `text` may not match the page. A PDF whose pages are only images has no text to return."""
+    authority_error = _authority_tool_error(ctx.context, READ_PDF_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, READ_PDF_TOOL_NAME, authority_error)
+    result = await read_attached_pdf(ctx.context, file_id, offset)
+    record_tool_step_result_for_ctx(ctx.context, READ_PDF_TOOL_NAME, {"file_id": file_id, "offset": offset}, result)
+    # Unescaped: the output cap counts characters of this string, and \uXXXX escapes would cut the window short.
+    return json.dumps(result, ensure_ascii=False)
+
+
 @function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
@@ -2336,6 +2391,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
+    request_google_connection_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
     run_blocks_tool,
@@ -2353,6 +2409,7 @@ NATIVE_TOOLS = [
     start_fresh_browser_tool,
     extend_browser_session_tool,
     upload_attached_file_tool,
+    read_attached_pdf_tool,
     run_workflow_for_accounts_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
@@ -2499,6 +2556,7 @@ def copilot_native_tools(
     run_tools_available: bool,
     supports_account_group_card: bool = False,
     supports_credential_delete_card: bool = False,
+    supports_google_setup_card: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2509,6 +2567,7 @@ def copilot_native_tools(
             (tool.name == "ask_user" and not supports_question_tool)
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
+            or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
             or (
                 tool.name == CREDENTIAL_DELETE_TOOL_NAME

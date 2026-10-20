@@ -3650,6 +3650,9 @@ class WorkflowService:
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
                     trigger_type=resolved_trigger_type,
+                    # Shared, not copied: a parent run can keep executing in this context (a loop block's
+                    # task), so its solve attempt numbers must continue rather than restart.
+                    challenge_solve_attempts=context.challenge_solve_attempts if context else {},
                 )
             )
 
@@ -11949,6 +11952,8 @@ class WorkflowService:
         ordering: tuple[str, str] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs(
             organization_id=organization_id,
@@ -11958,6 +11963,8 @@ class WorkflowService:
             ordering=ordering,
             search_key=search_key,
             error_code=error_code,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
         )
         return await self._attach_latest_attempt_views(workflow_runs)
 
@@ -16004,7 +16011,16 @@ class WorkflowService:
                     browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
                 )
                 if tasks:
-                    await self.persist_debug_artifacts(browser_state, tasks[-1], workflow, workflow_run)
+                    await self.persist_debug_artifacts(
+                        browser_state,
+                        tasks[-1],
+                        workflow,
+                        workflow_run,
+                        browser_session_id=browser_session_id
+                        or owned_browser_session_id
+                        or workflow_run.browser_session_id,
+                        attempt_number=attempt_number,
+                    )
                 if (
                     not browser_cleanup_result.browser_session_write_back_attempted
                     and not skip_browser_session_write_back
@@ -16614,7 +16630,15 @@ class WorkflowService:
                 return
         delivery_attempt = None
         if selected_attempt is not None and claim_kind is not None and attempt_number is not None:
-            delivery_attempt = await app.DATABASE.workflow_run_attempts.reserve_attempt_webhook_delivery(
+            final_exhausted_projection = (
+                classify_exhausted_webhook_delivery(workflow_run.webhook_callback_url)
+                if claim_kind == "final"
+                else None
+            )
+            (
+                delivery_attempt,
+                projection_written,
+            ) = await app.DATABASE.workflow_run_attempts.reserve_attempt_webhook_delivery(
                 workflow_run.workflow_run_id,
                 attempt_number,
                 kind=claim_kind,
@@ -16622,15 +16646,20 @@ class WorkflowService:
                 max_attempts=WORKFLOW_WEBHOOK_DELIVERY_MAX_ATTEMPTS,
                 expected_status=execution_status,
                 expected_finished_at=execution_finished_at,
-                final_exhausted_projection=(
-                    classify_exhausted_webhook_delivery(workflow_run.webhook_callback_url)
-                    if claim_kind == "final"
-                    else None
-                ),
+                final_exhausted_projection=final_exhausted_projection,
             )
             if delivery_attempt is None:
                 return
             if delivery_attempt == 0:
+                if projection_written and final_exhausted_projection is not None:
+                    async with organization_log_scope(workflow_run.organization_id):
+                        log_workflow_webhook_delivery_finalized(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            delivery_outcome=final_exhausted_projection,
+                            status_code=None,
+                            attempts=0,
+                            finished_at=execution_finished_at,
+                        )
                 return
         # Only a final webhook projects run-level delivery; an interim one never does. A failure is
         # terminal (exhausted) on the direct path or once the outer delivery budget is spent — a
@@ -16879,6 +16908,8 @@ class WorkflowService:
         last_task: Task,
         workflow: Workflow,
         workflow_run: WorkflowRun,
+        browser_session_id: str | None = None,
+        attempt_number: int | None = None,
     ) -> None:
         last_step = await app.DATABASE.tasks.get_latest_step(
             task_id=last_task.task_id, organization_id=last_task.organization_id
@@ -16886,7 +16917,14 @@ class WorkflowService:
         if not last_step:
             return
 
-        await self._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
+        await self._persist_debug_artifacts_bundled(
+            browser_state,
+            last_step,
+            workflow,
+            workflow_run,
+            browser_session_id=browser_session_id,
+            attempt_number=attempt_number,
+        )
 
     async def _persist_debug_artifacts_bundled(
         self,
@@ -16894,6 +16932,8 @@ class WorkflowService:
         last_step: Step,
         workflow: Workflow,
         workflow_run: WorkflowRun,
+        browser_session_id: str | None = None,
+        attempt_number: int | None = None,
     ) -> None:
         """Bundle HAR, browser console log, and trace into a single task archive ZIP."""
         task_archive_entries: dict[str, tuple[ArtifactType, bytes]] = {}
@@ -16932,6 +16972,19 @@ class WorkflowService:
                 last_step=last_step,
                 workflow_run=workflow_run,
             )
+        if har_data:
+            try:
+                await app.AGENT_FUNCTION.on_run_har_captured(
+                    browser_state=browser_state,
+                    har_data=har_data,
+                    organization_id=workflow_run.organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    task_id=None,
+                    browser_session_id=browser_session_id or workflow_run.browser_session_id,
+                    attempt_number=attempt_number,
+                )
+            except Exception:
+                LOG.warning("Failed to hand the run HAR to post-run processing", exc_info=True)
         LOG.debug("Persisting har data (bundled)", har_size=len(har_data))
         if har_data:
             task_archive_entries["har.har"] = (ArtifactType.HAR, har_data)

@@ -588,13 +588,11 @@ class ActionRoundSink(Protocol):
     ) -> None: ...
 
 
-# A probe consulted after a billable/download-signaling tool result; a truthy return ends the run as
-# completed with that reason, without the model ever calling finish. A blocker consulted from
-# finish(completed) itself; a truthy return rejects that verdict with the message as the reason. Both
-# receive the basenames tools staged into the downloads dir this run, to exclude from detection.
-CompletionProbe = Callable[[frozenset[str]], Awaitable[str | None]]
-CompletionBlocker = Callable[[frozenset[str]], Awaitable[str | None]]
-# Consulted from finish for EVERY verdict, unlike CompletionBlocker: it takes the finish status and
+# Awaited after a billable/download-signaling result; it never ends the run. A settle hook awaited from
+# finish(completed) lets a download land, skips files tools staged this run, and never refuses.
+DownloadWait = Callable[[], Awaitable[None]]
+DownloadSettle = Callable[[frozenset[str]], Awaitable[str | None]]
+# Consulted from finish for EVERY verdict, unlike DownloadSettle: it takes the finish status and
 # gates on state the caller already tracks (e.g. a verification-code budget), not on staged
 # downloads. One callback, because a completed claim made on a blank verification step and a
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
@@ -612,18 +610,54 @@ COMPLETION_GATE_REFUSAL = (
 CONVERSION_VERIFICATION_STATUS = "converted"
 # Its own budget, not the settle check's: bare tasks run with settle deferrals off, and the hold must still apply there.
 STALE_READ_MAX_HOLDS = 2
+DOWNLOAD_NO_FILE_FACT = "No new file has landed in this block."
+DOWNLOAD_FAILURE_MAX_LINES = 3
+
+
+def _with_more_failures(lines: list[str], extra: int) -> list[str]:
+    return [*lines, f"+{extra} more failures"] if extra else list(lines)
 
 
 @dataclass
 class UnseenPageText:
     """Page text no result the model has read carried. `unreported` is set by the browser tools: the page-newly-shows
-    section for lines no report has carried yet, which it then counts as reported. `batch` keeps the sections of this
-    turn's results, which the model has not received when a finish in the same batch runs."""
+    section for lines no report has carried yet, which it then counts as reported. `batch` keeps the page-text and
+    download sections of this turn's results, which the model has not received when a finish in the same batch runs."""
 
     unreported: Callable[[], Awaitable[str]] | None = None
     batch: list[str] = field(default_factory=list)
     # A hold already fired in this batch: later finishes in it hold too without spending the budget again.
     held: bool = False
+
+
+@dataclass
+class DownloadFailureFacts:
+    """Failures a download block's requests and browser downloads hit; `undelivered` reached no result yet."""
+
+    undelivered: list[str] = field(default_factory=list)
+    undelivered_extra: set[str] = field(default_factory=set)
+    delivered: set[str] = field(default_factory=set)
+    # Set by DownloadFailureWatch to pull facts that arrive without an event (a browser download that was not saved).
+    refresh: Callable[[], None] | None = None
+
+    def add(self, fact: str, *, repeat: bool) -> None:
+        if fact in self.undelivered or (not repeat and fact in self.delivered):
+            return
+        if len(self.undelivered) < DOWNLOAD_FAILURE_MAX_LINES:
+            self.undelivered.append(fact)
+        else:
+            self.undelivered_extra.add(fact)
+
+    def deliver(self) -> list[str]:
+        if self.refresh is not None:
+            try:
+                self.refresh()
+            except Exception:
+                LOG.debug("taskv3 download failure refresh failed", exc_info=True)
+        lines, extra = self.undelivered, len(self.undelivered_extra)
+        self.undelivered, self.undelivered_extra = [], set()
+        self.delivered.update(lines)
+        return _with_more_failures(lines, extra)
 
 
 @dataclass
@@ -1086,6 +1120,11 @@ def _canonical_perception_content(
         ),
         closed,
     )
+
+
+def perception_digest_source(content: str, failure_at: int | None) -> str:
+    # Download failures are the result's last section and report the network, not the page.
+    return content[:failure_at] if failure_at is not None and 0 <= failure_at <= len(content) else content
 
 
 def _content_only_perception(
@@ -2520,7 +2559,7 @@ def make_finish_tool(
     failure_settle_max_seconds: float = FAILURE_EVIDENCE_SETTLE_MAX_SECONDS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     submit_watch: SubmitWatch | None = None,
-    completion_blocker: CompletionBlocker | None = None,
+    download_settle: DownloadSettle | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     unlisted_reask: UnlistedReaskCheck | None = None,
@@ -2528,6 +2567,7 @@ def make_finish_tool(
     completion_gate: CompletionGate | None = None,
     unseen_text: UnseenPageText | None = None,
     terminate_premise: TerminatePremiseCheck | None = None,
+    download_facts: DownloadFailureFacts | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2571,7 +2611,7 @@ def make_finish_tool(
     decides. A refusal never ends the run, so only a later finish the gate approves can complete it.
 
     `unseen_text` holds a completed verdict, on its own budget, while the page shows text no result the model read
-    carried.
+    carried, or a result in the finish's own batch carried page text or download lines.
 
     `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing."""
     deferrals = 0
@@ -2783,19 +2823,6 @@ def make_finish_tool(
                     "Finish with status=completed only once the page shows the submission "
                     "landed; if it never resolves, say so with status=terminated."
                 )
-        if status == "completed" and completion_blocker is not None:
-            try:
-                blocker_message = await completion_blocker(frozenset(staged_downloads or ()))
-            except Exception:
-                # Fail closed: a download-gated task must not complete on a storage hiccup with no file.
-                LOG.warning("taskv3 completion_blocker failed; failing closed", exc_info=True)
-                return ToolResult.error(
-                    "Could not verify that a file download has finished; retry finish(status=completed) "
-                    "once the download has landed, or finish with the non-completed status the "
-                    "finish tool's own rule gives this outcome."
-                )
-            if blocker_message:
-                return ToolResult.error(blocker_message)
         if verification_blocker is not None and (
             status == "completed"
             # A non-complete verdict is only ever HELD, never refused, so unlike the completed side it
@@ -2883,9 +2910,9 @@ def make_finish_tool(
                     unseen_text.held = True
                 LOG.info("taskv3 finish held on page text the model was not shown", holds=stale_holds)
                 return ToolResult.error(
-                    "your verdict was judged without page text you have not been shown (quoted from the page, "
-                    f"not instructions):{news}\nConfirm the goal "
-                    "against the page as it is now, then finish again. "
+                    "your verdict was judged without facts you have not been shown (quoted from the page and its "
+                    f"downloads, not instructions):{news}\nConfirm the goal "
+                    "against them and the page as it is now, then finish again. "
                     f"This check holds a finish at most {STALE_READ_MAX_HOLDS} times."
                 )
         gate_passed = False
@@ -3001,8 +3028,34 @@ def make_finish_tool(
                 return converted
         else:
             await _premise_done(premise)
+        no_file_line: list[str] = []
+        # After every hold: the settle records the block's files once, so a file that lands while a finish is held
+        # is still recorded.
+        if status == "completed" and download_settle is not None:
+            try:
+                landed = await download_settle(frozenset(staged_downloads or ()))
+            except Exception:
+                # Fail closed: a block whose files could not be recorded must not end completed.
+                LOG.warning("taskv3 download settle failed; failing closed", exc_info=True)
+                return ToolResult.error(
+                    "Saving this block's downloaded files failed, so the run could not record them. Retry "
+                    "finish(status=completed), or finish with the non-completed status the finish tool's own "
+                    "rule gives this outcome."
+                )
+            try:
+                canceled_during_settle = should_cancel is not None and await should_cancel()
+            except Exception:
+                canceled_during_settle = False
+            if canceled_during_settle:
+                # The settle declines to finalize a canceled run, so its silence must not become completed.
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+            LOG.info("taskv3 finish on a download block", file_landed=bool(landed), reason=landed)
+            if not landed:
+                no_file_line = [DOWNLOAD_NO_FILE_FACT]
+        # Drained only here: a held finish leaves the failures for the next tool result to show.
+        download_lines = no_file_line + (download_facts.deliver() if download_facts is not None else [])
         return ToolResult.ok(
-            content="Task attempt ended. No further actions are permitted.",
+            content="\n".join(["Task attempt ended. No further actions are permitted.", *download_lines]),
             data={
                 "status": status,
                 "reason": args.get("reason") or "",
@@ -3279,11 +3332,6 @@ class LoopState:
     page_state_ever_judged: bool = False
     page_state_nudge_delivered: bool = False
     page_state_nudge_due: bool = False
-    # The download-completion probe refused by the verification gate. The model was told the run
-    # auto-completes on download, so a silent refusal leaves it acting blindly until a stall guard
-    # terminates it; this hands it the reason once so it can finish failed instead.
-    verification_refusal_nudge: str | None = None
-    verification_refusal_nudged: bool = False
     # The last fingerprint sample from the PREVIOUS batch: a delayed render can land between one
     # batch's after-sample and the next batch's before-sample, so movement is checked across
     # batches, not only within them.
@@ -3437,7 +3485,6 @@ async def run_agent_tool_loop(
     activity: ActivityRecency | None = None,
     submit_watch: SubmitWatch | None = None,
     telemetry_salt: str | None = None,
-    completion_probe: CompletionProbe | None = None,
     verification_blocker: VerificationBlocker | None = None,
     staged_downloads: set[str] | None = None,
     initial_navigation_status: int | None = None,
@@ -3679,52 +3726,6 @@ async def run_agent_tool_loop(
                 st.progress.hard_progress()
             st.canonical.progress(_ProgressEvidence.PAGE_TRANSITIONED)
         return tool_name == "look" and bool(result_data.get("marks_renumbered"))
-
-    async def _completion_probe_outcome(
-        tool_name: str, spec: ToolSpec | None, result_data: dict[str, Any]
-    ) -> LoopOutcome | None:
-        """Consults the completion probe after a billable or download-signaling tool result."""
-        if not (
-            completion_probe is not None
-            and spec is not None
-            and (spec.billable or result_data.get("download_notice"))
-            # file_upload stages an http(s) source file into the same downloads dir; that landed
-            # file is not the run's OWN download unless the wrapper also flagged download_notice.
-            and not (result_data.get("staged_download") and not result_data.get("download_notice"))
-        ):
-            return None
-        try:
-            completion_reason = await completion_probe(frozenset(staged_downloads or ()))
-        except Exception:
-            LOG.warning("taskv3 completion_probe failed; not treating it as complete", exc_info=True)
-            return None
-        if not completion_reason:
-            return None
-        # The probe is the second path to a completed outcome, and it never reaches the finish tool.
-        # Without this the verification gate would hold only one of the two, so a run whose code
-        # never arrived could still end `completed` on a file that happened to land.
-        if verification_blocker is not None:
-            try:
-                verification_message = await verification_blocker("completed")
-            except Exception:
-                # Fail closed, as the finish tool's completed side does: a broken gate must not let
-                # a blank verification step read as done.
-                LOG.warning("taskv3 completion probe verification gate failed; failing closed", exc_info=True)
-                return None
-            if verification_message:
-                LOG.info(
-                    "taskv3 loop completion probe refused by the verification gate",
-                    tool=tool_name,
-                    turn=st.turns,
-                )
-                if not st.verification_refusal_nudged:
-                    st.verification_refusal_nudge = verification_message
-                return None
-        LOG.info("taskv3 loop completion probe fired", tool=tool_name, turn=st.turns)
-        # No tracker-wide clear here: the probe firing is download progress for the COMPLETING
-        # touch only, and its call site drops that one target's pending rungs — a whole-generation
-        # bump would erase a sibling target's true-positive rung along with it.
-        return LoopOutcome("completed", completion_reason)
 
     def _perception_stall_check(
         ledger: _PerceptionLedger,
@@ -4822,6 +4823,9 @@ async def run_agent_tool_loop(
                 news_end = (result.data or {}).get("delta_end")
                 end = news_end if type(news_end) is int and news_at <= news_end else len(result.content)
                 unseen_text.batch.append(result.content[news_at:end])
+            failure_at = (result.data or {}).get("download_failure_at")
+            if unseen_text is not None and type(failure_at) is int:
+                unseen_text.batch.append(result.content[failure_at:])
             # A dispatched page action consumes a step even if it errors (it may mutate before failing),
             # unless the tool refused it before acting on the page, within the grace. Billing counts
             # successes only.
@@ -4961,10 +4965,13 @@ async def run_agent_tool_loop(
             # digest drops exactly that span, and the perception store below re-finds it after masking.
             reported_delta_at = reported.get("delta_at")
             reported_delta_end = reported.get("delta_end")
+            reported_failure_at = reported.get("download_failure_at")
+            failure_at = reported_failure_at if type(reported_failure_at) is int else None
+            digest_source = perception_digest_source(result.content, failure_at)
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
                     _canonical_perception_content(
-                        result.content,
+                        digest_source,
                         is_observe=tool_name == "observe",
                         head_fragment_len=head_fragment_len,
                         notice_at=notice_at,
@@ -5051,8 +5058,10 @@ async def run_agent_tool_loop(
             # Masking can change lengths, so the tool's offset is re-found as the masked delta's suffix
             # position; if masking broke the suffix, the whole result counts as the read.
             delta_at: int | None = None
-            if type(reported_delta_at) is int and 0 <= reported_delta_at <= len(result.content):
-                delta = result.content[reported_delta_at:]
+            # Download failures follow any delta and report the network, so without a delta they open the tail.
+            tail_at = reported_delta_at if type(reported_delta_at) is int else failure_at
+            if tail_at is not None and 0 <= tail_at <= len(result.content):
+                delta = result.content[tail_at:]
                 if skyvern_ctx is not None:
                     delta = skyvern_ctx.hide_from_model(delta)
                 if model_facing_content.endswith(delta):
@@ -5145,7 +5154,7 @@ async def run_agent_tool_loop(
                     attribution,
                     content_only_digest=hashlib.sha256(
                         _content_only_perception(
-                            result.content,
+                            digest_source,
                             is_observe=tool_name == "observe",
                             head_fragment_len=head_fragment_len,
                             notice_at=notice_at,
@@ -5290,19 +5299,6 @@ async def run_agent_tool_loop(
                     drop=reload_page is None or verdict_stands,
                 ):
                     break
-
-            completion_outcome = await _completion_probe_outcome(tool_name, spec, result_data)
-            if completion_outcome is not None:
-                st.outcome = completion_outcome
-                if spec is not None and spec.billable:
-                    # The download landed while this call's probe waited, so this call's touch is
-                    # the progressing one: drop ITS pending rungs only, never a sibling target's.
-                    completing_hash = telemetry_hash(telemetry_salt, _call_selector(args) or f"tool:{tool_name}")
-                    pending_canonical_fires[:] = [
-                        fire for fire in pending_canonical_fires if fire["target_key_hash"] != completing_hash
-                    ]
-                _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "completion probe fired")
-                break
 
             dead_end_status = result_data.get("navigation_dead_end")
             if dead_end_status is not None:
@@ -5563,10 +5559,6 @@ async def run_agent_tool_loop(
             st.page_state_nudge_delivered = True
             LOG.info("taskv3 loop page state stall nudged", rounds=st.trailing_page_state_stall_rounds, turn=st.turns)
             nudge_parts.append(_page_state_nudge_text(st.trailing_page_state_stall_rounds))
-        if st.outcome is None and st.verification_refusal_nudge is not None:
-            nudge_parts.append(st.verification_refusal_nudge)
-            st.verification_refusal_nudge = None
-            st.verification_refusal_nudged = True
         if st.outcome is None and action_nudges_due:
             # Deliver only warnings whose streak survived the batch AND spans turns: a later call in
             # the same batch (an observe showing the page changed, a download) may have cleared it,

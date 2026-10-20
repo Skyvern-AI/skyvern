@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections import OrderedDict
 from contextvars import ContextVar, Token
 from threading import RLock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -18,6 +19,10 @@ from skyvern.constants import SKYVERN_CLI_USER_AGENT, SKYVERN_MCP_USER_AGENT
 from skyvern.library.skyvern import Skyvern
 
 from .api_key_hash import hash_api_key_for_cache
+from .hosted_driver import HostedDriver, owners
+
+if TYPE_CHECKING:
+    from playwright.async_api import Playwright
 
 # Fern applies a per-call timeout to the whole request (connect, read, write and pool), so only run_sdk_action gets it.
 # 115 s bounds one call below the 120 s ALB idle timeout; a tool that makes several calls can still run longer.
@@ -27,6 +32,8 @@ _skyvern_instance: ContextVar[Skyvern | None] = ContextVar("skyvern_instance", d
 _api_key_override: ContextVar[str | None] = ContextVar("skyvern_api_key_override", default=None)
 _global_skyvern_instance: Skyvern | None = None
 _api_key_clients: OrderedDict[str, Skyvern] = OrderedDict()
+# Evicted loopback clients whose driver a running call still leases; the idle sweep closes them once it is released.
+_closing_clients: set[_LoopbackSkyvern] = set()
 _clients_lock = RLock()
 LOG = structlog.get_logger(__name__)
 
@@ -69,11 +76,36 @@ def _resolve_self_base_url() -> str:
 
 
 class _LoopbackSkyvern(Skyvern):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._hosted_driver = HostedDriver()
+
     async def run_sdk_action(
         self, *, request_options: RequestOptions | None = None, **kwargs: Any
     ) -> RunSdkActionResponse:
         options: RequestOptions = {"timeout_in_seconds": LOOPBACK_SDK_ACTION_TIMEOUT_SECONDS, **(request_options or {})}
         return await super().run_sdk_action(request_options=options, **kwargs)
+
+    async def _get_playwright(self) -> Playwright:
+        from .session_manager import stateless_call_playwright  # noqa: PLC0415 — circular import
+
+        # Concurrent calls on this key share one driver; each call leases it, and the API's idle sweep stops it
+        # once no call has used it for a while, so a key served once does not keep a driver for the process life.
+        return await stateless_call_playwright(self._hosted_driver)
+
+    async def aclose(self) -> None:
+        await self._close()
+
+    async def _close(self) -> bool:
+        with _clients_lock:
+            if self._hosted_driver.leases:
+                # Evicted while a call still uses the driver and this HTTP client; closing now would break that call.
+                _closing_clients.add(self)
+                return False
+            _closing_clients.discard(self)
+        reclaimed = await self._hosted_driver.close()
+        await super().aclose()
+        return reclaimed
 
 
 def _build_cloud_client(api_key: str) -> Skyvern:
@@ -192,6 +224,35 @@ def get_skyvern() -> Skyvern:
                 _global_skyvern_instance = instance
     _skyvern_instance.set(instance)
     return instance
+
+
+async def sweep_idle_hosted_drivers(now: float | None = None) -> int:
+    """Stop hosted MCP drivers that no call has used for the idle threshold, and close released evicted clients."""
+    now = time.monotonic() if now is None else now
+    reclaimed = 0
+    # Driven by the owner registry, not the client cache: an evicted client's driver can start after eviction.
+    for owner in owners():
+        try:
+            reclaimed += await owner.reap(now, settings.HOSTED_MCP_DRIVER_IDLE_SECONDS)
+        except Exception:
+            LOG.warning("Failed to stop an idle hosted MCP browser driver", exc_info=True)
+    with _clients_lock:
+        released = [client for client in _closing_clients if not client._hosted_driver.leases]
+    for client in released:
+        try:
+            reclaimed += await client._close()
+        except Exception:
+            LOG.warning("Failed to close an evicted hosted MCP client", exc_info=True)
+    return reclaimed
+
+
+async def shutdown_hosted_drivers() -> None:
+    """Stop every hosted MCP driver, leased or not, as the process shuts down."""
+    for owner in owners():
+        try:
+            await owner.close()
+        except Exception:
+            LOG.warning("Failed to stop a hosted MCP browser driver at shutdown", exc_info=True)
 
 
 async def close_skyvern() -> None:

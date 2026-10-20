@@ -1785,6 +1785,11 @@ def setup_logger() -> None:
     logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)
     logging.getLogger("LiteLLM Proxy").setLevel(logging.CRITICAL)
 
+    # pypdf reports recoverable per-font and per-object decode problems while it keeps parsing, some at
+    # ERROR (one "Advanced encoding ... not implemented yet" per font per page); lower this locally only
+    # to debug one PDF's extraction.
+    logging.getLogger("pypdf").setLevel(logging.CRITICAL)
+
     # The OTLP gRPC exporter logs a WARNING per retry and an ERROR per dropped batch when its
     # endpoint is unreachable; raise its threshold via OTEL_EXPORTER_LOG_LEVEL (default WARNING) to
     # drop that spam where the endpoint is intentionally unavailable, keeping it visible elsewhere.

@@ -37,9 +37,11 @@ from urllib.parse import urlparse
 
 import structlog
 from PIL import Image, ImageDraw
+from playwright.async_api import BrowserContext, Download, Page, Request, Response
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
+from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
@@ -82,6 +84,7 @@ from skyvern.forge.taskv3.field_commit import (
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
+    DOWNLOAD_FAILURE_MAX_LINES,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     OPENED_LIST_ERROR_CLASSES,
@@ -92,12 +95,14 @@ from skyvern.forge.taskv3.loop import (
     TARGET_LABEL_DATA_KEY,
     CoveredBranch,
     CoveredLayerKind,
+    DownloadFailureFacts,
     SemanticCommitStats,
     ToolHandler,
     ToolRefusal,
     ToolResult,
     ToolSpec,
     UnseenPageText,
+    _may_submit,
     current_tool_call_seq,
     mark_is_filler,
     record_click_dispatched,
@@ -118,13 +123,18 @@ from skyvern.forge.taskv3.run_arms import (
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
+from skyvern.webeye.action_deadline import cancellable_driver_call
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
+from skyvern.webeye.cdp_download_interceptor import download_tally_for_context
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.flutter_semantics import (
     FLUTTER_STATE_JS,
+    FLUTTER_TEXT_FIELD_JS,
+    FRAME_SETTLE_TIMEOUT_SECONDS,
+    TWO_FRAMES_JS,
     FlutterSemanticsState,
     SemanticsActivation,
     activate_flutter_semantics,
@@ -12556,6 +12566,8 @@ def build_browser_tools(
     vision_enabled: bool = True,
     semantic_commit_stats: SemanticCommitStats | None = None,
     unseen_text: UnseenPageText | None = None,
+    download_failures: DownloadFailureWatch | None = None,
+    download_wait: Callable[[], Awaitable[None]] | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
 
@@ -18456,6 +18468,7 @@ def build_browser_tools(
         if not reachable:
             return _covered_error(selector, occluder)
         written = text
+        flutter_field = bool(clear and text and not box_text) and await _is_flutter_text_field(page, selector)
         if clear:
             if (
                 field_type == "date"
@@ -18471,6 +18484,15 @@ def build_browser_tools(
                         f"{selector} is a date field that stores year-month-day, and {shown} is not a date or could "
                         "be read as more than one date, so nothing was typed. Type it as YYYY-MM-DD.",
                         error_class="date_format_refused",
+                    )
+            if flutter_field:
+                # fill() focuses and writes in one step; the write must land after the field's first frame instead.
+                await input_dispatch.focus(page, selector, timeout=_ACTION_TIMEOUT_MS)
+                if not await _two_frames_passed(page):
+                    return ToolResult.error(
+                        f"{selector} is a field of an app that draws its own page, and the page did not finish a frame "
+                        "after the field was focused, so nothing was typed. Re-observe the field before typing again.",
+                        error_class="text_not_held",
                     )
             await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
@@ -18524,6 +18546,13 @@ def build_browser_tools(
                     await field.dispose()
             if not_held is not None:
                 return not_held
+        # The field's own frame can still overwrite the write, so it is read back only after that frame has run.
+        if flutter_field and not await _two_frames_passed(page):
+            return ToolResult.error(
+                f"typed into {selector}, but the page did not finish a frame afterwards, so it is NOT confirmed that "
+                "the field kept the text. Re-observe the field before typing again.",
+                error_class="text_not_held",
+            )
         entry = (
             await _entry_read_back(
                 page,
@@ -18922,6 +18951,21 @@ def build_browser_tools(
             f"of the text may not have landed, or the page reformatted it. {warning}",
             error_class="text_not_held",
         )
+
+    async def _is_flutter_text_field(page: Any, selector: str) -> bool:
+        try:
+            return await page.locator(selector).first.evaluate(FLUTTER_TEXT_FIELD_JS, timeout=2000) is True
+        except Exception:
+            return False
+
+    async def _two_frames_passed(page: Any) -> bool:
+        # False when no frame came within the bound: the caller then fails closed instead of trusting a read the
+        # field could still overwrite. Cancellation is not an Exception, so it still propagates.
+        try:
+            frames = cancellable_driver_call(lambda: page.evaluate(TWO_FRAMES_JS))
+            return await asyncio.wait_for(frames, FRAME_SETTLE_TIMEOUT_SECONDS) is True
+        except Exception:
+            return False
 
     async def _entry_read_back(
         page: Any, selector: str, text: str, *, variant: str, echo: bool, before: str | None = None
@@ -22386,9 +22430,9 @@ def build_browser_tools(
             _tool_spec.address_probe = _click_address
         elif _tool_spec.name == "type":
             _tool_spec.answer_probe = _answer_field
-    # Inside the download signal, so a download notice stays the last thing in a result.
+    # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir)
+    _apply_download_signal(tools, downloads_dir, download_failures, download_wait)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -22711,23 +22755,240 @@ def apply_blank_page_guard(tools: list[ToolSpec], guard: BlankWorkingPageGuard |
         tool_spec.handler = wrapped
 
 
-def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> None:
-    """Wrap every tool in the given list so a file landing in `downloads_dir` during (or between)
-    calls is reported in the next tool result, without a dedicated tool call. Tools assembled later
-    (finish, auth/captcha extras) are not wrapped; a download landing during those surfaces on the
-    next wrapped call. State (seen files, pending re-delivery lines) is shared across all wrapped
-    tools via this closure, one instance per build_browser_tools call. No-op without downloads_dir."""
-    if not downloads_dir:
+_DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
+_DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
+_SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
+DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
+DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
+_DOWNLOAD_FAILURE_URL_MAX = 120
+_DOWNLOAD_NAME_WAIT_SECONDS = 1.0
+
+
+class DownloadFailureWatch:
+    """Records, on a download block, xhr/fetch requests and documents a call started that came back 4xx/5xx or failed,
+    and browser downloads the interceptor could not save, into `facts` for the next tool result to report."""
+
+    def __init__(self, page_provider: PageProvider, opaque_refs: OpaqueUrlRefs | None = None) -> None:
+        self.facts = DownloadFailureFacts(refresh=self._read_tally)
+        self._page_provider = page_provider
+        self._opaque_refs = opaque_refs
+        self._context: BrowserContext | None = None
+        self._open_calls = 0
+        self._call_seq = 0
+        self._unattached_logged = False
+        # Tracked requests not yet finished: the call that started each, None for one started between calls.
+        self._live: dict[Request, int | None] = {}
+        self._responded: set[Request] = set()
+        self._changed = asyncio.Event()
+        self._tally_generation: str | None = None
+        self._tally_seen: dict[str, int] = {}
+        # A browser that owns its downloads stores each under a generated id; the page's own name, keyed by that id.
+        self._page_names: dict[str, str] = {}
+        self._naming: set[asyncio.Task[None]] = set()
+        self._named_pages: weakref.WeakSet[Any] = weakref.WeakSet()
+
+        def on_request(request: Request) -> None:
+            try:
+                kind = request.resource_type
+                call = self._call_seq if self._open_calls > 0 else None
+                if kind in _DOWNLOAD_FAILURE_RESOURCE_TYPES or (kind == "document" and call is not None):
+                    self._live[request] = call
+            except Exception:
+                LOG.debug("taskv3 download failure watch request hook failed", exc_info=True)
+
+        def on_response(response: Response) -> None:
+            try:
+                request = response.request
+                if request in self._live:
+                    self._responded.add(request)
+                    if response.status >= 400:
+                        self._record(request, f"returned HTTP {response.status}")
+                    self._changed.set()
+            except Exception:
+                LOG.debug("taskv3 download failure watch response hook failed", exc_info=True)
+
+        def on_finished(request: Request) -> None:
+            self._live.pop(request, None)
+            self._responded.discard(request)
+            self._changed.set()
+
+        def on_failed(request: Request) -> None:
+            try:
+                # A navigation the browser turns into a download fails after its response arrived; only a request
+                # that never got one failed to reach the server.
+                if request in self._live and request not in self._responded:
+                    self._record(
+                        request, f"failed ({_DOWNLOAD_NOTICE_SANITIZE_RE.sub('', request.failure or '')[:80]})"
+                    )
+            except Exception:
+                LOG.debug("taskv3 download failure watch failure hook failed", exc_info=True)
+            on_finished(request)
+
+        self._hooks: dict[str, Callable[..., None]] = {
+            "request": on_request,
+            "response": on_response,
+            "requestfinished": on_finished,
+            "requestfailed": on_failed,
+            # A tab the action opens can start the download itself.
+            "page": self._name_downloads_on,
+        }
+
+    def _name_downloads_on(self, tab: Page) -> None:
+        if tab not in self._named_pages:
+            tab.on("download", self._on_download)
+            self._named_pages.add(tab)
+
+    def _on_download(self, download: Download) -> None:
+        task = asyncio.ensure_future(self._name_download(download))
+        self._naming.add(task)
+        task.add_done_callback(self._naming.discard)
+
+    async def _name_download(self, download: Download) -> None:
+        with contextlib.suppress(Exception):
+            path = await download.path()
+            if path:
+                self._page_names[os.path.basename(path)] = download.suggested_filename
+
+    async def page_names(self, stored: list[str]) -> dict[str, str]:
+        """The page's own name for each of `stored` the browser saved under a generated id, waiting briefly for a
+        download whose saved path is not known yet."""
+
+        def known(name: str) -> str | None:
+            return self._page_names.get(name) or self._page_names.get(os.path.splitext(name)[0])
+
+        deadline = time.monotonic() + _DOWNLOAD_NAME_WAIT_SECONDS
+        while self._naming and any(known(name) is None for name in stored):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.wait(set(self._naming), timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+        return {name: page_name for name in stored if (page_name := known(name))}
+
+    def _describe(self, request: Request) -> str:
+        url = request.url
+        masked = self._opaque_refs.mask(url, cut=True) if self._opaque_refs is not None else url
+        shown = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", urlparse(masked).path or "/")[:_DOWNLOAD_FAILURE_URL_MAX]
+        return f"{request.method} {shown}"
+
+    def _record(self, request: Request, what: str) -> None:
+        self.facts.add(f"Request failed: {self._describe(request)} {what}", repeat=self._live[request] is not None)
+
+    def _read_tally(self) -> None:
+        tally = download_tally_for_context(self._context)
+        if tally is None:
+            return
+        if tally.generation != self._tally_generation:
+            first = self._tally_generation is None
+            self._tally_generation = tally.generation
+            self._tally_seen = dict(tally.unsolicited_failures) if first else {}
+        for reason, total in tally.unsolicited_failures.items():
+            unsaved = total - self._tally_seen.get(reason, 0)
+            if unsaved > 0:
+                self._tally_seen[reason] = total
+                self.facts.add(
+                    f"Browser download not saved ({_DOWNLOAD_NOTICE_SANITIZE_RE.sub('', reason)[:80]}): {unsaved}",
+                    repeat=True,
+                )
+
+    async def begin(self) -> int:
+        try:
+            working_page = await self._page_provider()
+            context = working_page.context
+            if hasattr(context, "on") and hasattr(context, "remove_listener"):
+                if context is not self._context:
+                    self.close()
+                    self._context = context
+                    self._tally_generation = None
+                    self._read_tally()
+                    for event, hook in self._hooks.items():
+                        context.on(event, hook)
+            elif not self._unattached_logged:
+                self._unattached_logged = True
+                LOG.info("taskv3 download failure watch cannot attach", context_type=type(context).__name__)
+            # After the context attach, whose close() drops every page listener.
+            self._name_downloads_on(working_page)
+        except Exception:
+            LOG.info("taskv3 download failure watch could not attach", exc_info=True)
+        # Counted after the await, so a cancel during it leaves no open call behind.
+        self._open_calls += 1
+        self._call_seq += 1
+        return self._call_seq
+
+    def end(self) -> None:
+        self._open_calls = max(0, self._open_calls - 1)
+
+    def _unanswered(self, call: int) -> list[Request]:
+        return [
+            request for request, started in self._live.items() if started == call and request not in self._responded
+        ]
+
+    async def settle(self, call: int, *, wait: bool) -> list[str]:
+        """Waits, boundedly and only when `wait`, for the requests call `call` started, then hands out the
+        undelivered facts and the requests still unanswered."""
+        deadline = time.monotonic() + _DOWNLOAD_FAILURE_SETTLE_SECONDS
+        pending: list[str] = []
+        try:
+            while wait and (unanswered := self._unanswered(call)):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # A long-poll never answers, so this is the cost of each such click.
+                    LOG.info("taskv3 download failure watch settle hit its deadline", unanswered=len(unanswered))
+                    # Stated, so a failure that arrives later is not hidden behind this call's no-file line.
+                    pending = [
+                        f"Request still pending: {self._describe(request)} "
+                        f"(no answer after {_DOWNLOAD_FAILURE_SETTLE_SECONDS:g} s)"
+                        for request in unanswered[:DOWNLOAD_FAILURE_MAX_LINES]
+                    ]
+                    if len(unanswered) > DOWNLOAD_FAILURE_MAX_LINES:
+                        pending.append(f"+{len(unanswered) - DOWNLOAD_FAILURE_MAX_LINES} more requests still pending")
+                    break
+                self._changed.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._changed.wait(), remaining)
+        finally:
+            self.end()
+        return self.facts.deliver() + pending
+
+    def close(self) -> None:
+        for working_page in list(self._named_pages):
+            with contextlib.suppress(Exception):
+                working_page.remove_listener("download", self._on_download)
+        self._named_pages = weakref.WeakSet()
+        for task in list(self._naming):
+            task.cancel()
+        if self._context is None:
+            return
+        for event, hook in self._hooks.items():
+            with contextlib.suppress(Exception):
+                self._context.remove_listener(event, hook)
+        self._context = None
+        self._live.clear()
+        self._responded.clear()
+
+
+def _apply_download_signal(
+    tools: list[ToolSpec],
+    downloads_dir: str | None,
+    failure_watch: DownloadFailureWatch | None = None,
+    download_wait: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
+    saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
+    if not downloads_dir and failure_watch is None:
         return
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
+    seen_session: set[str] = set()
+    session_baselined = False
     pending: list[str] = []
     baseline = {"done": False}
     baseline_lock = asyncio.Lock()
     attempt_started_at: datetime | None = None
 
     def _list_split() -> tuple[list[str], list[str]]:
+        if not downloads_dir:
+            return [], []
         try:
             names = sorted(
                 name
@@ -22744,6 +23005,100 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
         in_progress = [n for n in names if n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
         return completed, in_progress
 
+    def _in_browser_session() -> bool:
+        context = skyvern_context.current()
+        return bool(context and context.browser_session_id and context.organization_id)
+
+    async def _session_files() -> list[str] | None:
+        """A persistent browser session's stored downloads, which never reach downloads_dir; None when unknown."""
+        context = skyvern_context.current()
+        if failure_watch is None and download_wait is None:
+            return []
+        if context is None or not context.browser_session_id or not context.organization_id:
+            return []
+        try:
+            # Every wrapped call lists, so a slow store must not hold up the call's own result.
+            async with asyncio.timeout(_SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS):
+                return await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=context.organization_id, browser_session_id=context.browser_session_id
+                )
+        except Exception:
+            LOG.info("taskv3 browser session download listing failed", exc_info=True)
+            return None
+
+    async def _new_session_files() -> list[str] | None:
+        """None when the listing failed or only set the baseline, so what is missing is unknown."""
+        nonlocal session_baselined
+        listed = await _session_files()
+        if listed is None:
+            return None
+        if not session_baselined:
+            # A baseline never read cannot be assumed empty, or every older stored file would read as new. The cost: a
+            # file stored before the first listing that succeeds is absorbed here and never named.
+            seen_session.update(listed)
+            session_baselined = True
+            return None
+        return listed
+
+    def _with_file_lines(
+        result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
+    ) -> tuple[ToolResult, bool]:
+        """`result` with this call's file lines, and whether the call itself reported a file."""
+        # A tool that stages its own file into downloads_dir (file_upload) names it in
+        # result.data; only that exact file is absorbed silently — an unrelated download
+        # completing during the same call still gets reported.
+        staged_name = (result.data or {}).get("staged_download")
+        completed, in_progress = _list_split()
+        new_lines: list[str] = []
+        for name in completed:
+            if name in seen_completed:
+                continue
+            seen_completed.add(name)
+            seen_started.add(_download_signal_identity(name))
+            if name == staged_name:
+                continue
+            try:
+                size = os.path.getsize(os.path.join(downloads_dir or "", name))
+            except OSError:
+                size = 0
+            display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", page_names.get(name, name))[:_DOWNLOAD_FAILURE_URL_MAX]
+            new_lines.append(f"Downloaded: {display} ({_human_download_size(size)})")
+        for uri in session_files:
+            if uri in seen_session:
+                continue
+            seen_session.add(uri)
+            name = os.path.basename(urlparse(uri).path)
+            # A blob: download is written to downloads_dir as well; its local line already names it.
+            if not name or name in seen_completed or name.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
+            display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)[:_DOWNLOAD_FAILURE_URL_MAX]
+            new_lines.append(f"Downloaded: {display} (in the browser session's storage)")
+        for name in in_progress:
+            identity = _download_signal_identity(name)
+            if identity in seen_started or identity in seen_completed:
+                continue
+            seen_started.add(identity)
+            display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", identity)
+            new_lines.append(f"Download started: {display} (in progress — not yet complete)")
+        deliver = list(dict.fromkeys(pending + new_lines))
+        if not deliver:
+            pending[:] = []
+            return result, False
+        capped = deliver[:_DOWNLOAD_SIGNAL_MAX_LINES]
+        overflow = len(deliver) - len(capped)
+        if overflow > 0:
+            capped = capped + [f"+{overflow} more files downloaded"]
+        pending[:] = deliver if compactable else []
+        # The flag lets the action-loop guard count the download as progress without parsing the content. `replace`,
+        # not a positional rebuild, so the fields inner wrappers set (screenshots included) survive.
+        return dataclasses.replace(
+            result,
+            content=result.content + "\n" + "\n".join(capped),
+            # download_new marks a download detected on THIS call; a compactable tool
+            # replaying retained pending lines carries only download_notice.
+            data={**(result.data or {}), "download_notice": True, "download_new": bool(new_lines)},
+        ), bool(new_lines)
+
     for tool_spec in tools:
 
         async def wrapped(
@@ -22751,10 +23106,12 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
             _handler: Callable[[dict[str, Any]], Awaitable[ToolResult]] = tool_spec.handler,
             _compactable: bool = tool_spec.compactable,
             _tool_name: str = tool_spec.name,
+            _billable: bool = tool_spec.billable,
         ) -> ToolResult:
             nonlocal attempt_started_at
             async with baseline_lock:
                 if not baseline["done"]:
+                    await _new_session_files()
                     try:
                         context = skyvern_context.current()
                         attempt_started_at = await get_download_retry_started_at(
@@ -22768,59 +23125,48 @@ def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> 
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
-            result = await _handler(args)
+            call = await failure_watch.begin() if failure_watch is not None else 0
             try:
-                # A tool that stages its own file into downloads_dir (file_upload) names it in
-                # result.data; only that exact file is absorbed silently — an unrelated download
-                # completing during the same call still gets reported.
-                staged_name = (result.data or {}).get("staged_download")
-                completed, in_progress = _list_split()
-                new_lines: list[str] = []
-                for name in completed:
-                    if name in seen_completed:
-                        continue
-                    seen_completed.add(name)
-                    seen_started.add(_download_signal_identity(name))
-                    if name == staged_name:
-                        continue
-                    try:
-                        size = os.path.getsize(os.path.join(downloads_dir, name))
-                    except OSError:
-                        size = 0
-                    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)
-                    new_lines.append(f"Downloaded: {display} ({_human_download_size(size)})")
-                for name in in_progress:
-                    identity = _download_signal_identity(name)
-                    if identity in seen_started or identity in seen_completed:
-                        continue
-                    seen_started.add(identity)
-                    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", identity)
-                    new_lines.append(f"Download started: {display} (in progress — not yet complete)")
-                deliver = list(dict.fromkeys(pending + new_lines))
-                if not deliver:
-                    pending[:] = []
-                    return result
-                capped = deliver[:_DOWNLOAD_SIGNAL_MAX_LINES]
-                overflow = len(deliver) - len(capped)
-                if overflow > 0:
-                    capped = capped + [f"+{overflow} more files downloaded"]
-                pending[:] = deliver if _compactable else []
-                # The flag lets the loop's action-loop guard treat the download as progress without
-                # sniffing the notice lines back out of the content string. Preserve screenshots so a
-                # result that also carried a look image (or any future image) is not silently dropped.
-                # `replace`, not a positional rebuild: this is the OUTERMOST wrapper, so a rebuild
-                # that lists fields silently drops whatever the inner wrappers set -- the screenshots
-                # the old comment here guarded, and every field added since.
-                return dataclasses.replace(
-                    result,
-                    content=result.content + "\n" + "\n".join(capped),
-                    # download_new marks a download detected on THIS call; a compactable tool
-                    # replaying retained pending lines carries only download_notice.
-                    data={**(result.data or {}), "download_notice": True, "download_new": bool(new_lines)},
-                )
+                result = await _handler(args)
+            except BaseException:
+                if failure_watch is not None:
+                    failure_watch.end()
+                raise
+            failures: list[str] = []
+            page_names: Mapping[str, str] = {}
+            if failure_watch is not None:
+                failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args))
+            # A file a tool staged itself (file_upload) is not a download to wait for.
+            staged = bool((result.data or {}).get("staged_download"))
+            if download_wait is not None and ((_billable and not staged) or _list_split()[1]):
+                try:
+                    await download_wait()
+                except Exception:
+                    LOG.warning("taskv3 download wait failed", tool=_tool_name, exc_info=True)
+            if failure_watch is not None:
+                landed = [name for name in _list_split()[0] if name not in seen_completed]
+                if landed:
+                    page_names = await failure_watch.page_names(landed)
+            session_files = await _new_session_files()
+            reported = True
+            try:
+                result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])
             except Exception:
                 LOG.warning("taskv3 download signal computation failed", tool=_tool_name, exc_info=True)
+            # Stated, not left to a missing line: a page can claim a download that never reached the run. A persistent
+            # session's storage can get the file after the call returns, so there it is "yet", after a listing read.
+            if failure_watch is not None and not reported and _may_submit(_tool_name, args):
+                if not _in_browser_session():
+                    failures.append(DOWNLOAD_NO_FILE_THIS_ACTION)
+                elif session_files is not None:
+                    failures.append(DOWNLOAD_NO_SESSION_FILE_YET)
+            if not failures:
                 return result
+            return dataclasses.replace(
+                result,
+                content=result.content + "\n" + "\n".join(failures),
+                data={**(result.data or {}), "download_failure_at": len(result.content)},
+            )
 
         tool_spec.handler = wrapped
 

@@ -472,6 +472,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_credential_delete_card: bool = Field(
         False, description="The client can display the credential deletion card and post its confirmation."
     )
+    supports_google_setup_card: bool = Field(
+        False, description="The client can display Gmail and Google Sheets connection cards with a scope profile."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,

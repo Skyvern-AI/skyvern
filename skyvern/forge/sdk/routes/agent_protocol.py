@@ -8,7 +8,7 @@ import time
 import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -78,6 +78,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.run_submission_gate import OPENAPI_SHED_RESPONSE, run_submission_slot
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
     is_job_recipe_workflow_run_trigger_type,
@@ -1247,76 +1248,6 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
         file,
         max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
     )
-
-
-@legacy_base_router.post(
-    "/workflows/sop-to-blocks",
-    response_model=dict[str, Any],
-    include_in_schema=False,
-)
-@legacy_base_router.post(
-    "/workflows/sop-to-blocks/",
-    response_model=dict[str, Any],
-    include_in_schema=False,
-)
-async def convert_sop_to_blocks(
-    file: UploadFile = Depends(_validate_file_size),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> dict[str, Any]:
-    """Convert a PDF SOP to workflow blocks without creating a workflow."""
-    analytics.capture(
-        "skyvern-oss-workflow-sop-to-blocks",
-        data={"organization_id": current_org.organization_id},
-    )
-
-    # Validate PDF
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    try:
-        file_contents = await file.read()
-        file_name = file.filename
-    finally:
-        await file.close()
-
-    # Extract text from PDF
-    sop_text = await asyncio.to_thread(
-        pdf_import_service.extract_text_from_pdf,
-        file_contents,
-        file_name,
-    )
-
-    # Convert to workflow definition via LLM
-    try:
-        result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
-    except HTTPException:
-        raise
-    except Exception as e:
-        LOG.exception(
-            "Failed to convert SOP to blocks",
-            organization_id=current_org.organization_id,
-            filename=file_name,
-        )
-        raise HTTPException(
-            status_code=422,
-            detail="Failed to convert SOP to workflow blocks. Please verify the PDF content and try again.",
-        ) from e
-
-    workflow_def = result.get("workflow_definition", {})
-
-    # Transform blocks: convert parameter_keys (backend format) to parameters (frontend format)
-    # This is done here rather than in _sanitize_workflow_json because the import-pdf endpoint
-    # needs the backend format for WorkflowCreateYAMLRequest validation
-    # Create shallow copies to avoid mutating shared data structures
-    blocks = [dict(block) for block in workflow_def.get("blocks", [])]
-    for block in blocks:
-        parameter_keys = block.pop("parameter_keys", None) or []
-        block["parameters"] = [{"key": key} for key in parameter_keys]
-
-    return {
-        "blocks": blocks,
-        "parameters": workflow_def.get("parameters", []),
-    }
 
 
 @legacy_base_router.post(
@@ -4942,6 +4873,26 @@ _WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL = (
     "Free-text run search exceeded its time limit. Retry with a created_at_start/created_at_end "
     "window of a few weeks or less, or search an exact browser profile or session ID."
 )
+# Unindexed free text walks the org's run history newest-first, so without a caller start it is bounded to
+# the window before the caller's end (or now). A product guardrail, not a measured optimum.
+_ORG_RUNS_SEARCH_DEFAULT_WINDOW = timedelta(days=30)
+_ORG_RUNS_SEARCH_TIMEOUT_DETAIL = (
+    "Free-text run search exceeded its time limit. Retry with a narrower created_at_start/created_at_end "
+    "window (a search without created_at_start covers only the 30 days before created_at_end or now), or "
+    "search an exact browser profile or session ID."
+)
+_ORG_RUNS_SEARCH_KEY_DESCRIPTION = (
+    _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION + " Without created_at_start, a search other than a complete browser "
+    "profile or session ID covers only runs created in the 30 days before created_at_end (or before now)."
+)
+_ORG_RUNS_CREATED_AT_START_DESCRIPTION = (
+    "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). "
+    "Supplying it replaces the 30-day default window of a free-text search_key."
+)
+_ORG_RUNS_CREATED_AT_END_DESCRIPTION = (
+    "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as "
+    "UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp."
+)
 
 
 def _runs_list_filter_names(**filters: object | None) -> list[str]:
@@ -5379,6 +5330,15 @@ async def run_workflow_legacy(
         "selected from a pool or fell back to, or the credential bound by a credential parameter on the "
         "run's workflow version when the run was created and the run recorded no selection for that "
         "parameter. Other pool and fallback members the run did not use do not match.\n\n"
+        "### Default search window\n\n"
+        "A `search_key` other than a complete browser profile or session id is matched only against runs created "
+        "in the **30 days before `created_at_end`** (or before now) unless the request supplies `created_at_start`. "
+        "This includes complete run and credential ids. Supply `created_at_start` (and optionally `created_at_end`) "
+        "to search a different range. Listings without `search_key` are not windowed. To fetch one run by its id, "
+        "use `GET /v1/runs/{run_id}`.\n\n"
+        "### created_at_start / created_at_end\n\n"
+        "Optional ISO 8601 bounds on the run's creation time: `created_at_start` is inclusive and "
+        "`created_at_end` is exclusive. A timestamp without an offset is read as UTC.\n\n"
         "### error_code\n\n"
         "An **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. "
         "A run matches if **any** of its tasks contains an error object with a matching `error_code` value. "
@@ -5388,7 +5348,10 @@ async def run_workflow_legacy(
         "All query parameters use AND logic:\n"
         "- `?status=failed` — only failed runs\n"
         "- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n"
-        "- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match"
+        "- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match "
+        "(searched over the last 30 days)\n"
+        "- `?search_key=prod_credential&created_at_start=2026-01-01T00:00:00Z&created_at_end=2026-02-01T00:00:00Z` "
+        "— search one explicit month"
     ),
     summary="Get all runs",
     openapi_extra={
@@ -5420,7 +5383,7 @@ async def get_workflow_runs(
     search_key: str | None = Query(
         None,
         max_length=500,
-        description=_WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION,
+        description=_ORG_RUNS_SEARCH_KEY_DESCRIPTION,
         examples=_RUN_SEARCH_KEY_EXAMPLES,
     ),
     error_code: str | None = Query(
@@ -5433,6 +5396,14 @@ async def get_workflow_runs(
         ),
         examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
     ),
+    created_at_start: Annotated[
+        datetime | None,
+        Query(description=_ORG_RUNS_CREATED_AT_START_DESCRIPTION, examples=["2026-01-01T00:00:00Z"]),
+    ] = None,
+    created_at_end: Annotated[
+        datetime | None,
+        Query(description=_ORG_RUNS_CREATED_AT_END_DESCRIPTION, examples=["2026-02-01T00:00:00Z"]),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
@@ -5455,18 +5426,36 @@ async def get_workflow_runs(
     credential parameter on the run's workflow version when the run was created and the run recorded no
     selection for that parameter.
 
+    A `search_key` other than a complete browser profile or session ID (run and credential IDs included)
+    searches only runs created in the 30 days before `created_at_end` (or before now) unless
+    `created_at_start` is supplied. Listings without `search_key` are not windowed.
+
+    **created_at_start** (inclusive) and **created_at_end** (exclusive) bound the run's creation time;
+    a timestamp without an offset is read as UTC.
+
     **error_code** performs an exact match against the `error_code` field in the `errors`
     JSON array on each task. A run matches if *any* of its tasks has a matching error code.
 
     **Examples:**
     - All failed runs: `?status=failed`
     - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
-    - Runs matching a parameter value: `?search_key=https://example.com`
-    - Runs matching a run ID: `?search_key=wr_abc123`
-    - Runs that used a credential: `?search_key=cred_123456789`
+    - Runs from the last 30 days matching a parameter value: `?search_key=https://example.com`
+    - Runs from the last 30 days matching a run ID: `?search_key=wr_abc123`
+    - Runs from the last 30 days that used a credential: `?search_key=cred_123456789`
+    - An older range: `?search_key=my_credential&created_at_start=2026-01-01T00:00:00Z`
     - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
+    default_window_applied = (
+        bool(search_key and not is_indexed_runs_list_search_key(search_key)) and created_at_start is None
+    )
+    effective_created_at_start = created_at_start
+    if default_window_applied:
+        window_end = to_naive_utc(created_at_end) or naive_utc_now()
+        # Floor instead of subtracting past datetime.min, which would raise OverflowError and surface as a 500.
+        effective_created_at_start = max(window_end, datetime.min + _ORG_RUNS_SEARCH_DEFAULT_WINDOW) - (
+            _ORG_RUNS_SEARCH_DEFAULT_WINDOW
+        )
     try:
         return await app.WORKFLOW_SERVICE.get_workflow_runs(
             organization_id=current_org.organization_id,
@@ -5475,6 +5464,8 @@ async def get_workflow_runs(
             status=status,
             search_key=search_key,
             error_code=error_code,
+            created_at_start=effective_created_at_start,
+            created_at_end=created_at_end,
         )
     except RunsListSearchCanceled as exc:
         LOG.warning(
@@ -5485,14 +5476,17 @@ async def get_workflow_runs(
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
             ),
+            default_window_applied=default_window_applied,
             page=page,
             page_size=page_size,
             statement_timeout_seconds=exc.statement_timeout_seconds,
         )
         raise _runs_list_timeout_error(
             indexed_search=exc.indexed_search,
-            search_detail=_RUNS_LIST_SEARCH_TIMEOUT_DETAIL,
+            search_detail=_ORG_RUNS_SEARCH_TIMEOUT_DETAIL,
         ) from exc
 
 

@@ -151,6 +151,10 @@ class BrowserState(Protocol):
 
     async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None: ...
 
+    async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
+        """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""
+        ...
+
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool: ...
 
     async def detach_remote_driver(self) -> None:
@@ -179,6 +183,7 @@ class BrowserState(Protocol):
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
         allow_transient_ui_suppression: bool = False,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage: ...
 
 

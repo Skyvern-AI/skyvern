@@ -30,6 +30,10 @@ def driver_transport_error_future(driver: Any) -> asyncio.Future[None] | None:
     return future if isinstance(future, asyncio.Future) else None
 
 
+def driver_connection_closed(driver: Any) -> bool:
+    return getattr(_driver_connection(driver), "_closed_error", None) is not None
+
+
 def kill_driver_process(driver: Any) -> None:
     process = getattr(getattr(_driver_connection(driver), "_transport", None), "_proc", None)
     if process is None or process.returncode is not None:

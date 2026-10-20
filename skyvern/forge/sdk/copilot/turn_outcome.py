@@ -7,7 +7,7 @@ schemas can embed ``TurnOutcome`` without importing copilot business logic.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
 import structlog
@@ -42,7 +42,9 @@ def connected_account_choice_context(
     outcome: TurnOutcome | None,
     *,
     explicit_selected_connection_id: str | None = None,
+    explicit_selected_connection_scopes: Sequence[str] = (),
     from_pending_proposal: bool = False,
+    reshown_setup_profiles: Sequence[str] = (),
 ) -> str:
     """Expose the validated picker selection as context; authorization remains in request policy."""
     choices = outcome.connected_account_choices if outcome is not None else None
@@ -54,6 +56,13 @@ def connected_account_choice_context(
     if explicit_selected_connection_id is not None:
         payload["selection_source"] = "pending_proposal_binding" if from_pending_proposal else "user_picker"
         payload["selected_connection_id"] = explicit_selected_connection_id
+        payload["selected_connection"] = {
+            "connection_id": explicit_selected_connection_id,
+            "state": "active",
+            "scopes_granted": list(explicit_selected_connection_scopes),
+        }
+    if reshown_setup_profiles:
+        payload["unselected_setup_cards_shown_again"] = list(reshown_setup_profiles)
     return json.dumps(payload, separators=(",", ":"))
 
 

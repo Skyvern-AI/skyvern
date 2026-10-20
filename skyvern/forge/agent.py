@@ -208,7 +208,14 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
 )
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
-from skyvern.forge.taskv3.loop import ACTION_BLOCK_TARGET_ACTION_RESERVE, LoopOutcome, RoundAction
+from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    DEFAULT_MAX_SETTLE_DEFERRALS,
+    DownloadSettle,
+    DownloadWait,
+    LoopOutcome,
+    RoundAction,
+)
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.provider_downloads import (
     PROVIDER_BASELINE_TIMEOUT_SECONDS,
@@ -2400,7 +2407,6 @@ class ForgeAgent:
             sanitize_handoff_url,
             string_leaves,
         )
-        from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import (
             _document_unidentifiable,
@@ -2653,11 +2659,11 @@ class ForgeAgent:
                 )
                 download_baseline_files = download_baseline_files + browser_session_downloaded_files
 
-        # Passed to the loop below as well, so a download-wait probe caps its wait at what's left
+        # Passed to the loop below as well, so a download wait caps itself at what's left
         # of the same deadline the loop enforces.
         loop_deadline_seconds = DEFAULT_DEADLINE_SECONDS
         loop_deadline_at = time.monotonic() + loop_deadline_seconds
-        # Shared across every probe call: a path that already hit DownloadFileMaxWaitingTime once
+        # Shared by every download wait and settle: a path that already hit DownloadFileMaxWaitingTime once
         # is excluded from later waits instead of being re-awaited on every subsequent action.
         download_wait_exhausted: set[str] = set()
 
@@ -2665,7 +2671,7 @@ class ForgeAgent:
         download_completion_reason: str | None = None
 
         # Owned here (not by the engine) so the final clean_up_task below can also exclude names
-        # tools staged into the downloads dir this run, whether or not the probe ever finalized.
+        # tools staged into the downloads dir this run, whether or not a download settle ever finalized.
         class _StagedDownloads(set[str]):
             # file_upload reports a basename for every source, but only http(s) sources are staged
             # into the downloads dir; a name that isn't there must not shadow a later real download.
@@ -2699,15 +2705,14 @@ class ForgeAgent:
         def _provider_wait_seconds(block: BaseTaskBlock) -> float:
             return min(block.download_timeout or PROVIDER_DOWNLOAD_WAIT_SECONDS, loop_deadline_at - time.monotonic())
 
-        completion_probe: CompletionProbe | None = None
-        completion_blocker: CompletionBlocker | None = None
+        download_wait: DownloadWait | None = None
+        download_settle: DownloadSettle | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
             complete_on_download_block = task_block
 
-            async def _download_completion_probe(staged: frozenset[str]) -> str | None:
+            async def _settle_downloads(staged: frozenset[str]) -> str | None:
                 nonlocal download_finalized, download_completion_reason
-                # A finish deferred by the settle gate re-probes; finalizing again would re-rename
-                # the same file (or re-fetch a browser-session download).
+                # Finalizing again would re-rename the same file (or re-fetch a browser-session download).
                 if download_finalized:
                     return download_completion_reason
                 assert workflow_download_directory is not None  # set alongside complete_on_download above
@@ -2748,41 +2753,24 @@ class ForgeAgent:
                 download_finalized = True
                 download_completion_reason = f"download completed ({len(new_files)} new file(s))"
                 LOG.info(
-                    "Task V3 task completed due to download",
+                    "Task V3 download finalized",
                     task_id=task.task_id,
                     num_new_files=len(new_files),
                 )
                 return download_completion_reason
 
-            async def _download_completion_blocker(staged: frozenset[str]) -> str | None:
-                reason = await _download_completion_probe(staged)
-                if reason:
-                    return None
-                return (
-                    "This task only completes once a file download finishes, and no download has "
-                    "been detected yet. Trigger the download, or finish with the non-completed "
-                    "status the finish tool's own rule gives this outcome if it cannot be triggered."
-                )
-
-            # A data-extraction goal needs the model to keep the turn and call finish() itself;
-            # ending the loop from the probe would drop the extraction. The blocker still
-            # withholds completion until the download lands.
-            if not (task.data_extraction_goal or task.extracted_information_schema):
-                completion_probe = _download_completion_probe
-            completion_blocker = _download_completion_blocker
-        elif (
+            download_settle = _settle_downloads
+        if (
             task_block is not None
-            and task_block.download_timeout is not None
-            and not task_block.complete_on_download
+            and (task_block.complete_on_download or task_block.download_timeout is not None)
             and task.workflow_run_id
         ):
-            # download_timeout alone carries no completion semantics; v1 bounds a post-action
-            # download-settle wait with it, so v3 gets an equivalent wait-only probe that never
-            # ends the run or blocks finish.
+            # As in v1, a download an action started lands (or hits download_timeout) before the model's next
+            # turn, so the next result can report it; the wait never ends the run or blocks finish.
             wait_only_block = task_block
 
-            async def _download_wait_only_probe(staged: frozenset[str]) -> str | None:
-                await self._wait_for_in_flight_downloads(
+            async def _download_wait() -> None:
+                if await self._wait_for_in_flight_downloads(
                     task,
                     wait_only_block,
                     organization.organization_id,
@@ -2790,10 +2778,18 @@ class ForgeAgent:
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
                     attempt_started_at=attempt_started_at,
-                )
-                return None
+                ):
+                    return
+                # A vendor session can keep a file its replay could not fetch; reading it back into the run dir is
+                # what lets the next result name it.
+                if provider_recovery is not None and wait_only_block.complete_on_download:
+                    await provider_recovery.recover(
+                        staged=staged_downloads,
+                        timeout=_provider_wait_seconds(wait_only_block),
+                        should_cancel=_should_cancel,
+                    )
 
-            completion_probe = _download_wait_only_probe
+            download_wait = _download_wait
 
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
         # the step engine uses) as the ACTION-round budget: a v3 step is one action round (a turn that
@@ -3335,8 +3331,8 @@ class ForgeAgent:
                 extra_system_guidance="\n\n".join(
                     part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
                 ),
-                completion_probe=completion_probe,
-                completion_blocker=completion_blocker,
+                download_wait=download_wait,
+                download_settle=download_settle,
                 completion_gate=_completion_gate,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
@@ -3428,7 +3424,7 @@ class ForgeAgent:
                             return False
 
                     blank_page = await _v3_page_left_blank(first_sample, _fingerprint_page, _settle_should_stop)
-                    # A suffix-only download block has no probe; its file is finalized by clean_up_task below.
+                    # No download settle finalized this block's file; clean_up_task below does.
                     # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
                     if (
                         blank_page is not None
@@ -3745,7 +3741,7 @@ class ForgeAgent:
                             finish_reason=finish_reason,
                             final_url=final_url,
                         )
-        # A probe-finalized run must not be finalized again (double rename); otherwise the fallback
+        # A settle-finalized run must not be finalized again (double rename); otherwise the fallback
         # finalize still has to exclude tool-staged inputs from what counts as a download.
         cleanup_list_files_before: list[str] | None = None
         if not download_finalized and download_baseline_files is not None:
@@ -7387,6 +7383,7 @@ class ForgeAgent:
         browser_state: BrowserState,
         scrape_type: ScrapeType,
         engine: RunEngine,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
@@ -7395,6 +7392,10 @@ class ForgeAgent:
             LOG.info("Try to stop loading the page before scraping")
             await browser_state.stop_page_loading()
         elif scrape_type == ScrapeType.RELOAD:
+            # The NORMAL rungs only wait for a navigation the browser had already reported when they checked; one
+            # reported later is still in flight here, and reloading would cancel it.
+            if navigation_deadline is not None and (page := await browser_state.get_working_page()) is not None:
+                await browser_state.wait_for_main_frame_navigation(page, navigation_deadline)
             LOG.info("Try to reload the page before scraping")
             await browser_state.reload_page(degradation=True)
 
@@ -7422,6 +7423,7 @@ class ForgeAgent:
             # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
             # verification / extraction / error-detection scrapes keep legacy scrolling.
             allow_transient_ui_suppression=True,
+            navigation_deadline=navigation_deadline,
         )
 
     async def _observe_claimed_download_within_grace(
@@ -7789,6 +7791,9 @@ class ForgeAgent:
                     stuck_operations=stuck_operations,
                 )
             blank_page_error: ScrapingFailedBlankPage | None = None
+            # One budget for the whole ladder: a scrape waits for an in-flight page navigation instead of
+            # timing out against it, and no later rung or replacement navigation gets a budget of its own.
+            navigation_deadline = time.monotonic() + settings.BROWSER_LOADING_TIMEOUT_MS / 1000
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
                 try:
                     scraped_page = await self._scrape_with_type(
@@ -7797,6 +7802,7 @@ class ForgeAgent:
                         browser_state=browser_state,
                         scrape_type=scrape_type,
                         engine=engine,
+                        navigation_deadline=navigation_deadline,
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
@@ -9699,6 +9705,18 @@ class ForgeAgent:
                     task=task,
                     browser_session_id=browser_session_id,
                 )
+            if har_data:
+                try:
+                    await app.AGENT_FUNCTION.on_run_har_captured(
+                        browser_state=browser_state,
+                        har_data=har_data,
+                        organization_id=task.organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        browser_session_id=browser_session_id or task.browser_session_id,
+                    )
+                except Exception:
+                    LOG.warning("Failed to hand the run HAR to post-run processing", exc_info=True)
             LOG.debug("Uploading har data", har_size=len(har_data))
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(

@@ -298,6 +298,8 @@ class TurnNarrativePayload(TypedDict):
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
     # the tool call whose row was newest when the card was raised.
     credentialPause: NotRequired[dict[str, str]]
+    # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
+    credentialPauses: NotRequired[list[dict[str, str]]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
@@ -904,12 +906,12 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
             and credential.credential_id in policy.carry_cited_credential_ids
             and not (settled_ids and credential.credential_id not in settled_ids)
         )
+        card_selected = credential.credential_id in policy.credential_pause_connected_credential_ids
         stamped_by_page = (
             credential.credential_id in policy.live_page_admitted_urls
-            and credential.credential_id != ctx.credential_pause_connected_credential_id
+            and not card_selected
             and not carry_stamp_the_user_answered
         )
-        card_selected = credential.credential_id == ctx.credential_pause_connected_credential_id
         if (
             credential.credential_id in policy.persisted_workflow_credential_ids
             and credential.credential_id not in settled_ids
@@ -1319,10 +1321,6 @@ class CopilotContext(AgentContext):
     # One update card (add an authenticator, or replace values a site refused) may follow an answered
     # card per turn: it asks to fix the credential the user already chose, not to choose again.
     credential_totp_update_asked: bool = False
-    # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
-    # A run that then hits a real login wall has evidence the guess did not, so it gets the budget
-    # back once.
-    credential_pause_reaskable_by_run: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
     credential_registration_outcome: Literal["rejected", "unknown"] | None = None
@@ -1330,6 +1328,7 @@ class CopilotContext(AgentContext):
     credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
+    credential_pause_receipts: list[dict[str, str]] = field(default_factory=list)
     demonstration_requested: bool = False
     demonstration_ran: bool = False
     demonstration_id: str | None = None
@@ -1349,6 +1348,8 @@ class CopilotContext(AgentContext):
     opening_workflow_title: str | None = None
     google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
+    google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -1571,6 +1572,9 @@ class CopilotContext(AgentContext):
         # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
         # run inherited from an earlier turn, which is not an attempt by this one.
         return bool(self.dispatched_run_ids_this_turn)
+
+    def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
+        return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]
 
     def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
         return {

@@ -126,7 +126,11 @@ from skyvern.forge.sdk.copilot.context import (
     sanitize_global_llm_context_for_prompt,
     tool_recorded_context_fields,
 )
-from skyvern.forge.sdk.copilot.credential_pause import credential_pause_reason, credential_recovery_token_digest
+from skyvern.forge.sdk.copilot.credential_pause import (
+    credential_pause_reason,
+    credential_pause_receipt,
+    credential_recovery_token_digest,
+)
 from skyvern.forge.sdk.copilot.data_write_defaults import default_data_write_continue_on_failure
 from skyvern.forge.sdk.copilot.demonstration_recorder import DemonstrationRejection
 from skyvern.forge.sdk.copilot.demonstration_replay import replay_demonstration
@@ -146,6 +150,7 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     resolve_turn_entrypoint_url,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
+from skyvern.forge.sdk.copilot.google_connection_notice import google_setup_notice, unselected_google_setup_offers
 from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
@@ -304,6 +309,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ConnectedAccountChoiceReference,
     DeliveredOutputFile,
+    GoogleSetupOffer,
     ResponseKind,
     TurnOutcome,
 )
@@ -1986,6 +1992,15 @@ def _make_agent_result(
         output_files = _turn_output_files(ctx)
         if output_files:
             turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
+        if ctx.google_setup_notices:
+            turn_outcome = turn_outcome.model_copy(
+                update={
+                    "google_setup_offers": [
+                        GoogleSetupOffer(scope_profile=notice.scopeProfile, connection_id=notice.connectionId)
+                        for notice in ctx.google_setup_notices
+                    ]
+                }
+            )
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -2100,23 +2115,15 @@ def _make_agent_result(
         if turn_outcome is not None and turn_outcome.output_files:
             payload_updates["outputFiles"] = [file.model_dump(mode="json") for file in turn_outcome.output_files]
         if ctx is not None and "credentialPause" not in narrative_payload:
-            pause_outcome = ctx.credential_pause_outcome
-            if pause_outcome:
-                pause_payload = {"outcome": pause_outcome}
-                if pause_outcome == "connected" and ctx.credential_pause_connected_credential_id:
-                    pause_payload["credentialId"] = ctx.credential_pause_connected_credential_id
-                signed_in_profile_id = (
-                    ctx.request_policy.credential_pause_signed_in_profile_id if ctx.request_policy else None
-                )
-                if pause_outcome == "signed_in" and signed_in_profile_id:
-                    pause_payload["browserProfileId"] = signed_in_profile_id
-                if ctx.credential_pause_anchor_tool_call_id:
-                    pause_payload["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
+            pause_payload = credential_pause_receipt(ctx)
+            if pause_payload:
                 payload_updates["credentialPause"] = pause_payload
-        if ctx is not None and "googleConnectionNotices" not in narrative_payload and ctx.google_connection_notices:
-            payload_updates["googleConnectionNotices"] = [
-                notice.to_payload() for notice in ctx.google_connection_notices
-            ]
+            if len(ctx.credential_pause_receipts) > 1:
+                payload_updates["credentialPauses"] = list(ctx.credential_pause_receipts)
+        if ctx is not None and "googleConnectionNotices" not in narrative_payload:
+            notice_payloads = ctx.google_connection_notice_payloads()
+            if notice_payloads:
+                payload_updates["googleConnectionNotices"] = notice_payloads
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
     if turn_facts is not None:
@@ -2270,8 +2277,9 @@ def _build_narrative_payload(
             "drainFingerprint": budget_state.drain_fingerprint,
             "leftRunIds": list(budget_state.leavable_run_ids) if budget_state.hard_backstop_reached else [],
         }
-    if ctx.google_connection_notices:
-        payload["googleConnectionNotices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
+    notice_payloads = ctx.google_connection_notice_payloads()
+    if notice_payloads:
+        payload["googleConnectionNotices"] = notice_payloads
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
@@ -3564,6 +3572,31 @@ async def _verified_connected_account_choices(
             )
         )
     return choices or None
+
+
+async def _reshow_unselected_google_setup(
+    ctx: CopilotContext, prior_turn_outcome: TurnOutcome | None, request_policy: RequestPolicy
+) -> list[str]:
+    """A pick on one setup card leaves its sibling cards in history, where they are inert, so offer them again."""
+    if request_policy.picked_connected_account_id is None or prior_turn_outcome is None:
+        return []
+    pending = unselected_google_setup_offers(
+        prior_turn_outcome.google_setup_offers or [], request_policy.picked_connected_account_scopes
+    )
+    if not pending:
+        return []
+    try:
+        visible = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
+    except Exception:
+        LOG.warning("copilot_google_setup_reshow_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
+        return []
+    ctx.google_setup_notices = [
+        google_setup_notice(
+            scope_profile=offer.scope_profile, connection_id=offer.connection_id, visible_credentials=visible
+        )
+        for offer in pending
+    ]
+    return [offer.scope_profile for offer in pending]
 
 
 async def _server_verified_connected_account_recovery_choices(
@@ -5563,6 +5596,7 @@ async def _run_copilot_turn_impl(
         native_tools=copilot_native_tools(
             supports_question_tool=chat_request.supports_question_tool,
             supports_account_group_card=chat_request.supports_account_group_card,
+            supports_google_setup_card=chat_request.supports_google_setup_card,
             supports_credential_delete_card=chat_request.supports_credential_delete_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
@@ -5618,8 +5652,15 @@ async def _run_copilot_turn_impl(
     scoped_global_llm_context = safe_global_llm_context
     prior_choice_context = connected_account_choice_context(
         prior_turn_outcome,
-        explicit_selected_connection_id=request_policy.selected_connected_account_id,
+        explicit_selected_connection_id=request_policy.picked_connected_account_id,
+        explicit_selected_connection_scopes=request_policy.picked_connected_account_scopes,
         from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
+        reshown_setup_profiles=(
+            await _reshow_unselected_google_setup(ctx, prior_turn_outcome, request_policy)
+            if chat_request.supports_google_setup_card
+            and not chat_request.selected_connected_account_from_pending_proposal
+            else []
+        ),
     )
     if prior_choice_context:
         scoped_global_llm_context = (
