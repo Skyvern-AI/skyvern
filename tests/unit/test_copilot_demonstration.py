@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -803,7 +803,10 @@ async def test_record_claim_never_locks_the_browser_index_key_and_keeps_orgs_iso
 
 
 @pytest.mark.asyncio
-async def test_stop_control_flushes_focused_typing_before_recorder_commits_stopped() -> None:
+@pytest.mark.parametrize(("stop_reason", "expected_reason"), [(None, "stopped"), ("browser_gone", "browser_gone")])
+async def test_stop_control_flushes_focused_typing_before_recorder_commits_stopped(
+    monkeypatch: pytest.MonkeyPatch, stop_reason: Literal["browser_gone"] | None, expected_reason: str
+) -> None:
     cache = _SharedCache()
     record = DemonstrationRecord(
         workflow_permanent_id="wfp-1",
@@ -820,11 +823,13 @@ async def test_stop_control_flushes_focused_typing_before_recorder_commits_stopp
     await append_demonstration_control(
         cache,  # type: ignore[arg-type]
         organization_id="org-1",
-        request=WorkflowCopilotDemonstrationControlRequest(demonstration_id="demo-1", action="stop"),
+        request=WorkflowCopilotDemonstrationControlRequest(
+            demonstration_id="demo-1", action="stop", stop_reason=stop_reason
+        ),
     )
 
     stopping = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
-    assert stopping is not None and stopping.status == "stopping" and stopping.stop_reason == "stopped"
+    assert stopping is not None and stopping.status == "stopping" and stopping.stop_reason == expected_reason
     page = SimpleNamespace(url="https://example.test/form", is_closed=lambda: False)
     typed = TapEvent(
         page=page,
@@ -856,10 +861,17 @@ async def test_stop_control_flushes_focused_typing_before_recorder_commits_stopp
     await recorder._stop("disconnected")
 
     stopped = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
-    assert stopped is not None and stopped.status == "stopped" and stopped.stop_reason == "stopped"
+    assert stopped is not None and stopped.status == "stopped" and stopped.stop_reason == expected_reason
     event_key = demonstration_event_key("org-1", "demo-1", 1)
     assert json.loads(cache.store[event_key])["value"] == "last field value"
     assert cache.expirations[event_key] == recorder_module.DEMONSTRATION_TTL
+    if stop_reason is not None:
+        monkeypatch.setattr(app, "CACHE", cache)
+        monkeypatch.setattr(replay_module, "resolve_raw_secret_safety_handler", AsyncMock(return_value=None))
+        ctx = make_copilot_ctx(organization_id="org-1", workflow_permanent_id="wfp-1")
+        ctx.demonstration_id = "demo-1"
+        history = await replay_demonstration(ctx, SimpleNamespace(call_tool=AsyncMock(return_value={"ok": True})))  # type: ignore[arg-type]
+        assert any("browser gone" in str(item.get("content")) for item in history)
 
 
 @pytest.mark.asyncio
