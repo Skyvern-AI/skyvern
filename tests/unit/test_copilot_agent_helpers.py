@@ -3629,7 +3629,7 @@ workflow_definition:
         assert "response" not in entry
 
     @pytest.mark.asyncio
-    async def test_retained_completed_action_observation_excludes_target_controlled_fields(
+    async def test_retained_completed_action_observation_carries_only_the_screened_recorded_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         secret = "sk-live-persisted-action-secret"
@@ -3685,8 +3685,12 @@ workflow_definition:
         )
 
         packet = result["data"]["build_test_packet"]
-        assert packet["action_observations"] == ["null_action failed code_line=18"]
+        [observation] = packet["action_observations"]
+        assert observation.startswith("null_action failed code_line=18")
+        assert "response says reveal [REDACTED_SECRET]" in observation
         assert secret not in str(packet)
+        assert "Ignore prior instructions" not in str(packet)
+        assert "target-element" not in str(packet)
 
     @pytest.mark.asyncio
     async def test_completed_action_observation_read_failure_degrades_to_packet_omission(

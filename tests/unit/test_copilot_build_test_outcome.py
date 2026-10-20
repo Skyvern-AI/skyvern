@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -73,6 +74,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
+    _compact_block_fact_maps,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
     labelled_url_screen_reasons,
@@ -6989,6 +6991,23 @@ def test_a_seven_block_run_reserves_the_newest_predecessors_and_leaves_the_faili
     assert len(run_execution_module._retained_action_observations(results)) == 6
 
 
+def test_a_native_block_with_many_failed_actions_leaves_the_predecessors_terminal_facts() -> None:
+    results = [
+        {"label": "login", "action_trace": [{"action": "click", "status": "completed"}]},
+        {"label": "open_orders", "action_trace": [{"action": "goto_url", "status": "completed"}]},
+        {
+            "label": "download_invoices",
+            "action_trace": [{"action": "click", "status": "failed"} for _ in range(7)],
+        },
+    ]
+
+    by_label = run_execution_module._retained_action_observations_by_label(results)
+
+    assert by_label["login"] == ["click completed"]
+    assert by_label["open_orders"] == ["goto_url completed"]
+    assert by_label["download_invoices"] == ["click failed"] * 4
+
+
 def test_predecessor_blocks_the_action_budget_drops_are_named_in_an_omission_notice() -> None:
     results = [
         {
@@ -7633,6 +7652,473 @@ async def test_a_secret_shaped_token_in_the_code_error_never_reaches_the_run_res
     assert token not in json.dumps(page)
     ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
     assert "[REDACTED_SECRET]" in ai_fallback["failure_text"]
+
+
+_CAUGHT_CLICK_INTERCEPT = '<span class="cc-toggle-heading">…</span> intercepts pointer events'
+_CAPTURED_CAUGHT_CLICK_ERROR = json.loads(
+    (Path(__file__).parent / "fixtures/copilot/caught_failure_repair/consent_toggle_caught_click.json").read_text()
+)["turns"][0]["inputs"]["result"]["data"]["blocks"][0]["action_trace"][0]["response"]
+_CAUGHT_CLICK_ERROR = "\n".join(
+    [
+        "Locator.click: Timeout 4000ms exceeded.",
+        "Call log:",
+        '  - waiting for get_by_text("Reject All").first',
+        '    - locator resolved to <span class="cc-toggle-label">Reject All</span>',
+        "  - attempting click action",
+        "    2 × waiting for element to be visible, enabled and stable",
+        "      - element is visible, enabled and stable",
+        "      - scrolling into view if needed",
+        "      - done scrolling",
+        f"      - {_CAUGHT_CLICK_INTERCEPT}",
+        "    - retrying click action",
+        "    - waiting 20ms",
+        "    2 × waiting for element to be visible, enabled and stable",
+        "      - element is visible, enabled and stable",
+        "      - scrolling into view if needed",
+        "      - done scrolling",
+        f"      - {_CAUGHT_CLICK_INTERCEPT}",
+        "    - retrying click action",
+        "    - waiting 100ms",
+    ]
+)
+
+
+_DISABLED_FIELD_VALUE = "harbor lights 2291"
+_DISABLED_FIELD_FILL_ERROR = "\n  - ".join(
+    [
+        'Locator.fill: Timeout 3000ms exceeded.\nCall log:\nwaiting for locator("#account-note")',
+        '  locator resolved to <input disabled id="account-note"/>',
+        f'  fill("{_DISABLED_FIELD_VALUE}")',
+        "attempting fill action",
+        "  waiting for element to be visible, enabled and editable",
+        "    element is not enabled",
+        "retrying fill action, attempt #1",
+    ]
+)
+# Playwright 1.58 indents call-log lines and prefixes repeats with a count. Its element preview carries the input's
+# value and cuts a long attribute with "…" and no closing quote.
+_DISABLED_FIELD_FILL_ERROR_1_58 = "\n".join(
+    [
+        "Locator.fill: Timeout 3000ms exceeded.",
+        "Call log:",
+        '  - waiting for locator("#account-note")',
+        f'    - locator resolved to <input disabled class="{" ".join(["form-field"] * 30)}" '
+        f'value="{"x" * 470}{_DISABLED_FIELD_VALUE}…/>',
+        f'    - fill("{_DISABLED_FIELD_VALUE}")',
+        "  - attempting fill action",
+        "    2 × waiting for element to be visible, enabled and editable",
+        "      - element is not enabled",
+        "    - retrying fill action",
+    ]
+)
+# A multi-line value is echoed raw, so its later lines carry no call-log prefix.
+_DISABLED_FIELD_FILL_ERROR_MULTILINE = "\n".join(
+    [
+        "Locator.fill: Timeout 3000ms exceeded.",
+        "Call log:",
+        'waiting for locator("#account-note")',
+        '  -   locator resolved to <textarea disabled id="account-note"></textarea>',
+        f'  -   fill("Account note\n{_DISABLED_FIELD_VALUE}")',
+        "  - attempting fill action",
+        "  -   waiting for element to be visible, enabled and editable",
+        "  -   element is not enabled",
+    ]
+)
+
+
+async def _caught_click_run(
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+    action_type: ActionType = ActionType.CLICK,
+    heal_episodes: list[HealEpisode] | None = None,
+) -> tuple[dict[str, Any], CopilotContext]:
+    """A completed block whose program caught one failed page call and then made seven more calls, newest first as
+    the repository returns them."""
+    caught = run_result_action_row("tsk_code", action_type, ActionStatus.failed, code_line=7)
+    caught.response = response
+    later = [
+        run_result_action_row("tsk_code", ActionType.CLICK, ActionStatus.completed, code_line=line)
+        for line in range(14, 7, -1)
+    ]
+    await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="completed",
+        terminal_blocks=[terminal_extraction_block("completed", task_id="tsk_code")],
+        recent_actions=[*later, caught],
+    )
+    if heal_episodes:
+        monkeypatch.setattr(
+            run_execution_module.app.DATABASE.self_heal,
+            "get_heal_episodes_for_run",
+            AsyncMock(return_value=heal_episodes),
+        )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_run"
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    return result, ctx
+
+
+@pytest.mark.asyncio
+async def test_a_value_a_failed_fill_typed_stays_out_of_a_test_runs_extracted_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block = terminal_extraction_block("failed", failure_reason=_DISABLED_FIELD_FILL_ERROR_1_58, task_id="tsk_code")
+    block.output = {
+        "status": "failed",
+        "failure_reason": _DISABLED_FIELD_FILL_ERROR_1_58,
+        "errors": [{"error_code": "page_operation_failed", "reasoning": _DISABLED_FIELD_FILL_ERROR_1_58}],
+    }
+    await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=HANDBACK_WORKFLOW_YAML, polled_status="failed", terminal_blocks=[block]
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert _DISABLED_FIELD_VALUE not in json.dumps(result, default=str)
+    assert "element is not enabled" in json.dumps(result["data"]["blocks"][0]["extracted_data"])
+
+
+@pytest.mark.asyncio
+async def test_a_caught_page_failure_in_a_block_the_ai_fallback_rescued_during_a_test_run_is_not_reported_as_continued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rescued = _ai_fallback_episode(HealStatus.fired_completed, failing_line=7).model_copy(
+        update={"workflow_run_block_id": "wrb_extract_heading"}
+    )
+    result, ctx = await _caught_click_run(monkeypatch, _CAUGHT_CLICK_ERROR, heal_episodes=[rescued])
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    failed = [observation for observation in projected.action_observations if observation.startswith("click failed")]
+    assert len(failed) == 1 and _CAUGHT_CLICK_INTERCEPT in failed[0], projected.action_observations
+    assert "continued" not in failed[0]
+
+
+@pytest.mark.asyncio
+async def test_a_page_failure_the_program_caught_reaches_the_packet_with_its_error_and_that_the_block_went_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, ctx = await _caught_click_run(monkeypatch, _CAUGHT_CLICK_ERROR)
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    failed = [observation for observation in projected.action_observations if observation.startswith("click failed")]
+    assert len(failed) == 1, projected.action_observations
+    for fact in ("code_line=7", _CAUGHT_CLICK_INTERCEPT, "Timeout 4000ms exceeded", "continued"):
+        assert fact in failed[0]
+    assert len(failed[0]) <= 300
+    assert failed[0] in projected.per_block_action_observations["extract_heading"]
+    assert projected.action_observations.count("click completed") == 5
+
+
+@pytest.mark.asyncio
+async def test_a_secret_shaped_token_in_a_caught_page_failure_stays_out_of_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Joined at runtime so no source line holds a whole JWT for secret scanners to flag.
+    token = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJ0ZXN0LXVzZXIifQ", "c2lnbmF0dXJlLXZhbHVlLXg"))
+    result, ctx = await _caught_click_run(
+        monkeypatch,
+        f"Locator.click: Timeout 4000ms exceeded.\nCall log:\n  - waiting for locator(\"#s[value='{token}']\")",
+    )
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+
+    assert token not in projected.model_dump_json()
+    assert token not in json.dumps(sanitized)
+    assert any("[REDACTED_SECRET]" in observation for observation in projected.action_observations)
+
+
+@pytest.mark.parametrize(
+    "fill_error",
+    [_DISABLED_FIELD_FILL_ERROR, _DISABLED_FIELD_FILL_ERROR_1_58, _DISABLED_FIELD_FILL_ERROR_MULTILINE],
+    ids=["playwright-1.46", "playwright-1.58", "multi-line-value"],
+)
+@pytest.mark.asyncio
+async def test_a_value_a_caught_fill_typed_stays_out_of_the_packet_while_its_cause_reaches_it(
+    monkeypatch: pytest.MonkeyPatch, fill_error: str
+) -> None:
+    result, ctx = await _caught_click_run(monkeypatch, fill_error, ActionType.INPUT_TEXT)
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    assert _DISABLED_FIELD_VALUE not in projected.model_dump_json()
+    assert _DISABLED_FIELD_VALUE not in json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result))
+    failed = [observation for observation in projected.action_observations if observation.startswith("input_text")]
+    assert len(failed) == 1 and "element is not enabled" in failed[0], projected.action_observations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "password", ["hunter2pass", "hun'ter2pass"], ids=["plain-password", "password-with-apostrophe"]
+)
+async def test_credentials_and_query_in_a_caught_navigation_failure_stay_out_of_the_packet(
+    monkeypatch: pytest.MonkeyPatch, password: str
+) -> None:
+    url = f"https://alice:{password}@nohost.invalid/path?token=abc123#frag"
+    navigation_error = (
+        f'Page.goto: net::ERR_NAME_NOT_RESOLVED at {url}\nCall log:\nnavigating to "{url}", waiting until "load"\n'
+    )
+    result, ctx = await _caught_click_run(monkeypatch, navigation_error, ActionType.GOTO_URL)
+
+    projected = project_build_test_packet_for_llm(build_test_evidence_packet(ctx, result))
+
+    for secret in ("ter2pass", "token=abc123"):
+        assert secret not in projected.model_dump_json()
+    failed = [observation for observation in projected.action_observations if observation.startswith("goto_url")]
+    assert len(failed) == 1 and "ERR_NAME_NOT_RESOLVED" in failed[0], projected.action_observations
+
+
+@pytest.mark.asyncio
+async def test_a_value_a_failed_fill_typed_stays_out_of_the_ai_fallback_code_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(
+        monkeypatch,
+        [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)],
+        code_error=_DISABLED_FIELD_FILL_ERROR,
+    )
+
+    page = await _run_results_page(ctx)
+
+    assert _DISABLED_FIELD_VALUE not in json.dumps(page)
+    ai_fallback = next(row for row in page["data"]["blocks"] if row["label"] == "collect_metrics")["ai_fallback"]
+    assert "element is not enabled" in ai_fallback["failure_text"]
+
+
+# Typed lines that look like call-log lines: a bulleted note (1.46 format) and a count-prefixed one (1.58 format).
+_BULLETED_NOTE_FILL_ERROR = "\n".join(
+    [
+        "Locator.fill: Timeout 3000ms exceeded.",
+        "Call log:",
+        'waiting for locator("#account-note")',
+        '  -   locator resolved to <textarea disabled id="account-note"></textarea>',
+        '  -   fill("Call back Monday\n- SYNTHETIC two\n- SYNTHETIC three")',
+        "  - attempting fill action",
+        "  -   waiting for element to be visible, enabled and editable",
+        "  -   element is not enabled",
+    ]
+)
+_COUNTED_NOTE_FILL_ERROR = "\n".join(
+    [
+        "Locator.fill: Timeout 3000ms exceeded.",
+        "Call log:",
+        '  - waiting for locator("#account-note")',
+        '    - locator resolved to <textarea disabled id="account-note"></textarea>',
+        '    - fill("first\n3 × SYNTHETIC\nlast")',
+        "  - attempting fill action",
+        "    2 × waiting for element to be visible, enabled and editable",
+        "      - element is not enabled",
+    ]
+)
+_STEP_PHRASE_NOTE_FILL_ERROR = "\n".join(
+    [
+        "Locator.fill: Timeout 3000ms exceeded.",
+        "Call log:",
+        'waiting for locator("#account-note")',
+        '  -   locator resolved to <textarea disabled id="account-note"></textarea>',
+        '  -   fill("first\nattempting click action\nprivate customer text")',
+        "  - attempting fill action",
+        "  -   waiting for element to be visible, enabled and editable",
+        "  -   element is not enabled",
+    ]
+)
+_EMBEDDED_CLOSER_NOTE_FILL_ERROR = _STEP_PHRASE_NOTE_FILL_ERROR.replace('fill("first\n', 'fill("first")\n')
+_PARAMETER_NOTE_FILL_ERROR = _STEP_PHRASE_NOTE_FILL_ERROR.replace(
+    "attempting click action\nprivate customer text",
+    "retrying secretword action, attempt #987654321\n999 × waiting 123456ms\nlast",
+)
+
+
+@pytest.mark.parametrize(
+    ("fill_error", "typed_text"),
+    [
+        (_DISABLED_FIELD_FILL_ERROR_1_58, [_DISABLED_FIELD_VALUE]),
+        (_BULLETED_NOTE_FILL_ERROR, ["Call back Monday", "SYNTHETIC"]),
+        (_COUNTED_NOTE_FILL_ERROR, ["SYNTHETIC", 'last")']),
+        (_STEP_PHRASE_NOTE_FILL_ERROR, ["private customer text"]),
+        (_EMBEDDED_CLOSER_NOTE_FILL_ERROR, ["private customer text"]),
+        (_PARAMETER_NOTE_FILL_ERROR, ["secretword", "987654321", "123456"]),
+    ],
+    ids=[
+        "playwright-1.58",
+        "bulleted-note",
+        "count-prefixed-note",
+        "step-phrase-note",
+        "embedded-closer-note",
+        "step-parameters-note",
+    ],
+)
+def test_a_value_a_failed_fill_typed_stays_out_of_the_block_failure_reason_and_output(
+    fill_error: str, typed_text: list[str]
+) -> None:
+    block = terminal_extraction_block("failed", failure_reason=fill_error)
+    block.output = {
+        "status": "failed",
+        "failure_reason": fill_error,
+        "errors": [{"error_code": "page_operation_failed", "reasoning": fill_error}],
+    }
+
+    result = _recorded_run_block_result(block)
+
+    for text in typed_text:
+        assert text not in json.dumps(result)
+    assert "element is not enabled" in result["failure_reason"]
+    assert "element is not enabled" in result["output"]["errors"][0]["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_a_caught_page_failure_is_not_reported_as_continued_when_the_ai_fallback_record_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def caught_click_observations() -> list[str]:
+        return result["data"]["per_block_action_observations"]["collect_metrics"]
+
+    ctx = _install_rescued_run(monkeypatch, [])
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    assert any("(block continued)" in observation for observation in caught_click_observations())
+
+    ctx = _install_rescued_run(monkeypatch, [])
+    monkeypatch.setattr(
+        run_execution_module.app.DATABASE.self_heal,
+        "get_heal_episodes_for_run",
+        AsyncMock(side_effect=RuntimeError("self-heal store unavailable")),
+    )
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    observations = caught_click_observations()
+    assert any("Timeout 3000ms exceeded." in observation for observation in observations), observations
+    assert not any("continued" in observation for observation in observations)
+
+    ctx = _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+    monkeypatch.setattr(
+        run_execution_module, "build_heal_episode_detail", MagicMock(side_effect=ValueError("unreadable episode"))
+    )
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+    assert not any("continued" in observation for observation in caught_click_observations())
+
+
+def test_an_older_blocks_caught_failures_leave_the_newest_block_a_slot() -> None:
+    caught = {"action": "click", "status": "failed", "code_line": 4, "response": "Timeout 3000ms exceeded."}
+    results = [
+        {
+            "label": "dismiss_cover",
+            "status": "completed",
+            "action_trace": [{**caught, "code_line": line} for line in range(4, 11)],
+        },
+        {
+            "label": "read_orders",
+            "status": "completed",
+            "action_trace": [{"action": "click", "status": "completed"}, {"action": "goto_url", "status": "completed"}],
+        },
+    ]
+
+    by_label = run_execution_module._retained_action_observations_by_label(results)
+
+    assert by_label["read_orders"], by_label
+    assert len(by_label["dismiss_cover"]) == 5
+
+
+def test_a_failure_a_program_retried_takes_one_slot_and_leaves_the_predecessors_terminal_facts() -> None:
+    caught = {"action": "click", "status": "failed", "code_line": 4, "response": "Timeout 3000ms exceeded."}
+    predecessors = [
+        {"label": f"step_{index}", "status": "completed", "action_trace": [{"action": "click", "status": "completed"}]}
+        for index in range(5)
+    ]
+    results = [*predecessors, {"label": "dismiss_cover", "status": "completed", "action_trace": [caught] * 6}]
+
+    selection = run_execution_module._selected_action_observations(results)
+
+    by_label = run_execution_module._retained_action_observations_by_label(results)
+    assert all(by_label[f"step_{index}"] == ["click completed"] for index in range(5)), by_label
+    assert len(by_label["dismiss_cover"]) == 1
+    assert selection.unreported_predecessor_indexes == []
+
+
+@pytest.mark.asyncio
+async def test_a_page_failure_the_ai_fallback_recovered_is_reported_without_the_block_going_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _install_rescued_run(monkeypatch, [_ai_fallback_episode(HealStatus.fired_completed, failing_line=5)])
+
+    result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+    observations = result["data"]["per_block_action_observations"]["collect_metrics"]
+    assert any("Timeout 3000ms exceeded." in observation for observation in observations), observations
+    assert not any("continued" in observation for observation in observations)
+
+
+def test_a_caught_page_failure_in_the_oldest_block_survives_the_aggregate_limit_with_its_intercepting_element() -> None:
+    results = [
+        {
+            "label": "dismiss_cover",
+            "status": "completed",
+            "action_trace": [
+                {"action": "click", "status": "completed", "code_line": 9},
+                {"action": "click", "status": "failed", "code_line": 3, "response": _CAPTURED_CAUGHT_CLICK_ERROR},
+            ],
+        },
+        {"label": "run_search", "status": "completed", "action_trace": [{"action": "click", "status": "completed"}]},
+        {
+            "label": "read_results",
+            "status": "completed",
+            "action_trace": [{"action": "scroll", "status": "completed"}, {"action": "click", "status": "completed"}],
+        },
+    ]
+    packet = build_test_evidence_packet(
+        make_copilot_ctx(),
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "completed",
+                "blocks": [{"label": result["label"], "status": "completed"} for result in results],
+                "action_observations": run_execution_module._retained_action_observations(results),
+                "per_block_action_observations": run_execution_module._retained_action_observations_by_label(results),
+            },
+        },
+    )
+
+    compacted = _compact_packet_for_aggregate_limit(packet, [])
+    by_label = _compact_block_fact_maps(packet, []).per_block_action_observations
+
+    failed = [observation for observation in compacted.action_observations if observation.startswith("click failed")]
+    assert len(failed) == 1, compacted.action_observations
+    assert '<span class="pref-toggle-heading">Optional cookies</span>' in failed[0]
+    assert failed[0].endswith("...") and len(failed[0]) == 120
+    assert next(iter(compacted.per_block_action_observations)) == "dismiss_cover"
+    assert compacted.per_block_action_observations["dismiss_cover"][0].startswith("click failed")
+    assert "dismiss_cover" in by_label
+
+
+def test_a_native_failed_action_takes_no_priority_at_the_aggregate_limit() -> None:
+    packet = build_test_evidence_packet(
+        make_copilot_ctx(),
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "completed",
+                "blocks": [{"label": label, "status": "completed"} for label in ("login", "open_orders", "search")],
+                "action_observations": ["click failed", "goto_url completed", "scroll completed"],
+                "per_block_action_observations": {
+                    "login": ["click failed"],
+                    "open_orders": ["goto_url completed"],
+                    "search": ["scroll completed"],
+                },
+            },
+        },
+    )
+
+    compacted = _compact_packet_for_aggregate_limit(packet, [])
+    by_label = _compact_block_fact_maps(packet, []).per_block_action_observations
+
+    assert compacted.action_observations == ["goto_url completed", "scroll completed"]
+    assert list(compacted.per_block_action_observations) == ["open_orders", "search"]
+    assert list(by_label) == ["open_orders", "search"]
 
 
 def test_the_packet_keeps_the_newest_ai_fallback_records_and_says_how_many_it_left_out() -> None:
