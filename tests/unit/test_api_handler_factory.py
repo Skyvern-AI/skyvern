@@ -30,6 +30,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 from skyvern.forge.sdk.api.llm.custom_llm_registry import _build_llm_config
 from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseFormat,
+    LLMContentFilteredError,
     LLMOutputTruncatedError,
     LLMProviderErrorRetryableTask,
 )
@@ -3307,6 +3308,110 @@ def test_llmcaller_router_is_cached_across_instances(monkeypatch: pytest.MonkeyP
 
     assert first._router is second._router
     assert len(build_calls) == 1
+
+
+def _canned_reply(finish_reason: str, content: str, prompt_tokens: int) -> dict[str, Any]:
+    return {
+        "model": "claude-haiku-test",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1, "total_tokens": prompt_tokens + 1},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chain_replies", "escape_reply", "expected_groups", "expected_content", "expected_input_tokens"),
+    [
+        (["stop", "stop"], None, ["group-0"], "group-0", 100),
+        (["content_filter", "stop"], None, ["group-0", "group-1"], "group-1", 140),
+        (["content_filter", "content_filter"], None, ["group-0", "group-1"], None, None),
+        (["content_filter"], None, ["group-0"], None, None),
+        (["litellm.InternalServerError", "content_filter"], None, ["group-0"], None, None),
+        (["content_filter", "content_filter"], "stop", ["group-0", "escape-group"], "escape-group", 110),
+        (["litellm.InternalServerError", "content_filter"], "stop", ["group-0", "escape-group"], "escape-group", 50),
+    ],
+    ids=[
+        "not_filtered",
+        "fallback_answers",
+        "fallback_refuses",
+        "no_fallback_group",
+        "fallback_already_served",
+        "content_filter_group",
+        "content_filter_group_after_router_fallback",
+    ],
+)
+async def test_llm_caller_sends_a_refused_call_once_to_the_fallback_group(
+    monkeypatch: pytest.MonkeyPatch,
+    chain_replies: list[str],
+    escape_reply: str | None,
+    expected_groups: list[str],
+    expected_content: str | None,
+    expected_input_tokens: int | None,
+) -> None:
+    """A refusal arrives as a valid response, so litellm's exception-driven fallback never fires. It is retried once
+    on the route's content-filter group, or else its first fallback group, and fails if that refuses."""
+    prompt_tokens = [100, 40]
+    deployments = [
+        LLMRouterModelConfig(
+            model_name=f"group-{i}",
+            litellm_params={
+                "model": "anthropic/claude-haiku-test" if i == 0 else "bedrock/claude-haiku-test",
+                "mock_response": reply
+                if reply.startswith("litellm.")
+                else _canned_reply(reply, f"group-{i}", prompt_tokens[i]),
+            },
+        )
+        for i, reply in enumerate(chain_replies)
+    ]
+    if escape_reply is not None:
+        deployments.append(
+            LLMRouterModelConfig(
+                model_name="escape-group",
+                litellm_params={
+                    "model": "bedrock/claude-haiku-test",
+                    "mock_response": _canned_reply(escape_reply, "escape-group", 10),
+                },
+            )
+        )
+    config = LLMRouterConfig(
+        model_name="haiku-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=deployments,
+        main_model_group="group-0",
+        fallback_model_group=[f"group-{i}" for i in range(1, len(chain_replies))] or None,
+        content_filter_fallback_model_group="escape-group" if escape_reply is not None else None,
+        num_retries=0,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    artifact_manager = MagicMock()
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    caller = LLMCaller("TEST_REFUSAL_FALLBACK_ROUTER")
+    assert caller._router is not None
+    real_acompletion = caller._router.acompletion
+    requested_groups: list[str] = []
+
+    async def recording_acompletion(*, model: str, **kwargs: Any) -> Any:
+        requested_groups.append(model)
+        return await real_acompletion(model=model, **kwargs)
+
+    monkeypatch.setattr(caller._router, "acompletion", recording_acompletion)
+
+    if expected_content is None:
+        with pytest.raises(LLMContentFilteredError, match="refused or its content filter blocked"):
+            await caller.call(prompt="go", prompt_name="taskv3-agent-loop", raw_response=True)
+    else:
+        response = await caller.call(prompt="go", prompt_name="taskv3-agent-loop", raw_response=True)
+        assert response["choices"][0]["message"]["content"] == expected_content
+        metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+        assert metrics["input_tokens"] == expected_input_tokens
+    assert requested_groups == expected_groups
 
 
 # Deployments have to be models litellm's *bundled* cost map knows: CI forces
