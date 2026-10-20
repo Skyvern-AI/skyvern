@@ -54,6 +54,7 @@ export function useDemonstrationRecorder({
   const [hasSkippedSensitiveField, setHasSkippedSensitiveField] =
     useState(false);
   const [limitReached, setLimitReached] = useState(false);
+  const [browserRestarted, setBrowserRestarted] = useState(false);
   const busyRef = useRef(false);
   const streamControllerRef = useRef<AbortController | null>(null);
   const demonstrationIdRef = useRef<string | null>(null);
@@ -63,6 +64,7 @@ export function useDemonstrationRecorder({
   onDoneRef.current = onDone;
   const onStartFailedRef = useRef(onStartFailed);
   onStartFailedRef.current = onStartFailed;
+  const sessionRef = useRef({ workflowPermanentId, browserSessionId });
 
   const updateBusy = useCallback((next: boolean) => {
     busyRef.current = next;
@@ -91,6 +93,7 @@ export function useDemonstrationRecorder({
     setCanFillCredentials(false);
     setHasSkippedSensitiveField(false);
     setLimitReached(false);
+    setBrowserRestarted(false);
     updateBusy(false);
     insertionRef.current = undefined;
   }, [updateBusy, updateDemonstrationId, updatePhase]);
@@ -393,6 +396,50 @@ export function useDemonstrationRecorder({
   }, [clear, sendControl, updateBusy]);
 
   useEffect(() => {
+    const previous = sessionRef.current;
+    const sameWorkflow = previous.workflowPermanentId === workflowPermanentId;
+    // A stream readiness gap reports a null session, so only a different real session is a restart.
+    sessionRef.current = {
+      workflowPermanentId,
+      browserSessionId:
+        browserSessionId ?? (sameWorkflow ? previous.browserSessionId : null),
+    };
+    const id = demonstrationIdRef.current;
+    const restarted =
+      !!browserSessionId && browserSessionId !== previous.browserSessionId;
+    // Done keeps the recording (phase idle, busy) until its send settles.
+    if (sameWorkflow && id && phaseRef.current === "idle" && busyRef.current) {
+      if (restarted) setBrowserRestarted(true);
+      return;
+    }
+    if (sameWorkflow && id && phaseRef.current !== "idle") {
+      // Early returns register no cleanup, and an aborted stream skips its busy reset once its ref is gone.
+      const resuming =
+        streamControllerRef.current !== null &&
+        phaseRef.current !== "recording";
+      streamControllerRef.current?.abort();
+      streamControllerRef.current = null;
+      if (resuming) updateBusy(false);
+      setSensitiveField(null);
+      if (!restarted) {
+        updatePhase("stopped");
+        return;
+      }
+      // The recording is bound to the old session: build or discard only.
+      const wasRecording = phaseRef.current === "recording";
+      setHasSkippedSensitiveField(false);
+      setBrowserRestarted(true);
+      updatePhase("stopped");
+      if (wasRecording) {
+        updateBusy(true);
+        void sendControl({ action: "stop", stop_reason: "browser_gone" }, id)
+          .catch(() => undefined)
+          .finally(() => {
+            if (demonstrationIdRef.current === id) updateBusy(false);
+          });
+      }
+      return;
+    }
     clear();
     if (!workflowPermanentId || !browserSessionId) return;
     const controller = new AbortController();
@@ -445,6 +492,8 @@ export function useDemonstrationRecorder({
     browserSessionId,
     clear,
     credentialGetter,
+    sendControl,
+    updateBusy,
     updateDemonstrationId,
     updatePhase,
     workflowPermanentId,
@@ -466,6 +515,7 @@ export function useDemonstrationRecorder({
     canFillCredentials,
     hasSkippedSensitiveField,
     limitReached,
+    browserRestarted,
     busy,
     start,
     resume,

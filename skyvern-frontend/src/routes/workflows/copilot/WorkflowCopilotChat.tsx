@@ -12300,7 +12300,9 @@ export function WorkflowCopilotChat({
                 <span>
                   {demonstrationRecorder.phase === "recording"
                     ? "Demonstrating"
-                    : "Demonstration paused"}
+                    : demonstrationRecorder.browserRestarted
+                      ? "Demonstration interrupted"
+                      : "Demonstration paused"}
                   {` · ${demonstrationRecorder.actionCount} ${
                     demonstrationRecorder.actionCount === 1
                       ? "action"
@@ -12326,7 +12328,9 @@ export function WorkflowCopilotChat({
                 </button>
                 {demonstrationRecorder.phase === "stopped" &&
                 demonstrationRecorder.demonstrationId &&
-                !demonstrationRecorder.limitReached ? (
+                liveBrowserSessionId &&
+                !demonstrationRecorder.limitReached &&
+                !demonstrationRecorder.browserRestarted ? (
                   <button
                     type="button"
                     disabled={demonstrationRecorder.busy}
@@ -12343,6 +12347,18 @@ export function WorkflowCopilotChat({
                   </button>
                 ) : null}
               </div>
+            </div>
+          ) : null}
+          {demonstrationRecorder.phase === "stopped" &&
+          demonstrationRecorder.browserRestarted ? (
+            <div className="border-b border-border px-3 py-1.5">
+              <RunLifecycleLine
+                content={
+                  demonstrationRecorder.actionCount > 0
+                    ? "The browser restarted, so the demonstration was interrupted. Build the workflow from the captured actions, or discard them to start over."
+                    : "The browser restarted, so the demonstration was interrupted. Discard it to start over."
+                }
+              />
             </div>
           ) : null}
           {demonstrationRecorder.hasSkippedSensitiveField ? (

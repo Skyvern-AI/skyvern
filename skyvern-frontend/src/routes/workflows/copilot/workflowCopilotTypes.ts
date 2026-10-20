@@ -619,6 +619,7 @@ export interface WorkflowCopilotDemonstrationControlRequest {
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;
+  stop_reason?: "browser_gone" | null;
 }
 
 export interface WorkflowCopilotDemonstrationControlResult {

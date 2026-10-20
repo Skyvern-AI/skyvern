@@ -186,7 +186,7 @@ async function renderChat(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  render(
+  const { rerender } = render(
     <QueryClientProvider client={queryClient}>
       <WorkflowCopilotChat docked={false} {...props} />
     </QueryClientProvider>,
@@ -196,6 +196,12 @@ async function renderChat(
       screen.getByRole("group", { name: "Copilot message composer" }),
     ).toBeTruthy(),
   );
+  return (next: ComponentProps<typeof WorkflowCopilotChat>) =>
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowCopilotChat docked={false} {...next} />
+      </QueryClientProvider>,
+    );
 }
 
 async function startDemonstration({
@@ -768,6 +774,111 @@ describe("WorkflowCopilotChat demonstration", () => {
       await screen.findByRole("button", { name: "Build the workflow" }),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("keeps captured actions and says so when the browser restarts mid-demonstration", async () => {
+    const rerenderChat = await renderChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+
+    rerenderChat({ liveBrowserSessionId: "browser-2" });
+
+    expect(
+      await screen.findByText(
+        /The browser restarted, so the demonstration was interrupted/,
+      ),
+    ).toBeTruthy();
+    expect(sansApiPost).toHaveBeenCalledWith(
+      "/workflow/copilot/demonstration/control",
+      {
+        demonstration_id: "demonstration-1",
+        action: "stop",
+        stop_reason: "browser_gone",
+      },
+    );
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Build the workflow",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(
+      within(
+        screen.getByRole("group", { name: "Your demonstration" }),
+      ).getAllByRole("listitem"),
+    ).toHaveLength(1);
+  });
+
+  it("pauses on a stream gap and keeps the recording through a gap mid-resume or mid-build", async () => {
+    const rerenderChat = await renderChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+    const recordCalls = () =>
+      streamCalls.filter((item) => item.path.endsWith("/record"));
+
+    rerenderChat({ liveBrowserSessionId: null });
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    await waitFor(() => expect(recordCalls()).toHaveLength(2));
+    expect(recordCalls()[1]?.body.demonstration_id).toBe("demonstration-1");
+    const resumeStream = postStreaming.mock.calls[
+      postStreaming.mock.calls.length - 1
+    ] as unknown[];
+
+    rerenderChat({ liveBrowserSessionId: null });
+    expect((resumeStream[3] as { signal: AbortSignal }).signal.aborted).toBe(
+      true,
+    );
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    expect(
+      (
+        (await screen.findByRole("button", {
+          name: "Resume",
+        })) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    expect(screen.queryByText(/The browser restarted/)).toBeNull();
+
+    let rejectSend: ((reason: Error) => void) | undefined;
+    postStreaming.mockImplementationOnce((path, body, onMessage) => {
+      streamCalls.push({ path, body, onMessage });
+      return new Promise((_, reject) => {
+        rejectSend = reject;
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Build the workflow" }));
+    await waitFor(() => expect(rejectSend).toBeDefined());
+    rerenderChat({ liveBrowserSessionId: null });
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    act(() => {
+      rejectSend?.(new Error("send failed"));
+    });
+
+    expect(
+      await screen.findByText("Demonstration paused · 1 action"),
+    ).toBeTruthy();
   });
 
   it.each(["stopped", "stopping"] as const)(
