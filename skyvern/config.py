@@ -300,6 +300,10 @@ class Settings(BaseSettings):
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
     WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
+    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED: bool = False
+    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
+    WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
+    WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
     # Local-development escape hatch: run a copilot block test run in the API process when sandbox
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.

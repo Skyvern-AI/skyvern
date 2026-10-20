@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -58,6 +58,7 @@ from skyvern.forge.sdk.copilot.context import (
     clear_proposed_credential,
     merge_approved_credentials_into_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import CopilotCostLedger, copilot_cost_scope, current_copilot_cost
 from skyvern.forge.sdk.copilot.credential_generation import generate_registration_password
 from skyvern.forge.sdk.copilot.credential_pause import (
     MANUAL_SIGN_IN_CLAIM_SECONDS,
@@ -90,6 +91,13 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     validate_demonstration_for_replay,
 )
 from skyvern.forge.sdk.copilot.enforcement import EXPIRED_TURN_REPLY_SECONDS, TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.eval_llm_overrides import (
+    EVAL_LLM_OVERRIDES_HEADER,
+    EvalLLMOverrides,
+    admit_eval_llm_overrides,
+    current_eval_llm_overrides,
+    eval_llm_override_scope,
+)
 from skyvern.forge.sdk.copilot.goal_suggestion import suggest_goal_from_code
 from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_REASON,
@@ -795,13 +803,37 @@ async def _stop_older_live_turns(
 RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
+def _copilot_eval_cost_enabled(organization_id: str) -> bool:
+    return (
+        settings.WORKFLOW_COPILOT_EVAL_COST_ENABLED
+        and organization_id in settings.WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS
+    )
+
+
+def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, str]:
+    if ledger is None:
+        return {}
+    receipt = {"receipt_id": uuid.uuid4().hex, "llm_cost": ledger.snapshot()}
+    return {"X-Copilot-Eval-LLM-Cost": json.dumps(receipt, separators=(",", ":"))}
+
+
 class _FirstEventTimingStream:
-    def __init__(self, stream: EventSourceStream, started_at: float) -> None:
+    def __init__(self, stream: EventSourceStream, started_at: float, *, include_eval_cost: bool = False) -> None:
         self._stream = stream
         self._started_at = started_at
+        self._include_eval_cost = include_eval_cost
         self.first_event_seconds: float | None = None
 
     async def send(self, data: Any) -> bool:
+        if isinstance(data, WorkflowCopilotStreamResponseUpdate):
+            overrides = current_eval_llm_overrides()
+            data = data.model_copy(
+                update={
+                    "eval_llm_config_overrides": dict(overrides.config_keys) if overrides else None,
+                    "eval_llm_config_overrides_sha256": overrides.sha256 if overrides else None,
+                    "llm_cost": current_copilot_cost() if self._include_eval_cost else None,
+                }
+            )
         is_status_ack = isinstance(data, WorkflowCopilotProcessingUpdate) and data.status in {
             "Processing...",
             "Thinking...",
@@ -2470,6 +2502,8 @@ async def _new_copilot_chat_post(
     *,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    eval_llm_overrides: EvalLLMOverrides | None = None,
+    eval_cost_enabled: bool = False,
 ) -> EventSourceResponse:
     """Run the OpenAI Agents SDK copilot and
     streams responses in the same SSE shape the frontend consumes. On
@@ -2489,7 +2523,7 @@ async def _new_copilot_chat_post(
     )
 
     async def stream_handler(raw_stream: EventSourceStream) -> None:
-        stream = _FirstEventTimingStream(raw_stream, request_started_at)
+        stream = _FirstEventTimingStream(raw_stream, request_started_at, include_eval_cost=eval_cost_enabled)
         LOG.info(
             "Workflow copilot agent chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -3514,7 +3548,12 @@ async def _new_copilot_chat_post(
                         first_event_seconds=stream.first_event_seconds,
                     )
 
-    return FastAPIEventSourceStream.create(request, stream_handler)
+    async def scoped_stream_handler(raw_stream: EventSourceStream) -> None:
+        cost_scope = copilot_cost_scope() if eval_cost_enabled else contextlib.nullcontext()
+        with eval_llm_override_scope(eval_llm_overrides, chat_request.workflow_permanent_id), cost_scope:
+            await stream_handler(raw_stream)
+
+    return FastAPIEventSourceStream.create(request, scoped_stream_handler)
 
 
 async def _get_or_create_workflow_copilot_chat(
@@ -3803,6 +3842,10 @@ async def workflow_copilot_chat_post(
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
+    eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
     if chat_request.product_action == "demonstrate":
         cache = shared_copilot_demonstration_cache()
@@ -3842,6 +3885,8 @@ async def workflow_copilot_chat_post(
             organization,
             eval_mode=eval_mode,
             eval_entrypoint_url=eval_entrypoint_url,
+            eval_llm_overrides=eval_llm_overrides,
+            eval_cost_enabled=eval_cost_enabled,
         )
 
     return await _new_copilot_chat_post(
@@ -3849,6 +3894,8 @@ async def workflow_copilot_chat_post(
         chat_request,
         organization,
         eval_entrypoint_url=eval_entrypoint_url,
+        eval_llm_overrides=eval_llm_overrides,
+        eval_cost_enabled=eval_cost_enabled,
     )
 
 
@@ -4305,6 +4352,8 @@ async def workflow_copilot_chat_history(
 
 @base_router.post("/workflow/copilot/question-response", include_in_schema=False)
 async def workflow_copilot_question_response(
+    request: Request,
+    http_response: Response,
     question_response: WorkflowCopilotQuestionResponseRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> QuestionInteraction:
@@ -4313,6 +4362,9 @@ async def workflow_copilot_question_response(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
     response = QuestionResponse(
         answers=question_response.answers,
         text=question_response.text,
@@ -4338,23 +4390,32 @@ async def workflow_copilot_question_response(
     if recorded.status == "resolved":
         return recorded
     if response.text is not None or any(answer.text is not None for answer in response.answers):
-        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+        cost_scope = (
+            copilot_cost_scope()
+            if _copilot_eval_cost_enabled(organization.organization_id)
+            else contextlib.nullcontext()
+        )
+        with eval_llm_override_scope(eval_llm_overrides, chat.workflow_permanent_id), cost_scope as ledger:
+            handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
 
-        async def screen_text(text: str) -> str:
-            safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
-            if safety.status == "blocked":
-                raise HTTPException(
-                    status_code=503, detail="The safety screen is unavailable. Please retry your answer."
-                )
-            if safety.status == "detected":
-                response.raw_secret_detected = True
-            return safety.canonical_user_message
+            async def screen_text(text: str) -> str:
+                safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
+                if safety.status == "blocked":
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The safety screen is unavailable. Please retry your answer.",
+                        headers=_copilot_eval_cost_headers(ledger),
+                    )
+                if safety.status == "detected":
+                    response.raw_secret_detected = True
+                return safety.canonical_user_message
 
-        if response.text is not None:
-            response.text = await screen_text(response.text)
-        for answer in response.answers:
-            if answer.text is not None:
-                answer.text = await screen_text(answer.text)
+            if response.text is not None:
+                response.text = await screen_text(response.text)
+            for answer in response.answers:
+                if answer.text is not None:
+                    answer.text = await screen_text(answer.text)
+        http_response.headers.update(_copilot_eval_cost_headers(ledger))
     return await resolve()
 
 
@@ -4499,6 +4560,8 @@ async def workflow_copilot_credential_deletion(
 
 @base_router.post("/workflow/copilot/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 async def workflow_copilot_steer(
+    request: Request,
+    http_response: Response,
     steer_request: WorkflowCopilotSteerRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> CopilotSteerMessage:
@@ -4510,6 +4573,9 @@ async def workflow_copilot_steer(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
 
     async def record(steer: CopilotSteerMessage | None = None) -> CopilotSteerMessage | None:
         try:
@@ -4525,12 +4591,24 @@ async def workflow_copilot_steer(
 
     recorded = await record()
     if recorded is None:
-        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
-        safety = await screen_raw_secret_safety(
-            steer_request.message, handler, organization_id=organization.organization_id
+        cost_scope = (
+            copilot_cost_scope()
+            if _copilot_eval_cost_enabled(organization.organization_id)
+            else contextlib.nullcontext()
         )
+        with eval_llm_override_scope(eval_llm_overrides, chat.workflow_permanent_id), cost_scope as ledger:
+            handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+            safety = await screen_raw_secret_safety(
+                steer_request.message, handler, organization_id=organization.organization_id
+            )
+        cost_headers = _copilot_eval_cost_headers(ledger)
+        http_response.headers.update(cost_headers)
         if safety.status == "blocked":
-            raise HTTPException(status_code=503, detail="The safety screen is unavailable. Please retry your message.")
+            raise HTTPException(
+                status_code=503,
+                detail="The safety screen is unavailable. Please retry your message.",
+                headers=cost_headers,
+            )
         screened = CopilotSteerMessage(
             steer_id=steer_request.steer_id,
             text=safety.canonical_user_message,

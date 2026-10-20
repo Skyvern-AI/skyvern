@@ -57,6 +57,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
+from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
@@ -344,20 +345,6 @@ _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
 _OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
-# litellm 1.89.1 drops `*_above_100k_tokens` price keys, so a long Haiku 5.5 prompt prices at the base rate.
-# Every Haiku 5.5 rate above 100k prompt tokens is 5x its base rate.
-_CLAUDE_HAIKU_5_5_MODEL_SUFFIX = "claude-haiku-5-5"
-_CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
-_CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER = 5.0
-
-
-def _long_prompt_cost_multiplier(model_name: str | None, prompt_tokens: int | None) -> float:
-    if model_name and model_name.endswith(_CLAUDE_HAIKU_5_5_MODEL_SUFFIX):
-        if prompt_tokens and prompt_tokens > _CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD:
-            return _CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER
-    return 1.0
-
-
 # Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
 # model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
 # as one the provider sent.
@@ -891,6 +878,7 @@ def _copilot_model_usage_event(
         output_tokens = None
         cache_read_tokens = None
         cache_creation_tokens = None
+    hidden_params = getattr(response, "_hidden_params", None)
     return CopilotModelUsageEvent(
         request_model=request_model,
         response_model=response_model if isinstance(response_model, str) else None,
@@ -900,6 +888,15 @@ def _copilot_model_usage_event(
         cache_read_tokens=cache_read_tokens,
         cache_creation_tokens=cache_creation_tokens,
         cost=cost,
+        cost_source=(
+            "provider_reported"
+            if isinstance(hidden_params, dict)
+            and hidden_params.get("custom_llm_provider") == "openrouter"
+            and LLMAPIHandlerFactory._extract_reported_usage_cost(response) is not None
+            else "litellm_estimate"
+        )
+        if cost is not None
+        else None,
         prompt_name=prompt_name,
     )
 
@@ -1456,12 +1453,12 @@ class LLMAPIHandlerFactory:
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
 
     @staticmethod
-    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+    def _extract_reported_usage_cost(response: object) -> float | None:
         """Return provider-reported cost from response.usage.cost when present."""
-        if not hasattr(response, "usage") or not response.usage:
+        usage = getattr(response, "usage", None)
+        if not usage:
             return None
 
-        usage = response.usage
         cost = getattr(usage, "cost", None)
         if cost is None and isinstance(usage, dict):
             cost = usage.get("cost")
@@ -1536,7 +1533,7 @@ class LLMAPIHandlerFactory:
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
         model_name = requested_model if isinstance(requested_model, str) else None
-        return cost * _long_prompt_cost_multiplier(model_name, prompt_tokens)
+        return cost * long_prompt_cost_multiplier(model_name, prompt_tokens)
 
     @staticmethod
     def _is_openai_direct_gpt5_6_long_context_flex(
@@ -4835,7 +4832,7 @@ class LLMCaller:
                         cache_read_input_tokens=cached_tokens,
                         cache_creation_input_tokens=cache_creation_tokens,
                     )
-                    llm_cost = (input_cost + output_cost) * _long_prompt_cost_multiplier(model, prompt_tokens)
+                    llm_cost = (input_cost + output_cost) * long_prompt_cost_multiplier(model, prompt_tokens)
             except Exception as exc:
                 # LiteLLM 1.89.1 wraps its missing-model ValueError in a plain Exception.
                 if isinstance(exc.__context__, ValueError) and str(exc.__context__).startswith(
