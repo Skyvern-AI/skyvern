@@ -60,7 +60,9 @@ function GoogleOAuthCallback() {
           description: error,
           variant: "destructive",
         });
-        navigate("/integrations", { replace: true });
+        if (!closeGoogleOAuthPopupIfMarked()) {
+          navigate("/integrations", { replace: true });
+        }
         return;
       }
       if (!code || !state) {
@@ -69,20 +71,23 @@ function GoogleOAuthCallback() {
           description: "The callback URL was missing a code or state value.",
           variant: "destructive",
         });
-        navigate("/integrations", { replace: true });
+        // A bounce whose state this tab never stored is not this popup's consent.
+        if (bouncedCredentialId || !closeGoogleOAuthPopupIfMarked()) {
+          navigate("/integrations", { replace: true });
+        }
         return;
       }
 
-      let connected = false;
       try {
         await submitOAuthCallbackAsync({ code, state });
         queryClient.invalidateQueries({ queryKey: ["googleOAuthCredentials"] });
-        connected = true;
+      } catch {
+        // The callback mutation's onError already reports the failure.
       } finally {
         clearStoredGoogleOAuthIntegrationIdForState(state);
-        if (!connected || !closeGoogleOAuthPopupIfMarked()) {
-          navigate("/integrations", { replace: true });
-        }
+      }
+      if (!closeGoogleOAuthPopupIfMarked()) {
+        navigate("/integrations", { replace: true });
       }
     };
 

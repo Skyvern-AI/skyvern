@@ -271,6 +271,7 @@ export type OnePasswordItemApiResponse = {
   vault_id: string;
   vault_name: string;
   category: string;
+  importable?: boolean;
   url?: string | null;
 };
 

@@ -59,7 +59,6 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { applySopResultAtCurrentAppend } from "./workspaceAuthoringActions";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
@@ -4543,68 +4542,52 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["recording", "SOP conversion"])(
-    "keeps generated blocks unsaved after accepting a proposal following %s",
-    async (source) => {
-      integration.canvas = true;
-      const staged = stageGraphProposal();
-      mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
-      await screen.findByRole("button", { name: "Accept" });
-      const generated = {
-        blocks: [
-          { ...staged.workflow_definition.blocks[0]!, label: "generated" },
-        ],
-        parameters: [],
-      };
-      act(() => {
-        const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-        if (source === "SOP conversion") {
-          applySopResultAtCurrentAppend({
-            result: generated,
-            getNodes: () => canvas.current!.nodes,
-            getEdges: () => canvas.current!.edges,
-            setRecordedBlocks: (result, insertionPoint) =>
-              useRecordedBlocksStore
-                .getState()
-                .setRecordedBlocks(result, insertionPoint, owner),
-          });
-        } else {
-          useRecordedBlocksStore
-            .getState()
-            .setRecordedBlocks(
-              generated,
-              { previous: null, next: null, connectingEdgeType: "default" },
-              owner,
-            );
-        }
-      });
-      await waitFor(() =>
-        expect(
-          useWorkflowHasChangesStore
-            .getState()
-            .getSaveData()!
-            .blocks.map((block) => block.label),
-        ).toEqual(["pause", "generated"]),
-      );
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-      await accept();
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Keep my edits" }),
-      );
-      await waitFor(() =>
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).toBeNull(),
-      );
-      const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
-      expect(saved.blocks.map((block) => block.label)).toEqual([
-        "pause",
-        "generated",
-      ]);
-      expect(saved.workflow.workflow_id).toBe(staged.workflow_id);
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-    },
-  );
+  test("keeps generated blocks unsaved after accepting a proposal following recording", async () => {
+    integration.canvas = true;
+    const staged = stageGraphProposal();
+    mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
+    await screen.findByRole("button", { name: "Accept" });
+    const generated = {
+      blocks: [
+        { ...staged.workflow_definition.blocks[0]!, label: "generated" },
+      ],
+      parameters: [],
+    };
+    act(() => {
+      useRecordedBlocksStore
+        .getState()
+        .setRecordedBlocks(
+          generated,
+          { previous: null, next: null, connectingEdgeType: "default" },
+          useWorkflowYamlEditorStore.getState().editorOwner!,
+        );
+    });
+    await waitFor(() =>
+      expect(
+        useWorkflowHasChangesStore
+          .getState()
+          .getSaveData()!
+          .blocks.map((block) => block.label),
+      ).toEqual(["pause", "generated"]),
+    );
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    await accept();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Keep my edits" }),
+    );
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull(),
+    );
+    const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
+    expect(saved.blocks.map((block) => block.label)).toEqual([
+      "pause",
+      "generated",
+    ]);
+    expect(saved.workflow.workflow_id).toBe(staged.workflow_id);
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+  });
 
   test.each([
     { label: "Disable parallel runs", setting: "runSequentially" as const },

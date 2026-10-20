@@ -1,5 +1,6 @@
-import type { WorkflowBlock, WorkflowParameter } from "../types/workflowTypes";
+import { toast } from "@/components/ui/use-toast";
 import type { InsertionPoint } from "@/store/RecordedBlocksStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import type { WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
 
 type WorkflowNodeLike = {
@@ -12,11 +13,6 @@ type WorkflowNodeLike = {
 type WorkflowEdgeLike = {
   source: string;
   target: string;
-};
-
-type SopResult = {
-  blocks: Array<WorkflowBlock>;
-  parameters: Array<WorkflowParameter>;
 };
 
 function resolveAppendInsertionPoint(
@@ -38,20 +34,23 @@ function resolveAppendInsertionPoint(
   };
 }
 
+function blockLabelFor(
+  nodes: Array<WorkflowNodeLike>,
+  nodeId: string | null | undefined,
+): string | null {
+  const node = nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || node.type === "start" || node.type === "nodeAdder") return null;
+  const label = node.data?.label;
+  return typeof label === "string" && label.length > 0 ? label : null;
+}
+
 function demonstrationInsertionFromNodes(
   nodes: Array<WorkflowNodeLike>,
   insertionPoint: Pick<InsertionPoint, "previous" | "next" | "parent">,
 ): WorkflowCopilotDemonstrationInsertion | null {
-  const labelFor = (nodeId: string | null) => {
-    const node = nodes.find((candidate) => candidate.id === nodeId);
-    if (!node || node.type === "start" || node.type === "nodeAdder")
-      return null;
-    const label = node.data?.label;
-    return typeof label === "string" && label.length > 0 ? label : null;
-  };
   const insertion = {
-    after_label: labelFor(insertionPoint.previous),
-    before_label: labelFor(insertionPoint.next),
+    after_label: blockLabelFor(nodes, insertionPoint.previous),
+    before_label: blockLabelFor(nodes, insertionPoint.next),
   };
   const parent =
     insertionPoint.parent ??
@@ -61,24 +60,40 @@ function demonstrationInsertionFromNodes(
     : insertion;
 }
 
-function applySopResultAtCurrentAppend({
-  result,
-  getNodes,
-  getEdges,
-  setRecordedBlocks,
-}: {
-  result: SopResult;
-  getNodes: () => Array<WorkflowNodeLike>;
-  getEdges: () => Array<WorkflowEdgeLike>;
-  setRecordedBlocks: (
-    result: SopResult,
-    insertionPoint: InsertionPoint,
-  ) => void;
-}) {
-  setRecordedBlocks(
-    result,
-    resolveAppendInsertionPoint(getNodes(), getEdges()),
-  );
+function sopAttachmentDraft(
+  insertion: WorkflowCopilotDemonstrationInsertion | null = null,
+  containerLabel: string | null = null,
+): string {
+  if (insertion?.after_label)
+    return `Add the steps from the attached SOP after the ${insertion.after_label} block.`;
+  if (insertion?.before_label)
+    return `Add the steps from the attached SOP before the ${insertion.before_label} block.`;
+  if (containerLabel)
+    return `Add the steps from the attached SOP inside the ${containerLabel} block.`;
+  return "Add the steps from the attached SOP to this agent.";
+}
+
+function stageSopFile(file: File, draft: string) {
+  if (!file.name.toLowerCase().endsWith(".pdf")) {
+    toast({
+      variant: "destructive",
+      title: "Invalid file type",
+      description: "Please select a PDF file",
+    });
+    return;
+  }
+  // Read at pick time: Copilot may have asked a question or started finishing a recording while
+  // the file picker was open.
+  const stage = useCopilotActionStore.getState().stageAttachment;
+  if (!stage) {
+    toast({
+      title: "Copilot can't take a file right now",
+      description:
+        "Answer its question or wait for it to finish, then try again.",
+    });
+    return;
+  }
+  stage(file, draft);
 }
 
 function resolveWorkspaceAuthoringActionAvailability({
@@ -90,7 +105,6 @@ function resolveWorkspaceAuthoringActionAvailability({
   isEditingYaml,
   hasFinallyBlock,
   isRecording,
-  isUploadingSOP,
 }: {
   browserReady: boolean;
   isGlobalWorkflow: boolean;
@@ -100,7 +114,6 @@ function resolveWorkspaceAuthoringActionAvailability({
   isEditingYaml: boolean;
   hasFinallyBlock: boolean;
   isRecording: boolean;
-  isUploadingSOP: boolean;
 }) {
   const unavailableReason = isWorkflowDeleted
     ? "This agent is deleted and view-only"
@@ -114,23 +127,22 @@ function resolveWorkspaceAuthoringActionAvailability({
             ? "The finally block must remain last. Add steps above it in the editor."
             : isRecording
               ? "Finish recording the current task first"
-              : isUploadingSOP
-                ? "Wait for the SOP upload to finish"
-                : null;
+              : null;
   const recordUnavailableReason =
     unavailableReason ??
     (hasActiveRun ? "Stop the active run before recording a task" : null);
 
   return {
-    canUploadSOP: unavailableReason === null,
     canRecordTask: recordUnavailableReason === null && browserReady,
     unavailableReason: recordUnavailableReason,
   };
 }
 
 export {
-  applySopResultAtCurrentAppend,
+  blockLabelFor,
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
+  sopAttachmentDraft,
+  stageSopFile,
 };

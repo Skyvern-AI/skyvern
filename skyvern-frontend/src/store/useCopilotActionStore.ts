@@ -64,6 +64,12 @@ interface CopilotActionStore extends CodeEditedGoalActions {
   suggestingGoalLabels: Array<string>;
   setSuggestingGoal: (label: string, suggesting: boolean) => void;
   setCodeEditedGoalActions: (actions: CodeEditedGoalActions) => void;
+  // Registered by the chat only while its composer can take a file, so a caller outside the chat
+  // that finds it null must not upload.
+  stageAttachment: ((file: File, draft: string) => void) | null;
+  setStageAttachment: (
+    stage: ((file: File, draft: string) => void) | null,
+  ) => void;
   requestBuild: (request: CopilotBlockBuildRequest) => void;
   applyPendingGoalChanges: () => void;
   clearPendingBuild: () => void;
@@ -126,6 +132,8 @@ export const useCopilotActionStore = create<CopilotActionStore>((set, get) => ({
   acceptGoal: noop,
   keepCode: noop,
   setCodeEditedGoalActions: (actions) => set(actions),
+  stageAttachment: null,
+  setStageAttachment: (stageAttachment) => set({ stageAttachment }),
   requestBuild: (request) =>
     set((state) => {
       if (state.generatingBlockLabel == null) {

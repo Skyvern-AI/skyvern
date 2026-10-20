@@ -1,10 +1,7 @@
 // @vitest-environment jsdom
 
-import { createElement, useLayoutEffect, type ReactNode } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
 import { Edge } from "@xyflow/react";
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -23,8 +20,6 @@ import {
   finishCopilotAcceptance,
   beginYamlCommit,
   registerEditorOwner,
-  unregisterEditorOwner,
-  runWorkflowAuthoringAction,
   createYamlCommitOwner,
   finishYamlCommit,
   useWorkflowYamlEditorStore,
@@ -32,13 +27,6 @@ import {
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowGraphState } from "../workflowEditorUtils";
 
-const uploadMocks = vi.hoisted(() => ({ post: vi.fn() }));
-vi.mock("@/api/AxiosClient", () => ({
-  getClient: async () => ({ post: uploadMocks.post }),
-}));
-vi.mock("@/hooks/useCredentialGetter", () => ({
-  useCredentialGetter: () => vi.fn(),
-}));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 const initialRecordedBlocksState = useRecordedBlocksStore.getState();
@@ -112,155 +100,6 @@ describe("useApplyRecordedBlocks", () => {
         expect(useWorkflowTitleStore.getState().copilotMetadataEdits).toEqual(
           {},
         );
-    },
-  );
-
-  it.each([
-    "unmounted",
-    "same workflow",
-    "same workflow null anchors",
-    "other workflow",
-  ])(
-    "binds a delayed SOP upload to its owner when the consumer is %s",
-    async (remount) => {
-      const client = new QueryClient({
-        defaultOptions: { mutations: { retry: false } },
-      });
-      const wrapper = ({ children }: { children: ReactNode }) =>
-        createElement(QueryClientProvider, { client }, children);
-      let resolveUpload!: (value: unknown) => void;
-      uploadMocks.post.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            resolveUpload = resolve;
-          }),
-      );
-      const doLayout = vi.fn();
-      const mountEditor = (workflowId: string) =>
-        renderHook(
-          () => {
-            useLayoutEffect(() => {
-              const owner = createYamlCommitOwner(workflowId);
-              registerEditorOwner(owner);
-              return () => unregisterEditorOwner(owner);
-            }, []);
-            const graph = useWorkflowGraphState(
-              [
-                {
-                  id: workflowId + "-start",
-                  type: "start",
-                  position: { x: 0, y: 0 },
-                  data: {},
-                },
-                {
-                  id: workflowId + "-adder",
-                  type: "nodeAdder",
-                  position: { x: 0, y: 0 },
-                  data: {},
-                },
-              ] as AppNode[],
-              [
-                {
-                  id: "initial",
-                  source: workflowId + "-start",
-                  target: workflowId + "-adder",
-                },
-              ],
-            );
-            useApplyRecordedBlocks({
-              enabled: true,
-              nodes: graph.nodes,
-              edges: graph.edges,
-              doLayout: (nodes, edges) => {
-                doLayout(nodes, edges);
-                graph.setNodes(nodes);
-                graph.setEdges(edges);
-              },
-            });
-            const upload = useSopToBlocksMutation({
-              onSuccess: (result, owner) =>
-                useRecordedBlocksStore.getState().setRecordedBlocks(
-                  result,
-                  {
-                    previous: remount.includes("null anchors")
-                      ? null
-                      : "disposed-start",
-                    next: remount.includes("null anchors")
-                      ? null
-                      : "disposed-adder",
-                    connectingEdgeType: "default",
-                  },
-                  owner,
-                ),
-            });
-            return { graph, upload };
-          },
-          { wrapper },
-        );
-      const editor = mountEditor("wpid-1");
-      let uploading!: Promise<boolean>;
-      act(() => {
-        uploading = runWorkflowAuthoringAction(() =>
-          editor.result.current.upload.mutateAsync(
-            new File(["pdf"], "steps.pdf"),
-          ),
-        );
-      });
-      await waitFor(() => expect(uploadMocks.post).toHaveBeenCalled());
-      editor.unmount();
-      const replacement =
-        remount === "unmounted"
-          ? null
-          : mountEditor(
-              remount.startsWith("same workflow") ? "wpid-1" : "wpid-2",
-            );
-      await act(async () => {
-        resolveUpload({
-          data: {
-            blocks: [
-              {
-                block_type: "goto_url",
-                label: "uploaded",
-                url: "https://example.com",
-              },
-            ],
-            parameters: [],
-          },
-        });
-        await uploading;
-      });
-      expect(doLayout).toHaveBeenCalledTimes(
-        remount.startsWith("same workflow") ? 1 : 0,
-      );
-      expect(useRecordedBlocksStore.getState().blocks).toBeNull();
-      expect(useWorkflowYamlEditorStore.getState()).toMatchObject({
-        authoringAction: null,
-        authoringInProgress: false,
-      });
-      if (remount.startsWith("same workflow")) {
-        expect(
-          replacement!.result.current.graph.nodes.filter(
-            (node) => node.data.label === "uploaded",
-          ),
-        ).toHaveLength(1);
-        const { nodes, edges } = replacement!.result.current.graph;
-        expect(edges).toHaveLength(2);
-        expect(
-          edges.every(
-            (edge) =>
-              nodes.some((node) => node.id === edge.source) &&
-              nodes.some((node) => node.id === edge.target),
-          ),
-        ).toBe(true);
-        replacement!.rerender();
-        expect(doLayout).toHaveBeenCalledTimes(1);
-      }
-      const token = beginCopilotAcceptance();
-      expect(token).not.toBeNull();
-      finishCopilotAcceptance(token!);
-      replacement?.unmount();
-      client.clear();
-      uploadMocks.post.mockClear();
     },
   );
 

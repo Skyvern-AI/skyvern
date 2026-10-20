@@ -134,4 +134,45 @@ describe("GoogleOAuthCallback", () => {
     });
     expect(queryByText("Integrations")).toBeNull();
   });
+
+  it.each([
+    ["provider cancellation", "?error=access_denied&state=state_1", false],
+    ["missing parameters", "?state=state_1", false],
+    ["an expired or failed exchange", "?code=code_1&state=state_1", true],
+  ])(
+    "closes the copilot card's popup on %s and stays put otherwise",
+    async (_case, query, exchangeFails) => {
+      if (exchangeFails) {
+        submitCallback.mockRejectedValue(new Error("consent expired"));
+      }
+      const page = () => (
+        <QueryClientProvider
+          client={
+            new QueryClient({ defaultOptions: { queries: { retry: false } } })
+          }
+        >
+          <MemoryRouter
+            initialEntries={[`/integrations/google/callback${query}`]}
+          >
+            <Routes>
+              <Route
+                path="/integrations/google/callback"
+                element={<GoogleOAuthCallback />}
+              />
+              <Route path="/integrations" element={<div>Integrations</div>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      const first = render(page());
+      await waitFor(() => expect(closePopup).toHaveBeenCalledTimes(1));
+      expect(first.queryByText("Integrations")).toBeNull();
+      first.unmount();
+
+      closePopup.mockReset().mockReturnValue(false);
+      const second = render(page());
+      expect(await second.findByText("Integrations")).toBeTruthy();
+    },
+  );
 });
