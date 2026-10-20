@@ -11,7 +11,7 @@ from collections.abc import Collection
 from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, runtime_checkable
 
 import litellm
 import structlog
@@ -52,6 +52,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     InvalidLLMResponseFormat,
+    LLMContentFilteredError,
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
@@ -975,6 +976,24 @@ class LLMCallStats(BaseModel):
     cached_tokens: int | None = None
     llm_cost: float | None = None
     llm_cost_available: bool = False
+
+
+_Number = TypeVar("_Number", int, float)
+
+
+def _add_optional(a: _Number | None, b: _Number | None) -> _Number | None:
+    return b if a is None else a if b is None else a + b
+
+
+def _combined_call_stats(first: LLMCallStats, second: LLMCallStats) -> LLMCallStats:
+    return LLMCallStats(
+        input_tokens=_add_optional(first.input_tokens, second.input_tokens),
+        output_tokens=_add_optional(first.output_tokens, second.output_tokens),
+        reasoning_tokens=_add_optional(first.reasoning_tokens, second.reasoning_tokens),
+        cached_tokens=_add_optional(first.cached_tokens, second.cached_tokens),
+        llm_cost=_add_optional(first.llm_cost, second.llm_cost),
+        llm_cost_available=first.llm_cost_available and second.llm_cost_available,
+    )
 
 
 def _get_artifact_targets_and_persist_flag(
@@ -4074,6 +4093,7 @@ class LLMCaller:
 
             t_llm_request = time.perf_counter()
             llm_duration_seconds = 0.0
+            refused_call_stats: LLMCallStats | None = None
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
@@ -4082,6 +4102,10 @@ class LLMCaller:
                     tools=tools,
                     **active_parameters,
                 )
+                if _response_finish_reason(response) == "content_filter":
+                    response, refused_call_stats = await self._retry_refused_call_on_fallback(
+                        response, messages, tools, active_parameters, prompt_name
+                    )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
                 if use_message_history and message_history_after_success is not None:
                     # only update message_history when the request is successful
@@ -4155,6 +4179,9 @@ class LLMCaller:
                 if not caller_owns_exhaustion_receipt:
                     self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except LLMContentFilteredError:
+                _llm_span.set_attribute("status", "error")
+                raise
             except LLMProviderError as e:
                 # Already classified (retryable or not) by the dispatch path; re-wrapping it below
                 # would erase that and log it as an unexpected failure.
@@ -4186,6 +4213,8 @@ class LLMCaller:
                     prompt_name=prompt_name,
                     cost=call_stats.llm_cost if call_stats.llm_cost_available else None,
                 )
+            if refused_call_stats is not None:
+                call_stats = _combined_call_stats(call_stats, refused_call_stats)
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
@@ -4396,12 +4425,72 @@ class LLMCaller:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
+    async def _retry_refused_call_on_fallback(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        messages: list[dict[str, Any]],
+        tools: list | None,
+        active_parameters: dict[str, Any],
+        prompt_name: str | None,
+    ) -> tuple[ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse, LLMCallStats]:
+        """A refusal or content-filter block arrives as a valid response, so the router's exception-driven fallback
+        never sees it. Send it once to the route's content-filter group, or else its first fallback group, as a
+        failed call would go, and fail if that refuses."""
+        refused_on = self.llm_config.model_name
+        fallback_group: str | None = None
+        if self._router is not None and isinstance(self.llm_config, LLMRouterConfig):
+            main_group = self.llm_config.main_model_group
+            refused_on = LLMAPIHandlerFactory._served_model_group(self._router, response) or main_group
+            content_filter_group = self.llm_config.content_filter_fallback_model_group
+            fallbacks = self.llm_config.fallback_model_group
+            if content_filter_group not in (None, refused_on):
+                fallback_group = content_filter_group
+            elif refused_on == main_group and fallbacks:
+                fallback_group = fallbacks if isinstance(fallbacks, str) else fallbacks[0]
+        refused_stats = await self._log_refused_response(response, prompt_name, refused_on, fallback_group)
+        if fallback_group is None:
+            raise LLMContentFilteredError(self.llm_key, [refused_on])
+        fallback_response = await self._dispatch_llm_call(
+            messages=messages, tools=tools, router_model_group=fallback_group, **active_parameters
+        )
+        if _response_finish_reason(fallback_response) == "content_filter":
+            await self._log_refused_response(fallback_response, prompt_name, fallback_group, None)
+            raise LLMContentFilteredError(self.llm_key, [refused_on, fallback_group])
+        return fallback_response, refused_stats
+
+    async def _log_refused_response(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        prompt_name: str | None,
+        refused_on: str,
+        fallback_group: str | None,
+    ) -> LLMCallStats:
+        stats = await self.get_call_stats(response)
+        _emit_copilot_model_usage_for_response(
+            response,
+            request_model=self.llm_config.model_name,
+            prompt_name=prompt_name,
+            cost=stats.llm_cost if stats.llm_cost_available else None,
+        )
+        LOG.warning(
+            "LLM response refused or blocked by content filter",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            filtered_model_group=refused_on,
+            fallback_model_group=fallback_group,
+            input_tokens=stats.input_tokens,
+            output_tokens=stats.output_tokens,
+            llm_cost=stats.llm_cost,
+        )
+        return stats
+
     @traced(name="skyvern.llm.dispatch")
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        router_model_group: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         await _validate_custom_llm_api_base(self.original_llm_key, self.llm_config)
@@ -4522,7 +4611,7 @@ class LLMCaller:
             # timeout kwarg: the router's own precedence lets per-deployment timeouts apply
             # (see _build_litellm_router). Direct configs fall through to acompletion below.
             return await self._router.acompletion(
-                model=self._router_model_group,
+                model=router_model_group or self._router_model_group,
                 messages=messages,
                 tools=tools,
                 drop_params=True,
