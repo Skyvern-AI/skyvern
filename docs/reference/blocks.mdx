@@ -50,17 +50,17 @@ These fields appear on most blocks:
 | **On block failure** | Only inside loops, where it replaces **Continue on Failure**. Choose **Stop the loop**, **Continue to next block in this iteration** or **Skip to next iteration**. |
 | **Model** | Override the default LLM model for this block (Advanced Settings on most blocks) |
 
-Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Download) share these additional fields:
+Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Download) add some of these fields:
 
-| Field | Description |
-|-------|-------------|
-| **URL** | Starting URL. Leave blank to continue from the previous block's page. |
-| **Engine** | AI engine for this block. **Default** runs on Skyvern 3.0 in agents created since October 1, 2026. The selector labels Skyvern 3.0 **Recommended** and Skyvern 1.0 **Legacy**. See [Choose an engine per block](/cloud/studio#choose-an-engine-per-block). |
-| **Max Steps Override** | Cap the number of AI reasoning steps |
-| **Disable Cache** | Skip cached script execution |
-| **2FA Identifier** | ID that links 2FA codes to this block. When empty, the block uses the selected credential's identifier, if it has one. |
-| **2FA Verification URL** | Endpoint this block polls when it needs a 2FA code |
-| **Error Messages** | Map error conditions to custom error codes (JSON) |
+| Field | Shown on | Description |
+|-------|----------|-------------|
+| **URL** | All except Extraction | Starting URL. Leave blank to continue from the previous block's page. |
+| **Engine** | All five | AI engine for this block. On Skyvern Cloud, **Default** runs on Skyvern 3.0 in agents created since October 1, 2026. The selector labels Skyvern 3.0 **Recommended** and Skyvern 1.0 and 2.0 **Legacy**. See [Choose an engine per block](/cloud/studio#choose-an-engine-per-block). |
+| **Max Steps Override** | All except Browser Action | Cap the number of AI reasoning steps |
+| **Disable Cache** | All five | Skip cached script execution |
+| **2FA Identifier** | All except Extraction | ID that links 2FA codes to this block. When empty, the block uses the selected credential's identifier, if it has one. |
+| **2FA Verification URL** | All except Extraction | Endpoint this block polls when it needs a 2FA code |
+| **Error Messages** | All except Extraction | Map error conditions to custom error codes (JSON) |
 
 <Note>
 Set **2FA Verification URL** on the block that may encounter 2FA. A `totp_url` set on the run does not fill empty block fields.

@@ -1,7 +1,7 @@
 ---
 title: Complete Reference (For LLMs)
-subtitle: Every public SDK method in one page
-description: Every public method of the Skyvern Python SDK on one page, with its signature and what it does. Covers tasks and runs, agents, schedules, folders, browser sessions, browser profiles, credentials, files, artifacts, helpers, browser control and error handling, with the TypeScript equivalents.
+subtitle: The public SDK methods in one page
+description: The public methods of the Skyvern Python SDK on one page, with its signature and what it does. Covers tasks and runs, agents, schedules, folders, browser sessions, browser profiles, credentials, files, artifacts, helpers, browser control and error handling, with the TypeScript equivalents.
 slug: sdk-reference/complete-reference
 keywords:
   - complete reference
@@ -19,7 +19,7 @@ keywords:
 ---
 
 <Note>
-This page lists every public SDK method with a one-line signature. Python names are shown; the TypeScript method is the camelCase name (`get_runs_v2` is `getRunsV2`) unless marked Python only. `?` marks an optional argument. The full reference for every method, with each parameter, return type and a runnable Python and TypeScript example, is generated from the SDK code: [Tasks and runs](/sdk-reference/runs), [Agents](/sdk-reference/agents), [Schedules](/sdk-reference/schedules), [Folders](/sdk-reference/folders), [Browser sessions](/sdk-reference/browser-sessions), [Browser profiles](/sdk-reference/browser-profiles), [Credentials](/sdk-reference/credentials), [Files](/sdk-reference/files), [Artifacts](/sdk-reference/artifacts), [Helpers](/sdk-reference/helpers), and for browser automation [Browsers](/sdk-reference/browser-automation/browsers), [Page actions](/sdk-reference/browser-automation/page), [Forms](/sdk-reference/browser-automation/forms), [Frames](/sdk-reference/browser-automation/frames) and [Page agent](/sdk-reference/browser-automation/agent). Where the two disagree, the generated pages are correct.
+This page lists the public SDK methods with a one-line signature. The SDKs also carry methods for run and agent tags, custom LLMs and scripts; those APIs are hidden from the public API reference, so this page leaves them out too. Python names are shown; the TypeScript method is the camelCase name (`get_runs_v2` is `getRunsV2`) unless marked Python only. `?` marks an optional argument. The full reference for every method, with each parameter, return type and a runnable Python and TypeScript example, is generated from the SDK code: [Tasks and runs](/sdk-reference/runs), [Agents](/sdk-reference/agents), [Schedules](/sdk-reference/schedules), [Folders](/sdk-reference/folders), [Browser sessions](/sdk-reference/browser-sessions), [Browser profiles](/sdk-reference/browser-profiles), [Credentials](/sdk-reference/credentials), [Files](/sdk-reference/files), [Artifacts](/sdk-reference/artifacts), [Helpers](/sdk-reference/helpers), and for browser automation [Browsers](/sdk-reference/browser-automation/browsers), [Page actions](/sdk-reference/browser-automation/page), [Forms](/sdk-reference/browser-automation/forms), [Frames](/sdk-reference/browser-automation/frames) and [Page agent](/sdk-reference/browser-automation/agent). Where the two disagree, the generated pages are correct.
 </Note>
 
 ## Install and initialize
@@ -85,7 +85,7 @@ Skyvern(
     follow_redirects: bool | None = True,
     httpx_client: httpx.AsyncClient | None = None, # Your own httpx client
 )
-await client.aclose()                              # Close all browsers and release resources
+await client.aclose()                              # Stops the local driver; end each cloud browser with await browser.close()
 
 # Local mode (Python only - requires pip install "skyvern[local]")
 # For local browser control, also run: python -m playwright install chromium
@@ -214,12 +214,6 @@ await page.frame_switch(selector="#payment-iframe")
 page.frame_main()                    # back to main frame
 frames = await page.frame_list()     # list all frames
 
-# classify - pick which described state the page is in, returns the option key (Python only)
-state = await page.classify(options={"logged_in": "Account dashboard", "logged_out": "Sign-in form"})
-
-# element_fallback - let the AI reach a goal when selectors fail (Python only)
-await page.element_fallback(navigation_goal="Open the most recent invoice", max_steps=5)
-
 # dynamic_field_map - map your data to extracted form fields with AI (Python only)
 mapping = await page.dynamic_field_map(form_fields=fields, data={...})
 
@@ -266,7 +260,7 @@ await page.selectOption({ prompt: "Select United States" });
 // fill_form, fill_multipage_form, fill_from_mapping - Python only
 // extract_form_fields, validate_mapping, fill_autocomplete - Python only
 // frame_switch, frame_main, frame_list - Python only
-// classify, element_fallback, dynamic_field_map - Python only
+// dynamic_field_map - Python only
 // keypress, move, drag, wait, download_file, reload_page - Python only
 ```
 </CodeGroup>
@@ -662,4 +656,4 @@ request_options=RequestOptions(
 - `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `skyvern_v3` (Python SDK and REST; the TypeScript client's type does not list `"skyvern-3.0"` yet), `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
 - `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
 - `page.agent` methods always wait for completion.
-- Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `classify`, `element_fallback`, `type`, `hover`, `scroll`, `keypress`, `move`, `drag`, `wait`, `download_file`, `reload_page`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `extract_form_fields`, `dynamic_field_map`, `fill_from_mapping`, `validate_mapping`, `fill_autocomplete`), and iframe management (`frame_switch`, `frame_main`, `frame_list`).
+- Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `keypress`, `move`, `drag`, `wait`, `download_file`, `reload_page`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `extract_form_fields`, `dynamic_field_map`, `fill_from_mapping`, `validate_mapping`, `fill_autocomplete`), and iframe management (`frame_switch`, `frame_main`, `frame_list`).

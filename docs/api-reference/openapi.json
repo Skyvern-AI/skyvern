@@ -16,22 +16,6 @@
         "operationId": "run_task_v1_run_tasks_post",
         "parameters": [
           {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
-          {
             "name": "x-user-agent",
             "in": "header",
             "required": false,
@@ -98,6 +82,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -118,22 +107,6 @@
               "type": "boolean",
               "default": false,
               "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
             }
           },
           {
@@ -229,6 +202,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -256,24 +234,6 @@
               "title": "Run Id"
             },
             "description": "The id of the task run or the workflow run."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -336,6 +296,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -358,24 +323,6 @@
               "title": "Run Id"
             },
             "description": "The id of the task run or the workflow run to cancel."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -412,6 +359,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -423,26 +375,6 @@
         "summary": "Bulk cancel runs",
         "description": "Cancel multiple runs (tasks or workflows) in a single request",
         "operationId": "bulk_cancel_runs_v1_runs_cancel_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -489,6 +421,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -518,24 +455,6 @@
               "title": "Folder Id"
             },
             "description": "Optional folder ID to assign the workflow to"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           },
           {
             "name": "Idempotency-Key",
@@ -601,6 +520,11 @@
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
+          }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
           }
         ]
       },
@@ -775,24 +699,6 @@
               "default": false,
               "title": "Template"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -835,6 +741,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -860,24 +771,6 @@
               "title": "Workflow Id"
             },
             "description": "The ID of the agent to update. Starts with `wpid_`."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -923,6 +816,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -948,24 +846,6 @@
               "title": "Workflow Id"
             },
             "description": "The ID of the agent to delete. Starts with `wpid_`."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1002,6 +882,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -1013,26 +898,6 @@
         "summary": "Create folder",
         "description": "Create a new folder to organize workflows",
         "operationId": "create_folder_v1_folders_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1068,7 +933,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "create_folder"
+        "x-fern-sdk-method-name": "create_folder",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -1122,24 +992,6 @@
               "title": "Search"
             },
             "description": "Search folders by title or description"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1168,7 +1020,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_folders"
+        "x-fern-sdk-method-name": "get_folders",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/folders/{folder_id}": {
@@ -1193,24 +1050,6 @@
               "title": "Folder Id"
             },
             "description": "Folder ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1238,7 +1077,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_folder"
+        "x-fern-sdk-method-name": "get_folder",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -1261,24 +1105,6 @@
               "title": "Folder Id"
             },
             "description": "Folder ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -1316,7 +1142,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_folder"
+        "x-fern-sdk-method-name": "update_folder",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1351,24 +1182,6 @@
               "title": "Delete Workflows"
             },
             "description": "If true, also delete all workflows in this folder"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1398,7 +1211,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "delete_folder"
+        "x-fern-sdk-method-name": "delete_folder",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/browser_types": {
@@ -1409,26 +1227,6 @@
         "summary": "List selectable browser types",
         "description": "List the selectable browser engines for the workflow/run browser_type setting. The list is runtime-capability aware: a runtime that can honor an explicit engine (the cloud dynamic-browser capability) returns all supported engines, while a runtime without it (OSS/self-host) returns an empty list rather than advertising selections the server would reject.",
         "operationId": "get_browser_types_v1_browser_types_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successfully listed selectable browser types",
@@ -1455,7 +1253,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_browser_types"
+        "x-fern-sdk-method-name": "get_browser_types",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/runs/{workflow_run_id}/tags": {
@@ -1480,24 +1283,6 @@
               "title": "Workflow Run Id"
             },
             "description": "Workflow run ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -1529,7 +1314,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "apply_run_tags"
+        "x-fern-sdk-method-name": "apply_run_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -1552,24 +1342,6 @@
               "title": "Workflow Run Id"
             },
             "description": "Workflow run ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1598,7 +1370,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_run_tags"
+        "x-fern-sdk-method-name": "get_run_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/runs/{workflow_run_id}/tags/{key}": {
@@ -1637,24 +1414,6 @@
               "title": "Key"
             },
             "description": "Tag key to delete"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1683,7 +1442,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "delete_run_tag"
+        "x-fern-sdk-method-name": "delete_run_tag",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/runs/{workflow_run_id}/tags/history": {
@@ -1759,24 +1523,6 @@
               "title": "Key"
             },
             "description": "Filter to events for a single tag key"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -1805,7 +1551,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_run_tag_history"
+        "x-fern-sdk-method-name": "get_run_tag_history",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/tag-keys": {
@@ -1816,26 +1567,6 @@
         "summary": "List tag keys",
         "description": "List all tag keys registered for the organization with their descriptions.",
         "operationId": "list_tag_keys_v1_tag_keys_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successfully retrieved tag keys",
@@ -1863,7 +1594,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "list_tag_keys"
+        "x-fern-sdk-method-name": "list_tag_keys",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/tag-keys/{key}": {
@@ -1885,24 +1621,6 @@
               "title": "Key"
             },
             "description": "Tag key to update"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -1934,7 +1652,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "update_tag_key"
+        "x-fern-sdk-method-name": "update_tag_key",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1957,24 +1680,6 @@
               "title": "Key"
             },
             "description": "Tag key to delete"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -2003,7 +1708,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "delete_tag_key"
+        "x-fern-sdk-method-name": "delete_tag_key",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/tag-values": {
@@ -2032,24 +1742,6 @@
               "title": "Key"
             },
             "description": "Filter to values for a single tag key"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -2079,7 +1771,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "list_tag_values"
+        "x-fern-sdk-method-name": "list_tag_values",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2088,26 +1785,6 @@
         "summary": "Create tag value",
         "description": "Register a grouped tag (key, value) with a palette color before any workflow uses it. The label shows a zero workflow count until applied to a workflow.",
         "operationId": "create_tag_value_v1_tag_values_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -2137,7 +1814,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "create_tag_value"
+        "x-fern-sdk-method-name": "create_tag_value",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/tag-values/{key}": {
@@ -2162,24 +1844,6 @@
               "title": "Key"
             },
             "description": "Tag key (group)"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -2211,7 +1875,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "update_tag_value"
+        "x-fern-sdk-method-name": "update_tag_value",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -2234,24 +1903,6 @@
               "title": "Key"
             },
             "description": "Tag key (group)"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -2290,7 +1941,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "delete_tag_value"
+        "x-fern-sdk-method-name": "delete_tag_value",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/tag-values/{key}/rename": {
@@ -2315,24 +1971,6 @@
               "title": "Key"
             },
             "description": "Tag key (group)"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -2367,7 +2005,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "rename_tag_value"
+        "x-fern-sdk-method-name": "rename_tag_value",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/workflow-tags": {
@@ -2399,24 +2042,6 @@
               "title": "Workflow Permanent Ids"
             },
             "description": "Comma-separated workflow permanent IDs"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -2445,7 +2070,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "batch_get_workflow_tags"
+        "x-fern-sdk-method-name": "batch_get_workflow_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2454,26 +2084,6 @@
         "summary": "Batch get agent tags (POST)",
         "description": "Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
         "operationId": "batch_get_workflow_tags_post_v1_workflow_tags_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -2510,7 +2120,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "batch_get_workflow_tags_post"
+        "x-fern-sdk-method-name": "batch_get_workflow_tags_post",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/run-tags": {
@@ -2542,24 +2157,6 @@
               "title": "Workflow Run Ids"
             },
             "description": "Comma-separated workflow run IDs"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -2588,7 +2185,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "batch_get_run_tags"
+        "x-fern-sdk-method-name": "batch_get_run_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2597,26 +2199,6 @@
         "summary": "Batch get run tags (POST)",
         "description": "Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).",
         "operationId": "batch_get_run_tags_post_v1_run_tags_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -2653,7 +2235,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "batch_get_run_tags_post"
+        "x-fern-sdk-method-name": "batch_get_run_tags_post",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/run-tag-suggestions": {
@@ -2664,26 +2251,6 @@
         "summary": "List run tag suggestions",
         "description": "List distinct (key, value) pairs ever set on a run for the organization, sourced from the run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys (which are never registered) so pickers can offer them alongside user-defined tags.",
         "operationId": "get_run_tag_suggestions_v1_run_tag_suggestions_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successfully retrieved run tag suggestions",
@@ -2707,7 +2274,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_run_tag_suggestions"
+        "x-fern-sdk-method-name": "get_run_tag_suggestions",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/artifacts/{artifact_id}/content": {
@@ -2801,24 +2373,6 @@
               ],
               "title": "Artifact Type"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -2847,7 +2401,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_run_artifacts"
+        "x-fern-sdk-method-name": "get_run_artifacts",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/runs/{run_id}/retry_webhook": {
@@ -2873,24 +2432,6 @@
               "title": "Run Id"
             },
             "description": "The id of the task run or the workflow run."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -2946,6 +2487,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -2972,24 +2518,6 @@
               "title": "Run Id"
             },
             "description": "The id of the workflow run or task_v2 run."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3037,6 +2565,11 @@
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Get timeline for a workflow run\nconst timeline = await skyvern.getRunTimeline(\"wr_123\");\nconsole.log(timeline);\n\n// Get timeline for a task_v2 run\nconst timeline2 = await skyvern.getRunTimeline(\"tsk_v2_123\");\nconsole.log(timeline2);\n"
               }
             ]
+          }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
           }
         ]
       }
@@ -3236,24 +2769,6 @@
               "title": "Failure Category"
             },
             "description": "Exact-match filter on a workflow run's top classifier failure category (`failure_category[0].category`). Only failed, terminated, and timed_out runs are eligible; canceled runs are never returned by this filter. Applies to `run_type=workflow_run` only — combined with a task run_type it matches nothing."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3283,7 +2798,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_runs_v2"
+        "x-fern-sdk-method-name": "get_runs_v2",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/upload_file": {
@@ -3294,26 +2814,6 @@
         "summary": "Upload a file",
         "description": "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its storage URI, a presigned download URL, and the expiry implied by the requested retention period.",
         "operationId": "upload_file_v1_upload_file_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3346,7 +2846,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "upload_file"
+        "x-fern-sdk-method-name": "upload_file",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/files/{file_id}": {
@@ -3366,24 +2871,6 @@
               "type": "string",
               "title": "File Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3401,7 +2888,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "delete_file"
+        "x-fern-sdk-method-name": "delete_file",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/browser_profiles": {
@@ -3412,26 +2904,6 @@
         "summary": "Create a browser profile",
         "description": "Create a blank browser profile, or create one from a persistent browser session or workflow run.",
         "operationId": "create_browser_profile_v1_browser_profiles_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3483,6 +2955,11 @@
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Create a blank browser profile for future runs\nconst blankProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"Fresh Profile\",\n});\nconsole.log(blankProfile);\n\n// Create a browser profile from a persistent browser session\nconst browserProfile = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    browser_session_id: \"pbs_123\",\n});\nconsole.log(browserProfile);\n\n// Or create from any workflow run that saved a browser (has a persisted archive)\nconst browserProfile2 = await skyvern.browserProfiles.createBrowserProfile({\n    name: \"My Profile\",\n    workflow_run_id: \"wr_123\",\n});\nconsole.log(browserProfile2);\n"
               }
             ]
+          }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
           }
         ]
       },
@@ -3567,24 +3044,6 @@
               "title": "Managed"
             },
             "description": "Omit to return all profiles; false returns only user-created profiles; true returns only auto-managed profiles."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3627,6 +3086,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -3652,24 +3116,6 @@
               "title": "Profile Id"
             },
             "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3711,6 +3157,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       },
       "patch": {
@@ -3734,24 +3185,6 @@
               "title": "Profile Id"
             },
             "description": "The ID of the browser profile to update. browser_profile_id starts with `bp_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -3806,6 +3239,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       },
       "delete": {
@@ -3829,24 +3267,6 @@
               "title": "Profile Id"
             },
             "description": "The ID of the browser profile to delete. browser_profile_id starts with `bp_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3881,6 +3301,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -3906,24 +3331,6 @@
               "title": "Profile Id"
             },
             "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -3951,7 +3358,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_browser_profile_usage"
+        "x-fern-sdk-method-name": "get_browser_profile_usage",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/browser_sessions": {
@@ -3962,26 +3374,6 @@
         "summary": "Create a session",
         "description": "Create a browser session that persists across multiple runs",
         "operationId": "create_browser_session_v1_browser_sessions_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4066,6 +3458,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       },
       "get": {
@@ -4075,26 +3472,6 @@
         "summary": "Get active browser sessions",
         "description": "Get all active browser sessions for the organization",
         "operationId": "get_browser_sessions_v1_browser_sessions_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successfully retrieved all active browser sessions",
@@ -4138,6 +3515,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4163,24 +3545,6 @@
               "title": "Browser Session Id"
             },
             "description": "The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -4223,6 +3587,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4248,24 +3617,6 @@
               "title": "Browser Session Id"
             },
             "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -4326,6 +3677,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4351,24 +3707,6 @@
               "title": "Browser Session Id"
             },
             "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -4412,7 +3750,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_browser_session"
+        "x-fern-sdk-method-name": "update_browser_session",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -4435,24 +3778,6 @@
               "title": "Browser Session Id"
             },
             "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -4530,6 +3855,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4541,26 +3871,6 @@
         "summary": "Send TOTP code",
         "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
         "operationId": "send_totp_code_v1_credentials_totp_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -4610,6 +3920,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4621,26 +3936,6 @@
         "summary": "Create credential",
         "description": "Creates a new credential for the current organization",
         "operationId": "create_credential_v1_credentials_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -4709,6 +4004,11 @@
                 "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.createCredential({\n    name: \"My Credit Card\",\n    credential_type: \"credit_card\",\n    credential: {\n        card_number: \"4242424242424242\",\n        card_cvv: \"424\",\n        card_exp_month: \"12\",\n        card_exp_year: \"2028\",\n        card_brand: \"visa\",\n        card_holder_name: \"John Doe\",\n        billing_address: {\n            line1: \"123 Main St\",\n            city: \"San Francisco\",\n            state_code: \"CA\",\n            postal_code: \"94105\",\n            country_code: \"US\",\n        },\n        billing_email: \"billing@example.com\",\n        metadata: { checkout_profile: \"default\" }\n    }\n});\n"
               }
             ]
+          }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
           }
         ]
       },
@@ -4812,24 +4112,6 @@
               "title": "Search"
             },
             "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -4872,6 +4154,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -4900,24 +4187,6 @@
               "title": "Credential Id"
             },
             "description": "The unique identifier of the credential to update"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -4980,6 +4249,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -5008,24 +4282,6 @@
               "title": "Credential Id"
             },
             "description": "The unique identifier of the credential to delete"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5057,6 +4313,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -5085,24 +4346,6 @@
               "title": "Credential Id"
             },
             "description": "The unique identifier of the credential"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5141,6 +4384,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -5152,26 +4400,6 @@
         "summary": "List Custom LLMs",
         "description": "List the custom LLM configurations available to the current organization.",
         "operationId": "list_custom_llms_v1_custom_llms_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -5195,7 +4423,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "list_custom_llms"
+        "x-fern-sdk-method-name": "list_custom_llms",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -5204,26 +4437,6 @@
         "summary": "Create Custom LLM",
         "description": "Create a custom LLM configuration for the current organization.",
         "operationId": "create_custom_llm_v1_custom_llms_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -5257,7 +4470,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "create_custom_llm"
+        "x-fern-sdk-method-name": "create_custom_llm",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/custom-llms/{custom_llm_id}": {
@@ -5279,24 +4497,6 @@
               "title": "Custom Llm Id"
             },
             "description": "The custom LLM id."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -5332,7 +4532,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "update_custom_llm"
+        "x-fern-sdk-method-name": "update_custom_llm",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -5352,24 +4557,6 @@
               "title": "Custom Llm Id"
             },
             "description": "The custom LLM id."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5395,7 +4582,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "delete_custom_llm"
+        "x-fern-sdk-method-name": "delete_custom_llm",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/run/tasks/login": {
@@ -5407,22 +4599,6 @@
         "description": "Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
         "operationId": "login_v1_run_tasks_login_post",
         "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
           {
             "name": "x-user-agent",
             "in": "header",
@@ -5504,6 +4680,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -5516,22 +4697,6 @@
         "description": "Download a file from a website by navigating and clicking download buttons",
         "operationId": "download_files_v1_run_tasks_download_files_post",
         "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          },
           {
             "name": "x-user-agent",
             "in": "header",
@@ -5597,6 +4762,11 @@
               }
             ]
           }
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
         ]
       }
     },
@@ -5608,26 +4778,6 @@
         "summary": "Create script",
         "description": "Create a new script with optional files and metadata",
         "operationId": "create_script_v1_scripts_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -5661,7 +4811,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "create_script"
+        "x-fern-sdk-method-name": "create_script",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -5702,24 +4857,6 @@
               "title": "Page Size"
             },
             "description": "Number of items per page"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5749,7 +4886,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_scripts"
+        "x-fern-sdk-method-name": "get_scripts",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/scripts/{script_id}": {
@@ -5774,24 +4916,6 @@
               "title": "Script Id"
             },
             "description": "The unique identifier of the script"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5817,7 +4941,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_script"
+        "x-fern-sdk-method-name": "get_script",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/scripts/{script_id}/deploy": {
@@ -5842,24 +4971,6 @@
               "title": "Script Id"
             },
             "description": "The unique identifier of the script"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -5895,7 +5006,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "deploy_script"
+        "x-fern-sdk-method-name": "deploy_script",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/scripts/{script_id}/run": {
@@ -5920,24 +5036,6 @@
               "title": "Script Id"
             },
             "description": "The unique identifier of the script"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -5960,7 +5058,12 @@
             }
           }
         },
-        "x-hidden": true
+        "x-hidden": true,
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/sdk/run_action": {
@@ -5971,26 +5074,6 @@
         "summary": "Run an SDK action",
         "description": "Execute a single SDK action with the specified parameters",
         "operationId": "run_sdk_action_v1_sdk_run_action_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -6024,7 +5107,12 @@
           }
         },
         "x-excluded": true,
-        "x-fern-sdk-method-name": "run_sdk_action"
+        "x-fern-sdk-method-name": "run_sdk_action",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/schedules": {
@@ -6098,24 +5186,6 @@
               "title": "Search"
             },
             "description": "Search by workflow title or schedule name"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -6139,7 +5209,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/folder": {
@@ -6164,24 +5239,6 @@
               "title": "Workflow Permanent Id"
             },
             "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -6222,7 +5279,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "update_workflow_folder"
+        "x-fern-sdk-method-name": "update_workflow_folder",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/tags": {
@@ -6247,24 +5309,6 @@
               "title": "Workflow Permanent Id"
             },
             "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -6296,7 +5340,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "apply_workflow_tags"
+        "x-fern-sdk-method-name": "apply_workflow_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -6319,24 +5368,6 @@
               "title": "Workflow Permanent Id"
             },
             "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -6365,7 +5396,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_workflow_tags"
+        "x-fern-sdk-method-name": "get_workflow_tags",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/tags/{key}": {
@@ -6404,24 +5440,6 @@
               "title": "Key"
             },
             "description": "Tag key to delete"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -6450,7 +5468,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "delete_workflow_tag"
+        "x-fern-sdk-method-name": "delete_workflow_tag",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/tags/history": {
@@ -6526,24 +5549,6 @@
               "title": "Key"
             },
             "description": "Filter to events for a single tag key"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -6572,7 +5577,12 @@
           }
         },
         "x-hidden": true,
-        "x-fern-sdk-method-name": "get_workflow_tag_history"
+        "x-fern-sdk-method-name": "get_workflow_tag_history",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/runs/{workflow_run_id}/retry": {
@@ -6597,22 +5607,6 @@
               "title": "Workflow Run Id"
             },
             "description": "The id of the workflow run to retry."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
           },
           {
             "name": "x-max-steps-override",
@@ -6686,7 +5680,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "retry_workflow_run"
+        "x-fern-sdk-method-name": "retry_workflow_run",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/runs": {
@@ -6695,7 +5694,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\nA complete browser profile or browser session id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\nA complete browser profile or browser session id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### Default search window\n\nA `search_key` other than a complete browser profile or session id is matched only against runs created in the **30 days before `created_at_end`** (or before now) unless the request supplies `created_at_start`. This includes complete run and credential ids. Supply `created_at_start` (and optionally `created_at_end`) to search a different range. Listings without `search_key` are not windowed. To fetch one run by its id, use `GET /v1/runs/{run_id}`.\n\n### created_at_start / created_at_end\n\nOptional ISO 8601 bounds on the run's creation time: `created_at_start` is inclusive and `created_at_end` is exclusive. A timestamp without an offset is read as UTC.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match (searched over the last 30 days)\n- `?search_key=prod_credential&created_at_start=2026-01-01T00:00:00Z&created_at_end=2026-02-01T00:00:00Z` — search one explicit month",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -6759,7 +5758,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile or session ID covers only runs created in the 30 days before created_at_end (or before now).",
               "examples": [
                 "login_url",
                 "wr_abc123",
@@ -6768,7 +5767,7 @@
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete browser profile or browser session ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile or session ID covers only runs created in the 30 days before created_at_end (or before now)."
           },
           {
             "name": "error_code",
@@ -6795,22 +5794,48 @@
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
           },
           {
-            "name": "x-api-key",
-            "in": "header",
+            "name": "created_at_start",
+            "in": "query",
             "required": false,
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "type": "string",
+                  "format": "date-time"
                 },
                 {
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
+              "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key.",
+              "examples": [
+                "2026-01-01T00:00:00Z"
+              ],
+              "title": "Created At Start"
             },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp.",
+              "examples": [
+                "2026-02-01T00:00:00Z"
+              ],
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp."
           }
         ],
         "responses": {
@@ -6839,7 +5864,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_workflow_runs"
+        "x-fern-sdk-method-name": "get_workflow_runs",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_id}/runs": {
@@ -7033,24 +6063,6 @@
               "title": "Include Child Runs"
             },
             "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7079,7 +6091,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_workflow_runs_by_id"
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}": {
@@ -7125,24 +6142,6 @@
               "default": false,
               "title": "Template"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7167,7 +6166,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_workflow"
+        "x-fern-sdk-method-name": "get_workflow",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/versions": {
@@ -7197,24 +6201,6 @@
               "default": false,
               "title": "Template"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7243,7 +6229,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "get_workflow_versions"
+        "x-fern-sdk-method-name": "get_workflow_versions",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/browser_session/reset_profile": {
@@ -7268,24 +6259,6 @@
               "title": "Workflow Permanent Id"
             },
             "description": "The permanent ID of the workflow. Starts with `wpid_`."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7309,7 +6282,12 @@
             }
           }
         },
-        "x-hidden": true
+        "x-hidden": true,
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/schedules": {
@@ -7329,24 +6307,6 @@
               "type": "string",
               "title": "Workflow Permanent Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -7380,7 +6340,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "get": {
         "tags": [
@@ -7398,24 +6363,6 @@
               "type": "string",
               "title": "Workflow Permanent Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7439,7 +6386,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
@@ -7468,24 +6420,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7509,7 +6443,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -7536,24 +6475,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "requestBody": {
@@ -7587,7 +6508,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -7614,24 +6540,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7655,7 +6563,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel": {
@@ -7684,24 +6597,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7725,7 +6620,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
@@ -7754,24 +6654,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7795,7 +6677,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
@@ -7824,24 +6711,6 @@
               "type": "string",
               "title": "Workflow Schedule Id"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
           }
         ],
         "responses": {
@@ -7865,7 +6734,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     },
     "/v1/recipes/jobs/extract": {
@@ -8451,22 +7325,6 @@
               "default": "json",
               "title": "Format"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -8507,7 +7365,12 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "export_audit_events"
+        "x-fern-sdk-method-name": "export_audit_events",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
       }
     }
   },
@@ -34830,14 +33693,6 @@
     {
       "url": "https://api.skyvern.com",
       "x-fern-server-name": "Cloud"
-    },
-    {
-      "url": "https://api-staging.skyvern.com",
-      "x-fern-server-name": "Staging"
-    },
-    {
-      "url": "http://localhost:8000",
-      "x-fern-server-name": "Local"
     }
   ]
 }
