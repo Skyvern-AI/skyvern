@@ -773,6 +773,9 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
             "None when unknown."
         ),
     )
+    eval_llm_config_overrides: dict[str, str] | None = None
+    eval_llm_config_overrides_sha256: str | None = None
+    llm_cost: dict[str, Any] | None = None
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",

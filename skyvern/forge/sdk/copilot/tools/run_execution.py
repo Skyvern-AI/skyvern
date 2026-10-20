@@ -131,6 +131,7 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstruction,
     upsert_narrative_block_attempt,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
@@ -4821,19 +4822,20 @@ async def _run_blocks_and_collect_debug(
             if secret_run_session_lock is not None and run_session_id:
                 ctx.secret_run_browser_session_ids.add(run_session_id)
             run_submission_attempted = True
-            await AsyncExecutorFactory.get_executor().execute_workflow(
-                request=None,
-                background_tasks=None,
-                organization=organization,
-                workflow_id=workflow_run.workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_permanent_id=ctx.workflow_permanent_id,
-                max_steps_override=None,
-                api_key="copilot-agent",
-                browser_session_id=run_session_id,
-                block_labels=executor_labels,
-                block_outputs=block_outputs_to_seed or None,
-            )
+            with exclude_workflow_block_cost():
+                await AsyncExecutorFactory.get_executor().execute_workflow(
+                    request=None,
+                    background_tasks=None,
+                    organization=organization,
+                    workflow_id=workflow_run.workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    max_steps_override=None,
+                    api_key="copilot-agent",
+                    browser_session_id=run_session_id,
+                    block_labels=executor_labels,
+                    block_outputs=block_outputs_to_seed or None,
+                )
         else:
             if allow_inline_code_execution:
                 LOG.error(
@@ -4874,21 +4876,22 @@ async def _run_blocks_and_collect_debug(
             if secret_run_session_lock is not None and run_session_id:
                 ctx.secret_run_browser_session_ids.add(run_session_id)
             run_submission_attempted = True
-            run_task = asyncio.create_task(
-                app.WORKFLOW_SERVICE.execute_workflow(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    api_key="copilot-agent",
-                    organization=organization,
-                    browser_session_id=run_session_id,
-                    block_labels=executor_labels,
-                    block_outputs=block_outputs_to_seed or None,
-                    # The run was created against the dispatch version, so execute that same
-                    # definition: its blocks carry the persisted output-parameter rows. Executing
-                    # the in-memory runtime copy instead registers block outputs against ids that
-                    # were never persisted, and every consumer keyed on the definition drops them.
-                    workflow_override=snapshot.workflow if dispatch_workflow is not None else runtime_workflow,
+            with exclude_workflow_block_cost():
+                run_task = asyncio.create_task(
+                    app.WORKFLOW_SERVICE.execute_workflow(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        api_key="copilot-agent",
+                        organization=organization,
+                        browser_session_id=run_session_id,
+                        block_labels=executor_labels,
+                        block_outputs=block_outputs_to_seed or None,
+                        # The run was created against the dispatch version, so execute that same
+                        # definition: its blocks carry the persisted output-parameter rows. Executing
+                        # the in-memory runtime copy instead registers block outputs against ids that
+                        # were never persisted, and every consumer keyed on the definition drops them.
+                        workflow_override=snapshot.workflow if dispatch_workflow is not None else runtime_workflow,
+                    )
                 )
-            )
     except BaseException:
         # Setup or submission failed or was cancelled, and the poll cleanup below never runs on this path.
         # BaseException so a cancellation also releases the lock, cancels a submitted run and retires its draft.
