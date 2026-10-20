@@ -84,6 +84,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     append_demonstration_control,
     claim_demonstration_recording,
     demonstration_action_labels,
+    demonstration_file_ids,
     demonstration_limit_reached,
     demonstration_owner_is_live,
     demonstration_time_limit_reached,
@@ -186,6 +187,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PRIVATE_SETTINGS_KEY,
     COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_ATTACHED_FILES_PER_MESSAGE,
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
     CopilotCancelSource,
@@ -246,6 +248,7 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
+from skyvern.services import uploaded_file_service
 from skyvern.services.browser_recording.evidence import build_recording_evidence
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.utils.contained_effects import contained_effect
@@ -3857,7 +3860,7 @@ async def workflow_copilot_chat_post(
                 detail="demonstration_id is required for a Copilot demonstration",
             )
         try:
-            await validate_demonstration_for_replay(
+            demonstration = await validate_demonstration_for_replay(
                 cache,
                 organization_id=organization.organization_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -3865,6 +3868,13 @@ async def workflow_copilot_chat_post(
             )
         except DemonstrationRejection as rejection:
             raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+        # A reloaded card no longer holds the files it attached; the recorded upload events still do.
+        demonstrated_file_ids = await demonstration_file_ids(
+            cache, organization.organization_id, chat_request.demonstration_id, demonstration.event_count
+        )
+        chat_request.attached_file_ids = list(dict.fromkeys([*chat_request.attached_file_ids, *demonstrated_file_ids]))[
+            :MAX_ATTACHED_FILES_PER_MESSAGE
+        ]
     raw_eval_mode = request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
@@ -4973,6 +4983,59 @@ async def workflow_copilot_demonstration_control(
         if record is not None and record.status == "stopped":
             return WorkflowCopilotDemonstrationControlResult(seq=seq, action_count=record.event_count)
     return WorkflowCopilotDemonstrationControlResult(seq=seq)
+
+
+@base_router.post(
+    "/workflow/copilot/demonstration/upload",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
+async def workflow_copilot_demonstration_upload(
+    demonstration_id: str = Form(..., max_length=64),
+    file: UploadFile = File(...),
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotDemonstrationControlResult:
+    cache = await _demonstration_cache(organization.organization_id)
+    demonstration = await load_demonstration_record(cache, organization.organization_id, demonstration_id)
+    if demonstration is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown demonstration")
+    await app.AGENT_FUNCTION.enforce_folder_access(
+        get_request_principal(),
+        "workflow_copilot.manage",
+        {"workflow_permanent_id": demonstration.workflow_permanent_id},
+    )
+    if demonstration.status != "recording":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Demonstration is not recording")
+    attached_file_ids = await demonstration_file_ids(
+        cache, organization.organization_id, demonstration_id, demonstration.event_count
+    )
+    # Done carries every attached file, so the message limit bounds them; failed attempts are not counted.
+    if len(attached_file_ids) >= MAX_ATTACHED_FILES_PER_MESSAGE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
+        )
+    await uploaded_file_service.validate_file_size(file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE)
+    try:
+        uploaded, _ = await uploaded_file_service.save_uploaded_file(
+            file=file, organization_id=organization.organization_id
+        )
+    except uploaded_file_service.UploadStorageError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    # The recorder attaches only files stored here for this demonstration, never an id the client names.
+    try:
+        seq = await append_demonstration_control(
+            cache,
+            organization_id=organization.organization_id,
+            request=WorkflowCopilotDemonstrationControlRequest(demonstration_id=demonstration_id, action="upload_file"),
+            file_id=uploaded.file_id,
+        )
+    except DemonstrationRejection as rejection:
+        await uploaded_file_service.delete_uploaded_file(
+            file_id=uploaded.file_id, organization_id=organization.organization_id
+        )
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+    return WorkflowCopilotDemonstrationControlResult(seq=seq, file_id=uploaded.file_id)
 
 
 @base_router.get("/workflow/copilot/demonstration/active", include_in_schema=False)

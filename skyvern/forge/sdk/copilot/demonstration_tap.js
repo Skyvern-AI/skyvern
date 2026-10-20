@@ -1177,6 +1177,7 @@
         waiter = finish;
       }),
     selectorFor: getDurableSelector,
+    labelFor: ownLabelText,
     flush,
     stop: () => {
       if (stopped) return [];

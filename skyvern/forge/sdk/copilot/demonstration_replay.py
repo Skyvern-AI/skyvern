@@ -37,7 +37,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, ScoutedInteraction, staged_demonstrated_action
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.copilot.tools.scouting import record_scouted_interaction_fact
@@ -233,6 +233,31 @@ async def _replay_events(
                 else {"ok": False, "error": "The demonstrated saved credential no longer exists."}
             )
             await record_call("fill_credential_field", args, args, output)
+            continue
+        if kind == "upload":
+            selector = str(event.get("selector") or "")
+            file_id = event.get("file_id")
+            if not isinstance(file_id, str):
+                seq = event.get("seq")
+                step = f"Demonstration step {seq}" if isinstance(seq, int) else "A demonstration step"
+                field_label = safe_label(event.get("field_label")) or "file input"
+                history.append(
+                    {
+                        "role": "user",
+                        "content": NUDGE_SENTINEL
+                        + f'{step} opened a file chooser for "{field_label}" ({selector}); the user chose no file.',
+                    }
+                )
+                continue
+            args = {"file_id": file_id, "selector": selector}
+            output = {
+                "ok": True,
+                "file_id": file_id,
+                "filename": redact_secretlike_filename(str(event.get("filename") or "")),
+                "size_bytes": event.get("size_bytes"),
+                "change_delivered": True,
+            }
+            await record_call("upload_attached_file", args, args, output)
             continue
 
         translated = _translate_action(
