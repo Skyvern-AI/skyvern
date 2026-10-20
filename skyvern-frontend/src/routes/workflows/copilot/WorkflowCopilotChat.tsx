@@ -293,6 +293,10 @@ import { captureChatScope, type ChatScopeRefs } from "./chatReadScope";
 import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import { safeHttpUrl } from "@/util/httpUrl";
 import { useDemonstrationRecorder } from "./useDemonstrationRecorder";
+import {
+  DemonstrationFileMarker,
+  DemonstrationFileTray,
+} from "./cards/DemonstrationFileTray";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -6978,7 +6982,8 @@ export function WorkflowCopilotChat({
   const demonstrationRecorder = useDemonstrationRecorder({
     workflowPermanentId,
     browserSessionId: demonstrationEnabled ? liveBrowserSessionId : null,
-    onDone: async ({ demonstrationId, actions }) => {
+    deleteFile: removeUnsentUpload,
+    onDone: async ({ demonstrationId, actions, files }) => {
       const messageId =
         demonstrationMessageIdRef.current ??
         `demonstration-${crypto.randomUUID()}`;
@@ -7010,6 +7015,7 @@ export function WorkflowCopilotChat({
         sent =
           (await handleSendRef.current?.(DEMONSTRATION_DONE_MESSAGE, {
             optimisticMessageId: messageId,
+            attachments: files.slice(0, ATTACHMENT_COUNT_LIMIT),
           })) ?? false;
       } finally {
         if (!sent) {
@@ -7777,8 +7783,12 @@ export function WorkflowCopilotChat({
             : "Type this sign-in yourself to keep its value private.",
         }
       : null;
+  const demonstrationFileRequest =
+    demonstrationRecorder.phase === "recording"
+      ? demonstrationRecorder.fileRequest
+      : null;
   const attentionQueue: {
-    kind: CopilotAttention | "demonstration_credential";
+    kind: CopilotAttention | "demonstration_credential" | "demonstration_file";
     upNext?: string;
   }[] = [];
   if (trayQuestion) {
@@ -7799,6 +7809,12 @@ export function WorkflowCopilotChat({
       upNext: "Fill this sign-in",
     });
   }
+  if (demonstrationFileRequest) {
+    attentionQueue.push({
+      kind: "demonstration_file",
+      upNext: "Choose a file",
+    });
+  }
   if (isDemonstrating) {
     attentionQueue.push({
       kind: "demonstration",
@@ -7809,8 +7825,14 @@ export function WorkflowCopilotChat({
   const headerAttention =
     activeAttention === "demonstration_credential"
       ? "credential"
-      : activeAttention;
-  const attentionUpNext = attentionQueue[1]?.upNext ?? null;
+      : activeAttention === "demonstration_file"
+        ? "demonstration"
+        : activeAttention;
+  // The demonstration is already on screen as the composer strip, so it is never worth an "Up next" row.
+  const attentionUpNext =
+    attentionQueue[1]?.kind === "demonstration"
+      ? null
+      : (attentionQueue[1]?.upNext ?? null);
   // Only the open tray replaces its transcript card; queued items stay actionable inline.
   const dockedPauseFrame =
     activeAttention === "credential" ? trayPauseFrame : null;
@@ -7823,7 +7845,10 @@ export function WorkflowCopilotChat({
       ? demonstrationCredentialFrame
       : null;
   const hasVisibleAttentionTray =
-    activeAttention !== null && activeAttention !== "demonstration";
+    activeAttention !== null &&
+    activeAttention !== "demonstration" &&
+    activeAttention !== "demonstration_credential" &&
+    activeAttention !== "demonstration_file";
   const [collapsedAttentionKey, setCollapsedAttentionKey] = useState<
     string | null
   >(null);
@@ -11746,6 +11771,18 @@ export function WorkflowCopilotChat({
                         }
                       />
                     </div>
+                    {message.id === demonstrationMessageIdRef.current &&
+                    activeAttention === "demonstration_file" ? (
+                      <div className={TURN_ROW_INSET}>
+                        <DemonstrationFileMarker />
+                      </div>
+                    ) : null}
+                    {message.id === demonstrationMessageIdRef.current &&
+                    activeAttention === "demonstration_credential" ? (
+                      <div className={TURN_ROW_INSET}>
+                        <CredentialAskMarker />
+                      </div>
+                    ) : null}
                   </Fragment>
                 ) : (
                   renderedMessage
@@ -12225,28 +12262,6 @@ export function WorkflowCopilotChat({
             tray={attentionTray(`account:${dockedAccountChoice.turnId}`)}
           />
         ) : null}
-        {dockedDemonstrationCredential && demonstrationSensitiveField ? (
-          <CredentialCard
-            key={`${demonstrationSensitiveField.field}:${demonstrationSensitiveField.selector}:${demonstrationSensitiveField.url}`}
-            frame={dockedDemonstrationCredential}
-            mode="inline-pause"
-            offerCredentials={demonstrationRecorder.canFillCredentials}
-            reloadKey={credentialsReloadKey}
-            onConnect={(credentialId) => {
-              if (credentialId) {
-                demonstrationRecorder.fillCredential(credentialId);
-                return;
-              }
-              pendingCredentialConnect.current = null;
-              pendingDemonstrationCredentialConnect.current = true;
-              setCredentialModalOpen(true);
-            }}
-            onSkip={demonstrationRecorder.dismissSensitiveField}
-            tray={attentionTray(
-              `demonstration-credential:${demonstrationSensitiveField.field}:${demonstrationSensitiveField.selector}`,
-            )}
-          />
-        ) : null}
         {showQueuedStrip && queuedPrompt ? (
           <QueuedMessageStrip
             text={queuedPrompt.content}
@@ -12348,6 +12363,45 @@ export function WorkflowCopilotChat({
                 ) : null}
               </div>
             </div>
+          ) : null}
+          {dockedDemonstrationCredential && demonstrationSensitiveField ? (
+            <CredentialCard
+              key={`${demonstrationSensitiveField.field}:${demonstrationSensitiveField.selector}:${demonstrationSensitiveField.url}`}
+              frame={dockedDemonstrationCredential}
+              mode="inline-pause"
+              offerCredentials={demonstrationRecorder.canFillCredentials}
+              reloadKey={credentialsReloadKey}
+              onConnect={(credentialId) => {
+                if (credentialId) {
+                  demonstrationRecorder.fillCredential(credentialId);
+                  return;
+                }
+                pendingCredentialConnect.current = null;
+                pendingDemonstrationCredentialConnect.current = true;
+                setCredentialModalOpen(true);
+              }}
+              onSkip={demonstrationRecorder.dismissSensitiveField}
+              tray={{
+                ...attentionTray(
+                  `demonstration-credential:${demonstrationSensitiveField.field}:${demonstrationSensitiveField.selector}`,
+                ),
+                embedded: true,
+              }}
+            />
+          ) : null}
+          {activeAttention === "demonstration_file" &&
+          demonstrationFileRequest ? (
+            <DemonstrationFileTray
+              label={demonstrationFileRequest.label}
+              busy={demonstrationRecorder.fileBusy}
+              onChoose={(file) => void demonstrationRecorder.chooseFile(file)}
+              tray={{
+                ...attentionTray(
+                  `demonstration-file:${demonstrationFileRequest.label}`,
+                ),
+                embedded: true,
+              }}
+            />
           ) : null}
           {demonstrationRecorder.phase === "stopped" &&
           demonstrationRecorder.browserRestarted ? (

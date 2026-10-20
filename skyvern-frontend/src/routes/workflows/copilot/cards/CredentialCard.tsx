@@ -648,6 +648,7 @@ function AskChrome({
           onCollapsedChange={tray.onCollapsedChange}
           minimizeLabel="Minimize sign-in request"
           upNext={tray.upNext}
+          embedded={tray.embedded}
         >
           <div className="flex min-h-0 flex-col gap-1 overflow-y-auto px-3 pb-2.5 pt-1">
             {lines.map((line, index) => (

@@ -583,6 +583,9 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "navigate_browser"
     | "upload_attached_file"
     | "fill_credential_field";
+  // Present only on an upload the recorder attached; a skipped file request has none.
+  file_id?: string;
+  filename?: string;
 }
 
 export interface WorkflowCopilotDemonstrationSensitiveFieldUpdate {
@@ -590,6 +593,11 @@ export interface WorkflowCopilotDemonstrationSensitiveFieldUpdate {
   field: "password" | "totp" | "other";
   selector: string;
   url: string;
+}
+
+export interface WorkflowCopilotDemonstrationFileRequestedUpdate {
+  type: "demonstration_file_requested";
+  label: string;
 }
 
 export interface WorkflowCopilotDemonstrationNoticeUpdate {
@@ -614,7 +622,7 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "stop" | "cancel";
+  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
   url?: string | null;
   selector?: string | null;
   credential_id?: string | null;
@@ -625,12 +633,14 @@ export interface WorkflowCopilotDemonstrationControlRequest {
 export interface WorkflowCopilotDemonstrationControlResult {
   seq: number;
   action_count?: number | null;
+  file_id?: string | null;
 }
 
 export type WorkflowCopilotDemonstrationUpdate =
   | WorkflowCopilotDemonstrationStartedUpdate
   | WorkflowCopilotDemonstrationActionUpdate
   | WorkflowCopilotDemonstrationSensitiveFieldUpdate
+  | WorkflowCopilotDemonstrationFileRequestedUpdate
   | WorkflowCopilotDemonstrationNoticeUpdate
   | WorkflowCopilotDemonstrationStoppedUpdate;
 
