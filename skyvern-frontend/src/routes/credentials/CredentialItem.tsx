@@ -556,22 +556,24 @@ function CredentialItem({
             </Tooltip>
           </TooltipProvider>
         )}
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                size="icon"
-                variant="tertiary"
-                className="h-8 w-9"
-                onClick={() => setEditModalOpen(true)}
-                aria-label="Edit credential"
-              >
-                <Pencil1Icon className="size-5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Edit Credential</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+        {credential.vault_type !== "onepassword" && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="tertiary"
+                  className="h-8 w-9"
+                  onClick={() => setEditModalOpen(true)}
+                  aria-label="Edit credential"
+                >
+                  <Pencil1Icon className="size-5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Edit Credential</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
         <DeleteCredentialButton credential={credential} />
       </div>
       <CredentialsModal

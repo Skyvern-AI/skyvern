@@ -258,3 +258,41 @@ describe("CredentialItem 1Password metadata", () => {
     expect(screen.getByText("missing in 1Password")).toBeTruthy();
   });
 });
+
+describe("SKY-18379 QA R1 repro: imported 1Password credential", () => {
+  it("QA1-U1: does not offer Edit on a read-only 1Password credential, whose update always 405s", () => {
+    render(
+      <MemoryRouter>
+        <CredentialItem
+          credential={makePasswordCredential({
+            vault_type: "onepassword",
+            vault_id: "vault-1",
+            item_id: "item-1",
+            credential: {
+              username: "user@example.com",
+              totp_type: "none",
+              totp_identifier: null,
+            },
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("1Password")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Edit credential" }),
+    ).toBeNull();
+  });
+
+  it("keeps Edit available for a Skyvern-vault credential", () => {
+    render(
+      <CredentialItem
+        credential={makePasswordCredential({ vault_type: "skyvern" })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Edit credential" }),
+    ).toBeTruthy();
+  });
+});
