@@ -1013,8 +1013,11 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     elapsed = loop.time() - started
     if not task.done():
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # A task that swallows its cancellation would hang an unbounded await here as well.
+        await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         pytest.fail(f"task still running after {wait_seconds}s")
     return task, elapsed
 
@@ -1027,9 +1030,8 @@ class DriverReplyProbe:
     without its task ending therefore leaves the reply live, and the driver's late error lands on it
     with nobody left to retrieve it."""
 
-    def __init__(self, error: BaseException, answers_after_seconds: float = 0.05) -> None:
+    def __init__(self, error: BaseException) -> None:
         self._error = error
-        self._answers_after_seconds = answers_after_seconds
         self.called = asyncio.Event()
         self.reply: asyncio.Future[Any] | None = None
 
@@ -1046,16 +1048,17 @@ class DriverReplyProbe:
                 reply.cancel()
 
         issuing_task.add_done_callback(abandon_reply)
-        loop.call_later(self._answers_after_seconds, lambda: reply.done() or reply.set_exception(self._error))
         # The driver abandons an unanswered reply on the line after this await, which cancellation skips.
         await asyncio.wait({reply}, return_when=asyncio.FIRST_COMPLETED)
         return reply.result()
 
-    async def orphaned_reply(self, wait_seconds: float = 2.0) -> bool:
-        """Whether the late reply carries an error nobody retrieved -- asyncio's never-retrieved line."""
+    def orphaned_reply(self) -> bool:
+        """Deliver the driver's late error now that the caller has given up, and report whether it landed on a reply
+        nobody will retrieve (asyncio's never-retrieved line)."""
         assert self.reply is not None, "the driver was never called"
-        await asyncio.wait({self.reply}, timeout=wait_seconds)
-        return self.reply.done() and not self.reply.cancelled() and self.reply.exception() is not None
+        if not self.reply.done():
+            self.reply.set_exception(self._error)
+        return not self.reply.cancelled() and self.reply.exception() is not None
 
 
 def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:

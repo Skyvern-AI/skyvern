@@ -16,7 +16,7 @@ from skyvern.webeye.utils.page import (
     _wait_for_navigation_settle,
     with_dom_utils,
 )
-from tests.unit.conftest import DriverReplyProbe
+from tests.unit.conftest import DriverReplyProbe, settle_or_fail
 
 
 class TestIsNavigationContextLost:
@@ -145,10 +145,15 @@ class TestEvaluateWithNavigationRecovery:
         frame = AsyncMock()
         frame.evaluate = probe
 
-        with pytest.raises(SkyvernPageAnalysisTimeout):
-            await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=25)
+        # Checked in the same task, before settle_or_fail yields, so a call the evaluate cancelled without
+        # awaiting has not yet abandoned its reply.
+        async def abandon_the_evaluate() -> None:
+            with pytest.raises(SkyvernPageAnalysisTimeout):
+                await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=25)
+            assert not probe.orphaned_reply()
 
-        assert not await probe.orphaned_reply()
+        task, _ = await settle_or_fail(abandon_the_evaluate())
+        task.result()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_type", [PlaywrightError, RuntimeError])
