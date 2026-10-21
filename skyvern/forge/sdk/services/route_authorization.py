@@ -268,6 +268,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_active": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_control": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_record": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_upload": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_disable_auto_accept": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_message_feedback": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_question_response": "workflow_copilot.manage",

@@ -194,7 +194,57 @@ class PageTap:
         self._reconcile_frames(key, tree)
         session.on("Page.frameNavigated", lambda event: self._frame_navigated(key, event))
         session.on("Page.frameRequestedNavigation", lambda event: self._frame_requested_navigation(key, event))
+        session.on("Page.fileChooserOpened", lambda event: self._file_chooser_opened(key, event))
         return key
+
+    def _file_chooser_opened(self, session_key: str, event: dict[str, Any]) -> None:
+        state = self._sessions.get(session_key)
+        backend_node_id = event.get("backendNodeId")
+        if state is None or not isinstance(backend_node_id, int):
+            return
+        frame_id = str(event.get("frameId") or "")
+        self._enqueue_event(
+            TapEvent(
+                page=state["page"],
+                session_key=session_key,
+                frame_id=frame_id,
+                is_main_frame=bool(state["is_page_session"] and frame_id == state["main_frame_id"]),
+                frame_name=str(state["frames"].get(frame_id, {}).get("name") or ""),
+                payload={"kind": "file_chooser", "ts": time.time() * 1000, "backend_node_id": backend_node_id},
+            )
+        )
+
+    async def call_on_file_input(self, event: TapEvent, declaration: str, *args: Any) -> Any:
+        state = self._sessions.get(event.session_key)
+        if state is None:
+            return None
+        session = state["session"]
+        try:
+            world = await session.send(
+                "Page.createIsolatedWorld",
+                {"frameId": event.frame_id, "worldName": WORLD, "grantUniveralAccess": False},
+            )
+            resolved = await session.send(
+                "DOM.resolveNode",
+                {
+                    "backendNodeId": event.payload["backend_node_id"],
+                    "executionContextId": world["executionContextId"],
+                },
+            )
+            result = await session.send(
+                "Runtime.callFunctionOn",
+                {
+                    "functionDeclaration": declaration,
+                    "objectId": resolved["object"]["objectId"],
+                    "arguments": [{"value": arg} for arg in args],
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+            )
+        except Exception:
+            LOG.info("copilot_demonstration_file_input_call_failed", exc_info=True)
+            return None
+        return result.get("result", {}).get("value")
 
     def _frame_requested_navigation(self, session_key: str, event: dict[str, Any]) -> None:
         state = self._sessions.get(session_key)

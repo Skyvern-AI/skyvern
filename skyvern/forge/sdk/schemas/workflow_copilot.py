@@ -596,7 +596,7 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
 
 class WorkflowCopilotDemonstrationControlRequest(BaseModel):
     demonstration_id: str = Field(max_length=64)
-    action: Literal["navigate", "fill_credential", "stop", "cancel"]
+    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
     url: str | None = Field(default=None, max_length=2048)
     selector: str | None = Field(default=None, max_length=2000)
     credential_id: str | None = Field(default=None, max_length=128)
@@ -608,6 +608,7 @@ class WorkflowCopilotDemonstrationControlRequest(BaseModel):
 class WorkflowCopilotDemonstrationControlResult(BaseModel):
     seq: int
     action_count: int | None = None
+    file_id: str | None = None
 
 
 class WorkflowCopilotDemonstrationRecordRequest(BaseModel):
