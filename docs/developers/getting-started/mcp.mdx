@@ -23,7 +23,7 @@ keywords:
   - coding agent
 ---
 
-Skyvern's MCP server gives your AI client 117 browser and automation tools. Your assistant can open a cloud browser, click and type, extract data, log in with stored credentials, and build and run agents, all from a chat or a coding session.
+Skyvern's MCP server gives your AI client 118 browser and automation tools. Your assistant can open a cloud browser, click and type, extract data, log in with stored credentials, and build and run agents, all from a chat or a coding session.
 
 The hosted server is at:
 
@@ -297,20 +297,21 @@ Your assistant picks tools from your request. "Go to Hacker News and get the top
 | Logins | `skyvern_login`, `skyvern_credential_list` | Log in with stored credentials, including 2FA |
 | Agents | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status` | Build, run and monitor agents |
 | Schedules and code | `skyvern_schedule_create`, `skyvern_script_get_code` | Schedule agents and inspect cached code |
+| Feedback | `skyvern_feedback` | Report a Skyvern problem or missing capability to the team that runs the server |
 
 Other tools cover tabs, iframes, file upload, network and console inspection, browser profiles, folders and stored browser state.
 
 ### Limit the tool list with scopes
 
-117 tools is a lot of context for some clients. A scope serves a smaller set:
+118 tools is a lot of context for some clients. A scope serves a smaller set:
 
 | Scope | Tools | Use it to |
 |---|---:|---|
-| `all` (default) | 117 | Everything |
-| `operate` | 30 | Run, monitor and inspect agents that already exist. No browser tools. |
-| `build` | 62 | Create and edit agents, with a browser for inspecting pages |
-| `browser` | 54 | Drive a browser directly |
-| `lean` | 33 | A small browser set with direct actions and schema-constrained output |
+| `all` (default) | 118 | Everything |
+| `operate` | 31 | Run, monitor and inspect agents that already exist. No browser tools. |
+| `build` | 63 | Create and edit agents, with a browser for inspecting pages |
+| `browser` | 55 | Drive a browser directly |
+| `lean` | 34 | A small browser set with direct actions and schema-constrained output |
 
 On the hosted server, use a scoped URL such as `https://api.skyvern.com/mcp/x/operate`, or keep the normal URL and send the header `X-Skyvern-Scope: operate`. For a local server, pass `--scope operate` to `skyvern run mcp`.
 
