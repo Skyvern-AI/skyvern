@@ -30,6 +30,14 @@ _PHONE_NUMBER_UNIQUE_INDEX = "uq_org_phone_numbers_org_number"
 _PHONE_NUMBER_SQLITE_UNIQUE_ERROR = (
     "UNIQUE constraint failed: organization_phone_numbers.organization_id, organization_phone_numbers.phone_number"
 )
+_MAINTENANCE_ORDER = (
+    OrganizationPhoneNumberModel.maintenance_checked_at.is_(None).desc(),
+    OrganizationPhoneNumberModel.maintenance_checked_at,
+)
+
+
+def _normalize_lifecycle_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    return {key: to_naive_utc(value) if isinstance(value, datetime) else value for key, value in updates.items()}
 
 
 class PhoneNumberAlreadyExists(ValueError):
@@ -594,6 +602,20 @@ class SMSRepository(BaseRepository):
             )
             return OrganizationPhoneNumber.model_validate(row) if row is not None else None
 
+    @db_operation("get_phone_number_by_stripe_subscription_id")
+    async def get_phone_number_by_stripe_subscription_id(
+        self,
+        stripe_subscription_id: str,
+    ) -> OrganizationPhoneNumber | None:
+        async with self.Session() as session:
+            row = await session.scalar(
+                select(OrganizationPhoneNumberModel).where(
+                    OrganizationPhoneNumberModel.stripe_subscription_id == stripe_subscription_id,
+                    OrganizationPhoneNumberModel.deleted_at.is_(None),
+                )
+            )
+            return OrganizationPhoneNumber.model_validate(row) if row is not None else None
+
     @db_operation("list_phone_numbers")
     async def list_phone_numbers(
         self,
@@ -612,6 +634,97 @@ class SMSRepository(BaseRepository):
             rows = (await session.scalars(query.order_by(OrganizationPhoneNumberModel.created_at))).all()
             return [OrganizationPhoneNumber.model_validate(row) for row in rows]
 
+    async def _list_managed_phone_numbers(
+        self,
+        *conditions: Any,
+        order_by: tuple[Any, ...],
+        limit: int,
+    ) -> list[OrganizationPhoneNumber]:
+        async with self.Session() as session:
+            rows = (
+                await session.scalars(
+                    select(OrganizationPhoneNumberModel).where(*conditions).order_by(*order_by).limit(limit)
+                )
+            ).all()
+        return [OrganizationPhoneNumber.model_validate(row) for row in rows]
+
+    @db_operation("list_due_quarantined_phone_numbers")
+    async def list_due_quarantined_phone_numbers(self, limit: int = 100) -> list[OrganizationPhoneNumber]:
+        return await self._list_managed_phone_numbers(
+            OrganizationPhoneNumberModel.status.in_(["quarantined", "surrendering"]),
+            OrganizationPhoneNumberModel.quarantined_until <= naive_utc_now(),
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+            OrganizationPhoneNumberModel.provider == "skyvern",
+            order_by=(
+                *_MAINTENANCE_ORDER,
+                OrganizationPhoneNumberModel.quarantined_until,
+                OrganizationPhoneNumberModel.phone_number_id,
+            ),
+            limit=limit,
+        )
+
+    @db_operation("list_reversal_pending_phone_numbers")
+    async def list_reversal_pending_phone_numbers(self, limit: int = 100) -> list[OrganizationPhoneNumber]:
+        return await self._list_managed_phone_numbers(
+            OrganizationPhoneNumberModel.status == "reversal_pending",
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+            OrganizationPhoneNumberModel.provider == "skyvern",
+            order_by=(
+                *_MAINTENANCE_ORDER,
+                OrganizationPhoneNumberModel.modified_at,
+                OrganizationPhoneNumberModel.phone_number_id,
+            ),
+            limit=limit,
+        )
+
+    @db_operation("list_incomplete_quarantined_phone_numbers")
+    async def list_incomplete_quarantined_phone_numbers(self, limit: int = 100) -> list[OrganizationPhoneNumber]:
+        return await self._list_managed_phone_numbers(
+            OrganizationPhoneNumberModel.status == "quarantined",
+            OrganizationPhoneNumberModel.quarantined_until.is_(None),
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+            OrganizationPhoneNumberModel.provider == "skyvern",
+            order_by=(
+                *_MAINTENANCE_ORDER,
+                OrganizationPhoneNumberModel.modified_at,
+                OrganizationPhoneNumberModel.phone_number_id,
+            ),
+            limit=limit,
+        )
+
+    @db_operation("list_active_managed_phone_numbers")
+    async def list_active_managed_phone_numbers(self, limit: int = 100) -> list[OrganizationPhoneNumber]:
+        return await self._list_managed_phone_numbers(
+            OrganizationPhoneNumberModel.status == "active",
+            OrganizationPhoneNumberModel.provider == "skyvern",
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+            order_by=(*_MAINTENANCE_ORDER, OrganizationPhoneNumberModel.phone_number_id),
+            limit=limit,
+        )
+
+    @db_operation("list_stale_provisioning_phone_numbers")
+    async def list_stale_provisioning_phone_numbers(
+        self,
+        limit: int = 100,
+        stale_after: timedelta = timedelta(minutes=5),
+    ) -> list[OrganizationPhoneNumber]:
+        stale_before = naive_utc_now() - stale_after
+        return await self._list_managed_phone_numbers(
+            OrganizationPhoneNumberModel.status == "provisioning",
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+            OrganizationPhoneNumberModel.provider == "skyvern",
+            or_(
+                OrganizationPhoneNumberModel.provisioning_claimed_at.is_(None),
+                OrganizationPhoneNumberModel.provisioning_claimed_at < stale_before,
+            ),
+            order_by=(
+                *_MAINTENANCE_ORDER,
+                OrganizationPhoneNumberModel.modified_at,
+                OrganizationPhoneNumberModel.phone_number_id,
+            ),
+            limit=limit,
+        )
+
     @db_operation("update_phone_number")
     async def update_phone_number(
         self,
@@ -628,7 +741,19 @@ class SMSRepository(BaseRepository):
         quarantined_until: datetime | None | object = _UNSET,
         price_cents: int | None | object = _UNSET,
         provider_cost_cents: int | None | object = _UNSET,
+        stripe_subscription_id: str | None | object = _UNSET,
+        stripe_subscription_item_id: str | None | object = _UNSET,
+        stripe_payment_intent_id: str | None | object = _UNSET,
+        stripe_invoice_id: str | None | object = _UNSET,
+        stripe_refund_id: str | None | object = _UNSET,
+        stripe_credit_note_id: str | None | object = _UNSET,
+        purchase_generation: str | None | object = _UNSET,
+        current_period_start: datetime | None | object = _UNSET,
+        current_period_end: datetime | None | object = _UNSET,
         provisioning_claimed_at: datetime | None | object = _UNSET,
+        cancel_at: datetime | None | object = _UNSET,
+        maintenance_checked_at: datetime | None | object = _UNSET,
+        billing_exempt: bool | object = _UNSET,
     ) -> OrganizationPhoneNumber | None:
         if status is not None and status not in PHONE_NUMBER_STATUSES:
             raise InvalidPhoneNumberStatus("Invalid phone number status")
@@ -682,6 +807,22 @@ class SMSRepository(BaseRepository):
                 row.price_cents = cast(int | None, price_cents)
             if provider_cost_cents is not _UNSET:
                 row.provider_cost_cents = cast(int | None, provider_cost_cents)
+            for key, value in (
+                ("stripe_subscription_id", stripe_subscription_id),
+                ("stripe_subscription_item_id", stripe_subscription_item_id),
+                ("stripe_payment_intent_id", stripe_payment_intent_id),
+                ("stripe_invoice_id", stripe_invoice_id),
+                ("stripe_refund_id", stripe_refund_id),
+                ("stripe_credit_note_id", stripe_credit_note_id),
+                ("purchase_generation", purchase_generation),
+                ("current_period_start", current_period_start),
+                ("current_period_end", current_period_end),
+                ("cancel_at", cancel_at),
+                ("maintenance_checked_at", maintenance_checked_at),
+                ("billing_exempt", bool(billing_exempt) if billing_exempt is not _UNSET else _UNSET),
+            ):
+                if value is not _UNSET:
+                    setattr(row, key, _normalize_lifecycle_updates({key: value})[key])
             if provisioning_claimed_at is not _UNSET:
                 row.provisioning_claimed_at = to_naive_utc(cast(datetime | None, provisioning_claimed_at))
             row.modified_at = naive_utc_now()
@@ -709,7 +850,19 @@ class SMSRepository(BaseRepository):
         price_cents: int | None | object = _UNSET,
         provider_cost_cents: int | None | object = _UNSET,
         quarantined_until: datetime | None | object = _UNSET,
+        stripe_subscription_id: str | None | object = _UNSET,
+        stripe_subscription_item_id: str | None | object = _UNSET,
+        stripe_payment_intent_id: str | None | object = _UNSET,
+        stripe_invoice_id: str | None | object = _UNSET,
+        stripe_refund_id: str | None | object = _UNSET,
+        stripe_credit_note_id: str | None | object = _UNSET,
+        purchase_generation: str | None | object = _UNSET,
+        current_period_start: datetime | None | object = _UNSET,
+        current_period_end: datetime | None | object = _UNSET,
         provisioning_claimed_at: datetime | None | object = _UNSET,
+        cancel_at: datetime | None | object = _UNSET,
+        maintenance_checked_at: datetime | None | object = _UNSET,
+        billing_exempt: bool | object = _UNSET,
     ) -> OrganizationPhoneNumber | None:
         """Apply a phone update only while the caller owns its claim token."""
         if status is not None and status not in PHONE_NUMBER_STATUSES:
@@ -722,10 +875,23 @@ class SMSRepository(BaseRepository):
             ("price_cents", price_cents),
             ("provider_cost_cents", provider_cost_cents),
             ("quarantined_until", quarantined_until),
+            ("stripe_subscription_id", stripe_subscription_id),
+            ("stripe_subscription_item_id", stripe_subscription_item_id),
+            ("stripe_payment_intent_id", stripe_payment_intent_id),
+            ("stripe_invoice_id", stripe_invoice_id),
+            ("stripe_refund_id", stripe_refund_id),
+            ("stripe_credit_note_id", stripe_credit_note_id),
+            ("purchase_generation", purchase_generation),
+            ("current_period_start", current_period_start),
+            ("current_period_end", current_period_end),
             ("provisioning_claimed_at", provisioning_claimed_at),
+            ("cancel_at", cancel_at),
+            ("maintenance_checked_at", maintenance_checked_at),
+            ("billing_exempt", billing_exempt),
         ):
             if value is not _UNSET:
-                values[key] = to_naive_utc(value) if isinstance(value, datetime) else value
+                values[key] = value
+        values = _normalize_lifecycle_updates(values)
         async with self.Session() as session:
             row = await session.scalar(
                 update(OrganizationPhoneNumberModel)
@@ -735,6 +901,52 @@ class SMSRepository(BaseRepository):
                     OrganizationPhoneNumberModel.provisioning_claimed_at == to_naive_utc(claim_token),
                     OrganizationPhoneNumberModel.deleted_at.is_(None),
                 )
+                .values(**values)
+                .returning(OrganizationPhoneNumberModel)
+            )
+            await session.commit()
+            if row is None:
+                return None
+            await session.refresh(row)
+            return OrganizationPhoneNumber.model_validate(row)
+
+    @db_operation("update_phone_number_if_expected")
+    async def update_phone_number_if_expected(
+        self,
+        phone_number_id: str,
+        organization_id: str,
+        *,
+        expected_status: str | tuple[str, ...],
+        expected_stripe_subscription_id: str | None | object = _UNSET,
+        expected_purchase_generation: str | None | object = _UNSET,
+        expected_provider_number_sid: str | None | object = _UNSET,
+        **updates: Any,
+    ) -> OrganizationPhoneNumber | None:
+        if "status" in updates and updates["status"] not in PHONE_NUMBER_STATUSES:
+            raise InvalidPhoneNumberStatus("Invalid phone number status")
+        conditions = [
+            OrganizationPhoneNumberModel.phone_number_id == phone_number_id,
+            OrganizationPhoneNumberModel.organization_id == organization_id,
+            OrganizationPhoneNumberModel.deleted_at.is_(None),
+        ]
+        conditions.append(
+            OrganizationPhoneNumberModel.status.in_(expected_status)
+            if isinstance(expected_status, tuple)
+            else OrganizationPhoneNumberModel.status == expected_status
+        )
+        for field, expected in (
+            ("stripe_subscription_id", expected_stripe_subscription_id),
+            ("purchase_generation", expected_purchase_generation),
+            ("provider_number_sid", expected_provider_number_sid),
+        ):
+            if expected is not _UNSET:
+                column = getattr(OrganizationPhoneNumberModel, field)
+                conditions.append(column.is_(None) if expected is None else column == expected)
+        values = {"modified_at": naive_utc_now(), **_normalize_lifecycle_updates(updates)}
+        async with self.Session() as session:
+            row = await session.scalar(
+                update(OrganizationPhoneNumberModel)
+                .where(*conditions)
                 .values(**values)
                 .returning(OrganizationPhoneNumberModel)
             )

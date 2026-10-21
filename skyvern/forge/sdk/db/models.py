@@ -341,8 +341,19 @@ class OrganizationPhoneNumberModel(Base):
             "organization_id",
             "phone_number",
             unique=True,
-            postgresql_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
-            sqlite_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+            postgresql_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+        ),
+        Index(
+            "uq_org_phone_numbers_stripe_subscription",
+            "stripe_subscription_id",
+            unique=True,
+            postgresql_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
         ),
     )
 
@@ -360,7 +371,19 @@ class OrganizationPhoneNumberModel(Base):
     price_cents = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="active", server_default="active")
     quarantined_until = Column(DateTime, nullable=True)
+    stripe_subscription_id = Column(String, nullable=True)
+    stripe_subscription_item_id = Column(String, nullable=True)
+    stripe_payment_intent_id = Column(String, nullable=True)
+    stripe_invoice_id = Column(String, nullable=True)
+    stripe_refund_id = Column(String, nullable=True)
+    stripe_credit_note_id = Column(String, nullable=True)
+    purchase_generation = Column(String, nullable=True)
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
     provisioning_claimed_at = Column(DateTime, nullable=True)
+    cancel_at = Column(DateTime, nullable=True)
+    maintenance_checked_at = Column(DateTime, nullable=True)
+    billing_exempt = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
