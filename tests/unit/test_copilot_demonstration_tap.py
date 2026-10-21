@@ -1007,3 +1007,109 @@ async def test_page_tap_click_snapshot_is_bounded_on_large_pages() -> None:
             if tap is not None:
                 await tap.stop()
             await browser.close()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() -> None:
+    body = b"""<html><body style="margin:0">
+      <div id="card" draggable="true" style="width:80px;height:40px">Card</div>
+      <div id="lane" style="width:200px;height:80px" ondragover="event.preventDefault()">Done lane</div>
+      <button id="handle" style="width:80px;height:40px">Handle</button>
+      <button id="slot" style="width:80px;height:40px">Slot</button>
+      <canvas id="pad" width="200" height="100"></canvas>
+      <div id="list" style="width:200px;height:120px"><button id="row" style="width:80px;height:30px">Row</button></div>
+      <div id="loose" draggable="true" style="width:80px;height:30px">Loose</div>
+      <p id="plain" style="height:40px">Plain</p>
+      <div id="col-a" style="width:120px;height:60px"><button id="mover" style="width:80px;height:30px">Mover</button></div>
+      <div id="col-b" style="width:120px;height:60px"></div>
+      <button id="after">After</button>
+      <script>
+        let ghost = null;
+        document.querySelector('#handle').addEventListener('pointerdown', () => {
+          ghost = document.querySelector('#handle').cloneNode(true);
+          ghost.removeAttribute('id');
+          ghost.style.position = 'fixed';
+          document.body.append(ghost);
+        });
+        document.addEventListener('pointermove', (event) => {
+          if (ghost) Object.assign(ghost.style, {left: event.clientX - 10 + 'px', top: event.clientY - 10 + 'px'});
+        });
+        document.addEventListener('pointerup', () => setTimeout(() => { if (ghost) ghost.remove(); ghost = null; }));
+        let moving = false;
+        document.querySelector('#mover').addEventListener('pointerdown', () => { moving = true; });
+        document.addEventListener('pointermove', (event) => {
+          const column = document.querySelector('#col-b');
+          const box = column.getBoundingClientRect();
+          if (moving && event.clientY > box.top && event.clientY < box.bottom) column.append(document.querySelector('#mover'));
+        });
+        document.addEventListener('pointerup', () => { moving = false; });
+      </script>
+    </body></html>"""
+    tap: PageTap | None = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route: Any) -> None:
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await context.route("**/*", serve)
+            page = await context.new_page()
+            await page.goto("http://main.test/")
+            tap = PageTap(context)
+            await tap.start([page])
+
+            async def drag(source: str, target_x: float, target_y: float) -> None:
+                box = await page.locator(source).bounding_box()
+                assert box is not None
+                await page.mouse.move(box["x"] + 10, box["y"] + 10)
+                await page.mouse.down()
+                await page.mouse.move(target_x, target_y, steps=5)
+                await page.mouse.up()
+
+            await page.drag_and_drop("#card", "#lane")
+            native, _ = await _wait_for_event(tap, kind="drag")
+            assert (native.payload["selector"], native.payload["target_selector"]) == ("#card", "#lane")
+
+            await page.evaluate("getSelection().selectAllChildren(document.querySelector('#plain'))")
+            slot = await page.locator("#slot").bounding_box()
+            assert slot is not None
+            await drag("#handle", slot["x"] + 10, slot["y"] + 10)
+            pointer, pointer_events = await _wait_for_event(tap, kind="drag", selector="#handle")
+            assert pointer.payload["target_selector"] == "#slot"
+            assert not any(event.payload.get("kind") == "click" for event in pointer_events)
+
+            pad = await page.locator("#pad").bounding_box()
+            assert pad is not None
+            await drag("#pad", pad["x"] + 60, pad["y"] + 60)
+            plain = await page.locator("#plain").bounding_box()
+            assert plain is not None
+            await drag("#pad", plain["x"] + 10, plain["y"] + 10)
+            await page.click("#after")
+            _, stroke_events = await _wait_for_event(tap, kind="click", selector="#after")
+            assert [event.payload["kind"] for event in stroke_events] == ["freeform_drag", "freeform_drag", "click"]
+
+            column = await page.locator("#col-b").bounding_box()
+            assert column is not None
+            await drag("#mover", column["x"] + 100, column["y"] + 50)
+            moved, _ = await _wait_for_event(tap, kind="drag", selector="#mover")
+            assert moved.payload["target_selector"] == "#col-b"
+            tap.drain_events()
+
+            listbox = await page.locator("#list").bounding_box()
+            assert listbox is not None
+            await drag("#row", listbox["x"] + 150, listbox["y"] + 100)
+            await page.drag_and_drop("#loose", "#plain")
+            await page.click("#after")
+            _, unrecorded = await _wait_for_event(tap, kind="click", selector="#after")
+            assert [(event.payload["kind"], event.payload.get("selector")) for event in unrecorded] == [
+                ("freeform_drag", "#row"),
+                ("freeform_drag", "#loose"),
+                ("click", "#after"),
+            ]
+            await browser.close()
+    finally:
+        if tap is not None:
+            await tap.stop()
