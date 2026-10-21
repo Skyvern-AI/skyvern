@@ -12,7 +12,17 @@ from skyvern.utils.phone_validation import (
     normalize_phone_identifier,
 )
 
-PhoneNumberStatus = Literal["active", "disabled", "released", "quarantined", "provisioning"]
+PhoneNumberStatus = Literal[
+    "active",
+    "disabled",
+    "released",
+    "quarantined",
+    "provisioning",
+    "quarantining",
+    "releasing",
+    "surrendering",
+    "reversal_pending",
+]
 PHONE_NUMBER_STATUSES: frozenset[str] = frozenset(get_args(PhoneNumberStatus))
 SMSConfigMode = Literal["connected", "manual", "managed"]
 SMS_CONFIG_MODES: frozenset[str] = frozenset(get_args(SMSConfigMode))
@@ -49,10 +59,31 @@ class OrganizationPhoneNumber(BaseModel):
     price_cents: int | None = None
     status: PhoneNumberStatus
     quarantined_until: datetime | None = None
+    stripe_subscription_id: str | None = None
+    stripe_subscription_item_id: str | None = None
+    stripe_payment_intent_id: str | None = None
+    stripe_invoice_id: str | None = None
+    stripe_refund_id: str | None = None
+    stripe_credit_note_id: str | None = None
+    purchase_generation: str | None = None
+    current_period_start: datetime | None = None
+    current_period_end: datetime | None = None
     provisioning_claimed_at: datetime | None = None
+    cancel_at: datetime | None = None
+    maintenance_checked_at: datetime | None = None
+    billing_exempt: bool = False
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+
+class AvailableManagedPhoneNumber(BaseModel):
+    phone_number: str
+    friendly_name: str | None = None
+    locality: str | None = None
+    region: str | None = None
+    iso_country: str | None = None
+    monthly_price_cents: int
 
 
 class TwilioPhoneNumberInfo(BaseModel):
