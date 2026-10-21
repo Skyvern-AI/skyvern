@@ -141,6 +141,11 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    # Playwright's `Locator.count()` and the iframe-chain `query_selector`/`content_frame` probes take
+    # no timeout argument, so a renderer that stopped answering leaves each one waiting on a protocol
+    # reply forever. The action deadline adds its headroom to this budget; expiry means the page stopped
+    # answering, not that a healthy lookup was merely slow.
+    BROWSER_ELEMENT_LOOKUP_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
     WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
@@ -181,6 +186,12 @@ class Settings(BaseSettings):
     # picks from whatever loaded — so this is kept short enough that a never-settling menu costs
     # seconds rather than the minutes a run's elapsed budget cannot absorb.
     OPTION_LOADING_TIMEOUT_MS: int = 60000
+    # Wall-clock budget for the autocomplete guessed-value fanout, measured from the ladder's first
+    # probe. The probe for the requested value always runs; this only gates the LLM-guessed retries,
+    # each of which costs a full clear-and-retype plus a DOM scrape. Without it a control whose
+    # options never match spent minutes per field before the discovery fallback was reached. The budget
+    # stops new guesses from starting; a guess already in progress may overrun it. 0 disables this limit.
+    AUTO_COMPLETION_LADDER_BUDGET_SECONDS: float = 60.0
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50

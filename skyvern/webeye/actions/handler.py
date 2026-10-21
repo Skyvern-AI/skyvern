@@ -274,6 +274,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    bounded_lookup_call,
     is_element_detached_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
@@ -2655,7 +2656,7 @@ class CustomSingleSelectResult:
         if not isinstance(self.action_result, ActionSuccess):
             return True
 
-        if await self.dropdown_menu.get_locator().count() == 0:
+        if await bounded_lookup_call(self.dropdown_menu.get_locator().count) == 0:
             return True
 
         return not await self.skyvern_frame.get_element_visible(self.dropdown_menu.get_locator())
@@ -6435,8 +6436,10 @@ async def _batched_target_stale_beyond_remap(
         return False  # only the main frame has a scrape-stable identity to reason about
     try:
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
-        if await locator.count() == 1:
+        if await bounded_lookup_call(locator.count) == 1:
             return False  # the exact injected node is still live -> not stale
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return False  # cannot confirm staleness -> decline; legacy dispatch stays authoritative
     return True
@@ -6497,8 +6500,10 @@ async def _refresh_stale_web_action_before_dispatch(
         return None
     try:
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
-        if await locator.count() == 1:
+        if await bounded_lookup_call(locator.count) == 1:
             return None  # the exact injected node is still live -> not stale -> dispatch unchanged
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return None  # cannot confirm liveness / marker survival -> decline; legacy path authoritative
 
@@ -6643,7 +6648,7 @@ async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
     if (await element.get_attr("role", mode="dynamic") or "").strip().casefold() != "option":
         return False
     multiselectable = element.get_locator().locator("xpath=ancestor-or-self::*[@aria-multiselectable][1]")
-    if await multiselectable.count() == 0:
+    if await bounded_lookup_call(multiselectable.count) == 0:
         return True
     return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
 
@@ -6698,6 +6703,8 @@ async def _resolve_static_listbox_container_target(
         if target is None or not await _is_static_listbox_option(target) or await target.is_disabled(dynamic=True):
             return _static_listbox_replan_failure(action, "The static listbox option is unavailable; rescrape it.")
         return target
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.debug("Static listbox container inspection failed", element_id=element.get_id())
         return None
@@ -6991,7 +6998,7 @@ async def _drive_grid_row_selection(
     click does not achieve the desired selection. Never loops, force-clicks, or mutates the DOM."""
     cell_locator = element.get_locator().locator('xpath=ancestor-or-self::*[@role="gridcell" or self::td][1]').first
     try:
-        if await cell_locator.count() == 0:
+        if await bounded_lookup_call(cell_locator.count) == 0:
             return None
         if await SkyvernElement._label_click_forwards_to_descendant(cell_locator, fail_closed=True):
             LOG.warning(
@@ -7007,6 +7014,8 @@ async def _drive_grid_row_selection(
             )
             return None
         await cell_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, position=point)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.warning(
             "Grid row-selection click failed, continuing the normal click", element_id=element.get_id(), exc_info=True
@@ -7080,6 +7089,8 @@ async def _resolve_live_click_state(
                 LOG.info("Trusting aria-selected on a static listbox option", element_id=element.get_id())
             return _EffectiveClickState(checked=parsed, control_type=None)
         return _EffectiveClickState(checked=None, control_type=None)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.debug("Failed to read live selected state; continuing with an ordinary click", element_id=element.get_id())
         return _EffectiveClickState(checked=None, control_type=None)
@@ -7091,7 +7102,7 @@ async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
 
 async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Locator | None:
     ancestor_label_locator = element.get_locator().locator("xpath=ancestor::label[1]")
-    if await ancestor_label_locator.count() > 0:
+    if await bounded_lookup_call(ancestor_label_locator.count) > 0:
         return ancestor_label_locator
 
     input_id = await element.get_attr("id", mode="dynamic")
@@ -7099,7 +7110,7 @@ async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Loc
         return None
 
     explicit_label_locator = element.get_frame().locator(f"label[for={json.dumps(input_id)}]")
-    if await explicit_label_locator.count() > 0:
+    if await bounded_lookup_call(explicit_label_locator.count) > 0:
         return explicit_label_locator.first
 
     return None
@@ -9080,6 +9091,59 @@ def _emit_tel_input_outcome(
         action.tel_input_outcome = None
 
 
+async def _press_autocomplete_commit_tab(*, skyvern_element: SkyvernElement, action: actions.Action) -> None:
+    if not await skyvern_element.is_visible() or await skyvern_element.is_raw_input() or action.skip_auto_complete_tab:
+        return
+    LOG.debug(
+        "Trigger input-selection hack, pressing Tab to choose one",
+        action=action,
+    )
+    await skyvern_element.press_key("Tab")
+
+
+async def _autocomplete_left_field_empty(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    engine_selection: BrowserEngineSelection | None,
+    expected_value: str,
+    is_secret_value: bool,
+) -> bool:
+    try:
+        value = await get_input_value(
+            tag_name=tag_name,
+            locator=skyvern_element.get_locator(),
+            engine_selection=engine_selection,
+            # This runs on the already-slow exhausted-ladder path, so it must not inherit
+            # Playwright's 30s default wait on a control the commit may have detached.
+            read_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception:
+        # A node that cannot be read -- detached, renavigated, or type-incompatible -- is no evidence
+        # of an empty field, and treating it as one would fail actions whose value did land.
+        LOG.info(
+            "Could not read the auto-completion field back, not treating it as empty",
+            element_id=skyvern_element.get_id(),
+            exc_info=True,
+        )
+        return False
+    if value is None:
+        return False
+    if value.strip():
+        return False
+
+    committed, _ = await _custom_select_scope_confirms_committed(
+        readback_scope_element=skyvern_element,
+        anchor_is_combobox_input=tag_name == InteractiveElement.INPUT,
+        matched_element_id=skyvern_element.get_id(),
+        matched_label="<secret>" if is_secret_value else expected_value,
+        expected_label=_normalize_select_shadow_text(expected_value),
+        allow_aria_selected_option_tokens=False,
+        allow_single_value_scope=tag_name == InteractiveElement.INPUT,
+    )
+    return not committed
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -9367,6 +9431,9 @@ async def _handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+    # Set when the auto-completion ladder ran every attempt and committed no option, so the plain
+    # fill below is typing text that matched nothing in the control's list.
+    autocomplete_ladder_unresolved: bool = False
     # Set when the typeahead prefilter (below) types the target into the field. If that pre-input
     # selection does not commit, the terminal fill must clear first so the typed-but-uncommitted value
     # is not doubled. `prefilter_attempted` stays set even when the typing raises mid-dispatch (leaving a
@@ -9597,9 +9664,9 @@ async def _handle_input_text_action(
                             "Find a blocking element to the current element, going to blur the blocking element first",
                             blocking_element=blocking_element.get_locator(),
                         )
-                        if await blocking_element.get_locator().count():
+                        if await bounded_lookup_call(blocking_element.get_locator().count):
                             await blocking_element.press_key("Escape")
-                        if await blocking_element.get_locator().count():
+                        if await bounded_lookup_call(blocking_element.get_locator().count):
                             await blocking_element.blur()
 
                 if try_to_quit_dropdown and await skyvern_element.is_visible():
@@ -9977,6 +10044,9 @@ async def _handle_input_text_action(
                 ):
                     auto_complete_hacky_flag = False
                     return [result]
+                # A search bar legitimately keeps free text with nothing selected, so only a
+                # non-search-bar control can have been left blank by the exhausted ladder.
+                autocomplete_ladder_unresolved = not input_or_select_context.is_search_bar
 
         # Only the bare-digit NANP path uses the verified fallback ladder; other tel shapes remain
         # observational to preserve flag-off behavior.
@@ -10201,7 +10271,7 @@ async def _handle_input_text_action(
                                 if restored
                                 else "its previous text could not be put back"
                             ),
-                            target_value=text,
+                            target_value="<secret>" if is_secret_value else text,
                         )
                     )
                 ]
@@ -10349,6 +10419,34 @@ async def _handle_input_text_action(
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
 
+        if autocomplete_ladder_unresolved:
+            # Commit here rather than in the outer finally: the Tab is what blurs the control, and an
+            # autocomplete that rejects unmatched text clears itself on blur. Only a read-back taken
+            # after the commit can confirm that a matching value was committed.
+            if auto_complete_hacky_flag:
+                auto_complete_hacky_flag = False
+            await _press_autocomplete_commit_tab(skyvern_element=skyvern_element, action=action)
+            if await _autocomplete_left_field_empty(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                engine_selection=engine_selection,
+                expected_value=text,
+                is_secret_value=is_secret_value,
+            ):
+                LOG.info(
+                    "Auto completion committed no matching option, reporting a failed action",
+                    element_id=skyvern_element.get_id(),
+                )
+                failure = ActionFailure(
+                    NoSuitableAutoCompleteOption(
+                        reasoning="the auto-completion options matched no attempted value and no matching option was committed",
+                        target_value="<secret>" if is_secret_value else text,
+                    )
+                )
+                # Prevent a duplicate-element action such as Submit from following this failure.
+                failure.skip_remaining_actions = True
+                return [failure]
+
         return [ActionSuccess()]
     except (SkyvernPageAnalysisTimeout, InvalidElementForTextInput):
         raise
@@ -10375,17 +10473,8 @@ async def _handle_input_text_action(
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
 
         # HACK: force to finish missing auto completion input
-        if (
-            auto_complete_hacky_flag
-            and await skyvern_element.is_visible()
-            and not await skyvern_element.is_raw_input()
-            and not action.skip_auto_complete_tab
-        ):
-            LOG.debug(
-                "Trigger input-selection hack, pressing Tab to choose one",
-                action=action,
-            )
-            await skyvern_element.press_key("Tab")
+        if auto_complete_hacky_flag:
+            await _press_autocomplete_commit_tab(skyvern_element=skyvern_element, action=action)
 
 
 _URL_RECOVERY_EDIT_DISTANCE_FRACTION = 0.1
@@ -12565,7 +12654,7 @@ async def choose_auto_completion_dropdown(
             if not element_id:
                 continue
             locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-            cnt = await locator.count()
+            cnt = await bounded_lookup_call(locator.count)
             if cnt == 0:
                 continue
 
@@ -12605,7 +12694,7 @@ async def choose_auto_completion_dropdown(
                     matched_element_id = matched_candidate.get("element_id") or ""
                     matched_label = matched_candidate.get("label") or ""
                     matched_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{matched_element_id}"]')
-                    if matched_element_id and matched_label and await matched_locator.count() > 0:
+                    if matched_element_id and matched_label and await bounded_lookup_call(matched_locator.count) > 0:
                         option_identity_matches = await _verify_autocomplete_option_identity(
                             skyvern_frame=skyvern_frame,
                             locator=matched_locator,
@@ -12734,7 +12823,7 @@ async def choose_auto_completion_dropdown(
                 input_normalized = " ".join(text.lower().split())
                 if fast_path_element_id and input_normalized and input_normalized in option_text:
                     fast_path_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{fast_path_element_id}"]')
-                    if await fast_path_locator.count() > 0:
+                    if await bounded_lookup_call(fast_path_locator.count) > 0:
                         LOG.info(
                             "Location auto-completion fast path: single option found, skipping LLM",
                             element_id=fast_path_element_id,
@@ -12824,7 +12913,10 @@ async def choose_auto_completion_dropdown(
 
         if not element_id:
             reasoning = json_response.get("reasoning")
-            raise NoSuitableAutoCompleteOption(reasoning=reasoning, target_value=text)
+            raise NoSuitableAutoCompleteOption(
+                reasoning=reasoning,
+                target_value="<secret>" if is_secret_value else text,
+            )
 
         if relevance_float < relevance_threshold:
             LOG.info(
@@ -12846,7 +12938,7 @@ async def choose_auto_completion_dropdown(
         )
 
         locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-        if await locator.count() == 0:
+        if await bounded_lookup_call(locator.count) == 0:
             raise MissingElement(element_id=element_id)
 
         # Use SkyvernElement.click() so we get the full fallback chain
@@ -12876,6 +12968,8 @@ async def choose_auto_completion_dropdown(
         clear_input = False
         return result
 
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -12927,6 +13021,7 @@ async def input_or_auto_complete_input(
     collapse_autocomplete_fanout_enabled: bool = False,
     *,
     is_secret_value: bool,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> ActionResult | None:
     action_phase.mark_action_phase(ActionPhase.AUTOCOMPLETE)
     LOG.info(
@@ -12945,6 +13040,26 @@ async def input_or_auto_complete_input(
     current_value = text
     result = AutoCompletionResult()
 
+    ladder_started_at = monotonic()
+    retry_budget_seconds = settings.AUTO_COMPLETION_LADDER_BUDGET_SECONDS
+    # Per-attempt value and duration. An attempt is silent for its whole runtime -- no log, no span --
+    # so without this a ladder that spends minutes is indistinguishable from one that spends seconds.
+    attempt_timings: list[dict[str, str | float]] = []
+
+    def _elapsed_seconds() -> float:
+        return monotonic() - ladder_started_at
+
+    def _retry_budget_exhausted() -> bool:
+        return retry_budget_seconds > 0 and _elapsed_seconds() >= retry_budget_seconds
+
+    def _record_attempt(value: str, started_at: float) -> None:
+        attempt_timings.append(
+            {
+                "value": "<secret>" if is_secret_value else value,
+                "seconds": round(monotonic() - started_at, 1),
+            }
+        )
+
     while current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
         current_attemp += 1
         whole_new_elements: list[dict] = []
@@ -12956,6 +13071,7 @@ async def input_or_auto_complete_input(
             input_value=current_value,
         )
         is_location = input_or_select_context.is_location_input or False
+        attempt_started_at = monotonic()
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
@@ -12971,6 +13087,7 @@ async def input_or_auto_complete_input(
             action=action,
             is_secret_value=is_secret_value,
         )
+        _record_attempt(current_value, attempt_started_at)
         if isinstance(result.action_result, ActionSuccess):
             return result.action_result
 
@@ -12995,29 +13112,40 @@ async def input_or_auto_complete_input(
         )
 
         values: list[dict] = []
-        prompt = prompt_engine.load_prompt(
-            "auto-completion-potential-answers",
-            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-            field_information=field_information,
-            current_value=current_value,
-            navigation_goal=task.navigation_goal,
-            navigation_payload_str=json.dumps(task.navigation_payload),
-            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        )
+        if _retry_budget_exhausted():
+            # Guesses the ladder cannot afford to type are not worth asking an LLM for; the
+            # discovery fallback below opens the unfiltered control instead.
+            LOG.info(
+                "Auto completion retry budget already spent by the first probe, skipping the potential-value fanout",
+                element_id=skyvern_element.get_id(),
+                elapsed_seconds=round(_elapsed_seconds(), 1),
+                budget_seconds=retry_budget_seconds,
+                attempts=attempt_timings,
+            )
+        else:
+            prompt = prompt_engine.load_prompt(
+                "auto-completion-potential-answers",
+                potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+                field_information=field_information,
+                current_value=current_value,
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            )
 
-        LOG.info(
-            "Ask LLM to give potential values based on the current value",
-            current_value=current_value,
-            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-        )
-        if collapse_autocomplete_fanout_enabled and action is not None:
-            action.set_has_mini_agent()
-        json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
-            prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
-        )
-        values = json_respone.get("potential_values", [])
+            LOG.info(
+                "Ask LLM to give potential values based on the current value",
+                current_value=current_value,
+                potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+            )
+            if collapse_autocomplete_fanout_enabled and action is not None:
+                action.set_has_mini_agent()
+            json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+                prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
+            )
+            values = json_respone.get("potential_values", [])
 
-        for each_value in values:
+        for value_index, each_value in enumerate(values):
             value: str = each_value.get("value", "")
             if not value:
                 LOG.info(
@@ -13025,11 +13153,22 @@ async def input_or_auto_complete_input(
                     value=each_value,
                 )
                 continue
+            if _retry_budget_exhausted():
+                LOG.info(
+                    "Auto completion retry budget exhausted, skipping the remaining potential values",
+                    element_id=skyvern_element.get_id(),
+                    elapsed_seconds=round(_elapsed_seconds(), 1),
+                    budget_seconds=retry_budget_seconds,
+                    attempts=attempt_timings,
+                    skipped_value_count=len(values) - value_index,
+                )
+                break
             LOG.info(
                 "Try the potential value for auto completion",
                 sampling=True,
                 input_value=value,
             )
+            attempt_started_at = monotonic()
             result = await choose_auto_completion_dropdown(
                 context=input_or_select_context,
                 page=page,
@@ -13046,6 +13185,7 @@ async def input_or_auto_complete_input(
                 allow_full_page_rescrape=not initial_probe_found_no_options,
                 is_secret_value=is_secret_value,
             )
+            _record_attempt(value, attempt_started_at)
             if isinstance(result.action_result, ActionSuccess):
                 return result.action_result
 
@@ -13109,6 +13249,8 @@ async def input_or_auto_complete_input(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
             context=input_or_select_context,
+            attempts=attempt_timings,
+            total_seconds=round(_elapsed_seconds(), 1),
         )
         return None
 
@@ -14006,9 +14148,11 @@ async def _evaluate_element_scoped(
 
 async def _read_custom_select_matched_state(element: SkyvernElement) -> dict | None:
     try:
-        if await element.get_locator().count() != 1:
+        if await bounded_lookup_call(element.get_locator().count) != 1:
             return None
         state = await _evaluate_element_scoped(element, _CUSTOM_SELECT_MATCHED_STATE_JS)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.info(
             "Failed to read custom-select matched element state",
